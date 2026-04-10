@@ -1,0 +1,539 @@
+/* =========================================
+   Base Layout & Animations
+   ========================================= */
+.page {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  width: 100vw;
+  overflow-x: hidden;
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+  background-color: #ffffff;
+}
+
+@media (min-width: 1024px) {
+  .page {
+    flex-direction: row;
+    height: 100vh;
+    overflow: hidden;
+    /* Prevents scrolling on desktop if not needed */
+  }
+}
+
+@keyframes fadeUp {
+  0% {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulseGlow {
+
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 0.55;
+    transform: scale(1.05);
+  }
+}
+
+/* =========================================
+   LEFT SIDE: Dark Midnight/Slate Area
+   ========================================= */
+.leftSide {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 3rem 1.5rem;
+  /* Reverted to the exact color from your provided code */
+  background: linear-gradient(180deg, #09090b 0%, #111827 100%);
+  overflow: hidden;
+  flex: 1.15;
+  /* Takes up slightly more than half the screen */
+}
+
+@media (min-width: 1024px) {
+  .leftSide {
+    padding: 4rem 10%;
+  }
+}
+
+.backgroundAmbience {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.gridOverlay {
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+  background-size: 34px 34px;
+  mask-image: radial-gradient(circle at center, rgba(0, 0, 0, 0.85), transparent 82%);
+  -webkit-mask-image: radial-gradient(circle at center, rgba(0, 0, 0, 0.85), transparent 82%);
+}
+
+.orbPrimary,
+.orbSecondary {
+  position: absolute;
+  border-radius: 999px;
+  filter: blur(95px);
+  animation: pulseGlow 12s ease-in-out infinite;
+}
+
+.orbPrimary {
+  top: -10%;
+  right: -4%;
+  width: 35rem;
+  height: 35rem;
+  /* Original indigo orb */
+  background: rgba(99, 102, 241, 0.18);
+}
+
+.orbSecondary {
+  bottom: -16%;
+  left: -8%;
+  width: 40rem;
+  height: 40rem;
+  /* Original blue orb */
+  background: rgba(37, 99, 235, 0.12);
+  animation-delay: 4s;
+}
+
+.leftContent {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+  animation: fadeUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Original Badge styling */
+.badge {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  gap: 0.5rem;
+  border: 1px solid rgba(129, 140, 248, 0.28);
+  border-radius: 999px;
+  background: rgba(99, 102, 241, 0.12);
+  padding: 0.45rem 0.95rem;
+  color: #c7d2fe;
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  backdrop-filter: blur(12px);
+}
+
+.badgeIcon {
+  width: 0.95rem;
+  height: 0.95rem;
+}
+
+.headingGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 1.15rem;
+}
+
+/* Original text colors */
+.title {
+  max-width: 36rem;
+  color: #ffffff;
+  font-size: clamp(2.35rem, 4vw, 4rem);
+  font-weight: 700;
+  line-height: 1.04;
+  letter-spacing: -0.045em;
+}
+
+.description {
+  max-width: 34rem;
+  color: #a1a1aa;
+  font-size: 1rem;
+  line-height: 1.75;
+}
+
+.featureGrid {
+  display: grid;
+  gap: 0.9rem;
+  margin-top: 1rem;
+}
+
+@media (min-width: 640px) {
+  .featureGrid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* Original feature card styling */
+.featureCard {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 1.2rem;
+  background: rgba(255, 255, 255, 0.04);
+  padding: 1.25rem;
+  backdrop-filter: blur(12px);
+  transition:
+    transform 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+
+.featureCard:hover {
+  transform: translateY(-2px);
+  border-color: rgba(129, 140, 248, 0.28);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.featureTitle {
+  color: #f8fafc;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.featureBody {
+  margin-top: 0.35rem;
+  color: #a1a1aa;
+  font-size: 0.84rem;
+  line-height: 1.55;
+}
+
+/* =========================================
+   RIGHT SIDE: Light Form Area
+   ========================================= */
+.rightSide {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1.5rem;
+  /* Original Light Background you provided */
+  background:
+    radial-gradient(circle at top right, rgba(99, 102, 241, 0.14), transparent 24%),
+    radial-gradient(circle at bottom left, rgba(37, 99, 235, 0.12), transparent 28%),
+    linear-gradient(180deg, #ffffff 0%, #f4f4f5 100%);
+}
+
+@media (min-width: 1024px) {
+  .rightSide {
+    padding: 2rem;
+    min-width: 480px;
+  }
+}
+
+.panelWrapper {
+  width: 100%;
+  max-width: 28rem;
+  opacity: 0;
+  animation: fadeUp 0.7s cubic-bezier(0.16, 1, 0.3, 1) 0.15s forwards;
+}
+
+.panel {
+  border: 1px solid #e4e4e7;
+  border-radius: 1.5rem;
+  background: rgba(255, 255, 255, 0.94);
+  width: 100%;
+  padding: 2.25rem 2rem;
+  box-shadow: 0 24px 70px rgba(15, 23, 42, 0.1);
+  backdrop-filter: blur(18px);
+}
+
+.panelHeader {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  margin-bottom: 1.5rem;
+}
+
+.panelTitle {
+  color: #0f172a;
+  font-size: 1.65rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+.panelDescription {
+  color: #64748b;
+  font-size: 0.92rem;
+  line-height: 1.6;
+}
+
+.tabsContainer {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+.tabsList {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-bottom: 1.5rem;
+  border: 1px solid #e4e4e7;
+  border-radius: 1rem;
+  background: #f4f4f5;
+  padding: 0.25rem;
+}
+
+.tabsTrigger {
+  border-radius: 0.8rem !important;
+  color: #71717a !important;
+  font-size: 0.9rem !important;
+  font-weight: 600 !important;
+  padding: 0.7rem 0.8rem !important;
+  transition: all 0.18s ease !important;
+}
+
+.tabsTrigger[data-state="active"] {
+  background: #0f172a !important;
+  color: #ffffff !important;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.18) !important;
+}
+
+.tabsContent {
+  margin-top: 0;
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.labelRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.fieldLabel {
+  color: #334155;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.forgotPassword {
+  color: #4f46e5;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-decoration: none;
+  transition: color 0.18s ease;
+}
+
+.forgotPassword:hover {
+  color: #4338ca;
+  text-decoration: underline;
+}
+
+.inputWrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.fieldIcon {
+  position: absolute;
+  left: 0.95rem;
+  width: 1rem;
+  height: 1rem;
+  color: #94a3b8;
+  pointer-events: none;
+  transition: color 0.18s ease;
+}
+
+.togglePassword {
+  position: absolute;
+  right: 0.45rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 0.75rem;
+  background: transparent;
+  padding: 0.55rem;
+  color: #94a3b8;
+  cursor: pointer;
+  transition: all 0.18s ease;
+}
+
+.togglePassword:hover {
+  color: #0f172a;
+  background: #f4f4f5;
+}
+
+.togglePassword svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+.input {
+  width: 100%;
+  height: 3.15rem !important;
+  border: 1px solid #e4e4e7 !important;
+  border-radius: 1rem !important;
+  background: #ffffff !important;
+  color: #0f172a !important;
+  padding-left: 2.8rem !important;
+  padding-right: 2.9rem !important;
+  font-size: 0.95rem !important;
+  transition: all 0.18s ease !important;
+}
+
+.input::placeholder {
+  color: #94a3b8 !important;
+}
+
+.input:focus {
+  outline: none !important;
+  border-color: #6366f1 !important;
+  box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.12) !important;
+  background: #ffffff !important;
+}
+
+.inputWrap:focus-within .fieldIcon {
+  color: #6366f1;
+}
+
+.strengthMeter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.9rem;
+  margin-top: 0.15rem;
+  padding-inline: 0.1rem;
+}
+
+.strengthBars {
+  display: flex;
+  gap: 0.35rem;
+  flex: 1;
+}
+
+.strengthBar {
+  height: 4px;
+  flex: 1;
+  border-radius: 999px;
+  background: #e4e4e7;
+  transition: all 0.2s ease;
+}
+
+.strengthBar.activeLow {
+  background: #ef4444;
+}
+
+.strengthBar.activeFair {
+  background: #f59e0b;
+}
+
+.strengthBar.activeGood {
+  background: #22c55e;
+}
+
+.strengthBar.activeStrong {
+  background: #10b981;
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.28);
+}
+
+.strengthText {
+  width: 3rem;
+  color: #64748b;
+  font-size: 0.74rem;
+  font-weight: 600;
+  text-align: right;
+}
+
+.submitButton {
+  width: 100%;
+  height: 3.15rem !important;
+  margin-top: 0.5rem;
+  border: none !important;
+  border-radius: 1rem !important;
+  background: linear-gradient(180deg, #111827 0%, #0f172a 100%) !important;
+  color: #ffffff !important;
+  font-size: 0.95rem !important;
+  font-weight: 700 !important;
+  box-shadow: 0 16px 32px rgba(15, 23, 42, 0.18) !important;
+  transition: all 0.18s ease !important;
+}
+
+.submitButton:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 18px 36px rgba(15, 23, 42, 0.24) !important;
+  background: linear-gradient(180deg, #0f172a 0%, #020617 100%) !important;
+}
+
+.submitButton:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.submitButton:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.disclaimer {
+  color: #64748b;
+  font-size: 0.76rem;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.disclaimer a {
+  color: #4f46e5;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.disclaimer a:hover {
+  text-decoration: underline;
+}
+
+.feedback {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.7rem;
+  margin-top: 1.15rem;
+  border-radius: 1rem;
+  padding: 0.95rem 1rem;
+  font-size: 0.84rem;
+  line-height: 1.55;
+  animation: fadeUp 0.24s ease forwards;
+}
+
+.success {
+  border: 1px solid #bbf7d0;
+  background: #f0fdf4;
+  color: #047857;
+}
+
+.error {
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.feedbackIcon {
+  flex-shrink: 0;
+  width: 1.1rem;
+  height: 1.1rem;
+  margin-top: 0.08rem;
+}
