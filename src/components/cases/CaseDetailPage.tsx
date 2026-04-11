@@ -8,20 +8,28 @@ import {
   Building2,
   CheckCircle2,
   Clock,
+  Database,
+  Download,
+  Edit2,
   ExternalLink,
+  Eye,
   FileText,
+  Folder,
+  Info,
   Loader2,
+  MapPin,
+  MoreHorizontal,
   Receipt,
+  Share2,
   ShieldAlert,
+  Sparkles,
   TriangleAlert,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   FIELD_DEFINITIONS,
   getFieldDefinitionsByKeys,
@@ -63,7 +71,7 @@ function getOrderedDocumentEntries(
 }
 
 function formatDateTime(value: string) {
-  return new Date(value).toLocaleString("en-IN", {
+  return new Date(value).toLocaleString("en-US", {
     day: "2-digit",
     month: "short",
     year: "numeric",
@@ -109,37 +117,13 @@ function displayValue(value: unknown) {
   return String(value);
 }
 
-function getRiskTone(score: number) {
-  if (score >= 70) {
-    return {
-      badge: "border-rose-200 bg-rose-50 text-rose-700",
-      panel: "border-rose-100 bg-gradient-to-br from-rose-50/50 to-white",
-      icon: "text-rose-600",
-      label: "High risk",
-    };
-  }
-  if (score >= 40) {
-    return {
-      badge: "border-amber-200 bg-amber-50 text-amber-700",
-      panel: "border-amber-100 bg-gradient-to-br from-amber-50/50 to-white",
-      icon: "text-amber-600",
-      label: "Medium risk",
-    };
-  }
-  return {
-    badge: "border-emerald-200 bg-emerald-50 text-emerald-700",
-    panel: "border-emerald-100 bg-gradient-to-br from-emerald-50/50 to-white",
-    icon: "text-emerald-600",
-    label: "Low risk",
-  };
-}
-
 export function CaseDetailPage({ caseId }: { caseId: string }) {
   const [detail, setDetail] = useState<SavedCaseDetail | null>(null);
   const [status, setStatus] = useState<LoadState>("loading");
   const [error, setError] = useState<string | null>(null);
+
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
-  const [activeMismatchId, setActiveMismatchId] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<"preview" | "data" | "ocr" | "mismatches">("preview");
 
   useEffect(() => {
     let active = true;
@@ -161,58 +145,32 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     };
   }, [caseId]);
 
-  const metrics = useMemo(() => {
-    if (!detail) {
-      return {
-        documents: 0,
-        mismatches: 0,
-      };
-    }
-
-    return {
-      documents: detail.documents.length,
-      mismatches: detail.mismatches.length,
-    };
-  }, [detail]);
-
   useEffect(() => {
     if (!detail) return;
-
     setActiveDocumentId((current) => {
       if (current && detail.documents.some((document) => document.id === current)) {
         return current;
       }
       return detail.documents[0]?.id ?? null;
     });
-
-    setActiveMismatchId((current) => {
-      if (current && detail.mismatches.some((mismatch) => mismatch.id === current)) {
-        return current;
-      }
-      return detail.mismatches[0]?.id ?? null;
-    });
   }, [detail]);
 
   const documentLookup = useMemo(() => {
     const map = new Map<string, SavedCaseDetail["documents"][number]>();
-
     detail?.documents.forEach((document) => {
       map.set(document.id, document);
       if (document.clientDocumentId) {
         map.set(document.clientDocumentId, document);
       }
     });
-
     return map;
   }, [detail]);
 
   const fileLookup = useMemo(() => {
     const map = new Map<string, SavedCaseDetail["files"][number]>();
-
     detail?.files.forEach((file) => {
       map.set(normalizeText(file.originalName), file);
     });
-
     return map;
   }, [detail]);
 
@@ -235,508 +193,466 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
     for (const candidate of candidates) {
       const exactMatch = fileLookup.get(candidate);
-      if (exactMatch) {
-        return exactMatch;
-      }
+      if (exactMatch) return exactMatch;
     }
 
     const partialMatch = detail.files.find((file) =>
       candidates.some((candidate) => normalizeText(file.originalName).includes(candidate))
     );
 
-    if (partialMatch) {
-      return partialMatch;
-    }
-
+    if (partialMatch) return partialMatch;
     return detail.files.length === 1 ? detail.files[0] : null;
   }, [activeDocument, detail, fileLookup]);
 
-  const activeMismatch = useMemo(() => {
-    if (!detail || !activeMismatchId) return null;
-    return detail.mismatches.find((mismatch) => mismatch.id === activeMismatchId) ?? null;
-  }, [detail, activeMismatchId]);
+  const activeFileUrl = activeDocumentFile?.signedUrl ?? null;
 
   const fieldCanonicalValues = useMemo(() => {
     if (!detail) return {} as Record<string, string>;
-
     const result: Record<string, string> = {};
-
     FIELD_DEFINITIONS.forEach(({ key }) => {
       const values = detail.documents
         .map((document) => document.extractedFields[key])
         .filter((value): value is string => typeof value === "string" && value.trim().length > 0);
-
       result[key] = pickCanonicalValue(values);
     });
-
     return result;
   }, [detail]);
 
-  const riskTone = detail ? getRiskTone(detail.case.riskScore) : null;
-
   return (
     <AppShell>
-      <div className="mx-auto max-w-7xl space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700 ease-out pb-12">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="space-y-1">
-            <Link
-              href="/cases"
-              className="mb-2 inline-flex items-center text-sm font-medium text-slate-500 transition-colors hover:text-slate-900"
-            >
-              <ArrowLeft className="mr-1.5 h-4 w-4" />
-              Back to Directory
+      <div className="flex h-full flex-col bg-[#f8fafc] animate-in fade-in duration-500">
+
+        {/* =========================================
+            TOP HEADER (Matches Reference Exactly)
+            ========================================= */}
+        <header className="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3 sm:px-6">
+          <div className="flex items-center gap-4">
+            <Link href="/cases" className="flex h-8 w-8 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors">
+              <ArrowLeft className="h-5 w-5" />
             </Link>
-            <h1 className="text-3xl font-bold tracking-tight text-slate-900 sm:text-4xl">
-              {detail?.case.displayName || "Loading Case..."}
-            </h1>
-            <p className="max-w-2xl text-sm text-slate-500">
-              Detailed inspection of uploaded files, extracted documents, and reconciliation findings.
-            </p>
+
+            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-emerald-50 text-emerald-600 border border-emerald-100/50">
+              <FileText className="h-4 w-4" />
+            </div>
+
+            <div className="flex items-center gap-3">
+              <h1 className="text-lg font-bold text-slate-900 tracking-tight">
+                {detail?.case.displayName || "Loading Case..."}
+              </h1>
+
+              {detail && (
+                <>
+                  <Badge variant="outline" className="rounded-full bg-emerald-50 text-emerald-700 border-emerald-200 px-2.5 font-medium shadow-sm">
+                    v1 • Current
+                  </Badge>
+                  {detail.case.riskScore > 0 ? (
+                    <Badge variant="outline" className="rounded-full bg-blue-50 text-blue-700 border-blue-200 px-2.5 font-medium flex items-center gap-1 shadow-sm">
+                      <Sparkles className="h-3 w-3" /> AI AUDITED
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="rounded-full bg-emerald-50 text-emerald-700 border-emerald-200 px-2.5 font-medium flex items-center gap-1 shadow-sm">
+                      <CheckCircle2 className="h-3 w-3" /> RECONCILED
+                    </Badge>
+                  )}
+                </>
+              )}
+            </div>
           </div>
 
-          {detail && (
-            <div className="flex items-center gap-3">
-              <Badge
-                variant="outline"
-                className="rounded-md border-slate-200 bg-slate-50/80 px-3 py-1 font-mono text-xs text-slate-600"
-              >
-                ID: {detail.case.slug}
-              </Badge>
-            </div>
-          )}
-        </div>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="icon" className="text-slate-500 hover:text-slate-800">
+              <Download className="h-4 w-4" />
+            </Button>
+            <Button variant="ghost" size="icon" className="text-slate-500 hover:text-slate-800">
+              <Share2 className="h-4 w-4" />
+            </Button>
+            <Button variant="ghost" size="icon" className="text-slate-500 hover:text-slate-800">
+              <Info className="h-4 w-4" />
+            </Button>
+            <div className="w-px h-5 bg-slate-200 mx-1"></div>
+            <Button variant="outline" className="h-9 gap-2 text-slate-700 font-semibold border-slate-200 shadow-sm hover:bg-slate-50">
+              <Edit2 className="h-4 w-4" /> Edit
+            </Button>
+            <Button variant="ghost" size="icon" className="text-slate-500 hover:text-slate-800">
+              <MoreHorizontal className="h-5 w-5" />
+            </Button>
+          </div>
+        </header>
 
+        {/* =========================================
+            STATE MANAGEMENT (LOADING / ERROR)
+            ========================================= */}
         {status === "loading" && (
-          <div className="flex flex-col items-center justify-center rounded-3xl border border-slate-200 bg-gradient-to-br from-white via-slate-50 to-indigo-50/40 py-24 text-slate-500 shadow-sm">
-            <Loader2 className="mb-4 h-8 w-8 animate-spin text-indigo-500" />
-            <p className="text-sm font-medium">Retrieving case records from workspace...</p>
+          <div className="flex flex-1 flex-col items-center justify-center py-24 text-slate-500">
+            <Loader2 className="mb-4 h-8 w-8 animate-spin text-emerald-500" />
+            <p className="text-sm font-medium">Retrieving case workspace...</p>
           </div>
         )}
 
         {status === "error" && (
-          <div className="flex items-start gap-4 rounded-3xl border border-red-200 bg-red-50 p-6 text-red-700 shadow-sm">
-            <ShieldAlert className="mt-0.5 h-6 w-6 shrink-0 text-red-500" />
-            <div>
-              <h3 className="font-semibold">Unable to load case</h3>
-              <p className="mt-1 text-sm opacity-90">{error}</p>
+          <div className="p-8">
+            <div className="flex items-start gap-4 rounded-2xl border border-red-200 bg-red-50 p-6 text-red-700 shadow-sm max-w-2xl mx-auto">
+              <ShieldAlert className="mt-0.5 h-6 w-6 shrink-0 text-red-500" />
+              <div>
+                <h3 className="font-bold text-lg">Unable to load case</h3>
+                <p className="mt-1 text-sm font-medium opacity-90">{error}</p>
+              </div>
             </div>
           </div>
         )}
 
+        {/* =========================================
+            MAIN SPLIT LAYOUT
+            ========================================= */}
         {status === "ready" && detail && (
-          <>
-            <div
-              className={`grid gap-0 overflow-hidden rounded-3xl border shadow-sm sm:grid-cols-2 lg:grid-cols-4 ${
-                riskTone?.panel || "border-slate-200 bg-gradient-to-br from-white via-slate-50 to-indigo-50/40"
-              }`}
-            >
-              <div className="flex flex-col justify-center border-b border-slate-200/70 p-6 sm:border-b-0 sm:border-r">
-                <div className="mb-2 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-slate-500">
-                  <Building2 className="h-3.5 w-3.5" /> Buyer Entity
-                </div>
-                <div className="truncate text-lg font-semibold text-slate-900" title={detail.case.buyerName || "—"}>
-                  {detail.case.buyerName || "—"}
-                </div>
-              </div>
+          <div className="flex flex-1 overflow-hidden">
 
-              <div className="flex flex-col justify-center border-b border-slate-200/70 p-6 sm:border-b-0 sm:border-r">
-                <div className="mb-2 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-slate-500">
-                  <Receipt className="h-3.5 w-3.5" /> Invoice / PO Ref
-                </div>
-                <div className="flex items-baseline gap-2">
-                  <span
-                    className="max-w-[120px] truncate text-lg font-semibold text-slate-900"
-                    title={detail.case.invoiceNumber || "—"}
-                  >
-                    {detail.case.invoiceNumber || "—"}
-                  </span>
-                  <span className="text-sm font-mono text-slate-400">/</span>
-                  <span
-                    className="max-w-[100px] truncate text-sm font-mono text-slate-500"
-                    title={detail.case.poNumber || "—"}
-                  >
-                    {detail.case.poNumber || "—"}
-                  </span>
-                </div>
-              </div>
+            {/* LEFT PANEL (Metadata & Context) */}
+            <div className="w-full max-w-md flex-shrink-0 border-r border-slate-200 bg-white overflow-y-auto hidden xl:block">
+              <div className="p-6 space-y-6">
 
-              <div className="flex flex-col justify-center border-b border-slate-200/70 p-6 lg:border-b-0 lg:border-r">
-                <div className="mb-2 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-slate-500">
-                  <Clock className="h-3.5 w-3.5" /> Processed On
-                </div>
-                <div className="text-sm font-medium text-slate-900">
-                  {formatDateTime(detail.case.createdAt)}
-                </div>
-              </div>
-
-              <div className="flex flex-col justify-center bg-white/40 p-6">
-                <div className="mb-2 flex items-center justify-between">
-                  <div className="text-[10px] font-bold uppercase tracking-widest text-slate-500">
-                    Reconciliation Risk
+                {/* Location Card */}
+                <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <div className="flex items-center gap-2 mb-4">
+                    <MapPin className="h-4 w-4 text-slate-400" />
+                    <h3 className="font-bold text-slate-800 text-sm">Location</h3>
                   </div>
-                  <TriangleAlert className={`h-4 w-4 ${riskTone?.icon}`} />
+                  <div className="flex items-center flex-wrap gap-2 text-sm text-slate-600 font-medium">
+                    <Folder className="h-4 w-4 text-emerald-600" />
+                    <span className="text-emerald-600 cursor-pointer hover:underline">Root</span>
+                    <span className="text-slate-300">/</span>
+                    <span>Cases</span>
+                    <span className="text-slate-300">/</span>
+                    <span className="text-slate-900">{detail.case.slug}</span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-3">
-                  <span className="text-3xl font-bold tracking-tight text-slate-900">
-                    {detail.case.riskScore}
-                  </span>
-                  <Badge variant="outline" className={riskTone?.badge}>
-                    {riskTone?.label}
-                  </Badge>
+
+                {/* Details Card */}
+                <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <div className="flex items-center gap-2 mb-5">
+                    <Info className="h-4 w-4 text-slate-400" />
+                    <h3 className="font-bold text-slate-800 text-sm">Details</h3>
+                  </div>
+                  <div className="grid grid-cols-2 gap-y-6 gap-x-4">
+                    <div>
+                      <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-1">Buyer</div>
+                      <div className="text-sm font-semibold text-slate-900 leading-tight">
+                        {detail.case.buyerName || "—"}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-1">Uploaded</div>
+                      <div className="text-sm font-semibold text-slate-900 leading-tight">
+                        {formatDateTime(detail.case.createdAt)}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-1">Invoice Ref</div>
+                      <div className="text-sm font-semibold text-slate-900 leading-tight">
+                        {detail.case.invoiceNumber || "—"}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-1">PO Number</div>
+                      <div className="text-sm font-semibold text-slate-900 leading-tight">
+                        {detail.case.poNumber || "—"}
+                      </div>
+                    </div>
+                  </div>
                 </div>
+
+                {/* Document Selector Card */}
+                <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <div className="flex items-center justify-between mb-4">
+                    <div className="flex items-center gap-2">
+                      <FileText className="h-4 w-4 text-slate-400" />
+                      <h3 className="font-bold text-slate-800 text-sm">Packet Documents</h3>
+                    </div>
+                    <Badge variant="secondary" className="bg-slate-100 text-slate-600 font-bold">{detail.documents.length}</Badge>
+                  </div>
+                  <div className="space-y-1.5">
+                    {detail.documents.map((d) => {
+                      const isActive = activeDocumentId === d.id;
+                      return (
+                        <button
+                          key={d.id}
+                          onClick={() => {
+                            setActiveDocumentId(d.id);
+                            if (activeTab === "mismatches") setActiveTab("preview");
+                          }}
+                          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all text-left ${isActive ? "bg-emerald-50 border border-emerald-100" : "hover:bg-slate-50 border border-transparent"
+                            }`}
+                        >
+                          <div className={`flex items-center justify-center shrink-0 w-8 h-8 rounded-lg ${isActive ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-100 text-slate-400'}`}>
+                            <FileText className="w-4 h-4" />
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <div className={`text-sm font-bold truncate ${isActive ? 'text-emerald-900' : 'text-slate-700'}`}>
+                              {d.title}
+                            </div>
+                            <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider truncate mt-0.5">
+                              {d.documentType}
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* AI Summary / Risk Card (Matches Green AI Box) */}
+                <div className={`rounded-2xl border p-6 shadow-sm ${detail.mismatches.length === 0 ? 'bg-[#f0fdf4] border-[#bbf7d0]' : 'bg-amber-50 border-amber-200'}`}>
+                  <div className="flex items-center gap-2 mb-4">
+                    <Sparkles className={`h-4 w-4 ${detail.mismatches.length === 0 ? 'text-[#166534]' : 'text-amber-700'}`} />
+                    <h3 className={`font-bold text-sm ${detail.mismatches.length === 0 ? 'text-[#166534]' : 'text-amber-900'}`}>AI Summary</h3>
+                  </div>
+
+                  {detail.mismatches.length === 0 ? (
+                    <div className="text-sm text-[#166534] font-medium leading-relaxed">
+                      This case has been successfully reconciled. All extracted data points match perfectly across the provided documents with 100% integrity. No further action is required.
+                    </div>
+                  ) : (
+                    <div className="text-sm text-amber-900 font-medium leading-relaxed">
+                      This packet requires attention. We detected conflicting values across the provided documents.
+                      <p className="mt-3 font-bold">Key Discrepancies:</p>
+                      <ul className="mt-2 space-y-1.5 list-disc pl-4 marker:text-amber-500">
+                        {detail.mismatches.map((m) => (
+                          <li key={m.id}>{FIELD_LABEL_LOOKUP[m.fieldName] || m.fieldName}</li>
+                        ))}
+                      </ul>
+                      <Button
+                        variant="link"
+                        className="p-0 h-auto mt-4 text-amber-700 font-bold"
+                        onClick={() => setActiveTab("mismatches")}
+                      >
+                        View all mismatches &rarr;
+                      </Button>
+                    </div>
+                  )}
+                </div>
+
               </div>
             </div>
 
-            <Tabs defaultValue="documents" className="mt-10 w-full">
-              <div className="flex justify-center sm:justify-start">
-                <TabsList className="mb-8 inline-flex h-12 items-center justify-center rounded-xl border border-slate-200/60 bg-slate-100/80 p-1 text-slate-500">
-                  <TabsTrigger
-                    value="documents"
-                    className="rounded-lg px-6 py-2 text-sm font-medium transition-all data-[state=active]:bg-white data-[state=active]:text-slate-900 data-[state=active]:shadow-sm"
-                  >
-                    Extracted Documents{" "}
-                    <Badge variant="secondary" className="ml-2 bg-slate-200/70 text-slate-700">
-                      {metrics.documents}
-                    </Badge>
-                  </TabsTrigger>
-                  <TabsTrigger
-                    value="mismatches"
-                    className="rounded-lg px-6 py-2 text-sm font-medium transition-all data-[state=active]:bg-white data-[state=active]:text-slate-900 data-[state=active]:shadow-sm"
-                  >
-                    Mismatches{" "}
-                    <Badge variant="secondary" className="ml-2 bg-indigo-100 text-indigo-700">
-                      {metrics.mismatches}
-                    </Badge>
-                  </TabsTrigger>
-                </TabsList>
-              </div>
+            {/* RIGHT PANEL (Viewer & Tabs) */}
+            <div className="flex-1 flex flex-col p-4 sm:p-6 lg:p-8 overflow-hidden relative">
+              <div className="bg-white border border-slate-200 rounded-[1.5rem] shadow-sm h-full flex flex-col overflow-hidden">
 
-              <TabsContent value="documents" className="focus:outline-none">
-                {metrics.documents === 0 ? (
-                  <div className="flex flex-col items-center justify-center rounded-3xl border border-dashed border-slate-300 bg-gradient-to-br from-white via-slate-50 to-indigo-50/30 py-20">
-                    <FileText className="mb-4 h-10 w-10 text-slate-300" />
-                    <h3 className="text-lg font-medium text-slate-900">No Documents Extracted</h3>
-                    <p className="text-sm text-slate-500">There are no OCR records saved for this case.</p>
+                {/* Viewer Header */}
+                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b border-slate-100 p-4 sm:px-6 gap-4">
+                  <div className="flex items-center gap-3">
+                    <Eye className="h-5 w-5 text-slate-400" />
+                    <h2 className="text-base font-bold text-slate-800">
+                      {activeTab === "mismatches" ? "Reconciliation Issues" : "Document Viewer"}
+                    </h2>
+                    {activeTab !== "mismatches" && (
+                      <Badge variant="secondary" className="bg-slate-100 text-slate-600 font-bold uppercase text-[10px] tracking-wider ml-2">PDF</Badge>
+                    )}
                   </div>
-                ) : (
-                  <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
-                    <Card className="border-slate-200 bg-white/90 shadow-sm">
-                      <div className="border-b border-slate-200/70 px-5 py-4">
-                        <div className="text-sm font-semibold text-slate-900">Documents</div>
-                        <div className="mt-1 text-xs text-slate-500">
-                          Select a saved document to preview and inspect.
+
+                  {/* Segmented Control Tabs */}
+                  <div className="bg-slate-100 p-1 rounded-xl flex items-center shadow-inner overflow-x-auto max-w-full">
+                    {[
+                      { id: "preview", label: "Preview", icon: Eye },
+                      { id: "data", label: "Extracted Data", icon: Database },
+                      { id: "ocr", label: "OCR Text", icon: FileText },
+                      { id: "mismatches", label: "Mismatches", icon: TriangleAlert },
+                    ].map((tab) => (
+                      <button
+                        key={tab.id}
+                        onClick={() => setActiveTab(tab.id as any)}
+                        className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-sm font-bold transition-all whitespace-nowrap ${activeTab === tab.id
+                          ? "bg-white text-slate-900 shadow-sm"
+                          : "text-slate-500 hover:text-slate-700 hover:bg-slate-200/50"
+                          }`}
+                      >
+                        <tab.icon className="w-4 h-4" />
+                        {tab.label}
+                        {tab.id === "mismatches" && detail.mismatches.length > 0 && (
+                          <span className="ml-1 flex h-4 w-4 items-center justify-center rounded-full bg-rose-100 text-[9px] text-rose-600">
+                            {detail.mismatches.length}
+                          </span>
+                        )}
+                      </button>
+                    ))}
+                    <button className="px-3 py-1.5 text-slate-400 hover:text-slate-700 transition-colors ml-1 border-l border-slate-200">
+                      <Download className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* File Sub-header (only for doc tabs) */}
+                {activeTab !== "mismatches" && activeDocument && (
+                  <div className="flex items-center gap-3 px-6 py-3 bg-slate-50/50 border-b border-slate-100">
+                    <FileText className="w-4 h-4 text-slate-400" />
+                    <span className="text-sm font-semibold text-slate-700 truncate">{activeDocument.sourceFileName || activeDocument.title}</span>
+                    <span className="text-slate-300">•</span>
+                    <span className="text-xs font-medium text-slate-400 flex items-center gap-1.5">
+                      <Clock className="w-3.5 h-3.5" />
+                      Processed {formatDateTime(activeDocument.createdAt)}
+                    </span>
+                  </div>
+                )}
+
+                {/* Content Area */}
+                <div className="flex-1 bg-[#f4f5f7] relative overflow-hidden flex flex-col p-4 sm:p-6">
+
+                  {/* TAB: PREVIEW */}
+                  {activeTab === "preview" && (
+                    <div className="bg-[#2d2d2d] rounded-xl flex-1 flex flex-col shadow-lg overflow-hidden border border-slate-300">
+                      {/* Dark Toolbar mimicking reference image */}
+                      <div className="h-12 bg-[#1e1e1e] flex items-center px-4 justify-between shrink-0">
+                        <div className="bg-[#3d3d3d] text-white text-xs font-semibold px-3 py-1.5 rounded-md">
+                          1 / {activeDocument?.pageCount || 1}
+                        </div>
+                        <div className="flex items-center gap-4 text-slate-300">
+                          <button className="hover:text-white transition-colors text-lg font-light">−</button>
+                          <button className="hover:text-white transition-colors text-lg font-light">+</button>
+                          <div className="w-px h-4 bg-slate-600 mx-2"></div>
+                          <button className="hover:text-white transition-colors text-xs font-semibold tracking-wider">FIT WIDTH</button>
                         </div>
                       </div>
-                      <ScrollArea className="h-[700px]">
-                        <div className="space-y-2 p-3">
-                          {detail.documents.map((document) => (
-                            <button
-                              key={document.id}
-                              onClick={() => setActiveDocumentId(document.id)}
-                              className={`flex w-full flex-col rounded-2xl border px-4 py-3 text-left transition hover:border-slate-300 hover:bg-slate-50 ${
-                                activeDocument?.id === document.id
-                                  ? "border-slate-900 bg-gradient-to-br from-slate-100 to-indigo-50/60 shadow-sm"
-                                  : "border-slate-200 bg-white"
-                              }`}
-                            >
-                              <div className="line-clamp-2 text-sm font-medium leading-tight text-slate-900">
-                                {document.title}
-                              </div>
-                              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                                <Badge
-                                  variant="outline"
-                                  className="rounded-full border-slate-200 bg-slate-50 text-[10px] text-slate-700"
-                                >
-                                  {document.documentType}
-                                </Badge>
-                                <span>{document.pageCount} page{document.pageCount === 1 ? "" : "s"}</span>
-                              </div>
-                              <div className="mt-2 truncate text-[11px] uppercase tracking-wide text-slate-400">
-                                {document.sourceHint || document.sourceFileName || "Unknown source"}
-                              </div>
-                            </button>
-                          ))}
-                        </div>
-                      </ScrollArea>
-                    </Card>
+                      <div className="flex-1 bg-[#525659] relative">
+                        {activeFileUrl ? (
+                          <iframe
+                            src={`${activeFileUrl}#toolbar=0&navpanes=0`}
+                            className="absolute inset-0 w-full h-full border-0 bg-white"
+                            title="PDF Preview"
+                          />
+                        ) : (
+                          <div className="flex items-center justify-center h-full flex-col text-slate-400 gap-3">
+                            <FileText className="w-10 h-10 opacity-50" />
+                            <p className="text-sm font-medium">Source preview not available for this document.</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
 
-                    {activeDocument && (
-                      <div className="grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,0.85fr)]">
-                        <Card className="overflow-hidden border-slate-200 bg-white/90 shadow-sm">
-                          <div className="flex h-[700px] min-w-0 flex-col overflow-hidden">
-                            <div className="flex-shrink-0 space-y-2 border-b border-slate-200/70 bg-gradient-to-r from-white to-slate-50 px-5 py-4">
-                              <div className="line-clamp-2 text-lg font-semibold leading-tight text-slate-900">
-                                {activeDocument.title}
-                              </div>
-                              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                                <Badge
-                                  variant="secondary"
-                                  className="rounded-full bg-slate-200/70 text-[10px] text-slate-700"
-                                >
-                                  {activeDocument.documentType}
-                                </Badge>
-                                <span>
-                                  {activeDocument.sourceHint || activeDocument.sourceFileName || "Unknown source"}
-                                </span>
-                              </div>
-                            </div>
+                  {/* TAB: EXTRACTED DATA */}
+                  {activeTab === "data" && (
+                    <div className="bg-white rounded-xl flex-1 shadow-sm border border-slate-200 overflow-hidden flex flex-col">
+                      <ScrollArea className="flex-1 p-6">
+                        <div className="max-w-3xl mx-auto space-y-6">
+                          <h2 className="text-2xl font-bold text-slate-900 mb-6 border-b border-slate-100 pb-4">Extracted Data Fields</h2>
+                          {activeDocumentEntries.length === 0 ? (
+                            <div className="text-center py-10 text-slate-500 font-medium">No fields extracted.</div>
+                          ) : (
+                            <div className="grid gap-x-8 gap-y-6 sm:grid-cols-2">
+                              {activeDocumentEntries.map(([key, value]) => {
+                                const currentValue = typeof value === "string" ? value : displayValue(value);
+                                const canonical = fieldCanonicalValues[key];
+                                const ok = !canonical || normalizeText(currentValue) === normalizeText(canonical);
 
-                            <div className="min-h-0 flex-1 bg-gradient-to-br from-slate-100 to-indigo-50/40">
-                              {activeDocumentFile?.signedUrl ? (
-                                <iframe
-                                  src={`${activeDocumentFile.signedUrl}#toolbar=0&navpanes=0&scrollbar=1&view=FitV&zoom=Fit`}
-                                  className="h-full w-full border-0"
-                                  title={`${activeDocument.title} preview`}
-                                />
-                              ) : (
-                                <div className="flex h-full items-center justify-center p-8">
-                                  <div className="w-full max-w-sm rounded-2xl border border-dashed border-slate-300 bg-white/95 p-6 text-center shadow-sm">
-                                    <FileText className="mx-auto mb-4 h-10 w-10 text-slate-300" />
-                                    <div className="text-sm font-medium text-slate-900">
-                                      Preview unavailable
+                                return (
+                                  <div key={key} className="flex flex-col border-b border-slate-100 pb-3 last:border-0 group">
+                                    <div className="flex justify-between items-center mb-1.5">
+                                      <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                                        {FIELD_LABEL_LOOKUP[key] || key}
+                                      </span>
+                                      {!ok && (
+                                        <Badge variant="outline" className="border-rose-200 bg-rose-50 text-rose-700 text-[9px] uppercase px-1.5 py-0">
+                                          Conflict
+                                        </Badge>
+                                      )}
                                     </div>
-                                    <div className="mt-2 text-xs text-slate-500">
-                                      No signed file URL was found for this saved document.
+                                    <div className="text-sm font-semibold text-slate-900 break-words">
+                                      {currentValue || <em className="text-slate-400 font-normal">Not detected</em>}
                                     </div>
                                   </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      </ScrollArea>
+                    </div>
+                  )}
+
+                  {/* TAB: OCR TEXT */}
+                  {activeTab === "ocr" && (
+                    <div className="bg-slate-900 rounded-xl flex-1 shadow-lg border border-slate-800 overflow-hidden flex flex-col text-slate-300">
+                      <ScrollArea className="flex-1 p-6">
+                        <div className="max-w-4xl mx-auto font-mono text-sm leading-relaxed opacity-90">
+                          <ReactMarkdown>
+                            {activeDocument?.markdown || "No OCR transcription available."}
+                          </ReactMarkdown>
+                        </div>
+                      </ScrollArea>
+                    </div>
+                  )}
+
+                  {/* TAB: MISMATCHES */}
+                  {activeTab === "mismatches" && (
+                    <div className="bg-white rounded-xl flex-1 shadow-sm border border-slate-200 overflow-hidden flex flex-col">
+                      <ScrollArea className="flex-1 p-6">
+                        <div className="max-w-4xl mx-auto space-y-8">
+                          {detail.mismatches.length === 0 ? (
+                            <div className="flex flex-col items-center justify-center py-20 text-center">
+                              <CheckCircle2 className="h-16 w-16 text-emerald-400 mb-4" />
+                              <h2 className="text-2xl font-bold text-slate-900">All Clear!</h2>
+                              <p className="text-slate-500 mt-2 font-medium">No data conflicts were found across the documents in this case.</p>
+                            </div>
+                          ) : (
+                            detail.mismatches.map((mismatch) => (
+                              <div key={mismatch.id} className="border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+                                <div className="bg-amber-50/50 border-b border-amber-100 p-5 flex items-center gap-3">
+                                  <TriangleAlert className="h-5 w-5 text-amber-600" />
+                                  <h3 className="text-lg font-bold text-slate-900">
+                                    Conflict: {FIELD_LABEL_LOOKUP[mismatch.fieldName] || mismatch.fieldName}
+                                  </h3>
                                 </div>
-                              )}
-                            </div>
-
-                            {activeDocumentFile?.signedUrl && (
-                              <div className="border-t border-slate-200/70 px-5 py-3">
-                                <Button
-                                  asChild
-                                  variant="outline"
-                                  className="rounded-xl border-slate-200 text-slate-700 hover:bg-slate-50 hover:text-slate-900"
-                                >
-                                  <a href={activeDocumentFile.signedUrl} target="_blank" rel="noreferrer">
-                                    <ExternalLink className="mr-2 h-4 w-4" />
-                                    Open Secure Link
-                                  </a>
-                                </Button>
-                              </div>
-                            )}
-                          </div>
-                        </Card>
-
-                        <Card className="overflow-hidden border-slate-200 bg-white/90 shadow-sm">
-                          <Tabs defaultValue="fields" className="flex h-[700px] flex-col">
-                            <div className="border-b border-slate-200/70 px-5 py-4">
-                              <div className="text-base font-semibold text-slate-900">Document details</div>
-                              <TabsList className="mt-4 grid w-full grid-cols-2 rounded-xl border border-slate-200/70 bg-slate-100/80 p-1">
-                                <TabsTrigger
-                                  value="fields"
-                                  className="rounded-lg data-[state=active]:bg-white data-[state=active]:text-slate-900 data-[state=active]:shadow-sm"
-                                >
-                                  Extracted fields
-                                </TabsTrigger>
-                                <TabsTrigger
-                                  value="ocr"
-                                  className="rounded-lg data-[state=active]:bg-white data-[state=active]:text-slate-900 data-[state=active]:shadow-sm"
-                                >
-                                  OCR markdown
-                                </TabsTrigger>
-                              </TabsList>
-                            </div>
-
-                            <div className="min-h-0 flex-1 px-5 py-4">
-                              <TabsContent value="fields" className="m-0 h-full">
-                                <ScrollArea className="h-full">
-                                  {activeDocumentEntries.length === 0 ? (
-                                    <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50/80 p-6 text-sm text-slate-500">
-                                      No extracted fields stored for this document.
-                                    </div>
-                                  ) : (
-                                    <div className="space-y-3">
-                                      {activeDocumentEntries.map(([key, value]) => {
-                                        const currentValue =
-                                          typeof value === "string" ? value : displayValue(value);
-                                        const canonical = fieldCanonicalValues[key];
-                                        const ok =
-                                          !canonical ||
-                                          normalizeText(currentValue) === normalizeText(canonical);
-
+                                <div className="p-6 space-y-6">
+                                  <div>
+                                    <h4 className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-3">Observed Values</h4>
+                                    <div className="grid gap-3 sm:grid-cols-2">
+                                      {(mismatch.values ?? []).map((value, index) => {
+                                        const title = (value.docId ? documentLookup.get(value.docId)?.title : null) ?? `Doc ${index + 1}`;
                                         return (
-                                          <div
-                                            key={key}
-                                            className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
-                                          >
-                                            <div className="flex items-start justify-between gap-3">
-                                              <div>
-                                                <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
-                                                  {FIELD_LABEL_LOOKUP[key] || key}
-                                                </div>
-                                                <div className="mt-2 break-words text-sm font-medium text-slate-900">
-                                                  {currentValue}
-                                                </div>
-                                              </div>
-                                              <Badge
-                                                variant="outline"
-                                                className={
-                                                  ok
-                                                    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                                                    : "border-rose-200 bg-rose-50 text-rose-700"
-                                                }
-                                              >
-                                                {ok ? "Match" : "Mismatch"}
-                                              </Badge>
+                                          <div key={index} className="bg-slate-50 border border-slate-100 rounded-xl p-4">
+                                            <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 truncate mb-1" title={title}>
+                                              {title}
+                                            </div>
+                                            <div className="text-sm font-semibold text-slate-900 break-words">
+                                              {value.value === null || value.value === undefined ? <em className="opacity-50">Missing</em> : String(value.value)}
                                             </div>
                                           </div>
                                         );
                                       })}
                                     </div>
-                                  )}
-                                </ScrollArea>
-                              </TabsContent>
+                                  </div>
 
-                              <TabsContent value="ocr" className="m-0 h-full">
-                                <ScrollArea className="h-full rounded-2xl border border-slate-200 bg-slate-50/70 p-5">
-                                  {activeDocument.markdown ? (
-                                    <div className="prose prose-sm max-w-none prose-slate">
-                                      <ReactMarkdown>{activeDocument.markdown}</ReactMarkdown>
-                                    </div>
-                                  ) : (
-                                    <div className="text-sm text-slate-500">No OCR markdown stored.</div>
-                                  )}
-                                </ScrollArea>
-                              </TabsContent>
-                            </div>
-                          </Tabs>
-                        </Card>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </TabsContent>
-
-              <TabsContent value="mismatches" className="focus:outline-none">
-                {metrics.mismatches === 0 ? (
-                  <div className="flex flex-col items-center justify-center rounded-3xl border border-slate-200 bg-gradient-to-br from-white via-slate-50 to-indigo-50/30 py-20 shadow-sm">
-                    <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-indigo-50">
-                      <CheckCircle2 className="h-8 w-8 text-indigo-500" />
-                    </div>
-                    <h3 className="text-lg font-medium text-slate-900">100% Data Integrity</h3>
-                    <p className="text-sm text-slate-500">
-                      No reconciliation mismatches were found in this case.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-                    <div className="lg:col-span-1">
-                      <Card className="border-slate-200 bg-white/90 shadow-sm">
-                        <div className="border-b border-slate-200/70 px-5 py-4">
-                          <div className="text-base font-semibold text-slate-900">Mismatches & Checks</div>
-                        </div>
-                        <ScrollArea className="h-[560px]">
-                          <div className="divide-y">
-                            {detail.mismatches.map((mismatch) => (
-                              <button
-                                key={mismatch.id}
-                                onClick={() => setActiveMismatchId(mismatch.id)}
-                                className={`w-full px-5 py-4 text-left transition hover:bg-slate-50 ${
-                                  activeMismatch?.id === mismatch.id ? "bg-gradient-to-r from-slate-100 to-indigo-50/70" : ""
-                                }`}
-                              >
-                                <div className="font-medium text-slate-900">
-                                  {FIELD_LABEL_LOOKUP[mismatch.fieldName] || mismatch.fieldName}
-                                </div>
-                                <div className="mt-1 text-xs text-slate-500">
-                                  {mismatch.values.length} observed value
-                                  {mismatch.values.length === 1 ? "" : "s"}
-                                </div>
-                              </button>
-                            ))}
-                          </div>
-                        </ScrollArea>
-                      </Card>
-                    </div>
-
-                    <div className="lg:col-span-2">
-                      <Card className="h-full border-slate-200 bg-white/90 shadow-sm">
-                        <div className="border-b border-slate-200/70 px-6 py-5">
-                          <div className="flex items-start gap-3">
-                            <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-indigo-50 text-indigo-600">
-                              <TriangleAlert className="h-5 w-5" />
-                            </div>
-                            <div>
-                              <div className="text-xs uppercase tracking-[0.2em] text-slate-500">
-                                Selected mismatch
-                              </div>
-                              <div className="mt-1 text-lg font-semibold text-slate-900">
-                                {activeMismatch
-                                  ? FIELD_LABEL_LOOKUP[activeMismatch.fieldName] || activeMismatch.fieldName
-                                  : "Choose a mismatch"}
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="p-6">
-                          {activeMismatch ? (
-                            <div className="space-y-6">
-                              <div>
-                                <div className="text-xs text-slate-500">Observed Values</div>
-                                <div className="mt-2 flex flex-wrap gap-2">
-                                  {(activeMismatch.values ?? []).map((value, index) => {
-                                    const documentTitle =
-                                      (value.docId ? documentLookup.get(value.docId)?.title : null) ??
-                                      value.docId ??
-                                      `Document ${index + 1}`;
-
-                                    return (
-                                      <div
-                                        key={`${activeMismatch.id}-${index}`}
-                                        className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-700"
-                                      >
-                                        <span className="font-medium">{documentTitle}</span>
-                                        {": "}
-                                        <span className="font-mono">
-                                          {value.value === null || value.value === undefined
-                                            ? "—"
-                                            : String(value.value)}
-                                        </span>
+                                  {mismatch.analysis && (
+                                    <div className="bg-slate-50 border border-slate-200 rounded-xl p-5">
+                                      <h4 className="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2">AI Analysis</h4>
+                                      <div className="prose prose-sm prose-slate max-w-none font-medium">
+                                        <ReactMarkdown>{mismatch.analysis}</ReactMarkdown>
                                       </div>
-                                    );
-                                  })}
+                                    </div>
+                                  )}
+
+                                  {mismatch.fixPlan && (
+                                    <div className="bg-emerald-50/50 border border-emerald-200 rounded-xl p-5">
+                                      <h4 className="text-[10px] font-bold uppercase tracking-widest text-emerald-600 mb-2">Recommended Resolution</h4>
+                                      <div className="prose prose-sm max-w-none prose-emerald font-medium text-emerald-900">
+                                        <ReactMarkdown>{mismatch.fixPlan}</ReactMarkdown>
+                                      </div>
+                                    </div>
+                                  )}
                                 </div>
                               </div>
-
-                              {activeMismatch.analysis && (
-                                <div>
-                                  <div className="text-xs text-slate-500">Analysis</div>
-                                  <div className="mt-2 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-700">
-                                    <div className="prose prose-sm max-w-none">
-                                      <ReactMarkdown>{activeMismatch.analysis}</ReactMarkdown>
-                                    </div>
-                                  </div>
-                                </div>
-                              )}
-
-                              {activeMismatch.fixPlan && (
-                                <div>
-                                  <div className="text-xs text-slate-500">Recommended Fix</div>
-                                  <div className="mt-2 rounded-xl border border-indigo-200 bg-indigo-50/80 p-4 text-sm text-slate-800">
-                                    <div className="prose prose-sm max-w-none prose-slate">
-                                      <ReactMarkdown>{activeMismatch.fixPlan}</ReactMarkdown>
-                                    </div>
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-                          ) : (
-                            <div className="flex min-h-[420px] items-center justify-center">
-                              <p className="text-slate-600">Select a mismatch to view details.</p>
-                            </div>
+                            ))
                           )}
                         </div>
-                      </Card>
+                      </ScrollArea>
                     </div>
-                  </div>
-                )}
-              </TabsContent>
-            </Tabs>
-          </>
+                  )}
+
+                </div>
+              </div>
+            </div>
+
+          </div>
         )}
       </div>
     </AppShell>

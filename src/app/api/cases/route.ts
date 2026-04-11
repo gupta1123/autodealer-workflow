@@ -1,11 +1,36 @@
 import { NextResponse } from "next/server";
 
 import { summarizeCase } from "@/lib/case-summary";
+import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import type { CaseDoc, Mismatch } from "@/types/pipeline";
 
 const STORAGE_BUCKET = "packet-files";
+
+function isRecycleBinSchemaMissing(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const record = error as Record<string, unknown>;
+  const code = typeof record.code === "string" ? record.code : "";
+  const message = [
+    record.message,
+    record.error,
+    record.details,
+    record.hint,
+    record.error_description,
+  ]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+
+  const mentionsRecycleColumns = /deleted_at|deleted_by_user_id/i.test(message);
+  const isMissingColumnError =
+    /schema cache|could not find|column .* does not exist|42703|PGRST/i.test(`${code} ${message}`);
+
+  return mentionsRecycleColumns && isMissingColumnError;
+}
 
 function serializeError(error: unknown) {
   if (error instanceof Error) {
@@ -37,6 +62,9 @@ function serializeError(error: unknown) {
     if (combined) {
       if (/owner_user_id|schema cache/i.test(combined)) {
         return `${combined} Run the auth migration in Supabase using supabase/packet_auth_backend_v2.sql, then retry.`;
+      }
+      if (/deleted_at|deleted_by_user_id/i.test(combined)) {
+        return `${combined} Run the recycle bin migration in Supabase using supabase/packet_recycle_bin_backend_v3.sql, then retry.`;
       }
       return combined;
     }
@@ -81,6 +109,8 @@ function mapCaseRow(row: {
   document_count: number;
   mismatch_count: number;
   created_at: string;
+  processing_meta?: unknown;
+  deleted_at?: string | null;
 }) {
   return {
     id: row.id,
@@ -95,6 +125,7 @@ function mapCaseRow(row: {
     documentCount: row.document_count,
     mismatchCount: row.mismatch_count,
     createdAt: row.created_at,
+    deletedAt: row.deleted_at ?? getRecycleBinDeletedAt(row.processing_meta),
   };
 }
 
@@ -112,22 +143,84 @@ export async function GET(request: Request) {
     const supabase = createSupabaseAdminClient();
     const url = new URL(request.url);
     const requestedLimit = Number(url.searchParams.get("limit") ?? "12");
+    const requestedScope = url.searchParams.get("scope");
+    const scope = requestedScope === "deleted" ? "deleted" : "active";
     const limit =
       Number.isFinite(requestedLimit) && requestedLimit > 0
         ? Math.min(Math.floor(requestedLimit), 200)
         : 12;
 
-    const { data, error } = await supabase
-      .from("packet_cases")
-      .select(
-        "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at"
-      )
-      .eq("owner_user_id", user.id)
-      .order("created_at", { ascending: false })
-      .limit(limit);
+    let data:
+      | Array<{
+          id: string;
+          slug: string;
+          display_name: string;
+          buyer_name: string | null;
+          po_number: string | null;
+          invoice_number: string | null;
+          status: string;
+          risk_score: number;
+          upload_count: number;
+          document_count: number;
+          mismatch_count: number;
+          created_at: string;
+          processing_meta?: unknown;
+          deleted_at?: string | null;
+        }>
+      | null = null;
 
-    if (error) {
-      throw error;
+    try {
+      let query = supabase
+        .from("packet_cases")
+        .select(
+          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
+        )
+        .eq("owner_user_id", user.id)
+        .limit(limit);
+
+      query =
+        scope === "deleted"
+          ? query.not("deleted_at", "is", null).order("deleted_at", { ascending: false })
+          : query.is("deleted_at", null).order("created_at", { ascending: false });
+
+      const result = await query;
+      if (result.error) {
+        throw result.error;
+      }
+      data = result.data;
+    } catch (error) {
+      if (!isRecycleBinSchemaMissing(error)) {
+        throw error;
+      }
+
+      const fallback = await supabase
+        .from("packet_cases")
+        .select(
+          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
+        )
+        .eq("owner_user_id", user.id)
+        .order("created_at", { ascending: false })
+        .limit(limit);
+
+      if (fallback.error) {
+        throw fallback.error;
+      }
+
+      const rows = (fallback.data ?? []).map((row) => ({
+        ...row,
+        deleted_at: getRecycleBinDeletedAt(row.processing_meta),
+      }));
+
+      data =
+        scope === "deleted"
+          ? rows
+              .filter((row) => isCaseRecycled(row.processing_meta))
+              .sort((a, b) => {
+                const aTime = new Date(a.deleted_at ?? 0).getTime();
+                const bTime = new Date(b.deleted_at ?? 0).getTime();
+                return bTime - aTime;
+              })
+          : rows.filter((row) => !isCaseRecycled(row.processing_meta));
     }
 
     return NextResponse.json({

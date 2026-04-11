@@ -13,6 +13,7 @@ export type SavedCaseRecord = {
   documentCount: number;
   mismatchCount: number;
   createdAt: string;
+  deletedAt: string | null;
 };
 
 export type SavedCaseFile = {
@@ -67,6 +68,7 @@ type RecentCasesResponse = {
 };
 
 type CaseDetailResponse = SavedCaseDetail;
+export type CaseListScope = "active" | "deleted";
 
 function extractApiError(payload: unknown, fallback: string) {
   if (!payload || typeof payload !== "object") {
@@ -125,6 +127,7 @@ export async function persistProcessedCase(params: {
 export async function fetchRecentCases(limit = 12): Promise<RecentCasesResponse> {
   const query = new URLSearchParams();
   query.set("limit", String(limit));
+  query.set("scope", "active");
 
   const response = await fetch(`/api/cases?${query.toString()}`, { cache: "no-store" });
   const payload = (await response.json().catch(() => ({}))) as Partial<RecentCasesResponse> & {
@@ -136,6 +139,73 @@ export async function fetchRecentCases(limit = 12): Promise<RecentCasesResponse>
   }
 
   return { cases: payload.cases };
+}
+
+export async function fetchCasesByScope(
+  scope: CaseListScope,
+  limit = 100
+): Promise<RecentCasesResponse> {
+  const query = new URLSearchParams();
+  query.set("limit", String(limit));
+  query.set("scope", scope);
+
+  const response = await fetch(`/api/cases?${query.toString()}`, { cache: "no-store" });
+  const payload = (await response.json().catch(() => ({}))) as Partial<RecentCasesResponse> & {
+    error?: string;
+  };
+
+  if (!response.ok || !Array.isArray(payload.cases)) {
+    throw new Error(extractApiError(payload, "Failed to load saved cases."));
+  }
+
+  return { cases: payload.cases };
+}
+
+async function mutateCase(
+  caseId: string,
+  init: RequestInit,
+  fallback: string,
+  path = `/api/cases/${caseId}`
+): Promise<{ case: SavedCaseRecord }> {
+  const response = await fetch(path, init);
+  const payload = (await response.json().catch(() => ({}))) as Partial<CreateCaseResponse> & {
+    error?: unknown;
+  };
+
+  if (!response.ok || !payload.case) {
+    throw new Error(extractApiError(payload, fallback));
+  }
+
+  return { case: payload.case };
+}
+
+export async function recycleCase(caseId: string) {
+  return mutateCase(
+    caseId,
+    { method: "DELETE" },
+    "Failed to move case to the recycle bin."
+  );
+}
+
+export async function restoreCase(caseId: string) {
+  return mutateCase(
+    caseId,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "restore" }),
+    },
+    "Failed to restore case from the recycle bin."
+  );
+}
+
+export async function deleteCaseForever(caseId: string) {
+  return mutateCase(
+    caseId,
+    { method: "DELETE" },
+    "Failed to permanently delete case.",
+    `/api/cases/${caseId}?mode=hard`
+  );
 }
 
 export async function fetchCaseDetail(caseId: string): Promise<CaseDetailResponse> {

@@ -7,6 +7,7 @@ import {
   LayoutDashboard,
   ListTree,
   LogOut,
+  Trash2,
   ShieldCheck,
   CheckCircle2,
   AlertCircle,
@@ -34,6 +35,11 @@ const NAV_ITEMS = [
     label: "All Cases",
     icon: ListTree,
   },
+  {
+    href: "/recycle-bin",
+    label: "Recycle Bin",
+    icon: Trash2,
+  },
 ];
 
 function isActivePath(pathname: string, href: string) {
@@ -57,21 +63,18 @@ export function DashboardSidebar({ stats, status }: DashboardSidebarProps) {
 
   return (
     <aside className={styles.sidebar}>
-
-      {/* BRANDING CARD */}
-      <div className={styles.brandCard}>
+      {/* BRANDING */}
+      <div className={styles.brandRow}>
         <div className={styles.brandIcon}>
           <ShieldCheck className="h-6 w-6" />
         </div>
         <div className={styles.brandText}>
-          <div className={styles.eyebrow}>Workspace</div>
           <div className={styles.brandTitle}>Comparator</div>
         </div>
       </div>
 
       {/* NAVIGATION */}
       <nav className={styles.navSection}>
-        <div className={styles.sectionHeader}>Main Menu</div>
         <div className={styles.navList}>
           {NAV_ITEMS.map((item) => {
             const active = isActivePath(pathname, item.href);

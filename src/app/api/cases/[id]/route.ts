@@ -1,9 +1,39 @@
 import { NextResponse } from "next/server";
 
+import {
+  getRecycleBinDeletedAt,
+  isCaseRecycled,
+  withRecycleBinMetadata,
+  withoutRecycleBinMetadata,
+} from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 const STORAGE_BUCKET = "packet-files";
+
+function isRecycleBinSchemaMissing(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const record = error as Record<string, unknown>;
+  const code = typeof record.code === "string" ? record.code : "";
+  const message = [
+    record.message,
+    record.error,
+    record.details,
+    record.hint,
+    record.error_description,
+  ]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+
+  const mentionsRecycleColumns = /deleted_at|deleted_by_user_id/i.test(message);
+  const isMissingColumnError =
+    /schema cache|could not find|column .* does not exist|42703|PGRST/i.test(`${code} ${message}`);
+
+  return mentionsRecycleColumns && isMissingColumnError;
+}
 
 function serializeError(error: unknown) {
   if (error instanceof Error) {
@@ -29,7 +59,11 @@ function serializeError(error: unknown) {
     }
 
     if (parts.length > 0) {
-      return parts.join(" ");
+      const combined = parts.join(" ");
+      if (/deleted_at|deleted_by_user_id/i.test(combined)) {
+        return `${combined} Run the recycle bin migration in Supabase using supabase/packet_recycle_bin_backend_v3.sql, then retry.`;
+      }
+      return combined;
     }
 
     return JSON.stringify(error);
@@ -52,6 +86,7 @@ function mapCaseRow(row: {
   mismatch_count: number;
   created_at: string;
   processing_meta?: unknown;
+  deleted_at?: string | null;
 }) {
   return {
     id: row.id,
@@ -66,6 +101,7 @@ function mapCaseRow(row: {
     documentCount: row.document_count,
     mismatchCount: row.mismatch_count,
     createdAt: row.created_at,
+    deletedAt: row.deleted_at ?? getRecycleBinDeletedAt(row.processing_meta),
     processingMeta: row.processing_meta ?? {},
   };
 }
@@ -88,20 +124,73 @@ export async function GET(
 
     const supabase = createSupabaseAdminClient();
 
-    const { data: caseRow, error: caseError } = await supabase
-      .from("packet_cases")
-      .select(
-        "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, owner_user_id"
-      )
-      .eq("id", id)
-      .eq("owner_user_id", user.id)
-      .single();
+    let caseRow:
+      | {
+          id: string;
+          slug: string;
+          display_name: string;
+          buyer_name: string | null;
+          po_number: string | null;
+          invoice_number: string | null;
+          status: string;
+          risk_score: number;
+          upload_count: number;
+          document_count: number;
+          mismatch_count: number;
+          created_at: string;
+          processing_meta?: unknown;
+          deleted_at?: string | null;
+        }
+      | null = null;
 
-    if (caseError) {
-      if (caseError.code === "PGRST116") {
+    try {
+      const result = await supabase
+        .from("packet_cases")
+        .select(
+          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, owner_user_id, deleted_at"
+        )
+        .eq("id", id)
+        .eq("owner_user_id", user.id)
+        .is("deleted_at", null)
+        .single();
+
+      if (result.error) {
+        if (result.error.code === "PGRST116") {
+          return NextResponse.json({ error: "Case not found." }, { status: 404 });
+        }
+        throw result.error;
+      }
+
+      caseRow = result.data;
+    } catch (error) {
+      if (!isRecycleBinSchemaMissing(error)) {
+        throw error;
+      }
+
+      const fallback = await supabase
+        .from("packet_cases")
+        .select(
+          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, owner_user_id"
+        )
+        .eq("id", id)
+        .eq("owner_user_id", user.id)
+        .single();
+
+      if (fallback.error) {
+        if (fallback.error.code === "PGRST116") {
+          return NextResponse.json({ error: "Case not found." }, { status: 404 });
+        }
+        throw fallback.error;
+      }
+
+      if (isCaseRecycled(fallback.data.processing_meta)) {
         return NextResponse.json({ error: "Case not found." }, { status: 404 });
       }
-      throw caseError;
+
+      caseRow = {
+        ...fallback.data,
+        deleted_at: getRecycleBinDeletedAt(fallback.data.processing_meta),
+      };
     }
 
     const [{ data: files, error: filesError }, { data: documents, error: docsError }, { data: mismatches, error: mismatchesError }] =
@@ -177,6 +266,356 @@ export async function GET(
         createdAt: mismatch.created_at,
       })),
     });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error: serializeError(error),
+      },
+      { status: 500 }
+    );
+  }
+}
+
+export async function DELETE(
+  request: Request,
+  context: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await context.params;
+    const url = new URL(request.url);
+    const mode = url.searchParams.get("mode") === "hard" ? "hard" : "soft";
+
+    const authClient = await createSupabaseServerClient();
+    const {
+      data: { user },
+    } = await authClient.auth.getUser();
+
+    if (!user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const supabase = createSupabaseAdminClient();
+
+    if (mode === "hard") {
+      let canHardDeleteWithColumn = true;
+
+      try {
+        const { error: schemaCheckError } = await supabase
+          .from("packet_cases")
+          .select("deleted_at")
+          .eq("id", id)
+          .limit(1);
+
+        if (schemaCheckError) {
+          throw schemaCheckError;
+        }
+      } catch (error) {
+        if (!isRecycleBinSchemaMissing(error)) {
+          throw error;
+        }
+        canHardDeleteWithColumn = false;
+      }
+
+      const { data: storedFiles, error: filesError } = await supabase
+        .from("packet_case_files")
+        .select("storage_bucket, storage_path")
+        .eq("case_id", id);
+
+      if (filesError) {
+        throw filesError;
+      }
+
+      const filesByBucket = new Map<string, string[]>();
+      for (const file of storedFiles ?? []) {
+        const bucketName = file.storage_bucket || STORAGE_BUCKET;
+        const currentPaths = filesByBucket.get(bucketName) ?? [];
+        currentPaths.push(file.storage_path);
+        filesByBucket.set(bucketName, currentPaths);
+      }
+
+      for (const [bucketName, paths] of filesByBucket.entries()) {
+        if (!paths.length) continue;
+        const { error: removeError } = await supabase.storage.from(bucketName).remove(paths);
+        if (removeError) {
+          throw removeError;
+        }
+      }
+
+      if (!canHardDeleteWithColumn) {
+        const existing = await supabase
+          .from("packet_cases")
+          .select(
+            "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
+          )
+          .eq("id", id)
+          .eq("owner_user_id", user.id)
+          .single();
+
+        if (existing.error) {
+          if (existing.error.code === "PGRST116") {
+            return NextResponse.json({ error: "Case not found." }, { status: 404 });
+          }
+          throw existing.error;
+        }
+
+        if (!isCaseRecycled(existing.data.processing_meta)) {
+          return NextResponse.json({ error: "Case not found." }, { status: 404 });
+        }
+
+        const removed = await supabase
+          .from("packet_cases")
+          .delete()
+          .eq("id", id)
+          .eq("owner_user_id", user.id)
+          .select(
+            "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
+          )
+          .single();
+
+        if (removed.error) {
+          if (removed.error.code === "PGRST116") {
+            return NextResponse.json({ error: "Case not found." }, { status: 404 });
+          }
+          throw removed.error;
+        }
+
+        return NextResponse.json({ case: mapCaseRow(existing.data) });
+      }
+
+      const { data, error } = await supabase
+        .from("packet_cases")
+        .delete()
+        .eq("id", id)
+        .eq("owner_user_id", user.id)
+        .not("deleted_at", "is", null)
+        .select(
+          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
+        )
+        .single();
+
+      if (error) {
+        if (error.code === "PGRST116") {
+          return NextResponse.json({ error: "Case not found." }, { status: 404 });
+        }
+        throw error;
+      }
+
+      return NextResponse.json({ case: mapCaseRow(data) });
+    }
+
+    let data:
+      | {
+          id: string;
+          slug: string;
+          display_name: string;
+          buyer_name: string | null;
+          po_number: string | null;
+          invoice_number: string | null;
+          status: string;
+          risk_score: number;
+          upload_count: number;
+          document_count: number;
+          mismatch_count: number;
+          created_at: string;
+          processing_meta?: unknown;
+          deleted_at?: string | null;
+        }
+      | null = null;
+
+    try {
+      const result = await supabase
+        .from("packet_cases")
+        .update({
+          deleted_at: new Date().toISOString(),
+          deleted_by_user_id: user.id,
+        })
+        .eq("id", id)
+        .eq("owner_user_id", user.id)
+        .is("deleted_at", null)
+        .select(
+          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
+        )
+        .single();
+
+      if (result.error) {
+        if (result.error.code === "PGRST116") {
+          return NextResponse.json({ error: "Case not found." }, { status: 404 });
+        }
+        throw result.error;
+      }
+
+      data = result.data;
+    } catch (error) {
+      if (!isRecycleBinSchemaMissing(error)) {
+        throw error;
+      }
+
+      const existing = await supabase
+        .from("packet_cases")
+        .select(
+          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
+        )
+        .eq("id", id)
+        .eq("owner_user_id", user.id)
+        .single();
+
+      if (existing.error) {
+        if (existing.error.code === "PGRST116") {
+          return NextResponse.json({ error: "Case not found." }, { status: 404 });
+        }
+        throw existing.error;
+      }
+
+      if (isCaseRecycled(existing.data.processing_meta)) {
+        return NextResponse.json({ error: "Case not found." }, { status: 404 });
+      }
+
+      const deletedAt = new Date().toISOString();
+      const updated = await supabase
+        .from("packet_cases")
+        .update({
+          processing_meta: withRecycleBinMetadata(existing.data.processing_meta, deletedAt, user.id),
+        })
+        .eq("id", id)
+        .eq("owner_user_id", user.id)
+        .select(
+          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
+        )
+        .single();
+
+      if (updated.error) {
+        throw updated.error;
+      }
+
+      data = {
+        ...updated.data,
+        deleted_at: deletedAt,
+      };
+    }
+
+    return NextResponse.json({ case: mapCaseRow(data) });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error: serializeError(error),
+      },
+      { status: 500 }
+    );
+  }
+}
+
+export async function PATCH(
+  request: Request,
+  context: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await context.params;
+    const payload = (await request.json().catch(() => ({}))) as { action?: string };
+
+    if (payload.action !== "restore") {
+      return NextResponse.json({ error: "Unsupported case action." }, { status: 400 });
+    }
+
+    const authClient = await createSupabaseServerClient();
+    const {
+      data: { user },
+    } = await authClient.auth.getUser();
+
+    if (!user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const supabase = createSupabaseAdminClient();
+    let data:
+      | {
+          id: string;
+          slug: string;
+          display_name: string;
+          buyer_name: string | null;
+          po_number: string | null;
+          invoice_number: string | null;
+          status: string;
+          risk_score: number;
+          upload_count: number;
+          document_count: number;
+          mismatch_count: number;
+          created_at: string;
+          processing_meta?: unknown;
+          deleted_at?: string | null;
+        }
+      | null = null;
+
+    try {
+      const result = await supabase
+        .from("packet_cases")
+        .update({
+          deleted_at: null,
+          deleted_by_user_id: null,
+        })
+        .eq("id", id)
+        .eq("owner_user_id", user.id)
+        .not("deleted_at", "is", null)
+        .select(
+          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
+        )
+        .single();
+
+      if (result.error) {
+        if (result.error.code === "PGRST116") {
+          return NextResponse.json({ error: "Case not found." }, { status: 404 });
+        }
+        throw result.error;
+      }
+
+      data = result.data;
+    } catch (error) {
+      if (!isRecycleBinSchemaMissing(error)) {
+        throw error;
+      }
+
+      const existing = await supabase
+        .from("packet_cases")
+        .select(
+          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
+        )
+        .eq("id", id)
+        .eq("owner_user_id", user.id)
+        .single();
+
+      if (existing.error) {
+        if (existing.error.code === "PGRST116") {
+          return NextResponse.json({ error: "Case not found." }, { status: 404 });
+        }
+        throw existing.error;
+      }
+
+      if (!isCaseRecycled(existing.data.processing_meta)) {
+        return NextResponse.json({ error: "Case not found." }, { status: 404 });
+      }
+
+      const updated = await supabase
+        .from("packet_cases")
+        .update({
+          processing_meta: withoutRecycleBinMetadata(existing.data.processing_meta),
+        })
+        .eq("id", id)
+        .eq("owner_user_id", user.id)
+        .select(
+          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
+        )
+        .single();
+
+      if (updated.error) {
+        throw updated.error;
+      }
+
+      data = {
+        ...updated.data,
+        deleted_at: null,
+      };
+    }
+
+    return NextResponse.json({ case: mapCaseRow(data) });
   } catch (error) {
     return NextResponse.json(
       {
