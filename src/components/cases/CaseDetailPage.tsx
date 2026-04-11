@@ -5,31 +5,26 @@ import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import {
   ArrowLeft,
-  Building2,
   CheckCircle2,
   Clock,
-  Database,
-  Download,
-  Edit2,
-  ExternalLink,
   Eye,
   FileText,
   Folder,
   Info,
   Loader2,
   MapPin,
-  MoreHorizontal,
-  Receipt,
-  Share2,
   ShieldAlert,
   Sparkles,
   TriangleAlert,
+  Database,
+  type LucideIcon,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
 import {
   FIELD_DEFINITIONS,
   getFieldDefinitionsByKeys,
@@ -38,6 +33,13 @@ import {
 import { fetchCaseDetail, type SavedCaseDetail } from "@/lib/case-persistence";
 
 type LoadState = "loading" | "ready" | "error";
+type ActiveTab = "preview" | "data" | "ocr";
+
+const DETAIL_TABS: { id: ActiveTab; label: string; icon: LucideIcon }[] = [
+  { id: "preview", label: "Preview", icon: Eye },
+  { id: "data", label: "Extracted Data", icon: Database },
+  { id: "ocr", label: "OCR Text", icon: FileText },
+];
 
 const FIELD_LABEL_LOOKUP = FIELD_DEFINITIONS.reduce(
   (acc, field) => {
@@ -123,7 +125,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   const [error, setError] = useState<string | null>(null);
 
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<"preview" | "data" | "ocr" | "mismatches">("preview");
+  const [activeTab, setActiveTab] = useState<ActiveTab>("preview");
 
   useEffect(() => {
     let active = true;
@@ -153,17 +155,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       }
       return detail.documents[0]?.id ?? null;
     });
-  }, [detail]);
-
-  const documentLookup = useMemo(() => {
-    const map = new Map<string, SavedCaseDetail["documents"][number]>();
-    detail?.documents.forEach((document) => {
-      map.set(document.id, document);
-      if (document.clientDocumentId) {
-        map.set(document.clientDocumentId, document);
-      }
-    });
-    return map;
   }, [detail]);
 
   const fileLookup = useMemo(() => {
@@ -223,9 +214,9 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       <div className="flex h-full flex-col bg-[#f8fafc] animate-in fade-in duration-500">
 
         {/* =========================================
-            TOP HEADER (Matches Reference Exactly)
+            TOP HEADER
             ========================================= */}
-        <header className="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3 sm:px-6">
+        <header className="flex items-center border-b border-slate-200 bg-white px-4 py-3 sm:px-6">
           <div className="flex items-center gap-4">
             <Link href="/cases" className="flex h-8 w-8 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors">
               <ArrowLeft className="h-5 w-5" />
@@ -257,25 +248,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 </>
               )}
             </div>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <Button variant="ghost" size="icon" className="text-slate-500 hover:text-slate-800">
-              <Download className="h-4 w-4" />
-            </Button>
-            <Button variant="ghost" size="icon" className="text-slate-500 hover:text-slate-800">
-              <Share2 className="h-4 w-4" />
-            </Button>
-            <Button variant="ghost" size="icon" className="text-slate-500 hover:text-slate-800">
-              <Info className="h-4 w-4" />
-            </Button>
-            <div className="w-px h-5 bg-slate-200 mx-1"></div>
-            <Button variant="outline" className="h-9 gap-2 text-slate-700 font-semibold border-slate-200 shadow-sm hover:bg-slate-50">
-              <Edit2 className="h-4 w-4" /> Edit
-            </Button>
-            <Button variant="ghost" size="icon" className="text-slate-500 hover:text-slate-800">
-              <MoreHorizontal className="h-5 w-5" />
-            </Button>
           </div>
         </header>
 
@@ -376,10 +348,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                       return (
                         <button
                           key={d.id}
-                          onClick={() => {
-                            setActiveDocumentId(d.id);
-                            if (activeTab === "mismatches") setActiveTab("preview");
-                          }}
+                          onClick={() => setActiveDocumentId(d.id)}
                           className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all text-left ${isActive ? "bg-emerald-50 border border-emerald-100" : "hover:bg-slate-50 border border-transparent"
                             }`}
                         >
@@ -400,7 +369,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                   </div>
                 </div>
 
-                {/* AI Summary / Risk Card (Matches Green AI Box) */}
+                {/* AI Summary / Risk Card */}
                 <div className={`rounded-2xl border p-6 shadow-sm ${detail.mismatches.length === 0 ? 'bg-[#f0fdf4] border-[#bbf7d0]' : 'bg-amber-50 border-amber-200'}`}>
                   <div className="flex items-center gap-2 mb-4">
                     <Sparkles className={`h-4 w-4 ${detail.mismatches.length === 0 ? 'text-[#166534]' : 'text-amber-700'}`} />
@@ -421,11 +390,11 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                         ))}
                       </ul>
                       <Button
+                        asChild
                         variant="link"
                         className="p-0 h-auto mt-4 text-amber-700 font-bold"
-                        onClick={() => setActiveTab("mismatches")}
                       >
-                        View all mismatches &rarr;
+                        <Link href={`/cases/${caseId}/mismatches`}>View all mismatches &rarr;</Link>
                       </Button>
                     </div>
                   )}
@@ -442,25 +411,16 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b border-slate-100 p-4 sm:px-6 gap-4">
                   <div className="flex items-center gap-3">
                     <Eye className="h-5 w-5 text-slate-400" />
-                    <h2 className="text-base font-bold text-slate-800">
-                      {activeTab === "mismatches" ? "Reconciliation Issues" : "Document Viewer"}
-                    </h2>
-                    {activeTab !== "mismatches" && (
-                      <Badge variant="secondary" className="bg-slate-100 text-slate-600 font-bold uppercase text-[10px] tracking-wider ml-2">PDF</Badge>
-                    )}
+                    <h2 className="text-base font-bold text-slate-800">Document Viewer</h2>
+                    <Badge variant="secondary" className="bg-slate-100 text-slate-600 font-bold uppercase text-[10px] tracking-wider ml-2">PDF</Badge>
                   </div>
 
                   {/* Segmented Control Tabs */}
                   <div className="bg-slate-100 p-1 rounded-xl flex items-center shadow-inner overflow-x-auto max-w-full">
-                    {[
-                      { id: "preview", label: "Preview", icon: Eye },
-                      { id: "data", label: "Extracted Data", icon: Database },
-                      { id: "ocr", label: "OCR Text", icon: FileText },
-                      { id: "mismatches", label: "Mismatches", icon: TriangleAlert },
-                    ].map((tab) => (
+                    {DETAIL_TABS.map((tab) => (
                       <button
                         key={tab.id}
-                        onClick={() => setActiveTab(tab.id as any)}
+                        onClick={() => setActiveTab(tab.id)}
                         className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-sm font-bold transition-all whitespace-nowrap ${activeTab === tab.id
                           ? "bg-white text-slate-900 shadow-sm"
                           : "text-slate-500 hover:text-slate-700 hover:bg-slate-200/50"
@@ -468,21 +428,25 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                       >
                         <tab.icon className="w-4 h-4" />
                         {tab.label}
-                        {tab.id === "mismatches" && detail.mismatches.length > 0 && (
-                          <span className="ml-1 flex h-4 w-4 items-center justify-center rounded-full bg-rose-100 text-[9px] text-rose-600">
-                            {detail.mismatches.length}
-                          </span>
-                        )}
                       </button>
                     ))}
-                    <button className="px-3 py-1.5 text-slate-400 hover:text-slate-700 transition-colors ml-1 border-l border-slate-200">
-                      <Download className="w-4 h-4" />
-                    </button>
+                    <Link
+                      href={`/cases/${caseId}/mismatches`}
+                      className="ml-1 flex items-center gap-2 rounded-lg px-4 py-1.5 text-sm font-bold whitespace-nowrap text-slate-500 transition-all hover:bg-slate-200/50 hover:text-slate-700"
+                    >
+                      <TriangleAlert className="w-4 h-4" />
+                      Mismatches
+                      {detail.mismatches.length > 0 && (
+                        <span className="ml-1 flex h-4 w-4 items-center justify-center rounded-full bg-rose-100 text-[9px] text-rose-600">
+                          {detail.mismatches.length}
+                        </span>
+                      )}
+                    </Link>
                   </div>
                 </div>
 
                 {/* File Sub-header (only for doc tabs) */}
-                {activeTab !== "mismatches" && activeDocument && (
+                {activeDocument && (
                   <div className="flex items-center gap-3 px-6 py-3 bg-slate-50/50 border-b border-slate-100">
                     <FileText className="w-4 h-4 text-slate-400" />
                     <span className="text-sm font-semibold text-slate-700 truncate">{activeDocument.sourceFileName || activeDocument.title}</span>
@@ -495,11 +459,11 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 )}
 
                 {/* Content Area */}
-                <div className="flex-1 bg-[#f4f5f7] relative overflow-hidden flex flex-col p-4 sm:p-6">
+                <Tabs value={activeTab} className="flex-1 bg-[#f4f5f7] relative overflow-hidden flex flex-col p-4 sm:p-6">
 
                   {/* TAB: PREVIEW */}
-                  {activeTab === "preview" && (
-                    <div className="bg-[#2d2d2d] rounded-xl flex-1 flex flex-col shadow-lg overflow-hidden border border-slate-300">
+                  <TabsContent value="preview" className="m-0 h-full w-full">
+                    <div className="bg-[#2d2d2d] rounded-xl h-full w-full flex flex-col shadow-lg overflow-hidden border border-slate-300">
                       {/* Dark Toolbar mimicking reference image */}
                       <div className="h-12 bg-[#1e1e1e] flex items-center px-4 justify-between shrink-0">
                         <div className="bg-[#3d3d3d] text-white text-xs font-semibold px-3 py-1.5 rounded-md">
@@ -527,11 +491,11 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                         )}
                       </div>
                     </div>
-                  )}
+                  </TabsContent>
 
                   {/* TAB: EXTRACTED DATA */}
-                  {activeTab === "data" && (
-                    <div className="bg-white rounded-xl flex-1 shadow-sm border border-slate-200 overflow-hidden flex flex-col">
+                  <TabsContent value="data" className="m-0 h-full w-full">
+                    <div className="bg-white rounded-xl h-full w-full shadow-sm border border-slate-200 overflow-hidden flex flex-col">
                       <ScrollArea className="flex-1 p-6">
                         <div className="max-w-3xl mx-auto space-y-6">
                           <h2 className="text-2xl font-bold text-slate-900 mb-6 border-b border-slate-100 pb-4">Extracted Data Fields</h2>
@@ -567,11 +531,11 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                         </div>
                       </ScrollArea>
                     </div>
-                  )}
+                  </TabsContent>
 
                   {/* TAB: OCR TEXT */}
-                  {activeTab === "ocr" && (
-                    <div className="bg-slate-900 rounded-xl flex-1 shadow-lg border border-slate-800 overflow-hidden flex flex-col text-slate-300">
+                  <TabsContent value="ocr" className="m-0 h-full w-full">
+                    <div className="bg-slate-900 rounded-xl h-full w-full shadow-lg border border-slate-800 overflow-hidden flex flex-col text-slate-300">
                       <ScrollArea className="flex-1 p-6">
                         <div className="max-w-4xl mx-auto font-mono text-sm leading-relaxed opacity-90">
                           <ReactMarkdown>
@@ -580,75 +544,8 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                         </div>
                       </ScrollArea>
                     </div>
-                  )}
-
-                  {/* TAB: MISMATCHES */}
-                  {activeTab === "mismatches" && (
-                    <div className="bg-white rounded-xl flex-1 shadow-sm border border-slate-200 overflow-hidden flex flex-col">
-                      <ScrollArea className="flex-1 p-6">
-                        <div className="max-w-4xl mx-auto space-y-8">
-                          {detail.mismatches.length === 0 ? (
-                            <div className="flex flex-col items-center justify-center py-20 text-center">
-                              <CheckCircle2 className="h-16 w-16 text-emerald-400 mb-4" />
-                              <h2 className="text-2xl font-bold text-slate-900">All Clear!</h2>
-                              <p className="text-slate-500 mt-2 font-medium">No data conflicts were found across the documents in this case.</p>
-                            </div>
-                          ) : (
-                            detail.mismatches.map((mismatch) => (
-                              <div key={mismatch.id} className="border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
-                                <div className="bg-amber-50/50 border-b border-amber-100 p-5 flex items-center gap-3">
-                                  <TriangleAlert className="h-5 w-5 text-amber-600" />
-                                  <h3 className="text-lg font-bold text-slate-900">
-                                    Conflict: {FIELD_LABEL_LOOKUP[mismatch.fieldName] || mismatch.fieldName}
-                                  </h3>
-                                </div>
-                                <div className="p-6 space-y-6">
-                                  <div>
-                                    <h4 className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-3">Observed Values</h4>
-                                    <div className="grid gap-3 sm:grid-cols-2">
-                                      {(mismatch.values ?? []).map((value, index) => {
-                                        const title = (value.docId ? documentLookup.get(value.docId)?.title : null) ?? `Doc ${index + 1}`;
-                                        return (
-                                          <div key={index} className="bg-slate-50 border border-slate-100 rounded-xl p-4">
-                                            <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 truncate mb-1" title={title}>
-                                              {title}
-                                            </div>
-                                            <div className="text-sm font-semibold text-slate-900 break-words">
-                                              {value.value === null || value.value === undefined ? <em className="opacity-50">Missing</em> : String(value.value)}
-                                            </div>
-                                          </div>
-                                        );
-                                      })}
-                                    </div>
-                                  </div>
-
-                                  {mismatch.analysis && (
-                                    <div className="bg-slate-50 border border-slate-200 rounded-xl p-5">
-                                      <h4 className="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2">AI Analysis</h4>
-                                      <div className="prose prose-sm prose-slate max-w-none font-medium">
-                                        <ReactMarkdown>{mismatch.analysis}</ReactMarkdown>
-                                      </div>
-                                    </div>
-                                  )}
-
-                                  {mismatch.fixPlan && (
-                                    <div className="bg-emerald-50/50 border border-emerald-200 rounded-xl p-5">
-                                      <h4 className="text-[10px] font-bold uppercase tracking-widest text-emerald-600 mb-2">Recommended Resolution</h4>
-                                      <div className="prose prose-sm max-w-none prose-emerald font-medium text-emerald-900">
-                                        <ReactMarkdown>{mismatch.fixPlan}</ReactMarkdown>
-                                      </div>
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            ))
-                          )}
-                        </div>
-                      </ScrollArea>
-                    </div>
-                  )}
-
-                </div>
+                  </TabsContent>
+                </Tabs>
               </div>
             </div>
 

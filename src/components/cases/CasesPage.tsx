@@ -11,9 +11,7 @@ import {
   Database,
   LayoutGrid,
   List,
-  Plus,
   Upload,
-  ChevronDown,
   Trash2,
 } from "lucide-react";
 
@@ -35,6 +33,7 @@ import {
 } from "@/lib/case-persistence";
 
 type LoadState = "loading" | "ready" | "error";
+type ViewMode = "grid" | "table";
 
 function formatDateTime(value: string) {
   return new Date(value).toLocaleString("en-US", {
@@ -55,6 +54,7 @@ export function CasesPage() {
   const [status, setStatus] = useState<LoadState>("loading");
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [viewMode, setViewMode] = useState<ViewMode>("table");
   const [pendingCase, setPendingCase] = useState<SavedCaseRecord | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
 
@@ -140,10 +140,28 @@ export function CasesPage() {
             <div className="flex items-center gap-3 w-full xl:w-auto overflow-x-auto pb-2 xl:pb-0">
               {/* View Toggles */}
               <div className="hidden md:flex items-center gap-1 border border-slate-200 rounded-lg p-1 bg-slate-50 shrink-0">
-                <button className="p-1.5 bg-white shadow-sm border border-slate-200 rounded-md text-slate-800 transition-colors">
+                <button
+                  type="button"
+                  onClick={() => setViewMode("grid")}
+                  className={`p-1.5 rounded-md transition-colors ${
+                    viewMode === "grid"
+                      ? "bg-white shadow-sm border border-slate-200 text-slate-800"
+                      : "text-slate-400 hover:text-slate-800"
+                  }`}
+                  aria-label="Card view"
+                >
                   <LayoutGrid className="w-4 h-4" />
                 </button>
-                <button className="p-1.5 text-slate-400 hover:text-slate-800 transition-colors">
+                <button
+                  type="button"
+                  onClick={() => setViewMode("table")}
+                  className={`p-1.5 rounded-md transition-colors ${
+                    viewMode === "table"
+                      ? "bg-white shadow-sm border border-slate-200 text-slate-800"
+                      : "text-slate-400 hover:text-slate-800"
+                  }`}
+                  aria-label="Table view"
+                >
                   <List className="w-4 h-4" />
                 </button>
               </div>
@@ -153,10 +171,6 @@ export function CasesPage() {
                 {cases.length} folders • {totalDocs} documents
               </div>
 
-              {/* Action Buttons */}
-              <Button variant="outline" className="bg-white text-slate-700 font-bold shadow-sm border-slate-200 shrink-0 hover:bg-slate-50">
-                <Plus className="w-4 h-4 mr-2" /> Folder
-              </Button>
               <Button asChild className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold shadow-md shadow-indigo-600/20 shrink-0 transition-transform hover:scale-[1.02]">
                 <Link href="/workspace">
                   <Upload className="w-4 h-4 mr-2" /> Upload
@@ -169,15 +183,7 @@ export function CasesPage() {
               FILTER / SEARCH BAR (Matches Image)
               ========================================= */}
           <div className="p-6 md:px-8 md:py-6">
-            <div className="flex flex-col md:flex-row items-stretch border border-slate-200 rounded-xl bg-white shadow-sm">
-
-              {/* Left Dropdown */}
-              <div className="flex items-center justify-between px-5 py-3 border-b md:border-b-0 md:border-r border-slate-200 hover:bg-slate-50 cursor-pointer min-w-[200px] transition-colors group rounded-t-xl md:rounded-tr-none md:rounded-l-xl">
-                <span className="text-sm font-semibold text-slate-700">All Risks</span>
-                <ChevronDown className="w-4 h-4 text-slate-400 group-hover:text-slate-600" />
-              </div>
-
-              {/* Middle Search Input */}
+            <div className="flex items-center rounded-xl border border-slate-200 bg-white shadow-sm">
               <div className="flex-1 flex items-center px-5 py-3 bg-white">
                 <Search className="w-4 h-4 text-slate-400 mr-3 shrink-0" />
                 <input
@@ -187,12 +193,6 @@ export function CasesPage() {
                   onChange={(e) => setSearchQuery(e.target.value)}
                   className="w-full outline-none text-sm font-medium text-slate-900 placeholder:text-slate-400 bg-transparent"
                 />
-              </div>
-
-              {/* Right Dropdown */}
-              <div className="flex items-center justify-between px-5 py-3 border-t md:border-t-0 md:border-l border-slate-200 hover:bg-slate-50 cursor-pointer min-w-[200px] transition-colors group rounded-b-xl md:rounded-bl-none md:rounded-r-xl">
-                <span className="text-sm font-semibold text-slate-700">All Buyers</span>
-                <ChevronDown className="w-4 h-4 text-slate-400 group-hover:text-slate-600" />
               </div>
             </div>
 
@@ -239,89 +239,158 @@ export function CasesPage() {
             )}
 
             {status === "ready" && filteredCases.length > 0 && (
-              <Table className="w-full text-sm">
-                <TableHeader>
-                  <TableRow className="border-b border-slate-100 hover:bg-transparent">
-                    <TableHead className="w-12 pl-6 md:pl-8"></TableHead>
-                    <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Name</TableHead>
-                    <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Type</TableHead>
-                    <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Category</TableHead>
-                    <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Risk</TableHead>
-                    <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Date</TableHead>
-                    <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider text-right pr-6 md:pr-8">Actions</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
+              viewMode === "grid" ? (
+                <div className="grid grid-cols-1 gap-4 px-6 md:grid-cols-2 md:px-8 xl:grid-cols-3">
                   {filteredCases.map((item) => (
-                    <TableRow
+                    <div
                       key={item.id}
-                      className="group cursor-pointer border-slate-100/60 transition-colors hover:bg-slate-50/80 h-16"
+                      className="group rounded-2xl border border-slate-200 bg-white p-5 shadow-sm transition-all hover:-translate-y-0.5 hover:border-indigo-200 hover:shadow-md"
                     >
-                      {/* Checkbox placeholder */}
-                      <TableCell className="pl-6 md:pl-8">
-                        <div className="w-4 h-4 border-2 border-slate-200 rounded text-transparent group-hover:border-slate-300 transition-colors" />
-                      </TableCell>
-
-                      {/* Name & Icon */}
-                      <TableCell className="py-3">
-                        <Link href={`/cases/${item.id}`} className="flex items-center gap-3 outline-none">
-                          <div className="w-9 h-9 rounded-lg bg-indigo-50/80 border border-indigo-100 text-indigo-600 flex items-center justify-center shrink-0">
-                            <Folder className="w-4 h-4 fill-indigo-100" />
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex min-w-0 items-start gap-3">
+                          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-indigo-100 bg-indigo-50 text-indigo-600">
+                            <Folder className="h-5 w-5 fill-indigo-100" />
                           </div>
-                          <span className="font-bold text-slate-800 text-sm group-hover:text-indigo-600 transition-colors truncate max-w-[200px] xl:max-w-[300px]">
-                            {item.displayName}
-                          </span>
-                          <span className="hidden sm:inline-flex items-center justify-center text-[10px] font-bold bg-white border border-slate-200 text-slate-500 px-2 py-0.5 rounded-full shadow-sm">
-                            {item.documentCount} items
-                          </span>
-                        </Link>
-                      </TableCell>
+                          <div className="min-w-0">
+                            <Link
+                              href={`/cases/${item.id}`}
+                              className="block truncate text-base font-bold text-slate-900 transition-colors hover:text-indigo-600"
+                            >
+                              {item.displayName}
+                            </Link>
+                            <div className="mt-1 text-xs font-medium text-slate-500">
+                              {item.buyerName || "No buyer name"}
+                            </div>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          className="shrink-0 text-slate-400 transition-colors hover:text-rose-600"
+                          aria-label="Delete"
+                          onClick={() => setPendingCase(item)}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
 
-                      {/* Type */}
-                      <TableCell className="py-3">
-                        <span className="font-bold text-xs text-slate-500 tracking-wide bg-slate-50 border border-slate-100 px-2 py-1 rounded-md uppercase">
+                      <div className="mt-4 flex flex-wrap items-center gap-2">
+                        <span className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">
                           Case File
                         </span>
-                      </TableCell>
-
-                      {/* Category (Buyer) */}
-                      <TableCell className="py-3">
-                        <span className="font-semibold text-slate-600 truncate block max-w-[150px]" title={item.buyerName || "—"}>
-                          {item.buyerName || "—"}
-                        </span>
-                      </TableCell>
-
-                      {/* Risk / Sender Equivalent */}
-                      <TableCell className="py-3">
-                        <span className={`font-bold text-[10px] uppercase tracking-wider px-2.5 py-1 rounded-md border ${getRiskColor(item.riskScore)}`}>
+                        <span
+                          className={`rounded-md border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${getRiskColor(item.riskScore)}`}
+                        >
                           Risk: {item.riskScore}
                         </span>
-                      </TableCell>
+                      </div>
 
-                      {/* Date */}
-                      <TableCell className="py-3 whitespace-nowrap text-sm font-semibold text-slate-500">
-                        {formatDateTime(item.createdAt)}
-                      </TableCell>
-
-                      {/* Actions */}
-                      <TableCell className="pr-6 md:pr-8 py-3 text-right">
-                        <div className="flex items-center justify-end gap-4 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <Link href={`/cases/${item.id}`} className="text-sm font-bold text-indigo-600 hover:text-indigo-700 transition-colors">
-                            Open
-                          </Link>
-                          <button
-                            className="text-slate-400 hover:text-rose-600 transition-colors"
-                            aria-label="Delete"
-                            onClick={() => setPendingCase(item)}
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                      <div className="mt-5 grid grid-cols-2 gap-3">
+                        <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                          <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                            Documents
+                          </div>
+                          <div className="mt-1 text-lg font-bold text-slate-900">
+                            {item.documentCount}
+                          </div>
                         </div>
-                      </TableCell>
-                    </TableRow>
+                        <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                          <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                            Created
+                          </div>
+                          <div className="mt-1 text-sm font-semibold text-slate-900">
+                            {formatDateTime(item.createdAt)}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="mt-5 flex items-center justify-between">
+                        <div className="text-xs font-semibold text-slate-500">
+                          {item.mismatchCount} mismatches
+                        </div>
+                        <Link
+                          href={`/cases/${item.id}`}
+                          className="text-sm font-bold text-indigo-600 transition-colors hover:text-indigo-700"
+                        >
+                          Open
+                        </Link>
+                      </div>
+                    </div>
                   ))}
-                </TableBody>
-              </Table>
+                </div>
+              ) : (
+                <Table className="w-full text-sm">
+                  <TableHeader>
+                    <TableRow className="border-b border-slate-100 hover:bg-transparent">
+                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Name</TableHead>
+                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Type</TableHead>
+                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Category</TableHead>
+                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Risk</TableHead>
+                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Date</TableHead>
+                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider text-right pr-6 md:pr-8">Actions</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {filteredCases.map((item) => (
+                      <TableRow
+                        key={item.id}
+                        className="group cursor-pointer border-slate-100/60 transition-colors hover:bg-slate-50/80 h-16"
+                      >
+                        <TableCell className="py-3 pl-6 md:pl-8">
+                          <Link href={`/cases/${item.id}`} className="flex items-center gap-3 outline-none">
+                            <div className="w-9 h-9 rounded-lg bg-indigo-50/80 border border-indigo-100 text-indigo-600 flex items-center justify-center shrink-0">
+                              <Folder className="w-4 h-4 fill-indigo-100" />
+                            </div>
+                            <span className="font-bold text-slate-800 text-sm group-hover:text-indigo-600 transition-colors truncate max-w-[200px] xl:max-w-[300px]">
+                              {item.displayName}
+                            </span>
+                            <span className="hidden sm:inline-flex items-center justify-center text-[10px] font-bold bg-white border border-slate-200 text-slate-500 px-2 py-0.5 rounded-full shadow-sm">
+                              {item.documentCount} items
+                            </span>
+                          </Link>
+                        </TableCell>
+
+                        <TableCell className="py-3">
+                          <span className="font-bold text-xs text-slate-500 tracking-wide bg-slate-50 border border-slate-100 px-2 py-1 rounded-md uppercase">
+                            Case File
+                          </span>
+                        </TableCell>
+
+                        <TableCell className="py-3">
+                          <span className="font-semibold text-slate-600 truncate block max-w-[150px]" title={item.buyerName || "—"}>
+                            {item.buyerName || "—"}
+                          </span>
+                        </TableCell>
+
+                        <TableCell className="py-3">
+                          <span className={`font-bold text-[10px] uppercase tracking-wider px-2.5 py-1 rounded-md border ${getRiskColor(item.riskScore)}`}>
+                            Risk: {item.riskScore}
+                          </span>
+                        </TableCell>
+
+                        <TableCell className="py-3 whitespace-nowrap text-sm font-semibold text-slate-500">
+                          {formatDateTime(item.createdAt)}
+                        </TableCell>
+
+                        <TableCell className="pr-6 md:pr-8 py-3 text-right">
+                          <div className="flex items-center justify-end gap-4 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <Link href={`/cases/${item.id}`} className="text-sm font-bold text-indigo-600 hover:text-indigo-700 transition-colors">
+                              Open
+                            </Link>
+                            <button
+                              type="button"
+                              className="text-slate-400 hover:text-rose-600 transition-colors"
+                              aria-label="Delete"
+                              onClick={() => setPendingCase(item)}
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )
             )}
           </div>
         </div>

@@ -3,17 +3,28 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
+  ChevronDown,
+  Clock,
+  Eye,
+  FileText,
   Loader2,
   RotateCcw,
   Search,
-  Trash2,
   Trash,
+  Trash2,
 } from "lucide-react";
 
 import { CaseConfirmDialog } from "@/components/cases/CaseConfirmDialog";
 import { AppShell } from "@/components/dashboard/AppShell";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import {
   deleteCaseForever,
   fetchCasesByScope,
@@ -36,7 +47,18 @@ function formatDateTime(value: string | null) {
     year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
-  });
+    second: "2-digit",
+  }).replace(',', ' -').replace(/\s([AP]M)$/, '_$1'); // Rough match for image format
+}
+
+function calculateDaysRemaining(deletedAt: string | null) {
+  if (!deletedAt) return 30;
+  const deletedDate = new Date(deletedAt);
+  const expiryDate = new Date(deletedDate.getTime() + (30 * 24 * 60 * 60 * 1000));
+  const now = new Date();
+  const diffTime = Math.max(0, expiryDate.getTime() - now.getTime());
+  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+  return diffDays;
 }
 
 export function RecycleBinPage() {
@@ -112,120 +134,201 @@ export function RecycleBinPage() {
 
   return (
     <AppShell>
-      <div className="mx-auto max-w-[1500px] w-full px-4 sm:px-6 lg:px-8 py-8 animate-in fade-in duration-700 ease-out text-slate-800">
-        <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] overflow-hidden flex flex-col">
-          <div className="border-b border-slate-100 px-6 py-7 md:px-8">
-            <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
+      <div className="mx-auto max-w-[1500px] w-full px-4 sm:px-6 lg:px-8 py-8 animate-in fade-in duration-700 ease-out text-[#0f172a]">
+
+        {/* MAIN CONTAINER matching the image's white box UI */}
+        <div className="bg-white border border-[#e2e8f0] rounded-2xl shadow-[0_8px_30px_rgba(0,0,0,0.04)] overflow-hidden flex flex-col">
+
+          {/* =========================================
+              HEADER SECTION (Matches Image)
+              ========================================= */}
+          <div className="p-6 md:p-8 border-b border-[#f1f5f9] flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
+
+            <div className="flex items-center gap-5">
+              <div className="w-14 h-14 bg-[#fef2f2] border border-[#fecaca] text-[#e11d48] rounded-2xl flex items-center justify-center shadow-sm">
+                <Trash2 className="w-7 h-7" />
+              </div>
               <div>
-                <div className="text-xs font-bold uppercase tracking-[0.24em] text-slate-400">
-                  Recycle Bin
-                </div>
-                <h1 className="mt-2 text-3xl font-extrabold tracking-tight text-slate-900">
-                  Deleted cases
-                </h1>
-                <p className="mt-2 max-w-2xl text-sm font-medium text-slate-500">
-                  Review recycled cases, restore them to the active directory, or permanently
-                  remove them.
+                <h1 className="text-2xl font-extrabold text-[#0f172a] tracking-tight">Recycle Bin</h1>
+                <p className="text-sm font-semibold text-[#94a3b8] mt-0.5">
+                  {filteredCases.length} items • Auto-deleted after 30 days
                 </p>
               </div>
-
-              <Button asChild variant="outline" className="border-slate-200 text-slate-700">
-                <Link href="/cases">Back to cases</Link>
-              </Button>
             </div>
           </div>
 
-          <div className="px-6 py-6 md:px-8">
-            <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
-              <Search className="h-4 w-4 text-slate-400" />
+          {/* =========================================
+              SEARCH BAR (Matches Image)
+              ========================================= */}
+          <div className="p-6 md:px-8 md:py-6">
+            <div className="flex items-center px-4 py-2.5 border border-[#e2e8f0] rounded-xl bg-[#f8fafc] shadow-sm max-w-md">
+              <Search className="w-4 h-4 text-[#94a3b8] mr-3 shrink-0" />
               <input
+                type="text"
+                placeholder="Search deleted items..."
                 value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Search recycled cases..."
-                className="w-full bg-transparent text-sm font-medium text-slate-900 outline-none placeholder:text-slate-400"
+                onChange={(e) => setQuery(e.target.value)}
+                className="w-full outline-none text-sm font-medium text-[#0f172a] placeholder:text-[#94a3b8] bg-transparent"
               />
             </div>
           </div>
 
-          {status === "loading" && (
-            <div className="flex flex-col items-center justify-center py-20 text-slate-500">
-              <Loader2 className="mb-4 h-8 w-8 animate-spin text-indigo-500" />
-              <p className="text-sm font-semibold">Loading recycle bin...</p>
-            </div>
-          )}
+          {/* =========================================
+              TABLE AREA
+              ========================================= */}
+          <div className="w-full overflow-x-auto pb-4">
 
-          {error && (
-            <div className="mx-6 mb-6 rounded-2xl border border-rose-200 bg-rose-50 px-5 py-4 text-sm text-rose-700 md:mx-8">
-              <div className="font-semibold">Recycle bin error</div>
-              <div className="mt-1">{error}</div>
-            </div>
-          )}
+            {status === "loading" && (
+              <div className="flex flex-col items-center justify-center py-20 text-[#64748b]">
+                <Loader2 className="mb-4 h-8 w-8 animate-spin text-[#6366f1]" />
+                <p className="text-sm font-semibold">Loading recycle bin...</p>
+              </div>
+            )}
 
-          {status === "ready" && filteredCases.length === 0 && (
-            <div className="px-6 pb-8 md:px-8">
-              <Card className="flex flex-col items-center justify-center rounded-3xl border border-dashed border-slate-300 bg-gradient-to-br from-white via-slate-50 to-indigo-50/30 py-20 text-center shadow-sm">
-                <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-slate-100 text-slate-400">
-                  <Trash className="h-7 w-7" />
+            {status === "error" && (
+              <div className="m-8 rounded-2xl border border-red-200 bg-red-50 p-6 text-sm text-red-700 flex items-start shadow-sm">
+                <Trash className="mr-3 h-5 w-5 text-red-500 shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-bold text-base mb-1">Failed to load recycle bin</div>
+                  <div>{error}</div>
                 </div>
-                <h3 className="text-lg font-bold text-slate-900">Recycle bin is empty</h3>
-                <p className="mt-2 max-w-sm text-sm text-slate-500">
-                  Deleted cases will appear here until they are restored or permanently deleted.
+              </div>
+            )}
+
+            {status === "ready" && cases.length === 0 && (
+              <div className="flex flex-col items-center justify-center py-24 text-center px-4">
+                <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-full bg-[#f8fafc] border border-[#e2e8f0] shadow-sm">
+                  <Trash2 className="h-8 w-8 text-[#cbd5e1]" />
+                </div>
+                <h3 className="text-lg font-bold text-[#0f172a]">Recycle Bin is Empty</h3>
+                <p className="mt-2 text-sm font-medium text-[#64748b] max-w-sm">
+                  Items you delete will appear here for 30 days before being permanently removed.
                 </p>
-              </Card>
-            </div>
-          )}
+              </div>
+            )}
 
-          {status === "ready" && filteredCases.length > 0 && (
-            <div className="grid gap-4 px-6 pb-8 md:px-8">
-              {filteredCases.map((item) => (
-                <Card
-                  key={item.id}
-                  className="rounded-2xl border border-slate-200 bg-white/90 px-5 py-5 shadow-sm"
+            {status === "ready" && cases.length > 0 && filteredCases.length === 0 && (
+              <div className="flex flex-col items-center justify-center py-24 text-center px-4">
+                <Search className="h-10 w-10 text-[#e2e8f0] mb-4" />
+                <h3 className="text-base font-bold text-[#0f172a]">No matches found</h3>
+                <p className="mt-1 text-sm font-medium text-[#64748b]">
+                  We couldn&apos;t find any deleted items matching &quot;{query}&quot;.
+                </p>
+                <Button
+                  variant="link"
+                  onClick={() => setQuery("")}
+                  className="mt-2 text-[#4f46e5] font-bold"
                 >
-                  <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-3">
-                        <div className="truncate text-lg font-bold text-slate-900">
-                          {item.displayName}
-                        </div>
-                        <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500">
-                          {item.documentCount} docs
-                        </span>
-                      </div>
-                      <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-slate-500">
-                        <span>Buyer: {item.buyerName || "—"}</span>
-                        <span>Deleted: {formatDateTime(item.deletedAt)}</span>
-                        <span>Slug: {item.slug}</span>
-                      </div>
-                    </div>
+                  Clear search
+                </Button>
+              </div>
+            )}
 
-                    <div className="flex flex-wrap items-center gap-3">
-                      <Button
-                        type="button"
-                        variant="outline"
-                        className="border-slate-200 text-slate-700 hover:bg-slate-50"
-                        onClick={() => setPendingAction({ type: "restore", item })}
-                      >
-                        <RotateCcw className="h-4 w-4" />
-                        Restore
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="destructive"
-                        className="shadow-sm"
-                        onClick={() => setPendingAction({ type: "destroy", item })}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                        Delete forever
-                      </Button>
-                    </div>
-                  </div>
-                </Card>
-              ))}
-            </div>
-          )}
+            {status === "ready" && filteredCases.length > 0 && (
+              <Table className="w-full text-sm">
+                <TableHeader>
+                  <TableRow className="border-b border-[#f1f5f9] hover:bg-transparent">
+                    <TableHead className="h-12 font-bold text-[#94a3b8] text-xs uppercase tracking-wider">DOCUMENT</TableHead>
+                    <TableHead className="h-12 font-bold text-[#94a3b8] text-xs uppercase tracking-wider">TEAM</TableHead>
+                    <TableHead className="h-12 font-bold text-[#94a3b8] text-xs uppercase tracking-wider">EXPIRES</TableHead>
+                    <TableHead className="h-12 font-bold text-[#94a3b8] text-xs uppercase tracking-wider text-right pr-6 md:pr-8">ACTIONS</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {filteredCases.map((item) => (
+                    <TableRow
+                      key={item.id}
+                      className="group border-[#f1f5f9] transition-colors hover:bg-[#f8fafc] h-16"
+                    >
+                      {/* Document Name & Details */}
+                      <TableCell className="py-4 pl-6 md:pl-8">
+                        <div className="flex items-start gap-3">
+                          <div className="mt-0.5 w-8 h-8 rounded-lg bg-[#f1f5f9] border border-[#e2e8f0] text-[#64748b] flex items-center justify-center shrink-0">
+                            <FileText className="w-4 h-4" />
+                          </div>
+                          <div>
+                            <Link
+                              href={`/cases/${item.id}`}
+                              className="font-bold text-[#0f172a] text-sm transition-colors hover:text-[#4f46e5]"
+                            >
+                              {item.displayName || "Unnamed Document"}
+                            </Link>
+                            <div className="mt-1 text-[11px] font-medium text-[#94a3b8]">
+                              {formatDateTime(item.deletedAt)} • by Admin
+                            </div>
+                          </div>
+                        </div>
+                      </TableCell>
+
+                      {/* Team (Placeholder mapped to Buyer for now) */}
+                      <TableCell className="py-4">
+                        <div className="flex items-center gap-1.5">
+                          <div className="w-1.5 h-1.5 rounded-full bg-[#10b981]" />
+                          <span className="font-semibold text-[#64748b] text-sm truncate max-w-[150px]">
+                            {item.buyerName || "Customer Handover"}
+                          </span>
+                        </div>
+                      </TableCell>
+
+                      {/* Expires */}
+                      <TableCell className="py-4">
+                        <div className="flex items-center gap-1.5 text-[#64748b] text-sm font-medium">
+                          <Clock className="w-3.5 h-3.5" />
+                          {calculateDaysRemaining(item.deletedAt)}d
+                        </div>
+                      </TableCell>
+
+                      {/* Actions */}
+                      <TableCell className="pr-6 md:pr-8 py-4 text-right">
+                        <div className="flex items-center justify-end gap-3 text-[#94a3b8]">
+                          <Link
+                            href={`/cases/${item.id}`}
+                            className="p-1.5 hover:text-[#0f172a] hover:bg-[#f1f5f9] rounded-md transition-colors"
+                            aria-label="View"
+                          >
+                            <Eye className="w-4 h-4" />
+                          </Link>
+                          <button
+                            className="p-1.5 hover:text-[#4f46e5] hover:bg-[#eef2ff] rounded-md transition-colors"
+                            aria-label="Restore"
+                            onClick={() => setPendingAction({ type: "restore", item })}
+                          >
+                            <RotateCcw className="w-4 h-4" />
+                          </button>
+                          <button
+                            className="p-1.5 hover:text-[#e11d48] hover:bg-[#fef2f2] rounded-md transition-colors"
+                            aria-label="Delete Permanently"
+                            onClick={() => setPendingAction({ type: "destroy", item })}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+
+            {/* Pagination Footer (Placeholder matching image) */}
+            {status === "ready" && filteredCases.length > 0 && (
+              <div className="px-6 md:px-8 pt-4 pb-2 flex items-center justify-between text-sm font-semibold text-[#94a3b8]">
+                <div>Page 1 of 1</div>
+                <div className="flex items-center gap-4">
+                  <button className="flex items-center opacity-50 cursor-not-allowed">
+                    <ChevronDown className="w-4 h-4 rotate-90 mr-1" /> Previous
+                  </button>
+                  <button className="flex items-center opacity-50 cursor-not-allowed">
+                    Next <ChevronDown className="w-4 h-4 -rotate-90 ml-1" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+          </div>
         </div>
 
+        {/* Confirmation Dialog remains unchanged functionally, but styled to fit if possible via its own component */}
         <CaseConfirmDialog
           open={Boolean(pendingAction)}
           onOpenChange={(open) => {

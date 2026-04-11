@@ -151,7 +151,6 @@ export async function GET(
         )
         .eq("id", id)
         .eq("owner_user_id", user.id)
-        .is("deleted_at", null)
         .single();
 
       if (result.error) {
@@ -181,10 +180,6 @@ export async function GET(
           return NextResponse.json({ error: "Case not found." }, { status: 404 });
         }
         throw fallback.error;
-      }
-
-      if (isCaseRecycled(fallback.data.processing_meta)) {
-        return NextResponse.json({ error: "Case not found." }, { status: 404 });
       }
 
       caseRow = {
