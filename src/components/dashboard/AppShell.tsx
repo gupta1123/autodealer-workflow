@@ -6,11 +6,27 @@ type AppShellProps = {
 
 export function AppShell({ children }: AppShellProps) {
   return (
-    <main className="min-h-screen bg-gradient-to-b from-white to-zinc-50 p-4 sm:p-6">
-      <div className="mx-auto grid max-w-[1700px] gap-4 xl:grid-cols-[300px_minmax(0,1fr)]">
-        <DashboardSidebar />
-        <div className="min-w-0">{children}</div>
-      </div>
-    </main>
+    <div
+      style={{
+        display: "flex",
+        height: "100vh",
+        overflow: "hidden",
+        backgroundColor: "#f7f7f5",
+      }}
+    >
+      {/* Fixed-width sidebar */}
+      <DashboardSidebar />
+
+      {/* Scrollable main content area */}
+      <main
+        style={{
+          flex: 1,
+          overflowY: "auto",
+          backgroundColor: "#f7f7f5",
+        }}
+      >
+        {children}
+      </main>
+    </div>
   );
 }

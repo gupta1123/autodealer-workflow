@@ -211,18 +211,18 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
   return (
     <AppShell>
-      <div className="flex h-full flex-col bg-[#f8fafc] animate-in fade-in duration-500">
+      <div className="flex h-full flex-col bg-[#f7f7f5] animate-in fade-in duration-500">
 
         {/* =========================================
             TOP HEADER
             ========================================= */}
-        <header className="flex items-center border-b border-slate-200 bg-white px-4 py-3 sm:px-6">
+        <header className="flex items-center border-b border-[#e5ddd0] bg-white px-4 py-3 sm:px-6">
           <div className="flex items-center gap-4">
-            <Link href="/cases" className="flex h-8 w-8 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-700 transition-colors">
+            <Link href="/cases" className="flex h-8 w-8 items-center justify-center rounded-md text-[#8a7f72] hover:bg-[#ede6d9] hover:text-[#1a1a1a] transition-colors">
               <ArrowLeft className="h-5 w-5" />
             </Link>
 
-            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-emerald-50 text-emerald-600 border border-emerald-100/50">
+            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-[#f0ece6] text-[#5a5046] border border-[#e5ddd0]">
               <FileText className="h-4 w-4" />
             </div>
 
@@ -233,15 +233,15 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
               {detail && (
                 <>
-                  <Badge variant="outline" className="rounded-full bg-emerald-50 text-emerald-700 border-emerald-200 px-2.5 font-medium shadow-sm">
+                  <Badge variant="outline" className="rounded-full bg-[#f0ece6] text-[#5a5046] border-[#e5ddd0] px-2.5 font-medium shadow-sm">
                     v1 • Current
                   </Badge>
                   {detail.case.riskScore > 0 ? (
-                    <Badge variant="outline" className="rounded-full bg-blue-50 text-blue-700 border-blue-200 px-2.5 font-medium flex items-center gap-1 shadow-sm">
+                    <Badge variant="outline" className="rounded-full bg-[#f0ece6] text-[#5a5046] border-[#e5ddd0] px-2.5 font-medium flex items-center gap-1 shadow-sm">
                       <Sparkles className="h-3 w-3" /> AI AUDITED
                     </Badge>
                   ) : (
-                    <Badge variant="outline" className="rounded-full bg-emerald-50 text-emerald-700 border-emerald-200 px-2.5 font-medium flex items-center gap-1 shadow-sm">
+                    <Badge variant="outline" className="rounded-full bg-[#f0ece6] text-[#5a5046] border-[#e5ddd0] px-2.5 font-medium flex items-center gap-1 shadow-sm">
                       <CheckCircle2 className="h-3 w-3" /> RECONCILED
                     </Badge>
                   )}
@@ -255,8 +255,8 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
             STATE MANAGEMENT (LOADING / ERROR)
             ========================================= */}
         {status === "loading" && (
-          <div className="flex flex-1 flex-col items-center justify-center py-24 text-slate-500">
-            <Loader2 className="mb-4 h-8 w-8 animate-spin text-emerald-500" />
+          <div className="flex flex-1 flex-col items-center justify-center py-24 text-[#8a7f72]">
+            <Loader2 className="mb-4 h-8 w-8 animate-spin text-[#8a7f72]" />
             <p className="text-sm font-medium">Retrieving case workspace...</p>
           </div>
         )}
@@ -280,18 +280,18 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           <div className="flex flex-1 overflow-hidden">
 
             {/* LEFT PANEL (Metadata & Context) */}
-            <div className="w-full max-w-md flex-shrink-0 border-r border-slate-200 bg-white overflow-y-auto hidden xl:block">
+            <div className="w-full max-w-md flex-shrink-0 border-r border-[#e5ddd0] bg-[#faf8f4] overflow-y-auto hidden xl:block">
               <div className="p-6 space-y-6">
 
                 {/* Location Card */}
-                <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                <div className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-sm">
                   <div className="flex items-center gap-2 mb-4">
-                    <MapPin className="h-4 w-4 text-slate-400" />
-                    <h3 className="font-bold text-slate-800 text-sm">Location</h3>
+                    <MapPin className="h-4 w-4 text-[#8a7f72]" />
+                    <h3 className="font-bold text-[#1a1a1a] text-sm">Location</h3>
                   </div>
                   <div className="flex items-center flex-wrap gap-2 text-sm text-slate-600 font-medium">
-                    <Folder className="h-4 w-4 text-emerald-600" />
-                    <span className="text-emerald-600 cursor-pointer hover:underline">Root</span>
+                    <Folder className="h-4 w-4 text-[#5a5046]" />
+                    <span className="text-[#5a5046] cursor-pointer hover:underline">Root</span>
                     <span className="text-slate-300">/</span>
                     <span>Cases</span>
                     <span className="text-slate-300">/</span>
@@ -300,10 +300,10 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 </div>
 
                 {/* Details Card */}
-                <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                <div className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-sm">
                   <div className="flex items-center gap-2 mb-5">
-                    <Info className="h-4 w-4 text-slate-400" />
-                    <h3 className="font-bold text-slate-800 text-sm">Details</h3>
+                    <Info className="h-4 w-4 text-[#8a7f72]" />
+                    <h3 className="font-bold text-[#1a1a1a] text-sm">Details</h3>
                   </div>
                   <div className="grid grid-cols-2 gap-y-6 gap-x-4">
                     <div>
@@ -334,13 +334,13 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 </div>
 
                 {/* Document Selector Card */}
-                <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                <div className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-sm">
                   <div className="flex items-center justify-between mb-4">
                     <div className="flex items-center gap-2">
-                      <FileText className="h-4 w-4 text-slate-400" />
-                      <h3 className="font-bold text-slate-800 text-sm">Packet Documents</h3>
+                      <FileText className="h-4 w-4 text-[#8a7f72]" />
+                      <h3 className="font-bold text-[#1a1a1a] text-sm">Packet Documents</h3>
                     </div>
-                    <Badge variant="secondary" className="bg-slate-100 text-slate-600 font-bold">{detail.documents.length}</Badge>
+                    <Badge variant="secondary" className="bg-[#e8ddd0] text-[#5a5046] font-bold">{detail.documents.length}</Badge>
                   </div>
                   <div className="space-y-1.5">
                     {detail.documents.map((d) => {
@@ -349,14 +349,14 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                         <button
                           key={d.id}
                           onClick={() => setActiveDocumentId(d.id)}
-                          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all text-left ${isActive ? "bg-emerald-50 border border-emerald-100" : "hover:bg-slate-50 border border-transparent"
+                          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all text-left ${isActive ? "bg-[#ede6d9] border border-[#d4c9b8]" : "hover:bg-[#f0ece6] border border-transparent"
                             }`}
                         >
-                          <div className={`flex items-center justify-center shrink-0 w-8 h-8 rounded-lg ${isActive ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-100 text-slate-400'}`}>
+                          <div className={`flex items-center justify-center shrink-0 w-8 h-8 rounded-lg ${isActive ? 'bg-[#e5ddd0] text-[#5a5046]' : 'bg-[#f0ece6] text-[#8a7f72]'}`}>
                             <FileText className="w-4 h-4" />
                           </div>
                           <div className="min-w-0 flex-1">
-                            <div className={`text-sm font-bold truncate ${isActive ? 'text-emerald-900' : 'text-slate-700'}`}>
+                            <div className={`text-sm font-bold truncate ${isActive ? 'text-[#1a1a1a]' : 'text-[#5a5046]'}`}>
                               {d.title}
                             </div>
                             <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider truncate mt-0.5">
@@ -404,26 +404,26 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
             </div>
 
             {/* RIGHT PANEL (Viewer & Tabs) */}
-            <div className="flex-1 flex flex-col p-4 sm:p-6 lg:p-8 overflow-hidden relative">
-              <div className="bg-white border border-slate-200 rounded-[1.5rem] shadow-sm h-full flex flex-col overflow-hidden">
+            <div className="flex-1 flex flex-col p-4 sm:p-6 lg:p-8 overflow-hidden relative bg-[#f7f7f5]">
+              <div className="bg-white border border-[#e5ddd0] rounded-[1.5rem] shadow-sm h-full flex flex-col overflow-hidden">
 
                 {/* Viewer Header */}
-                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b border-slate-100 p-4 sm:px-6 gap-4">
+                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b border-[#e5ddd0] p-4 sm:px-6 gap-4">
                   <div className="flex items-center gap-3">
-                    <Eye className="h-5 w-5 text-slate-400" />
-                    <h2 className="text-base font-bold text-slate-800">Document Viewer</h2>
-                    <Badge variant="secondary" className="bg-slate-100 text-slate-600 font-bold uppercase text-[10px] tracking-wider ml-2">PDF</Badge>
+                    <Eye className="h-5 w-5 text-[#8a7f72]" />
+                    <h2 className="text-base font-bold text-[#1a1a1a]">Document Viewer</h2>
+                    <Badge variant="secondary" className="bg-[#f0ece6] text-[#5a5046] font-bold uppercase text-[10px] tracking-wider ml-2">PDF</Badge>
                   </div>
 
                   {/* Segmented Control Tabs */}
-                  <div className="bg-slate-100 p-1 rounded-xl flex items-center shadow-inner overflow-x-auto max-w-full">
+                  <div className="bg-[#ede6d9] p-1 rounded-xl flex items-center shadow-inner overflow-x-auto max-w-full">
                     {DETAIL_TABS.map((tab) => (
                       <button
                         key={tab.id}
                         onClick={() => setActiveTab(tab.id)}
                         className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-sm font-bold transition-all whitespace-nowrap ${activeTab === tab.id
-                          ? "bg-white text-slate-900 shadow-sm"
-                          : "text-slate-500 hover:text-slate-700 hover:bg-slate-200/50"
+                          ? "bg-white text-[#1a1a1a] shadow-sm"
+                          : "text-[#8a7f72] hover:text-[#1a1a1a] hover:bg-[#e5ddd0]/60"
                           }`}
                       >
                         <tab.icon className="w-4 h-4" />
@@ -432,7 +432,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                     ))}
                     <Link
                       href={`/cases/${caseId}/mismatches`}
-                      className="ml-1 flex items-center gap-2 rounded-lg px-4 py-1.5 text-sm font-bold whitespace-nowrap text-slate-500 transition-all hover:bg-slate-200/50 hover:text-slate-700"
+                      className="ml-1 flex items-center gap-2 rounded-lg px-4 py-1.5 text-sm font-bold whitespace-nowrap text-[#8a7f72] transition-all hover:bg-[#e5ddd0]/60 hover:text-[#1a1a1a]"
                     >
                       <TriangleAlert className="w-4 h-4" />
                       Mismatches
@@ -447,11 +447,11 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
                 {/* File Sub-header (only for doc tabs) */}
                 {activeDocument && (
-                  <div className="flex items-center gap-3 px-6 py-3 bg-slate-50/50 border-b border-slate-100">
-                    <FileText className="w-4 h-4 text-slate-400" />
-                    <span className="text-sm font-semibold text-slate-700 truncate">{activeDocument.sourceFileName || activeDocument.title}</span>
-                    <span className="text-slate-300">•</span>
-                    <span className="text-xs font-medium text-slate-400 flex items-center gap-1.5">
+                  <div className="flex items-center gap-3 px-6 py-3 bg-[#faf8f4] border-b border-[#e5ddd0]">
+                    <FileText className="w-4 h-4 text-[#8a7f72]" />
+                    <span className="text-sm font-semibold text-[#1a1a1a] truncate">{activeDocument.sourceFileName || activeDocument.title}</span>
+                    <span className="text-[#c8bfb2]">•</span>
+                    <span className="text-xs font-medium text-[#8a7f72] flex items-center gap-1.5">
                       <Clock className="w-3.5 h-3.5" />
                       Processed {formatDateTime(activeDocument.createdAt)}
                     </span>
@@ -459,7 +459,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 )}
 
                 {/* Content Area */}
-                <Tabs value={activeTab} className="flex-1 bg-[#f4f5f7] relative overflow-hidden flex flex-col p-4 sm:p-6">
+                <Tabs value={activeTab} className="flex-1 bg-[#f0ece6] relative overflow-hidden flex flex-col p-4 sm:p-6">
 
                   {/* TAB: PREVIEW */}
                   <TabsContent value="preview" className="m-0 h-full w-full">
@@ -495,7 +495,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
                   {/* TAB: EXTRACTED DATA */}
                   <TabsContent value="data" className="m-0 h-full w-full">
-                    <div className="bg-white rounded-xl h-full w-full shadow-sm border border-slate-200 overflow-hidden flex flex-col">
+                    <div className="bg-white rounded-xl h-full w-full shadow-sm border border-[#e5ddd0] overflow-hidden flex flex-col">
                       <ScrollArea className="flex-1 p-6">
                         <div className="max-w-3xl mx-auto space-y-6">
                           <h2 className="text-2xl font-bold text-slate-900 mb-6 border-b border-slate-100 pb-4">Extracted Data Fields</h2>

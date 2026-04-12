@@ -66,7 +66,7 @@ export function DashboardHome() {
 
   return (
     <AppShell>
-      <div className="mx-auto w-full max-w-[1400px] animate-in fade-in slide-in-from-bottom-4 px-4 py-8 text-[#0f172a] duration-700 ease-out sm:px-6 lg:px-8">
+      <div className="w-full animate-in fade-in slide-in-from-bottom-4 px-8 py-8 text-[#0f172a] duration-700 ease-out">
 
         {/* HEADER SECTION */}
         <header className="mb-10 flex flex-col items-start gap-4">

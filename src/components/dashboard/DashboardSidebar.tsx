@@ -2,150 +2,133 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useRef, useState } from "react";
 import {
-  FileSearch,
   LayoutDashboard,
-  ListTree,
-  LogOut,
+  FolderOpen,
+  FileStack,
   Trash2,
-  ShieldCheck,
-  CheckCircle2,
-  AlertCircle,
-  Loader2,
-  Cloud
+  LogOut,
+  ChevronsUpDown,
 } from "lucide-react";
-
-import { Button } from "@/components/ui/button";
 
 import styles from "./DashboardSidebar.module.css";
 
-const NAV_ITEMS = [
-  {
-    href: "/",
-    label: "Dashboard",
-    icon: LayoutDashboard,
-  },
-  {
-    href: "/workspace",
-    label: "Packet Workspace",
-    icon: FileSearch,
-  },
-  {
-    href: "/cases",
-    label: "All Cases",
-    icon: ListTree,
-  },
-  {
-    href: "/recycle-bin",
-    label: "Recycle Bin",
-    icon: Trash2,
-  },
+/* ── Primary nav ─────────────────────────────── */
+const PRIMARY_NAV = [
+  { href: "/", label: "Dashboard", icon: LayoutDashboard },
+  { href: "/workspace", label: "Add Case", icon: FileStack },
+  { href: "/cases", label: "All Cases", icon: FolderOpen },
+  { href: "/recycle-bin", label: "Recycle Bin", icon: Trash2 },
 ];
 
 function isActivePath(pathname: string, href: string) {
-  if (href === "/") {
-    return pathname === "/";
-  }
+  if (href === "/") return pathname === "/";
   return pathname === href || pathname.startsWith(`${href}/`);
 }
 
-export interface DashboardSidebarProps {
-  stats?: Array<{ label: string; value: string | number }>;
-  status?: {
-    type: "idle" | "saving" | "saved" | "error";
-    title: string;
-    message: string;
-  };
+interface UserInfo {
+  name: string;
+  email: string;
 }
 
-export function DashboardSidebar({ stats, status }: DashboardSidebarProps) {
+export interface DashboardSidebarProps {
+  user?: UserInfo;
+}
+
+export function DashboardSidebar({ user }: DashboardSidebarProps) {
   const pathname = usePathname();
+  const [popoverOpen, setPopoverOpen] = useState(false);
+  const userRowRef = useRef<HTMLDivElement>(null);
+
+  const displayUser: UserInfo = user ?? {
+    name: "Admin",
+    email: "admin@kalika.local",
+  };
+
+  const initials = displayUser.name
+    .split(" ")
+    .map((w) => w[0])
+    .join("")
+    .toUpperCase()
+    .slice(0, 2);
 
   return (
     <aside className={styles.sidebar}>
-      {/* BRANDING */}
+      {/* ── BRAND ── */}
       <div className={styles.brandRow}>
-        <div className={styles.brandIcon}>
-          <ShieldCheck className="h-6 w-6" />
-        </div>
-        <div className={styles.brandText}>
-          <div className={styles.brandTitle}>Comparator</div>
+        <div className={styles.brandLeft}>
+          <div className={styles.brandLogoMark}>K</div>
+          <span className={styles.brandTitle}>Kalika</span>
         </div>
       </div>
 
-      {/* NAVIGATION */}
+      {/* ── PRIMARY NAVIGATION ── */}
       <nav className={styles.navSection}>
-        <div className={styles.navList}>
-          {NAV_ITEMS.map((item) => {
+        <ul className={styles.navList} role="list">
+          {PRIMARY_NAV.map((item) => {
             const active = isActivePath(pathname, item.href);
             const Icon = item.icon;
-
             return (
-              <Link
-                key={item.href}
-                href={item.href}
-                className={`${styles.navItem} ${active ? styles.navItemActive : ""}`}
-              >
-                <div className={styles.navItemLeft}>
-                  <Icon className={styles.navIcon} />
-                  <span className={styles.navTitle}>{item.label}</span>
-                </div>
-                {active && <div className={styles.activeDot} />}
-              </Link>
+              <li key={item.href}>
+                <Link
+                  href={item.href}
+                  className={`${styles.navItem} ${active ? styles.navItemActive : ""}`}
+                >
+                  <div className={styles.navItemLeft}>
+                    {active && <div className={styles.activeBar} />}
+                    <Icon className={styles.navIcon} />
+                    <span className={styles.navTitle}>{item.label}</span>
+                  </div>
+                </Link>
+              </li>
             );
           })}
-        </div>
+        </ul>
       </nav>
-
-      {/* OPTIONAL STATS */}
-      {stats && stats.length > 0 && (
-        <div className={styles.statsSection}>
-          <div className={styles.sectionHeader}>Overview</div>
-          <div className={styles.statsGrid}>
-            {stats.map((stat, idx) => (
-              <div key={idx} className={styles.statCard}>
-                <div className={styles.statValue}>{stat.value}</div>
-                <div className={styles.statLabel}>{stat.label}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* OPTIONAL SYSTEM STATUS */}
-      {status && (
-        <div className={styles.statusSection}>
-          <div className={styles.sectionHeader}>System Status</div>
-          <div
-            className={`
-              ${styles.statusCard} 
-              ${status.type === "idle" ? styles.statusNeutral : ""}
-              ${status.type === "saving" ? styles.statusSaving : ""}
-              ${status.type === "saved" ? styles.statusSaved : ""}
-              ${status.type === "error" ? styles.statusError : ""}
-            `}
-          >
-            <div className={styles.statusTitle}>
-              {status.type === "saved" && <CheckCircle2 className="h-4 w-4" />}
-              {status.type === "error" && <AlertCircle className="h-4 w-4" />}
-              {status.type === "saving" && <Loader2 className="h-4 w-4 animate-spin" />}
-              {status.type === "idle" && <Cloud className="h-4 w-4" />}
-              {status.title}
-            </div>
-            <div className={styles.statusBody}>{status.message}</div>
-          </div>
-        </div>
-      )}
 
       <div className={styles.spacer} />
 
-      {/* LOGOUT ACTION */}
-      <form action="/auth/signout" method="post" className={styles.signOutForm}>
-        <Button type="submit" variant="ghost" className={styles.signOutButton}>
-          <LogOut className="mr-2 h-4 w-4" />
-          Logout
-        </Button>
-      </form>
+      {/* ── USER ROW (opens popover) ── */}
+      <div className={styles.userRowWrapper} ref={userRowRef}>
+        {/* Logout Popover */}
+        {popoverOpen && (
+          <>
+            {/* Backdrop to close */}
+            <div
+              className={styles.popoverBackdrop}
+              onClick={() => setPopoverOpen(false)}
+            />
+            <div className={styles.popover}>
+              <form action="/auth/signout" method="post">
+                <button type="submit" className={styles.popoverLogoutBtn}>
+                  <LogOut size={14} />
+                  <span>Log out</span>
+                </button>
+              </form>
+            </div>
+          </>
+        )}
+
+        <div
+          className={styles.userRow}
+          onClick={() => setPopoverOpen((o) => !o)}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => e.key === "Enter" && setPopoverOpen((o) => !o)}
+          aria-expanded={popoverOpen}
+          aria-haspopup="true"
+        >
+          <div className={styles.userLeft}>
+            <div className={styles.userAvatar}>{initials}</div>
+            <div className={styles.userInfo}>
+              <span className={styles.userName}>{displayUser.name}</span>
+              <span className={styles.userEmail}>{displayUser.email}</span>
+            </div>
+          </div>
+          <ChevronsUpDown size={14} className={styles.userChevron} />
+        </div>
+      </div>
     </aside>
   );
 }

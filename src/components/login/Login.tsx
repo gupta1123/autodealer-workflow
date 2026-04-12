@@ -1,22 +1,16 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   CheckCircle2,
   Loader2,
-  LockKeyhole,
-  Mail,
-  ShieldCheck,
   AlertCircle,
   Eye,
-  EyeOff
+  EyeOff,
 } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
-
 import styles from "./Login.module.css";
 
 function safeNextPath(value: string | null) {
@@ -37,10 +31,73 @@ export function Login() {
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [loadingMode, setLoadingMode] = useState<"signin" | null>(null);
-  const [error, setError] = useState<string | null>(initialError);
+  const [error, setError] = useState<string | null>(initialError ?? null);
   const [message, setMessage] = useState<string | null>(
-    initialMessage === "1" ? "Email confirmed. You can sign in now." : initialMessage
+    initialMessage === "1" ? "Email confirmed. You can sign in now." : (initialMessage ?? null)
   );
+
+  /* ── Scanner animation refs ── */
+  const scannerRef = useRef<HTMLDivElement>(null);
+  const progressRef = useRef<HTMLDivElement>(null);
+  const stackRef = useRef<HTMLDivElement>(null);
+  const stackInnerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    /* Float the inner doc stack (not the centering wrapper) */
+    let floatDir = -1;
+    let floatY = 0;
+    let floatRaf: number;
+    const floatSpeed = 0.04;
+
+    function animateFloat() {
+      if (cancelled || !stackInnerRef.current) return;
+      floatY += floatSpeed * floatDir;
+      if (floatY <= -12 || floatY >= 0) floatDir *= -1;
+      stackInnerRef.current.style.transform = `translateY(${floatY}px)`;
+      floatRaf = requestAnimationFrame(animateFloat);
+    }
+    floatRaf = requestAnimationFrame(animateFloat);
+
+    /* Scanner loop */
+    function runScan() {
+      if (cancelled || !scannerRef.current || !progressRef.current) return;
+      const scanner = scannerRef.current;
+      const bar = progressRef.current;
+
+      scanner.style.transition = "none";
+      scanner.style.top = "0%";
+      scanner.style.opacity = "0";
+      bar.style.transition = "none";
+      bar.style.width = "0%";
+
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (cancelled) return;
+          scanner.style.transition = "top 2.6s linear, opacity 0.3s ease";
+          scanner.style.top = "100%";
+          scanner.style.opacity = "0.85";
+          bar.style.transition = "width 2.6s ease";
+          bar.style.width = "100%";
+
+          setTimeout(() => {
+            if (cancelled) return;
+            scanner.style.opacity = "0";
+            setTimeout(runScan, 800);
+          }, 2700);
+        });
+      });
+    }
+
+    const startTimer = setTimeout(runScan, 400);
+
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(floatRaf);
+      clearTimeout(startTimer);
+    };
+  }, []);
 
   async function handleSignIn(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -66,135 +123,188 @@ export function Login() {
   return (
     <main className={styles.page}>
 
-      {/* =========================================
-          LEFT SIDE: Dark Midnight/Slate Area
-          ========================================= */}
-      <section className={styles.leftSide}>
-        <div className={styles.backgroundAmbience} aria-hidden="true">
-          <div className={styles.orbPrimary} />
-          <div className={styles.orbSecondary} />
-          <div className={styles.gridOverlay} />
+      {/* ════════════════════════════════════
+          LEFT PANEL — Dark engine
+          ════════════════════════════════════ */}
+      <section className={styles.leftPanel}>
+
+        {/* Brand */}
+        <div className={styles.brand}>
+          <div className={styles.brandMark}>
+            <div className={styles.brandDot} />
+          </div>
+          <span className={styles.brandName}>Kalika.</span>
         </div>
 
-        <div className={styles.leftContent}>
-          <div className={styles.badge}>
-            <ShieldCheck className={styles.badgeIcon} />
-            <span>Secure procurement workflow</span>
-          </div>
+        {/* Scanning document visual */}
+        <div className={styles.docStackWrapper}>
+          <div className={styles.docStackInner} ref={stackInnerRef}>
+            {/* Back layers */}
+            <div className={`${styles.docLayer} ${styles.docLayerBack1}`} />
+            <div className={`${styles.docLayer} ${styles.docLayerBack2}`} />
 
-          <div className={styles.headingGroup}>
-            <h1 className={styles.title}>Sign in before you process client packet cases.</h1>
-            <p className={styles.description}>
-              This workspace runs with authenticated access. Sign in to upload
-              procurement packets, extract fields, verify document data, and securely save results to your workspace.
-            </p>
-          </div>
+            {/* Front document */}
+            <div className={`${styles.docLayer} ${styles.docLayerFront}`}>
+              {/* Scan line */}
+              <div className={styles.scanLine} ref={scannerRef} />
 
-          <div className={styles.featureGrid}>
-            <div className={styles.featureCard}>
-              <div className={styles.featureTitle}>Login-protected</div>
-              <div className={styles.featureBody}>
-                Unauthenticated visitors are safely redirected here.
+              {/* Doc header */}
+              <div className={styles.docHeader}>
+                <span className={styles.docId}>PKT-2024-0341</span>
+                <span className={styles.docBadge}>CONFIDENTIAL</span>
+              </div>
+
+              {/* Fake content lines */}
+              <div className={styles.docLines}>
+                <div className={styles.docLine} style={{ width: "100%" }} />
+                <div className={styles.docLine} style={{ width: "83%" }} />
+                <div className={styles.docLine} style={{ width: "100%" }} />
+                <div className={styles.docBoxRow}>
+                  <div className={styles.docBox} style={{ flex: "1" }} />
+                  <div className={styles.docBox} style={{ flex: "2" }} />
+                </div>
+                <div className={styles.docLine} style={{ width: "100%" }} />
+                <div className={styles.docLine} style={{ width: "72%" }} />
+                <div className={styles.docLine} style={{ width: "90%" }} />
+              </div>
+
+              {/* Progress / extraction bar */}
+              <div className={styles.extraction}>
+                <div className={styles.extractionLabel}>
+                  <div className={styles.extractionPing} />
+                  <span>EXTRACTING FIELDS...</span>
+                </div>
+                <div className={styles.progressTrack}>
+                  <div className={styles.progressBar} ref={progressRef} />
+                </div>
               </div>
             </div>
-            <div className={styles.featureCard}>
-              <div className={styles.featureTitle}>User-owned cases</div>
-              <div className={styles.featureBody}>
-                Processed packets are securely saved to your account.
-              </div>
-            </div>
-            <div className={styles.featureCard}>
-              <div className={styles.featureTitle}>Server-side APIs</div>
-              <div className={styles.featureBody}>
-                Sensitive network routes require a valid session.
-              </div>
-            </div>
+          </div>
+        </div>
+
+        {/* Bottom copy */}
+        <div className={styles.leftFooter}>
+          <h2 className={styles.leftHeading}>
+            Procurement packet<br />
+            <span className={styles.leftAccent}>intelligence engine.</span>
+          </h2>
+          <div className={styles.leftMeta}>
+            <span>● SECURE WORKFLOW</span>
+            <span>● FIELD EXTRACTION</span>
           </div>
         </div>
       </section>
 
-      {/* =========================================
-          RIGHT SIDE: Action / Form Area
-          ========================================= */}
-      <section className={styles.rightSide}>
-        <div className={styles.panelWrapper}>
-          <div className={styles.panel}>
-            <header className={styles.panelHeader}>
-              <h2 className={styles.panelTitle}>Access Workspace</h2>
-              <p className={styles.panelDescription}>
-                Enter your credentials to continue to your dashboard.
-              </p>
-            </header>
-            <form className={styles.form} onSubmit={handleSignIn}>
-              <label className={styles.field}>
-                <span className={styles.fieldLabel}>Email Address</span>
-                <div className={styles.inputWrap}>
-                  <Mail className={styles.fieldIcon} />
-                  <Input
-                    type="email"
-                    required
-                    value={email}
-                    onChange={(event) => setEmail(event.target.value)}
-                    placeholder="you@company.com"
-                    className={styles.input}
-                  />
-                </div>
-              </label>
+      {/* ════════════════════════════════════
+          RIGHT PANEL — Light form
+          ════════════════════════════════════ */}
+      <section className={styles.rightPanel}>
 
-              <label className={styles.field}>
-                <div className={styles.labelRow}>
-                  <span className={styles.fieldLabel}>Password</span>
-                  <a href="/forgot-password" className={styles.forgotPassword} onClick={(e) => { e.preventDefault(); }}>
-                    Forgot password?
-                  </a>
-                </div>
-                <div className={styles.inputWrap}>
-                  <LockKeyhole className={styles.fieldIcon} />
-                  <Input
-                    type={showPassword ? "text" : "password"}
-                    required
-                    value={password}
-                    onChange={(event) => setPassword(event.target.value)}
-                    placeholder="••••••••"
-                    className={styles.input}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className={styles.togglePassword}
-                    aria-label={showPassword ? "Hide password" : "Show password"}
-                  >
-                    {showPassword ? <EyeOff /> : <Eye />}
-                  </button>
-                </div>
-              </label>
+        {/* Status strip */}
+        <div className={styles.statusStrip}>
+          <div className={styles.statusDot} />
+          <span className={styles.statusText}>Systems Operational</span>
+        </div>
 
-              <Button type="submit" className={styles.submitButton} disabled={loadingMode !== null}>
-                {loadingMode === "signin" ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Authenticating...
-                  </>
-                ) : (
-                  "Sign In to Workspace"
-                )}
-              </Button>
-            </form>
+        {/* Login card */}
+        <div className={styles.card}>
+          {/* Brutalist corner marks */}
+          <div className={`${styles.corner} ${styles.cornerTL}`} />
+          <div className={`${styles.corner} ${styles.cornerTR}`} />
+          <div className={`${styles.corner} ${styles.cornerBL}`} />
+          <div className={`${styles.corner} ${styles.cornerBR}`} />
 
-            {message && (
-              <div className={`${styles.feedback} ${styles.success}`}>
-                <CheckCircle2 className={styles.feedbackIcon} />
-                <span>{message}</span>
-              </div>
-            )}
-
-            {error && (
-              <div className={`${styles.feedback} ${styles.error}`}>
-                <AlertCircle className={styles.feedbackIcon} />
-                <span>{error}</span>
-              </div>
-            )}
+          <div className={styles.cardHeader}>
+            <h1 className={styles.cardTitle}>Identify.</h1>
+            <p className={styles.cardSub}>
+              Authenticate to access your case workspace.
+            </p>
           </div>
+
+          <form className={styles.form} onSubmit={handleSignIn}>
+            {/* Email */}
+            <div className={styles.fieldGroup}>
+              <label className={styles.fieldLabel} htmlFor="login-email">
+                Work Email
+              </label>
+              <input
+                id="login-email"
+                type="email"
+                required
+                autoComplete="email"
+                placeholder="name@company.com"
+                className={styles.input}
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
+            </div>
+
+            {/* Password */}
+            <div className={styles.fieldGroup}>
+              <label className={styles.fieldLabel} htmlFor="login-password">
+                Password
+              </label>
+              <div className={styles.inputWrap}>
+                <input
+                  id="login-password"
+                  type={showPassword ? "text" : "password"}
+                  required
+                  autoComplete="current-password"
+                  placeholder="••••••••••••"
+                  className={`${styles.input} ${styles.inputPassword}`}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className={styles.eyeBtn}
+                  onClick={() => setShowPassword((v) => !v)}
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                >
+                  {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
+                </button>
+              </div>
+            </div>
+
+            {/* Submit */}
+            <button
+              type="submit"
+              className={styles.submitBtn}
+              disabled={loadingMode !== null}
+            >
+              {loadingMode === "signin" ? (
+                <>
+                  <Loader2 className={styles.spinIcon} size={16} />
+                  Authenticating...
+                </>
+              ) : (
+                "Initialize Session"
+              )}
+            </button>
+          </form>
+
+          {/* Feedback banners */}
+          {message && (
+            <div className={`${styles.feedback} ${styles.feedbackSuccess}`}>
+              <CheckCircle2 size={15} className={styles.feedbackIcon} />
+              <span>{message}</span>
+            </div>
+          )}
+          {error && (
+            <div className={`${styles.feedback} ${styles.feedbackError}`}>
+              <AlertCircle size={15} className={styles.feedbackIcon} />
+              <span>{error}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Footer links */}
+        <div className={styles.pageFooter}>
+          <a href="#" className={styles.footerLink}>Documentation</a>
+          <span className={styles.footerDot}>•</span>
+          <a href="#" className={styles.footerLink}>Contact Support</a>
+          <span className={styles.footerDot}>•</span>
+          <a href="#" className={styles.footerLink}>Legal</a>
         </div>
       </section>
     </main>

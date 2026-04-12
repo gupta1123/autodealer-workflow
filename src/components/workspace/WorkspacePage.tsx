@@ -434,10 +434,10 @@ export function WorkspacePage() {
 
   if (pipelineStatus === "idle") {
     return renderWithSidebar(
-      <section className="relative flex min-h-[calc(100vh-2rem)] items-center justify-center overflow-hidden rounded-[2rem] bg-gradient-to-br from-slate-50 via-indigo-50/40 to-white">
+      <section className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#f7f7f5]">
         <div className="absolute inset-0 -z-10">
-          <div className="absolute left-[8%] top-[12%] h-72 w-72 rounded-full bg-slate-900/6 blur-3xl" />
-          <div className="absolute right-[14%] bottom-[15%] h-80 w-80 rounded-full bg-indigo-400/12 blur-3xl" />
+          <div className="absolute left-[8%] top-[12%] h-72 w-72 rounded-full bg-[#e5ddd0]/40 blur-3xl" />
+          <div className="absolute right-[14%] bottom-[15%] h-80 w-80 rounded-full bg-[#d4c9b8]/30 blur-3xl" />
         </div>
         <motion.div
           initial={{ opacity: 0, y: 24 }}
@@ -445,8 +445,8 @@ export function WorkspacePage() {
           transition={{ duration: 0.6, ease: "easeOut" }}
           className="relative z-10 mx-auto flex w-full max-w-4xl flex-col items-center gap-10 px-6 py-16 text-center"
         >
-          <div className="inline-flex items-center gap-2 rounded-full border border-indigo-100 bg-white/90 px-4 py-1.5 text-xs font-medium text-slate-600 shadow-sm backdrop-blur">
-            <Sparkles className="h-3.5 w-3.5 text-indigo-500" />
+          <div className="inline-flex items-center gap-2 rounded-full border border-[#e5ddd0] bg-white px-4 py-1.5 text-xs font-medium text-[#5a5046] shadow-sm">
+            <Sparkles className="h-3.5 w-3.5 text-[#8a7f72]" />
             Procurement Workflow Demo
           </div>
           <div className="space-y-4">
@@ -458,8 +458,8 @@ export function WorkspacePage() {
             </p>
           </div>
           <div className="w-full max-w-3xl space-y-6">
-            <label className="relative flex flex-col items-center justify-center gap-3 rounded-3xl border border-dashed border-slate-300 bg-white/90 px-8 py-10 text-slate-600 shadow-sm transition hover:border-indigo-300 hover:bg-white">
-              <Upload className="h-6 w-6 text-indigo-500" />
+            <label className="relative flex flex-col items-center justify-center gap-3 rounded-3xl border border-dashed border-[#c8bfb2] bg-white px-8 py-10 text-[#5a5046] shadow-sm transition hover:border-[#8a7f72] hover:bg-white cursor-pointer">
+              <Upload className="h-6 w-6 text-[#8a7f72]" />
               <div className="text-base font-medium">Upload packet documents</div>
               <p className="text-sm text-slate-500">
                 Case PDFs with tax invoices, purchase orders, e-way bills, weighment slips, LR copies, RCs, driving licences, PAN cards, FASTag toll proofs, test certificates, transport permits, and photo evidence
@@ -609,10 +609,10 @@ export function WorkspacePage() {
     }
 
     return renderWithSidebar(
-      <section className="relative flex min-h-[calc(100vh-2rem)] items-center justify-center overflow-hidden rounded-[2rem] bg-gradient-to-br from-slate-50 via-indigo-50/40 to-white text-slate-900">
+      <section className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#f7f7f5] text-[#1a1a1a]">
         <div className="absolute inset-0 -z-10">
-          <div className="absolute left-[12%] top-[8%] h-72 w-72 rounded-full bg-slate-900/6 blur-3xl" />
-          <div className="absolute right-[10%] bottom-[12%] h-80 w-80 rounded-full bg-indigo-400/12 blur-3xl" />
+          <div className="absolute left-[12%] top-[8%] h-72 w-72 rounded-full bg-[#e5ddd0]/40 blur-3xl" />
+          <div className="absolute right-[10%] bottom-[12%] h-80 w-80 rounded-full bg-[#d4c9b8]/30 blur-3xl" />
         </div>
         <motion.div
           initial={{ opacity: 0, y: 24 }}
@@ -629,17 +629,17 @@ export function WorkspacePage() {
                 Classifying, digitizing, and validating uploads…
               </h1>
             </div>
-            <div className="rounded-2xl border border-indigo-100 bg-white px-4 py-3 text-right shadow-lg">
+            <div className="rounded-2xl border border-[#e5ddd0] bg-white px-4 py-3 text-right shadow-sm">
               <div className="text-[11px] uppercase tracking-wide text-slate-500">Elapsed</div>
               <div className="text-lg font-semibold text-slate-900">{secondsElapsed}s</div>
             </div>
           </div>
 
-          <div className="rounded-3xl border border-indigo-100 bg-white/90 px-6 py-6 shadow-xl backdrop-blur">
+          <div className="rounded-3xl border border-[#e5ddd0] bg-white px-6 py-6 shadow-sm">
             <div className="mb-4 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex items-center gap-3">
-                <div className="grid h-12 w-12 place-items-center rounded-2xl bg-indigo-50 text-indigo-600 shadow-inner">
-                  <Sparkles className="h-6 w-6 animate-pulse text-indigo-600" />
+                <div className="grid h-12 w-12 place-items-center rounded-2xl bg-[#f0ece6] text-[#8a7f72] shadow-inner">
+                  <Sparkles className="h-6 w-6 animate-pulse text-[#8a7f72]" />
                 </div>
                 <div>
                   <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
@@ -671,7 +671,7 @@ export function WorkspacePage() {
               initial={{ opacity: 0, y: 12 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.4, ease: "easeOut" }}
-              className="flex h-full flex-col rounded-3xl border border-indigo-100 bg-white p-6 shadow-xl"
+              className="flex h-full flex-col rounded-3xl border border-[#e5ddd0] bg-white p-6 shadow-sm"
             >
               <div className="flex items-start justify-between">
                 <div>
@@ -713,8 +713,8 @@ export function WorkspacePage() {
                   </div>
                   <div className="text-xs text-slate-400">Source file · {sourceName}</div>
                 </div>
-                <div className="flex items-center gap-1 rounded-full border border-indigo-100 bg-indigo-50 px-3 py-1 text-xs text-slate-700">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-600" />
+                <div className="flex items-center gap-1 rounded-full border border-[#e5ddd0] bg-[#f0ece6] px-3 py-1 text-xs text-[#5a5046]">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[#8a7f72]" />
                   {currentStageMeta.label}
                 </div>
               </div>
@@ -764,7 +764,7 @@ export function WorkspacePage() {
 
   if (pipelineStatus === "error") {
     return renderWithSidebar(
-      <section className="flex min-h-[calc(100vh-2rem)] flex-col items-center justify-center gap-4 rounded-[2rem] bg-gradient-to-br from-white via-zinc-100 to-white text-center text-slate-700">
+      <section className="flex min-h-screen flex-col items-center justify-center gap-4 bg-[#f7f7f5] text-center text-[#5a5046]">
         <div className="rounded-3xl border border-red-200 bg-red-50 px-6 py-5 shadow-sm">
           <p className="text-sm font-medium text-red-700">Something went wrong while processing documents.</p>
           {pipelineError && <p className="mt-2 text-xs text-red-600">{pipelineError}</p>}
@@ -779,7 +779,7 @@ export function WorkspacePage() {
   // Safety check for activeDoc
   if (!activeDoc) {
     return renderWithSidebar(
-      <section className="flex min-h-[calc(100vh-2rem)] items-center justify-center rounded-[2rem] bg-white">
+      <section className="flex min-h-screen items-center justify-center bg-[#f7f7f5]">
         <p className="text-zinc-600">No document selected</p>
       </section>
     );
@@ -792,7 +792,7 @@ export function WorkspacePage() {
           <div>
             <div className="text-xs uppercase tracking-[0.3em] text-zinc-500">Dashboard</div>
             <h1 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900 sm:text-3xl">
-              Packet review workspace
+              Add Case
             </h1>
             <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-600">
               Review extracted packet documents, compare shared fields, inspect mismatches, and
