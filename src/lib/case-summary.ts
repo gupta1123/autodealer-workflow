@@ -1,28 +1,116 @@
 import { CORE_PACKET_GROUPS } from "@/lib/document-schema";
-import type { CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
+import type { CaseDoc, DocType, FieldKey, Mismatch } from "@/types/pipeline";
 
 export type CaseSummary = {
   slug: string;
   displayName: string;
   buyerName: string;
+  category: string;
+  packetCategory: string;
   poNumber: string;
   invoiceNumber: string;
+  primaryReference: string;
   paymentGap: number;
   riskScore: number;
   missingDocTypes: string[];
   documentTypes: string[];
 };
 
+type ProcessingMetaLike = {
+  caseCategory?: unknown;
+  packetCategory?: unknown;
+  documentTypes?: unknown;
+};
+
+const RECEIVER_DOC_WEIGHTS: Partial<Record<DocType, number>> = {
+  "Tax Invoice": 6,
+  Invoice: 6,
+  "Purchase Order": 6,
+  "Amended Purchase Order": 6,
+  "E-Way Bill": 4,
+  "Delivery Note": 4,
+  "Delivery Challan": 4,
+  "Lorry Receipt": 3,
+  "Weighment Slip": 3,
+  "Material Test Certificate": 2,
+};
+
+const RECEIVER_FIELD_PRIORITY_BY_DOC_TYPE: Record<DocType, FieldKey[]> = {
+  "Purchase Order": ["vendorName", "buyerName"],
+  "Amended Purchase Order": ["vendorName", "buyerName"],
+  Invoice: ["buyerName"],
+  "Tax Invoice": ["buyerName"],
+  Receipt: ["buyerName"],
+  "Delivery Note": ["buyerName"],
+  "Delivery Challan": ["buyerName"],
+  "E-Way Bill": ["buyerName"],
+  "Weighment Slip": ["buyerName"],
+  "Lorry Receipt": ["buyerName"],
+  "Vehicle Registration Certificate": [],
+  "Driving Licence": [],
+  "PAN Card": [],
+  "FASTag Toll Proof": [],
+  "Material Test Certificate": ["buyerName"],
+  "Photo Evidence": [],
+  "Transport Permit": [],
+  "Bank Statement": [],
+  "Map Printout": [],
+  "Payment Screenshot": [],
+  Unknown: ["buyerName"],
+};
+
+const CASE_SUBJECT_FIELD_PRIORITY_BY_DOC_TYPE: Partial<Record<DocType, FieldKey[]>> = {
+  "Vehicle Registration Certificate": ["ownerName"],
+  "Driving Licence": ["driverName", "holderName"],
+  "PAN Card": ["holderName"],
+  "Transport Permit": ["ownerName"],
+};
+
+const CASE_CATEGORY_BY_DOC_TYPE: Record<DocType, string> = {
+  "Purchase Order": "Purchase packet",
+  "Amended Purchase Order": "Purchase packet",
+  Invoice: "Commercial packet",
+  "Tax Invoice": "Commercial packet",
+  Receipt: "Payment packet",
+  "Delivery Note": "Logistics packet",
+  "Delivery Challan": "Logistics packet",
+  "E-Way Bill": "Logistics packet",
+  "Weighment Slip": "Weight packet",
+  "Lorry Receipt": "Logistics packet",
+  "Vehicle Registration Certificate": "Vehicle KYC packet",
+  "Driving Licence": "Vehicle KYC packet",
+  "PAN Card": "Vehicle KYC packet",
+  "FASTag Toll Proof": "Transport proof packet",
+  "Material Test Certificate": "Quality packet",
+  "Photo Evidence": "Evidence packet",
+  "Transport Permit": "Transport proof packet",
+  "Bank Statement": "Payment packet",
+  "Map Printout": "Route packet",
+  "Payment Screenshot": "Payment packet",
+  Unknown: "General packet",
+};
+
 function normalizeValue(value?: string | null) {
   return value?.replace(/\s+/g, " ").trim() ?? "";
 }
 
-function firstFieldValue(documents: CaseDoc[], field: FieldKey) {
-  for (const document of documents) {
-    const value = normalizeValue(document.fields[field]);
-    if (value) return value;
+function normalizePartyName(value?: string | null) {
+  const normalized = normalizeValue(value);
+  const matchKey = normalizeMatchKey(normalized);
+
+  if (
+    !normalized ||
+    normalized.length < 2 ||
+    ["na", "notapplicable", "notavailable", "notvisible", "unknown", "none", "nil"].includes(matchKey)
+  ) {
+    return "";
   }
-  return "";
+
+  return normalized;
+}
+
+function normalizeMatchKey(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 function currencyishToNumber(value?: string) {
@@ -41,14 +129,303 @@ function slugify(value: string, fallback: string) {
   return normalized || fallback;
 }
 
+function formatSourceDisplayName(value: string) {
+  return value
+    .replace(/\.[^.]+$/, "")
+    .replace(/[-_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function firstFieldValue(documents: CaseDoc[], field: FieldKey) {
+  for (const document of documents) {
+    const value = normalizeValue(document.fields[field]);
+    if (value) return value;
+  }
+  return "";
+}
+
+function pickWeightedDocumentValue(
+  documents: CaseDoc[],
+  getValue: (document: CaseDoc) => string,
+  getWeight: (document: CaseDoc) => number
+) {
+  const ranked = new Map<
+    string,
+    {
+      value: string;
+      score: number;
+      count: number;
+      firstSeenAt: number;
+    }
+  >();
+
+  documents.forEach((document, index) => {
+    const value = normalizeValue(getValue(document));
+    if (!value) return;
+
+    const key = normalizeMatchKey(value);
+    const current = ranked.get(key);
+    if (current) {
+      current.score += getWeight(document);
+      current.count += 1;
+      return;
+    }
+
+    ranked.set(key, {
+      value,
+      score: getWeight(document),
+      count: 1,
+      firstSeenAt: index,
+    });
+  });
+
+  const best = Array.from(ranked.values()).sort((left, right) => {
+    if (right.score !== left.score) return right.score - left.score;
+    if (right.count !== left.count) return right.count - left.count;
+    return left.firstSeenAt - right.firstSeenAt;
+  })[0];
+
+  return best?.value ?? "";
+}
+
+function getReceiverWeight(document: CaseDoc) {
+  return RECEIVER_DOC_WEIGHTS[document.type] ?? 1;
+}
+
+function firstDocumentPartyValue(document: CaseDoc, fields: readonly FieldKey[]) {
+  for (const field of fields) {
+    const value = normalizePartyName(document.fields[field]);
+    if (value) {
+      return value;
+    }
+  }
+
+  return "";
+}
+
+function getReceiverCandidate(document: CaseDoc) {
+  return firstDocumentPartyValue(
+    document,
+    RECEIVER_FIELD_PRIORITY_BY_DOC_TYPE[document.type] ?? RECEIVER_FIELD_PRIORITY_BY_DOC_TYPE.Unknown
+  );
+}
+
+function getCaseSubjectCandidate(document: CaseDoc) {
+  return firstDocumentPartyValue(document, CASE_SUBJECT_FIELD_PRIORITY_BY_DOC_TYPE[document.type] ?? []);
+}
+
+export function deriveCaseReceiverName(documents: CaseDoc[]) {
+  const receiverName = pickWeightedDocumentValue(
+    documents,
+    getReceiverCandidate,
+    getReceiverWeight
+  );
+
+  if (receiverName) {
+    return receiverName;
+  }
+
+  return pickWeightedDocumentValue(
+    documents,
+    getCaseSubjectCandidate,
+    (document) => Math.max(1, getReceiverWeight(document) - 2)
+  );
+}
+
+function deriveSourceDisplayName(documents: CaseDoc[]) {
+  const sourceName = documents
+    .map((document) => normalizeValue(document.sourceHint))
+    .find((value) => value.length > 0);
+
+  return sourceName ? formatSourceDisplayName(sourceName) : "";
+}
+
+function derivePrimaryReference(documents: CaseDoc[]) {
+  const invoiceReference = pickWeightedDocumentValue(
+    documents,
+    (document) => normalizeValue(document.fields.invoiceNumber ?? document.fields.referenceInvoiceNumber),
+    (document) => (document.type === "Invoice" || document.type === "Tax Invoice" ? 5 : 2)
+  );
+
+  if (invoiceReference) {
+    return invoiceReference;
+  }
+
+  const purchaseReference = pickWeightedDocumentValue(
+    documents,
+    (document) => normalizeValue(document.fields.poNumber ?? document.fields.referencePoNumber),
+    (document) =>
+      document.type === "Purchase Order" || document.type === "Amended Purchase Order" ? 5 : 2
+  );
+
+  if (purchaseReference) {
+    return purchaseReference;
+  }
+
+  const referenceFieldPriority: FieldKey[] = [
+    "eWayBillNumber",
+    "lorryReceiptNumber",
+    "weighmentNumber",
+    "receiptNumber",
+    "certificateNumber",
+    "permitNumber",
+    "vehicleNumber",
+  ];
+
+  for (const field of referenceFieldPriority) {
+    const value = firstFieldValue(documents, field);
+    if (value) {
+      return value;
+    }
+  }
+
+  return "";
+}
+
+function derivePacketCategory(documents: CaseDoc[]) {
+  if (documents.length === 0) {
+    return "Draft case";
+  }
+
+  const presentTypes = Array.from(new Set(documents.map((document) => document.type)));
+  const presentCategories = Array.from(
+    new Set(presentTypes.map((type) => CASE_CATEGORY_BY_DOC_TYPE[type] ?? "General packet"))
+  );
+
+  if (presentTypes.length === 1) {
+    return presentCategories[0];
+  }
+
+  const presentCoreGroups = CORE_PACKET_GROUPS.filter((group) =>
+    group.types.some((type) => presentTypes.includes(type))
+  );
+
+  if (presentCoreGroups.length >= 2) {
+    return "Procurement packet";
+  }
+
+  if (presentCategories.length === 1) {
+    return presentCategories[0];
+  }
+
+  return "Mixed document packet";
+}
+
+export function resolveCaseCategoryLabel(params: {
+  receiverName?: string | null;
+  storedCategory?: string | null;
+  status?: string | null;
+}) {
+  const receiverName = normalizeValue(params.receiverName);
+  const storedCategory = normalizeValue(params.storedCategory);
+
+  if (receiverName) {
+    return `${receiverName} packet`;
+  }
+
+  if (params.status === "draft") {
+    return "Receiver pending";
+  }
+
+  if (storedCategory) {
+    return storedCategory;
+  }
+
+  return "General packet";
+}
+
+export function getCaseCategoryFromProcessingMeta(
+  processingMeta: unknown,
+  status?: string,
+  fallbackDocumentTypes?: string[]
+) {
+  const record =
+    processingMeta && typeof processingMeta === "object" && !Array.isArray(processingMeta)
+      ? (processingMeta as ProcessingMetaLike)
+      : {};
+
+  if (typeof record.caseCategory === "string" && record.caseCategory.trim().length > 0) {
+    return record.caseCategory;
+  }
+
+  if (typeof record.packetCategory === "string" && record.packetCategory.trim().length > 0) {
+    return record.packetCategory;
+  }
+
+  const documentTypes = Array.isArray(record.documentTypes)
+    ? record.documentTypes.filter((value): value is DocType => typeof value === "string")
+    : (fallbackDocumentTypes?.filter((value): value is DocType => typeof value === "string") ?? []);
+
+  if (documentTypes.length > 0) {
+    return derivePacketCategory(
+      documentTypes.map((type, index) => ({
+        id: `${type}-${index}`,
+        type,
+        title: type,
+        pages: 1,
+        fields: {},
+        md: "",
+      }))
+    );
+  }
+
+  if (status === "draft") {
+    return "Draft case";
+  }
+
+  return "General packet";
+}
+
+export function resolveStoredCaseDisplayName(params: {
+  storedDisplayName?: string | null;
+  receiverName?: string | null;
+  invoiceNumber?: string | null;
+  poNumber?: string | null;
+  category?: string | null;
+  status?: string | null;
+}) {
+  const storedDisplayName = normalizeValue(params.storedDisplayName);
+  const receiverName = normalizeValue(params.receiverName);
+  const primaryReference =
+    normalizeValue(params.invoiceNumber) || normalizeValue(params.poNumber);
+  const category = resolveCaseCategoryLabel({
+    receiverName,
+    storedCategory: params.category,
+    status: params.status,
+  });
+
+  if (receiverName) {
+    return primaryReference ? `${receiverName} / ${primaryReference}` : receiverName;
+  }
+
+  if (params.status === "draft") {
+    return storedDisplayName ? `Receiver pending / ${storedDisplayName}` : "Receiver pending";
+  }
+
+  if (storedDisplayName) {
+    return storedDisplayName;
+  }
+
+  if (primaryReference) {
+    return `${category} / ${primaryReference}`;
+  }
+
+  return category;
+}
+
 export function summarizeCase(documents: CaseDoc[], mismatches: Mismatch[]): CaseSummary {
-  const buyerName =
-    firstFieldValue(documents, "buyerName") ||
-    firstFieldValue(documents, "vendorName") ||
-    "pending-buyer";
+  const buyerName = deriveCaseReceiverName(documents);
   const poNumber = firstFieldValue(documents, "poNumber") || firstFieldValue(documents, "referencePoNumber");
   const invoiceNumber =
     firstFieldValue(documents, "invoiceNumber") || firstFieldValue(documents, "referenceInvoiceNumber");
+  const primaryReference = derivePrimaryReference(documents);
+  const sourceDisplayName = deriveSourceDisplayName(documents);
+  const packetCategory = derivePacketCategory(documents);
+  const category = resolveCaseCategoryLabel({
+    receiverName: buyerName,
+    storedCategory: packetCategory,
+  });
   const totalAmount = currencyishToNumber(firstFieldValue(documents, "totalAmount"));
   const paidAmount = currencyishToNumber(firstFieldValue(documents, "paidAmount"));
   const paymentGap = totalAmount && paidAmount ? Math.abs(totalAmount - paidAmount) : 0;
@@ -63,22 +440,27 @@ export function summarizeCase(documents: CaseDoc[], mismatches: Mismatch[]): Cas
     mismatches.length * 10 + missingDocTypes.length * 12 + (paymentGap > 0 ? 10 : 0)
   );
 
-  const buyerSlug = slugify(
-    buyerName
-      .split(/\s+/)
-      .filter(Boolean)
-      .slice(0, 3)
-      .join("-"),
-    "pending-buyer"
+  const subjectSlug = slugify(buyerName || sourceDisplayName || packetCategory, "packet-case");
+  const referenceSlug = slugify(
+    primaryReference || buyerName || sourceDisplayName || packetCategory,
+    "packet"
   );
-  const referenceSlug = slugify(poNumber || invoiceNumber || "pending-doc", "pending-doc");
 
   return {
-    slug: `${buyerSlug}-${referenceSlug}`,
-    displayName: `${buyerSlug}-${referenceSlug}`,
+    slug: `${subjectSlug}-${referenceSlug}`,
+    displayName: resolveStoredCaseDisplayName({
+      storedDisplayName: sourceDisplayName,
+      receiverName: buyerName,
+      invoiceNumber,
+      poNumber,
+      category,
+    }),
     buyerName,
+    category,
+    packetCategory,
     poNumber,
     invoiceNumber,
+    primaryReference,
     paymentGap,
     riskScore,
     missingDocTypes,

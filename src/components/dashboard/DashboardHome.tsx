@@ -66,7 +66,7 @@ export function DashboardHome() {
 
   return (
     <AppShell>
-      <div className="w-full animate-in fade-in slide-in-from-bottom-4 px-8 py-8 text-[#0f172a] duration-700 ease-out">
+      <div className="w-full animate-in fade-in slide-in-from-bottom-4 px-4 py-6 text-[#0f172a] duration-700 ease-out sm:px-8 sm:py-8">
 
         {/* HEADER SECTION */}
         <header className="mb-10 flex flex-col items-start gap-4">
@@ -212,7 +212,7 @@ export function DashboardHome() {
                         {item.displayName}
                       </h3>
                       <p className="truncate text-[11px] font-semibold text-[#94a3b8] uppercase tracking-wider mt-1">
-                        {item.buyerName || item.slug}
+                        {item.category} • {item.receiverName || "Receiver pending"}
                       </p>
                     </div>
                   </div>

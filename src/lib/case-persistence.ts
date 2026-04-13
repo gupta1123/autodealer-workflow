@@ -1,10 +1,12 @@
-import type { CaseDoc, Mismatch, QueuedUpload } from "@/types/pipeline";
+import type { CaseDoc, ComparisonOptions, Mismatch, QueuedUpload } from "@/types/pipeline";
 
 export type SavedCaseRecord = {
   id: string;
   slug: string;
   displayName: string;
   buyerName: string | null;
+  receiverName: string | null;
+  category: string;
   poNumber: string | null;
   invoiceNumber: string | null;
   status: string;
@@ -69,6 +71,7 @@ type RecentCasesResponse = {
 
 type CaseDetailResponse = SavedCaseDetail;
 export type CaseListScope = "active" | "deleted";
+export type CaseDecision = "accepted" | "rejected";
 
 function extractApiError(payload: unknown, fallback: string) {
   if (!payload || typeof payload !== "object") {
@@ -97,10 +100,14 @@ export async function persistProcessedCase(params: {
   uploads: QueuedUpload[];
   documents: CaseDoc[];
   mismatches: Mismatch[];
+  comparisonOptions?: ComparisonOptions;
 }): Promise<CreateCaseResponse> {
   const formData = new FormData();
   formData.set("documents", JSON.stringify(params.documents));
   formData.set("mismatches", JSON.stringify(params.mismatches));
+  if (params.comparisonOptions) {
+    formData.set("comparisonOptions", JSON.stringify(params.comparisonOptions));
+  }
 
   for (const upload of params.uploads) {
     if (upload.file) {
@@ -119,6 +126,95 @@ export async function persistProcessedCase(params: {
 
   if (!response.ok || !payload.case) {
     throw new Error(extractApiError(payload, "Failed to save processed case to Supabase."));
+  }
+
+  return { case: payload.case };
+}
+
+export async function createDraftCase(params: {
+  uploads: QueuedUpload[];
+}): Promise<CreateCaseResponse> {
+  const formData = new FormData();
+  formData.set("mode", "draft");
+
+  for (const upload of params.uploads) {
+    if (upload.file) {
+      formData.append("files", upload.file, upload.file.name || upload.name);
+    }
+  }
+
+  const response = await fetch("/api/cases", {
+    method: "POST",
+    body: formData,
+  });
+
+  const payload = (await response.json().catch(() => ({}))) as Partial<CreateCaseResponse> & {
+    error?: string;
+  };
+
+  if (!response.ok || !payload.case) {
+    throw new Error(extractApiError(payload, "Failed to create draft case."));
+  }
+
+  return { case: payload.case };
+}
+
+export async function appendCaseFiles(
+  caseId: string,
+  uploads: QueuedUpload[],
+  mode: "append" | "overwrite" = "append"
+): Promise<CreateCaseResponse> {
+  const formData = new FormData();
+  formData.set("mode", mode);
+
+  for (const upload of uploads) {
+    if (upload.file) {
+      formData.append("files", upload.file, upload.file.name || upload.name);
+    }
+  }
+
+  const response = await fetch(`/api/cases/${caseId}/files`, {
+    method: "POST",
+    body: formData,
+  });
+
+  const payload = (await response.json().catch(() => ({}))) as Partial<CreateCaseResponse> & {
+    error?: string;
+  };
+
+  if (!response.ok || !payload.case) {
+    throw new Error(extractApiError(payload, "Failed to add files to case."));
+  }
+
+  return { case: payload.case };
+}
+
+export async function saveCaseAnalysis(
+  caseId: string,
+  params: {
+    documents: CaseDoc[];
+    mismatches: Mismatch[];
+    comparisonOptions?: ComparisonOptions;
+  }
+): Promise<CreateCaseResponse> {
+  const formData = new FormData();
+  formData.set("documents", JSON.stringify(params.documents));
+  formData.set("mismatches", JSON.stringify(params.mismatches));
+  if (params.comparisonOptions) {
+    formData.set("comparisonOptions", JSON.stringify(params.comparisonOptions));
+  }
+
+  const response = await fetch(`/api/cases/${caseId}/analysis`, {
+    method: "POST",
+    body: formData,
+  });
+
+  const payload = (await response.json().catch(() => ({}))) as Partial<CreateCaseResponse> & {
+    error?: string;
+  };
+
+  if (!response.ok || !payload.case) {
+    throw new Error(extractApiError(payload, "Failed to save case analysis."));
   }
 
   return { case: payload.case };
@@ -196,6 +292,18 @@ export async function restoreCase(caseId: string) {
       body: JSON.stringify({ action: "restore" }),
     },
     "Failed to restore case from the recycle bin."
+  );
+}
+
+export async function updateCaseDecision(caseId: string, decision: CaseDecision) {
+  return mutateCase(
+    caseId,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: decision === "accepted" ? "accept" : "reject" }),
+    },
+    `Failed to ${decision === "accepted" ? "accept" : "reject"} case.`
   );
 }
 

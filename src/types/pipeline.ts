@@ -155,6 +155,10 @@ export interface Mismatch {
   fixPlan?: string;
 }
 
+export interface ComparisonOptions {
+  considerFormatting: boolean;
+}
+
 export type ProcessingStep =
   | "idle"
   | "reading_files"

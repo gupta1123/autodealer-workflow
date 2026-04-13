@@ -84,6 +84,16 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
               </li>
             );
           })}
+          <li className={styles.mobileLogoutItem}>
+            <form action="/auth/signout" method="post">
+              <button type="submit" className={`${styles.navItem} ${styles.mobileLogoutButton}`}>
+                <div className={styles.navItemLeft}>
+                  <LogOut className={styles.navIcon} />
+                  <span className={styles.navTitle}>Logout</span>
+                </div>
+              </button>
+            </form>
+          </li>
         </ul>
       </nav>
 

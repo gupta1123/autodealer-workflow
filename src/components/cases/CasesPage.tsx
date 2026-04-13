@@ -49,6 +49,40 @@ function getRiskColor(score: number) {
   return "text-emerald-600 bg-emerald-50 border-emerald-200";
 }
 
+function getCaseStatusLabel(status: string) {
+  if (status === "draft") return "Draft";
+  if (status === "accepted") return "Accepted";
+  if (status === "rejected") return "Rejected";
+  if (status === "failed") return "Failed";
+  if (status === "processing") return "Processing";
+  return "Pending";
+}
+
+function getCaseStatusColor(status: string) {
+  if (status === "draft") return "text-amber-700 bg-amber-50 border-amber-200";
+  if (status === "accepted") return "text-emerald-700 bg-emerald-50 border-emerald-200";
+  if (status === "rejected") return "text-rose-700 bg-rose-50 border-rose-200";
+  if (status === "failed") return "text-red-700 bg-red-50 border-red-200";
+  if (status === "processing") return "text-blue-700 bg-blue-50 border-blue-200";
+  return "text-slate-600 bg-slate-50 border-slate-200";
+}
+
+function useIsMobileView() {
+  const [isMobileView, setIsMobileView] = useState(false);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia("(max-width: 767px)");
+    const update = () => setIsMobileView(mediaQuery.matches);
+
+    update();
+    mediaQuery.addEventListener("change", update);
+
+    return () => mediaQuery.removeEventListener("change", update);
+  }, []);
+
+  return isMobileView;
+}
+
 export function CasesPage() {
   const [cases, setCases] = useState<SavedCaseRecord[]>([]);
   const [status, setStatus] = useState<LoadState>("loading");
@@ -57,6 +91,7 @@ export function CasesPage() {
   const [viewMode, setViewMode] = useState<ViewMode>("table");
   const [pendingCase, setPendingCase] = useState<SavedCaseRecord | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const isMobileView = useIsMobileView();
 
   useEffect(() => {
     let active = true;
@@ -87,11 +122,14 @@ export function CasesPage() {
 
     return cases.filter((c) =>
       c.displayName.toLowerCase().includes(query) ||
-      (c.buyerName && c.buyerName.toLowerCase().includes(query)) ||
+      (c.receiverName && c.receiverName.toLowerCase().includes(query)) ||
+      c.category.toLowerCase().includes(query) ||
       (c.poNumber && c.poNumber.toLowerCase().includes(query)) ||
       c.slug.toLowerCase().includes(query)
     );
   }, [cases, searchQuery]);
+
+  const effectiveViewMode: ViewMode = isMobileView ? "grid" : viewMode;
 
   async function handleConfirmDelete() {
     if (!pendingCase) return;
@@ -239,7 +277,7 @@ export function CasesPage() {
             )}
 
             {status === "ready" && filteredCases.length > 0 && (
-              viewMode === "grid" ? (
+              effectiveViewMode === "grid" ? (
                 <div className="grid grid-cols-1 gap-4 px-6 md:grid-cols-2 md:px-8 xl:grid-cols-3">
                   {filteredCases.map((item) => (
                     <div
@@ -259,7 +297,7 @@ export function CasesPage() {
                               {item.displayName}
                             </Link>
                             <div className="mt-1 text-xs font-medium text-slate-500">
-                              {item.buyerName || "No buyer name"}
+                              {item.receiverName || "Receiver pending"}
                             </div>
                           </div>
                         </div>
@@ -275,7 +313,12 @@ export function CasesPage() {
 
                       <div className="mt-4 flex flex-wrap items-center gap-2">
                         <span className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                          Case File
+                          {item.category}
+                        </span>
+                        <span
+                          className={`rounded-md border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${getCaseStatusColor(item.status)}`}
+                        >
+                          {getCaseStatusLabel(item.status)}
                         </span>
                         <span
                           className={`rounded-md border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${getRiskColor(item.riskScore)}`}
@@ -322,7 +365,7 @@ export function CasesPage() {
                   <TableHeader>
                     <TableRow className="border-b border-slate-100 hover:bg-transparent">
                       <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Name</TableHead>
-                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Type</TableHead>
+                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Status</TableHead>
                       <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Category</TableHead>
                       <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Risk</TableHead>
                       <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Date</TableHead>
@@ -343,21 +386,26 @@ export function CasesPage() {
                             <span className="font-bold text-slate-800 text-sm group-hover:text-indigo-600 transition-colors truncate max-w-[200px] xl:max-w-[300px]">
                               {item.displayName}
                             </span>
-                            <span className="hidden sm:inline-flex items-center justify-center text-[10px] font-bold bg-white border border-slate-200 text-slate-500 px-2 py-0.5 rounded-full shadow-sm">
-                              {item.documentCount} items
-                            </span>
+                            <div className="hidden min-w-0 flex-col sm:flex">
+                              <span
+                                className="truncate text-[11px] font-semibold text-slate-500"
+                                title={item.receiverName || "Receiver pending"}
+                              >
+                                {item.receiverName || "Receiver pending"}
+                              </span>
+                            </div>
                           </Link>
                         </TableCell>
 
                         <TableCell className="py-3">
-                          <span className="font-bold text-xs text-slate-500 tracking-wide bg-slate-50 border border-slate-100 px-2 py-1 rounded-md uppercase">
-                            Case File
+                          <span className={`font-bold text-[10px] uppercase tracking-wider px-2.5 py-1 rounded-md border ${getCaseStatusColor(item.status)}`}>
+                            {getCaseStatusLabel(item.status)}
                           </span>
                         </TableCell>
 
                         <TableCell className="py-3">
-                          <span className="font-semibold text-slate-600 truncate block max-w-[150px]" title={item.buyerName || "—"}>
-                            {item.buyerName || "—"}
+                          <span className="font-semibold text-slate-600 truncate block max-w-[180px]" title={item.category}>
+                            {item.category}
                           </span>
                         </TableCell>
 

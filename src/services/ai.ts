@@ -1,10 +1,10 @@
 import type { CaseDoc, DocType, FieldKey, Mismatch } from "@/types/pipeline";
 import {
-  FIELD_DEFINITIONS,
+  ACTIVE_FIELD_DEFINITIONS,
   FIELD_LABELS,
   getFieldKeysForDocType,
+  omitIgnoredFields,
 } from "@/lib/document-schema";
-import { matchSampleByIndex, matchSampleByType } from "@/services/templates";
 
 let aiUnavailableReason: string | null = null;
 const CLIENT_MAX_RETRIES = Number(
@@ -136,13 +136,41 @@ async function callOpenRouter(messages: OpenRouterMessage[], label: string, expe
   throw lastError instanceof Error ? lastError : new Error(`OpenRouter ${label} failed`);
 }
 
-const ALL_ALLOWED_FIELD_KEYS = FIELD_DEFINITIONS.map((field) => field.key);
+const ALL_ALLOWED_FIELD_KEYS = ACTIVE_FIELD_DEFINITIONS.map((field) => field.key);
 
 const FIELD_MAPPINGS: Record<FieldKey, string[]> = {
-  vendorName: ["vendorName", "sellerName", "supplierName"],
+  vendorName: [
+    "vendorName",
+    "sellerName",
+    "supplierName",
+    "vendor",
+    "seller",
+    "supplier",
+    "consignorName",
+    "issuerName",
+  ],
   supplierGstin: ["supplierGstin", "vendorGstin", "sellerGstin", "gstin", "gstinUin"],
-  buyerName: ["buyerName", "customerName", "consigneeName"],
-  buyerGstin: ["buyerGstin", "customerGstin", "consigneeGstin", "shipToGstin"],
+  buyerName: [
+    "buyerName",
+    "customerName",
+    "consigneeName",
+    "buyer",
+    "customer",
+    "consignee",
+    "billToName",
+    "shipToName",
+    "recipientName",
+    "purchaserName",
+  ],
+  buyerGstin: [
+    "buyerGstin",
+    "customerGstin",
+    "consigneeGstin",
+    "shipToGstin",
+    "billToGstin",
+    "recipientGstin",
+    "purchaserGstin",
+  ],
   poNumber: ["poNumber", "purchaseOrderNumber"],
   poAmendmentNumber: ["poAmendmentNumber", "amendmentNumber", "poVersion", "revisionNumber"],
   invoiceNumber: ["invoiceNumber", "billNumber"],
@@ -307,7 +335,7 @@ function getOrderedFieldKeysForDocument(doc: CaseDoc): FieldKey[] {
   const orderedKeys = [...getAllowedFieldKeysForDocType(doc.type)];
   const seen = new Set<FieldKey>(orderedKeys);
 
-  for (const { key } of FIELD_DEFINITIONS) {
+  for (const { key } of ACTIVE_FIELD_DEFINITIONS) {
     if (doc.fields[key] && !seen.has(key)) {
       orderedKeys.push(key);
       seen.add(key);
@@ -350,31 +378,21 @@ function buildMarkdown(doc: CaseDoc): string {
   return lines.join("\n");
 }
 
-function fallbackDoc(fileName: string, index: number, docType?: DocType): CaseDoc {
-  const typeBased = docType && docType !== "Unknown" ? matchSampleByType(docType) : null;
-  const template =
-    typeBased ??
-    (docType && docType !== "Unknown"
-      ? ({
-          id: `generic_${docType.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`,
-          type: docType,
-          title: `${formatDocType(docType)} — ${fileName}`,
-          pages: 1,
-          fields: {},
-          md: `# ${formatDocType(docType)}\n\nSource file: ${fileName}`,
-          sourceHint: fileName,
-        } satisfies CaseDoc)
-      : matchSampleByIndex(index));
-  return {
-    ...template,
-    id: `${template.id}-${index}`,
+function fallbackDoc(fileName: string, docType?: DocType): CaseDoc {
+  const resolvedType =
+    docType && docType !== "Unknown" ? docType : inferDocTypeFromFilename(fileName);
+
+  const fallback: CaseDoc = {
+    id: `fallback_${resolvedType.toLowerCase().replace(/[^a-z0-9]+/g, "_")}_${Date.now()}`,
+    type: resolvedType,
+    title: `${formatDocType(resolvedType)} — ${fileName}`,
+    pages: 1,
+    fields: omitIgnoredFields({}) as Partial<Record<FieldKey, string>>,
+    md: "",
     sourceHint: fileName,
-    type: docType && docType !== "Unknown" ? docType : template.type,
-    title:
-      docType && docType !== "Unknown"
-        ? `${formatDocType(docType)} — ${fileName}`
-        : template.title,
   };
+  fallback.md = buildMarkdown(fallback);
+  return fallback;
 }
 
 function safeJsonParse<T>(raw: string, fallback: T): T {
@@ -436,18 +454,17 @@ export async function extractDataFromImages(params: {
   fileName: string;
   pageImages: string[];
   documentType: DocType;
-  fallbackIndex: number;
 }): Promise<{ doc: CaseDoc; extractedDocuments: Array<{ documentType: DocType; fields: Record<string, unknown> }> }> {
-  const { fileName, pageImages, documentType, fallbackIndex } = params;
+  const { fileName, pageImages, documentType } = params;
   const allowedFieldKeys = getAllowedFieldKeysForDocType(documentType);
   const allowedFieldKeysText = allowedFieldKeys.join(", ");
 
   if (!pageImages.length || pageImages.some((image) => !image.startsWith("data:image/"))) {
-    return { doc: fallbackDoc(fileName, fallbackIndex, documentType), extractedDocuments: [] };
+    return { doc: fallbackDoc(fileName, documentType), extractedDocuments: [] };
   }
 
   if (aiUnavailableReason) {
-    return { doc: fallbackDoc(fileName, fallbackIndex, documentType), extractedDocuments: [] };
+    return { doc: fallbackDoc(fileName, documentType), extractedDocuments: [] };
   }
 
   try {
@@ -461,6 +478,8 @@ export async function extractDataFromImages(params: {
               content:
               `Extract structured fields from procurement, logistics, transport, vehicle KYC, FASTag, quality certificate, and photo-evidence documents and return only JSON with key "fields". ` +
               `This document is a ${documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
+              "For party roles on seller-issued documents, vendorName is the issuing supplier/seller/consignor and buyerName is the receiving buyer, bill-to party, ship-to party, consignee, customer, or purchaser. " +
+              "For Purchase Order or Amended Purchase Order documents, vendorName is the supplier/vendor receiving the order and buyerName is the purchaser issuing the order. Never swap these roles. " +
               "Omit any field that is not visible or not applicable to this document type. Do not hallucinate.",
             },
           {
@@ -472,6 +491,7 @@ export async function extractDataFromImages(params: {
                   `This upload is likely a ${documentType}. ` +
                   "Pages may include invoices, purchase orders, e-way bills, weighment slips, lorry receipts, RC/DL/PAN cards, FASTag toll proofs, test certificates, permits, or photo evidence. " +
                   `Extract only clearly visible ${documentType}-specific fields from this allowed schema: ${allowedFieldKeysText}. ` +
+                  "If both supplier and receiver are visible, map seller-issued documents as seller/consignor to vendorName and receiving buyer/bill-to/ship-to/consignee to buyerName. For purchase orders, map the supplier/vendor receiving the order to vendorName. " +
                   "Preserve exact document numbers, vehicle ids, GSTINs, weights, dates, and financial totals.",
               },
               { type: "image_url", image_url: { url: image } },
@@ -512,7 +532,7 @@ export async function extractDataFromImages(params: {
     } else {
       console.warn("Failed to analyze document with OpenRouter", error);
     }
-    return { doc: fallbackDoc(fileName, fallbackIndex, documentType), extractedDocuments: [] };
+    return { doc: fallbackDoc(fileName, documentType), extractedDocuments: [] };
   }
 }
 

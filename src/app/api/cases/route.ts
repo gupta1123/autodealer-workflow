@@ -1,6 +1,17 @@
 import { NextResponse } from "next/server";
 
-import { summarizeCase } from "@/lib/case-summary";
+import {
+  deriveCaseReceiverName,
+  getCaseCategoryFromProcessingMeta,
+  resolveCaseCategoryLabel,
+  resolveStoredCaseDisplayName,
+  summarizeCase,
+} from "@/lib/case-summary";
+import {
+  DEFAULT_COMPARISON_OPTIONS,
+  readComparisonOptions,
+} from "@/lib/comparison";
+import { omitIgnoredFields, shouldConsiderFieldKey } from "@/lib/document-schema";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
@@ -66,6 +77,9 @@ function serializeError(error: unknown) {
       if (/deleted_at|deleted_by_user_id/i.test(combined)) {
         return `${combined} Run the recycle bin migration in Supabase using supabase/packet_recycle_bin_backend_v3.sql, then retry.`;
       }
+      if (/packet_cases_status_check|violates check constraint/i.test(combined)) {
+        return `${combined} Run the case draft migration in Supabase using supabase/packet_case_draft_backend_v5.sql, then retry.`;
+      }
       return combined;
     }
 
@@ -82,6 +96,14 @@ function parseJsonField<T>(value: FormDataEntryValue | null, fieldName: string):
   return JSON.parse(value) as T;
 }
 
+function parseComparisonOptions(value: FormDataEntryValue | null) {
+  if (typeof value !== "string") {
+    return DEFAULT_COMPARISON_OPTIONS;
+  }
+
+  return readComparisonOptions(JSON.parse(value));
+}
+
 function sanitizeFileName(fileName: string) {
   const cleaned = fileName
     .toLowerCase()
@@ -89,34 +111,166 @@ function sanitizeFileName(fileName: string) {
     .replace(/-+/g, "-")
     .replace(/^-+|-+$/g, "");
 
-  return cleaned || "upload.pdf";
+  return cleaned || "upload";
+}
+
+function inferContentType(file: File) {
+  if (file.type) {
+    return file.type;
+  }
+
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  if (extension === "pdf") return "application/pdf";
+  if (extension === "jpg" || extension === "jpeg") return "image/jpeg";
+  if (extension === "png") return "image/png";
+  if (extension === "webp") return "image/webp";
+  if (extension === "gif") return "image/gif";
+  if (extension === "heic") return "image/heic";
+  if (extension === "heif") return "image/heif";
+  return "application/octet-stream";
+}
+
+function formatDraftName(fileName: string) {
+  const cleaned = fileName
+    .replace(/\.[^.]+$/, "")
+    .replace(/[-_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return cleaned || "New packet case";
+}
+
+function slugifyDraftName(value: string, fallback: string) {
+  const slug = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+
+  return slug || fallback;
 }
 
 function isFileEntry(entry: FormDataEntryValue): entry is File {
   return typeof entry !== "string";
 }
 
-function mapCaseRow(row: {
+function sanitizeDocumentsForStorage(documents: CaseDoc[]): CaseDoc[] {
+  return documents.map((document) => ({
+    ...document,
+    fields: omitIgnoredFields(document.fields ?? {}) as CaseDoc["fields"],
+  }));
+}
+
+function sanitizeMismatchesForStorage(mismatches: Mismatch[]): Mismatch[] {
+  return mismatches.filter((mismatch) => shouldConsiderFieldKey(mismatch.field));
+}
+
+function mapDocumentRowForCaseSummary(row: {
   id: string;
-  slug: string;
-  display_name: string;
-  buyer_name: string | null;
-  po_number: string | null;
-  invoice_number: string | null;
-  status: string;
-  risk_score: number;
-  upload_count: number;
-  document_count: number;
-  mismatch_count: number;
-  created_at: string;
-  processing_meta?: unknown;
-  deleted_at?: string | null;
-}) {
+  client_document_id: string | null;
+  source_file_name: string | null;
+  source_hint: string | null;
+  document_type: string;
+  title: string | null;
+  page_count: number | null;
+  extracted_fields: unknown;
+}): CaseDoc {
+  const extractedFields =
+    row.extracted_fields && typeof row.extracted_fields === "object" && !Array.isArray(row.extracted_fields)
+      ? Object.fromEntries(
+          Object.entries(row.extracted_fields).flatMap(([key, value]) => {
+            if (typeof value === "string" || typeof value === "number") {
+              return [[key, String(value)]];
+            }
+            return [];
+          })
+        )
+      : {};
+
+  return {
+    id: row.client_document_id || row.id,
+    type: row.document_type as CaseDoc["type"],
+    title: row.title || row.document_type,
+    pages: row.page_count || 1,
+    fields: extractedFields as CaseDoc["fields"],
+    md: "",
+    sourceHint: row.source_hint || row.source_file_name || undefined,
+  };
+}
+
+async function fetchCaseDocumentsForSummary(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  caseIds: string[]
+) {
+  const documentsByCaseId = new Map<string, CaseDoc[]>();
+
+  if (caseIds.length === 0) {
+    return documentsByCaseId;
+  }
+
+  const { data, error } = await supabase
+    .from("packet_documents")
+    .select("case_id, id, client_document_id, source_file_name, source_hint, document_type, title, page_count, extracted_fields")
+    .in("case_id", caseIds)
+    .order("created_at", { ascending: true });
+
+  if (error) {
+    throw error;
+  }
+
+  for (const row of data ?? []) {
+    const current = documentsByCaseId.get(row.case_id) ?? [];
+    current.push(mapDocumentRowForCaseSummary(row));
+    documentsByCaseId.set(row.case_id, current);
+  }
+
+  return documentsByCaseId;
+}
+
+function mapCaseRow(
+  row: {
+    id: string;
+    slug: string;
+    display_name: string;
+    buyer_name: string | null;
+    po_number: string | null;
+    invoice_number: string | null;
+    status: string;
+    risk_score: number;
+    upload_count: number;
+    document_count: number;
+    mismatch_count: number;
+    created_at: string;
+    processing_meta?: unknown;
+    deleted_at?: string | null;
+  },
+  documents: CaseDoc[] = []
+) {
+  const receiverName = deriveCaseReceiverName(documents) || row.buyer_name;
+  const category = resolveCaseCategoryLabel({
+    receiverName,
+    storedCategory: getCaseCategoryFromProcessingMeta(
+      row.processing_meta,
+      row.status,
+      documents.map((document) => document.type)
+    ),
+    status: row.status,
+  });
+
   return {
     id: row.id,
     slug: row.slug,
-    displayName: row.display_name,
-    buyerName: row.buyer_name,
+    displayName: resolveStoredCaseDisplayName({
+      storedDisplayName: row.display_name,
+      receiverName,
+      invoiceNumber: row.invoice_number,
+      poNumber: row.po_number,
+      category,
+      status: row.status,
+    }),
+    buyerName: receiverName,
+    receiverName,
+    category,
     poNumber: row.po_number,
     invoiceNumber: row.invoice_number,
     status: row.status,
@@ -223,8 +377,13 @@ export async function GET(request: Request) {
           : rows.filter((row) => !isCaseRecycled(row.processing_meta));
     }
 
+    const documentsByCaseId = await fetchCaseDocumentsForSummary(
+      supabase,
+      (data ?? []).map((row) => row.id)
+    );
+
     return NextResponse.json({
-      cases: (data ?? []).map(mapCaseRow),
+      cases: (data ?? []).map((row) => mapCaseRow(row, documentsByCaseId.get(row.id) ?? [])),
     });
   } catch (error) {
     return NextResponse.json(
@@ -253,10 +412,103 @@ export async function POST(request: Request) {
 
     supabase = createSupabaseAdminClient();
     const formData = await request.formData();
-    const documents = parseJsonField<CaseDoc[]>(formData.get("documents"), "documents");
-    const mismatches = parseJsonField<Mismatch[]>(formData.get("mismatches"), "mismatches");
+    const mode = typeof formData.get("mode") === "string" ? formData.get("mode") : null;
     const files = formData.getAll("files").filter(isFileEntry);
 
+    if (mode === "draft") {
+      if (!files.length) {
+        return NextResponse.json(
+          { error: "Upload at least one file to create a case." },
+          { status: 400 }
+        );
+      }
+
+      caseId = crypto.randomUUID();
+      const firstFileName = files[0]?.name ?? "New packet case";
+      const displayName = formatDraftName(firstFileName);
+      const slug = `${slugifyDraftName(displayName, "draft-case")}-${caseId.slice(0, 8)}`;
+
+      const fileRows = [];
+      for (const file of files) {
+        const storagePath = `${caseId}/${Date.now()}-${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
+        const binary = new Uint8Array(await file.arrayBuffer());
+        const contentType = inferContentType(file);
+        const { error: uploadError } = await supabase.storage.from(STORAGE_BUCKET).upload(storagePath, binary, {
+          contentType,
+          upsert: false,
+        });
+
+        if (uploadError) {
+          throw uploadError;
+        }
+
+        uploadedPaths.push(storagePath);
+        fileRows.push({
+          case_id: caseId,
+          original_name: file.name,
+          storage_bucket: STORAGE_BUCKET,
+          storage_path: storagePath,
+          mime_type: contentType,
+          size_bytes: file.size,
+        });
+      }
+
+      const caseRow = {
+        id: caseId,
+        owner_user_id: user.id,
+        slug,
+        display_name: displayName,
+        buyer_name: null,
+        po_number: null,
+        invoice_number: null,
+        status: "draft",
+        risk_score: 0,
+        upload_count: files.length,
+        document_count: 0,
+        mismatch_count: 0,
+        processing_meta: {
+          draft: true,
+          draftCreatedAt: new Date().toISOString(),
+          caseCategory: "Draft case",
+          packetCategory: "Draft case",
+          documentTypes: [],
+          missingDocumentGroups: [],
+          paymentGap: 0,
+        },
+      };
+
+      const { data: insertedCase, error: caseError } = await supabase
+        .from("packet_cases")
+        .insert(caseRow)
+        .select(
+          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
+        )
+        .single();
+
+      if (caseError) {
+        throw caseError;
+      }
+
+      const { error: fileInsertError } = await supabase.from("packet_case_files").insert(fileRows);
+      if (fileInsertError) {
+        throw fileInsertError;
+      }
+
+      return NextResponse.json(
+        {
+          case: mapCaseRow(insertedCase),
+        },
+        { status: 201 }
+      );
+    }
+
+    const documents = sanitizeDocumentsForStorage(
+      parseJsonField<CaseDoc[]>(formData.get("documents"), "documents")
+    );
+    const mismatches = sanitizeMismatchesForStorage(
+      parseJsonField<Mismatch[]>(formData.get("mismatches"), "mismatches")
+    );
+    const comparisonOptions = parseComparisonOptions(formData.get("comparisonOptions"));
     if (!documents.length) {
       return NextResponse.json(
         { error: "No processed documents were provided to save." },
@@ -271,8 +523,9 @@ export async function POST(request: Request) {
     for (const file of files) {
       const storagePath = `${caseId}/${Date.now()}-${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
       const binary = new Uint8Array(await file.arrayBuffer());
+      const contentType = inferContentType(file);
       const { error: uploadError } = await supabase.storage.from(STORAGE_BUCKET).upload(storagePath, binary, {
-        contentType: file.type || "application/pdf",
+        contentType,
         upsert: false,
       });
 
@@ -286,7 +539,7 @@ export async function POST(request: Request) {
         original_name: file.name,
         storage_bucket: STORAGE_BUCKET,
         storage_path: storagePath,
-        mime_type: file.type || "application/pdf",
+        mime_type: contentType,
         size_bytes: file.size,
       });
     }
@@ -306,8 +559,11 @@ export async function POST(request: Request) {
       mismatch_count: mismatches.length,
       processing_meta: {
         documentTypes: summary.documentTypes,
+        caseCategory: summary.category,
+        packetCategory: summary.packetCategory,
         missingDocumentGroups: summary.missingDocTypes,
         paymentGap: summary.paymentGap,
+        comparisonOptions,
       },
     };
 
@@ -315,7 +571,7 @@ export async function POST(request: Request) {
       .from("packet_cases")
       .insert(caseRow)
       .select(
-        "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at"
+        "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
       )
       .single();
 

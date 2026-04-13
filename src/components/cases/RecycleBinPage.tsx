@@ -97,9 +97,10 @@ export function RecycleBinPage() {
 
     return cases.filter((item) => {
       return (
-        item.displayName.toLowerCase().includes(normalized) ||
-        item.slug.toLowerCase().includes(normalized) ||
-        (item.buyerName ?? "").toLowerCase().includes(normalized)
+      item.displayName.toLowerCase().includes(normalized) ||
+      item.slug.toLowerCase().includes(normalized) ||
+      (item.receiverName ?? "").toLowerCase().includes(normalized) ||
+      item.category.toLowerCase().includes(normalized)
       );
     });
   }, [cases, query]);
@@ -225,89 +226,159 @@ export function RecycleBinPage() {
             )}
 
             {status === "ready" && filteredCases.length > 0 && (
-              <Table className="w-full text-sm">
-                <TableHeader>
-                  <TableRow className="border-b border-[#f1f5f9] hover:bg-transparent">
-                    <TableHead className="h-12 font-bold text-[#94a3b8] text-xs uppercase tracking-wider">DOCUMENT</TableHead>
-                    <TableHead className="h-12 font-bold text-[#94a3b8] text-xs uppercase tracking-wider">TEAM</TableHead>
-                    <TableHead className="h-12 font-bold text-[#94a3b8] text-xs uppercase tracking-wider">EXPIRES</TableHead>
-                    <TableHead className="h-12 font-bold text-[#94a3b8] text-xs uppercase tracking-wider text-right pr-6 md:pr-8">ACTIONS</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
+              <>
+                <div className="grid gap-4 px-4 pb-2 md:hidden">
                   {filteredCases.map((item) => (
-                    <TableRow
+                    <div
                       key={item.id}
-                      className="group border-[#f1f5f9] transition-colors hover:bg-[#f8fafc] h-16"
+                      className="rounded-2xl border border-[#e2e8f0] bg-white p-4 shadow-sm"
                     >
-                      {/* Document Name & Details */}
-                      <TableCell className="py-4 pl-6 md:pl-8">
-                        <div className="flex items-start gap-3">
-                          <div className="mt-0.5 w-8 h-8 rounded-lg bg-[#f1f5f9] border border-[#e2e8f0] text-[#64748b] flex items-center justify-center shrink-0">
-                            <FileText className="w-4 h-4" />
-                          </div>
-                          <div>
-                            <Link
-                              href={`/cases/${item.id}`}
-                              className="font-bold text-[#0f172a] text-sm transition-colors hover:text-[#4f46e5]"
-                            >
-                              {item.displayName || "Unnamed Document"}
-                            </Link>
-                            <div className="mt-1 text-[11px] font-medium text-[#94a3b8]">
-                              {formatDateTime(item.deletedAt)} • by Admin
-                            </div>
-                          </div>
+                      <div className="flex items-start gap-3">
+                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[#e2e8f0] bg-[#f8fafc] text-[#64748b]">
+                          <FileText className="h-5 w-5" />
                         </div>
-                      </TableCell>
-
-                      {/* Team (Placeholder mapped to Buyer for now) */}
-                      <TableCell className="py-4">
-                        <div className="flex items-center gap-1.5">
-                          <div className="w-1.5 h-1.5 rounded-full bg-[#10b981]" />
-                          <span className="font-semibold text-[#64748b] text-sm truncate max-w-[150px]">
-                            {item.buyerName || "Customer Handover"}
-                          </span>
-                        </div>
-                      </TableCell>
-
-                      {/* Expires */}
-                      <TableCell className="py-4">
-                        <div className="flex items-center gap-1.5 text-[#64748b] text-sm font-medium">
-                          <Clock className="w-3.5 h-3.5" />
-                          {calculateDaysRemaining(item.deletedAt)}d
-                        </div>
-                      </TableCell>
-
-                      {/* Actions */}
-                      <TableCell className="pr-6 md:pr-8 py-4 text-right">
-                        <div className="flex items-center justify-end gap-3 text-[#94a3b8]">
+                        <div className="min-w-0 flex-1">
                           <Link
                             href={`/cases/${item.id}`}
-                            className="p-1.5 hover:text-[#0f172a] hover:bg-[#f1f5f9] rounded-md transition-colors"
-                            aria-label="View"
+                            className="block truncate text-sm font-bold text-[#0f172a] hover:text-[#4f46e5]"
                           >
-                            <Eye className="w-4 h-4" />
+                            {item.displayName || "Unnamed Document"}
                           </Link>
-                          <button
-                            className="p-1.5 hover:text-[#4f46e5] hover:bg-[#eef2ff] rounded-md transition-colors"
-                            aria-label="Restore"
-                            onClick={() => setPendingAction({ type: "restore", item })}
-                          >
-                            <RotateCcw className="w-4 h-4" />
-                          </button>
-                          <button
-                            className="p-1.5 hover:text-[#e11d48] hover:bg-[#fef2f2] rounded-md transition-colors"
-                            aria-label="Delete Permanently"
-                            onClick={() => setPendingAction({ type: "destroy", item })}
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                          <div className="mt-1 text-[11px] font-medium text-[#94a3b8]">
+                            {formatDateTime(item.deletedAt)} • by Admin
+                          </div>
                         </div>
-                      </TableCell>
-                    </TableRow>
+                      </div>
+
+                      <div className="mt-4 grid grid-cols-2 gap-3">
+                        <div className="rounded-xl bg-[#f8fafc] p-3">
+                          <div className="text-[10px] font-bold uppercase tracking-widest text-[#94a3b8]">
+                            Receiver
+                          </div>
+                          <div className="mt-1 truncate text-sm font-semibold text-[#64748b]">
+                            {item.receiverName || "Receiver pending"}
+                          </div>
+                        </div>
+                        <div className="rounded-xl bg-[#f8fafc] p-3">
+                          <div className="text-[10px] font-bold uppercase tracking-widest text-[#94a3b8]">
+                            Expires
+                          </div>
+                          <div className="mt-1 flex items-center gap-1.5 text-sm font-semibold text-[#64748b]">
+                            <Clock className="h-3.5 w-3.5" />
+                            {calculateDaysRemaining(item.deletedAt)}d
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 flex items-center justify-end gap-2">
+                        <Link
+                          href={`/cases/${item.id}`}
+                          className="rounded-lg border border-[#e2e8f0] p-2 text-[#64748b] transition-colors hover:bg-[#f8fafc] hover:text-[#0f172a]"
+                          aria-label="View"
+                        >
+                          <Eye className="h-4 w-4" />
+                        </Link>
+                        <button
+                          className="rounded-lg border border-[#e0e7ff] p-2 text-[#4f46e5] transition-colors hover:bg-[#eef2ff]"
+                          aria-label="Restore"
+                          onClick={() => setPendingAction({ type: "restore", item })}
+                        >
+                          <RotateCcw className="h-4 w-4" />
+                        </button>
+                        <button
+                          className="rounded-lg border border-[#fecaca] p-2 text-[#e11d48] transition-colors hover:bg-[#fef2f2]"
+                          aria-label="Delete Permanently"
+                          onClick={() => setPendingAction({ type: "destroy", item })}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </div>
                   ))}
-                </TableBody>
-              </Table>
+                </div>
+
+                <div className="hidden md:block">
+                  <Table className="w-full text-sm">
+                    <TableHeader>
+                      <TableRow className="border-b border-[#f1f5f9] hover:bg-transparent">
+                        <TableHead className="h-12 font-bold text-[#94a3b8] text-xs uppercase tracking-wider">DOCUMENT</TableHead>
+                        <TableHead className="h-12 font-bold text-[#94a3b8] text-xs uppercase tracking-wider">RECEIVER</TableHead>
+                        <TableHead className="h-12 font-bold text-[#94a3b8] text-xs uppercase tracking-wider">EXPIRES</TableHead>
+                        <TableHead className="h-12 font-bold text-[#94a3b8] text-xs uppercase tracking-wider text-right pr-6 md:pr-8">ACTIONS</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {filteredCases.map((item) => (
+                        <TableRow
+                          key={item.id}
+                          className="group border-[#f1f5f9] transition-colors hover:bg-[#f8fafc] h-16"
+                        >
+                          <TableCell className="py-4 pl-6 md:pl-8">
+                            <div className="flex items-start gap-3">
+                              <div className="mt-0.5 w-8 h-8 rounded-lg bg-[#f1f5f9] border border-[#e2e8f0] text-[#64748b] flex items-center justify-center shrink-0">
+                                <FileText className="w-4 h-4" />
+                              </div>
+                              <div>
+                                <Link
+                                  href={`/cases/${item.id}`}
+                                  className="font-bold text-[#0f172a] text-sm transition-colors hover:text-[#4f46e5]"
+                                >
+                                  {item.displayName || "Unnamed Document"}
+                                </Link>
+                                <div className="mt-1 text-[11px] font-medium text-[#94a3b8]">
+                                  {formatDateTime(item.deletedAt)} • by Admin
+                                </div>
+                              </div>
+                            </div>
+                          </TableCell>
+
+                          <TableCell className="py-4">
+                            <div className="flex items-center gap-1.5">
+                              <div className="w-1.5 h-1.5 rounded-full bg-[#10b981]" />
+                              <span className="font-semibold text-[#64748b] text-sm truncate max-w-[150px]">
+                                {item.receiverName || "Receiver pending"}
+                              </span>
+                            </div>
+                          </TableCell>
+
+                          <TableCell className="py-4">
+                            <div className="flex items-center gap-1.5 text-[#64748b] text-sm font-medium">
+                              <Clock className="w-3.5 h-3.5" />
+                              {calculateDaysRemaining(item.deletedAt)}d
+                            </div>
+                          </TableCell>
+
+                          <TableCell className="pr-6 md:pr-8 py-4 text-right">
+                            <div className="flex items-center justify-end gap-3 text-[#94a3b8]">
+                              <Link
+                                href={`/cases/${item.id}`}
+                                className="p-1.5 hover:text-[#0f172a] hover:bg-[#f1f5f9] rounded-md transition-colors"
+                                aria-label="View"
+                              >
+                                <Eye className="w-4 h-4" />
+                              </Link>
+                              <button
+                                className="p-1.5 hover:text-[#4f46e5] hover:bg-[#eef2ff] rounded-md transition-colors"
+                                aria-label="Restore"
+                                onClick={() => setPendingAction({ type: "restore", item })}
+                              >
+                                <RotateCcw className="w-4 h-4" />
+                              </button>
+                              <button
+                                className="p-1.5 hover:text-[#e11d48] hover:bg-[#fef2f2] rounded-md transition-colors"
+                                aria-label="Delete Permanently"
+                                onClick={() => setPendingAction({ type: "destroy", item })}
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              </>
             )}
 
             {/* Pagination Footer (Placeholder matching image) */}

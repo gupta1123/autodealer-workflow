@@ -1,15 +1,61 @@
 import { NextResponse } from "next/server";
 
 import {
+  deriveCaseReceiverName,
+  getCaseCategoryFromProcessingMeta,
+  resolveCaseCategoryLabel,
+  resolveStoredCaseDisplayName,
+} from "@/lib/case-summary";
+import {
   getRecycleBinDeletedAt,
   isCaseRecycled,
   withRecycleBinMetadata,
   withoutRecycleBinMetadata,
 } from "@/lib/recycle-bin";
+import { omitIgnoredFields, shouldConsiderFieldKey } from "@/lib/document-schema";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import type { CaseDoc } from "@/types/pipeline";
 
 const STORAGE_BUCKET = "packet-files";
+
+function sanitizeExtractedFields(fields: unknown) {
+  if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
+    return {};
+  }
+
+  return omitIgnoredFields(fields as Record<string, unknown>);
+}
+
+function mapDocumentRowForCaseSummary(row: {
+  id: string;
+  client_document_id: string | null;
+  source_file_name: string | null;
+  source_hint: string | null;
+  document_type: string;
+  title: string | null;
+  page_count: number | null;
+  extracted_fields: unknown;
+}): CaseDoc {
+  const extractedFields = Object.fromEntries(
+    Object.entries(sanitizeExtractedFields(row.extracted_fields)).flatMap(([key, value]) => {
+      if (typeof value === "string" || typeof value === "number") {
+        return [[key, String(value)]];
+      }
+      return [];
+    })
+  );
+
+  return {
+    id: row.client_document_id || row.id,
+    type: row.document_type as CaseDoc["type"],
+    title: row.title || row.document_type,
+    pages: row.page_count || 1,
+    fields: extractedFields as CaseDoc["fields"],
+    md: "",
+    sourceHint: row.source_hint || row.source_file_name || undefined,
+  };
+}
 
 function isRecycleBinSchemaMissing(error: unknown) {
   if (!error || typeof error !== "object") {
@@ -63,6 +109,9 @@ function serializeError(error: unknown) {
       if (/deleted_at|deleted_by_user_id/i.test(combined)) {
         return `${combined} Run the recycle bin migration in Supabase using supabase/packet_recycle_bin_backend_v3.sql, then retry.`;
       }
+      if (/packet_cases_status_check|violates check constraint/i.test(combined)) {
+        return `${combined} Run the case draft migration in Supabase using supabase/packet_case_draft_backend_v5.sql, then retry.`;
+      }
       return combined;
     }
 
@@ -72,27 +121,50 @@ function serializeError(error: unknown) {
   return String(error ?? "Unknown error");
 }
 
-function mapCaseRow(row: {
-  id: string;
-  slug: string;
-  display_name: string;
-  buyer_name: string | null;
-  po_number: string | null;
-  invoice_number: string | null;
-  status: string;
-  risk_score: number;
-  upload_count: number;
-  document_count: number;
-  mismatch_count: number;
-  created_at: string;
-  processing_meta?: unknown;
-  deleted_at?: string | null;
-}) {
+function mapCaseRow(
+  row: {
+    id: string;
+    slug: string;
+    display_name: string;
+    buyer_name: string | null;
+    po_number: string | null;
+    invoice_number: string | null;
+    status: string;
+    risk_score: number;
+    upload_count: number;
+    document_count: number;
+    mismatch_count: number;
+    created_at: string;
+    processing_meta?: unknown;
+    deleted_at?: string | null;
+  },
+  documents: CaseDoc[] = []
+) {
+  const receiverName = deriveCaseReceiverName(documents) || row.buyer_name;
+  const category = resolveCaseCategoryLabel({
+    receiverName,
+    storedCategory: getCaseCategoryFromProcessingMeta(
+      row.processing_meta,
+      row.status,
+      documents.map((document) => document.type)
+    ),
+    status: row.status,
+  });
+
   return {
     id: row.id,
     slug: row.slug,
-    displayName: row.display_name,
-    buyerName: row.buyer_name,
+    displayName: resolveStoredCaseDisplayName({
+      storedDisplayName: row.display_name,
+      receiverName,
+      invoiceNumber: row.invoice_number,
+      poNumber: row.po_number,
+      category,
+      status: row.status,
+    }),
+    buyerName: receiverName,
+    receiverName,
+    category,
     poNumber: row.po_number,
     invoiceNumber: row.invoice_number,
     status: row.status,
@@ -233,8 +305,10 @@ export async function GET(
       })
     );
 
+    const caseSummaryDocuments = (documents ?? []).map(mapDocumentRowForCaseSummary);
+
     return NextResponse.json({
-      case: mapCaseRow(caseRow),
+      case: mapCaseRow(caseRow, caseSummaryDocuments),
       files: filesWithUrls,
       documents: (documents ?? []).map((document) => ({
         id: document.id,
@@ -244,22 +318,21 @@ export async function GET(
         documentType: document.document_type,
         title: document.title,
         pageCount: document.page_count,
-        extractedFields:
-          document.extracted_fields && typeof document.extracted_fields === "object"
-            ? document.extracted_fields
-            : {},
+        extractedFields: sanitizeExtractedFields(document.extracted_fields),
         markdown: document.markdown,
         createdAt: document.created_at,
       })),
-      mismatches: (mismatches ?? []).map((mismatch) => ({
-        id: mismatch.id,
-        clientMismatchId: mismatch.client_mismatch_id,
-        fieldName: mismatch.field_name,
-        values: Array.isArray(mismatch.values_json) ? mismatch.values_json : [],
-        analysis: mismatch.analysis,
-        fixPlan: mismatch.fix_plan,
-        createdAt: mismatch.created_at,
-      })),
+      mismatches: (mismatches ?? [])
+        .filter((mismatch) => shouldConsiderFieldKey(mismatch.field_name))
+        .map((mismatch) => ({
+          id: mismatch.id,
+          clientMismatchId: mismatch.client_mismatch_id,
+          fieldName: mismatch.field_name,
+          values: Array.isArray(mismatch.values_json) ? mismatch.values_json : [],
+          analysis: mismatch.analysis,
+          fixPlan: mismatch.fix_plan,
+          createdAt: mismatch.created_at,
+        })),
     });
   } catch (error) {
     return NextResponse.json(
@@ -507,7 +580,7 @@ export async function PATCH(
     const { id } = await context.params;
     const payload = (await request.json().catch(() => ({}))) as { action?: string };
 
-    if (payload.action !== "restore") {
+    if (!["restore", "accept", "reject"].includes(payload.action ?? "")) {
       return NextResponse.json({ error: "Unsupported case action." }, { status: 400 });
     }
 
@@ -521,6 +594,73 @@ export async function PATCH(
     }
 
     const supabase = createSupabaseAdminClient();
+
+    if (payload.action === "accept" || payload.action === "reject") {
+      const nextStatus = payload.action === "accept" ? "accepted" : "rejected";
+
+      try {
+        const result = await supabase
+          .from("packet_cases")
+          .update({ status: nextStatus })
+          .eq("id", id)
+          .eq("owner_user_id", user.id)
+          .is("deleted_at", null)
+          .select(
+            "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
+          )
+          .single();
+
+        if (result.error) {
+          if (result.error.code === "PGRST116") {
+            return NextResponse.json({ error: "Case not found." }, { status: 404 });
+          }
+          throw result.error;
+        }
+
+        return NextResponse.json({ case: mapCaseRow(result.data) });
+      } catch (error) {
+        if (!isRecycleBinSchemaMissing(error)) {
+          throw error;
+        }
+
+        const existing = await supabase
+          .from("packet_cases")
+          .select(
+            "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
+          )
+          .eq("id", id)
+          .eq("owner_user_id", user.id)
+          .single();
+
+        if (existing.error) {
+          if (existing.error.code === "PGRST116") {
+            return NextResponse.json({ error: "Case not found." }, { status: 404 });
+          }
+          throw existing.error;
+        }
+
+        if (isCaseRecycled(existing.data.processing_meta)) {
+          return NextResponse.json({ error: "Case not found." }, { status: 404 });
+        }
+
+        const updated = await supabase
+          .from("packet_cases")
+          .update({ status: nextStatus })
+          .eq("id", id)
+          .eq("owner_user_id", user.id)
+          .select(
+            "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
+          )
+          .single();
+
+        if (updated.error) {
+          throw updated.error;
+        }
+
+        return NextResponse.json({ case: mapCaseRow(updated.data) });
+      }
+    }
+
     let data:
       | {
           id: string;

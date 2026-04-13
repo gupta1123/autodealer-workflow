@@ -1,6 +1,7 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import Image from "next/image";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import {
@@ -39,28 +40,55 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { AppShell } from "@/components/dashboard/AppShell";
+import { AnalysisOptionsDialog } from "@/components/workspace/AnalysisOptionsDialog";
+import { DuplicateUploadDialog } from "@/components/workspace/DuplicateUploadDialog";
 import { summarizeCase } from "@/lib/case-summary";
-import { useDocumentPipeline } from "@/hooks/useDocumentPipeline";
 import {
+  areComparableValuesEqual,
+  DEFAULT_COMPARISON_OPTIONS,
+  getCommercialAmountValue,
+  getComparableFieldValue,
+  getComparisonDisplayLabel,
+  getComparisonModeLabel,
+  getPaymentEvidenceAmountValue,
+  pickCanonicalComparableValue,
+  PRIMARY_COMPARISON_FIELDS,
+} from "@/lib/comparison";
+import {
+  appendCaseFiles,
+  createDraftCase,
+  updateCaseDecision,
+  type CaseDecision,
+} from "@/lib/case-persistence";
+import { useDocumentPipeline, type DuplicateUploadConflict, type DuplicateUploadStrategy } from "@/hooks/useDocumentPipeline";
+import {
+  Camera,
+  CheckCircle2,
   Eye,
   FileText,
+  Folder,
+  FolderPlus,
   GitCompare,
+  ImagePlus,
   Loader2,
   Play,
   Sparkles,
   TriangleAlert,
   Upload,
   Trash2,
+  Plus,
 } from "lucide-react";
 import type {
   CaseDoc,
+  ComparisonOptions,
   DocType,
   FieldKey,
   PipelineStageId,
+  QueuedUpload,
 } from "@/types/pipeline";
 import {
+  ACTIVE_FIELD_DEFINITIONS,
   CORE_PACKET_GROUPS,
-  FIELD_DEFINITIONS,
   getFieldDefinitionsByKeys,
   getFieldDefinitionsForDocType,
   getFieldKeysForDocType,
@@ -86,9 +114,11 @@ type FieldMismatch = {
 };
 
 const DUMMY_DOCS: CaseDoc[] = SAMPLE_DOCS;
-const ALL_FIELDS = FIELD_DEFINITIONS;
+const ALL_FIELDS = ACTIVE_FIELD_DEFINITIONS;
+const DOCUMENT_UPLOAD_ACCEPT = "application/pdf,image/*";
+const IMAGE_UPLOAD_ACCEPT = "image/*";
 
-const FIELD_LABEL_LOOKUP: Record<string, string> = FIELD_DEFINITIONS.reduce(
+const FIELD_LABEL_LOOKUP: Record<string, string> = ACTIVE_FIELD_DEFINITIONS.reduce(
   (acc, { key, label }) => {
     acc[key] = label;
     return acc;
@@ -168,32 +198,6 @@ const PIPELINE_STAGES: Array<{
     },
   ];
 
-function normalize(v?: string) {
-  return (v || "").replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function pickCanonical(values: string[]) {
-  // choose the mode (most frequent non-empty) as canonical
-  const counts = new Map<string, number>();
-  for (const v of values) {
-    const key = normalize(v);
-    if (!key) continue;
-    counts.set(key, (counts.get(key) || 0) + 1);
-  }
-  let best: string | undefined;
-  let bestCount = 0;
-  for (const [k, c] of counts) {
-    if (c > bestCount) {
-      best = k;
-      bestCount = c;
-    }
-  }
-  // return original value matching best key, else first non-empty
-  return (
-    values.find((v) => normalize(v) === best) || values.find((v) => !!normalize(v)) || ""
-  );
-}
-
 function currencyishToNumber(v?: string) {
   if (!v) return undefined;
   const n = Number(v.replace(/[₹,\s]/g, ""));
@@ -202,7 +206,7 @@ function currencyishToNumber(v?: string) {
 
 function getDocumentFieldDefinitions(doc: CaseDoc) {
   const relevantKeys = getFieldKeysForDocType(doc.type);
-  const presentKeys = FIELD_DEFINITIONS.filter(({ key }) => Boolean(doc.fields[key])).map(
+  const presentKeys = ALL_FIELDS.filter(({ key }) => Boolean(doc.fields[key])).map(
     ({ key }) => key
   );
   const orderedKeys = [...new Set<FieldKey>([...relevantKeys, ...presentKeys])];
@@ -212,6 +216,21 @@ function getDocumentFieldDefinitions(doc: CaseDoc) {
   }
 
   return getFieldDefinitionsByKeys(orderedKeys);
+}
+
+function getSourceFileLabel(mimeType?: string | null, sourceName?: string) {
+  if (mimeType?.startsWith("image/")) return "Image";
+  if (mimeType === "application/pdf") return "PDF";
+  if (sourceName && /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/i.test(sourceName)) return "Image";
+  if (sourceName && /\.pdf$/i.test(sourceName)) return "PDF";
+  return "File";
+}
+
+function isImageSource(mimeType?: string | null, sourceName?: string | null) {
+  return (
+    Boolean(mimeType?.startsWith("image/")) ||
+    Boolean(sourceName && /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/i.test(sourceName))
+  );
 }
 
 function getComparisonFieldDefinitions(docs: CaseDoc[]) {
@@ -230,7 +249,7 @@ function getComparisonFieldDefinitions(docs: CaseDoc[]) {
   });
 
   docs.forEach((doc) => {
-    FIELD_DEFINITIONS.forEach(({ key }) => {
+    ALL_FIELDS.forEach(({ key }) => {
       if (doc.fields[key]) {
         pushKey(key);
       }
@@ -238,14 +257,14 @@ function getComparisonFieldDefinitions(docs: CaseDoc[]) {
   });
 
   if (orderedKeys.length === 0) {
-    FIELD_DEFINITIONS.filter(({ important }) => important).forEach(({ key }) => pushKey(key));
+    ALL_FIELDS.filter(({ important }) => important).forEach(({ key }) => pushKey(key));
   }
 
   return getFieldDefinitionsByKeys(orderedKeys);
 }
 
 // Compute mismatches across documents per field
-function useMismatchReport(docs: CaseDoc[]) {
+function useMismatchReport(docs: CaseDoc[], comparisonOptions: ComparisonOptions) {
   return useMemo(() => {
     const byField = ALL_FIELDS.reduce(
       (acc, { key }) => {
@@ -267,12 +286,17 @@ function useMismatchReport(docs: CaseDoc[]) {
     }
 
     for (const { key } of ALL_FIELDS) {
-      const values = Object.values(byField[key].values);
-      const canonical = pickCanonical(values);
+      const values = docs
+        .map((doc) => getComparableFieldValue(doc, key))
+        .filter(
+          (value): value is string =>
+            value !== undefined && value !== null && String(value).trim() !== ""
+        );
+      const canonical = pickCanonicalComparableValue(values, comparisonOptions);
       byField[key].canonical = canonical;
       const mismatchingDocs: string[] = [];
       for (const [docId, v] of Object.entries(byField[key].values)) {
-        if (normalize(v) && canonical && normalize(v) !== normalize(canonical)) {
+        if (v && canonical && !areComparableValuesEqual(v, canonical, comparisonOptions)) {
           mismatchingDocs.push(docId);
         }
       }
@@ -280,17 +304,37 @@ function useMismatchReport(docs: CaseDoc[]) {
     }
 
     const allMismatches: FieldMismatch[] = [];
-    for (const { key, label } of ALL_FIELDS) {
-      const ent = byField[key];
-      if (!ent || ent.mismatchingDocs.length === 0) continue;
+    for (const key of PRIMARY_COMPARISON_FIELDS) {
+      const values = docs
+        .map((doc) => ({
+          docId: doc.id,
+          value: getComparableFieldValue(doc, key),
+        }))
+        .filter((entry) => entry.value !== undefined && entry.value !== null && String(entry.value).trim() !== "");
+
+      if (values.length < 2) {
+        continue;
+      }
+
+      const canonical = pickCanonicalComparableValue(
+        values.map((entry) => entry.value as string),
+        comparisonOptions
+      );
+
+      const mismatchingDocs = values
+        .filter((entry) => canonical && !areComparableValuesEqual(entry.value, canonical, comparisonOptions))
+        .map((entry) => entry.docId);
+
+      if (mismatchingDocs.length === 0) {
+        continue;
+      }
+
       allMismatches.push({
         field: key,
-        label,
-        canonical: ent.canonical,
-        mismatchingDocs: ent.mismatchingDocs,
-        values: docs
-          .map((doc) => ({ docId: doc.id, value: doc.fields[key] }))
-          .filter((entry) => entry.value !== undefined && entry.value !== ""),
+        label: getComparisonDisplayLabel(key, FIELD_LABEL_LOOKUP[key]),
+        canonical,
+        mismatchingDocs,
+        values,
       });
     }
 
@@ -299,8 +343,28 @@ function useMismatchReport(docs: CaseDoc[]) {
     const missingDocTypes = CORE_PACKET_GROUPS
       .filter((group) => !hasAnyType(group.types))
       .map((group) => group.label);
-    const amountA = currencyishToNumber(byField.totalAmount.canonical);
-    const amountB = currencyishToNumber(byField.paidAmount.canonical);
+    const amountA = currencyishToNumber(
+      pickCanonicalComparableValue(
+        docs
+          .map((doc) => getCommercialAmountValue(doc))
+          .filter(
+            (value): value is string =>
+              value !== undefined && value !== null && String(value).trim() !== ""
+          ),
+        comparisonOptions
+      )
+    );
+    const amountB = currencyishToNumber(
+      pickCanonicalComparableValue(
+        docs
+          .map((doc) => getPaymentEvidenceAmountValue(doc))
+          .filter(
+            (value): value is string =>
+              value !== undefined && value !== null && String(value).trim() !== ""
+          ),
+        comparisonOptions
+      )
+    );
     const paymentGap = amountA && amountB ? Math.abs(amountA - amountB) : 0;
     const risk = Math.min(100, allMismatches.length * 10 + missingDocTypes.length * 12 + (paymentGap > 0 ? 10 : 0));
 
@@ -311,7 +375,7 @@ function useMismatchReport(docs: CaseDoc[]) {
       paymentGap,
       risk,
     };
-  }, [docs]);
+  }, [docs, comparisonOptions]);
 }
 
 // ------------------------------------------------------------
@@ -335,6 +399,24 @@ function FieldValue({ value }: { value?: string }) {
   );
 }
 
+function caseStatusLabel(status?: string) {
+  if (status === "draft") return "Draft";
+  if (status === "accepted") return "Accepted";
+  if (status === "rejected") return "Rejected";
+  if (status === "failed") return "Failed";
+  if (status === "processing") return "Processing";
+  return "Pending decision";
+}
+
+function caseStatusClassName(status?: string) {
+  if (status === "draft") return "border-amber-200 bg-amber-50 text-amber-700";
+  if (status === "accepted") return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  if (status === "rejected") return "border-rose-200 bg-rose-50 text-rose-700";
+  if (status === "failed") return "border-red-200 bg-red-50 text-red-700";
+  if (status === "processing") return "border-blue-200 bg-blue-50 text-blue-700";
+  return "border-slate-200 bg-slate-50 text-slate-600";
+}
+
 export function WorkspacePage() {
   const {
     status: pipelineStatus,
@@ -348,16 +430,37 @@ export function WorkspacePage() {
     queueFiles,
     removeUpload,
     startProcessing,
+    updateSavedCase,
     reset: resetPipeline,
   } = useDocumentPipeline();
   const [activeDocId, setActiveDocId] = useState<string | null>(null);
   const [activeMismatchId, setActiveMismatchId] = useState<string | null>(null);
+  const [duplicateUploadConflicts, setDuplicateUploadConflicts] = useState<DuplicateUploadConflict[]>([]);
+  const [caseDraftCreated, setCaseDraftCreated] = useState(false);
+  const [draftCaseStatus, setDraftCaseStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [draftCaseError, setDraftCaseError] = useState<string | null>(null);
+  const [caseDecisionStatus, setCaseDecisionStatus] = useState<"idle" | "updating" | "error">("idle");
+  const [caseDecisionError, setCaseDecisionError] = useState<string | null>(null);
+  const [analysisOptionsOpen, setAnalysisOptionsOpen] = useState(false);
+  const [comparisonOptions, setComparisonOptions] = useState<ComparisonOptions>(
+    DEFAULT_COMPARISON_OPTIONS
+  );
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [cameraStatus, setCameraStatus] = useState<"idle" | "opening" | "ready" | "error">("idle");
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [imagePreviewUploadId, setImagePreviewUploadId] = useState<string | null>(null);
+
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const cameraFallbackInputRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const galleryInputRef = useRef<HTMLInputElement | null>(null);
 
   const docs = documents.length ? documents : DUMMY_DOCS;
   const docTitleLookup = useMemo(() => new Map(docs.map((doc) => [doc.id, doc])), [docs]);
   const showAiMismatches = pipelineMismatches.length > 0;
 
-  const { byField, allMismatches, paymentGap, risk } = useMismatchReport(docs);
+  const { byField, allMismatches, paymentGap, risk } = useMismatchReport(docs, comparisonOptions);
 
   const activeDoc = activeDocId ? docs.find((d) => d.id === activeDocId) : undefined;
   const activeDocFieldDefinitions = useMemo(
@@ -379,6 +482,25 @@ export function WorkspacePage() {
     }
     return null;
   }, [activeDocIndex, queuedUploads, documents]);
+  const activeUploadFile = activeDocIndex >= 0 ? queuedUploads[activeDocIndex]?.file : undefined;
+  const activeSourceFileType = activeUploadFile?.type;
+  const activeSourceFileLabel = getSourceFileLabel(activeSourceFileType, activeDoc?.sourceHint);
+  const activeSourceIsImage = isImageSource(activeSourceFileType, activeDoc?.sourceHint);
+  const imagePreviewUrls = useMemo(() => {
+    const urls = new Map<string, string>();
+
+    queuedUploads.forEach((upload) => {
+      if (upload.file && isImageSource(upload.file.type, upload.name)) {
+        urls.set(upload.id, URL.createObjectURL(upload.file));
+      }
+    });
+
+    return urls;
+  }, [queuedUploads]);
+  const imagePreviewUpload = imagePreviewUploadId
+    ? queuedUploads.find((upload) => upload.id === imagePreviewUploadId)
+    : undefined;
+  const imagePreviewUrl = imagePreviewUpload ? imagePreviewUrls.get(imagePreviewUpload.id) : null;
 
   const activeMismatch = useMemo(() => {
     if (!activeMismatchId) return null;
@@ -407,12 +529,416 @@ export function WorkspacePage() {
   }, [pipelineMismatches, allMismatches, showAiMismatches]);
 
   const caseSummary = useMemo(
-    () => summarizeCase(documents.length ? documents : docs, pipelineMismatches),
-    [documents, docs, pipelineMismatches]
+    () => summarizeCase(documents.length ? documents : docs, pipelineMismatches), [documents, docs, pipelineMismatches]
   );
   const caseName = caseSummary.displayName;
   const hasUploads = queuedUploads.length > 0;
+  const queuedUploadLabel = `${queuedUploads.length} document${queuedUploads.length === 1 ? "" : "s"}`;
   const renderWithSidebar = (content: React.ReactNode) => <AppShell>{content}</AppShell>;
+
+  const persistDraftUploads = async (
+    acceptedUploads: QueuedUpload[],
+    strategy: Exclude<DuplicateUploadStrategy, "prompt"> | "append" = "append"
+  ) => {
+    if (!persistence.savedCase || persistence.savedCase.status !== "draft" || acceptedUploads.length === 0) {
+      return;
+    }
+
+    try {
+      setDraftCaseStatus("saving");
+      setDraftCaseError(null);
+      const updated = await appendCaseFiles(
+        persistence.savedCase.id,
+        acceptedUploads,
+        strategy === "overwrite" ? "overwrite" : "append"
+      );
+      updateSavedCase(updated.case);
+      setDraftCaseStatus("saved");
+    } catch (appendError) {
+      setDraftCaseError(appendError instanceof Error ? appendError.message : "Failed to add files to case.");
+      setDraftCaseStatus("error");
+    }
+  };
+
+  const handleQueueFiles = (files?: FileList | File[] | null) => {
+    const result = queueFiles(files);
+    if (result?.conflicts.length) {
+      setDuplicateUploadConflicts(result.conflicts);
+    }
+    if (result?.acceptedUploads.length) {
+      void persistDraftUploads(result.acceptedUploads);
+    }
+  };
+
+  const stopCameraStream = (stream: MediaStream | null = cameraStream) => {
+    stream?.getTracks().forEach((track) => track.stop());
+  };
+
+  const closeCameraCapture = () => {
+    stopCameraStream();
+    setCameraStream(null);
+    setCameraOpen(false);
+    setCameraStatus("idle");
+    setCameraError(null);
+  };
+
+  const handleUploadInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    handleQueueFiles(event.currentTarget.files);
+    if (event.currentTarget.value) event.currentTarget.value = "";
+  };
+
+  const handleCameraInputFallback = () => {
+    cameraFallbackInputRef.current?.click();
+  };
+
+  const handleCameraCaptureRequest = async () => {
+    setCameraError(null);
+
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      handleCameraInputFallback();
+      return;
+    }
+
+    try {
+      setCameraOpen(true);
+      setCameraStatus("opening");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+        },
+      });
+      setCameraStream(stream);
+      setCameraStatus("ready");
+    } catch (error) {
+      setCameraOpen(false);
+      setCameraStatus("idle");
+      setCameraError(error instanceof Error ? error.message : "Camera is not available on this device.");
+      handleCameraInputFallback();
+    }
+  };
+
+  const handleCaptureCameraFrame = () => {
+    const video = cameraVideoRef.current;
+
+    if (!video) {
+      setCameraError("Camera preview is not ready yet.");
+      return;
+    }
+
+    const width = video.videoWidth || 1280;
+    const height = video.videoHeight || 720;
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+
+    if (!context) {
+      setCameraError("Unable to capture this camera frame.");
+      return;
+    }
+
+    canvas.width = width;
+    canvas.height = height;
+    context.drawImage(video, 0, 0, width, height);
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          setCameraError("Unable to capture this camera frame.");
+          return;
+        }
+
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const file = new File([blob], `camera-capture-${timestamp}.jpg`, {
+          type: "image/jpeg",
+          lastModified: Date.now(),
+        });
+        handleQueueFiles([file]);
+        closeCameraCapture();
+      },
+      "image/jpeg",
+      0.92
+    );
+  };
+
+  const resolveDuplicateUploads = (strategy: Exclude<DuplicateUploadStrategy, "prompt">) => {
+    if (duplicateUploadConflicts.length === 0) return;
+    const result = queueFiles(
+      duplicateUploadConflicts.map((conflict) => conflict.file),
+      strategy
+    );
+    if (result?.acceptedUploads.length) {
+      void persistDraftUploads(result.acceptedUploads, strategy);
+    }
+    setDuplicateUploadConflicts([]);
+  };
+
+  const duplicateUploadDialog = (
+    <DuplicateUploadDialog
+      open={duplicateUploadConflicts.length > 0}
+      conflicts={duplicateUploadConflicts}
+      onOpenChange={(open) => {
+        if (!open) setDuplicateUploadConflicts([]);
+      }}
+      onOverwrite={() => resolveDuplicateUploads("overwrite")}
+      onDuplicate={() => resolveDuplicateUploads("duplicate")}
+    />
+  );
+
+  const cameraCaptureDialog = cameraOpen ? (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4 py-6 backdrop-blur-sm">
+      <div className="flex w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-white/10 bg-slate-950 shadow-2xl">
+        <div className="flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4 text-white">
+          <div>
+            <div className="text-sm font-bold">Camera capture</div>
+            <div className="text-xs text-slate-400">Point the camera at one document page and capture it.</div>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            className="border-white/20 bg-white/10 text-white hover:bg-white/20 hover:text-white"
+            onClick={closeCameraCapture}
+          >
+            Close
+          </Button>
+        </div>
+        <div className="relative aspect-[3/4] max-h-[72vh] bg-black sm:aspect-video">
+          <video
+            ref={cameraVideoRef}
+            autoPlay
+            muted
+            playsInline
+            className="h-full w-full object-contain"
+          />
+          {cameraStatus === "opening" && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/70 text-white">
+              <Loader2 className="h-8 w-8 animate-spin" />
+              <div className="text-sm font-semibold">Opening camera...</div>
+            </div>
+          )}
+        </div>
+        {cameraError && (
+          <div className="border-t border-amber-400/20 bg-amber-500/10 px-5 py-3 text-sm text-amber-100">
+            {cameraError}
+          </div>
+        )}
+        <div className="flex flex-col gap-3 border-t border-white/10 bg-slate-900 px-5 py-4 sm:flex-row sm:justify-end">
+          <Button
+            type="button"
+            variant="outline"
+            className="border-white/20 bg-white/10 text-white hover:bg-white/20 hover:text-white"
+            onClick={handleCameraInputFallback}
+          >
+            Use phone camera app
+          </Button>
+          <Button
+            type="button"
+            disabled={cameraStatus !== "ready"}
+            className="bg-white text-slate-950 hover:bg-slate-100"
+            onClick={handleCaptureCameraFrame}
+          >
+            Capture photo
+          </Button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
+  const imagePreviewDialog = imagePreviewUpload && imagePreviewUrl ? (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4 py-6 backdrop-blur-sm">
+      <div className="flex w-full max-w-3xl flex-col overflow-hidden rounded-3xl border border-white/10 bg-slate-950 shadow-2xl">
+        <div className="flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4 text-white">
+          <div className="min-w-0">
+            <div className="text-sm font-bold">Selected image</div>
+            <div className="truncate text-xs text-slate-400">{imagePreviewUpload.name}</div>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            className="border-white/20 bg-white/10 text-white hover:bg-white/20 hover:text-white"
+            onClick={() => setImagePreviewUploadId(null)}
+          >
+            Close
+          </Button>
+        </div>
+        <div className="relative h-[70vh] max-h-[760px] min-h-[320px] bg-black">
+          <Image
+            src={imagePreviewUrl}
+            alt={imagePreviewUpload.name}
+            fill
+            unoptimized
+            sizes="100vw"
+            className="object-contain"
+          />
+        </div>
+      </div>
+    </div>
+  ) : null;
+
+  const analysisOptionsDialog = (
+    <AnalysisOptionsDialog
+      open={analysisOptionsOpen}
+      onOpenChange={setAnalysisOptionsOpen}
+      onSelect={(nextOptions) => {
+        setComparisonOptions(nextOptions);
+        setAnalysisOptionsOpen(false);
+        void startProcessing(nextOptions);
+      }}
+    />
+  );
+
+  const resetWorkspace = () => {
+    setCaseDraftCreated(false);
+    setDuplicateUploadConflicts([]);
+    setImagePreviewUploadId(null);
+    setDraftCaseStatus("idle");
+    setDraftCaseError(null);
+    setCaseDecisionStatus("idle");
+    setCaseDecisionError(null);
+    setAnalysisOptionsOpen(false);
+    closeCameraCapture();
+    setComparisonOptions(DEFAULT_COMPARISON_OPTIONS);
+    resetPipeline();
+  };
+
+  const handleCreateCaseDraft = async () => {
+    if (!hasUploads) return;
+
+    if (persistence.savedCase) {
+      setCaseDraftCreated(true);
+      return;
+    }
+
+    try {
+      setDraftCaseStatus("saving");
+      setDraftCaseError(null);
+      const created = await createDraftCase({ uploads: queuedUploads });
+      updateSavedCase(created.case);
+      setCaseDraftCreated(true);
+      setDraftCaseStatus("saved");
+    } catch (createError) {
+      setDraftCaseError(createError instanceof Error ? createError.message : "Failed to create case.");
+      setDraftCaseStatus("error");
+    }
+  };
+
+  const handleCaseDecision = async (decision: CaseDecision) => {
+    if (!persistence.savedCase) return;
+
+    try {
+      setCaseDecisionStatus("updating");
+      setCaseDecisionError(null);
+      const updated = await updateCaseDecision(persistence.savedCase.id, decision);
+      updateSavedCase(updated.case);
+      setCaseDecisionStatus("idle");
+    } catch (decisionError) {
+      setCaseDecisionError(
+        decisionError instanceof Error
+          ? decisionError.message
+          : `Failed to ${decision === "accepted" ? "accept" : "reject"} case.`
+      );
+      setCaseDecisionStatus("error");
+    }
+  };
+
+  const handleAnalyzeRequest = () => {
+    if (!hasUploads) return;
+    setAnalysisOptionsOpen(true);
+  };
+
+  const queuedUploadRail = hasUploads ? (
+    <div className="w-full max-w-3xl space-y-3 text-left">
+      <div className="flex items-center justify-between">
+        <div className="text-sm font-bold text-slate-900">Files selected for this case</div>
+        <div className="text-xs font-bold uppercase tracking-[0.2em] text-[#8a7f72]">
+          {queuedUploadLabel}
+        </div>
+      </div>
+      <div className="overflow-x-auto">
+        <div className="flex items-center gap-3 pb-1">
+          {queuedUploads.map((upload, index) => {
+            const fallbackTemplate = matchSampleByIndex(index);
+            const inferredType = upload.resultDoc?.type ?? upload.classifiedType ?? fallbackTemplate.type;
+            const imageUrl = imagePreviewUrls.get(upload.id);
+
+            if (imageUrl) {
+              return (
+                <div key={upload.id} className="group relative h-14 w-14 shrink-0">
+                  <button
+                    type="button"
+                    className="relative h-full w-full overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm transition hover:border-[#8a7f72]"
+                    onClick={() => setImagePreviewUploadId(upload.id)}
+                    aria-label={`Preview ${upload.name}`}
+                  >
+                    <Image
+                      src={imageUrl}
+                      alt={upload.name}
+                      fill
+                      unoptimized
+                      sizes="56px"
+                      className="object-cover"
+                    />
+                    <span className="absolute -right-1 -top-1 z-10 grid h-5 w-5 place-items-center rounded-full bg-slate-900 text-[11px] font-bold text-white shadow-sm">
+                      {index + 1}
+                    </span>
+                  </button>
+                  {!persistence.savedCase && (
+                    <button
+                      type="button"
+                      className="absolute -bottom-1 -right-1 z-10 grid h-6 w-6 place-items-center rounded-full border border-red-100 bg-white text-red-500 shadow-sm transition hover:bg-red-50"
+                      onClick={() => removeUpload(upload.id)}
+                      aria-label="Remove image"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+              );
+            }
+
+            return (
+              <Popover key={upload.id}>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    className="group relative flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-[#e5ddd0] bg-white text-[#5a5046] shadow-sm transition hover:border-[#8a7f72] hover:text-[#1a1a1a]"
+                  >
+                    <FileText className="h-6 w-6" />
+                    <span className="absolute -right-1 -top-1 grid h-5 w-5 place-items-center rounded-full bg-slate-900 text-[11px] font-bold text-white shadow-sm">
+                      {index + 1}
+                    </span>
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent align="center" side="top" className="w-64 text-left border-[#e5ddd0] shadow-xl rounded-2xl p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-bold text-slate-900">
+                        {upload.name}
+                      </div>
+                      <div className="text-xs font-medium text-slate-500 mt-0.5">
+                        Slot {index + 1} · {inferredType}
+                      </div>
+                    </div>
+                    {!persistence.savedCase && (
+                      <button
+                        type="button"
+                        className="shrink-0 rounded-full border border-slate-200 bg-slate-50 p-1.5 text-slate-400 transition hover:border-red-200 hover:bg-red-50 hover:text-red-600"
+                        onClick={() => removeUpload(upload.id)}
+                        aria-label="Remove file"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    )}
+                  </div>
+                  <div className="mt-3 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5 text-xs font-medium text-slate-600 leading-relaxed">
+                    These files are in the case draft. Analysis starts only when you choose Analyze case.
+                  </div>
+                </PopoverContent>
+              </Popover>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  ) : null;
 
   useEffect(() => {
     if (pipelineStatus === "ready" && documents.length) {
@@ -424,6 +950,26 @@ export function WorkspacePage() {
   }, [pipelineStatus, documents]);
 
   useEffect(() => {
+    if (pipelineStatus === "idle" && queuedUploads.length === 0 && caseDraftCreated) {
+      setCaseDraftCreated(false);
+    }
+  }, [caseDraftCreated, pipelineStatus, queuedUploads.length]);
+
+  useEffect(() => {
+    const video = cameraVideoRef.current;
+
+    if (!cameraOpen || !cameraStream || !video) {
+      return;
+    }
+
+    video.srcObject = cameraStream;
+    void video.play().catch((error) => {
+      setCameraError(error instanceof Error ? error.message : "Unable to start camera preview.");
+      setCameraStatus("error");
+    });
+  }, [cameraOpen, cameraStream]);
+
+  useEffect(() => {
     if (activeFileUrl) {
       const url = activeFileUrl;
       return () => {
@@ -432,133 +978,276 @@ export function WorkspacePage() {
     }
   }, [activeFileUrl]);
 
-  if (pipelineStatus === "idle") {
+  useEffect(() => {
+    return () => {
+      imagePreviewUrls.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [imagePreviewUrls]);
+
+  useEffect(() => {
+    if (imagePreviewUploadId && !queuedUploads.some((upload) => upload.id === imagePreviewUploadId)) {
+      setImagePreviewUploadId(null);
+    }
+  }, [imagePreviewUploadId, queuedUploads]);
+
+  useEffect(() => {
+    return () => {
+      cameraStream?.getTracks().forEach((track) => track.stop());
+    };
+  }, [cameraStream]);
+
+  // =========================================================================
+  // STATE 1: IDLE / UPLOAD SCREEN
+  // =========================================================================
+  if (pipelineStatus === "idle" && !caseDraftCreated) {
     return renderWithSidebar(
-      <section className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#f7f7f5]">
-        <div className="absolute inset-0 -z-10">
-          <div className="absolute left-[8%] top-[12%] h-72 w-72 rounded-full bg-[#e5ddd0]/40 blur-3xl" />
-          <div className="absolute right-[14%] bottom-[15%] h-80 w-80 rounded-full bg-[#d4c9b8]/30 blur-3xl" />
-        </div>
-        <motion.div
-          initial={{ opacity: 0, y: 24 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.6, ease: "easeOut" }}
-          className="relative z-10 mx-auto flex w-full max-w-4xl flex-col items-center gap-10 px-6 py-16 text-center"
-        >
-          <div className="inline-flex items-center gap-2 rounded-full border border-[#e5ddd0] bg-white px-4 py-1.5 text-xs font-medium text-[#5a5046] shadow-sm">
-            <Sparkles className="h-3.5 w-3.5 text-[#8a7f72]" />
-            Procurement Workflow Demo
+      <>
+        <section className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#f7f7f5]">
+          <div className="absolute inset-0 -z-10">
+            <div className="absolute left-[8%] top-[12%] h-72 w-72 rounded-full bg-[#e5ddd0]/40 blur-3xl" />
+            <div className="absolute right-[14%] bottom-[15%] h-80 w-80 rounded-full bg-[#d4c9b8]/30 blur-3xl" />
           </div>
-          <div className="space-y-4">
-            <h1 className="text-4xl font-semibold tracking-tight text-slate-900 sm:text-5xl">
-              Procurement Packet Comparator
-            </h1>
-            <p className="mx-auto max-w-2xl text-base leading-relaxed text-slate-600">
-              Upload client case packets containing invoices, purchase orders, e-way bills, weighment slips, lorry receipts, RC/DL/PAN cards, FASTag toll proofs, test certificates, transport permits, and truck photos. The app extracts key fields, cross-references shared values, and highlights mismatches before review.
-            </p>
-          </div>
-          <div className="w-full max-w-3xl space-y-6">
-            <label className="relative flex flex-col items-center justify-center gap-3 rounded-3xl border border-dashed border-[#c8bfb2] bg-white px-8 py-10 text-[#5a5046] shadow-sm transition hover:border-[#8a7f72] hover:bg-white cursor-pointer">
-              <Upload className="h-6 w-6 text-[#8a7f72]" />
-              <div className="text-base font-medium">Upload packet documents</div>
-              <p className="text-sm text-slate-500">
-                Case PDFs with tax invoices, purchase orders, e-way bills, weighment slips, LR copies, RCs, driving licences, PAN cards, FASTag toll proofs, test certificates, transport permits, and photo evidence
+          <motion.div
+            initial={{ opacity: 0, y: 24 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6, ease: "easeOut" }}
+            className="relative z-10 mx-auto flex w-full max-w-4xl flex-col items-center gap-8 px-6 py-16 text-center"
+          >
+            <div className="inline-flex items-center gap-2 rounded-full border border-[#e5ddd0] bg-white px-4 py-1.5 text-xs font-bold text-[#5a5046] shadow-sm uppercase tracking-widest">
+              <Sparkles className="h-3.5 w-3.5 text-[#8a7f72]" />
+              New Case Workspace
+            </div>
+
+            <div className="space-y-4 max-w-3xl">
+              <h1 className="text-4xl font-extrabold tracking-tight text-slate-900 sm:text-5xl">
+                Upload files and create a case
+              </h1>
+              <p className="mx-auto max-w-2xl text-base font-medium leading-relaxed text-[#5a5046]">
+                Start by selecting the documents that belong to one client case. We will create the case first, then you can add more files or run analysis when the packet is ready.
               </p>
-              <input
-                type="file"
-                multiple
-                accept="application/pdf"
-                className="absolute inset-0 cursor-pointer opacity-0"
-                onChange={(e) => {
-                  queueFiles(e.target.files);
-                  if (e.target.value) e.target.value = "";
-                }}
-              />
-            </label>
+            </div>
+
+            <div className="w-full max-w-3xl space-y-6">
+
+              {/* PRIMARY DROPZONE */}
+              <label className="group relative flex cursor-pointer flex-col items-center justify-center gap-4 rounded-[2rem] border-2 border-dashed border-[#c8bfb2] bg-white/60 px-8 py-14 text-[#5a5046] shadow-sm transition-all hover:border-[#8a7f72] hover:bg-white hover:shadow-md">
+                <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-[#f0ece6] text-[#5a5046] transition-transform duration-300 group-hover:scale-110 group-hover:bg-[#e8ddd0]">
+                  <Upload className="h-8 w-8" />
+                </div>
+                <div className="text-center">
+                  <div className="text-xl font-bold text-slate-900">Drop files here or click to browse</div>
+                  <p className="mx-auto mt-2 max-w-md text-sm font-medium text-slate-500">
+                    Upload PDFs, invoices, receipts, and images. We&apos;ll automatically classify and extract data.
+                  </p>
+                </div>
+                <input
+                  type="file"
+                  multiple
+                  accept={DOCUMENT_UPLOAD_ACCEPT}
+                  className="absolute inset-0 cursor-pointer opacity-0"
+                  onChange={handleUploadInputChange}
+                />
+              </label>
+
+              {/* DIVIDER */}
+              <div className="my-6 flex w-full items-center gap-4 opacity-80">
+                <div className="h-px flex-1 bg-[#e5ddd0]"></div>
+                <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#8a7f72]">Or import from</div>
+                <div className="h-px flex-1 bg-[#e5ddd0]"></div>
+              </div>
+
+              {/* SECONDARY UPLOAD OPTIONS (BENTO GRID) */}
+              <div className="grid w-full grid-cols-1 gap-4 sm:grid-cols-2">
+                {/* Photo Library Card */}
+                <label className="group relative flex cursor-pointer items-center gap-4 rounded-2xl border border-[#e5ddd0] bg-white p-4 shadow-sm transition-all hover:border-[#d4c9b8] hover:bg-[#faf8f4] hover:shadow-md">
+                  <input type="file" multiple accept={IMAGE_UPLOAD_ACCEPT} className="sr-only" onChange={handleUploadInputChange} />
+                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-[#f0ece6] text-[#5a5046] transition-colors group-hover:bg-[#e8ddd0] group-hover:text-[#1a1a1a]">
+                    <ImagePlus className="h-5 w-5" />
+                  </div>
+                  <div className="text-left">
+                    <div className="text-sm font-bold text-slate-900">Photo Library</div>
+                    <div className="mt-0.5 text-[11px] font-semibold text-slate-500">Images & Receipts</div>
+                  </div>
+                </label>
+
+                {/* Camera Card */}
+                <button
+                  type="button"
+                  className="group relative flex cursor-pointer items-center gap-4 rounded-2xl border border-[#e5ddd0] bg-white p-4 shadow-sm transition-all hover:border-[#d4c9b8] hover:bg-[#faf8f4] hover:shadow-md text-left"
+                  onClick={handleCameraCaptureRequest}
+                >
+                  <input ref={cameraFallbackInputRef} type="file" accept={IMAGE_UPLOAD_ACCEPT} capture="environment" className="sr-only" onChange={handleUploadInputChange} />
+                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-[#f0ece6] text-[#5a5046] transition-colors group-hover:bg-[#e8ddd0] group-hover:text-[#1a1a1a]">
+                    {cameraStatus === "opening" ? <Loader2 className="h-5 w-5 animate-spin" /> : <Camera className="h-5 w-5" />}
+                  </div>
+                  <div>
+                    <div className="text-sm font-bold text-slate-900">Take Photo</div>
+                    <div className="mt-0.5 text-[11px] font-semibold text-slate-500">Scan with camera</div>
+                  </div>
+                </button>
+              </div>
+
+              {queuedUploadRail && (
+                <div className="pt-4 border-t border-[#e5ddd0]">
+                  {queuedUploadRail}
+                </div>
+              )}
+
+              {draftCaseStatus === "error" && draftCaseError && (
+                <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-left text-sm font-bold text-red-700 shadow-sm">
+                  {draftCaseError}
+                </div>
+              )}
+            </div>
 
             {hasUploads && (
-              <div className="w-full max-w-3xl space-y-3 text-left">
-                <div className="flex items-center justify-between">
-                  <div className="text-sm font-medium text-slate-700">Procurement documents ready for processing</div>
-                  <div className="text-xs uppercase tracking-[0.2em] text-slate-400">
-                    {queuedUploads.length} document{queuedUploads.length > 1 ? "s" : ""}
-                  </div>
-                </div>
-                <div className="overflow-x-auto">
-                  <div className="flex items-center gap-3 pb-1">
-                    {queuedUploads.map((upload, index) => {
-                      const fallbackTemplate = matchSampleByIndex(index);
-                      const inferredType = upload.resultDoc?.type ?? upload.classifiedType ?? fallbackTemplate.type;
-                      return (
-                        <Popover key={upload.id}>
-                          <PopoverTrigger asChild>
-                            <button
-                              type="button"
-                              className="group relative flex h-12 w-12 items-center justify-center rounded-2xl border border-slate-200 bg-white text-slate-600 shadow-sm transition hover:border-indigo-300 hover:text-slate-900"
-                            >
-                              <FileText className="h-5 w-5" />
-                              <span className="absolute -top-1 -right-1 grid h-5 w-5 place-items-center rounded-full bg-slate-900 text-[11px] font-semibold text-white">
-                                {index + 1}
-                              </span>
-                            </button>
-                          </PopoverTrigger>
-                          <PopoverContent align="center" side="top" className="w-64 text-left">
-                            <div className="flex items-start justify-between gap-3">
-                              <div className="min-w-0">
-                                <div className="truncate text-sm font-medium text-slate-900">
-                                  {upload.name}
-                                </div>
-                                <div className="text-xs text-slate-500">
-                                  Slot {index + 1} · {inferredType}
-                                </div>
-                              </div>
-                              <button
-                                type="button"
-                                className="rounded-full border border-slate-200 p-1 text-slate-500 transition hover:border-slate-400 hover:text-slate-700"
-                                onClick={() => removeUpload(upload.id)}
-                                aria-label="Remove file"
-                              >
-                                <Trash2 className="h-4 w-4" />
-                              </button>
-                            </div>
-                            <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
-                              Pipeline stages: upload, classify, OCR, extract, validate. Status updates appear as processing runs.
-                            </div>
-                          </PopoverContent>
-                        </Popover>
-                      );
-                    })}
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {hasUploads && (
-            <motion.div
-              whileHover={{ scale: 1.03 }}
-              whileTap={{ scale: 0.97 }}
-              transition={{ type: "spring", stiffness: 200, damping: 15 }}
-            >
-              <Button
-                size="lg"
-                disabled={!hasUploads}
-                className="group relative overflow-hidden rounded-2xl px-8 py-6 text-base font-semibold shadow-lg disabled:cursor-not-allowed disabled:opacity-60"
-                onClick={startProcessing}
+              <motion.div
+                whileHover={{ scale: 1.02 }}
+                whileTap={{ scale: 0.98 }}
+                transition={{ type: "spring", stiffness: 300, damping: 20 }}
+                className="w-full max-w-3xl"
               >
-                <span className="absolute inset-0 bg-gradient-to-r from-slate-900 via-slate-800 to-slate-700 opacity-95 transition-opacity group-hover:opacity-100" />
-                <span className="relative z-10 flex items-center gap-2 tracking-tight text-white">
-                  <Play className="h-5 w-5 fill-white" />
-                  Process documents
-                </span>
-              </Button>
-            </motion.div>
-          )}
-        </motion.div>
-      </section>
+                <Button
+                  size="lg"
+                  disabled={!hasUploads || draftCaseStatus === "saving"}
+                  className="group relative w-full overflow-hidden rounded-2xl px-8 py-7 text-lg font-bold shadow-lg disabled:cursor-not-allowed disabled:opacity-60 bg-slate-900 hover:bg-slate-800 text-white"
+                  onClick={handleCreateCaseDraft}
+                >
+                  <span className="relative z-10 flex items-center justify-center gap-3 tracking-tight">
+                    {draftCaseStatus === "saving" ? (
+                      <Loader2 className="h-5 w-5 animate-spin" />
+                    ) : (
+                      <FolderPlus className="h-5 w-5" />
+                    )}
+                    {draftCaseStatus === "saving" ? "Creating case..." : "Create case & Continue"}
+                  </span>
+                </Button>
+              </motion.div>
+            )}
+          </motion.div>
+        </section>
+        {duplicateUploadDialog}
+        {cameraCaptureDialog}
+        {imagePreviewDialog}
+        {analysisOptionsDialog}
+      </>
     );
   }
 
+  // =========================================================================
+  // STATE 2: DRAFT CREATED (Ready to Analyze)
+  // =========================================================================
+  if (pipelineStatus === "idle" && caseDraftCreated) {
+    return renderWithSidebar(
+      <>
+        <section className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#f7f7f5]">
+          <div className="absolute inset-0 -z-10">
+            <div className="absolute left-[12%] top-[14%] h-72 w-72 rounded-full bg-[#e5ddd0]/40 blur-3xl" />
+            <div className="absolute right-[12%] bottom-[14%] h-80 w-80 rounded-full bg-[#d4c9b8]/30 blur-3xl" />
+          </div>
+          <motion.div
+            initial={{ opacity: 0, y: 24 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5, ease: "easeOut" }}
+            className="relative z-10 mx-auto flex w-full max-w-4xl flex-col items-center gap-8 px-6 py-16 text-center"
+          >
+            <div className="grid h-16 w-16 place-items-center rounded-[1.25rem] bg-emerald-100 text-emerald-600 shadow-sm border border-emerald-200">
+              <CheckCircle2 className="h-8 w-8" />
+            </div>
+
+            <div className="space-y-4 max-w-2xl">
+              <div className="text-xs font-bold uppercase tracking-[0.3em] text-[#8a7f72]">Case Draft Created</div>
+              <h1 className="text-4xl font-extrabold tracking-tight text-slate-900 sm:text-5xl">
+                Ready for Analysis
+              </h1>
+              <p className="mx-auto text-base font-medium leading-relaxed text-[#5a5046]">
+                The case has {queuedUploadLabel} ready. Add any missing documents now, or start the analysis engine to extract fields and reconcile data.
+              </p>
+
+              {persistence.savedCase && (
+                <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-[#e5ddd0] bg-white px-4 py-2 text-sm font-bold text-slate-700 shadow-sm">
+                  <Folder className="h-4 w-4 text-[#8a7f72]" /> {persistence.savedCase.displayName}
+                </div>
+              )}
+              {draftCaseStatus === "saving" && (
+                <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-4 py-2 text-sm font-bold text-blue-700 shadow-sm">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Syncing files to case...
+                </div>
+              )}
+              {draftCaseStatus === "error" && draftCaseError && (
+                <div className="mx-auto mt-4 max-w-2xl rounded-2xl border border-red-200 bg-red-50 px-5 py-4 text-sm font-bold text-red-700 shadow-sm">
+                  {draftCaseError}
+                </div>
+              )}
+            </div>
+
+            <div className="w-full max-w-3xl rounded-[2rem] border border-[#e5ddd0] bg-white p-6 shadow-sm">
+              {queuedUploadRail}
+            </div>
+
+            <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#8a7f72]">
+              Mode: {getComparisonModeLabel(comparisonOptions)}
+            </div>
+
+            {/* ACTION ROW */}
+            <div className="flex w-full max-w-3xl flex-col gap-4 sm:flex-row sm:items-center sm:justify-center mt-2">
+
+              {/* HIDDEN INPUTS FOR POPOVER */}
+              <input ref={fileInputRef} type="file" multiple accept={DOCUMENT_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
+              <input ref={galleryInputRef} type="file" multiple accept={IMAGE_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
+
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button variant="outline" disabled={draftCaseStatus === "saving"} className="rounded-2xl px-6 py-6 text-base font-bold border-[#e5ddd0] text-slate-700 bg-white hover:bg-[#faf8f4] shadow-sm transition-transform hover:scale-[1.02]">
+                    <Plus className="mr-2 h-5 w-5 text-[#8a7f72]" /> Add more files
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent align="center" side="bottom" className="w-56 p-2 rounded-2xl border-[#e5ddd0] shadow-xl bg-white">
+                  <button onClick={() => fileInputRef.current?.click()} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-bold text-slate-700 hover:bg-[#faf8f4] hover:text-slate-900 transition-colors">
+                    <FolderPlus className="h-4 w-4 text-[#8a7f72]" /> Browse Files
+                  </button>
+                  <button onClick={() => galleryInputRef.current?.click()} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-bold text-slate-700 hover:bg-[#faf8f4] hover:text-slate-900 transition-colors">
+                    <ImagePlus className="h-4 w-4 text-[#8a7f72]" /> Photo Library
+                  </button>
+                  <button onClick={handleCameraCaptureRequest} disabled={cameraStatus === "opening"} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-bold text-slate-700 hover:bg-[#faf8f4] hover:text-slate-900 transition-colors disabled:opacity-50">
+                    {cameraStatus === "opening" ? <Loader2 className="h-4 w-4 animate-spin text-[#8a7f72]" /> : <Camera className="h-4 w-4 text-[#8a7f72]" />} Take Photo
+                  </button>
+                </PopoverContent>
+              </Popover>
+
+              <Button
+                type="button"
+                disabled={!hasUploads}
+                className="flex-1 rounded-2xl bg-slate-900 px-8 py-6 text-base font-bold text-white shadow-lg shadow-slate-900/15 hover:bg-slate-800 transition-transform hover:scale-[1.02]"
+                onClick={handleAnalyzeRequest}
+              >
+                <Play className="mr-2 h-5 w-5 fill-white" />
+                Analyze Case
+              </Button>
+
+              <Button
+                type="button"
+                variant="ghost"
+                className="rounded-2xl px-6 py-6 text-base font-bold text-[#8a7f72] hover:bg-[#e5ddd0]/30 hover:text-slate-700"
+                onClick={resetWorkspace}
+              >
+                Start over
+              </Button>
+            </div>
+          </motion.div>
+        </section>
+        {duplicateUploadDialog}
+        {cameraCaptureDialog}
+        {imagePreviewDialog}
+        {analysisOptionsDialog}
+      </>
+    );
+  }
+
+  // =========================================================================
+  // STATE 3: PROCESSING SCREEN
+  // =========================================================================
   if (pipelineStatus === "processing") {
     const totalDocs = queuedUploads.length || SAMPLE_DOCS.length;
     const activeIndex = activeUploadId
@@ -609,7 +1298,7 @@ export function WorkspacePage() {
     }
 
     return renderWithSidebar(
-      <section className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#f7f7f5] text-[#1a1a1a]">
+      <section className="relative flex min-h-[calc(100vh-2rem)] items-center justify-center overflow-hidden bg-[#f7f7f5] text-slate-900">
         <div className="absolute inset-0 -z-10">
           <div className="absolute left-[12%] top-[8%] h-72 w-72 rounded-full bg-[#e5ddd0]/40 blur-3xl" />
           <div className="absolute right-[10%] bottom-[12%] h-80 w-80 rounded-full bg-[#d4c9b8]/30 blur-3xl" />
@@ -622,43 +1311,43 @@ export function WorkspacePage() {
         >
           <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
             <div>
-              <span className="text-xs uppercase tracking-[0.3em] text-slate-500">
+              <span className="text-xs font-bold uppercase tracking-[0.3em] text-[#8a7f72]">
                 Document intake pipeline
               </span>
-              <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-900 sm:text-4xl">
+              <h1 className="mt-2 text-3xl font-extrabold tracking-tight text-slate-900 sm:text-4xl">
                 Classifying, digitizing, and validating uploads…
               </h1>
             </div>
-            <div className="rounded-2xl border border-[#e5ddd0] bg-white px-4 py-3 text-right shadow-sm">
-              <div className="text-[11px] uppercase tracking-wide text-slate-500">Elapsed</div>
-              <div className="text-lg font-semibold text-slate-900">{secondsElapsed}s</div>
+            <div className="rounded-2xl border border-[#e5ddd0] bg-white px-5 py-4 text-right shadow-sm">
+              <div className="text-[10px] font-bold uppercase tracking-widest text-[#8a7f72]">Elapsed</div>
+              <div className="text-xl font-bold text-slate-900">{secondsElapsed}s</div>
             </div>
           </div>
 
-          <div className="rounded-3xl border border-[#e5ddd0] bg-white px-6 py-6 shadow-sm">
-            <div className="mb-4 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex items-center gap-3">
-                <div className="grid h-12 w-12 place-items-center rounded-2xl bg-[#f0ece6] text-[#8a7f72] shadow-inner">
-                  <Sparkles className="h-6 w-6 animate-pulse text-[#8a7f72]" />
+          <div className="rounded-3xl border border-[#e5ddd0] bg-white/95 px-8 py-8 shadow-md backdrop-blur">
+            <div className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-center gap-4">
+                <div className="grid h-14 w-14 place-items-center rounded-2xl bg-[#f0ece6] text-[#5a5046] shadow-inner">
+                  <Sparkles className="h-6 w-6 animate-pulse text-[#5a5046]" />
                 </div>
                 <div>
-                  <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                  <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#8a7f72]">
                     Global progress
                   </div>
-                  <div className="text-3xl font-semibold text-slate-900">
+                  <div className="text-3xl font-extrabold text-slate-900">
                     {Math.round(pipelineProgress * 100)}%
                   </div>
                 </div>
               </div>
-              <div className="text-sm text-slate-600">
+              <div className="text-sm font-medium text-slate-600">
                 Analyzing{" "}
-                <span className="font-semibold text-slate-900">{currentOrdinal}</span>{" "}
+                <span className="font-bold text-slate-900">{currentOrdinal}</span>{" "}
                 of {totalDocs} documents
               </div>
             </div>
-            <div className="relative h-3 w-full overflow-hidden rounded-full bg-zinc-100">
+            <div className="relative h-3 w-full overflow-hidden rounded-full bg-[#f0ece6]">
               <motion.div
-                className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-slate-900 via-slate-800 to-indigo-600"
+                className="absolute inset-y-0 left-0 rounded-full bg-slate-900"
                 animate={{ width: `${pipelineProgress * 100}%` }}
                 transition={{ ease: "easeInOut", duration: 0.3 }}
               />
@@ -671,14 +1360,14 @@ export function WorkspacePage() {
               initial={{ opacity: 0, y: 12 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.4, ease: "easeOut" }}
-              className="flex h-full flex-col rounded-3xl border border-[#e5ddd0] bg-white p-6 shadow-sm"
+              className="flex h-full flex-col rounded-3xl border border-[#e5ddd0] bg-white p-8 shadow-md"
             >
               <div className="flex items-start justify-between">
                 <div>
-                  <div className="text-xs uppercase tracking-[0.3em] text-slate-500">
+                  <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#8a7f72]">
                     Current document
                   </div>
-                  <div className="mt-2 min-h-[56px]">
+                  <div className="mt-3 min-h-[56px]">
                     <AnimatePresence mode="wait">
                       {classificationComplete ? (
                         <motion.div
@@ -688,10 +1377,10 @@ export function WorkspacePage() {
                           exit={{ opacity: 0, y: -6 }}
                           transition={{ duration: 0.25 }}
                         >
-                          <h2 className="text-lg font-semibold leading-tight text-slate-900">
+                          <h2 className="text-xl font-bold leading-tight text-slate-900">
                             {currentDoc.title}
                           </h2>
-                          <div className="mt-1 text-sm text-slate-500">{currentDoc.type}</div>
+                          <div className="mt-1 text-sm font-semibold text-slate-500">{currentDoc.type}</div>
                         </motion.div>
                       ) : (
                         <motion.div
@@ -701,55 +1390,56 @@ export function WorkspacePage() {
                           exit={{ opacity: 0, y: -6 }}
                           transition={{ duration: 0.25 }}
                         >
-                          <h2 className="text-lg font-semibold leading-tight text-slate-900">
+                          <h2 className="text-xl font-bold leading-tight text-slate-900">
                             {sourceName}
                           </h2>
-                          <div className="mt-1 text-sm text-slate-500">
+                          <div className="mt-1 text-sm font-semibold text-slate-500">
                             Identifying document type
                           </div>
                         </motion.div>
                       )}
                     </AnimatePresence>
                   </div>
-                  <div className="text-xs text-slate-400">Source file · {sourceName}</div>
+                  <div className="text-xs font-semibold text-[#8a7f72] mt-2">Source file · {sourceName}</div>
                 </div>
-                <div className="flex items-center gap-1 rounded-full border border-[#e5ddd0] bg-[#f0ece6] px-3 py-1 text-xs text-[#5a5046]">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[#8a7f72]" />
+                <div className="flex items-center gap-2 rounded-full border border-[#e5ddd0] bg-[#f0ece6] px-4 py-1.5 text-xs font-bold text-[#5a5046]">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   {currentStageMeta.label}
                 </div>
               </div>
-              <div className="mt-6 space-y-3">
+
+              <div className="mt-8 space-y-4">
                 {PIPELINE_STAGES.map((stage) => {
                   const status = stageStatus(stage);
                   const dotClass =
                     status === "done"
-                      ? "bg-indigo-600"
+                      ? "bg-emerald-500"
                       : status === "active"
-                        ? "bg-indigo-600 animate-pulse"
-                        : "bg-zinc-300";
+                        ? "bg-slate-900 animate-pulse"
+                        : "bg-[#e5ddd0]";
                   const textClass =
-                    status === "pending" ? "text-slate-400" : "text-slate-900";
+                    status === "pending" ? "text-[#8a7f72]" : "text-slate-900";
                   return (
-                    <div key={stage.id} className="flex gap-3">
-                      <span className={`mt-2 h-2 w-2 rounded-full ${dotClass}`} />
-                      <div>
-                        <div className={`text-sm font-medium ${textClass}`}>
-                          {stage.label}
-                        </div>
-
+                    <div key={stage.id} className="flex items-center gap-4">
+                      <div className={`flex h-6 w-6 items-center justify-center rounded-full ${status === 'done' ? 'bg-emerald-100 text-emerald-600' : status === 'active' ? 'bg-slate-100 text-slate-900 animate-pulse' : 'bg-[#f0ece6] text-[#8a7f72]'}`}>
+                        {status === 'done' ? <CheckCircle2 className="h-4 w-4" /> : status === 'active' ? <Loader2 className="h-4 w-4 animate-spin" /> : <div className="h-2 w-2 rounded-full bg-current" />}
+                      </div>
+                      <div className={`text-sm font-bold ${textClass}`}>
+                        {stage.label}
                       </div>
                     </div>
                   );
                 })}
               </div>
-              <div className="mt-6">
-                <div className="mb-2 flex items-center justify-between text-xs uppercase tracking-[0.2em] text-slate-500">
+
+              <div className="mt-8 pt-6 border-t border-[#e5ddd0]">
+                <div className="mb-2 flex items-center justify-between text-[10px] font-bold uppercase tracking-[0.2em] text-[#8a7f72]">
                   <span>Document progress</span>
                   <span>{Math.round(docProgress * 100)}%</span>
                 </div>
-                <div className="relative h-2 overflow-hidden rounded-full bg-zinc-100">
+                <div className="relative h-2 overflow-hidden rounded-full bg-[#f0ece6]">
                   <motion.div
-                    className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-slate-900 via-slate-800 to-indigo-600"
+                    className="absolute inset-y-0 left-0 rounded-full bg-slate-900"
                     animate={{ width: `${docProgress * 100}%` }}
                     transition={{ ease: "easeInOut", duration: 0.25 }}
                   />
@@ -764,12 +1454,18 @@ export function WorkspacePage() {
 
   if (pipelineStatus === "error") {
     return renderWithSidebar(
-      <section className="flex min-h-screen flex-col items-center justify-center gap-4 bg-[#f7f7f5] text-center text-[#5a5046]">
-        <div className="rounded-3xl border border-red-200 bg-red-50 px-6 py-5 shadow-sm">
-          <p className="text-sm font-medium text-red-700">Something went wrong while processing documents.</p>
-          {pipelineError && <p className="mt-2 text-xs text-red-600">{pipelineError}</p>}
+      <section className="flex min-h-[calc(100vh-2rem)] flex-col items-center justify-center gap-6 bg-[#f7f7f5] text-center text-slate-700">
+        <div className="h-20 w-20 bg-red-50 rounded-full flex items-center justify-center mb-2 shadow-sm border border-red-100">
+          <TriangleAlert className="h-10 w-10 text-red-500" />
         </div>
-        <Button onClick={resetPipeline} className="rounded-2xl px-6 py-3">
+        <div>
+          <h2 className="text-3xl font-extrabold text-slate-900">Processing Failed</h2>
+          <p className="text-[#5a5046] mt-3 max-w-md font-medium">An unexpected error occurred while analyzing the documents in the pipeline.</p>
+        </div>
+        <div className="bg-red-50 border border-red-100 rounded-2xl p-5 max-w-md w-full text-left font-mono text-xs text-red-800 break-words shadow-sm">
+          {pipelineError || "Unknown pipeline error."}
+        </div>
+        <Button onClick={resetPipeline} size="lg" className="rounded-2xl mt-4 font-bold bg-slate-900 hover:bg-slate-800 text-white px-8">
           Try again
         </Button>
       </section>
@@ -779,401 +1475,12 @@ export function WorkspacePage() {
   // Safety check for activeDoc
   if (!activeDoc) {
     return renderWithSidebar(
-      <section className="flex min-h-screen items-center justify-center bg-[#f7f7f5]">
-        <p className="text-zinc-600">No document selected</p>
+      <section className="flex min-h-[calc(100vh-2rem)] items-center justify-center bg-[#f7f7f5]">
+        <p className="text-[#8a7f72] font-medium">No document selected</p>
       </section>
     );
   }
 
-  return renderWithSidebar(
-    <TooltipProvider>
-      <section className="w-full">
-        <div className="mb-4 flex flex-col gap-3 sm:mb-6 sm:flex-row sm:items-start sm:justify-between">
-          <div>
-            <div className="text-xs uppercase tracking-[0.3em] text-zinc-500">Dashboard</div>
-            <h1 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900 sm:text-3xl">
-              Add Case
-            </h1>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-600">
-              Review extracted packet documents, compare shared fields, inspect mismatches, and
-              save authenticated case runs to Supabase.
-            </p>
-          </div>
-
-          <label className="relative inline-flex items-center self-start">
-            <input
-              type="file"
-              multiple
-              className="peer absolute inset-0 z-10 cursor-pointer opacity-0"
-              onChange={(e) => {
-                queueFiles(e.target.files);
-                if (e.target.value) e.target.value = "";
-              }}
-            />
-            <Button className="gap-2 bg-slate-900 text-white hover:bg-slate-800">
-              <Upload className="h-4 w-4" /> Upload
-            </Button>
-          </label>
-        </div>
-
-        {/* Hero Header Card */}
-        <Card className="mb-4 border-zinc-200">
-          <CardContent className="flex flex-wrap items-center justify-between gap-4 p-4">
-            <div className="flex items-center gap-3">
-                <div className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-slate-900 to-slate-800 text-white shadow">
-                  <Eye className="h-5 w-5" />
-                </div>
-              <div>
-                <div className="text-sm text-zinc-500">Current Case</div>
-                <div className="font-medium">{caseName}</div>
-                {paymentGap > 0 && (
-                  <div className="text-xs text-amber-600">
-                    Payment gap detected: {paymentGap}
-                  </div>
-                )}
-                {persistence.status === "saving" && (
-                  <div className="text-xs text-zinc-500">
-                    Saving original PDFs, extracted fields, and mismatch analysis to Supabase...
-                  </div>
-                )}
-                {persistence.status === "saved" && persistence.savedCase && (
-                  <div className="text-xs text-emerald-600">
-                    Stored in Supabase with case ID {persistence.savedCase.id} on{" "}
-                    {new Date(persistence.savedCase.createdAt).toLocaleString("en-IN")}
-                  </div>
-                )}
-                {persistence.status === "error" && persistence.error && (
-                  <div className="text-xs text-red-600">
-                    Processing finished, but saving to Supabase failed: {persistence.error}
-                  </div>
-                )}
-              </div>
-            </div>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <div className="rounded-xl border bg-white px-3 py-2 text-right shadow-sm">
-                  <div className="text-xs text-zinc-500">Risk Score</div>
-                  <div className="text-lg font-semibold tracking-tight">{risk}</div>
-                </div>
-              </TooltipTrigger>
-              <TooltipContent>
-                Derived from mismatch count, missing document types, and payment reconciliation checks
-              </TooltipContent>
-            </Tooltip>
-          </CardContent>
-        </Card>
-
-        {/* Workspace */}
-        <Tabs defaultValue="review" className="w-full">
-          <TabsList className="mb-4 grid w-full grid-cols-3 sm:w-auto sm:grid-cols-3">
-            <TabsTrigger value="review" className="gap-2">
-              <Eye className="h-4 w-4" /> Review
-            </TabsTrigger>
-            <TabsTrigger value="compare" className="gap-2">
-              <GitCompare className="h-4 w-4" /> Compare
-            </TabsTrigger>
-            <TabsTrigger value="issues" className="gap-2">
-              <TriangleAlert className="h-4 w-4" /> Mismatches
-            </TabsTrigger>
-          </TabsList>
-
-          {/* REVIEW TAB: Side-by-side document + extracted + Markdown OCR */}
-          <TabsContent value="review">
-            <div className="grid grid-cols-1 gap-4 lg:grid-cols-[260px_minmax(0,1fr)_minmax(0,1fr)]">
-              {/* Left: Document browser */}
-              <Card className="border-zinc-200">
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-base">
-                    <div className="flex items-center gap-2 mb-1">
-                      <FileText className="h-4 w-4" />
-                      <span>Documents</span>
-                    </div>
-                    <div className="text-xs text-zinc-500">Click a doc to preview source & fields</div>
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="p-0">
-                  <ScrollArea className="h-[calc(100vh-200px)] p-3">
-                    <div className="space-y-2">
-                      {docs.map((d) => (
-                        <button
-                          key={d.id}
-                          onClick={() => setActiveDocId(d.id)}
-                          className={`flex w-full flex-col rounded-xl border px-3 py-2 text-left transition hover:bg-zinc-50 ${activeDocId === d.id ? "border-zinc-900" : "border-zinc-200"
-                            }`}
-                        >
-                          <div className="min-w-0 space-y-1">
-                            <div className="line-clamp-2 text-sm font-medium leading-tight">{d.title}</div>
-                            <div className="flex items-center gap-2 text-xs text-zinc-500">
-                              <Badge variant="outline" className="rounded-full text-[9px]">{d.type}</Badge>
-                              <span className="truncate">{d.sourceHint}</span>
-                            </div>
-                            <div className="text-[11px] uppercase tracking-wide text-zinc-400">
-                              {d.pages} page{d.pages > 1 ? "s" : ""}
-                            </div>
-                          </div>
-                        </button>
-                      ))}
-                    </div>
-                  </ScrollArea>
-                </CardContent>
-              </Card>
-
-              {/* Middle: Source preview */}
-              <Card className="border-zinc-200">
-                <div className="flex h-[calc(100vh-200px)] min-w-0 flex-col overflow-hidden">
-                  <div className="flex-shrink-0 space-y-1 border-b px-3 py-2">
-                    <div className="line-clamp-2 text-sm font-medium leading-tight">{activeDoc.title}</div>
-                    <div className="flex items-center gap-2 text-xs text-zinc-500">
-                      <Badge variant="secondary" className="rounded-full text-[10px]">{activeDoc.type}</Badge>
-                      <span className="truncate">{activeDoc.sourceHint || "source-file.pdf"}</span>
-                    </div>
-                  </div>
-                  <div className="flex-1 min-h-0">
-                    {activeFileUrl ? (
-                      <iframe
-                        src={`${activeFileUrl}#toolbar=0&navpanes=0&scrollbar=1&view=FitV&zoom=Fit`}
-                        className="w-full h-full border-0"
-                        title="Document Preview"
-                      />
-                    ) : (
-                      <div className="p-6">
-                        <div className="mx-auto aspect-[3/4] w-full max-w-sm rounded-xl border bg-white p-4 shadow-sm">
-                          <div className="mb-2 text-xs text-zinc-500">Source preview (placeholder)</div>
-                          <div className="h-full rounded-md border bg-zinc-50" />
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </Card>
-
-              {/* Right: Extracted fields + OCR insights */}
-              <Card className="border-zinc-200 flex flex-col overflow-hidden">
-                <Tabs defaultValue="fields" className="flex flex-col h-[calc(100vh-200px)]">
-                  <CardHeader className="flex-shrink-0 pb-0">
-                    <CardTitle className="text-base">Document insights</CardTitle>
-                    <TabsList className="mt-4 grid w-full grid-cols-2">
-                      <TabsTrigger value="fields">Extracted fields</TabsTrigger>
-                      <TabsTrigger value="ocr">OCR markdown</TabsTrigger>
-                    </TabsList>
-                  </CardHeader>
-                  <CardContent className="flex-1 pt-4 min-h-0">
-                    <TabsContent value="fields" className="h-full m-0">
-                      <ScrollArea className="h-full">
-                        <Table>
-                          <TableHeader>
-                            <TableRow>
-                              <TableHead>Field</TableHead>
-                              <TableHead>Value</TableHead>
-                              <TableHead className="w-24">Status</TableHead>
-                            </TableRow>
-                          </TableHeader>
-                          <TableBody>
-                            {activeDocFieldDefinitions.map(({ key, label }) => {
-                              const v = activeDoc.fields[key];
-                              const canonical = byField[key]?.canonical;
-                              const ok = !v || !canonical || normalize(v) === normalize(canonical);
-                              return (
-                                <TableRow key={key}>
-                                  <TableCell className="whitespace-nowrap text-sm">{label}</TableCell>
-                                  <TableCell className="text-sm">
-                                    <div className="break-words whitespace-pre-wrap">
-                                      <FieldValue value={v} />
-                                    </div>
-                                  </TableCell>
-                                  <TableCell>
-                                    <ValueBadge ok={ok} value={v} />
-                                  </TableCell>
-                                </TableRow>
-                              );
-                            })}
-                          </TableBody>
-                        </Table>
-                      </ScrollArea>
-                    </TabsContent>
-                    <TabsContent value="ocr" className="h-full m-0">
-                      <div className="h-full flex flex-col">
-                        <ScrollArea className="flex-1">
-                          <div className="rounded-xl border bg-zinc-50 p-4">
-                            <div className="prose prose-sm max-w-none prose-slate">
-                              <ReactMarkdown>
-                                {activeDoc.md}
-                              </ReactMarkdown>
-                            </div>
-                          </div>
-                        </ScrollArea>
-                      </div>
-                    </TabsContent>
-                  </CardContent>
-                </Tabs>
-              </Card>
-            </div>
-          </TabsContent>
-
-          {/* COMPARE TAB: Cross-doc matrix */}
-          <TabsContent value="compare">
-            <Card className="border-zinc-200">
-              <CardHeader className="pb-2">
-                <CardTitle className="text-base">Cross‑Document Field Comparison</CardTitle>
-              </CardHeader>
-              <CardContent className="p-0">
-                <div className="overflow-auto h-[600px]">
-                  <Table className="min-w-[800px]">
-                    <TableCaption className="text-left">Canonical value is computed as the most frequent value across documents.</TableCaption>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead className="min-w-[160px] sticky left-0 bg-white">Field</TableHead>
-                        {docs.map((d) => (
-                          <TableHead key={d.id} className="w-[200px]">{d.title}</TableHead>
-                        ))}
-                        <TableHead className="min-w-[160px]">Canonical</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {comparisonFieldDefinitions.map(({ key, label }) => (
-                        <TableRow key={key}>
-                          <TableCell className="text-sm font-medium min-w-[160px] sticky left-0 bg-white">{label}</TableCell>
-                          {docs.map((d) => {
-                            const v = d.fields[key];
-                            const ok = !v || normalize(v) === normalize(byField[key]?.canonical);
-                            return (
-                              <TableCell key={d.id} className="align-top max-w-[200px]">
-                                <div className="flex flex-col gap-1">
-                                  <div className="text-xs break-words whitespace-pre-wrap">
-                                    <FieldValue value={v} />
-                                  </div>
-                                  <div>
-                                    <ValueBadge ok={ok} value={v} />
-                                  </div>
-                                </div>
-                              </TableCell>
-                            );
-                          })}
-                          <TableCell className="min-w-[160px]">
-                            <div className="rounded-lg border bg-zinc-50 p-2 font-mono text-xs break-words whitespace-pre-wrap">
-                              {byField[key]?.canonical || <em className="opacity-60">—</em>}
-                            </div>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
-              </CardContent>
-            </Card>
-          </TabsContent>
-
-          {/* ISSUES TAB: Mismatch list with quick-fix guidance */}
-          <TabsContent value="issues">
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-              <div className="lg:col-span-1">
-                <Card className="border-zinc-200">
-                  <CardHeader className="pb-2">
-                    <CardTitle className="text-base">Mismatches & Checks</CardTitle>
-                  </CardHeader>
-                  <CardContent className="p-0">
-                    <ScrollArea className="h-[520px]">
-                      <div className="divide-y">
-                        {showAiMismatches ? (
-                          pipelineMismatches.map((mismatch) => (
-                            <button
-                              key={mismatch.id}
-                              onClick={() => setActiveMismatchId(mismatch.id)}
-                              className={`w-full text-left p-4 hover:bg-zinc-50 ${activeMismatchId === mismatch.id ? 'bg-zinc-100' : ''
-                                }`}
-                            >
-                              <div className="font-medium">{FIELD_LABEL_LOOKUP[mismatch.field] ?? mismatch.field}</div>
-                            </button>
-                          ))
-                        ) : (
-                          allMismatches.map((mismatch) => (
-                            <button
-                              key={mismatch.field}
-                              onClick={() => setActiveMismatchId(mismatch.field)}
-                              className={`w-full text-left p-4 hover:bg-zinc-50 ${activeMismatchId === mismatch.field ? 'bg-zinc-100' : ''
-                                }`}
-                            >
-                              <div className="font-medium">{mismatch.label}</div>
-                            </button>
-                          ))
-                        )}
-                        {(!pipelineMismatches.length && !allMismatches.length) && (
-                          <div className="p-6 text-sm text-zinc-600">No mismatches detected. You&apos;re good! 🎉</div>
-                        )}
-                      </div>
-                    </ScrollArea>
-                  </CardContent>
-                </Card>
-              </div>
-              <div className="lg:col-span-2">
-                <Card className="border-zinc-200">
-                  <CardContent className="p-6">
-                    {activeMismatch ? (
-                      <div className="space-y-4">
-                        <div>
-                          <div className="text-xs text-zinc-500">Field</div>
-                          <div className="font-medium">
-                            {FIELD_LABEL_LOOKUP[activeMismatch.field] ?? activeMismatch.field}
-                          </div>
-                        </div>
-                        <div>
-                          <div className="text-xs text-zinc-500">Observed Values</div>
-                          <div className="mt-1 flex flex-wrap gap-2">
-                            {(activeMismatch.values ?? []).map((value) => (
-                              <div
-                                key={`${activeMismatch.id}-${value.docId}`}
-                                className="rounded-full border border-zinc-200 bg-zinc-50 px-3 py-1 text-xs"
-                              >
-                                <span className="font-medium">
-                                  {docTitleLookup.get(value.docId)?.title ?? value.docId}
-                                </span>
-                                {": "}
-                                <span className="font-mono">
-                                  {value.value === null || value.value === undefined
-                                    ? "—"
-                                    : String(value.value)}
-                                </span>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                        {activeMismatch.analysis && (
-                          <div>
-                            <div className="text-xs text-zinc-500">Analysis</div>
-                            <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
-                              <div className="prose prose-sm max-w-none">
-                                <ReactMarkdown>
-                                  {activeMismatch.analysis}
-                                </ReactMarkdown>
-                              </div>
-                            </div>
-                          </div>
-                        )}
-                        {activeMismatch.fixPlan && (
-                          <div>
-                            <div className="text-xs text-zinc-500">Recommended Fix</div>
-                            <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">
-                              <div className="prose prose-sm max-w-none prose-emerald">
-                                <ReactMarkdown>
-                                  {activeMismatch.fixPlan}
-                                </ReactMarkdown>
-                              </div>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="flex items-center justify-center h-full">
-                        <p className="text-zinc-600">Select a mismatch to view details.</p>
-                      </div>
-                    )}
-                  </CardContent>
-                </Card>
-              </div>
-            </div>
-          </TabsContent>
-        </Tabs>
-      </section>
-    </TooltipProvider>
-  );
+  // Workspace Ready State is handled inside CaseDetailPage component visually matching this theme
+  return renderWithSidebar(<div className="p-8">Workspace Ready (Should transition to detail view)</div>);
 }

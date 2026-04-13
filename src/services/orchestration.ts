@@ -1,11 +1,12 @@
 import type {
   CaseDoc,
+  ComparisonOptions,
   DocType,
   Mismatch,
   PipelineStageId,
   QueuedUpload,
 } from "@/types/pipeline";
-import { pdfToImagePages } from "@/services/pdf";
+import { fileToImagePages } from "@/services/pdf";
 import {
   classifyDocumentFromImage,
   extractDataFromImages,
@@ -13,6 +14,7 @@ import {
 } from "@/services/ai";
 import { verifyCaseDocuments } from "@/services/verification";
 import { matchSampleByIndex } from "@/services/templates";
+import { DEFAULT_COMPARISON_OPTIONS } from "@/lib/comparison";
 
 export type StagePayload = {
   fileName?: string;
@@ -33,7 +35,8 @@ export interface PipelineResult {
 
 export async function orchestrateUploads(
   uploads: QueuedUpload[],
-  onStageUpdate: StageUpdate
+  onStageUpdate: StageUpdate,
+  comparisonOptions: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS
 ): Promise<PipelineResult> {
   const documents: CaseDoc[] = [];
 
@@ -49,9 +52,9 @@ export async function orchestrateUploads(
     let pageImages: string[] = [];
     if (file) {
       try {
-        pageImages = await pdfToImagePages(file);
+        pageImages = await fileToImagePages(file);
       } catch (error) {
-        console.error("Failed to convert PDF to images", error);
+        console.error("Failed to convert upload to images", error);
       }
     }
 
@@ -64,7 +67,6 @@ export async function orchestrateUploads(
       fileName: upload.name,
       pageImages,
       documentType,
-      fallbackIndex: index,
     });
 
     const finalizedDoc: CaseDoc = {
@@ -83,7 +85,7 @@ export async function orchestrateUploads(
     onStageUpdate(upload.id, "complete", { document: finalizedDoc });
   }
 
-  const rawMismatches = verifyCaseDocuments(documents);
+  const rawMismatches = verifyCaseDocuments(documents, comparisonOptions);
   const mismatches = rawMismatches.length
     ? await generateMismatchAnalysis(rawMismatches as Mismatch[], documents)
     : [];

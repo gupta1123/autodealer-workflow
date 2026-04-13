@@ -80,6 +80,33 @@ export const FIELD_DEFINITIONS: FieldDefinition[] = [
   { key: "evidenceDescription", label: "Evidence Description" },
 ];
 
+export const IGNORED_PACKET_FIELD_KEYS: readonly FieldKey[] = [
+  "certificateDate",
+  "documentDate",
+  "ackDate",
+  "transactionDate",
+  "validityDate",
+  "dateOfBirth",
+  "itemDescription",
+  "photoTimestamp",
+];
+
+const IGNORED_PACKET_FIELD_KEY_SET = new Set<FieldKey>(IGNORED_PACKET_FIELD_KEYS);
+
+export function shouldConsiderFieldKey(fieldKey: string): fieldKey is FieldKey {
+  return !IGNORED_PACKET_FIELD_KEY_SET.has(fieldKey as FieldKey);
+}
+
+export const ACTIVE_FIELD_DEFINITIONS = FIELD_DEFINITIONS.filter(({ key }) =>
+  shouldConsiderFieldKey(key)
+);
+
+export function omitIgnoredFields<T>(fields: Record<string, T>): Record<string, T> {
+  return Object.fromEntries(
+    Object.entries(fields).filter(([key]) => shouldConsiderFieldKey(key))
+  ) as Record<string, T>;
+}
+
 const FIELD_DEFINITION_LOOKUP = FIELD_DEFINITIONS.reduce(
   (acc, field) => {
     acc[field.key] = field;
@@ -331,7 +358,7 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
 };
 
 export function getFieldKeysForDocType(docType: DocType | string): FieldKey[] {
-  return DOC_TYPE_EXTRACTION_FIELDS[docType as DocType] ?? [];
+  return (DOC_TYPE_EXTRACTION_FIELDS[docType as DocType] ?? []).filter(shouldConsiderFieldKey);
 }
 
 export function getFieldDefinitionsByKeys(fieldKeys: readonly string[]): FieldDefinition[] {
@@ -341,7 +368,7 @@ export function getFieldDefinitionsByKeys(fieldKeys: readonly string[]): FieldDe
     const normalizedKey = fieldKey as FieldKey;
     const fieldDefinition = FIELD_DEFINITION_LOOKUP[normalizedKey];
 
-    if (!fieldDefinition || seen.has(normalizedKey)) {
+    if (!fieldDefinition || seen.has(normalizedKey) || !shouldConsiderFieldKey(normalizedKey)) {
       return [];
     }
 

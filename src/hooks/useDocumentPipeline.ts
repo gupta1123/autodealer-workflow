@@ -1,17 +1,31 @@
 import { useCallback, useMemo, useState } from "react";
 
-import { persistProcessedCase, type SavedCaseRecord } from "@/lib/case-persistence";
+import { persistProcessedCase, saveCaseAnalysis, type SavedCaseRecord } from "@/lib/case-persistence";
 import type {
   CaseDoc,
+  ComparisonOptions,
   Mismatch,
   PipelineStageId,
   PipelineStageProgress,
   QueuedUpload,
 } from "@/types/pipeline";
 import { orchestrateUploads, StagePayload } from "@/services/orchestration";
+import { DEFAULT_COMPARISON_OPTIONS } from "@/lib/comparison";
 
 type PipelineStatus = "idle" | "processing" | "ready" | "error";
 type PersistenceStatus = "idle" | "saving" | "saved" | "error";
+export type DuplicateUploadStrategy = "prompt" | "overwrite" | "duplicate";
+
+export type DuplicateUploadConflict = {
+  id: string;
+  file: File;
+  existingUpload: QueuedUpload;
+};
+
+export type QueueFilesResult = {
+  conflicts: DuplicateUploadConflict[];
+  acceptedUploads: QueuedUpload[];
+};
 
 const STAGE_SEQUENCE: PipelineStageId[] = [
   "upload_received",
@@ -28,6 +42,23 @@ function buildInitialStages(): PipelineStageProgress[] {
     status: index === 0 ? "active" : "pending",
     startedAt: index === 0 ? Date.now() : undefined,
   }));
+}
+
+function normalizeUploadName(name: string) {
+  return name.trim().toLowerCase();
+}
+
+function buildQueuedUpload(file: File): QueuedUpload {
+  return {
+    id: `${file.name}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    name: file.name,
+    file,
+    stages: buildInitialStages(),
+  };
+}
+
+function buildConflictId(file: File, index: number) {
+  return `${normalizeUploadName(file.name)}-${file.size}-${file.lastModified}-${index}`;
 }
 
 function progressForStages(stages: PipelineStageProgress[]): number {
@@ -69,16 +100,65 @@ export function useDocumentPipeline() {
   const [persistenceError, setPersistenceError] = useState<string | null>(null);
   const [savedCase, setSavedCase] = useState<SavedCaseRecord | null>(null);
 
-  const queueFiles = useCallback((files?: FileList | null) => {
+  const queueFiles = useCallback((files?: FileList | File[] | null, strategy: DuplicateUploadStrategy = "prompt"): QueueFilesResult | undefined => {
     if (!files || files.length === 0) return;
-    const incoming: QueuedUpload[] = Array.from(files).map((file) => ({
-      id: `${file.name}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      name: file.name,
-      file,
-      stages: buildInitialStages(),
-    }));
-    setQueuedUploads((prev) => [...prev, ...incoming]);
-  }, []);
+    const sourceFiles = Array.from(files);
+    const acceptedUploads: QueuedUpload[] = [];
+    const conflicts: DuplicateUploadConflict[] = [];
+    const knownUploads = new Map<string, QueuedUpload>();
+
+    queuedUploads.forEach((upload) => {
+      knownUploads.set(normalizeUploadName(upload.name), upload);
+    });
+
+    sourceFiles.forEach((file, index) => {
+      const key = normalizeUploadName(file.name);
+      const existingUpload = knownUploads.get(key);
+
+      if (strategy === "prompt" && existingUpload) {
+        conflicts.push({
+          id: buildConflictId(file, index),
+          file,
+          existingUpload,
+        });
+        return;
+      }
+
+      const nextUpload = buildQueuedUpload(file);
+      acceptedUploads.push(nextUpload);
+
+      if (strategy !== "duplicate") {
+        knownUploads.set(key, nextUpload);
+      }
+    });
+
+    if (acceptedUploads.length > 0) {
+      setQueuedUploads((prev) => {
+        let nextUploads = [...prev];
+
+        acceptedUploads.forEach((nextUpload) => {
+          const existingIndex = nextUploads.findIndex(
+            (upload) => normalizeUploadName(upload.name) === normalizeUploadName(nextUpload.name)
+          );
+
+          if (existingIndex >= 0 && strategy === "overwrite") {
+            nextUploads = nextUploads.map((upload, index) => (index === existingIndex ? nextUpload : upload));
+            return;
+          }
+
+          if (existingIndex >= 0 && strategy === "prompt") {
+            return;
+          }
+
+          nextUploads = [...nextUploads, nextUpload];
+        });
+
+        return nextUploads;
+      });
+    }
+
+    return { conflicts, acceptedUploads };
+  }, [queuedUploads]);
 
   const removeUpload = useCallback((id: string) => {
     setQueuedUploads((prev) => prev.filter((item) => item.id !== id));
@@ -96,7 +176,11 @@ export function useDocumentPipeline() {
     setSavedCase(null);
   }, []);
 
-  const startProcessing = useCallback(async () => {
+  const updateSavedCase = useCallback((caseRecord: SavedCaseRecord) => {
+    setSavedCase(caseRecord);
+  }, []);
+
+  const startProcessing = useCallback(async (comparisonOptions: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS) => {
     if (queuedUploads.length === 0) return;
     setStatus("processing");
     setDocuments([]);
@@ -104,28 +188,31 @@ export function useDocumentPipeline() {
     setError(null);
     setPersistenceStatus("idle");
     setPersistenceError(null);
-    setSavedCase(null);
 
     const uploadsSnapshot = queuedUploads.map((upload) => ({ ...upload }));
 
     try {
-      const result = await orchestrateUploads(uploadsSnapshot, (uploadId, stage, payload?: StagePayload) => {
-        setActiveUploadId(uploadId);
-        setQueuedUploads((prev) =>
-          prev.map((upload) => {
-            if (upload.id !== uploadId) return upload;
-            const stages = advanceStages(upload.stages, stage);
-            const updates: Partial<QueuedUpload> = { stages };
-            if (stage === "classifying" && payload?.documentType) {
-              updates.classifiedType = payload.documentType;
-            }
-            if (stage === "complete" && payload?.document) {
-              updates.resultDoc = payload.document;
-            }
-            return { ...upload, ...updates };
-          })
-        );
-      });
+      const result = await orchestrateUploads(
+        uploadsSnapshot,
+        (uploadId, stage, payload?: StagePayload) => {
+          setActiveUploadId(uploadId);
+          setQueuedUploads((prev) =>
+            prev.map((upload) => {
+              if (upload.id !== uploadId) return upload;
+              const stages = advanceStages(upload.stages, stage);
+              const updates: Partial<QueuedUpload> = { stages };
+              if (stage === "classifying" && payload?.documentType) {
+                updates.classifiedType = payload.documentType;
+              }
+              if (stage === "complete" && payload?.document) {
+                updates.resultDoc = payload.document;
+              }
+              return { ...upload, ...updates };
+            })
+          );
+        },
+        comparisonOptions
+      );
 
       setDocuments(result.documents);
       setMismatches(result.mismatches);
@@ -134,11 +221,18 @@ export function useDocumentPipeline() {
 
       setPersistenceStatus("saving");
       try {
-        const persisted = await persistProcessedCase({
-          uploads: uploadsSnapshot,
-          documents: result.documents,
-          mismatches: result.mismatches,
-        });
+        const persisted = savedCase
+          ? await saveCaseAnalysis(savedCase.id, {
+              documents: result.documents,
+              mismatches: result.mismatches,
+              comparisonOptions,
+            })
+          : await persistProcessedCase({
+              uploads: uploadsSnapshot,
+              documents: result.documents,
+              mismatches: result.mismatches,
+              comparisonOptions,
+            });
         setSavedCase(persisted.case);
         setPersistenceStatus("saved");
       } catch (persistError) {
@@ -154,7 +248,7 @@ export function useDocumentPipeline() {
       setStatus("error");
       setActiveUploadId(null);
     }
-  }, [queuedUploads]);
+  }, [queuedUploads, savedCase]);
 
   const overallProgress = useMemo(() => {
     if (queuedUploads.length === 0) return 0;
@@ -178,6 +272,7 @@ export function useDocumentPipeline() {
     queueFiles,
     removeUpload,
     startProcessing,
+    updateSavedCase,
     reset,
   } as const;
 }

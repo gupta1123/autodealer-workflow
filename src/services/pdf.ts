@@ -38,7 +38,70 @@ export async function fileToDataUrl(file: File): Promise<string> {
   });
 }
 
-export async function pdfToImagePages(file: File): Promise<string[]> {
+function inferImageMimeType(fileName: string) {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+
+  switch (extension) {
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "png":
+      return "image/png";
+    case "webp":
+      return "image/webp";
+    case "gif":
+      return "image/gif";
+    case "bmp":
+      return "image/bmp";
+    case "heic":
+      return "image/heic";
+    case "heif":
+      return "image/heif";
+    default:
+      return "";
+  }
+}
+
+function isImageFile(file: File) {
+  return file.type.startsWith("image/") || Boolean(inferImageMimeType(file.name));
+}
+
+async function imageFileToImagePage(file: File): Promise<string> {
+  const imageFile = file.type.startsWith("image/")
+    ? file
+    : new File([file], file.name, { type: inferImageMimeType(file.name) || "image/jpeg" });
+  const dataUrl = await fileToDataUrl(imageFile);
+
+  return new Promise((resolve) => {
+    const image = new Image();
+
+    image.onload = () => {
+      const maxSide = 1800;
+      const scale = Math.min(1, maxSide / Math.max(image.naturalWidth, image.naturalHeight));
+      const canvas = document.createElement("canvas");
+      const context = canvas.getContext("2d");
+
+      if (!context) {
+        resolve(dataUrl);
+        return;
+      }
+
+      canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL("image/jpeg", 0.9));
+    };
+
+    image.onerror = () => resolve(dataUrl);
+    image.src = dataUrl;
+  });
+}
+
+export async function fileToImagePages(file: File): Promise<string[]> {
+  if (isImageFile(file)) {
+    return [await imageFileToImagePage(file)];
+  }
+
   try {
     const pdfjsLib = await loadPdfJs();
     const arrayBuffer = await file.arrayBuffer();
@@ -69,6 +132,8 @@ export async function pdfToImagePages(file: File): Promise<string[]> {
     return [fallback];
   }
 }
+
+export const pdfToImagePages = fileToImagePages;
 
 export function base64ToInlineData(base64: string, mimeType: string) {
   return {

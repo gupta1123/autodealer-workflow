@@ -1,4 +1,5 @@
 import { DashboardSidebar } from "@/components/dashboard/DashboardSidebar";
+import styles from "./AppShell.module.css";
 
 type AppShellProps = {
   children: React.ReactNode;
@@ -6,27 +7,10 @@ type AppShellProps = {
 
 export function AppShell({ children }: AppShellProps) {
   return (
-    <div
-      style={{
-        display: "flex",
-        height: "100vh",
-        overflow: "hidden",
-        backgroundColor: "#f7f7f5",
-      }}
-    >
-      {/* Fixed-width sidebar */}
+    <div className={styles.shell}>
       <DashboardSidebar />
 
-      {/* Scrollable main content area */}
-      <main
-        style={{
-          flex: 1,
-          overflowY: "auto",
-          backgroundColor: "#f7f7f5",
-        }}
-      >
-        {children}
-      </main>
+      <main className={styles.main}>{children}</main>
     </div>
   );
 }
