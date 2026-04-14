@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useEffect, useState, useMemo } from "react";
 import {
-  Loader2,
   Search,
   FolderOpen,
   Folder,
@@ -18,6 +17,7 @@ import {
 import { AppShell } from "@/components/dashboard/AppShell";
 import { CaseConfirmDialog } from "@/components/cases/CaseConfirmDialog";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
   TableBody,
@@ -81,6 +81,101 @@ function useIsMobileView() {
   }, []);
 
   return isMobileView;
+}
+
+function CasesGridSkeleton() {
+  return (
+    <div className="grid grid-cols-1 gap-3 px-4 sm:grid-cols-2 md:px-6 lg:grid-cols-3 xl:grid-cols-4">
+      {Array.from({ length: 8 }).map((_, index) => (
+        <div
+          key={index}
+          className="flex flex-col rounded-xl border border-[#e5ddd0] bg-white p-3.5 shadow-sm"
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex min-w-0 items-start gap-2.5">
+              <Skeleton className="h-8 w-8 shrink-0 rounded-lg bg-[#f0ece6]" />
+              <div className="min-w-0 space-y-2">
+                <Skeleton className="h-3.5 w-36 bg-slate-100" />
+                <Skeleton className="h-3 w-24 bg-slate-100" />
+              </div>
+            </div>
+            <Skeleton className="h-5 w-5 rounded-md bg-slate-100" />
+          </div>
+          <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+            <Skeleton className="h-5 w-16 rounded bg-slate-100" />
+            <Skeleton className="h-5 w-10 rounded bg-slate-100" />
+          </div>
+          <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5">
+            <Skeleton className="h-3 w-24 bg-slate-100" />
+            <Skeleton className="h-3 w-16 bg-slate-100" />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CasesTableSkeleton() {
+  return (
+    <Table className="w-full text-sm">
+      <TableHeader>
+        <TableRow className="border-b border-slate-100 hover:bg-transparent">
+          <TableHead className="h-10 pl-4 md:pl-6 font-bold text-slate-400 text-[11px] uppercase tracking-wider">Name</TableHead>
+          <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider">Status</TableHead>
+          <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider hidden lg:table-cell">Category</TableHead>
+          <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider">Risk</TableHead>
+          <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider hidden md:table-cell">Date</TableHead>
+          <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider text-right pr-4 md:pr-6">Actions</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {Array.from({ length: 9 }).map((_, index) => (
+          <TableRow key={index} className="border-slate-100/60 h-11">
+            <TableCell className="py-2 pl-4 md:pl-6">
+              <div className="flex items-center gap-2.5">
+                <Skeleton className="h-7 w-7 shrink-0 rounded-md bg-[#f0ece6]" />
+                <div className="min-w-0 space-y-1.5">
+                  <Skeleton className="h-3.5 w-44 bg-slate-100" />
+                  <Skeleton className="hidden h-3 w-28 bg-slate-100 sm:block" />
+                </div>
+              </div>
+            </TableCell>
+            <TableCell className="py-2">
+              <Skeleton className="h-5 w-16 rounded bg-slate-100" />
+            </TableCell>
+            <TableCell className="py-2 hidden lg:table-cell">
+              <Skeleton className="h-3.5 w-28 bg-slate-100" />
+            </TableCell>
+            <TableCell className="py-2">
+              <Skeleton className="h-5 w-10 rounded bg-slate-100" />
+            </TableCell>
+            <TableCell className="py-2 hidden md:table-cell">
+              <Skeleton className="h-3.5 w-20 bg-slate-100" />
+            </TableCell>
+            <TableCell className="pr-4 md:pr-6 py-2">
+              <div className="flex justify-end gap-3">
+                <Skeleton className="h-3.5 w-9 bg-slate-100" />
+                <Skeleton className="h-3.5 w-3.5 rounded bg-slate-100" />
+              </div>
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+function CasesLoadingSkeleton({ viewMode }: { viewMode: ViewMode }) {
+  return (
+    <>
+      <div className="md:hidden">
+        <CasesGridSkeleton />
+      </div>
+      <div className="hidden md:block">
+        {viewMode === "grid" ? <CasesGridSkeleton /> : <CasesTableSkeleton />}
+      </div>
+    </>
+  );
 }
 
 export function CasesPage() {
@@ -204,7 +299,11 @@ export function CasesPage() {
 
               {/* Status Summary */}
               <div className="hidden md:flex items-center text-xs font-semibold text-[#8a7f72] px-4 border-x border-[#e5ddd0] shrink-0">
-                {cases.length} folders • {totalDocs} documents
+                {status === "loading" ? (
+                  <Skeleton className="h-3.5 w-36 bg-[#e5ddd0]" />
+                ) : (
+                  `${cases.length} folders • ${totalDocs} documents`
+                )}
               </div>
 
               <Button asChild className="bg-[#1a1a1a] hover:bg-[#2d2d2d] text-white font-bold shadow-md shadow-[#1a1a1a]/15 shrink-0 transition-transform hover:scale-[1.02]">
@@ -232,8 +331,13 @@ export function CasesPage() {
               </div>
             </div>
 
-            <div className="mt-6 text-sm font-semibold text-slate-500">
-              Documents <span className="text-slate-400 ml-1">({filteredCases.length} in current view)</span>
+            <div className="mt-6 flex items-center gap-1 text-sm font-semibold text-slate-500">
+              <span>Documents</span>
+              {status === "loading" ? (
+                <Skeleton className="h-3.5 w-32 bg-slate-100" />
+              ) : (
+                <span className="text-slate-400">({filteredCases.length} in current view)</span>
+              )}
             </div>
           </div>
 
@@ -243,10 +347,7 @@ export function CasesPage() {
           <div className="w-full overflow-x-auto pb-4">
 
             {status === "loading" && (
-              <div className="flex flex-col items-center justify-center py-20 text-slate-500">
-                <Loader2 className="mb-4 h-8 w-8 animate-spin text-[#8a7f72]" />
-                <p className="text-sm font-semibold">Loading directory...</p>
-              </div>
+              <CasesLoadingSkeleton viewMode={viewMode} />
             )}
 
             {status === "error" && (

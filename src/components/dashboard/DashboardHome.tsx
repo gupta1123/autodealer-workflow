@@ -6,7 +6,6 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   FileText,
-  Loader2,
   Database,
   Activity,
   TrendingUp,
@@ -15,6 +14,7 @@ import {
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
+import { Skeleton } from "@/components/ui/skeleton";
 import { fetchRecentCases, type SavedCaseRecord } from "@/lib/case-persistence";
 
 type LoadState = "loading" | "ready" | "error";
@@ -22,6 +22,41 @@ type LoadState = "loading" | "ready" | "error";
 function average(values: number[]) {
   if (!values.length) return 0;
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function MetricValueSkeleton() {
+  return <Skeleton className="h-8 w-16 rounded-lg bg-slate-200/70" />;
+}
+
+function RecentCasesSkeleton() {
+  return (
+    <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
+      {Array.from({ length: 6 }).map((_, index) => (
+        <div
+          key={index}
+          className="flex flex-col justify-between rounded-[24px] border border-[#f1f5f9] bg-white p-6 shadow-[0_4px_24px_rgba(0,0,0,0.02)]"
+        >
+          <div className="mb-8 flex items-start gap-4">
+            <Skeleton className="h-12 w-12 shrink-0 rounded-2xl bg-slate-100" />
+            <div className="min-w-0 flex-1 space-y-2">
+              <Skeleton className="h-4 w-4/5 bg-slate-100" />
+              <Skeleton className="h-3 w-3/5 bg-slate-100" />
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="rounded-2xl bg-[#f8fafc] p-4">
+              <Skeleton className="h-3 w-20 bg-slate-200/70" />
+              <Skeleton className="mt-3 h-7 w-10 bg-slate-200/70" />
+            </div>
+            <div className="rounded-2xl bg-[#f8fafc] p-4">
+              <Skeleton className="h-3 w-16 bg-slate-200/70" />
+              <Skeleton className="mt-3 h-7 w-10 bg-slate-200/70" />
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 export function DashboardHome() {
@@ -108,9 +143,13 @@ export function DashboardHome() {
                   ACTIVE DOCUMENTS
                 </div>
                 <div className="mt-1 flex items-baseline gap-2">
-                  <span className="text-3xl font-extrabold text-[#0f172a] leading-none">
-                    {status === "loading" ? "..." : metrics.totalDocuments}
-                  </span>
+                  {status === "loading" ? (
+                    <MetricValueSkeleton />
+                  ) : (
+                    <span className="text-3xl font-extrabold text-[#0f172a] leading-none">
+                      {metrics.totalDocuments}
+                    </span>
+                  )}
                   <ArrowUpRight className="h-4 w-4 text-[#10b981]" />
                 </div>
               </div>
@@ -127,9 +166,13 @@ export function DashboardHome() {
                   TOTAL CASES
                 </div>
                 <div className="mt-1 flex items-baseline gap-2">
-                  <span className="text-3xl font-extrabold text-[#0f172a] leading-none">
-                    {status === "loading" ? "..." : metrics.totalCases}
-                  </span>
+                  {status === "loading" ? (
+                    <MetricValueSkeleton />
+                  ) : (
+                    <span className="text-3xl font-extrabold text-[#0f172a] leading-none">
+                      {metrics.totalCases}
+                    </span>
+                  )}
                 </div>
               </div>
             </div>
@@ -145,9 +188,13 @@ export function DashboardHome() {
                   MISMATCHES
                 </div>
                 <div className="mt-1 flex items-baseline gap-2">
-                  <span className="text-3xl font-extrabold text-[#0f172a] leading-none">
-                    {status === "loading" ? "..." : metrics.totalMismatches}
-                  </span>
+                  {status === "loading" ? (
+                    <MetricValueSkeleton />
+                  ) : (
+                    <span className="text-3xl font-extrabold text-[#0f172a] leading-none">
+                      {metrics.totalMismatches}
+                    </span>
+                  )}
                 </div>
               </div>
             </div>
@@ -163,9 +210,13 @@ export function DashboardHome() {
                   AVERAGE RISK
                 </div>
                 <div className="mt-1 flex items-baseline gap-2">
-                  <span className="text-3xl font-extrabold text-[#0f172a] leading-none">
-                    {status === "loading" ? "..." : metrics.averageRisk}
-                  </span>
+                  {status === "loading" ? (
+                    <MetricValueSkeleton />
+                  ) : (
+                    <span className="text-3xl font-extrabold text-[#0f172a] leading-none">
+                      {metrics.averageRisk}
+                    </span>
+                  )}
                   <ArrowUpRight className="h-4 w-4 text-[#10b981]" />
                 </div>
               </div>
@@ -181,14 +232,12 @@ export function DashboardHome() {
               RECENT CASES
             </h2>
             <div className="rounded-full bg-[#f1f5f9] px-3 py-1 text-[11px] font-bold text-[#64748b]">
-              {status === "ready" ? `${metrics.recentList.length} UNITS` : "..."}
+              {status === "ready" ? `${metrics.recentList.length} UNITS` : <Skeleton className="h-3 w-12 bg-slate-200/70" />}
             </div>
           </div>
 
           {status === "loading" ? (
-            <div className="flex h-[300px] items-center justify-center">
-              <Loader2 className="h-8 w-8 animate-spin text-[#cbd5e1]" />
-            </div>
+            <RecentCasesSkeleton />
           ) : status === "ready" && metrics.recentList.length === 0 ? (
             <div className="flex h-[300px] flex-col items-center justify-center rounded-[24px] border border-dashed border-[#e2e8f0] bg-white">
               <FolderOpen className="mb-3 h-8 w-8 text-[#cbd5e1]" />

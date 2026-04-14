@@ -9,13 +9,13 @@ import {
   FileText,
   Info,
   Lightbulb,
-  Loader2,
   ShieldAlert,
   Sparkles,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
 import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   getComparableFieldValue,
   getComparisonDisplayLabel,
@@ -143,6 +143,89 @@ function getDocumentName(
   return document?.title || document?.sourceFileName || document?.sourceHint || fallback;
 }
 
+function MismatchReviewSkeleton() {
+  return (
+    <div className="flex flex-1 flex-col min-h-0 overflow-hidden lg:flex-row">
+      <aside className="flex shrink-0 flex-col border-b border-slate-200 bg-white lg:w-80 lg:border-b-0 lg:border-r">
+        <div className="hidden border-b border-slate-100 p-5 lg:block">
+          <div className="mb-4 flex items-center gap-2">
+            <Skeleton className="h-4 w-4 rounded bg-slate-100" />
+            <Skeleton className="h-4 w-28 bg-slate-100" />
+          </div>
+          <div className="space-y-3">
+            <div className="space-y-2">
+              <Skeleton className="h-3 w-16 bg-slate-100" />
+              <Skeleton className="h-4 w-40 bg-slate-100" />
+            </div>
+            <div className="flex items-center justify-between">
+              <div className="space-y-2">
+                <Skeleton className="h-3 w-20 bg-slate-100" />
+                <Skeleton className="h-4 w-8 bg-slate-100" />
+              </div>
+              <div className="space-y-2">
+                <Skeleton className="h-3 w-16 bg-amber-100" />
+                <Skeleton className="h-4 w-8 bg-amber-100" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-1 flex-col overflow-hidden bg-slate-50/50 lg:bg-white">
+          <div className="flex items-center justify-between border-b border-slate-100 bg-white px-4 py-3 lg:px-5 lg:py-4">
+            <Skeleton className="h-4 w-32 bg-slate-100" />
+          </div>
+          <div className="flex gap-2 overflow-x-auto p-3 lg:block lg:space-y-0 lg:overflow-y-hidden lg:p-0">
+            {Array.from({ length: 5 }).map((_, index) => (
+              <div
+                key={index}
+                className="shrink-0 rounded-full border border-slate-200 bg-white px-4 py-2 lg:w-full lg:rounded-none lg:border-0 lg:border-l-[3px] lg:border-transparent lg:px-5 lg:py-3"
+              >
+                <Skeleton className="h-4 w-28 bg-slate-100" />
+                <Skeleton className="mt-2 hidden h-3 w-20 bg-slate-100 lg:block" />
+              </div>
+            ))}
+          </div>
+        </div>
+      </aside>
+
+      <main className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
+        <div className="mx-auto max-w-3xl space-y-6">
+          <div className="space-y-2">
+            <Skeleton className="h-7 w-52 bg-slate-200/70" />
+            <Skeleton className="h-4 w-80 max-w-full bg-slate-200/70" />
+          </div>
+          <div>
+            <div className="mb-3 flex items-center gap-2">
+              <Skeleton className="h-4 w-4 rounded bg-slate-100" />
+              <Skeleton className="h-4 w-32 bg-slate-100" />
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {Array.from({ length: 4 }).map((_, index) => (
+                <div key={index} className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+                  <Skeleton className="mb-3 h-3 w-32 bg-slate-100" />
+                  <Skeleton className="h-4 w-44 bg-slate-100" />
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-lg border border-indigo-100 bg-indigo-50/50 p-4">
+            <Skeleton className="h-4 w-36 bg-indigo-100" />
+            <Skeleton className="mt-2 h-3 w-64 max-w-full bg-indigo-100" />
+          </div>
+          <div className="rounded-lg border border-slate-200 bg-slate-50/80 p-4 sm:p-5">
+            <Skeleton className="mb-4 h-4 w-36 bg-slate-200/70" />
+            <div className="space-y-3">
+              <Skeleton className="h-3.5 w-full bg-slate-200/70" />
+              <Skeleton className="h-3.5 w-5/6 bg-slate-200/70" />
+              <Skeleton className="h-3.5 w-4/6 bg-slate-200/70" />
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
+
 export function CaseMismatchPage({ caseId }: { caseId: string }) {
   const [detail, setDetail] = useState<SavedCaseDetail | null>(null);
   const [status, setStatus] = useState<LoadState>("loading");
@@ -247,9 +330,13 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
             </Link>
 
             <div className="flex min-w-0 flex-1 items-center gap-3">
-              <h1 className="truncate text-lg font-semibold tracking-tight text-slate-900">
-                {detail?.case.displayName || "Loading review..."}
-              </h1>
+              {status === "loading" ? (
+                <Skeleton className="h-5 w-52 max-w-[55vw] bg-slate-100" />
+              ) : (
+                <h1 className="truncate text-lg font-semibold tracking-tight text-slate-900">
+                  {detail?.case.displayName}
+                </h1>
+              )}
               {detail && (
                 <Badge
                   variant="secondary"
@@ -264,10 +351,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
 
         {/* Loading State */}
         {status === "loading" && (
-          <div className="flex flex-1 flex-col items-center justify-center text-slate-500">
-            <Loader2 className="mb-4 h-8 w-8 animate-spin text-amber-500" />
-            <p className="text-sm font-medium">Loading review...</p>
-          </div>
+          <MismatchReviewSkeleton />
         )}
 
         {/* Error State */}

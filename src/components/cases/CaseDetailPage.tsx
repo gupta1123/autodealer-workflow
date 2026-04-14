@@ -38,6 +38,7 @@ import { AnalysisOptionsDialog } from "@/components/workspace/AnalysisOptionsDia
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   areComparableValuesEqual,
   getComparableFieldValue,
@@ -245,6 +246,111 @@ async function savedDetailToUploads(detail: SavedCaseDetail): Promise<QueuedUplo
   return [...uploads, ...remainingUploads];
 }
 
+function CaseDetailSkeleton() {
+  return (
+    <div className="flex min-h-[calc(100vh-4rem)] flex-1 flex-col overflow-hidden bg-[#fafafa]">
+      <header className="flex h-14 sm:h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-3 sm:px-6">
+        <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-4">
+          <Skeleton className="h-8 w-8 shrink-0 rounded-lg bg-slate-100" />
+          <div className="h-6 w-px shrink-0 bg-slate-200" />
+          <Skeleton className="h-4 w-44 max-w-[45vw] bg-slate-100" />
+        </div>
+        <Skeleton className="hidden h-7 w-24 rounded-full bg-slate-100 md:block" />
+        <Skeleton className="h-5 w-16 rounded-full bg-slate-100 md:hidden" />
+      </header>
+
+      <div className="flex flex-1 min-h-0">
+        <aside className="hidden w-80 shrink-0 flex-col border-r border-slate-200 bg-[#fafafa] lg:w-[24rem] md:flex">
+          <div className="p-6 space-y-6">
+            <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+              <div className="space-y-3 bg-slate-50 p-5">
+                <div className="flex items-center gap-2">
+                  <Skeleton className="h-7 w-7 rounded-full bg-slate-200/70" />
+                  <Skeleton className="h-4 w-36 bg-slate-200/70" />
+                </div>
+                <Skeleton className="h-3.5 w-full bg-slate-200/70" />
+                <Skeleton className="h-3.5 w-4/5 bg-slate-200/70" />
+              </div>
+              <div className="grid grid-cols-2 gap-4 border-t border-slate-100 p-5">
+                {Array.from({ length: 4 }).map((_, index) => (
+                  <div key={index} className="space-y-2">
+                    <Skeleton className="h-3 w-16 bg-slate-100" />
+                    <Skeleton className="h-4 w-24 bg-slate-100" />
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <div className="mb-3 flex items-center justify-between px-1">
+                <Skeleton className="h-3 w-36 bg-slate-200/70" />
+                <Skeleton className="h-5 w-8 rounded-full bg-slate-200/70" />
+              </div>
+              <div className="space-y-1.5">
+                {Array.from({ length: 5 }).map((_, index) => (
+                  <div key={index} className="flex items-center gap-3 rounded-xl border border-transparent px-3 py-3">
+                    <Skeleton className="h-8 w-8 shrink-0 rounded-lg bg-slate-100" />
+                    <div className="min-w-0 flex-1 space-y-2">
+                      <Skeleton className="h-3.5 w-4/5 bg-slate-100" />
+                      <Skeleton className="h-3 w-1/2 bg-slate-100" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </aside>
+
+        <main className="flex flex-1 min-w-0 flex-col bg-[#fafafa] px-2.5 pb-0 pt-2.5 sm:p-4 md:p-6 lg:p-8">
+          <div className="mb-3 rounded-xl border border-[#e5ddd0] bg-white p-1.5 shadow-sm md:hidden">
+            <div className="flex gap-2 overflow-hidden">
+              {Array.from({ length: 3 }).map((_, index) => (
+                <Skeleton key={index} className="h-12 min-w-[130px] rounded-lg bg-[#f0ece6]" />
+              ))}
+            </div>
+          </div>
+
+          <div className="flex flex-1 flex-col overflow-hidden bg-white shadow-sm sm:rounded-2xl sm:border sm:border-slate-200">
+            <div className="flex flex-col justify-between gap-3 border-b border-slate-100 bg-white p-2 sm:flex-row sm:items-center sm:p-4">
+              <div className="hidden items-center gap-3 sm:flex">
+                <Skeleton className="h-5 w-5 rounded bg-slate-100" />
+                <Skeleton className="h-4 w-28 bg-slate-100" />
+                <Skeleton className="h-5 w-14 rounded-full bg-slate-100" />
+              </div>
+              <div className="flex w-full items-center justify-between gap-3 sm:w-auto sm:justify-end">
+                <div className="flex w-full items-center rounded-xl border border-[#e5ddd0] bg-[#f0ece6] p-1.5 sm:w-auto">
+                  {Array.from({ length: 3 }).map((_, index) => (
+                    <Skeleton key={index} className="mx-1 h-8 flex-1 rounded-lg bg-white/70 sm:w-20" />
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="relative flex-1 bg-[#525659] p-4">
+              <div className="mx-auto h-full max-w-3xl rounded-lg bg-white p-6 shadow-2xl">
+                <div className="space-y-4">
+                  <Skeleton className="h-7 w-3/4 bg-slate-100" />
+                  <Skeleton className="h-4 w-1/2 bg-slate-100" />
+                  <div className="space-y-3 pt-6">
+                    {Array.from({ length: 9 }).map((_, index) => (
+                      <Skeleton key={index} className="h-3.5 w-full bg-slate-100" />
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 shadow-2xl">
+                <Skeleton className="h-3 w-10 bg-white/20" />
+                <Skeleton className="h-6 w-6 rounded-lg bg-white/20" />
+                <Skeleton className="h-6 w-6 rounded-lg bg-white/20" />
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
+
 export function CaseDetailPage({ caseId }: { caseId: string }) {
   const [detail, setDetail] = useState<SavedCaseDetail | null>(null);
   const [status, setStatus] = useState<LoadState>("loading");
@@ -446,12 +552,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   if (status === "loading") {
     return (
       <AppShell>
-        <div className="flex flex-1 items-center justify-center bg-slate-50/50 min-h-[calc(100vh-4rem)]">
-          <div className="flex flex-col items-center gap-4 text-slate-500">
-            <Loader2 className="h-8 w-8 animate-spin text-indigo-600" />
-            <p className="text-sm font-medium">Loading case details...</p>
-          </div>
-        </div>
+        <CaseDetailSkeleton />
       </AppShell>
     );
   }
@@ -715,10 +816,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                           <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Uploaded</span>
                           <span className="text-slate-900 font-medium line-clamp-2">{formatDateTime(detail.case.createdAt)}</span>
                         </div>
-                        <div>
-                          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Sender</span>
-                          <span className="text-slate-900 font-medium line-clamp-2">N/A</span>
-                        </div>
+
                         <div>
                           <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Receiver</span>
                           <span className="text-slate-900 font-medium line-clamp-2">{detail.case.receiverName || "—"}</span>
