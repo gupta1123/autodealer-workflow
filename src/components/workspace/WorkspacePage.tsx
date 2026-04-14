@@ -101,10 +101,11 @@ import type {
 } from "@/types/pipeline";
 import {
   ACTIVE_FIELD_DEFINITIONS,
-  CORE_PACKET_GROUPS,
+  getEnabledCorePacketGroups,
   getFieldDefinitionsByKeys,
   getFieldDefinitionsForDocType,
   getFieldKeysForDocType,
+  shouldConsiderFieldKey,
 } from "@/lib/document-schema";
 import { SAMPLE_DOCS, matchSampleByIndex } from "@/services/templates";
 
@@ -332,6 +333,16 @@ function useMismatchReport(docs: CaseDoc[], comparisonOptions: ComparisonOptions
 
     const allMismatches: FieldMismatch[] = [];
     for (const key of PRIMARY_COMPARISON_FIELDS) {
+      const shouldCheck = docs.some(
+        (doc) =>
+          shouldConsiderFieldKey(key, doc.type) &&
+          getFieldKeysForDocType(doc.type).includes(key)
+      );
+
+      if (!shouldCheck) {
+        continue;
+      }
+
       const values = docs
         .map((doc) => ({
           docId: doc.id,
@@ -367,7 +378,7 @@ function useMismatchReport(docs: CaseDoc[], comparisonOptions: ComparisonOptions
 
     const hasAnyType = (targets: DocType[]) => docs.some((doc) => targets.includes(doc.type));
 
-    const missingDocTypes = CORE_PACKET_GROUPS
+    const missingDocTypes = getEnabledCorePacketGroups()
       .filter((group) => !hasAnyType(group.types))
       .map((group) => group.label);
     const amountA = currencyishToNumber(
@@ -1189,25 +1200,23 @@ export function WorkspacePage() {
   // =========================================================================
   if (pipelineStatus === "idle" && !caseDraftCreated) {
     return renderWithSidebar(
-      <div className="min-h-screen bg-[#f7f7f5] px-4 pb-8 pt-5 text-[#1a1a1a] sm:px-6">
-        <div className="mx-auto w-full max-w-5xl">
-          {/* Header Section */}
-          <div className="mb-5 border-b border-[#e5ddd0] pb-4">
-            <div className="flex items-center gap-3 sm:gap-4">
-              <Button variant="ghost" size="icon" className="text-[#8a7f72] hover:text-[#1a1a1a] hover:bg-[#e5ddd0]/50 rounded-full transition-colors shrink-0 h-8 w-8 sm:h-9 sm:w-9">
-                <ArrowLeft className="h-4 w-4 sm:h-5 sm:w-5" />
-              </Button>
-              <div className="hidden sm:flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-[#f0ece6] text-[#1a1a1a] border border-[#e5ddd0] shadow-sm">
-                <UploadCloud className="h-6 w-6" />
-              </div>
-              <div className="flex flex-col min-w-0">
-                <h1 className="text-lg sm:text-xl font-bold text-[#1a1a1a]">Add case documents</h1>
-                <p className="text-xs sm:text-sm font-medium text-[#8a7f72] mt-0.5 leading-snug">Upload or scan the documents for one case.</p>
-              </div>
+      <div className="flex min-h-screen flex-col bg-[#f7f7f5] px-4 pb-20 text-[#1a1a1a] sm:px-6 md:pb-8">
+        {/* Header Section */}
+        <div className="mx-auto w-full max-w-2xl pt-5 mb-5 border-b border-[#e5ddd0] pb-4">
+          <div className="flex items-center gap-3 sm:gap-4">
+            <div className="hidden sm:flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-[#f0ece6] text-[#1a1a1a] border border-[#e5ddd0] shadow-sm">
+              <UploadCloud className="h-6 w-6" />
+            </div>
+            <div className="flex flex-col min-w-0">
+              <h1 className="text-lg sm:text-xl font-bold text-[#1a1a1a]">Add case documents</h1>
+              <p className="text-xs sm:text-sm font-medium text-[#8a7f72] mt-0.5 leading-snug">Upload or scan the documents for one case.</p>
             </div>
           </div>
+        </div>
 
-          {/* Main Upload Area */}
+        {/* Centered Upload Card */}
+        <div className="flex flex-1 items-center justify-center">
+        <div className="w-full max-w-2xl">
           <div className="w-full rounded-[2rem] border-2 border-dashed border-[#e5ddd0] bg-white px-5 py-7 text-center shadow-sm transition-all hover:border-[#d4c9b8] hover:shadow-md sm:px-8 sm:py-8">
             <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-[1.25rem] border border-[#e5ddd0] bg-[#f0ece6] text-[#1a1a1a] shadow-sm">
               <UploadCloud className="h-7 w-7" />
@@ -1250,13 +1259,7 @@ export function WorkspacePage() {
               ))}
             </div>
 
-            {/* Feature info */}
-            <div className="mx-auto mt-6 inline-flex items-center gap-2 text-sm font-semibold text-[#8a7f72]">
-              <Database className="h-4 w-4" /> AI-powered field extraction, receiver naming, and mismatch checks
-            </div>
-            <p className="mx-auto mt-2 max-w-2xl text-sm font-medium leading-relaxed text-[#8a7f72]">
-              Upload PDFs or images, or scan a paper document page by page. Each finished scan stays together as one document in the case.
-            </p>
+
 
             {/* Action Buttons */}
             <div className="mx-auto mt-6 flex flex-wrap justify-center gap-3">
@@ -1273,10 +1276,7 @@ export function WorkspacePage() {
               </Button>
             </div>
 
-            {/* Bottom Info */}
-            <p className="mx-auto mt-6 max-w-3xl text-sm font-medium leading-relaxed text-[#8a7f72]">
-              Supported formats: PDF and images such as JPG, PNG, WEBP, HEIC. For a multi-page paper document, use Scan document and tap Finish document after the last page.
-            </p>
+
           </div>
 
           {/* Draft Error & Queue Overlays */}
@@ -1312,6 +1312,7 @@ export function WorkspacePage() {
             </motion.div>
           )}
 
+        </div>
         </div>
         {cameraFallbackInput}
         {duplicateUploadDialog}

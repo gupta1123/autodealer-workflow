@@ -7,6 +7,8 @@ import ReactMarkdown from "react-markdown";
 import {
   ArrowLeft,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Clock,
   Eye,
   FileText,
@@ -43,6 +45,7 @@ import {
   areComparableValuesEqual,
   getComparableFieldValue,
   getComparisonDisplayLabel,
+  isPrimaryComparisonField,
   pickCanonicalComparableValue,
   readComparisonOptions,
 } from "@/lib/comparison";
@@ -147,6 +150,16 @@ function getSourceFileLabel(mimeType?: string | null, sourceName?: string | null
   if (sourceName && /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/i.test(sourceName)) return "Image";
   if (sourceName && /\.pdf$/i.test(sourceName)) return "PDF";
   return "File";
+}
+
+function isImageSourceFile(mimeType?: string | null, sourceName?: string | null) {
+  if (mimeType?.startsWith("image/")) return true;
+  if (sourceName && /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/i.test(sourceName)) return true;
+  return false;
+}
+
+function formatCaseSubject(category: string) {
+  return /packet$/i.test(category.trim()) ? category.trim() : `${category} Packet`;
 }
 
 function getCaseStatusLabel(status: string) {
@@ -364,6 +377,8 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<ActiveTab>("preview");
+  const [previewPageIndex, setPreviewPageIndex] = useState(0);
+  const [previewZoom, setPreviewZoom] = useState(1);
 
   useEffect(() => {
     let active = true;
@@ -403,13 +418,27 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     return map;
   }, [detail]);
 
+  const uploadGroups = useMemo(
+    () =>
+      readUploadGroupMeta(
+        detail?.case.processingMeta && typeof detail.case.processingMeta === "object"
+          ? (detail.case.processingMeta as Record<string, unknown>).uploadGroups
+          : undefined
+      ),
+    [detail]
+  );
+
   const activeDocument = useMemo(() => {
     if (!detail || !activeDocumentId) return null;
     return detail.documents.find((document) => document.id === activeDocumentId) ?? null;
   }, [detail, activeDocumentId]);
 
   const visibleMismatches = useMemo(
-    () => detail?.mismatches.filter((mismatch) => shouldConsiderFieldKey(mismatch.fieldName)) ?? [],
+    () =>
+      detail?.mismatches.filter(
+        (mismatch) =>
+          shouldConsiderFieldKey(mismatch.fieldName) && isPrimaryComparisonField(mismatch.fieldName)
+      ) ?? [],
     [detail]
   );
 
@@ -418,36 +447,79 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     return getOrderedDocumentEntries(activeDocument.documentType, activeDocument.extractedFields);
   }, [activeDocument]);
 
-  const activeDocumentFile = useMemo(() => {
-    if (!detail || !activeDocument) return null;
+  const activeDocumentFiles = useMemo(() => {
+    if (!detail || !activeDocument) return [];
 
     const candidates = [activeDocument.sourceFileName, activeDocument.sourceHint]
       .filter((value): value is string => Boolean(value))
       .map((value) => normalizeText(value));
 
+    const matchedUploadGroup = uploadGroups.find((group) => {
+      const normalizedGroupName = normalizeText(group.name);
+      const normalizedPrimaryFileName = normalizeText(group.primaryFileName || "");
+      const normalizedFileNames = group.fileNames.map((fileName) => normalizeText(fileName));
+
+      return candidates.some(
+        (candidate) =>
+          candidate === normalizedGroupName ||
+          candidate === normalizedPrimaryFileName ||
+          normalizedFileNames.includes(candidate)
+      );
+    });
+
+    if (matchedUploadGroup) {
+      const groupFiles = matchedUploadGroup.fileNames
+        .map((fileName) => fileLookup.get(normalizeText(fileName)))
+        .filter((file): file is SavedCaseDetail["files"][number] => Boolean(file));
+
+      if (groupFiles.length) {
+        return groupFiles;
+      }
+    }
+
     for (const candidate of candidates) {
       const exactMatch = fileLookup.get(candidate);
-      if (exactMatch) return exactMatch;
+      if (exactMatch) return [exactMatch];
     }
 
     const partialMatch = detail.files.find((file) =>
       candidates.some((candidate) => normalizeText(file.originalName).includes(candidate))
     );
 
-    if (partialMatch) return partialMatch;
-    return detail.files.length === 1 ? detail.files[0] : null;
-  }, [activeDocument, detail, fileLookup]);
+    if (partialMatch) return [partialMatch];
+    return detail.files.length === 1 ? [detail.files[0]] : [];
+  }, [activeDocument, detail, fileLookup, uploadGroups]);
 
-  const activeFileUrl = activeDocumentFile?.signedUrl ?? null;
-  const activeSourceLabel = getSourceFileLabel(activeDocumentFile?.mimeType, activeDocument?.sourceFileName);
-  const activeSourceIsImage =
-    activeDocumentFile?.mimeType?.startsWith("image/") ||
-    Boolean(
-      (activeDocument?.sourceFileName || activeDocument?.sourceHint) &&
-      /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/i.test(
-        activeDocument?.sourceFileName || activeDocument?.sourceHint || ""
-      )
-    );
+  const activePreviewFile =
+    activeDocumentFiles[previewPageIndex] ?? activeDocumentFiles[0] ?? null;
+  const activeFileUrl = activePreviewFile?.signedUrl ?? null;
+  const previewPageCount = activeDocumentFiles.length || activeDocument?.pageCount || 1;
+  const activeSourceLabel = getSourceFileLabel(
+    activePreviewFile?.mimeType,
+    activePreviewFile?.originalName || activeDocument?.sourceFileName
+  );
+  const activeSourceIsImage = isImageSourceFile(
+    activePreviewFile?.mimeType,
+    activePreviewFile?.originalName || activeDocument?.sourceFileName || activeDocument?.sourceHint
+  );
+  const canGoToPreviousPreviewPage = previewPageIndex > 0;
+  const canGoToNextPreviewPage =
+    activeDocumentFiles.length > 0 && previewPageIndex < activeDocumentFiles.length - 1;
+  const canZoomOut = activeSourceIsImage && previewZoom > 0.75;
+  const canZoomIn = activeSourceIsImage && previewZoom < 3;
+
+  useEffect(() => {
+    setPreviewPageIndex(0);
+    setPreviewZoom(1);
+  }, [activeDocumentId]);
+
+  useEffect(() => {
+    setPreviewPageIndex((current) => Math.min(current, Math.max(activeDocumentFiles.length - 1, 0)));
+  }, [activeDocumentFiles.length]);
+
+  useEffect(() => {
+    setPreviewZoom(1);
+  }, [previewPageIndex]);
 
   const comparisonOptions = useMemo(
     () =>
@@ -680,7 +752,11 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
   return (
     <AppShell>
-      <div className="flex flex-1 flex-col bg-[#fafafa] overflow-hidden animate-in fade-in duration-300 relative min-h-[calc(100vh-4rem)]">
+      <div
+        className={`relative flex min-h-[calc(100vh-4rem)] flex-1 flex-col overflow-hidden bg-[#fafafa] animate-in fade-in duration-300 ${
+          showActions ? "pb-28 md:pb-0" : ""
+        }`}
+      >
 
         {/* Top Navigation Bar */}
         <header className="flex h-14 sm:h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-3 sm:px-6 z-20 relative">
@@ -784,7 +860,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
                       <p className={`text-sm leading-relaxed ${visibleMismatches.length === 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
                         {visibleMismatches.length === 0
-                          ? `The packet contains ${detail.documents.length} documents. All extracted key data points match perfectly across the set.`
+                          ? `The packet contains ${detail.documents.length} document${detail.documents.length === 1 ? "" : "s"}. All extracted key data points match perfectly across the set.`
                           : `The AI found ${visibleMismatches.length} conflicting data points across the ${detail.documents.length} documents provided. Review is highly recommended.`}
                       </p>
 
@@ -810,14 +886,14 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                       <div className="grid grid-cols-2 gap-y-4 gap-x-2 text-sm">
                         <div>
                           <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Subject</span>
-                          <span className="text-slate-900 font-medium line-clamp-2">{detail.case.category} Packet</span>
+                          <span className="text-slate-900 font-medium line-clamp-2">{formatCaseSubject(detail.case.category)}</span>
                         </div>
                         <div>
                           <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Uploaded</span>
                           <span className="text-slate-900 font-medium line-clamp-2">{formatDateTime(detail.case.createdAt)}</span>
                         </div>
 
-                        <div>
+                        <div className="col-span-2">
                           <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Receiver</span>
                           <span className="text-slate-900 font-medium line-clamp-2">{detail.case.receiverName || "—"}</span>
                         </div>
@@ -850,7 +926,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                               {doc.title}
                             </p>
                             <p className="truncate text-[10px] font-medium text-slate-400 mt-0.5 uppercase tracking-wider">
-                              {doc.documentType}
+                              {doc.documentType}{doc.pageCount && doc.pageCount > 1 ? ` · ${doc.pageCount} pages` : ""}
                             </p>
                           </div>
                         </button>
@@ -882,7 +958,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                       style={{ minWidth: '130px' }}
                     >
                       <p className="font-bold text-[11px] truncate w-full">{doc.title}</p>
-                      <p className={`text-[9px] font-bold opacity-60 truncate w-full uppercase tracking-tighter mt-0.5 ${isActive ? 'text-white' : 'text-[#8a7f72]'}`}>{doc.documentType}</p>
+                      <p className={`text-[9px] font-bold opacity-60 truncate w-full uppercase tracking-tighter mt-0.5 ${isActive ? 'text-white' : 'text-[#8a7f72]'}`}>{doc.documentType}{doc.pageCount && doc.pageCount > 1 ? ` · ${doc.pageCount}p` : ""}</p>
                     </button>
                   )
                 })}
@@ -945,14 +1021,23 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                     <div className="flex-1 relative overflow-auto">
                       {activeFileUrl ? (
                         activeSourceIsImage ? (
-                          <div className="absolute inset-0 flex items-center justify-center p-4">
-                            <Image
-                              src={activeFileUrl}
-                              alt="Document preview"
-                              fill
-                              unoptimized
-                              className="object-contain drop-shadow-2xl"
-                            />
+                          <div className="absolute inset-0 overflow-auto">
+                            <div className="flex min-h-full min-w-full items-center justify-center p-4">
+                              <div
+                                className="relative h-[min(78vh,920px)] w-[min(88vw,1200px)] max-h-full max-w-full transition-transform duration-150 ease-out"
+                                style={{ transform: `scale(${previewZoom})`, transformOrigin: "center center" }}
+                              >
+                                <Image
+                                  src={activeFileUrl}
+                                  alt={`Document preview page ${previewPageIndex + 1}`}
+                                  fill
+                                  unoptimized
+                                  sizes="(min-width: 1024px) 70vw, 92vw"
+                                  className="object-contain drop-shadow-2xl"
+                                  draggable={false}
+                                />
+                              </div>
+                            </div>
                           </div>
                         ) : (
                           <iframe
@@ -971,14 +1056,68 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                       {/* Floating Dark Toolbar */}
                       {activeFileUrl && (
                         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-1 bg-slate-900/80 backdrop-blur-md px-2 py-1.5 rounded-xl border border-white/10 shadow-2xl z-20">
+                          {previewPageCount > 1 && (
+                            <>
+                              <button
+                                type="button"
+                                disabled={!canGoToPreviousPreviewPage}
+                                className="p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+                                onClick={() => setPreviewPageIndex((current) => Math.max(0, current - 1))}
+                                aria-label="Previous page"
+                              >
+                                <ChevronLeft className="h-4 w-4" />
+                              </button>
+                            </>
+                          )}
                           <div className="text-white text-[10px] sm:text-xs font-semibold px-2 flex items-center gap-1">
-                            1 <span className="opacity-50">/ {activeDocument?.pageCount || 1}</span>
+                            {Math.min(previewPageIndex + 1, previewPageCount)} <span className="opacity-50">/ {previewPageCount}</span>
                           </div>
+                          {previewPageCount > 1 && (
+                            <>
+                              <button
+                                type="button"
+                                disabled={!canGoToNextPreviewPage}
+                                className="p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+                                onClick={() =>
+                                  setPreviewPageIndex((current) =>
+                                    Math.min(Math.max(activeDocumentFiles.length - 1, 0), current + 1)
+                                  )
+                                }
+                                aria-label="Next page"
+                              >
+                                <ChevronRight className="h-4 w-4" />
+                              </button>
+                            </>
+                          )}
                           <div className="h-3 w-px bg-white/20 mx-1"></div>
-                          <button className="p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors"><ZoomOut className="h-4 w-4" /></button>
-                          <button className="p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors"><ZoomIn className="h-4 w-4" /></button>
+                          <button
+                            type="button"
+                            disabled={!canZoomOut}
+                            className="p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+                            onClick={() => setPreviewZoom((current) => Math.max(0.75, Number((current - 0.25).toFixed(2))))}
+                            aria-label="Zoom out"
+                          >
+                            <ZoomOut className="h-4 w-4" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={!canZoomIn}
+                            className="p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+                            onClick={() => setPreviewZoom((current) => Math.min(3, Number((current + 0.25).toFixed(2))))}
+                            aria-label="Zoom in"
+                          >
+                            <ZoomIn className="h-4 w-4" />
+                          </button>
                           <div className="h-3 w-px bg-white/20 mx-1 hidden sm:block"></div>
-                          <button className="hidden sm:block p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors"><RotateCw className="h-4 w-4" /></button>
+                          <button
+                            type="button"
+                            disabled={!activeSourceIsImage || previewZoom === 1}
+                            className="hidden sm:block p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+                            onClick={() => setPreviewZoom(1)}
+                            aria-label="Reset zoom"
+                          >
+                            <RotateCw className="h-4 w-4" />
+                          </button>
                         </div>
                       )}
                     </div>
@@ -1043,7 +1182,10 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
         {/* Mobile Sticky Action Bar */}
         {showActions && (
-          <div className="md:hidden fixed bottom-0 left-0 right-0 border-t border-slate-200 bg-white p-3 flex items-center gap-3 z-30 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] pb-safe">
+          <div
+            className="fixed left-0 right-0 z-[90] flex items-center gap-3 border-t border-slate-200 bg-white p-3 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] md:hidden"
+            style={{ bottom: "calc(5.25rem + env(safe-area-inset-bottom))" }}
+          >
             <Button
               variant="outline"
               className="flex-1 rounded-xl text-rose-600 hover:bg-rose-50 hover:text-rose-700 border-slate-200 shadow-sm h-12 font-semibold"

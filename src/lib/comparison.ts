@@ -61,11 +61,11 @@ export const PRIMARY_COMPARISON_FIELDS: FieldKey[] = [
   "vehicleNumber",
   "fuelType",
   "currency",
+  "taxAmount",
   "totalAmount",
   "freightAmount",
   "advanceAmount",
   "toPayAmount",
-  "materialDescription",
   "materialGrade",
   "itemQuantity",
   "unit",
@@ -80,8 +80,6 @@ export const PRIMARY_COMPARISON_FIELDS: FieldKey[] = [
   "transactionReference",
   "fastagReference",
   "tollPlaza",
-  "dispatchFrom",
-  "shipTo",
   "mapLocation",
   "ownerName",
   "transporterName",
@@ -89,6 +87,8 @@ export const PRIMARY_COMPARISON_FIELDS: FieldKey[] = [
   "panNumber",
   "evidenceDescription",
 ];
+
+const PRIMARY_COMPARISON_FIELD_SET = new Set<string>(PRIMARY_COMPARISON_FIELDS);
 
 type ComparableDoc = Pick<CaseDoc, "type" | "fields">;
 
@@ -171,6 +171,11 @@ export function pickCanonicalComparableValue(
 
 export function getComparisonFieldKey(fieldKey: FieldKey) {
   return COMPARISON_FIELD_ALIASES[fieldKey] ?? fieldKey;
+}
+
+export function isPrimaryComparisonField(fieldKey: string) {
+  const canonicalField = getComparisonFieldKey(fieldKey as FieldKey);
+  return PRIMARY_COMPARISON_FIELD_SET.has(canonicalField);
 }
 
 export function getComparisonDisplayLabel(fieldKey: string, fallback?: string) {

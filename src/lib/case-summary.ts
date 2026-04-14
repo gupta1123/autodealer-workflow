@@ -1,4 +1,8 @@
-import { CORE_PACKET_GROUPS } from "@/lib/document-schema";
+import {
+  getEnabledCorePacketGroups,
+  isDocTypeEnabled,
+  type PacketFieldConfiguration,
+} from "@/lib/document-schema";
 import type { CaseDoc, DocType, FieldKey, Mismatch } from "@/types/pipeline";
 
 export type CaseSummary = {
@@ -44,13 +48,13 @@ const RECEIVER_FIELD_PRIORITY_BY_DOC_TYPE: Record<DocType, FieldKey[]> = {
   "Delivery Note": ["buyerName"],
   "Delivery Challan": ["buyerName"],
   "E-Way Bill": ["buyerName"],
-  "Weighment Slip": ["buyerName"],
+  "Weighment Slip": [],
   "Lorry Receipt": ["buyerName"],
   "Vehicle Registration Certificate": [],
   "Driving Licence": [],
   "PAN Card": [],
   "FASTag Toll Proof": [],
-  "Material Test Certificate": ["buyerName"],
+  "Material Test Certificate": [],
   "Photo Evidence": [],
   "Transport Permit": [],
   "Bank Statement": [],
@@ -283,12 +287,25 @@ function derivePrimaryReference(documents: CaseDoc[]) {
   return "";
 }
 
-function derivePacketCategory(documents: CaseDoc[]) {
+function derivePacketCategory(
+  documents: CaseDoc[],
+  fieldConfiguration?: PacketFieldConfiguration
+) {
   if (documents.length === 0) {
     return "Draft case";
   }
 
-  const presentTypes = Array.from(new Set(documents.map((document) => document.type)));
+  const presentTypes = Array.from(
+    new Set(
+      documents
+        .map((document) => document.type)
+        .filter((type) => isDocTypeEnabled(type, fieldConfiguration))
+    )
+  );
+
+  if (presentTypes.length === 0) {
+    return "General packet";
+  }
   const presentCategories = Array.from(
     new Set(presentTypes.map((type) => CASE_CATEGORY_BY_DOC_TYPE[type] ?? "General packet"))
   );
@@ -297,7 +314,7 @@ function derivePacketCategory(documents: CaseDoc[]) {
     return presentCategories[0];
   }
 
-  const presentCoreGroups = CORE_PACKET_GROUPS.filter((group) =>
+  const presentCoreGroups = getEnabledCorePacketGroups(fieldConfiguration).filter((group) =>
     group.types.some((type) => presentTypes.includes(type))
   );
 
@@ -338,7 +355,8 @@ export function resolveCaseCategoryLabel(params: {
 export function getCaseCategoryFromProcessingMeta(
   processingMeta: unknown,
   status?: string,
-  fallbackDocumentTypes?: string[]
+  fallbackDocumentTypes?: string[],
+  fieldConfiguration?: PacketFieldConfiguration
 ) {
   const record =
     processingMeta && typeof processingMeta === "object" && !Array.isArray(processingMeta)
@@ -366,7 +384,8 @@ export function getCaseCategoryFromProcessingMeta(
         pages: 1,
         fields: {},
         md: "",
-      }))
+      })),
+      fieldConfiguration
     );
   }
 
@@ -414,14 +433,18 @@ export function resolveStoredCaseDisplayName(params: {
   return category;
 }
 
-export function summarizeCase(documents: CaseDoc[], mismatches: Mismatch[]): CaseSummary {
+export function summarizeCase(
+  documents: CaseDoc[],
+  mismatches: Mismatch[],
+  fieldConfiguration?: PacketFieldConfiguration
+): CaseSummary {
   const buyerName = deriveCaseReceiverName(documents);
   const poNumber = firstFieldValue(documents, "poNumber") || firstFieldValue(documents, "referencePoNumber");
   const invoiceNumber =
     firstFieldValue(documents, "invoiceNumber") || firstFieldValue(documents, "referenceInvoiceNumber");
   const primaryReference = derivePrimaryReference(documents);
   const sourceDisplayName = deriveSourceDisplayName(documents);
-  const packetCategory = derivePacketCategory(documents);
+  const packetCategory = derivePacketCategory(documents, fieldConfiguration);
   const category = resolveCaseCategoryLabel({
     receiverName: buyerName,
     storedCategory: packetCategory,
@@ -430,8 +453,12 @@ export function summarizeCase(documents: CaseDoc[], mismatches: Mismatch[]): Cas
   const paidAmount = currencyishToNumber(firstFieldValue(documents, "paidAmount"));
   const paymentGap = totalAmount && paidAmount ? Math.abs(totalAmount - paidAmount) : 0;
 
-  const presentTypes = new Set(documents.map((document) => document.type));
-  const missingDocTypes = CORE_PACKET_GROUPS
+  const presentTypes = new Set(
+    documents
+      .map((document) => document.type)
+      .filter((type) => isDocTypeEnabled(type, fieldConfiguration))
+  );
+  const missingDocTypes = getEnabledCorePacketGroups(fieldConfiguration)
     .filter((group) => !group.types.some((type) => presentTypes.has(type)))
     .map((group) => group.label);
 

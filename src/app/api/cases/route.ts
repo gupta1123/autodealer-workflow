@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 
 import {
-  deriveCaseReceiverName,
   getCaseCategoryFromProcessingMeta,
   resolveCaseCategoryLabel,
   resolveStoredCaseDisplayName,
@@ -9,14 +8,21 @@ import {
 } from "@/lib/case-summary";
 import {
   DEFAULT_COMPARISON_OPTIONS,
+  getComparableFieldValue,
+  isPrimaryComparisonField,
   readComparisonOptions,
 } from "@/lib/comparison";
-import { omitIgnoredFields, shouldConsiderFieldKey } from "@/lib/document-schema";
+import {
+  sanitizeFieldsForDocType,
+  shouldConsiderFieldKey,
+  type PacketFieldConfiguration,
+} from "@/lib/document-schema";
+import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { readUploadGroupMeta } from "@/lib/upload-groups";
-import type { CaseDoc, Mismatch } from "@/types/pipeline";
+import type { CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
 
 const STORAGE_BUCKET = "packet-files";
 
@@ -167,15 +173,51 @@ function isFileEntry(entry: FormDataEntryValue): entry is File {
   return typeof entry !== "string";
 }
 
-function sanitizeDocumentsForStorage(documents: CaseDoc[]): CaseDoc[] {
+function sanitizeDocumentsForStorage(
+  documents: CaseDoc[],
+  fieldConfiguration: PacketFieldConfiguration
+): CaseDoc[] {
   return documents.map((document) => ({
     ...document,
-    fields: omitIgnoredFields(document.fields ?? {}) as CaseDoc["fields"],
+    fields: sanitizeFieldsForDocType(
+      document.type,
+      document.fields ?? {},
+      fieldConfiguration
+    ) as CaseDoc["fields"],
   }));
 }
 
-function sanitizeMismatchesForStorage(mismatches: Mismatch[]): Mismatch[] {
-  return mismatches.filter((mismatch) => shouldConsiderFieldKey(mismatch.field));
+function hasMeaningfulDocumentFieldValue(value: unknown) {
+  if (value === null || value === undefined) {
+    return false;
+  }
+
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
+
+  return true;
+}
+
+function sanitizeMismatchesForStorage(
+  mismatches: Mismatch[],
+  documents: CaseDoc[],
+  fieldConfiguration: PacketFieldConfiguration
+): Mismatch[] {
+  return mismatches.filter((mismatch) => {
+    if (
+      !shouldConsiderFieldKey(mismatch.field, undefined, fieldConfiguration) ||
+      !isPrimaryComparisonField(mismatch.field)
+    ) {
+      return false;
+    }
+
+    const supportingDocuments = documents.filter((document) =>
+      hasMeaningfulDocumentFieldValue(getComparableFieldValue(document, mismatch.field as FieldKey))
+    );
+
+    return supportingDocuments.length >= 2;
+  });
 }
 
 function mapDocumentRowForCaseSummary(row: {
@@ -187,16 +229,20 @@ function mapDocumentRowForCaseSummary(row: {
   title: string | null;
   page_count: number | null;
   extracted_fields: unknown;
-}): CaseDoc {
+}, fieldConfiguration: PacketFieldConfiguration): CaseDoc {
   const extractedFields =
     row.extracted_fields && typeof row.extracted_fields === "object" && !Array.isArray(row.extracted_fields)
-      ? Object.fromEntries(
-          Object.entries(row.extracted_fields).flatMap(([key, value]) => {
-            if (typeof value === "string" || typeof value === "number") {
-              return [[key, String(value)]];
-            }
-            return [];
-          })
+      ? sanitizeFieldsForDocType(
+          row.document_type,
+          Object.fromEntries(
+            Object.entries(row.extracted_fields).flatMap(([key, value]) => {
+              if (typeof value === "string" || typeof value === "number") {
+                return [[key, String(value)]];
+              }
+              return [];
+            })
+          ),
+          fieldConfiguration
         )
       : {};
 
@@ -214,7 +260,8 @@ function mapDocumentRowForCaseSummary(row: {
 
 async function fetchCaseDocumentsForSummary(
   supabase: ReturnType<typeof createSupabaseAdminClient>,
-  caseIds: string[]
+  caseIds: string[],
+  fieldConfiguration: PacketFieldConfiguration
 ) {
   const documentsByCaseId = new Map<string, CaseDoc[]>();
 
@@ -234,11 +281,57 @@ async function fetchCaseDocumentsForSummary(
 
   for (const row of data ?? []) {
     const current = documentsByCaseId.get(row.case_id) ?? [];
-    current.push(mapDocumentRowForCaseSummary(row));
+    current.push(mapDocumentRowForCaseSummary(row, fieldConfiguration));
     documentsByCaseId.set(row.case_id, current);
   }
 
   return documentsByCaseId;
+}
+
+async function fetchCaseMismatchCountsForSummary(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  caseIds: string[],
+  documentsByCaseId: Map<string, CaseDoc[]>,
+  fieldConfiguration: PacketFieldConfiguration
+) {
+  const mismatchCountsByCaseId = new Map<string, number>();
+
+  if (caseIds.length === 0) {
+    return mismatchCountsByCaseId;
+  }
+
+  const { data, error } = await supabase
+    .from("packet_mismatches")
+    .select("case_id, field_name")
+    .in("case_id", caseIds);
+
+  if (error) {
+    throw error;
+  }
+
+  for (const row of data ?? []) {
+    if (
+      !shouldConsiderFieldKey(row.field_name, undefined, fieldConfiguration) ||
+      !isPrimaryComparisonField(row.field_name)
+    ) {
+      continue;
+    }
+
+    const supportingDocuments = (documentsByCaseId.get(row.case_id) ?? []).filter((document) =>
+      hasMeaningfulDocumentFieldValue(getComparableFieldValue(document, row.field_name as FieldKey))
+    );
+
+    if (supportingDocuments.length < 2) {
+      continue;
+    }
+
+    mismatchCountsByCaseId.set(
+      row.case_id,
+      (mismatchCountsByCaseId.get(row.case_id) ?? 0) + 1
+    );
+  }
+
+  return mismatchCountsByCaseId;
 }
 
 function mapCaseRow(
@@ -258,30 +351,40 @@ function mapCaseRow(
     processing_meta?: unknown;
     deleted_at?: string | null;
   },
-  documents: CaseDoc[] = []
+  documents: CaseDoc[] = [],
+  mismatchCountOverride?: number,
+  fieldConfiguration?: PacketFieldConfiguration
 ) {
-  const receiverName = deriveCaseReceiverName(documents) || row.buyer_name;
-  const category = resolveCaseCategoryLabel({
-    receiverName,
-    storedCategory: getCaseCategoryFromProcessingMeta(
-      row.processing_meta,
-      row.status,
-      documents.map((document) => document.type)
-    ),
-    status: row.status,
-  });
-
-  return {
-    id: row.id,
-    slug: row.slug,
-    displayName: resolveStoredCaseDisplayName({
+  const derivedSummary =
+    documents.length > 0 ? summarizeCase(documents, [], fieldConfiguration) : null;
+  const receiverName = derivedSummary ? derivedSummary.buyerName : row.buyer_name;
+  const category =
+    derivedSummary?.category ||
+    resolveCaseCategoryLabel({
+      receiverName,
+      storedCategory: getCaseCategoryFromProcessingMeta(
+        row.processing_meta,
+        row.status,
+        documents.map((document) => document.type),
+        fieldConfiguration
+      ),
+      status: row.status,
+    });
+  const displayName =
+    derivedSummary?.displayName ||
+    resolveStoredCaseDisplayName({
       storedDisplayName: row.display_name,
       receiverName,
       invoiceNumber: row.invoice_number,
       poNumber: row.po_number,
       category,
       status: row.status,
-    }),
+    });
+
+  return {
+    id: row.id,
+    slug: row.slug,
+    displayName,
     buyerName: receiverName,
     receiverName,
     category,
@@ -291,7 +394,7 @@ function mapCaseRow(
     riskScore: row.risk_score,
     uploadCount: row.upload_count,
     documentCount: row.document_count,
-    mismatchCount: row.mismatch_count,
+    mismatchCount: mismatchCountOverride ?? row.mismatch_count,
     createdAt: row.created_at,
     deletedAt: row.deleted_at ?? getRecycleBinDeletedAt(row.processing_meta),
   };
@@ -309,6 +412,7 @@ export async function GET(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
+    const fieldConfiguration = await getPersistedPacketFieldConfiguration();
     const url = new URL(request.url);
     const requestedLimit = Number(url.searchParams.get("limit") ?? "12");
     const requestedScope = url.searchParams.get("scope");
@@ -393,11 +497,25 @@ export async function GET(request: Request) {
 
     const documentsByCaseId = await fetchCaseDocumentsForSummary(
       supabase,
-      (data ?? []).map((row) => row.id)
+      (data ?? []).map((row) => row.id),
+      fieldConfiguration
+    );
+    const mismatchCountsByCaseId = await fetchCaseMismatchCountsForSummary(
+      supabase,
+      (data ?? []).map((row) => row.id),
+      documentsByCaseId,
+      fieldConfiguration
     );
 
     return NextResponse.json({
-      cases: (data ?? []).map((row) => mapCaseRow(row, documentsByCaseId.get(row.id) ?? [])),
+      cases: (data ?? []).map((row) =>
+        mapCaseRow(
+          row,
+          documentsByCaseId.get(row.id) ?? [],
+          mismatchCountsByCaseId.get(row.id) ?? 0,
+          fieldConfiguration
+        )
+      ),
     });
   } catch (error) {
     return NextResponse.json(
@@ -425,6 +543,7 @@ export async function POST(request: Request) {
     }
 
     supabase = createSupabaseAdminClient();
+    const fieldConfiguration = await getPersistedPacketFieldConfiguration();
     const formData = await request.formData();
     const mode = typeof formData.get("mode") === "string" ? formData.get("mode") : null;
     const files = formData.getAll("files").filter(isFileEntry);
@@ -519,10 +638,13 @@ export async function POST(request: Request) {
     }
 
     const documents = sanitizeDocumentsForStorage(
-      parseJsonField<CaseDoc[]>(formData.get("documents"), "documents")
+      parseJsonField<CaseDoc[]>(formData.get("documents"), "documents"),
+      fieldConfiguration
     );
     const mismatches = sanitizeMismatchesForStorage(
-      parseJsonField<Mismatch[]>(formData.get("mismatches"), "mismatches")
+      parseJsonField<Mismatch[]>(formData.get("mismatches"), "mismatches"),
+      documents,
+      fieldConfiguration
     );
     const comparisonOptions = parseComparisonOptions(formData.get("comparisonOptions"));
     if (!documents.length) {
@@ -532,7 +654,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const summary = summarizeCase(documents, mismatches);
+    const summary = summarizeCase(documents, mismatches, fieldConfiguration);
     caseId = crypto.randomUUID();
 
     const fileRows = [];

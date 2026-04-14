@@ -10,6 +10,7 @@ import {
   Trash2,
   LogOut,
   ChevronsUpDown,
+  Settings,
 } from "lucide-react";
 
 import styles from "./DashboardSidebar.module.css";
@@ -110,12 +111,29 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
               onClick={() => setPopoverOpen(false)}
             />
             <div className={styles.popover}>
-              <form action="/auth/signout" method="post">
-                <button type="submit" className={styles.popoverLogoutBtn}>
-                  <LogOut size={14} />
-                  <span>Log out</span>
-                </button>
-              </form>
+              <div className={styles.popoverHeader}>
+                <div className={styles.popoverUserAvatar}>{initials}</div>
+                <div className={styles.popoverUserInfo}>
+                  <div className={styles.popoverUserName}>{displayUser.name}</div>
+                  <div className={styles.popoverUserEmail}>{displayUser.email}</div>
+                </div>
+              </div>
+              
+              <div className={styles.popoverMenu}>
+                <Link href="/settings" className={styles.popoverMenuItem} onClick={() => setPopoverOpen(false)}>
+                  <Settings size={14} className={styles.popoverMenuIcon} />
+                  <span>Settings</span>
+                </Link>
+              </div>
+
+              <div className={styles.popoverFooter}>
+                <form action="/auth/signout" method="post" className="w-full">
+                  <button type="submit" className={styles.popoverLogoutBtn}>
+                    <LogOut size={14} />
+                    <span>Sign out</span>
+                  </button>
+                </form>
+              </div>
             </div>
           </>
         )}

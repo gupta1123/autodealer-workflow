@@ -30,28 +30,28 @@ function MetricValueSkeleton() {
 
 function RecentCasesSkeleton() {
   return (
-    <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
-      {Array.from({ length: 6 }).map((_, index) => (
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+      {Array.from({ length: 4 }).map((_, index) => (
         <div
           key={index}
-          className="flex flex-col justify-between rounded-[24px] border border-[#f1f5f9] bg-white p-6 shadow-[0_4px_24px_rgba(0,0,0,0.02)]"
+          className="flex flex-col rounded-xl border border-[#e5ddd0] bg-white p-3.5 shadow-sm"
         >
-          <div className="mb-8 flex items-start gap-4">
-            <Skeleton className="h-12 w-12 shrink-0 rounded-2xl bg-slate-100" />
-            <div className="min-w-0 flex-1 space-y-2">
-              <Skeleton className="h-4 w-4/5 bg-slate-100" />
-              <Skeleton className="h-3 w-3/5 bg-slate-100" />
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex min-w-0 items-start gap-2.5">
+              <Skeleton className="h-8 w-8 shrink-0 rounded-lg bg-[#f0ece6]" />
+              <div className="min-w-0 space-y-2">
+                <Skeleton className="h-3.5 w-36 bg-slate-100" />
+                <Skeleton className="h-3 w-24 bg-slate-100" />
+              </div>
             </div>
           </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div className="rounded-2xl bg-[#f8fafc] p-4">
-              <Skeleton className="h-3 w-20 bg-slate-200/70" />
-              <Skeleton className="mt-3 h-7 w-10 bg-slate-200/70" />
-            </div>
-            <div className="rounded-2xl bg-[#f8fafc] p-4">
-              <Skeleton className="h-3 w-16 bg-slate-200/70" />
-              <Skeleton className="mt-3 h-7 w-10 bg-slate-200/70" />
-            </div>
+          <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+            <Skeleton className="h-5 w-16 rounded bg-slate-100" />
+            <Skeleton className="h-5 w-10 rounded bg-slate-100" />
+          </div>
+          <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5">
+            <Skeleton className="h-3 w-24 bg-slate-100" />
+            <Skeleton className="h-3 w-16 bg-slate-100" />
           </div>
         </div>
       ))}
@@ -244,58 +244,41 @@ export function DashboardHome() {
               <p className="text-sm font-medium text-[#64748b]">No cases processed yet.</p>
             </div>
           ) : (
-            <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
               {metrics.recentList.map((item) => (
                 <Link
                   href={`/cases/${item.id}`}
                   key={item.id}
-                  className="flex flex-col justify-between rounded-[24px] border border-[#f1f5f9] bg-white p-6 shadow-[0_4px_24px_rgba(0,0,0,0.02)] transition-all hover:border-[#e2e8f0] hover:shadow-[0_8px_30px_rgba(0,0,0,0.04)]"
+                  className="group flex flex-col rounded-xl border border-[#e5ddd0] bg-white p-3.5 shadow-sm transition-all hover:-translate-y-px hover:border-[#d4c9b8] hover:shadow-md"
                 >
-                  {/* Top Area: Icon & Name */}
-                  <div className="mb-8 flex items-start gap-4">
-                    <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[#f8fafc] text-[#94a3b8]">
-                      <Users className="h-5 w-5" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <h3 className="truncate text-[15px] font-bold text-[#0f172a] leading-tight">
-                        {item.displayName}
-                      </h3>
-                      <p className="truncate text-[11px] font-semibold text-[#94a3b8] uppercase tracking-wider mt-1">
-                        {item.category} • {item.receiverName || "Receiver pending"}
-                      </p>
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex min-w-0 items-start gap-2.5">
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#e5ddd0] bg-[#f0ece6] text-[#5a5046]">
+                        <Users className="h-4 w-4" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-bold text-[#1a1a1a] group-hover:text-[#5a5046] transition-colors" title={item.displayName}>
+                          {item.displayName}
+                        </div>
+                        <div className="mt-0.5 truncate text-[11px] font-medium text-slate-400">
+                          {item.receiverName || "Receiver pending"}
+                        </div>
+                      </div>
                     </div>
                   </div>
 
-                  {/* Bottom Area: Metrics Grid */}
-                  <div className="grid grid-cols-2 gap-4">
-                    {/* Documents Stat */}
-                    <div className="rounded-2xl bg-[#f8fafc] p-4">
-                      <div className="text-[10px] font-bold uppercase tracking-widest text-[#94a3b8]">
-                        DOCUMENTS
-                      </div>
-                      <div className="mt-1 flex items-baseline justify-between">
-                        <span className="text-2xl font-bold text-[#0f172a]">
-                          {item.documentCount}
-                        </span>
-                      </div>
-                    </div>
+                  <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+                    <span className="rounded border border-emerald-100 bg-emerald-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-emerald-700">
+                      Completed
+                    </span>
+                    <span className="rounded border border-amber-100 bg-amber-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-amber-700">
+                      R:{item.riskScore}
+                    </span>
+                  </div>
 
-                    {/* Risk Score Stat */}
-                    <div className="rounded-2xl bg-[#f8fafc] p-4">
-                      <div className="text-[10px] font-bold uppercase tracking-widest text-[#94a3b8]">
-                        RISK SCORE
-                      </div>
-                      <div className="mt-1 flex items-baseline justify-between">
-                        <span className={`text-2xl font-bold ${item.riskScore >= 40 ? 'text-[#e11d48]' : 'text-[#0f172a]'}`}>
-                          {item.riskScore}
-                        </span>
-                        {item.riskScore > 0 ? (
-                          <ArrowUpRight className="h-4 w-4 text-[#e2e8f0]" />
-                        ) : (
-                          <ArrowDownRight className="h-4 w-4 text-[#e2e8f0]" />
-                        )}
-                      </div>
-                    </div>
+                  <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5 text-[11px] font-semibold text-slate-400">
+                    <span>{item.documentCount} docs · {item.mismatchCount} issues</span>
+                    <ArrowUpRight className="h-3 w-3 text-slate-300" />
                   </div>
                 </Link>
               ))}

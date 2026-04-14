@@ -1,30 +1,40 @@
 import { NextResponse } from "next/server";
 
 import {
-  deriveCaseReceiverName,
   getCaseCategoryFromProcessingMeta,
   resolveCaseCategoryLabel,
   resolveStoredCaseDisplayName,
+  summarizeCase,
 } from "@/lib/case-summary";
+import { getComparableFieldValue, isPrimaryComparisonField } from "@/lib/comparison";
 import {
   getRecycleBinDeletedAt,
   isCaseRecycled,
   withRecycleBinMetadata,
   withoutRecycleBinMetadata,
 } from "@/lib/recycle-bin";
-import { omitIgnoredFields, shouldConsiderFieldKey } from "@/lib/document-schema";
+import {
+  sanitizeFieldsForDocType,
+  shouldConsiderFieldKey,
+  type PacketFieldConfiguration,
+} from "@/lib/document-schema";
+import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import type { CaseDoc } from "@/types/pipeline";
+import type { CaseDoc, FieldKey } from "@/types/pipeline";
 
 const STORAGE_BUCKET = "packet-files";
 
-function sanitizeExtractedFields(fields: unknown) {
+function sanitizeExtractedFields(
+  documentType: string,
+  fields: unknown,
+  fieldConfiguration: PacketFieldConfiguration
+) {
   if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
     return {};
   }
 
-  return omitIgnoredFields(fields as Record<string, unknown>);
+  return sanitizeFieldsForDocType(documentType, fields as Record<string, unknown>, fieldConfiguration);
 }
 
 function mapDocumentRowForCaseSummary(row: {
@@ -36,9 +46,9 @@ function mapDocumentRowForCaseSummary(row: {
   title: string | null;
   page_count: number | null;
   extracted_fields: unknown;
-}): CaseDoc {
+}, fieldConfiguration: PacketFieldConfiguration): CaseDoc {
   const extractedFields = Object.fromEntries(
-    Object.entries(sanitizeExtractedFields(row.extracted_fields)).flatMap(([key, value]) => {
+    Object.entries(sanitizeExtractedFields(row.document_type, row.extracted_fields, fieldConfiguration)).flatMap(([key, value]) => {
       if (typeof value === "string" || typeof value === "number") {
         return [[key, String(value)]];
       }
@@ -139,30 +149,40 @@ function mapCaseRow(
     processing_meta?: unknown;
     deleted_at?: string | null;
   },
-  documents: CaseDoc[] = []
+  documents: CaseDoc[] = [],
+  mismatchCountOverride?: number,
+  fieldConfiguration?: PacketFieldConfiguration
 ) {
-  const receiverName = deriveCaseReceiverName(documents) || row.buyer_name;
-  const category = resolveCaseCategoryLabel({
-    receiverName,
-    storedCategory: getCaseCategoryFromProcessingMeta(
-      row.processing_meta,
-      row.status,
-      documents.map((document) => document.type)
-    ),
-    status: row.status,
-  });
-
-  return {
-    id: row.id,
-    slug: row.slug,
-    displayName: resolveStoredCaseDisplayName({
+  const derivedSummary =
+    documents.length > 0 ? summarizeCase(documents, [], fieldConfiguration) : null;
+  const receiverName = derivedSummary ? derivedSummary.buyerName : row.buyer_name;
+  const category =
+    derivedSummary?.category ||
+    resolveCaseCategoryLabel({
+      receiverName,
+      storedCategory: getCaseCategoryFromProcessingMeta(
+        row.processing_meta,
+        row.status,
+        documents.map((document) => document.type),
+        fieldConfiguration
+      ),
+      status: row.status,
+    });
+  const displayName =
+    derivedSummary?.displayName ||
+    resolveStoredCaseDisplayName({
       storedDisplayName: row.display_name,
       receiverName,
       invoiceNumber: row.invoice_number,
       poNumber: row.po_number,
       category,
       status: row.status,
-    }),
+    });
+
+  return {
+    id: row.id,
+    slug: row.slug,
+    displayName,
     buyerName: receiverName,
     receiverName,
     category,
@@ -172,7 +192,7 @@ function mapCaseRow(
     riskScore: row.risk_score,
     uploadCount: row.upload_count,
     documentCount: row.document_count,
-    mismatchCount: row.mismatch_count,
+    mismatchCount: mismatchCountOverride ?? row.mismatch_count,
     createdAt: row.created_at,
     deletedAt: row.deleted_at ?? getRecycleBinDeletedAt(row.processing_meta),
     processingMeta: row.processing_meta ?? {},
@@ -196,6 +216,7 @@ export async function GET(
     }
 
     const supabase = createSupabaseAdminClient();
+    const fieldConfiguration = await getPersistedPacketFieldConfiguration();
 
     let caseRow:
       | {
@@ -306,25 +327,51 @@ export async function GET(
       })
     );
 
-    const caseSummaryDocuments = (documents ?? []).map(mapDocumentRowForCaseSummary);
+    const caseSummaryDocuments = (documents ?? []).map((document) =>
+      mapDocumentRowForCaseSummary(document, fieldConfiguration)
+    );
+    const sanitizedDocuments = (documents ?? []).map((document) => ({
+      id: document.id,
+      clientDocumentId: document.client_document_id,
+      sourceFileName: document.source_file_name,
+      sourceHint: document.source_hint,
+      documentType: document.document_type,
+      title: document.title,
+      pageCount: document.page_count,
+      extractedFields: sanitizeExtractedFields(
+        document.document_type,
+        document.extracted_fields,
+        fieldConfiguration
+      ),
+      markdown: document.markdown,
+      createdAt: document.created_at,
+    }));
+    const filteredMismatches = (mismatches ?? []).filter((mismatch) => {
+      if (
+        !shouldConsiderFieldKey(mismatch.field_name, undefined, fieldConfiguration) ||
+        !isPrimaryComparisonField(mismatch.field_name)
+      ) {
+        return false;
+      }
+
+      const supportingDocuments = caseSummaryDocuments.filter((document) => {
+        const value = getComparableFieldValue(document, mismatch.field_name as FieldKey);
+        return value !== null && value !== undefined && String(value).trim().length > 0;
+      });
+
+      return supportingDocuments.length >= 2;
+    });
 
     return NextResponse.json({
-      case: mapCaseRow(caseRow, caseSummaryDocuments),
+      case: mapCaseRow(
+        caseRow,
+        caseSummaryDocuments,
+        filteredMismatches.length,
+        fieldConfiguration
+      ),
       files: filesWithUrls,
-      documents: (documents ?? []).map((document) => ({
-        id: document.id,
-        clientDocumentId: document.client_document_id,
-        sourceFileName: document.source_file_name,
-        sourceHint: document.source_hint,
-        documentType: document.document_type,
-        title: document.title,
-        pageCount: document.page_count,
-        extractedFields: sanitizeExtractedFields(document.extracted_fields),
-        markdown: document.markdown,
-        createdAt: document.created_at,
-      })),
-      mismatches: (mismatches ?? [])
-        .filter((mismatch) => shouldConsiderFieldKey(mismatch.field_name))
+      documents: sanitizedDocuments,
+      mismatches: filteredMismatches
         .map((mismatch) => ({
           id: mismatch.id,
           clientMismatchId: mismatch.client_mismatch_id,

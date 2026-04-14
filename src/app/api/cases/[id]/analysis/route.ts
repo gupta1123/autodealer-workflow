@@ -8,13 +8,20 @@ import {
 } from "@/lib/case-summary";
 import {
   DEFAULT_COMPARISON_OPTIONS,
+  getComparableFieldValue,
+  isPrimaryComparisonField,
   readComparisonOptions,
 } from "@/lib/comparison";
-import { omitIgnoredFields, shouldConsiderFieldKey } from "@/lib/document-schema";
+import {
+  sanitizeFieldsForDocType,
+  shouldConsiderFieldKey,
+  type PacketFieldConfiguration,
+} from "@/lib/document-schema";
+import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import type { CaseDoc, Mismatch } from "@/types/pipeline";
+import type { CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
 
 function isRecycleBinSchemaMissing(error: unknown) {
   if (!error || typeof error !== "object") {
@@ -72,15 +79,51 @@ function parseComparisonOptions(value: FormDataEntryValue | null) {
   return readComparisonOptions(JSON.parse(value));
 }
 
-function sanitizeDocumentsForStorage(documents: CaseDoc[]): CaseDoc[] {
+function sanitizeDocumentsForStorage(
+  documents: CaseDoc[],
+  fieldConfiguration: PacketFieldConfiguration
+): CaseDoc[] {
   return documents.map((document) => ({
     ...document,
-    fields: omitIgnoredFields(document.fields ?? {}) as CaseDoc["fields"],
+    fields: sanitizeFieldsForDocType(
+      document.type,
+      document.fields ?? {},
+      fieldConfiguration
+    ) as CaseDoc["fields"],
   }));
 }
 
-function sanitizeMismatchesForStorage(mismatches: Mismatch[]): Mismatch[] {
-  return mismatches.filter((mismatch) => shouldConsiderFieldKey(mismatch.field));
+function hasMeaningfulDocumentFieldValue(value: unknown) {
+  if (value === null || value === undefined) {
+    return false;
+  }
+
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
+
+  return true;
+}
+
+function sanitizeMismatchesForStorage(
+  mismatches: Mismatch[],
+  documents: CaseDoc[],
+  fieldConfiguration: PacketFieldConfiguration
+): Mismatch[] {
+  return mismatches.filter((mismatch) => {
+    if (
+      !shouldConsiderFieldKey(mismatch.field, undefined, fieldConfiguration) ||
+      !isPrimaryComparisonField(mismatch.field)
+    ) {
+      return false;
+    }
+
+    const supportingDocuments = documents.filter((document) =>
+      hasMeaningfulDocumentFieldValue(getComparableFieldValue(document, mismatch.field as FieldKey))
+    );
+
+    return supportingDocuments.length >= 2;
+  });
 }
 
 function mapCaseRow(row: {
@@ -147,12 +190,16 @@ export async function POST(
     }
 
     const supabase = createSupabaseAdminClient();
+    const fieldConfiguration = await getPersistedPacketFieldConfiguration();
     const formData = await request.formData();
     const documents = sanitizeDocumentsForStorage(
-      parseJsonField<CaseDoc[]>(formData.get("documents"), "documents")
+      parseJsonField<CaseDoc[]>(formData.get("documents"), "documents"),
+      fieldConfiguration
     );
     const mismatches = sanitizeMismatchesForStorage(
-      parseJsonField<Mismatch[]>(formData.get("mismatches"), "mismatches")
+      parseJsonField<Mismatch[]>(formData.get("mismatches"), "mismatches"),
+      documents,
+      fieldConfiguration
     );
     const comparisonOptions = parseComparisonOptions(formData.get("comparisonOptions"));
 
@@ -259,7 +306,7 @@ export async function POST(
       if (mismatchInsertError) throw mismatchInsertError;
     }
 
-    const summary = summarizeCase(documents, mismatches);
+    const summary = summarizeCase(documents, mismatches, fieldConfiguration);
     const existingMeta =
       existing.processing_meta && typeof existing.processing_meta === "object"
         ? (existing.processing_meta as Record<string, unknown>)

@@ -37,7 +37,6 @@ export type FieldKey =
   | "advanceAmount"
   | "toPayAmount"
   | "itemDescription"
-  | "materialDescription"
   | "materialGrade"
   | "itemQuantity"
   | "unit"

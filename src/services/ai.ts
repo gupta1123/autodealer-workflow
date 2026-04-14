@@ -138,7 +138,7 @@ async function callOpenRouter(messages: OpenRouterMessage[], label: string, expe
 
 const ALL_ALLOWED_FIELD_KEYS = ACTIVE_FIELD_DEFINITIONS.map((field) => field.key);
 
-const FIELD_MAPPINGS: Record<FieldKey, string[]> = {
+const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   vendorName: [
     "vendorName",
     "sellerName",
@@ -205,7 +205,6 @@ const FIELD_MAPPINGS: Record<FieldKey, string[]> = {
   advanceAmount: ["advanceAmount", "advancePaid"],
   toPayAmount: ["toPayAmount", "toPay", "ttbAmount"],
   itemDescription: ["itemDescription", "description", "productDescription"],
-  materialDescription: ["materialDescription", "material", "goodsDescription"],
   materialGrade: ["materialGrade", "grade", "steelGrade"],
   itemQuantity: ["itemQuantity", "quantity", "qty"],
   unit: ["unit", "uom"],
@@ -355,7 +354,7 @@ function mapFields(
     : ALL_ALLOWED_FIELD_KEYS;
 
   allowedFieldKeys.forEach((fieldKey) => {
-    const aliases = FIELD_MAPPINGS[fieldKey];
+    const aliases = FIELD_MAPPINGS[fieldKey] ?? [];
     for (const alias of aliases) {
       const value = fields[alias];
       if (value !== undefined && value !== null && value !== "") {
@@ -738,6 +737,17 @@ export async function generateMismatchAnalysis(
             `2. Confirm the supplier's final billable amount.\n` +
             `3. Correct the document with the wrong total.\n` +
             `4. Reconcile payment only after the packet totals align.`,
+        };
+      case "taxAmount":
+        return {
+          analysis:
+            `Tax amount mismatch detected. Observed values: ${observed}. ` +
+            "GST amount differences usually mean the taxable value, tax breakup, or document basis is not aligned across the packet. That can create compliance issues and distort the final payable amount.",
+          fixPlan:
+            `1. Confirm the correct GST amount from the final billing document.\n` +
+            `2. Reconcile taxable value and tax treatment across invoice and e-way bill.\n` +
+            `3. Correct the document carrying the wrong tax amount.\n` +
+            `4. Re-run the comparison before approval.`,
         };
       case "itemQuantity":
         return {

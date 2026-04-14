@@ -19,6 +19,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   getComparableFieldValue,
   getComparisonDisplayLabel,
+  isPrimaryComparisonField,
   pickCanonicalComparableValue,
   readComparisonOptions,
 } from "@/lib/comparison";
@@ -39,6 +40,33 @@ const FIELD_LABEL_LOOKUP = ACTIVE_FIELD_DEFINITIONS.reduce(
   },
   {} as Record<string, string>
 );
+
+const FIELD_GROUPS = {
+  weight: ["grossWeight", "tareWeight", "netWeight", "itemQuantity", "unit"],
+  party: [
+    "vendorName",
+    "supplierGstin",
+    "buyerName",
+    "buyerGstin",
+    "ownerName",
+    "driverName",
+    "holderName",
+    "fatherName",
+    "panNumber",
+  ],
+};
+
+function getGroupForField(field: string): string | null {
+  for (const [groupName, fields] of Object.entries(FIELD_GROUPS)) {
+    if (fields.includes(field)) return groupName;
+  }
+  return null;
+}
+
+function getFieldsInGroup(field: string): string[] {
+  const group = getGroupForField(field);
+  return group ? FIELD_GROUPS[group as keyof typeof FIELD_GROUPS] : [];
+}
 
 const FIELD_GUIDANCE: Array<{
   fields: string[];
@@ -73,7 +101,7 @@ const FIELD_GUIDANCE: Array<{
       ],
     },
     {
-      fields: ["vehicleNumber", "registrationNumber", "lorryReceiptNumber", "fastagReference"],
+      fields: ["vehicleNumber", "registrationNumber", "lorryReceiptNumber", "fastagReference", "eWayBillNumber"],
       why: "The vehicle or transport proof may not belong to the same shipment.",
       steps: [
         "Confirm the vehicle actually used for this delivery.",
@@ -91,7 +119,17 @@ const FIELD_GUIDANCE: Array<{
       ],
     },
     {
-      fields: ["vendorName", "supplierGstin", "buyerName", "buyerGstin", "ownerName", "driverName", "panNumber"],
+      fields: [
+        "vendorName",
+        "supplierGstin",
+        "buyerName",
+        "buyerGstin",
+        "ownerName",
+        "driverName",
+        "holderName",
+        "fatherName",
+        "panNumber",
+      ],
       why: "One document may have the wrong party, GSTIN, or identity detail.",
       steps: [
         "Confirm the correct sender, receiver, GSTIN, or identity detail.",
@@ -141,6 +179,97 @@ function getDocumentName(
   if (!docId) return fallback;
   const document = documentLookup.get(docId);
   return document?.title || document?.sourceFileName || document?.sourceHint || fallback;
+}
+
+type GroupedMismatch = {
+  groupName: string;
+  groupLabel: string;
+  fields: Array<{
+    fieldName: string;
+    fieldLabel: string;
+    values: Array<{ docId: string | undefined; value: unknown }>;
+  }>;
+};
+
+function buildGroupedMismatch(
+  activeMismatch: MismatchRecord,
+  documentLookup: Map<string, SavedCaseDetail["documents"][number]>
+): GroupedMismatch | null {
+  const group = getGroupForField(activeMismatch.fieldName);
+  if (!group) return null;
+
+  const fields = getFieldsInGroup(activeMismatch.fieldName);
+  const groupLabel = group === "weight" ? "Weight / Quantity" : "Party / Identity Details";
+
+  const result: GroupedMismatch = {
+    groupName: group,
+    groupLabel,
+    fields: fields.map((fieldName) => ({
+      fieldName,
+      fieldLabel: getFieldLabel(fieldName),
+      values: [],
+    })),
+  };
+
+  const docIds = new Set<string>();
+  (activeMismatch.values ?? []).forEach((v) => {
+    if (v.docId) docIds.add(v.docId);
+  });
+
+  result.fields.forEach((field) => {
+    field.values = Array.from(docIds).map((docId) => {
+      const doc = documentLookup.get(docId);
+      const extractedFields = doc?.extractedFields as Record<string, unknown> | undefined;
+      return { docId, value: extractedFields?.[field.fieldName] };
+    });
+  });
+
+  return result;
+}
+
+function GroupedMismatchTable({ grouped, documentLookup }: { grouped: GroupedMismatch; documentLookup: Map<string, SavedCaseDetail["documents"][number]> }) {
+  const docIds = grouped.fields[0]?.values.map((v) => v.docId) ?? [];
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
+      <div className="px-4 py-3 bg-slate-50 border-b border-slate-200">
+        <h3 className="text-sm font-semibold text-slate-900">{grouped.groupLabel}</h3>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 border-b border-slate-200">
+            <tr>
+              <th className="text-left px-4 py-2.5 text-xs font-medium text-slate-500 uppercase tracking-wider">Field</th>
+              {docIds.map((docId) => {
+                const doc = documentLookup.get(docId ?? "");
+                return (
+                  <th key={docId} className="text-left px-4 py-2.5 text-xs font-medium text-slate-500 uppercase tracking-wider">
+                    {doc?.title || doc?.sourceFileName || `Doc ${docId}`}
+                  </th>
+                );
+              })}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {grouped.fields.map((field) => (
+              <tr key={field.fieldName} className="hover:bg-slate-50/50">
+                <td className="px-4 py-2.5 font-medium text-slate-700 whitespace-nowrap">{field.fieldLabel}</td>
+                {field.values.map((val, idx) => (
+                  <td key={idx} className="px-4 py-2.5 text-slate-900">
+                    {val.value === null || val.value === undefined || val.value === "" ? (
+                      <span className="text-slate-400 italic">Missing</span>
+                    ) : (
+                      String(val.value)
+                    )}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
 }
 
 function MismatchReviewSkeleton() {
@@ -253,7 +382,11 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
   }, [caseId]);
 
   const visibleMismatches = useMemo(
-    () => detail?.mismatches.filter((mismatch) => shouldConsiderFieldKey(mismatch.fieldName)) ?? [],
+    () =>
+      detail?.mismatches.filter(
+        (mismatch) =>
+          shouldConsiderFieldKey(mismatch.fieldName) && isPrimaryComparisonField(mismatch.fieldName)
+      ) ?? [],
     [detail]
   );
 
@@ -311,6 +444,11 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
     if (!activeMismatchId) return visibleMismatches[0] ?? null;
     return visibleMismatches.find((mismatch) => mismatch.id === activeMismatchId) ?? null;
   }, [activeMismatchId, visibleMismatches]);
+
+  const groupedMismatch = useMemo(() => {
+    if (!activeMismatch || !documentLookup) return null;
+    return buildGroupedMismatch(activeMismatch, documentLookup);
+  }, [activeMismatch, documentLookup]);
 
   const activeFieldLabel = activeMismatch ? getFieldLabel(activeMismatch.fieldName) : "";
   const activeGuidance = activeMismatch ? getGuidance(activeMismatch.fieldName) : null;
@@ -470,32 +608,36 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                       </p>
                     </div>
 
-                    {/* Conflicting Values Grid */}
-                    <div>
-                      <h3 className="mb-3 text-sm font-semibold text-slate-900 flex items-center gap-2">
-                        <FileText className="h-4 w-4 text-slate-400" />
-                        Extracted Values
-                      </h3>
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        {(activeMismatch.values ?? []).map((value, index) => {
-                          const title = getDocumentName(documentLookup, value.docId, `Document ${index + 1}`);
+                    {/* Conflicting Values Grid or Grouped Table */}
+                    {groupedMismatch ? (
+                      <GroupedMismatchTable grouped={groupedMismatch} documentLookup={documentLookup} />
+                    ) : (
+                      <div>
+                        <h3 className="mb-3 text-sm font-semibold text-slate-900 flex items-center gap-2">
+                          <FileText className="h-4 w-4 text-slate-400" />
+                          Extracted Values
+                        </h3>
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          {(activeMismatch.values ?? []).map((value, index) => {
+                            const title = getDocumentName(documentLookup, value.docId, `Document ${index + 1}`);
 
-                          return (
-                            <div
-                              key={`${activeMismatch.id}-${value.docId ?? index}`}
-                              className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm transition-all hover:shadow-md"
-                            >
-                              <div className="text-xs font-medium text-slate-500 mb-2 truncate" title={title}>
-                                {title}
+                            return (
+                              <div
+                                key={`${activeMismatch.id}-${value.docId ?? index}`}
+                                className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm transition-all hover:shadow-md"
+                              >
+                                <div className="text-xs font-medium text-slate-500 mb-2 truncate" title={title}>
+                                  {title}
+                                </div>
+                                <div className="text-sm font-semibold text-slate-900 break-words">
+                                  {displayValue(value.value)}
+                                </div>
                               </div>
-                              <div className="text-sm font-semibold text-slate-900 break-words">
-                                {displayValue(value.value)}
-                              </div>
-                            </div>
-                          );
-                        })}
+                            );
+                          })}
+                        </div>
                       </div>
-                    </div>
+                    )}
 
                     {/* Canonical Value Suggestion (Compact) */}
                     {fieldCanonicalValues[activeMismatch.fieldName] && (
