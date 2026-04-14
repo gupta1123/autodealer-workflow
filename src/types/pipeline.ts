@@ -101,6 +101,7 @@ export interface CaseDoc {
   pages: number;
   fields: Partial<Record<FieldKey, string>>;
   md: string;
+  sourceFileName?: string;
   sourceHint?: string;
 }
 
@@ -127,6 +128,8 @@ export interface QueuedUpload {
   id: string;
   name: string;
   file?: File;
+  files?: File[];
+  source?: "file" | "gallery" | "camera_scan";
   stages: PipelineStageProgress[];
   classifiedType?: DocType;
   resultDoc?: CaseDoc;

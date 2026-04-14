@@ -1,6 +1,7 @@
 "use client";
 
 import Image from "next/image";
+import { useRouter } from "next/navigation";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import ReactMarkdown from "react-markdown";
@@ -60,6 +61,12 @@ import {
   updateCaseDecision,
   type CaseDecision,
 } from "@/lib/case-persistence";
+import {
+  CAMERA_SCAN_SOURCE,
+  getQueuedUploadFiles,
+  getQueuedUploadPageCount,
+  getQueuedUploadPrimaryFile,
+} from "@/lib/upload-groups";
 import { useDocumentPipeline, type DuplicateUploadConflict, type DuplicateUploadStrategy } from "@/hooks/useDocumentPipeline";
 import {
   Camera,
@@ -74,9 +81,11 @@ import {
   Play,
   Sparkles,
   TriangleAlert,
-  Upload,
   Trash2,
   Plus,
+  ArrowLeft,
+  UploadCloud,
+  Database
 } from "lucide-react";
 import type {
   CaseDoc,
@@ -231,6 +240,20 @@ function isImageSource(mimeType?: string | null, sourceName?: string | null) {
     Boolean(mimeType?.startsWith("image/")) ||
     Boolean(sourceName && /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/i.test(sourceName))
   );
+}
+
+function createCameraSessionStamp() {
+  return new Date().toISOString();
+}
+
+function getCameraDocumentName(stamp: string, pageCount: number) {
+  const readableStamp = stamp.slice(0, 16).replace("T", " ");
+  const pageLabel = `${pageCount} page${pageCount === 1 ? "" : "s"}`;
+  return `Camera document ${readableStamp} (${pageLabel})`;
+}
+
+function getCameraPageFileName(stamp: string, pageNumber: number) {
+  return `camera-document-${stamp.replace(/[:.]/g, "-")}-page-${pageNumber}.jpg`;
 }
 
 function getComparisonFieldDefinitions(docs: CaseDoc[]) {
@@ -418,6 +441,7 @@ function caseStatusClassName(status?: string) {
 }
 
 export function WorkspacePage() {
+  const router = useRouter();
   const {
     status: pipelineStatus,
     queuedUploads,
@@ -428,6 +452,7 @@ export function WorkspacePage() {
     activeUploadId,
     persistence,
     queueFiles,
+    queueUploadGroup,
     removeUpload,
     startProcessing,
     updateSavedCase,
@@ -449,8 +474,10 @@ export function WorkspacePage() {
   const [cameraStatus, setCameraStatus] = useState<"idle" | "opening" | "ready" | "error">("idle");
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [cameraPageFiles, setCameraPageFiles] = useState<File[]>([]);
   const [imagePreviewUploadId, setImagePreviewUploadId] = useState<string | null>(null);
 
+  const cameraSessionRef = useRef(createCameraSessionStamp());
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const cameraFallbackInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -477,30 +504,40 @@ export function WorkspacePage() {
   const activeFileUrl = useMemo(() => {
     if (activeDocIndex === -1 || documents.length === 0) return null;
     const upload = queuedUploads[activeDocIndex];
-    if (upload && upload.file) {
-      return URL.createObjectURL(upload.file);
+    const file = upload ? getQueuedUploadPrimaryFile(upload) : undefined;
+    if (file) {
+      return URL.createObjectURL(file);
     }
     return null;
   }, [activeDocIndex, queuedUploads, documents]);
-  const activeUploadFile = activeDocIndex >= 0 ? queuedUploads[activeDocIndex]?.file : undefined;
+  const activeUpload = activeDocIndex >= 0 ? queuedUploads[activeDocIndex] : undefined;
+  const activeUploadFile = activeUpload ? getQueuedUploadPrimaryFile(activeUpload) : undefined;
   const activeSourceFileType = activeUploadFile?.type;
   const activeSourceFileLabel = getSourceFileLabel(activeSourceFileType, activeDoc?.sourceHint);
   const activeSourceIsImage = isImageSource(activeSourceFileType, activeDoc?.sourceHint);
   const imagePreviewUrls = useMemo(() => {
-    const urls = new Map<string, string>();
+    const urls = new Map<string, string[]>();
 
     queuedUploads.forEach((upload) => {
-      if (upload.file && isImageSource(upload.file.type, upload.name)) {
-        urls.set(upload.id, URL.createObjectURL(upload.file));
+      const imageFiles = getQueuedUploadFiles(upload).filter((file) => isImageSource(file.type, file.name));
+      if (imageFiles.length) {
+        urls.set(
+          upload.id,
+          imageFiles.map((file) => URL.createObjectURL(file))
+        );
       }
     });
 
     return urls;
   }, [queuedUploads]);
+  const cameraPagePreviewUrls = useMemo(
+    () => cameraPageFiles.map((file) => URL.createObjectURL(file)),
+    [cameraPageFiles]
+  );
   const imagePreviewUpload = imagePreviewUploadId
     ? queuedUploads.find((upload) => upload.id === imagePreviewUploadId)
     : undefined;
-  const imagePreviewUrl = imagePreviewUpload ? imagePreviewUrls.get(imagePreviewUpload.id) : null;
+  const imagePreviewPageUrls = imagePreviewUpload ? imagePreviewUrls.get(imagePreviewUpload.id) ?? [] : [];
 
   const activeMismatch = useMemo(() => {
     if (!activeMismatchId) return null;
@@ -570,6 +607,19 @@ export function WorkspacePage() {
     }
   };
 
+  const queueCameraDocument = (files: File[]) => {
+    if (!files.length) return;
+
+    const result = queueUploadGroup(files, {
+      name: getCameraDocumentName(cameraSessionRef.current, files.length),
+      source: CAMERA_SCAN_SOURCE,
+    });
+
+    if (result?.acceptedUploads.length) {
+      void persistDraftUploads(result.acceptedUploads);
+    }
+  };
+
   const stopCameraStream = (stream: MediaStream | null = cameraStream) => {
     stream?.getTracks().forEach((track) => track.stop());
   };
@@ -580,11 +630,26 @@ export function WorkspacePage() {
     setCameraOpen(false);
     setCameraStatus("idle");
     setCameraError(null);
+    setCameraPageFiles([]);
   };
 
   const handleUploadInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     handleQueueFiles(event.currentTarget.files);
     if (event.currentTarget.value) event.currentTarget.value = "";
+  };
+
+  const handleCameraFallbackInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files ?? []);
+    if (event.currentTarget.value) event.currentTarget.value = "";
+    if (!files.length) return;
+
+    if (cameraOpen) {
+      setCameraPageFiles((prev) => [...prev, ...files]);
+      return;
+    }
+
+    cameraSessionRef.current = createCameraSessionStamp();
+    queueCameraDocument(files);
   };
 
   const handleCameraInputFallback = () => {
@@ -593,6 +658,8 @@ export function WorkspacePage() {
 
   const handleCameraCaptureRequest = async () => {
     setCameraError(null);
+    cameraSessionRef.current = createCameraSessionStamp();
+    setCameraPageFiles([]);
 
     if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       handleCameraInputFallback();
@@ -646,17 +713,32 @@ export function WorkspacePage() {
           return;
         }
 
-        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-        const file = new File([blob], `camera-capture-${timestamp}.jpg`, {
-          type: "image/jpeg",
-          lastModified: Date.now(),
+        setCameraPageFiles((prev) => {
+          const pageNumber = prev.length + 1;
+          const file = new File([blob], getCameraPageFileName(cameraSessionRef.current, pageNumber), {
+            type: "image/jpeg",
+            lastModified: Date.now(),
+          });
+          return [...prev, file];
         });
-        handleQueueFiles([file]);
-        closeCameraCapture();
       },
       "image/jpeg",
       0.92
     );
+  };
+
+  const handleRemoveCameraPage = (pageIndex: number) => {
+    setCameraPageFiles((prev) => prev.filter((_, index) => index !== pageIndex));
+  };
+
+  const handleFinishCameraDocument = () => {
+    if (!cameraPageFiles.length) {
+      setCameraError("Capture at least one page before finishing this document.");
+      return;
+    }
+
+    queueCameraDocument(cameraPageFiles);
+    closeCameraCapture();
   };
 
   const resolveDuplicateUploads = (strategy: Exclude<DuplicateUploadStrategy, "prompt">) => {
@@ -683,13 +765,27 @@ export function WorkspacePage() {
     />
   );
 
+  const cameraFallbackInput = (
+    <input
+      ref={cameraFallbackInputRef}
+      type="file"
+      accept={IMAGE_UPLOAD_ACCEPT}
+      capture="environment"
+      multiple
+      className="hidden"
+      onChange={handleCameraFallbackInputChange}
+    />
+  );
+
   const cameraCaptureDialog = cameraOpen ? (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4 py-6 backdrop-blur-sm">
       <div className="flex w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-white/10 bg-slate-950 shadow-2xl">
         <div className="flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4 text-white">
           <div>
-            <div className="text-sm font-bold">Camera capture</div>
-            <div className="text-xs text-slate-400">Point the camera at one document page and capture it.</div>
+            <div className="text-sm font-bold">Scan one document</div>
+            <div className="text-xs text-slate-400">
+              Capture every page, then finish once this document is complete.
+            </div>
           </div>
           <Button
             type="button"
@@ -697,7 +793,7 @@ export function WorkspacePage() {
             className="border-white/20 bg-white/10 text-white hover:bg-white/20 hover:text-white"
             onClick={closeCameraCapture}
           >
-            Close
+            {cameraPageFiles.length ? "Discard" : "Close"}
           </Button>
         </div>
         <div className="relative aspect-[3/4] max-h-[72vh] bg-black sm:aspect-video">
@@ -720,6 +816,41 @@ export function WorkspacePage() {
             {cameraError}
           </div>
         )}
+        {cameraPagePreviewUrls.length > 0 && (
+          <div className="border-t border-white/10 bg-slate-900/95 px-5 py-4">
+            <div className="mb-3 flex items-center justify-between gap-3 text-white">
+              <div className="text-sm font-bold">
+                {cameraPagePreviewUrls.length} page{cameraPagePreviewUrls.length === 1 ? "" : "s"} captured
+              </div>
+              <div className="text-xs font-medium text-slate-400">Tap trash to remove a page.</div>
+            </div>
+            <div className="flex gap-3 overflow-x-auto pb-1">
+              {cameraPagePreviewUrls.map((url, index) => (
+                <div key={`${url}-${index}`} className="relative h-20 w-16 shrink-0 overflow-hidden rounded-xl border border-white/15 bg-black">
+                  <Image
+                    src={url}
+                    alt={`Captured page ${index + 1}`}
+                    fill
+                    unoptimized
+                    sizes="64px"
+                    className="object-cover"
+                  />
+                  <span className="absolute left-1 top-1 rounded-full bg-slate-950/80 px-1.5 py-0.5 text-[10px] font-bold text-white">
+                    {index + 1}
+                  </span>
+                  <button
+                    type="button"
+                    className="absolute bottom-1 right-1 grid h-5 w-5 place-items-center rounded-full bg-white text-red-600 shadow"
+                    onClick={() => handleRemoveCameraPage(index)}
+                    aria-label={`Remove captured page ${index + 1}`}
+                  >
+                    <Trash2 className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         <div className="flex flex-col gap-3 border-t border-white/10 bg-slate-900 px-5 py-4 sm:flex-row sm:justify-end">
           <Button
             type="button"
@@ -727,28 +858,39 @@ export function WorkspacePage() {
             className="border-white/20 bg-white/10 text-white hover:bg-white/20 hover:text-white"
             onClick={handleCameraInputFallback}
           >
-            Use phone camera app
+            Open phone camera
           </Button>
           <Button
             type="button"
             disabled={cameraStatus !== "ready"}
-            className="bg-white text-slate-950 hover:bg-slate-100"
+            variant="outline"
+            className="border-white/20 bg-white/10 text-white hover:bg-white/20 hover:text-white"
             onClick={handleCaptureCameraFrame}
           >
-            Capture photo
+            Capture page
+          </Button>
+          <Button
+            type="button"
+            disabled={cameraPageFiles.length === 0}
+            className="bg-white text-slate-950 hover:bg-slate-100"
+            onClick={handleFinishCameraDocument}
+          >
+            Finish document
           </Button>
         </div>
       </div>
     </div>
   ) : null;
 
-  const imagePreviewDialog = imagePreviewUpload && imagePreviewUrl ? (
+  const imagePreviewDialog = imagePreviewUpload && imagePreviewPageUrls.length > 0 ? (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4 py-6 backdrop-blur-sm">
       <div className="flex w-full max-w-3xl flex-col overflow-hidden rounded-3xl border border-white/10 bg-slate-950 shadow-2xl">
         <div className="flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4 text-white">
           <div className="min-w-0">
-            <div className="text-sm font-bold">Selected image</div>
-            <div className="truncate text-xs text-slate-400">{imagePreviewUpload.name}</div>
+            <div className="text-sm font-bold">Selected document</div>
+            <div className="truncate text-xs text-slate-400">
+              {imagePreviewUpload.name} · {imagePreviewPageUrls.length} page{imagePreviewPageUrls.length === 1 ? "" : "s"}
+            </div>
           </div>
           <Button
             type="button"
@@ -759,15 +901,29 @@ export function WorkspacePage() {
             Close
           </Button>
         </div>
-        <div className="relative h-[70vh] max-h-[760px] min-h-[320px] bg-black">
-          <Image
-            src={imagePreviewUrl}
-            alt={imagePreviewUpload.name}
-            fill
-            unoptimized
-            sizes="100vw"
-            className="object-contain"
-          />
+        <div className="max-h-[76vh] overflow-y-auto bg-black p-4">
+          <div className={imagePreviewPageUrls.length === 1 ? "relative h-[70vh] min-h-[320px]" : "grid gap-4 sm:grid-cols-2"}>
+            {imagePreviewPageUrls.map((url, index) => (
+              <div
+                key={`${url}-${index}`}
+                className={imagePreviewPageUrls.length === 1 ? "relative h-full" : "relative aspect-[3/4] overflow-hidden rounded-2xl border border-white/10 bg-slate-900"}
+              >
+                <Image
+                  src={url}
+                  alt={`${imagePreviewUpload.name} page ${index + 1}`}
+                  fill
+                  unoptimized
+                  sizes={imagePreviewPageUrls.length === 1 ? "100vw" : "(min-width: 640px) 50vw, 100vw"}
+                  className="object-contain"
+                />
+                {imagePreviewPageUrls.length > 1 && (
+                  <span className="absolute left-3 top-3 rounded-full bg-slate-950/80 px-2 py-1 text-xs font-bold text-white">
+                    Page {index + 1}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
         </div>
       </div>
     </div>
@@ -847,7 +1003,7 @@ export function WorkspacePage() {
   const queuedUploadRail = hasUploads ? (
     <div className="w-full max-w-3xl space-y-3 text-left">
       <div className="flex items-center justify-between">
-        <div className="text-sm font-bold text-slate-900">Files selected for this case</div>
+        <div className="text-sm font-bold text-[#1a1a1a]">Documents in this case</div>
         <div className="text-xs font-bold uppercase tracking-[0.2em] text-[#8a7f72]">
           {queuedUploadLabel}
         </div>
@@ -857,9 +1013,10 @@ export function WorkspacePage() {
           {queuedUploads.map((upload, index) => {
             const fallbackTemplate = matchSampleByIndex(index);
             const inferredType = upload.resultDoc?.type ?? upload.classifiedType ?? fallbackTemplate.type;
-            const imageUrl = imagePreviewUrls.get(upload.id);
+            const imageUrls = imagePreviewUrls.get(upload.id);
+            const pageCount = getQueuedUploadPageCount(upload);
 
-            if (imageUrl) {
+            if (imageUrls?.length) {
               return (
                 <div key={upload.id} className="group relative h-14 w-14 shrink-0">
                   <button
@@ -869,16 +1026,21 @@ export function WorkspacePage() {
                     aria-label={`Preview ${upload.name}`}
                   >
                     <Image
-                      src={imageUrl}
+                      src={imageUrls[0]}
                       alt={upload.name}
                       fill
                       unoptimized
                       sizes="56px"
                       className="object-cover"
                     />
-                    <span className="absolute -right-1 -top-1 z-10 grid h-5 w-5 place-items-center rounded-full bg-slate-900 text-[11px] font-bold text-white shadow-sm">
+                    <span className="absolute -right-1 -top-1 z-10 grid h-5 w-5 place-items-center rounded-full bg-[#1a1a1a] text-[11px] font-bold text-white shadow-sm">
                       {index + 1}
                     </span>
+                    {pageCount > 1 && (
+                      <span className="absolute bottom-1 left-1 z-10 rounded-full bg-white/95 px-1.5 py-0.5 text-[10px] font-bold text-[#1a1a1a] shadow-sm">
+                        {pageCount}p
+                      </span>
+                    )}
                   </button>
                   {!persistence.savedCase && (
                     <button
@@ -899,10 +1061,10 @@ export function WorkspacePage() {
                 <PopoverTrigger asChild>
                   <button
                     type="button"
-                    className="group relative flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-[#e5ddd0] bg-white text-[#5a5046] shadow-sm transition hover:border-[#8a7f72] hover:text-[#1a1a1a]"
+                    className="group relative flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-[#e5ddd0] bg-white text-[#5a5046] shadow-sm transition hover:border-[#8a7f72] hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
                   >
                     <FileText className="h-6 w-6" />
-                    <span className="absolute -right-1 -top-1 grid h-5 w-5 place-items-center rounded-full bg-slate-900 text-[11px] font-bold text-white shadow-sm">
+                    <span className="absolute -right-1 -top-1 grid h-5 w-5 place-items-center rounded-full bg-[#1a1a1a] text-[11px] font-bold text-white shadow-sm">
                       {index + 1}
                     </span>
                   </button>
@@ -910,11 +1072,12 @@ export function WorkspacePage() {
                 <PopoverContent align="center" side="top" className="w-64 text-left border-[#e5ddd0] shadow-xl rounded-2xl p-3">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <div className="truncate text-sm font-bold text-slate-900">
+                      <div className="truncate text-sm font-bold text-[#1a1a1a]">
                         {upload.name}
                       </div>
                       <div className="text-xs font-medium text-slate-500 mt-0.5">
                         Slot {index + 1} · {inferredType}
+                        {pageCount > 1 ? ` · ${pageCount} pages` : ""}
                       </div>
                     </div>
                     {!persistence.savedCase && (
@@ -929,7 +1092,7 @@ export function WorkspacePage() {
                     )}
                   </div>
                   <div className="mt-3 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5 text-xs font-medium text-slate-600 leading-relaxed">
-                    These files are in the case draft. Analysis starts only when you choose Analyze case.
+                    These documents are saved in this case. Analysis starts when you choose Analyze case.
                   </div>
                 </PopoverContent>
               </Popover>
@@ -939,6 +1102,16 @@ export function WorkspacePage() {
       </div>
     </div>
   ) : null;
+
+  useEffect(() => {
+    if (
+      pipelineStatus === "ready" &&
+      persistence.status === "saved" &&
+      persistence.savedCase?.id
+    ) {
+      router.replace(`/cases/${persistence.savedCase.id}`);
+    }
+  }, [persistence.savedCase?.id, persistence.status, pipelineStatus, router]);
 
   useEffect(() => {
     if (pipelineStatus === "ready" && documents.length) {
@@ -980,9 +1153,17 @@ export function WorkspacePage() {
 
   useEffect(() => {
     return () => {
-      imagePreviewUrls.forEach((url) => URL.revokeObjectURL(url));
+      imagePreviewUrls.forEach((urls) => {
+        urls.forEach((url) => URL.revokeObjectURL(url));
+      });
     };
   }, [imagePreviewUrls]);
+
+  useEffect(() => {
+    return () => {
+      cameraPagePreviewUrls.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, [cameraPagePreviewUrls]);
 
   useEffect(() => {
     if (imagePreviewUploadId && !queuedUploads.some((upload) => upload.id === imagePreviewUploadId)) {
@@ -1001,136 +1182,136 @@ export function WorkspacePage() {
   // =========================================================================
   if (pipelineStatus === "idle" && !caseDraftCreated) {
     return renderWithSidebar(
-      <>
-        <section className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#f7f7f5]">
-          <div className="absolute inset-0 -z-10">
-            <div className="absolute left-[8%] top-[12%] h-72 w-72 rounded-full bg-[#e5ddd0]/40 blur-3xl" />
-            <div className="absolute right-[14%] bottom-[15%] h-80 w-80 rounded-full bg-[#d4c9b8]/30 blur-3xl" />
+      <div className="min-h-screen bg-[#f7f7f5] px-4 pb-8 pt-5 text-[#1a1a1a] sm:px-6">
+        <div className="mx-auto w-full max-w-5xl">
+          {/* Header Section */}
+          <div className="mb-5 border-b border-[#e5ddd0] pb-4">
+            <div className="flex items-center gap-3 sm:gap-4">
+              <Button variant="ghost" size="icon" className="text-[#8a7f72] hover:text-[#1a1a1a] hover:bg-[#e5ddd0]/50 rounded-full transition-colors shrink-0 h-8 w-8 sm:h-9 sm:w-9">
+                <ArrowLeft className="h-4 w-4 sm:h-5 sm:w-5" />
+              </Button>
+              <div className="hidden sm:flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-[#f0ece6] text-[#1a1a1a] border border-[#e5ddd0] shadow-sm">
+                <UploadCloud className="h-6 w-6" />
+              </div>
+              <div className="flex flex-col min-w-0">
+                <h1 className="text-lg sm:text-xl font-bold text-[#1a1a1a]">Add case documents</h1>
+                <p className="text-xs sm:text-sm font-medium text-[#8a7f72] mt-0.5 leading-snug">Upload or scan the documents for one case.</p>
+              </div>
+            </div>
           </div>
-          <motion.div
-            initial={{ opacity: 0, y: 24 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.6, ease: "easeOut" }}
-            className="relative z-10 mx-auto flex w-full max-w-4xl flex-col items-center gap-8 px-6 py-16 text-center"
-          >
-            <div className="inline-flex items-center gap-2 rounded-full border border-[#e5ddd0] bg-white px-4 py-1.5 text-xs font-bold text-[#5a5046] shadow-sm uppercase tracking-widest">
-              <Sparkles className="h-3.5 w-3.5 text-[#8a7f72]" />
-              New Case Workspace
+
+          {/* Main Upload Area */}
+          <div className="w-full rounded-[2rem] border-2 border-dashed border-[#e5ddd0] bg-white px-5 py-7 text-center shadow-sm transition-all hover:border-[#d4c9b8] hover:shadow-md sm:px-8 sm:py-8">
+            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-[1.25rem] border border-[#e5ddd0] bg-[#f0ece6] text-[#1a1a1a] shadow-sm">
+              <UploadCloud className="h-7 w-7" />
             </div>
 
-            <div className="space-y-4 max-w-3xl">
-              <h1 className="text-4xl font-extrabold tracking-tight text-slate-900 sm:text-5xl">
-                Upload files and create a case
-              </h1>
-              <p className="mx-auto max-w-2xl text-base font-medium leading-relaxed text-[#5a5046]">
-                Start by selecting the documents that belong to one client case. We will create the case first, then you can add more files or run analysis when the packet is ready.
-              </p>
-            </div>
-
-            <div className="w-full max-w-3xl space-y-6">
-
-              {/* PRIMARY DROPZONE */}
-              <label className="group relative flex cursor-pointer flex-col items-center justify-center gap-4 rounded-[2rem] border-2 border-dashed border-[#c8bfb2] bg-white/60 px-8 py-14 text-[#5a5046] shadow-sm transition-all hover:border-[#8a7f72] hover:bg-white hover:shadow-md">
-                <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-[#f0ece6] text-[#5a5046] transition-transform duration-300 group-hover:scale-110 group-hover:bg-[#e8ddd0]">
-                  <Upload className="h-8 w-8" />
-                </div>
-                <div className="text-center">
-                  <div className="text-xl font-bold text-slate-900">Drop files here or click to browse</div>
-                  <p className="mx-auto mt-2 max-w-md text-sm font-medium text-slate-500">
-                    Upload PDFs, invoices, receipts, and images. We&apos;ll automatically classify and extract data.
-                  </p>
-                </div>
-                <input
-                  type="file"
-                  multiple
-                  accept={DOCUMENT_UPLOAD_ACCEPT}
-                  className="absolute inset-0 cursor-pointer opacity-0"
-                  onChange={handleUploadInputChange}
-                />
+            <h2 className="text-2xl font-extrabold text-[#1a1a1a] sm:text-3xl">Upload case packet</h2>
+            <p className="mt-2 text-base font-medium text-[#5a5046]">
+              or{" "}
+              <label className="cursor-pointer font-bold text-[#15803d] hover:text-[#166534] hover:underline">
+                click to browse
+                <input type="file" multiple accept={DOCUMENT_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
               </label>
+              {" "}PDFs and images
+            </p>
 
-              {/* DIVIDER */}
-              <div className="my-6 flex w-full items-center gap-4 opacity-80">
-                <div className="h-px flex-1 bg-[#e5ddd0]"></div>
-                <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#8a7f72]">Or import from</div>
-                <div className="h-px flex-1 bg-[#e5ddd0]"></div>
-              </div>
-
-              {/* SECONDARY UPLOAD OPTIONS (BENTO GRID) */}
-              <div className="grid w-full grid-cols-1 gap-4 sm:grid-cols-2">
-                {/* Photo Library Card */}
-                <label className="group relative flex cursor-pointer items-center gap-4 rounded-2xl border border-[#e5ddd0] bg-white p-4 shadow-sm transition-all hover:border-[#d4c9b8] hover:bg-[#faf8f4] hover:shadow-md">
-                  <input type="file" multiple accept={IMAGE_UPLOAD_ACCEPT} className="sr-only" onChange={handleUploadInputChange} />
-                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-[#f0ece6] text-[#5a5046] transition-colors group-hover:bg-[#e8ddd0] group-hover:text-[#1a1a1a]">
-                    <ImagePlus className="h-5 w-5" />
-                  </div>
-                  <div className="text-left">
-                    <div className="text-sm font-bold text-slate-900">Photo Library</div>
-                    <div className="mt-0.5 text-[11px] font-semibold text-slate-500">Images & Receipts</div>
-                  </div>
-                </label>
-
-                {/* Camera Card */}
-                <button
-                  type="button"
-                  className="group relative flex cursor-pointer items-center gap-4 rounded-2xl border border-[#e5ddd0] bg-white p-4 shadow-sm transition-all hover:border-[#d4c9b8] hover:bg-[#faf8f4] hover:shadow-md text-left"
-                  onClick={handleCameraCaptureRequest}
+            {/* Pills */}
+            <div className="mx-auto mt-5 flex max-w-2xl flex-wrap justify-center gap-2">
+              {[
+                { label: "PDF", accent: true },
+                { label: "JPG" },
+                { label: "PNG" },
+                { label: "WEBP" },
+                { label: "HEIC" },
+                { label: "Invoice", accent: true },
+                { label: "PO" },
+                { label: "E-Way Bill" },
+                { label: "Receipt" },
+                { label: "Delivery Note" },
+              ].map((pill) => (
+                <span
+                  key={pill.label}
+                  className={`rounded-full border px-3 py-1 text-xs font-bold uppercase tracking-wider ${
+                    pill.accent
+                      ? "border-[#c9ead2] bg-[#eaf7ee] text-[#15803d]"
+                      : "border-[#e5ddd0] bg-[#faf8f4] text-[#5a5046]"
+                  }`}
                 >
-                  <input ref={cameraFallbackInputRef} type="file" accept={IMAGE_UPLOAD_ACCEPT} capture="environment" className="sr-only" onChange={handleUploadInputChange} />
-                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-[#f0ece6] text-[#5a5046] transition-colors group-hover:bg-[#e8ddd0] group-hover:text-[#1a1a1a]">
-                    {cameraStatus === "opening" ? <Loader2 className="h-5 w-5 animate-spin" /> : <Camera className="h-5 w-5" />}
-                  </div>
-                  <div>
-                    <div className="text-sm font-bold text-slate-900">Take Photo</div>
-                    <div className="mt-0.5 text-[11px] font-semibold text-slate-500">Scan with camera</div>
-                  </div>
-                </button>
-              </div>
-
-              {queuedUploadRail && (
-                <div className="pt-4 border-t border-[#e5ddd0]">
-                  {queuedUploadRail}
-                </div>
-              )}
-
-              {draftCaseStatus === "error" && draftCaseError && (
-                <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-left text-sm font-bold text-red-700 shadow-sm">
-                  {draftCaseError}
-                </div>
-              )}
+                  {pill.label}
+                </span>
+              ))}
             </div>
 
-            {hasUploads && (
-              <motion.div
-                whileHover={{ scale: 1.02 }}
-                whileTap={{ scale: 0.98 }}
-                transition={{ type: "spring", stiffness: 300, damping: 20 }}
-                className="w-full max-w-3xl"
-              >
+            {/* Feature info */}
+            <div className="mx-auto mt-6 inline-flex items-center gap-2 text-sm font-semibold text-[#8a7f72]">
+              <Database className="h-4 w-4" /> AI-powered field extraction, receiver naming, and mismatch checks
+            </div>
+            <p className="mx-auto mt-2 max-w-2xl text-sm font-medium leading-relaxed text-[#8a7f72]">
+              Upload PDFs or images, or scan a paper document page by page. Each finished scan stays together as one document in the case.
+            </p>
+
+            {/* Action Buttons */}
+            <div className="mx-auto mt-6 flex flex-wrap justify-center gap-3">
+              <Button className="rounded-xl bg-[#1a1a1a] px-5 py-5 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] transition-transform hover:scale-[1.02]" onClick={() => fileInputRef.current?.click()}>
+                <UploadCloud className="mr-2 h-5 w-5" /> Upload PDF/Image
+                <input ref={fileInputRef} type="file" multiple accept={DOCUMENT_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
+              </Button>
+              <Button variant="outline" className="rounded-xl border-[#e5ddd0] bg-white px-5 py-5 text-base font-bold text-[#5a5046] shadow-sm hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-transform hover:scale-[1.02]" onClick={() => galleryInputRef.current?.click()}>
+                <ImagePlus className="mr-2 h-5 w-5 text-[#8a7f72]" /> Choose from gallery
+                <input ref={galleryInputRef} type="file" multiple accept={IMAGE_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
+              </Button>
+              <Button variant="outline" className="rounded-xl border-[#e5ddd0] bg-white px-5 py-5 text-base font-bold text-[#5a5046] shadow-sm hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-transform hover:scale-[1.02]" onClick={handleCameraCaptureRequest}>
+                <Camera className="mr-2 h-5 w-5 text-[#8a7f72]" /> Scan document
+              </Button>
+            </div>
+
+            {/* Bottom Info */}
+            <p className="mx-auto mt-6 max-w-3xl text-sm font-medium leading-relaxed text-[#8a7f72]">
+              Supported formats: PDF and images such as JPG, PNG, WEBP, HEIC. For a multi-page paper document, use Scan document and tap Finish document after the last page.
+            </p>
+          </div>
+
+          {/* Draft Error & Queue Overlays */}
+          {draftCaseStatus === "error" && draftCaseError && (
+            <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 px-5 py-4 text-sm font-bold text-red-700 shadow-sm text-center">
+              {draftCaseError}
+            </div>
+          )}
+
+          {hasUploads && (
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="mt-5 flex flex-col items-center"
+            >
+              <div className="w-full rounded-[1.5rem] border border-[#e5ddd0] bg-white p-4 shadow-sm">
+                {queuedUploadRail}
+              </div>
+              <div className="mt-4 w-full max-w-md">
                 <Button
                   size="lg"
-                  disabled={!hasUploads || draftCaseStatus === "saving"}
-                  className="group relative w-full overflow-hidden rounded-2xl px-8 py-7 text-lg font-bold shadow-lg disabled:cursor-not-allowed disabled:opacity-60 bg-slate-900 hover:bg-slate-800 text-white"
+                  disabled={draftCaseStatus === "saving"}
+                  className="w-full rounded-2xl bg-[#1a1a1a] px-8 py-6 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] disabled:opacity-60 transition-transform hover:scale-[1.02]"
                   onClick={handleCreateCaseDraft}
                 >
-                  <span className="relative z-10 flex items-center justify-center gap-3 tracking-tight">
-                    {draftCaseStatus === "saving" ? (
-                      <Loader2 className="h-5 w-5 animate-spin" />
-                    ) : (
-                      <FolderPlus className="h-5 w-5" />
-                    )}
-                    {draftCaseStatus === "saving" ? "Creating case..." : "Create case & Continue"}
-                  </span>
+                  {draftCaseStatus === "saving" ? (
+                    <span className="flex items-center justify-center gap-3"><Loader2 className="h-5 w-5 animate-spin" /> Creating case...</span>
+                  ) : (
+                    <span className="flex items-center justify-center gap-3"><FolderPlus className="h-5 w-5" /> Create case</span>
+                  )}
                 </Button>
-              </motion.div>
-            )}
-          </motion.div>
-        </section>
+              </div>
+            </motion.div>
+          )}
+
+        </div>
+        {cameraFallbackInput}
         {duplicateUploadDialog}
         {cameraCaptureDialog}
         {imagePreviewDialog}
         {analysisOptionsDialog}
-      </>
+      </div>
     );
   }
 
@@ -1151,28 +1332,28 @@ export function WorkspacePage() {
             transition={{ duration: 0.5, ease: "easeOut" }}
             className="relative z-10 mx-auto flex w-full max-w-4xl flex-col items-center gap-8 px-6 py-16 text-center"
           >
-            <div className="grid h-16 w-16 place-items-center rounded-[1.25rem] bg-emerald-100 text-emerald-600 shadow-sm border border-emerald-200">
+            <div className="grid h-16 w-16 place-items-center rounded-[1.25rem] bg-[#eaf7ee] text-[#15803d] shadow-sm border border-[#c9ead2]">
               <CheckCircle2 className="h-8 w-8" />
             </div>
 
             <div className="space-y-4 max-w-2xl">
-              <div className="text-xs font-bold uppercase tracking-[0.3em] text-[#8a7f72]">Case Draft Created</div>
-              <h1 className="text-4xl font-extrabold tracking-tight text-slate-900 sm:text-5xl">
-                Ready for Analysis
+              <div className="text-xs font-bold uppercase tracking-[0.3em] text-[#8a7f72]">Case created</div>
+              <h1 className="text-4xl font-extrabold tracking-tight text-[#1a1a1a] sm:text-5xl">
+                Ready to analyze
               </h1>
               <p className="mx-auto text-base font-medium leading-relaxed text-[#5a5046]">
-                The case has {queuedUploadLabel} ready. Add any missing documents now, or start the analysis engine to extract fields and reconcile data.
+                This case has {queuedUploadLabel} ready. Add any missing documents, then analyze to extract fields and check mismatches.
               </p>
 
               {persistence.savedCase && (
-                <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-[#e5ddd0] bg-white px-4 py-2 text-sm font-bold text-slate-700 shadow-sm">
+                <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-[#e5ddd0] bg-white px-4 py-2 text-sm font-bold text-[#5a5046] shadow-sm">
                   <Folder className="h-4 w-4 text-[#8a7f72]" /> {persistence.savedCase.displayName}
                 </div>
               )}
               {draftCaseStatus === "saving" && (
-                <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-4 py-2 text-sm font-bold text-blue-700 shadow-sm">
+                <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-[#c9ead2] bg-[#eaf7ee] px-4 py-2 text-sm font-bold text-[#15803d] shadow-sm">
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  Syncing files to case...
+                  Adding documents to case...
                 </div>
               )}
               {draftCaseStatus === "error" && draftCaseError && (
@@ -1199,19 +1380,19 @@ export function WorkspacePage() {
 
               <Popover>
                 <PopoverTrigger asChild>
-                  <Button variant="outline" disabled={draftCaseStatus === "saving"} className="rounded-2xl px-6 py-6 text-base font-bold border-[#e5ddd0] text-slate-700 bg-white hover:bg-[#faf8f4] shadow-sm transition-transform hover:scale-[1.02]">
-                    <Plus className="mr-2 h-5 w-5 text-[#8a7f72]" /> Add more files
+                  <Button variant="outline" disabled={draftCaseStatus === "saving"} className="rounded-2xl px-6 py-6 text-base font-bold border-[#e5ddd0] text-[#5a5046] bg-white hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-transform hover:scale-[1.02]">
+                    <Plus className="mr-2 h-5 w-5 text-[#8a7f72]" /> Add documents
                   </Button>
                 </PopoverTrigger>
                 <PopoverContent align="center" side="bottom" className="w-56 p-2 rounded-2xl border-[#e5ddd0] shadow-xl bg-white">
-                  <button onClick={() => fileInputRef.current?.click()} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-bold text-slate-700 hover:bg-[#faf8f4] hover:text-slate-900 transition-colors">
-                    <FolderPlus className="h-4 w-4 text-[#8a7f72]" /> Browse Files
+                  <button onClick={() => fileInputRef.current?.click()} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-colors">
+                    <FolderPlus className="h-4 w-4 text-[#8a7f72]" /> Upload PDF/Image
                   </button>
-                  <button onClick={() => galleryInputRef.current?.click()} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-bold text-slate-700 hover:bg-[#faf8f4] hover:text-slate-900 transition-colors">
-                    <ImagePlus className="h-4 w-4 text-[#8a7f72]" /> Photo Library
+                  <button onClick={() => galleryInputRef.current?.click()} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-colors">
+                    <ImagePlus className="h-4 w-4 text-[#8a7f72]" /> Choose from gallery
                   </button>
-                  <button onClick={handleCameraCaptureRequest} disabled={cameraStatus === "opening"} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-bold text-slate-700 hover:bg-[#faf8f4] hover:text-slate-900 transition-colors disabled:opacity-50">
-                    {cameraStatus === "opening" ? <Loader2 className="h-4 w-4 animate-spin text-[#8a7f72]" /> : <Camera className="h-4 w-4 text-[#8a7f72]" />} Take Photo
+                  <button onClick={handleCameraCaptureRequest} disabled={cameraStatus === "opening"} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-colors disabled:opacity-50">
+                    {cameraStatus === "opening" ? <Loader2 className="h-4 w-4 animate-spin text-[#8a7f72]" /> : <Camera className="h-4 w-4 text-[#8a7f72]" />} Scan document
                   </button>
                 </PopoverContent>
               </Popover>
@@ -1219,24 +1400,25 @@ export function WorkspacePage() {
               <Button
                 type="button"
                 disabled={!hasUploads}
-                className="flex-1 rounded-2xl bg-slate-900 px-8 py-6 text-base font-bold text-white shadow-lg shadow-slate-900/15 hover:bg-slate-800 transition-transform hover:scale-[1.02]"
+                className="flex-1 rounded-2xl bg-[#1a1a1a] px-8 py-6 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] transition-transform hover:scale-[1.02]"
                 onClick={handleAnalyzeRequest}
               >
                 <Play className="mr-2 h-5 w-5 fill-white" />
-                Analyze Case
+                Analyze case
               </Button>
 
               <Button
                 type="button"
                 variant="ghost"
-                className="rounded-2xl px-6 py-6 text-base font-bold text-[#8a7f72] hover:bg-[#e5ddd0]/30 hover:text-slate-700"
+                className="rounded-2xl px-6 py-6 text-base font-bold text-[#8a7f72] hover:bg-[#e5ddd0]/30 hover:text-[#1a1a1a]"
                 onClick={resetWorkspace}
               >
-                Start over
+                Start new case
               </Button>
             </div>
           </motion.div>
         </section>
+        {cameraFallbackInput}
         {duplicateUploadDialog}
         {cameraCaptureDialog}
         {imagePreviewDialog}
@@ -1307,24 +1489,24 @@ export function WorkspacePage() {
           initial={{ opacity: 0, y: 24 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.5, ease: "easeOut" }}
-          className="relative z-10 mx-auto flex w-full max-w-5xl flex-col gap-8 px-6 py-12"
+          className="relative z-10 mx-auto flex w-full max-w-5xl flex-col gap-5 sm:gap-8 px-4 sm:px-6 py-8 sm:py-12"
         >
           <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
             <div>
               <span className="text-xs font-bold uppercase tracking-[0.3em] text-[#8a7f72]">
                 Document intake pipeline
               </span>
-              <h1 className="mt-2 text-3xl font-extrabold tracking-tight text-slate-900 sm:text-4xl">
+              <h1 className="mt-2 text-2xl font-extrabold tracking-tight text-slate-900 sm:text-4xl">
                 Classifying, digitizing, and validating uploads…
               </h1>
             </div>
-            <div className="rounded-2xl border border-[#e5ddd0] bg-white px-5 py-4 text-right shadow-sm">
-              <div className="text-[10px] font-bold uppercase tracking-widest text-[#8a7f72]">Elapsed</div>
-              <div className="text-xl font-bold text-slate-900">{secondsElapsed}s</div>
+            <div className="rounded-xl border border-[#e5ddd0] bg-white px-4 py-2.5 sm:px-5 sm:py-4 text-left sm:text-right shadow-sm shrink-0 self-start sm:self-auto min-w-[100px]">
+              <div className="text-[9px] sm:text-[10px] font-bold uppercase tracking-widest text-[#8a7f72]">Elapsed</div>
+              <div className="text-lg sm:text-xl font-bold text-slate-900 leading-tight">{secondsElapsed}s</div>
             </div>
           </div>
 
-          <div className="rounded-3xl border border-[#e5ddd0] bg-white/95 px-8 py-8 shadow-md backdrop-blur">
+          <div className="rounded-2xl sm:rounded-3xl border border-[#e5ddd0] bg-white/95 px-5 py-6 sm:px-8 sm:py-8 shadow-md backdrop-blur">
             <div className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex items-center gap-4">
                 <div className="grid h-14 w-14 place-items-center rounded-2xl bg-[#f0ece6] text-[#5a5046] shadow-inner">
@@ -1472,6 +1654,63 @@ export function WorkspacePage() {
     );
   }
 
+  if (pipelineStatus === "ready") {
+    const hasSaveError = persistence.status === "error";
+    const savedCaseId = persistence.savedCase?.id;
+
+    return renderWithSidebar(
+      <section className="flex min-h-[calc(100vh-2rem)] flex-col items-center justify-center gap-5 bg-[#f7f7f5] px-6 text-center text-[#5a5046]">
+        <div className="grid h-16 w-16 place-items-center rounded-2xl border border-[#e5ddd0] bg-white shadow-sm">
+          {hasSaveError ? (
+            <TriangleAlert className="h-8 w-8 text-red-500" />
+          ) : (
+            <Loader2 className="h-8 w-8 animate-spin text-[#8a7f72]" />
+          )}
+        </div>
+        <div>
+          <h2 className="text-2xl font-extrabold text-[#1a1a1a]">
+            {hasSaveError
+              ? "Case analysis could not be saved"
+              : savedCaseId
+                ? "Opening case detail"
+                : "Saving analyzed case"}
+          </h2>
+          <p className="mx-auto mt-2 max-w-md text-sm font-medium leading-6">
+            {hasSaveError
+              ? "The documents were analyzed, but saving the results failed. Please try again so the case detail page can be created."
+              : savedCaseId
+                ? "The case is ready. Redirecting you to the detail page now."
+                : "Analysis is complete. We are saving the case before opening the detail page."}
+          </p>
+        </div>
+        {hasSaveError && persistence.error && (
+          <div className="max-w-lg rounded-2xl border border-red-100 bg-red-50 p-4 text-left font-mono text-xs text-red-700 shadow-sm">
+            {persistence.error}
+          </div>
+        )}
+        {savedCaseId && (
+          <Button
+            type="button"
+            className="rounded-2xl bg-[#1a1a1a] px-6 py-5 font-bold text-white hover:bg-[#2d2d2d]"
+            onClick={() => router.replace(`/cases/${savedCaseId}`)}
+          >
+            Open case detail
+          </Button>
+        )}
+        {hasSaveError && (
+          <Button
+            type="button"
+            variant="outline"
+            className="rounded-2xl border-[#e5ddd0] bg-white px-6 py-5 font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+            onClick={resetWorkspace}
+          >
+            Start again
+          </Button>
+        )}
+      </section>
+    );
+  }
+
   // Safety check for activeDoc
   if (!activeDoc) {
     return renderWithSidebar(
@@ -1480,7 +1719,4 @@ export function WorkspacePage() {
       </section>
     );
   }
-
-  // Workspace Ready State is handled inside CaseDetailPage component visually matching this theme
-  return renderWithSidebar(<div className="p-8">Workspace Ready (Should transition to detail view)</div>);
 }

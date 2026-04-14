@@ -53,6 +53,7 @@ function mapDocumentRowForCaseSummary(row: {
     pages: row.page_count || 1,
     fields: extractedFields as CaseDoc["fields"],
     md: "",
+    sourceFileName: row.source_file_name || undefined,
     sourceHint: row.source_hint || row.source_file_name || undefined,
   };
 }

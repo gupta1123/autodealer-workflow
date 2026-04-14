@@ -1,4 +1,5 @@
 import type { CaseDoc, ComparisonOptions, Mismatch, QueuedUpload } from "@/types/pipeline";
+import { getQueuedUploadFiles, serializeQueuedUploadGroups } from "@/lib/upload-groups";
 
 export type SavedCaseRecord = {
   id: string;
@@ -73,6 +74,20 @@ type CaseDetailResponse = SavedCaseDetail;
 export type CaseListScope = "active" | "deleted";
 export type CaseDecision = "accepted" | "rejected";
 
+function appendUploadsToFormData(formData: FormData, uploads: QueuedUpload[]) {
+  const uploadGroups = serializeQueuedUploadGroups(uploads);
+
+  if (uploadGroups.length) {
+    formData.set("uploadGroups", JSON.stringify(uploadGroups));
+  }
+
+  for (const upload of uploads) {
+    for (const file of getQueuedUploadFiles(upload)) {
+      formData.append("files", file, file.name || upload.name);
+    }
+  }
+}
+
 function extractApiError(payload: unknown, fallback: string) {
   if (!payload || typeof payload !== "object") {
     return fallback;
@@ -109,11 +124,7 @@ export async function persistProcessedCase(params: {
     formData.set("comparisonOptions", JSON.stringify(params.comparisonOptions));
   }
 
-  for (const upload of params.uploads) {
-    if (upload.file) {
-      formData.append("files", upload.file, upload.file.name || upload.name);
-    }
-  }
+  appendUploadsToFormData(formData, params.uploads);
 
   const response = await fetch("/api/cases", {
     method: "POST",
@@ -137,11 +148,7 @@ export async function createDraftCase(params: {
   const formData = new FormData();
   formData.set("mode", "draft");
 
-  for (const upload of params.uploads) {
-    if (upload.file) {
-      formData.append("files", upload.file, upload.file.name || upload.name);
-    }
-  }
+  appendUploadsToFormData(formData, params.uploads);
 
   const response = await fetch("/api/cases", {
     method: "POST",
@@ -167,11 +174,7 @@ export async function appendCaseFiles(
   const formData = new FormData();
   formData.set("mode", mode);
 
-  for (const upload of uploads) {
-    if (upload.file) {
-      formData.append("files", upload.file, upload.file.name || upload.name);
-    }
-  }
+  appendUploadsToFormData(formData, uploads);
 
   const response = await fetch(`/api/cases/${caseId}/files`, {
     method: "POST",

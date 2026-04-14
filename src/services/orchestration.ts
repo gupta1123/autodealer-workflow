@@ -7,6 +7,7 @@ import type {
   QueuedUpload,
 } from "@/types/pipeline";
 import { fileToImagePages } from "@/services/pdf";
+import { getQueuedUploadFiles } from "@/lib/upload-groups";
 import {
   classifyDocumentFromImage,
   extractDataFromImages,
@@ -42,7 +43,7 @@ export async function orchestrateUploads(
 
   for (let index = 0; index < uploads.length; index++) {
     const upload = uploads[index];
-    const file = upload.file;
+    const sourceFiles = getQueuedUploadFiles(upload);
 
     const fallbackTemplate = matchSampleByIndex(index);
 
@@ -50,11 +51,13 @@ export async function orchestrateUploads(
     await delay(200);
 
     let pageImages: string[] = [];
-    if (file) {
-      try {
-        pageImages = await fileToImagePages(file);
-      } catch (error) {
-        console.error("Failed to convert upload to images", error);
+    if (sourceFiles.length) {
+      for (const file of sourceFiles) {
+        try {
+          pageImages = [...pageImages, ...(await fileToImagePages(file))];
+        } catch (error) {
+          console.error("Failed to convert upload to images", error);
+        }
       }
     }
 
@@ -72,6 +75,7 @@ export async function orchestrateUploads(
     const finalizedDoc: CaseDoc = {
       ...doc,
       sourceHint: upload.name,
+      sourceFileName: sourceFiles[0]?.name ?? upload.name,
       pages: doc.pages || pageImages.length || fallbackTemplate.pages,
     };
 

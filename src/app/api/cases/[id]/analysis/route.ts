@@ -233,7 +233,7 @@ export async function POST(
     const documentRows = documents.map((document) => ({
       case_id: id,
       client_document_id: document.id,
-      source_file_name: document.sourceHint ?? null,
+      source_file_name: document.sourceFileName ?? document.sourceHint ?? null,
       source_hint: document.sourceHint ?? null,
       document_type: document.type,
       title: document.title,

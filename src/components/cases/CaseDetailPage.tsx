@@ -19,6 +19,17 @@ import {
   TriangleAlert,
   Database,
   Play,
+  Check,
+  X,
+  FileDigit,
+  FileSearch,
+  LayoutDashboard,
+  ZoomIn,
+  ZoomOut,
+  RotateCw,
+  Maximize,
+  Undo2,
+  Redo2,
   type LucideIcon,
 } from "lucide-react";
 
@@ -27,7 +38,6 @@ import { AnalysisOptionsDialog } from "@/components/workspace/AnalysisOptionsDia
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Tabs, TabsContent } from "@/components/ui/tabs";
 import {
   areComparableValuesEqual,
   getComparableFieldValue,
@@ -48,6 +58,7 @@ import {
   type CaseDecision,
   type SavedCaseDetail,
 } from "@/lib/case-persistence";
+import { CAMERA_SCAN_SOURCE, readUploadGroupMeta } from "@/lib/upload-groups";
 import { orchestrateUploads } from "@/services/orchestration";
 import type {
   ComparisonOptions,
@@ -62,9 +73,9 @@ type LoadState = "loading" | "ready" | "error";
 type ActiveTab = "preview" | "data" | "ocr";
 
 const DETAIL_TABS: { id: ActiveTab; label: string; icon: LucideIcon }[] = [
-  { id: "preview", label: "Preview", icon: Eye },
-  { id: "data", label: "Extracted Data", icon: Database },
-  { id: "ocr", label: "OCR Text", icon: FileText },
+  { id: "preview", label: "Original", icon: Eye },
+  { id: "data", label: "Data", icon: Database },
+  { id: "ocr", label: "Text", icon: FileDigit },
 ];
 
 const STAGE_SEQUENCE: PipelineStageId[] = [
@@ -114,6 +125,7 @@ function formatDateTime(value: string) {
     year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
+    second: "2-digit",
   });
 }
 
@@ -147,12 +159,12 @@ function getCaseStatusLabel(status: string) {
 }
 
 function getCaseStatusClassName(status: string) {
-  if (status === "draft") return "border-amber-200 bg-amber-50 text-amber-700";
-  if (status === "accepted") return "border-emerald-200 bg-emerald-50 text-emerald-700";
-  if (status === "rejected") return "border-rose-200 bg-rose-50 text-rose-700";
-  if (status === "failed") return "border-red-200 bg-red-50 text-red-700";
-  if (status === "processing") return "border-blue-200 bg-blue-50 text-blue-700";
-  return "border-slate-200 bg-slate-50 text-slate-700";
+  if (status === "draft") return "bg-slate-100 text-slate-700 border-slate-200";
+  if (status === "accepted") return "bg-emerald-50 text-emerald-700 border-emerald-200";
+  if (status === "rejected") return "bg-rose-50 text-rose-700 border-rose-200";
+  if (status === "failed") return "bg-red-50 text-red-700 border-red-200";
+  if (status === "processing") return "bg-blue-50 text-blue-700 border-blue-200";
+  return "bg-slate-50 text-slate-600 border-slate-200";
 }
 
 function buildInitialStages(): PipelineStageProgress[] {
@@ -163,10 +175,7 @@ function buildInitialStages(): PipelineStageProgress[] {
   }));
 }
 
-async function savedFileToUpload(
-  file: SavedCaseDetail["files"][number],
-  index: number
-): Promise<QueuedUpload> {
+async function savedFileToUploadFile(file: SavedCaseDetail["files"][number]) {
   if (!file.signedUrl) {
     throw new Error(`Unable to access ${file.originalName}. Please refresh and try again.`);
   }
@@ -181,12 +190,59 @@ async function savedFileToUpload(
     type: file.mimeType || blob.type || "application/pdf",
   });
 
+  return uploadFile;
+}
+
+async function savedFileToUpload(
+  file: SavedCaseDetail["files"][number],
+  index: number
+): Promise<QueuedUpload> {
+  const uploadFile = await savedFileToUploadFile(file);
+
   return {
     id: `${file.id}-${index}`,
     name: file.originalName,
     file: uploadFile,
+    files: [uploadFile],
+    source: "file",
     stages: buildInitialStages(),
   };
+}
+
+async function savedDetailToUploads(detail: SavedCaseDetail): Promise<QueuedUpload[]> {
+  const uploadGroups = readUploadGroupMeta(detail.case.processingMeta?.uploadGroups);
+  const uploads: QueuedUpload[] = [];
+  const usedFileIds = new Set<string>();
+
+  for (const group of uploadGroups) {
+    const groupFiles = group.fileNames
+      .map((fileName) => detail.files.find((file) => !usedFileIds.has(file.id) && normalizeText(file.originalName) === normalizeText(fileName)))
+      .filter((file): file is SavedCaseDetail["files"][number] => Boolean(file));
+
+    if (!groupFiles.length) {
+      continue;
+    }
+
+    groupFiles.forEach((file) => usedFileIds.add(file.id));
+    const files = await Promise.all(groupFiles.map(savedFileToUploadFile));
+
+    uploads.push({
+      id: group.id,
+      name: group.name,
+      file: files[0],
+      files,
+      source: group.source ?? CAMERA_SCAN_SOURCE,
+      stages: buildInitialStages(),
+    });
+  }
+
+  const remainingUploads = await Promise.all(
+    detail.files
+      .filter((file) => !usedFileIds.has(file.id))
+      .map((file, index) => savedFileToUpload(file, uploads.length + index))
+  );
+
+  return [...uploads, ...remainingUploads];
 }
 
 export function CaseDetailPage({ caseId }: { caseId: string }) {
@@ -277,17 +333,14 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   }, [activeDocument, detail, fileLookup]);
 
   const activeFileUrl = activeDocumentFile?.signedUrl ?? null;
-  const activeSourceFileLabel = getSourceFileLabel(
-    activeDocumentFile?.mimeType,
-    activeDocument?.sourceFileName || activeDocument?.sourceHint
-  );
+  const activeSourceLabel = getSourceFileLabel(activeDocumentFile?.mimeType, activeDocument?.sourceFileName);
   const activeSourceIsImage =
     activeDocumentFile?.mimeType?.startsWith("image/") ||
     Boolean(
       (activeDocument?.sourceFileName || activeDocument?.sourceHint) &&
-        /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/i.test(
-          activeDocument?.sourceFileName || activeDocument?.sourceHint || ""
-        )
+      /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/i.test(
+        activeDocument?.sourceFileName || activeDocument?.sourceHint || ""
+      )
     );
 
   const comparisonOptions = useMemo(
@@ -328,7 +381,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       setAnalysisError(null);
       setAnalysisProgress(5);
 
-      const uploads = await Promise.all(detail.files.map(savedFileToUpload));
+      const uploads = await savedDetailToUploads(detail);
       const totalStageEvents = Math.max(1, uploads.length * STAGE_SEQUENCE.length);
       let stageEvents = 0;
 
@@ -369,12 +422,12 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       setDetail((current) =>
         current
           ? {
-              ...current,
-              case: {
-                ...current.case,
-                ...updated.case,
-              },
-            }
+            ...current,
+            case: {
+              ...current.case,
+              ...updated.case,
+            },
+          }
           : current
       );
       setDecisionStatus("idle");
@@ -388,115 +441,124 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     }
   }
 
+  const isFinalDecision = detail?.case.status === "accepted" || detail?.case.status === "rejected";
+
+  if (status === "loading") {
+    return (
+      <AppShell>
+        <div className="flex flex-1 items-center justify-center bg-slate-50/50 min-h-[calc(100vh-4rem)]">
+          <div className="flex flex-col items-center gap-4 text-slate-500">
+            <Loader2 className="h-8 w-8 animate-spin text-indigo-600" />
+            <p className="text-sm font-medium">Loading case details...</p>
+          </div>
+        </div>
+      </AppShell>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <AppShell>
+        <div className="flex flex-1 items-center justify-center bg-slate-50/50 p-6 min-h-[calc(100vh-4rem)]">
+          <div className="w-full max-w-md flex flex-col items-center text-center bg-white p-8 rounded-3xl shadow-sm border border-slate-200">
+            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-red-50 mb-4">
+              <ShieldAlert className="h-8 w-8 text-red-500" />
+            </div>
+            <h3 className="text-xl font-semibold text-slate-900">Unable to load case</h3>
+            <p className="mt-2 text-sm text-slate-600 leading-relaxed">{error}</p>
+            <Button asChild variant="outline" className="mt-8 rounded-xl w-full">
+              <Link href="/cases">Return to Cases</Link>
+            </Button>
+          </div>
+        </div>
+      </AppShell>
+    );
+  }
+
+  // =========================================
+  // DRAFT STATE (Awaiting Analysis)
+  // =========================================
   if (status === "ready" && detail?.case.status === "draft") {
     const isAnalyzing = analysisStatus === "processing" || analysisStatus === "saving";
 
     return (
       <AppShell>
-        <div className="flex min-h-full flex-col bg-[#f7f7f5] animate-in fade-in duration-500">
-          <header className="flex flex-col gap-4 border-b border-[#e5ddd0] bg-white px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
-            <div className="flex min-w-0 items-center gap-3">
-              <Link href="/cases" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[#8a7f72] hover:bg-[#ede6d9] hover:text-[#1a1a1a]">
+        <div className="flex flex-1 flex-col bg-[#fafafa] animate-in fade-in duration-500 min-h-[calc(100vh-4rem)]">
+          <header className="flex h-14 sm:h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 sm:px-6">
+            <div className="flex items-center gap-3 sm:gap-4 w-full">
+              <Link href="/cases" className="text-slate-400 hover:text-slate-800 transition-colors shrink-0">
                 <ArrowLeft className="h-5 w-5" />
               </Link>
-              <div className="grid h-10 w-10 place-items-center rounded-xl border border-[#e5ddd0] bg-[#f0ece6] text-[#5a5046]">
-                <FileText className="h-5 w-5" />
-              </div>
-              <div className="min-w-0">
-                <h1 className="truncate text-lg font-bold text-slate-900">{detail.case.displayName}</h1>
-                <div className="mt-1 flex items-center gap-2">
-                  <Badge
-                    variant="outline"
-                    className={`rounded-full ${getCaseStatusClassName(detail.case.status)}`}
-                  >
-                    {getCaseStatusLabel(detail.case.status)}
-                  </Badge>
-                  <Badge
-                    variant="outline"
-                    className="rounded-full border-[#e5ddd0] bg-[#f0ece6] text-[#5a5046]"
-                  >
-                    {detail.case.category}
-                  </Badge>
-                  <Badge
-                    variant="outline"
-                    className="rounded-full border-[#e5ddd0] bg-[#f0ece6] text-[#5a5046]"
-                  >
-                    {comparisonOptions.considerFormatting
-                      ? "Formatting compared exactly"
-                      : "Formatting ignored"}
-                  </Badge>
-                  <span className="text-xs font-medium text-slate-400">
-                    {detail.files.length} file{detail.files.length === 1 ? "" : "s"} uploaded
-                  </span>
-                </div>
-              </div>
+              <h1 className="text-base sm:text-lg font-semibold text-slate-900 truncate pr-2">
+                {detail.case.displayName}
+              </h1>
+              <Badge variant="outline" className={`ml-auto rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider shrink-0 ${getCaseStatusClassName(detail.case.status)}`}>
+                {getCaseStatusLabel(detail.case.status)}
+              </Badge>
             </div>
           </header>
 
-          <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-6 px-4 py-8 sm:px-6 lg:px-8">
-            <div className="rounded-3xl border border-[#e5ddd0] bg-white p-6 shadow-sm">
-              <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-                <div>
-                  <div className="text-xs font-bold uppercase tracking-[0.3em] text-slate-400">
-                    Ready for analysis
-                  </div>
-                  <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
-                    Analyze this case from the saved draft
-                  </h2>
-                  <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">
-                    These files are already saved and visible in the case list. Run analysis here to extract fields,
-                    compare values, generate mismatches, and convert the draft into a completed case.
-                  </p>
-                </div>
-                <Button
-                  type="button"
-                  disabled={isAnalyzing || detail.files.length === 0}
-                  className="rounded-2xl bg-slate-900 px-7 py-6 text-white hover:bg-slate-800"
-                  onClick={() => setAnalysisOptionsOpen(true)}
-                >
-                  {isAnalyzing ? <Loader2 className="h-5 w-5 animate-spin" /> : <Play className="h-5 w-5 fill-white" />}
-                  {analysisStatus === "saving" ? "Saving analysis..." : isAnalyzing ? "Analyzing case..." : "Analyze case"}
-                </Button>
+          <main className="flex-1 flex flex-col items-center justify-center p-4 py-8 sm:p-6 sm:py-24">
+            <div className="w-full max-w-2xl bg-white rounded-3xl shadow-sm border border-slate-200 p-6 sm:p-12 text-center">
+              <div className="mx-auto flex h-16 w-16 sm:h-20 sm:w-20 items-center justify-center rounded-full bg-indigo-50 mb-5 sm:mb-6">
+                <FileSearch className="h-8 w-8 sm:h-10 sm:w-10 text-indigo-600" />
               </div>
+              <h2 className="text-xl sm:text-3xl font-bold tracking-tight text-slate-900 mb-3 sm:mb-4">
+                Ready for AI Analysis
+              </h2>
+              <p className="text-sm sm:text-base text-slate-600 mb-6 sm:mb-8 max-w-lg mx-auto leading-relaxed">
+                {detail.files.length} document{detail.files.length !== 1 && 's'} securely uploaded. Run the analysis engine to extract critical fields, reconcile data, and highlight discrepancies.
+              </p>
 
-              {isAnalyzing && (
-                <div className="mt-6">
-                  <div className="mb-2 flex items-center justify-between text-xs font-bold uppercase tracking-[0.2em] text-slate-400">
-                    <span>{analysisStatus === "saving" ? "Saving results" : "Analysis progress"}</span>
+              {isAnalyzing ? (
+                <div className="w-full max-w-md mx-auto space-y-3 text-left">
+                  <div className="flex items-center justify-between text-xs sm:text-sm font-semibold text-slate-700">
+                    <span>{analysisStatus === "saving" ? "Finalizing results..." : "Analyzing documents..."}</span>
                     <span>{analysisProgress}%</span>
                   </div>
-                  <div className="h-2 overflow-hidden rounded-full bg-slate-100">
-                    <div className="h-full rounded-full bg-slate-900 transition-all" style={{ width: `${analysisProgress}%` }} />
+                  <div className="h-2.5 overflow-hidden rounded-full bg-slate-100">
+                    <div className="h-full rounded-full bg-indigo-600 transition-all duration-300 ease-out" style={{ width: `${analysisProgress}%` }} />
                   </div>
                 </div>
+              ) : (
+                <Button
+                  size="lg"
+                  disabled={detail.files.length === 0}
+                  className="rounded-xl w-full sm:w-auto bg-indigo-600 hover:bg-indigo-700 text-white px-8 py-6 text-base font-semibold shadow-md shadow-indigo-600/20 transition-transform hover:scale-[1.02]"
+                  onClick={() => setAnalysisOptionsOpen(true)}
+                >
+                  <Sparkles className="mr-2 h-5 w-5" /> Analyze Case
+                </Button>
               )}
 
               {analysisStatus === "error" && analysisError && (
-                <div className="mt-6 rounded-2xl border border-red-200 bg-red-50 p-4 text-sm font-medium text-red-700">
+                <div className="mt-6 rounded-xl border border-red-200 bg-red-50 p-4 text-sm font-medium text-red-700 text-left">
                   {analysisError}
                 </div>
               )}
             </div>
 
-            <div className="grid gap-4 md:grid-cols-2">
-              {detail.files.map((file, index) => (
-                <div key={file.id} className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-sm">
-                  <div className="flex items-start gap-3">
-                    <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-[#f0ece6] text-[#5a5046]">
-                      <FileText className="h-5 w-5" />
+            {/* Document list minimal view */}
+            {!isAnalyzing && detail.files.length > 0 && (
+              <div className="w-full max-w-2xl mt-8">
+                <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3 px-1">Uploaded Files ({detail.files.length})</h3>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 sm:gap-3">
+                  {detail.files.map((file) => (
+                    <div key={file.id} className="flex items-center gap-3 bg-white border border-slate-200 rounded-xl p-3 shadow-sm">
+                      <div className="h-8 w-8 rounded-lg bg-slate-100 text-slate-400 flex items-center justify-center shrink-0">
+                        <FileText className="h-4 w-4" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium text-slate-900">{file.originalName}</p>
+                        <p className="text-xs text-slate-500">{file.sizeBytes ? `${Math.round(file.sizeBytes / 1024)} KB` : "File"}</p>
+                      </div>
                     </div>
-	                    <div className="min-w-0 flex-1">
-	                      <div className="truncate text-sm font-bold text-slate-900">{file.originalName}</div>
-	                      <div className="mt-1 text-xs font-medium text-slate-500">
-	                        {getSourceFileLabel(file.mimeType, file.originalName)} {index + 1} •{" "}
-	                        {file.sizeBytes ? `${Math.round(file.sizeBytes / 1024)} KB` : "Stored file"}
-	                      </div>
-	                    </div>
-                  </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+              </div>
+            )}
           </main>
+
           <AnalysisOptionsDialog
             open={analysisOptionsOpen}
             onOpenChange={setAnalysisOptionsOpen}
@@ -510,296 +572,188 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     );
   }
 
+  // =========================================
+  // ANALYZED STATE (Split Screen View)
+  // =========================================
+  const showActions = detail && detail.case.status !== "draft" && !isFinalDecision;
+
   return (
     <AppShell>
-      <div className="flex min-h-full flex-col bg-[#f7f7f5] animate-in fade-in duration-500">
+      <div className="flex flex-1 flex-col bg-[#fafafa] overflow-hidden animate-in fade-in duration-300 relative min-h-[calc(100vh-4rem)]">
 
-        {/* =========================================
-            TOP HEADER
-            ========================================= */}
-        <header className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b border-[#e5ddd0] bg-white px-4 py-3 sm:px-6 gap-4 sm:gap-6">
-          <div className="flex min-w-0 items-start gap-3 sm:items-center sm:gap-4 w-full sm:w-auto">
-            <Link href="/cases" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[#8a7f72] hover:bg-[#ede6d9] hover:text-[#1a1a1a] transition-colors">
-              <ArrowLeft className="h-5 w-5" />
+        {/* Top Navigation Bar */}
+        <header className="flex h-14 sm:h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-3 sm:px-6 z-20 relative">
+          <div className="flex items-center gap-2 sm:gap-4 min-w-0 flex-1">
+            <Link href="/cases" className="flex items-center justify-center h-8 w-8 rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-100 transition-colors shrink-0">
+              <ArrowLeft className="h-4 w-4 sm:h-5 w-5" />
             </Link>
-
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-[#f0ece6] text-[#5a5046] border border-[#e5ddd0]">
-              <FileText className="h-4 w-4" />
-            </div>
-
-            <div className="min-w-0 flex-1">
-              <h1 className="truncate text-base font-bold tracking-tight text-slate-900 sm:text-lg">
-                {detail?.case.displayName || "Loading Case..."}
+            <div className="w-px h-6 bg-slate-200 shrink-0"></div>
+            <div className="min-w-0 flex flex-col justify-center">
+              <h1 className="text-xs sm:text-base font-bold text-slate-900 truncate">
+                {detail?.case.displayName}
               </h1>
-
-              {detail && (
-                <div className="mt-1.5 flex flex-wrap items-center gap-2 sm:mt-0.5">
-                  <Badge
-                    variant="outline"
-                    className={`rounded-full px-2.5 font-medium shadow-sm shrink-0 ${getCaseStatusClassName(detail.case.status)}`}
-                  >
-                    {getCaseStatusLabel(detail.case.status)}
-                  </Badge>
-                  <Badge
-                    variant="outline"
-                    className="rounded-full bg-[#f0ece6] text-[#5a5046] border-[#e5ddd0] px-2.5 font-medium shadow-sm shrink-0"
-                  >
-                    {detail.case.category}
-                  </Badge>
-                  <Badge
-                    variant="outline"
-                    className="rounded-full bg-[#f0ece6] text-[#5a5046] border-[#e5ddd0] px-2.5 font-medium shadow-sm shrink-0"
-                  >
-                    {comparisonOptions.considerFormatting
-                      ? "Formatting compared exactly"
-                      : "Formatting ignored"}
-                  </Badge>
-                  {detail.case.riskScore > 0 ? (
-                    <Badge variant="outline" className="rounded-full bg-[#f0ece6] text-[#5a5046] border-[#e5ddd0] px-2.5 font-medium flex items-center gap-1 shadow-sm shrink-0">
-                      <Sparkles className="h-3 w-3" /> AI AUDITED
-                    </Badge>
-                  ) : (
-                    <Badge variant="outline" className="rounded-full bg-[#f0ece6] text-[#5a5046] border-[#e5ddd0] px-2.5 font-medium flex items-center gap-1 shadow-sm shrink-0">
-                      <CheckCircle2 className="h-3 w-3" /> RECONCILED
-                    </Badge>
-                  )}
-                </div>
-              )}
             </div>
+          </div>
+
+          {/* Action Area (Desktop) */}
+          <div className="hidden md:flex items-center gap-3 shrink-0">
+            <Badge variant="outline" className={`rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wider ${getCaseStatusClassName(detail?.case.status || "")}`}>
+              {getCaseStatusLabel(detail?.case.status || "")}
+            </Badge>
+            {showActions ? (
+              <>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="text-rose-600 hover:bg-rose-50 hover:text-rose-700 border-slate-200 shadow-sm transition-colors"
+                  disabled={decisionStatus === "updating"}
+                  onClick={() => handleCaseDecision("rejected")}
+                >
+                  <X className="h-4 w-4 mr-1.5" />
+                  Reject
+                </Button>
+                <Button
+                  size="sm"
+                  className="bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm transition-colors"
+                  disabled={decisionStatus === "updating"}
+                  onClick={() => handleCaseDecision("accepted")}
+                >
+                  {decisionStatus === "updating" ? (
+                    <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+                  ) : (
+                    <Check className="h-4 w-4 mr-1.5" />
+                  )}
+                  Accept Case
+                </Button>
+              </>
+            ) : null}
+          </div>
+
+          {/* Mobile Status Badge fallback */}
+          <div className="md:hidden shrink-0 ml-2">
+            <Badge variant="outline" className={`rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${getCaseStatusClassName(detail?.case.status || "")}`}>
+              {getCaseStatusLabel(detail?.case.status || "")}
+            </Badge>
           </div>
         </header>
 
-        {/* =========================================
-            STATE MANAGEMENT (LOADING / ERROR)
-            ========================================= */}
-        {status === "loading" && (
-          <div className="flex flex-1 flex-col items-center justify-center py-24 text-[#8a7f72]">
-            <Loader2 className="mb-4 h-8 w-8 animate-spin text-[#8a7f72]" />
-            <p className="text-sm font-medium">Retrieving case workspace...</p>
+        {decisionStatus === "error" && decisionError && (
+          <div className="bg-red-50 text-red-600 text-xs sm:text-sm p-3 text-center border-b border-red-100 font-medium z-10 relative shrink-0">
+            {decisionError}
           </div>
         )}
 
-        {status === "error" && (
-          <div className="p-4 sm:p-8">
-            <div className="flex items-start gap-4 rounded-2xl border border-red-200 bg-red-50 p-6 text-red-700 shadow-sm max-w-2xl mx-auto">
-              <ShieldAlert className="mt-0.5 h-6 w-6 shrink-0 text-red-500" />
-              <div>
-                <h3 className="font-bold text-lg">Unable to load case</h3>
-                <p className="mt-1 text-sm font-medium opacity-90">{error}</p>
+        {/* Mobile AI Alert Banner (Extremely Compact) */}
+        {visibleMismatches.length > 0 && (
+          <div className="md:hidden bg-rose-50 border-b border-rose-100 py-2.5 px-4 flex items-center justify-between shrink-0 z-10 relative">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="bg-rose-100 p-1 rounded-full shrink-0">
+                <TriangleAlert className="h-4 w-4 text-rose-600" />
               </div>
+              <h3 className="text-[11px] font-extrabold text-rose-900 uppercase tracking-tight">{visibleMismatches.length} Issues Found</h3>
             </div>
+            <Button asChild size="sm" variant="ghost" className="h-8 text-[10px] bg-rose-600 hover:bg-rose-700 text-white rounded-lg px-4 shrink-0 font-bold uppercase tracking-wider shadow-sm">
+              <Link href={`/cases/${caseId}/mismatches`}>Review</Link>
+            </Button>
           </div>
         )}
 
-        {/* =========================================
-            MAIN SPLIT LAYOUT
-            ========================================= */}
-        {status === "ready" && detail && (
-          <>
-            {detail.case.status !== "draft" && (
-              <div className="border-b border-[#e5ddd0] bg-[#faf8f4] px-4 py-4 sm:px-6">
-                <div className="mx-auto flex w-full max-w-7xl flex-col gap-4 rounded-2xl border border-[#e5ddd0] bg-white p-4 shadow-sm lg:flex-row lg:items-center lg:justify-between">
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <div className="text-sm font-semibold text-slate-900">Case decision</div>
-                      <span
-                        className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${getCaseStatusClassName(detail.case.status)}`}
-                      >
-                        {getCaseStatusLabel(detail.case.status)}
-                      </span>
-                    </div>
-                    <p className="mt-1 max-w-2xl text-sm leading-6 text-slate-500">
-                      Review the extracted data and mismatches here, then accept the case when it is ready for downstream use or reject it when corrections are needed.
-                    </p>
-                    {decisionStatus === "error" && decisionError && (
-                      <p className="mt-2 text-xs font-medium text-red-600">{decisionError}</p>
-                    )}
-                  </div>
-                  <div className="flex flex-col gap-2 sm:flex-row">
-                    <Button
-                      type="button"
-                      disabled={decisionStatus === "updating" || detail.case.status === "accepted"}
-                      className="rounded-xl bg-emerald-600 text-white hover:bg-emerald-700"
-                      onClick={() => handleCaseDecision("accepted")}
-                    >
-                      {decisionStatus === "updating" ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <CheckCircle2 className="h-4 w-4" />
-                      )}
-                      Accept case
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={decisionStatus === "updating" || detail.case.status === "rejected"}
-                      className="rounded-xl border-rose-200 text-rose-700 hover:bg-rose-50 hover:text-rose-800"
-                      onClick={() => handleCaseDecision("rejected")}
-                    >
-                      <TriangleAlert className="h-4 w-4" />
-                      Reject case
-                    </Button>
-                  </div>
-                </div>
-              </div>
-            )}
+        {/* Main Content Split */}
+        <div className="flex flex-1 min-h-0 relative">
 
-            <div className="flex flex-1 flex-col overflow-visible xl:flex-row xl:overflow-hidden">
-
-              {/* MOBILE ONLY: Context Cards (Stacked above the viewer) */}
-              <div className="space-y-4 border-b border-[#e5ddd0] bg-[#faf8f4] p-4 xl:hidden">
-              <div className="grid grid-cols-2 gap-3">
-                <div className="rounded-2xl border border-[#e5ddd0] bg-white p-4 shadow-sm">
-                  <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 truncate">
-                    Receiver
-                  </div>
-                  <div className="mt-1 truncate text-sm font-semibold text-slate-900" title={detail.case.receiverName || "—"}>
-                    {detail.case.receiverName || "—"}
-                  </div>
-                </div>
-                <div className="rounded-2xl border border-[#e5ddd0] bg-white p-4 shadow-sm">
-                  <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 truncate">
-                    Category
-                  </div>
-                  <div className="mt-1 truncate text-sm font-semibold text-slate-900" title={detail.case.category}>
-                    {detail.case.category}
-                  </div>
-                </div>
-                <div className="rounded-2xl border border-[#e5ddd0] bg-white p-4 shadow-sm">
-                  <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 truncate">
-                    Mismatches
-                  </div>
-                  <div className="mt-1 text-sm font-semibold text-slate-900">
-                    {visibleMismatches.length}
-                  </div>
-                </div>
-              </div>
-
-              {/* Mobile Document Selector (Horizontal Scroll) */}
-              <div className="rounded-2xl border border-[#e5ddd0] bg-white p-4 shadow-sm">
-                <div className="mb-3 flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-2">
-                    <FileText className="h-4 w-4 text-[#8a7f72] shrink-0" />
-                    <h3 className="text-sm font-bold text-[#1a1a1a]">Documents</h3>
-                  </div>
-                  <Badge variant="secondary" className="bg-[#e8ddd0] text-[#5a5046] font-bold shrink-0">
-                    {detail.documents.length}
-                  </Badge>
-                </div>
-                <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-2 [&::-webkit-scrollbar]:hidden[-ms-overflow-style:none] [scrollbar-width:none]">
-                  {detail.documents.map((document) => {
-                    const isActive = activeDocumentId === document.id;
-                    return (
-                      <button
-                        key={document.id}
-                        onClick={() => setActiveDocumentId(document.id)}
-                        className={`min-w-[220px] max-w-[260px] shrink-0 rounded-xl border px-3 py-2.5 text-left transition-all ${isActive
-                            ? "border-[#d4c9b8] bg-[#ede6d9]"
-                            : "border-[#e5ddd0] bg-[#faf8f4] hover:bg-[#f0ece6]"
-                          }`}
-                      >
-                        <div className="line-clamp-2 text-sm font-bold text-[#1a1a1a]">
-                          {document.title}
-                        </div>
-                        <div className="mt-1 truncate text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-                          {document.documentType}
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-              </div>
-
-              {/* DESKTOP ONLY: LEFT PANEL (Metadata & Context) */}
-              <div className="w-full max-w-md flex-shrink-0 border-r border-[#e5ddd0] bg-[#faf8f4] overflow-y-auto hidden xl:block">
+          {/* Left Sidebar (Desktop only) */}
+          <aside className="w-80 lg:w-[24rem] shrink-0 border-r border-slate-200 bg-[#fafafa] hidden md:flex flex-col">
+            <ScrollArea className="flex-1">
               <div className="p-6 space-y-6">
 
-                {/* Location Card */}
-                <div className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-sm">
-                  <div className="flex items-center gap-2 mb-4">
-                    <MapPin className="h-4 w-4 text-[#8a7f72]" />
-                    <h3 className="font-bold text-[#1a1a1a] text-sm">Location</h3>
-                  </div>
-                  <div className="flex items-center flex-wrap gap-2 text-sm text-slate-600 font-medium">
-                    <Folder className="h-4 w-4 text-[#5a5046]" />
-                    <span className="text-[#5a5046] cursor-pointer hover:underline">Root</span>
-                    <span className="text-slate-300">/</span>
-                    <span>Cases</span>
-                    <span className="text-slate-300">/</span>
-                    <span className="text-slate-900 truncate max-w-[120px]" title={detail.case.slug}>{detail.case.slug}</span>
-                  </div>
-                </div>
+                {/* Unified AI Summary & Metadata Card */}
+                {detail && (
+                  <div className={`rounded-2xl border shadow-sm overflow-hidden flex flex-col ${visibleMismatches.length === 0 ? 'border-emerald-200' : 'border-rose-200'}`}>
 
-                {/* Details Card */}
-                <div className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-sm">
-                  <div className="flex items-center gap-2 mb-5">
-                    <Info className="h-4 w-4 text-[#8a7f72]" />
-                    <h3 className="font-bold text-[#1a1a1a] text-sm">Details</h3>
-                  </div>
-                  <div className="grid grid-cols-2 gap-y-6 gap-x-4">
-                    <div className="min-w-0">
-                      <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-1">Receiver</div>
-                      <div className="text-sm font-semibold text-slate-900 leading-tight truncate" title={detail.case.receiverName || "—"}>
-                        {detail.case.receiverName || "—"}
+                    {/* Status Header Area */}
+                    <div className={`p-5 ${visibleMismatches.length === 0 ? 'bg-emerald-50/50' : 'bg-rose-50/50'}`}>
+                      <div className="flex items-center gap-2 mb-3">
+                        <div className={`rounded-full p-1.5 shadow-sm ${visibleMismatches.length === 0 ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600'}`}>
+                          {visibleMismatches.length === 0 ? <CheckCircle2 className="h-4 w-4" /> : <TriangleAlert className="h-4 w-4" />}
+                        </div>
+                        <h3 className={`text-sm font-bold ${visibleMismatches.length === 0 ? 'text-emerald-900' : 'text-rose-900'}`}>
+                          {visibleMismatches.length === 0 ? 'Data Reconciled' : 'Discrepancies Found'}
+                        </h3>
                       </div>
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-1">Category</div>
-                      <div className="text-sm font-semibold text-slate-900 leading-tight truncate" title={detail.case.category}>
-                        {detail.case.category}
-                      </div>
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-1">Uploaded</div>
-                      <div className="text-sm font-semibold text-slate-900 leading-tight truncate">
-                        {formatDateTime(detail.case.createdAt)}
-                      </div>
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-1">Invoice Ref</div>
-                      <div className="text-sm font-semibold text-slate-900 leading-tight truncate" title={detail.case.invoiceNumber || "—"}>
-                        {detail.case.invoiceNumber || "—"}
-                      </div>
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-1">PO Number</div>
-                      <div className="text-sm font-semibold text-slate-900 leading-tight truncate" title={detail.case.poNumber || "—"}>
-                        {detail.case.poNumber || "—"}
-                      </div>
-                    </div>
-                  </div>
-                </div>
 
-                {/* Desktop Document Selector Card */}
-                <div className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-sm">
-                  <div className="flex items-center justify-between mb-4">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <FileText className="h-4 w-4 text-[#8a7f72] shrink-0" />
-                      <h3 className="font-bold text-[#1a1a1a] text-sm truncate">Packet Documents</h3>
+                      <p className={`text-sm leading-relaxed ${visibleMismatches.length === 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                        {visibleMismatches.length === 0
+                          ? `The packet contains ${detail.documents.length} documents. All extracted key data points match perfectly across the set.`
+                          : `The AI found ${visibleMismatches.length} conflicting data points across the ${detail.documents.length} documents provided. Review is highly recommended.`}
+                      </p>
+
+                      {/* Mismatches Action Button */}
+                      {visibleMismatches.length > 0 && (
+                        <Button asChild className="w-full mt-4 bg-rose-600 hover:bg-rose-700 text-white shadow-sm font-semibold h-10">
+                          <Link href={`/cases/${caseId}/mismatches`}>
+                            <TriangleAlert className="h-4 w-4 mr-2" />
+                            Review {visibleMismatches.length} Issue{visibleMismatches.length !== 1 && 's'}
+                          </Link>
+                        </Button>
+                      )}
+
+                      {visibleMismatches.length === 0 && (
+                        <div className="mt-4 flex items-center justify-center gap-2 text-xs font-semibold text-emerald-600 bg-emerald-100/50 py-2 rounded-lg border border-emerald-100">
+                          <Sparkles className="h-3.5 w-3.5" /> High Confidence
+                        </div>
+                      )}
                     </div>
-                    <Badge variant="secondary" className="bg-[#e8ddd0] text-[#5a5046] font-bold shrink-0">{detail.documents.length}</Badge>
+
+                    {/* Metadata Grid */}
+                    <div className="bg-white p-5 border-t border-slate-100">
+                      <div className="grid grid-cols-2 gap-y-4 gap-x-2 text-sm">
+                        <div>
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Subject</span>
+                          <span className="text-slate-900 font-medium line-clamp-2">{detail.case.category} Packet</span>
+                        </div>
+                        <div>
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Uploaded</span>
+                          <span className="text-slate-900 font-medium line-clamp-2">{formatDateTime(detail.case.createdAt)}</span>
+                        </div>
+                        <div>
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Sender</span>
+                          <span className="text-slate-900 font-medium line-clamp-2">N/A</span>
+                        </div>
+                        <div>
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Receiver</span>
+                          <span className="text-slate-900 font-medium line-clamp-2">{detail.case.receiverName || "—"}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Documents List */}
+                <div>
+                  <div className="flex items-center justify-between mb-3 px-1">
+                    <h3 className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">Documents in Packet</h3>
+                    <span className="text-[10px] font-bold text-slate-500 bg-slate-200/50 px-2 py-0.5 rounded-full">{detail?.documents.length}</span>
                   </div>
                   <div className="space-y-1.5">
-                    {detail.documents.map((d) => {
-                      const isActive = activeDocumentId === d.id;
+                    {detail?.documents.map((doc) => {
+                      const isActive = activeDocumentId === doc.id;
                       return (
                         <button
-                          key={d.id}
-                          onClick={() => setActiveDocumentId(d.id)}
-                          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all text-left ${isActive ? "bg-[#ede6d9] border border-[#d4c9b8]" : "hover:bg-[#f0ece6] border border-transparent"
+                          key={doc.id}
+                          onClick={() => setActiveDocumentId(doc.id)}
+                          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl text-left transition-all ${isActive ? 'bg-white shadow-sm border border-slate-200 ring-1 ring-slate-200' : 'hover:bg-slate-200/50 border border-transparent'
                             }`}
                         >
-                          <div className={`flex items-center justify-center shrink-0 w-8 h-8 rounded-lg ${isActive ? 'bg-[#e5ddd0] text-[#5a5046]' : 'bg-[#f0ece6] text-[#8a7f72]'}`}>
-                            <FileText className="w-4 h-4" />
+                          <div className={`shrink-0 h-8 w-8 rounded-lg flex items-center justify-center ${isActive ? 'bg-indigo-50 text-indigo-600' : 'bg-white text-slate-400 border border-slate-200'}`}>
+                            <FileText className="h-4 w-4" />
                           </div>
                           <div className="min-w-0 flex-1">
-                            <div className={`text-sm font-bold truncate ${isActive ? 'text-[#1a1a1a]' : 'text-[#5a5046]'}`}>
-                              {d.title}
-                            </div>
-                            <div className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider truncate mt-0.5">
-                              {d.documentType}
-                            </div>
+                            <p className={`truncate text-sm font-bold ${isActive ? 'text-slate-900' : 'text-slate-600'}`}>
+                              {doc.title}
+                            </p>
+                            <p className="truncate text-[10px] font-medium text-slate-400 mt-0.5 uppercase tracking-wider">
+                              {doc.documentType}
+                            </p>
                           </div>
                         </button>
                       );
@@ -807,208 +761,212 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                   </div>
                 </div>
 
-                {/* Desktop AI Summary / Risk Card */}
-                <div className={`rounded-2xl border p-6 shadow-sm ${visibleMismatches.length === 0 ? 'bg-[#f0fdf4] border-[#bbf7d0]' : 'bg-amber-50 border-amber-200'}`}>
-                  <div className="flex items-center gap-2 mb-4">
-                    <Sparkles className={`h-4 w-4 ${visibleMismatches.length === 0 ? 'text-[#166534]' : 'text-amber-700'}`} />
-                    <h3 className={`font-bold text-sm ${visibleMismatches.length === 0 ? 'text-[#166534]' : 'text-amber-900'}`}>AI Summary</h3>
-                  </div>
-
-                  {visibleMismatches.length === 0 ? (
-                    <div className="text-sm text-[#166534] font-medium leading-relaxed">
-                      This case has been successfully reconciled. All extracted data points match perfectly across the provided documents with 100% integrity. No further action is required.
-                    </div>
-                  ) : (
-                    <div className="text-sm text-amber-900 font-medium leading-relaxed">
-                      This packet requires attention. We detected conflicting values across the provided documents.
-                      <p className="mt-3 font-bold">Key Discrepancies:</p>
-                      <ul className="mt-2 space-y-1.5 list-disc pl-4 marker:text-amber-500">
-                        {visibleMismatches.map((m) => (
-                          <li key={m.id}>
-                            {getComparisonDisplayLabel(m.fieldName, FIELD_LABEL_LOOKUP[m.fieldName])}
-                          </li>
-                        ))}
-                      </ul>
-                      <Button
-                        asChild
-                        variant="link"
-                        className="p-0 h-auto mt-4 text-amber-700 font-bold"
-                      >
-                        <Link href={`/cases/${caseId}/mismatches`}>View all mismatches &rarr;</Link>
-                      </Button>
-                    </div>
-                  )}
-                </div>
-
               </div>
-              </div>
+            </ScrollArea>
+          </aside>
 
-              {/* RIGHT PANEL (Viewer & Tabs) */}
-              <div className="relative flex min-w-0 flex-1 flex-col bg-[#f7f7f5] p-3 sm:p-4 lg:p-6 xl:overflow-hidden">
-              <div className="flex flex-col overflow-hidden rounded-[1.5rem] border border-[#e5ddd0] bg-white shadow-sm h-auto xl:h-full">
+          {/* Right Main Area (Document Viewer Card) */}
+          <main className="flex-1 flex flex-col min-w-0 bg-[#fafafa] pt-2.5 px-2.5 pb-0 sm:p-4 md:p-6 lg:p-8 relative">
 
-                {/* Viewer Header */}
-                <div className="flex flex-col items-start justify-between border-b border-[#e5ddd0] p-4 gap-4 xl:flex-row xl:items-center sm:px-6">
-	                  <div className="flex items-center gap-3">
-	                    <Eye className="h-5 w-5 text-[#8a7f72] shrink-0" />
-	                    <h2 className="text-base font-bold text-[#1a1a1a] truncate">Document Viewer</h2>
-	                    <Badge variant="secondary" className="bg-[#f0ece6] text-[#5a5046] font-bold uppercase text-[10px] tracking-wider ml-1 sm:ml-2 shrink-0">
-	                      {activeSourceFileLabel}
-	                    </Badge>
-	                  </div>
-
-                  {/* Segmented Control Tabs (Horizontal Scroll on Mobile) */}
-                  <div className="w-full xl:w-auto bg-[#ede6d9] p-1 rounded-xl flex items-center shadow-inner overflow-x-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
-                    {DETAIL_TABS.map((tab) => (
-                      <button
-                        key={tab.id}
-                        onClick={() => setActiveTab(tab.id)}
-                        className={`flex shrink-0 items-center gap-2 px-3 sm:px-4 py-1.5 rounded-lg text-sm font-bold transition-all whitespace-nowrap ${activeTab === tab.id
-                          ? "bg-white text-[#1a1a1a] shadow-sm"
-                          : "text-[#8a7f72] hover:text-[#1a1a1a] hover:bg-[#e5ddd0]/60"
-                          }`}
-                      >
-                        <tab.icon className="w-4 h-4 shrink-0" />
-                        {tab.label}
-                      </button>
-                    ))}
-                    <Link
-                      href={`/cases/${caseId}/mismatches`}
-                      className="ml-1 flex shrink-0 items-center gap-2 rounded-lg px-3 sm:px-4 py-1.5 text-sm font-bold whitespace-nowrap text-[#8a7f72] transition-all hover:bg-[#e5ddd0]/60 hover:text-[#1a1a1a]"
+            {/* Mobile Document Selector (Horizontal scroll) */}
+            <div className="md:hidden bg-white border border-[#e5ddd0] rounded-xl mb-3 p-1.5 shrink-0 z-10 relative overflow-hidden shadow-sm">
+              <div className="flex overflow-x-auto gap-2 snap-x scrollbar-hide py-0.5 px-0.5">
+                {detail?.documents.map((doc) => {
+                  const isActive = activeDocumentId === doc.id;
+                  return (
+                    <button
+                      key={doc.id}
+                      onClick={() => setActiveDocumentId(doc.id)}
+                      className={`snap-start shrink-0 flex flex-col items-center justify-center px-4 py-2 rounded-lg text-center transition-all border ${isActive 
+                        ? 'bg-[#1a1a1a] border-slate-900 shadow-md text-white' 
+                        : 'bg-[#f0ece6] border-[#e5ddd0] text-[#5a5046]'
+                        }`}
+                      style={{ minWidth: '130px' }}
                     >
-                      <TriangleAlert className="w-4 h-4 shrink-0" />
-                      Mismatches
-                      {visibleMismatches.length > 0 && (
-                        <span className="ml-1 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-rose-100 text-[9px] text-rose-600">
-                          {visibleMismatches.length}
-                        </span>
-                      )}
-                    </Link>
+                      <p className="font-bold text-[11px] truncate w-full">{doc.title}</p>
+                      <p className={`text-[9px] font-bold opacity-60 truncate w-full uppercase tracking-tighter mt-0.5 ${isActive ? 'text-white' : 'text-[#8a7f72]'}`}>{doc.documentType}</p>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+
+            {/* The Unified Card Container */}
+            <div className="flex flex-col flex-1 bg-white sm:border border-slate-200 sm:rounded-2xl shadow-sm overflow-hidden mb-2 sm:mb-0">
+
+              {/* Card Header (Tabs & Title) */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-2 sm:p-4 border-b border-slate-100 bg-white shrink-0">
+
+                {/* Left Side: Title & Badge (Desktop Only) */}
+                <div className="hidden sm:flex items-center gap-3">
+                  <div className="flex items-center gap-2">
+                    {activeTab === 'preview' ? <Eye className="h-5 w-5 text-slate-500" /> : activeTab === 'data' ? <Database className="h-5 w-5 text-slate-500" /> : <FileDigit className="h-5 w-5 text-slate-500" />}
+                    <h2 className="text-base font-bold text-slate-900">
+                      {activeTab === 'preview' ? 'Preview' : activeTab === 'data' ? 'Extracted Data' : 'Raw Text'}
+                    </h2>
                   </div>
+                  <Badge variant="outline" className="rounded-full px-2.5 py-0.5 text-[10px] uppercase font-bold text-slate-500 bg-slate-50 border-slate-200">
+                    {activeTab === 'preview' ? activeSourceLabel : 'View'}
+                  </Badge>
                 </div>
 
-                {/* File Sub-header */}
-                {activeDocument && (
-                  <div className="flex items-center gap-3 border-b border-[#e5ddd0] bg-[#faf8f4] px-4 py-3 sm:px-6">
-                    <FileText className="w-4 h-4 text-[#8a7f72] shrink-0" />
-                    <span className="text-sm font-semibold text-[#1a1a1a] truncate">{activeDocument.sourceFileName || activeDocument.title}</span>
-                    <span className="text-[#c8bfb2] shrink-0">•</span>
-                    <span className="text-xs font-medium text-[#8a7f72] flex items-center gap-1.5 shrink-0">
-                      <Clock className="w-3.5 h-3.5" />
-                      <span className="hidden sm:inline">Processed {formatDateTime(activeDocument.createdAt)}</span>
-                      <span className="sm:hidden">{formatDateTime(activeDocument.createdAt).split(',')[0]}</span>
-                    </span>
+                {/* Right Side: Segmented Control & Actions */}
+                <div className="flex items-center justify-between sm:justify-end w-full sm:w-auto gap-3">
+
+                  {/* Segmented Control */}
+                  <div className="flex items-center bg-[#f0ece6] p-1.5 rounded-xl w-full sm:w-auto border border-[#e5ddd0]">
+                    {DETAIL_TABS.map((tab) => {
+                      const isActive = activeTab === tab.id;
+                      return (
+                        <button
+                          key={tab.id}
+                          onClick={() => setActiveTab(tab.id)}
+                          className={`flex-1 sm:flex-none flex items-center justify-center gap-2 px-3.5 py-2 rounded-lg text-[11px] sm:text-sm font-bold transition-all ${isActive
+                              ? 'bg-[#1a1a1a] text-white shadow-md'
+                              : 'text-[#5a5046] hover:bg-[#e5ddd0]/30'
+                            }`}
+                        >
+                          <tab.icon className={`h-3.5 w-3.5 ${isActive ? 'text-white' : 'text-[#8a7f72]'}`} />
+                          <span>{tab.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                </div>
+              </div>
+
+              {/* Card Body (The Views) */}
+              <div className="flex-1 relative bg-white overflow-hidden">
+
+                {/* 1. Preview View */}
+                {activeTab === 'preview' && (
+                  <div className="absolute inset-0 flex flex-col bg-[#525659]">
+
+                    {/* PDF/Image Canvas */}
+                    <div className="flex-1 relative overflow-auto">
+                      {activeFileUrl ? (
+                        activeSourceIsImage ? (
+                          <div className="absolute inset-0 flex items-center justify-center p-4">
+                            <Image
+                              src={activeFileUrl}
+                              alt="Document preview"
+                              fill
+                              unoptimized
+                              className="object-contain drop-shadow-2xl"
+                            />
+                          </div>
+                        ) : (
+                          <iframe
+                            src={`${activeFileUrl}#toolbar=0&navpanes=0`}
+                            className="absolute inset-0 w-full h-full border-0 bg-white"
+                            title="Document Preview"
+                          />
+                        )
+                      ) : (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-300 gap-4 p-6 text-center">
+                          <FileSearch className="w-12 h-12 opacity-50" />
+                          <p className="text-sm font-medium">Source preview not available for this document.</p>
+                        </div>
+                      )}
+
+                      {/* Floating Dark Toolbar */}
+                      {activeFileUrl && (
+                        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-1 bg-slate-900/80 backdrop-blur-md px-2 py-1.5 rounded-xl border border-white/10 shadow-2xl z-20">
+                          <div className="text-white text-[10px] sm:text-xs font-semibold px-2 flex items-center gap-1">
+                            1 <span className="opacity-50">/ {activeDocument?.pageCount || 1}</span>
+                          </div>
+                          <div className="h-3 w-px bg-white/20 mx-1"></div>
+                          <button className="p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors"><ZoomOut className="h-4 w-4" /></button>
+                          <button className="p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors"><ZoomIn className="h-4 w-4" /></button>
+                          <div className="h-3 w-px bg-white/20 mx-1 hidden sm:block"></div>
+                          <button className="hidden sm:block p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors"><RotateCw className="h-4 w-4" /></button>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 )}
 
-                {/* Content Area */}
-                <Tabs value={activeTab} className="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-[#f0ece6] p-3 sm:p-4 md:p-6">
-
-                  {/* TAB: PREVIEW */}
-                  <TabsContent value="preview" className="m-0 h-full min-h-0 w-full">
-                    <div className="flex h-[60vh] min-h-[450px] xl:h-full w-full flex-col overflow-hidden rounded-xl border border-slate-300 bg-[#2d2d2d] shadow-lg">
-                      {/* Dark Toolbar */}
-                      <div className="h-12 bg-[#1e1e1e] flex items-center px-3 sm:px-4 justify-between shrink-0">
-                        <div className="bg-[#3d3d3d] text-white text-xs font-semibold px-2 sm:px-3 py-1.5 rounded-md">
-                          1 / {activeDocument?.pageCount || 1}
+                {/* 2. Data View */}
+                {activeTab === 'data' && (
+                  <div className="absolute inset-0 overflow-y-auto">
+                    <div className="p-4 sm:p-8 max-w-4xl mx-auto pb-8">
+                      {activeDocumentEntries.length === 0 ? (
+                        <div className="py-12 text-center text-sm font-medium text-slate-500">
+                          No specific fields extracted for this document type.
                         </div>
-                        <div className="flex items-center gap-2 sm:gap-4 text-slate-300">
-                          <button className="hover:text-white transition-colors text-lg font-light w-8 h-8 flex items-center justify-center">−</button>
-                          <button className="hover:text-white transition-colors text-lg font-light w-8 h-8 flex items-center justify-center">+</button>
-                          <div className="w-px h-4 bg-slate-600 mx-1 sm:mx-2 shrink-0"></div>
-                          <button className="hover:text-white transition-colors text-[10px] sm:text-xs font-semibold tracking-wider">FIT</button>
-                        </div>
-                      </div>
-	                      <div className="flex-1 bg-[#525659] relative">
-	                        {activeFileUrl ? (
-	                          activeSourceIsImage ? (
-	                            <div className="absolute inset-0 flex items-center justify-center overflow-auto bg-[#202124] p-4">
-	                              <Image
-	                                src={activeFileUrl}
-	                                alt={activeDocument?.sourceFileName || activeDocument?.title || "Document preview"}
-	                                fill
-	                                unoptimized
-	                                sizes="100vw"
-	                                className="object-contain p-4"
-	                              />
-	                            </div>
-	                          ) : (
-	                            <iframe
-	                              src={`${activeFileUrl}#toolbar=0&navpanes=0`}
-	                              className="absolute inset-0 w-full h-full border-0 bg-white"
-	                              title="Document Preview"
-	                            />
-	                          )
-	                        ) : (
-                          <div className="flex items-center justify-center h-full flex-col text-slate-400 gap-3 px-4 text-center">
-                            <FileText className="w-10 h-10 opacity-50" />
-                            <p className="text-sm font-medium">Source preview not available for this document.</p>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </TabsContent>
+                      ) : (
+                        <div className="flex flex-col text-sm border border-slate-100 rounded-xl overflow-hidden shadow-sm">
+                          {activeDocumentEntries.map(([key, value], index) => {
+                            const currentValue = typeof value === "string" ? value : displayValue(value);
+                            const canonical = fieldCanonicalValues[key];
+                            const ok = !canonical || areComparableValuesEqual(currentValue, canonical, comparisonOptions);
 
-                  {/* TAB: EXTRACTED DATA */}
-                  <TabsContent value="data" className="m-0 h-full min-h-0 w-full">
-                    <div className="bg-white rounded-xl h-[60vh] min-h-[450px] xl:h-full w-full min-h-0 shadow-sm border border-[#e5ddd0] overflow-hidden flex flex-col">
-                      <ScrollArea className="min-h-0 flex-1 p-4 sm:p-6">
-                        <div className="max-w-3xl mx-auto space-y-6">
-                          <h2 className="text-xl sm:text-2xl font-bold text-slate-900 mb-4 sm:mb-6 border-b border-slate-100 pb-4">Extracted Data Fields</h2>
-                          {activeDocumentEntries.length === 0 ? (
-                            <div className="text-center py-10 text-slate-500 font-medium">No fields extracted.</div>
-                          ) : (
-                            <div className="grid gap-x-8 gap-y-4 sm:gap-y-6 grid-cols-1 sm:grid-cols-2">
-                              {activeDocumentEntries.map(([key, value]) => {
-                                const currentValue = typeof value === "string" ? value : displayValue(value);
-                                const canonical = fieldCanonicalValues[key];
-                                const ok =
-                                  !canonical ||
-                                  areComparableValuesEqual(currentValue, canonical, comparisonOptions);
-
-                                return (
-                                  <div key={key} className="flex flex-col border-b border-slate-100 pb-3 last:border-0 group">
-                                    <div className="flex justify-between items-start sm:items-center mb-1.5 gap-2">
-                                      <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 break-words">
-                                        {FIELD_LABEL_LOOKUP[key] || key}
+                            return (
+                              <div key={key} className={`flex flex-col sm:flex-row sm:items-start p-3 sm:p-5 ${index !== activeDocumentEntries.length - 1 ? 'border-b border-slate-100' : ''} hover:bg-slate-50/50 transition-colors bg-white`}>
+                                <div className="w-full sm:w-1/3 mb-1 sm:mb-0 pr-4">
+                                  <div className="font-semibold text-slate-500 text-xs sm:text-sm uppercase sm:normal-case tracking-wider sm:tracking-normal flex items-center gap-2">
+                                    {FIELD_LABEL_LOOKUP[key] || key}
+                                    {!ok && (
+                                      <span className="px-1.5 py-0.5 rounded text-[9px] sm:text-[10px] font-bold bg-rose-100 text-rose-700 uppercase tracking-wider shrink-0">
+                                        Conflict
                                       </span>
-                                      {!ok && (
-                                        <Badge variant="outline" className="border-rose-200 bg-rose-50 text-rose-700 text-[9px] uppercase px-1.5 py-0 shrink-0">
-                                          Conflict
-                                        </Badge>
-                                      )}
-                                    </div>
-                                    <div className="text-sm font-semibold text-slate-900 break-words">
-                                      {currentValue || <em className="text-slate-400 font-normal">Not detected</em>}
-                                    </div>
+                                    )}
                                   </div>
-                                );
-                              })}
-                            </div>
-                          )}
+                                </div>
+                                <div className="w-full sm:w-2/3 text-slate-900 font-medium sm:text-sm text-base break-words">
+                                  {currentValue || <span className="text-slate-300 font-normal italic">Not detected</span>}
+                                </div>
+                              </div>
+                            )
+                          })}
                         </div>
-                      </ScrollArea>
+                      )}
                     </div>
-                  </TabsContent>
+                  </div>
+                )}
 
-                  {/* TAB: OCR TEXT */}
-                  <TabsContent value="ocr" className="m-0 h-full min-h-0 w-full">
-                    <div className="bg-slate-900 rounded-xl h-[60vh] min-h-[450px] xl:h-full w-full min-h-0 shadow-lg border border-slate-800 overflow-hidden flex flex-col text-slate-300">
-                      <ScrollArea className="min-h-0 flex-1 p-4 sm:p-6">
-                        <div className="max-w-4xl mx-auto font-mono text-xs sm:text-sm leading-relaxed opacity-90 break-words">
-                          <ReactMarkdown>
-                            {activeDocument?.markdown || "No OCR transcription available."}
-                          </ReactMarkdown>
-                        </div>
-                      </ScrollArea>
+                {/* 3. OCR View */}
+                {activeTab === 'ocr' && (
+                  <div className="absolute inset-0 overflow-y-auto bg-slate-50 text-slate-800">
+                    <div className="p-4 sm:p-8 max-w-4xl mx-auto font-mono text-[11px] sm:text-sm leading-relaxed whitespace-pre-wrap break-words">
+                      <ReactMarkdown>
+                        {activeDocument?.markdown || "No OCR transcription available."}
+                      </ReactMarkdown>
                     </div>
-                  </TabsContent>
-                </Tabs>
-              </div>
-              </div>
+                  </div>
+                )}
 
+              </div>
             </div>
-          </>
+
+          </main>
+        </div>
+
+        {/* Mobile Sticky Action Bar */}
+        {showActions && (
+          <div className="md:hidden fixed bottom-0 left-0 right-0 border-t border-slate-200 bg-white p-3 flex items-center gap-3 z-30 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] pb-safe">
+            <Button
+              variant="outline"
+              className="flex-1 rounded-xl text-rose-600 hover:bg-rose-50 hover:text-rose-700 border-slate-200 shadow-sm h-12 font-semibold"
+              disabled={decisionStatus === "updating"}
+              onClick={() => handleCaseDecision("rejected")}
+            >
+              <X className="h-5 w-5 mr-2" /> Reject
+            </Button>
+            <Button
+              className="flex-1 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm h-12 font-semibold"
+              disabled={decisionStatus === "updating"}
+              onClick={() => handleCaseDecision("accepted")}
+            >
+              {decisionStatus === "updating" ? (
+                <Loader2 className="h-5 w-5 animate-spin mr-2" />
+              ) : (
+                <Check className="h-5 w-5 mr-2" />
+              )}
+              Accept
+            </Button>
+          </div>
         )}
       </div>
     </AppShell>

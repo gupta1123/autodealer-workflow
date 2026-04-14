@@ -8,6 +8,7 @@ import {
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { mergeUploadGroupMeta, readUploadGroupMeta } from "@/lib/upload-groups";
 
 const STORAGE_BUCKET = "packet-files";
 
@@ -63,6 +64,18 @@ function inferContentType(file: File) {
   if (extension === "heic") return "image/heic";
   if (extension === "heif") return "image/heif";
   return "application/octet-stream";
+}
+
+function parseUploadGroups(value: FormDataEntryValue | null) {
+  if (typeof value !== "string") {
+    return [];
+  }
+
+  try {
+    return readUploadGroupMeta(JSON.parse(value));
+  } catch {
+    return [];
+  }
 }
 
 function serializeError(error: unknown) {
@@ -144,6 +157,7 @@ export async function POST(
     const formData = await request.formData();
     const mode = formData.get("mode") === "overwrite" ? "overwrite" : "append";
     const files = formData.getAll("files").filter(isFileEntry);
+    const uploadGroups = parseUploadGroups(formData.get("uploadGroups"));
 
     if (!files.length) {
       return NextResponse.json({ error: "Upload at least one file." }, { status: 400 });
@@ -303,9 +317,25 @@ export async function POST(
       | null = null;
 
     try {
+      const existingMeta =
+        existing.processing_meta && typeof existing.processing_meta === "object"
+          ? (existing.processing_meta as Record<string, unknown>)
+          : {};
+      const existingUploadGroups = readUploadGroupMeta(existingMeta.uploadGroups);
+      const nextPayload: Record<string, unknown> = {
+        upload_count: count ?? existing.upload_count + files.length,
+      };
+
+      if (uploadGroups.length) {
+        nextPayload.processing_meta = {
+          ...existingMeta,
+          uploadGroups: mergeUploadGroupMeta(existingUploadGroups, uploadGroups),
+        };
+      }
+
       const result = await supabase
         .from("packet_cases")
-        .update({ upload_count: count ?? existing.upload_count + files.length })
+        .update(nextPayload)
         .eq("id", id)
         .eq("owner_user_id", user.id)
         .select(
@@ -320,9 +350,25 @@ export async function POST(
         throw error;
       }
 
+      const existingMeta =
+        existing.processing_meta && typeof existing.processing_meta === "object"
+          ? (existing.processing_meta as Record<string, unknown>)
+          : {};
+      const existingUploadGroups = readUploadGroupMeta(existingMeta.uploadGroups);
+      const nextPayload: Record<string, unknown> = {
+        upload_count: count ?? existing.upload_count + files.length,
+      };
+
+      if (uploadGroups.length) {
+        nextPayload.processing_meta = {
+          ...existingMeta,
+          uploadGroups: mergeUploadGroupMeta(existingUploadGroups, uploadGroups),
+        };
+      }
+
       const fallback = await supabase
         .from("packet_cases")
-        .update({ upload_count: count ?? existing.upload_count + files.length })
+        .update(nextPayload)
         .eq("id", id)
         .eq("owner_user_id", user.id)
         .select(

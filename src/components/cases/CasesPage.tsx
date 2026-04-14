@@ -153,39 +153,38 @@ export function CasesPage() {
 
   return (
     <AppShell>
-      <div className="mx-auto max-w-[1500px] w-full px-4 sm:px-6 lg:px-8 py-8 animate-in fade-in duration-700 ease-out text-slate-800">
+      <div className="mx-auto max-w-[1500px] w-full px-4 sm:px-6 lg:px-8 py-8 animate-in fade-in duration-700 ease-out text-[#1a1a1a]">
 
         {/* MAIN CONTAINER matching the image's white box UI */}
-        <div className="bg-white border border-slate-200/80 rounded-2xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] overflow-hidden flex flex-col">
+        <div className="bg-white border border-[#e5ddd0] rounded-2xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] overflow-hidden flex flex-col">
 
           {/* =========================================
               HEADER SECTION (Matches Image)
               ========================================= */}
-          <div className="p-6 md:p-8 border-b border-slate-100 flex flex-col xl:flex-row justify-between items-start xl:items-center gap-6">
+          <div className="p-6 md:p-8 border-b border-[#e5ddd0] flex flex-col xl:flex-row justify-between items-start xl:items-center gap-6">
 
             {/* Title Area */}
             <div className="flex items-center gap-5">
-              <div className="w-14 h-14 bg-indigo-50 border border-indigo-100/50 text-indigo-600 rounded-2xl flex items-center justify-center shadow-sm">
+              <div className="w-14 h-14 bg-[#f0ece6] border border-[#e5ddd0] text-[#1a1a1a] rounded-2xl flex items-center justify-center shadow-sm">
                 <FolderOpen className="w-7 h-7" />
               </div>
               <div>
-                <h1 className="text-2xl font-extrabold text-slate-900 tracking-tight">Case Directory</h1>
-                <p className="text-sm font-semibold text-slate-400 mt-0.5">Root</p>
+                <h1 className="text-2xl font-extrabold text-[#1a1a1a] tracking-tight">Case Directory</h1>
+                <p className="text-sm font-semibold text-[#8a7f72] mt-0.5">Root</p>
               </div>
             </div>
 
             {/* Action Cluster */}
             <div className="flex items-center gap-3 w-full xl:w-auto overflow-x-auto pb-2 xl:pb-0">
               {/* View Toggles */}
-              <div className="hidden md:flex items-center gap-1 border border-slate-200 rounded-lg p-1 bg-slate-50 shrink-0">
+              <div className="hidden md:flex items-center gap-1 border border-[#e5ddd0] rounded-lg p-1 bg-[#faf8f4] shrink-0">
                 <button
                   type="button"
                   onClick={() => setViewMode("grid")}
-                  className={`p-1.5 rounded-md transition-colors ${
-                    viewMode === "grid"
-                      ? "bg-white shadow-sm border border-slate-200 text-slate-800"
-                      : "text-slate-400 hover:text-slate-800"
-                  }`}
+                  className={`p-1.5 rounded-md transition-colors ${viewMode === "grid"
+                      ? "bg-white shadow-sm border border-[#e5ddd0] text-[#1a1a1a]"
+                      : "text-[#8a7f72] hover:text-[#1a1a1a]"
+                    }`}
                   aria-label="Card view"
                 >
                   <LayoutGrid className="w-4 h-4" />
@@ -193,11 +192,10 @@ export function CasesPage() {
                 <button
                   type="button"
                   onClick={() => setViewMode("table")}
-                  className={`p-1.5 rounded-md transition-colors ${
-                    viewMode === "table"
-                      ? "bg-white shadow-sm border border-slate-200 text-slate-800"
-                      : "text-slate-400 hover:text-slate-800"
-                  }`}
+                  className={`p-1.5 rounded-md transition-colors ${viewMode === "table"
+                      ? "bg-white shadow-sm border border-[#e5ddd0] text-[#1a1a1a]"
+                      : "text-[#8a7f72] hover:text-[#1a1a1a]"
+                    }`}
                   aria-label="Table view"
                 >
                   <List className="w-4 h-4" />
@@ -205,11 +203,11 @@ export function CasesPage() {
               </div>
 
               {/* Status Summary */}
-              <div className="hidden md:flex items-center text-xs font-semibold text-slate-500 px-4 border-x border-slate-200 shrink-0">
+              <div className="hidden md:flex items-center text-xs font-semibold text-[#8a7f72] px-4 border-x border-[#e5ddd0] shrink-0">
                 {cases.length} folders • {totalDocs} documents
               </div>
 
-              <Button asChild className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold shadow-md shadow-indigo-600/20 shrink-0 transition-transform hover:scale-[1.02]">
+              <Button asChild className="bg-[#1a1a1a] hover:bg-[#2d2d2d] text-white font-bold shadow-md shadow-[#1a1a1a]/15 shrink-0 transition-transform hover:scale-[1.02]">
                 <Link href="/workspace">
                   <Upload className="w-4 h-4 mr-2" /> Upload
                 </Link>
@@ -246,7 +244,7 @@ export function CasesPage() {
 
             {status === "loading" && (
               <div className="flex flex-col items-center justify-center py-20 text-slate-500">
-                <Loader2 className="mb-4 h-8 w-8 animate-spin text-indigo-500" />
+                <Loader2 className="mb-4 h-8 w-8 animate-spin text-[#8a7f72]" />
                 <p className="text-sm font-semibold">Loading directory...</p>
               </div>
             )}
@@ -270,7 +268,7 @@ export function CasesPage() {
                 <p className="mt-2 text-sm font-medium text-slate-500 max-w-sm">
                   No cases have been processed yet. Upload your first packet to see it here.
                 </p>
-                <Button asChild className="mt-6 rounded-lg font-bold bg-indigo-600 hover:bg-indigo-700">
+                <Button asChild className="mt-6 rounded-lg font-bold bg-[#1a1a1a] hover:bg-[#2d2d2d] text-white">
                   <Link href="/workspace">Start Upload</Link>
                 </Button>
               </div>
@@ -278,159 +276,125 @@ export function CasesPage() {
 
             {status === "ready" && filteredCases.length > 0 && (
               effectiveViewMode === "grid" ? (
-                <div className="grid grid-cols-1 gap-4 px-6 md:grid-cols-2 md:px-8 xl:grid-cols-3">
+                <div className="grid grid-cols-1 gap-3 px-4 sm:grid-cols-2 md:px-6 lg:grid-cols-3 xl:grid-cols-4">
                   {filteredCases.map((item) => (
-                    <div
+                    <Link
                       key={item.id}
-                      className="group rounded-2xl border border-slate-200 bg-white p-5 shadow-sm transition-all hover:-translate-y-0.5 hover:border-indigo-200 hover:shadow-md"
+                      href={`/cases/${item.id}`}
+                      className="group flex flex-col rounded-xl border border-[#e5ddd0] bg-white p-3.5 shadow-sm transition-all hover:-translate-y-px hover:border-[#d4c9b8] hover:shadow-md"
                     >
-                      <div className="flex items-start justify-between gap-4">
-                        <div className="flex min-w-0 items-start gap-3">
-                          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-indigo-100 bg-indigo-50 text-indigo-600">
-                            <Folder className="h-5 w-5 fill-indigo-100" />
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex min-w-0 items-start gap-2.5">
+                          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#e5ddd0] bg-[#f0ece6] text-[#5a5046]">
+                            <Folder className="h-4 w-4 fill-[#e5ddd0]" />
                           </div>
                           <div className="min-w-0">
-                            <Link
-                              href={`/cases/${item.id}`}
-                              className="block truncate text-base font-bold text-slate-900 transition-colors hover:text-indigo-600"
-                            >
+                            <div className="truncate text-sm font-bold text-[#1a1a1a] group-hover:text-[#5a5046] transition-colors" title={item.displayName}>
                               {item.displayName}
-                            </Link>
-                            <div className="mt-1 text-xs font-medium text-slate-500">
+                            </div>
+                            <div className="mt-0.5 truncate text-[11px] font-medium text-slate-400">
                               {item.receiverName || "Receiver pending"}
                             </div>
                           </div>
                         </div>
                         <button
                           type="button"
-                          className="shrink-0 text-slate-400 transition-colors hover:text-rose-600"
+                          className="shrink-0 rounded-md p-1 text-slate-300 transition-colors hover:bg-rose-50 hover:text-rose-500"
                           aria-label="Delete"
-                          onClick={() => setPendingCase(item)}
+                          onClick={(e) => { e.preventDefault(); e.stopPropagation(); setPendingCase(item); }}
                         >
-                          <Trash2 className="h-4 w-4" />
+                          <Trash2 className="h-3.5 w-3.5" />
                         </button>
                       </div>
 
-                      <div className="mt-4 flex flex-wrap items-center gap-2">
-                        <span className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                          {item.category}
-                        </span>
+                      <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
                         <span
-                          className={`rounded-md border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${getCaseStatusColor(item.status)}`}
+                          className={`rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider ${getCaseStatusColor(item.status)}`}
                         >
                           {getCaseStatusLabel(item.status)}
                         </span>
                         <span
-                          className={`rounded-md border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${getRiskColor(item.riskScore)}`}
+                          className={`rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider ${getRiskColor(item.riskScore)}`}
                         >
-                          Risk: {item.riskScore}
+                          R:{item.riskScore}
                         </span>
                       </div>
 
-                      <div className="mt-5 grid grid-cols-2 gap-3">
-                        <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                          <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
-                            Documents
-                          </div>
-                          <div className="mt-1 text-lg font-bold text-slate-900">
-                            {item.documentCount}
-                          </div>
-                        </div>
-                        <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                          <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
-                            Created
-                          </div>
-                          <div className="mt-1 text-sm font-semibold text-slate-900">
-                            {formatDateTime(item.createdAt)}
-                          </div>
-                        </div>
+                      <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5 text-[11px] font-semibold text-slate-400">
+                        <span>{item.documentCount} docs · {item.mismatchCount} issues</span>
+                        <span>{formatDateTime(item.createdAt)}</span>
                       </div>
-
-                      <div className="mt-5 flex items-center justify-between">
-                        <div className="text-xs font-semibold text-slate-500">
-                          {item.mismatchCount} mismatches
-                        </div>
-                        <Link
-                          href={`/cases/${item.id}`}
-                          className="text-sm font-bold text-indigo-600 transition-colors hover:text-indigo-700"
-                        >
-                          Open
-                        </Link>
-                      </div>
-                    </div>
+                    </Link>
                   ))}
                 </div>
               ) : (
                 <Table className="w-full text-sm">
                   <TableHeader>
                     <TableRow className="border-b border-slate-100 hover:bg-transparent">
-                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Name</TableHead>
-                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Status</TableHead>
-                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Category</TableHead>
-                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Risk</TableHead>
-                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider">Date</TableHead>
-                      <TableHead className="h-12 font-bold text-slate-400 text-xs uppercase tracking-wider text-right pr-6 md:pr-8">Actions</TableHead>
+                      <TableHead className="h-10 pl-4 md:pl-6 font-bold text-slate-400 text-[11px] uppercase tracking-wider">Name</TableHead>
+                      <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider">Status</TableHead>
+                      <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider hidden lg:table-cell">Category</TableHead>
+                      <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider">Risk</TableHead>
+                      <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider hidden md:table-cell">Date</TableHead>
+                      <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider text-right pr-4 md:pr-6">Actions</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {filteredCases.map((item) => (
                       <TableRow
                         key={item.id}
-                        className="group cursor-pointer border-slate-100/60 transition-colors hover:bg-slate-50/80 h-16"
+                        className="group cursor-pointer border-slate-100/60 transition-colors hover:bg-slate-50/80 h-11"
                       >
-                        <TableCell className="py-3 pl-6 md:pl-8">
-                          <Link href={`/cases/${item.id}`} className="flex items-center gap-3 outline-none">
-                            <div className="w-9 h-9 rounded-lg bg-indigo-50/80 border border-indigo-100 text-indigo-600 flex items-center justify-center shrink-0">
-                              <Folder className="w-4 h-4 fill-indigo-100" />
+                        <TableCell className="py-2 pl-4 md:pl-6">
+                          <Link href={`/cases/${item.id}`} className="flex items-center gap-2.5 outline-none">
+                            <div className="w-7 h-7 rounded-md bg-[#f0ece6] border border-[#e5ddd0] text-[#5a5046] flex items-center justify-center shrink-0">
+                              <Folder className="w-3.5 h-3.5 fill-[#e5ddd0]" />
                             </div>
-                            <span className="font-bold text-slate-800 text-sm group-hover:text-indigo-600 transition-colors truncate max-w-[200px] xl:max-w-[300px]">
-                              {item.displayName}
-                            </span>
-                            <div className="hidden min-w-0 flex-col sm:flex">
-                              <span
-                                className="truncate text-[11px] font-semibold text-slate-500"
-                                title={item.receiverName || "Receiver pending"}
-                              >
-                                {item.receiverName || "Receiver pending"}
+                            <div className="min-w-0">
+                              <span className="font-semibold text-[#1a1a1a] text-[13px] group-hover:text-[#5a5046] transition-colors truncate block max-w-[180px] xl:max-w-[280px]" title={item.displayName}>
+                                {item.displayName}
+                              </span>
+                              <span className="hidden sm:block truncate text-[11px] text-slate-400 mt-px" title={item.receiverName || ""}>
+                                {item.receiverName || ""}
                               </span>
                             </div>
                           </Link>
                         </TableCell>
 
-                        <TableCell className="py-3">
-                          <span className={`font-bold text-[10px] uppercase tracking-wider px-2.5 py-1 rounded-md border ${getCaseStatusColor(item.status)}`}>
+                        <TableCell className="py-2">
+                          <span className={`font-bold text-[9px] uppercase tracking-wider px-2 py-0.5 rounded border ${getCaseStatusColor(item.status)}`}>
                             {getCaseStatusLabel(item.status)}
                           </span>
                         </TableCell>
 
-                        <TableCell className="py-3">
-                          <span className="font-semibold text-slate-600 truncate block max-w-[180px]" title={item.category}>
+                        <TableCell className="py-2 hidden lg:table-cell">
+                          <span className="text-[13px] font-medium text-slate-500 truncate block max-w-[160px]" title={item.category}>
                             {item.category}
                           </span>
                         </TableCell>
 
-                        <TableCell className="py-3">
-                          <span className={`font-bold text-[10px] uppercase tracking-wider px-2.5 py-1 rounded-md border ${getRiskColor(item.riskScore)}`}>
-                            Risk: {item.riskScore}
+                        <TableCell className="py-2">
+                          <span className={`font-bold text-[9px] uppercase tracking-wider px-2 py-0.5 rounded border ${getRiskColor(item.riskScore)}`}>
+                            {item.riskScore}
                           </span>
                         </TableCell>
 
-                        <TableCell className="py-3 whitespace-nowrap text-sm font-semibold text-slate-500">
+                        <TableCell className="py-2 whitespace-nowrap text-[13px] font-medium text-slate-400 hidden md:table-cell">
                           {formatDateTime(item.createdAt)}
                         </TableCell>
 
-                        <TableCell className="pr-6 md:pr-8 py-3 text-right">
-                          <div className="flex items-center justify-end gap-4 opacity-0 group-hover:opacity-100 transition-opacity">
-                            <Link href={`/cases/${item.id}`} className="text-sm font-bold text-indigo-600 hover:text-indigo-700 transition-colors">
+                        <TableCell className="pr-4 md:pr-6 py-2 text-right">
+                          <div className="flex items-center justify-end gap-3 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <Link href={`/cases/${item.id}`} className="text-[13px] font-bold text-[#1a1a1a] hover:text-[#5a5046] transition-colors">
                               Open
                             </Link>
                             <button
                               type="button"
-                              className="text-slate-400 hover:text-rose-600 transition-colors"
+                              className="text-slate-300 hover:text-rose-500 transition-colors"
                               aria-label="Delete"
                               onClick={() => setPendingCase(item)}
                             >
-                              <Trash2 className="w-4 h-4" />
+                              <Trash2 className="w-3.5 h-3.5" />
                             </button>
                           </div>
                         </TableCell>

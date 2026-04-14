@@ -11,6 +11,7 @@ import type {
 } from "@/types/pipeline";
 import { orchestrateUploads, StagePayload } from "@/services/orchestration";
 import { DEFAULT_COMPARISON_OPTIONS } from "@/lib/comparison";
+import { getQueuedUploadFiles } from "@/lib/upload-groups";
 
 type PipelineStatus = "idle" | "processing" | "ready" | "error";
 type PersistenceStatus = "idle" | "saving" | "saved" | "error";
@@ -53,6 +54,21 @@ function buildQueuedUpload(file: File): QueuedUpload {
     id: `${file.name}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     name: file.name,
     file,
+    files: [file],
+    source: "file",
+    stages: buildInitialStages(),
+  };
+}
+
+function buildQueuedUploadGroup(files: File[], name: string, source: QueuedUpload["source"] = "file"): QueuedUpload {
+  const primaryFile = files[0];
+
+  return {
+    id: `${name}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    name,
+    file: primaryFile,
+    files,
+    source,
     stages: buildInitialStages(),
   };
 }
@@ -160,6 +176,22 @@ export function useDocumentPipeline() {
     return { conflicts, acceptedUploads };
   }, [queuedUploads]);
 
+  const queueUploadGroup = useCallback(
+    (files?: File[] | null, options?: { name?: string; source?: QueuedUpload["source"] }): QueueFilesResult | undefined => {
+      if (!files || files.length === 0) return;
+      const name = options?.name?.trim() || files[0]?.name || "Camera document";
+      const nextUpload = buildQueuedUploadGroup(files, name, options?.source ?? "file");
+
+      setQueuedUploads((prev) => [...prev, nextUpload]);
+
+      return {
+        conflicts: [],
+        acceptedUploads: [nextUpload],
+      };
+    },
+    []
+  );
+
   const removeUpload = useCallback((id: string) => {
     setQueuedUploads((prev) => prev.filter((item) => item.id !== id));
   }, []);
@@ -189,7 +221,10 @@ export function useDocumentPipeline() {
     setPersistenceStatus("idle");
     setPersistenceError(null);
 
-    const uploadsSnapshot = queuedUploads.map((upload) => ({ ...upload }));
+    const uploadsSnapshot = queuedUploads.map((upload) => ({
+      ...upload,
+      files: getQueuedUploadFiles(upload),
+    }));
 
     try {
       const result = await orchestrateUploads(
@@ -270,6 +305,7 @@ export function useDocumentPipeline() {
     },
     progress: overallProgress,
     queueFiles,
+    queueUploadGroup,
     removeUpload,
     startProcessing,
     updateSavedCase,

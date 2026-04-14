@@ -15,6 +15,7 @@ import { omitIgnoredFields, shouldConsiderFieldKey } from "@/lib/document-schema
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { readUploadGroupMeta } from "@/lib/upload-groups";
 import type { CaseDoc, Mismatch } from "@/types/pipeline";
 
 const STORAGE_BUCKET = "packet-files";
@@ -102,6 +103,18 @@ function parseComparisonOptions(value: FormDataEntryValue | null) {
   }
 
   return readComparisonOptions(JSON.parse(value));
+}
+
+function parseUploadGroups(value: FormDataEntryValue | null) {
+  if (typeof value !== "string") {
+    return [];
+  }
+
+  try {
+    return readUploadGroupMeta(JSON.parse(value));
+  } catch {
+    return [];
+  }
 }
 
 function sanitizeFileName(fileName: string) {
@@ -195,6 +208,7 @@ function mapDocumentRowForCaseSummary(row: {
     fields: extractedFields as CaseDoc["fields"],
     md: "",
     sourceHint: row.source_hint || row.source_file_name || undefined,
+    sourceFileName: row.source_file_name || undefined,
   };
 }
 
@@ -414,6 +428,7 @@ export async function POST(request: Request) {
     const formData = await request.formData();
     const mode = typeof formData.get("mode") === "string" ? formData.get("mode") : null;
     const files = formData.getAll("files").filter(isFileEntry);
+    const uploadGroups = parseUploadGroups(formData.get("uploadGroups"));
 
     if (mode === "draft") {
       if (!files.length) {
@@ -424,7 +439,7 @@ export async function POST(request: Request) {
       }
 
       caseId = crypto.randomUUID();
-      const firstFileName = files[0]?.name ?? "New packet case";
+      const firstFileName = uploadGroups[0]?.name ?? files[0]?.name ?? "New packet case";
       const displayName = formatDraftName(firstFileName);
       const slug = `${slugifyDraftName(displayName, "draft-case")}-${caseId.slice(0, 8)}`;
 
@@ -474,6 +489,7 @@ export async function POST(request: Request) {
           documentTypes: [],
           missingDocumentGroups: [],
           paymentGap: 0,
+          uploadGroups,
         },
       };
 
@@ -564,6 +580,7 @@ export async function POST(request: Request) {
         missingDocumentGroups: summary.missingDocTypes,
         paymentGap: summary.paymentGap,
         comparisonOptions,
+        uploadGroups,
       },
     };
 
@@ -589,7 +606,7 @@ export async function POST(request: Request) {
     const documentRows = documents.map((document) => ({
       case_id: caseId,
       client_document_id: document.id,
-      source_file_name: document.sourceHint ?? null,
+      source_file_name: document.sourceFileName ?? document.sourceHint ?? null,
       source_hint: document.sourceHint ?? null,
       document_type: document.type,
       title: document.title,

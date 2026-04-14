@@ -5,16 +5,17 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
   CheckCircle2,
+  ChevronRight,
   FileText,
+  Info,
+  Lightbulb,
   Loader2,
   ShieldAlert,
   Sparkles,
-  TriangleAlert,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
 import { Badge } from "@/components/ui/badge";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   getComparableFieldValue,
   getComparisonDisplayLabel,
@@ -44,61 +45,61 @@ const FIELD_GUIDANCE: Array<{
   why: string;
   steps: string[];
 }> = [
-  {
-    fields: ["poNumber", "referencePoNumber"],
-    why: "These documents may be linked to different purchase orders.",
-    steps: [
-      "Confirm the approved PO number.",
-      "Correct the document that has the wrong PO reference.",
-      "Run analysis again after updating the file.",
-    ],
-  },
-  {
-    fields: ["invoiceNumber", "referenceInvoiceNumber", "receiptNumber"],
-    why: "The invoice or receipt reference may point to the wrong bill.",
-    steps: [
-      "Confirm the correct invoice number from the supplier invoice.",
-      "Correct the receipt or support document using the wrong invoice reference.",
-      "Run analysis again before accepting the case.",
-    ],
-  },
-  {
-    fields: ["totalAmount", "subtotal", "taxAmount", "paidAmount", "statementAmount", "currency"],
-    why: "The amount, tax, payment, or currency does not match across documents.",
-    steps: [
-      "Confirm the final bill amount and currency.",
-      "Check whether tax or payment proof is using a different value.",
-      "Correct the wrong document before approval.",
-    ],
-  },
-  {
-    fields: ["vehicleNumber", "registrationNumber", "lorryReceiptNumber", "fastagReference"],
-    why: "The vehicle or transport proof may not belong to the same shipment.",
-    steps: [
-      "Confirm the vehicle actually used for this delivery.",
-      "Check the invoice, e-way bill, LR, FASTag, and RC records.",
-      "Replace or correct the document with the wrong transport detail.",
-    ],
-  },
-  {
-    fields: ["grossWeight", "tareWeight", "netWeight", "itemQuantity", "unit"],
-    why: "The quantity or weighment proof does not match the billing document.",
-    steps: [
-      "Compare the invoice quantity with the delivery and weighment documents.",
-      "Confirm which value should be used for billing.",
-      "Correct the wrong file and re-run analysis.",
-    ],
-  },
-  {
-    fields: ["vendorName", "supplierGstin", "buyerName", "buyerGstin", "ownerName", "driverName", "panNumber"],
-    why: "One document may have the wrong party, GSTIN, or identity detail.",
-    steps: [
-      "Confirm the correct sender, receiver, GSTIN, or identity detail.",
-      "Check the source document where the value came from.",
-      "Correct the document that has the wrong party information.",
-    ],
-  },
-];
+    {
+      fields: ["poNumber", "referencePoNumber"],
+      why: "These documents may be linked to different purchase orders.",
+      steps: [
+        "Confirm the approved PO number.",
+        "Correct the document that has the wrong PO reference.",
+        "Run analysis again after updating the file.",
+      ],
+    },
+    {
+      fields: ["invoiceNumber", "referenceInvoiceNumber", "receiptNumber"],
+      why: "The invoice or receipt reference may point to the wrong bill.",
+      steps: [
+        "Confirm the correct invoice number from the supplier invoice.",
+        "Correct the receipt or support document using the wrong invoice reference.",
+        "Run analysis again before accepting the case.",
+      ],
+    },
+    {
+      fields: ["totalAmount", "subtotal", "taxAmount", "paidAmount", "statementAmount", "currency"],
+      why: "The amount, tax, payment, or currency does not match across documents.",
+      steps: [
+        "Confirm the final bill amount and currency.",
+        "Check whether tax or payment proof is using a different value.",
+        "Correct the wrong document before approval.",
+      ],
+    },
+    {
+      fields: ["vehicleNumber", "registrationNumber", "lorryReceiptNumber", "fastagReference"],
+      why: "The vehicle or transport proof may not belong to the same shipment.",
+      steps: [
+        "Confirm the vehicle actually used for this delivery.",
+        "Check the invoice, e-way bill, LR, FASTag, and RC records.",
+        "Replace or correct the document with the wrong transport detail.",
+      ],
+    },
+    {
+      fields: ["grossWeight", "tareWeight", "netWeight", "itemQuantity", "unit"],
+      why: "The quantity or weighment proof does not match the billing document.",
+      steps: [
+        "Compare the invoice quantity with the delivery and weighment documents.",
+        "Confirm which value should be used for billing.",
+        "Correct the wrong file and re-run analysis.",
+      ],
+    },
+    {
+      fields: ["vendorName", "supplierGstin", "buyerName", "buyerGstin", "ownerName", "driverName", "panNumber"],
+      why: "One document may have the wrong party, GSTIN, or identity detail.",
+      steps: [
+        "Confirm the correct sender, receiver, GSTIN, or identity detail.",
+        "Check the source document where the value came from.",
+        "Correct the document that has the wrong party information.",
+      ],
+    },
+  ];
 
 function getFieldLabel(fieldName: string) {
   return getComparisonDisplayLabel(fieldName, FIELD_LABEL_LOOKUP[fieldName]);
@@ -124,7 +125,9 @@ function getValueCount(mismatch: MismatchRecord) {
 }
 
 function displayValue(value: unknown) {
-  if (value === null || value === undefined || value === "") return "Missing";
+  if (value === null || value === undefined || value === "") {
+    return <span className="text-slate-400 italic font-normal">Missing</span>;
+  }
   if (Array.isArray(value)) return value.join(", ");
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
@@ -176,7 +179,6 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
       if (current && visibleMismatches.some((mismatch) => mismatch.id === current)) {
         return current;
       }
-
       return visibleMismatches[0]?.id ?? null;
     });
   }, [visibleMismatches]);
@@ -232,258 +234,233 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
 
   return (
     <AppShell>
-      <div className="flex h-full flex-col bg-[#f7f7f5] animate-in fade-in duration-500">
-        <header className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b border-[#e5ddd0] bg-white px-4 py-3 sm:px-6 gap-4 sm:gap-6 shrink-0">
-          <div className="flex min-w-0 items-start gap-3 sm:items-center sm:gap-4 w-full sm:w-auto">
+      <div className="flex h-full flex-col bg-slate-50 animate-in fade-in duration-500">
+
+        {/* Header */}
+        <header className="sticky top-0 z-10 flex h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 sm:px-6 shadow-sm">
+          <div className="flex min-w-0 items-center gap-3 w-full">
             <Link
               href={`/cases/${caseId}`}
-              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900"
             >
               <ArrowLeft className="h-5 w-5" />
             </Link>
 
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-amber-200 bg-amber-50 text-amber-600">
-              <TriangleAlert className="h-4 w-4" />
-            </div>
-
-            <div className="min-w-0 flex-1">
-              <h1 className="truncate text-base font-bold tracking-tight text-slate-900 sm:text-lg">
+            <div className="flex min-w-0 flex-1 items-center gap-3">
+              <h1 className="truncate text-lg font-semibold tracking-tight text-slate-900">
                 {detail?.case.displayName || "Loading review..."}
               </h1>
-              <div className="mt-1.5 flex flex-wrap items-center gap-2 sm:mt-0.5">
+              {detail && (
                 <Badge
-                  variant="outline"
-                  className="rounded-full border-amber-200 bg-amber-50 px-2.5 font-medium text-amber-700 shadow-sm shrink-0"
+                  variant="secondary"
+                  className="hidden sm:inline-flex bg-amber-100 text-amber-800 hover:bg-amber-100 border-transparent rounded-md px-2 py-0.5 shrink-0"
                 >
-                  Needs review
+                  {visibleMismatches.length} Issue{visibleMismatches.length === 1 ? "" : "s"}
                 </Badge>
-                {detail && (
-                  <Badge
-                    variant="outline"
-                    className="rounded-full border-rose-200 bg-rose-50 px-2.5 font-medium text-rose-700 shadow-sm shrink-0"
-                  >
-                    {visibleMismatches.length} issue{visibleMismatches.length === 1 ? "" : "s"}
-                  </Badge>
-                )}
-              </div>
+              )}
             </div>
           </div>
         </header>
 
+        {/* Loading State */}
         {status === "loading" && (
-          <div className="flex flex-1 flex-col items-center justify-center py-24 text-slate-500">
+          <div className="flex flex-1 flex-col items-center justify-center text-slate-500">
             <Loader2 className="mb-4 h-8 w-8 animate-spin text-amber-500" />
             <p className="text-sm font-medium">Loading review...</p>
           </div>
         )}
 
+        {/* Error State */}
         {status === "error" && (
-          <div className="p-4 sm:p-8">
-            <div className="mx-auto flex max-w-2xl items-start gap-4 rounded-2xl border border-red-200 bg-red-50 p-6 text-red-700 shadow-sm">
-              <ShieldAlert className="mt-0.5 h-6 w-6 shrink-0 text-red-500" />
+          <div className="p-4 sm:p-8 flex-1">
+            <div className="mx-auto flex max-w-2xl items-start gap-4 rounded-xl border border-red-200 bg-white p-6 shadow-sm">
+              <ShieldAlert className="h-6 w-6 shrink-0 text-red-500" />
               <div>
-                <h3 className="text-lg font-bold">Unable to load review</h3>
-                <p className="mt-1 text-sm font-medium opacity-90">{error}</p>
+                <h3 className="text-lg font-semibold text-slate-900">Unable to load review</h3>
+                <p className="mt-1 text-sm text-slate-500">{error}</p>
               </div>
             </div>
           </div>
         )}
 
+        {/* Main Content Layout */}
         {status === "ready" && detail && (
-          <div className="flex flex-1 flex-col overflow-visible xl:flex-row xl:overflow-hidden">
-            <div className="w-full shrink-0 border-b border-slate-200 bg-white xl:max-w-[340px] xl:border-b-0 xl:border-r">
-              <ScrollArea className="h-auto xl:h-full">
-                <div className="p-4 sm:p-6 xl:space-y-6">
-                  <div className="hidden xl:block rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-                    <div className="mb-4 flex items-center gap-2">
-                      <Sparkles className="h-4 w-4 text-amber-600" />
-                      <h2 className="text-sm font-bold text-slate-800">Case</h2>
-                    </div>
-                    <div className="grid gap-3">
-                      <div className="rounded-xl bg-slate-50 p-3">
-                        <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
-                          Receiver
-                        </div>
-                        <div className="mt-1 text-sm font-semibold text-slate-900 truncate" title={detail.case.receiverName || "—"}>
-                          {detail.case.receiverName || "—"}
-                        </div>
-                      </div>
-                      <div className="grid grid-cols-2 gap-3">
-                        <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                          <div className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
-                            Docs
-                          </div>
-                          <div className="mt-1 text-lg font-bold text-slate-900">
-                            {detail.documents.length}
-                          </div>
-                        </div>
-                        <div className="rounded-xl border border-rose-200 bg-rose-50 p-3">
-                          <div className="text-[10px] font-bold uppercase tracking-widest text-rose-500">
-                            Issues
-                          </div>
-                          <div className="mt-1 text-lg font-bold text-rose-700">
-                            {visibleMismatches.length}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
+          <div className="flex flex-1 flex-col lg:flex-row min-h-0 overflow-hidden">
 
-                  <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm xl:mb-0">
-                    <div className="flex items-center justify-between gap-3 border-b border-slate-100 px-5 py-4">
-                      <h3 className="text-base font-bold text-slate-900">Issues to check</h3>
-                      {visibleMismatches.length > 0 && (
-                        <span className="hidden xl:inline-block rounded-full bg-rose-50 px-2 py-1 text-[10px] font-bold uppercase tracking-widest text-rose-600">
-                          Pick one
-                        </span>
-                      )}
-                    </div>
+            {/* Sidebar / Mobile Tabs */}
+            <aside className="flex flex-col shrink-0 border-b border-slate-200 bg-white lg:w-80 lg:border-b-0 lg:border-r z-0">
 
-                    {visibleMismatches.length === 0 ? (
-                      <div className="p-6 text-sm font-medium text-slate-500">
-                        No issues found. Values match across this case.
-                      </div>
-                    ) : (
-                      <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1 pt-1 sm:p-3 xl:block xl:h-[calc(100vh-24rem)] xl:overflow-y-auto xl:divide-y xl:divide-slate-100 xl:p-0 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none][scrollbar-width:none]">
-                        {visibleMismatches.map((mismatch) => {
-                          const isActive = activeMismatchId === mismatch.id;
-                          const fieldLabel = getFieldLabel(mismatch.fieldName);
-                          return (
-                            <button
-                              key={mismatch.id}
-                              onClick={() => setActiveMismatchId(mismatch.id)}
-                              className={`min-w-[240px] max-w-[280px] shrink-0 rounded-xl border px-4 py-3 text-left transition-all xl:min-w-0 xl:w-full xl:rounded-none xl:border-0 xl:px-5 xl:py-4 ${isActive
-                                ? "border-amber-200 bg-amber-50 xl:bg-slate-100 xl:border-transparent"
-                                : "border-slate-200 bg-white hover:bg-slate-50 xl:border-transparent"
-                                }`}
-                            >
-                              <div className="flex items-start justify-between gap-3">
-                                <div className="min-w-0 flex-1">
-                                  <div className="text-sm font-bold text-slate-900 truncate" title={fieldLabel}>
-                                    {fieldLabel}
-                                  </div>
-                                  <div className="mt-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-                                    {getValueCount(mismatch)} value{getValueCount(mismatch) === 1 ? "" : "s"} found
-                                  </div>
-                                </div>
-                                <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
-                              </div>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
+              {/* Desktop Only: Case Meta Summary */}
+              <div className="hidden lg:block p-5 border-b border-slate-100">
+                <div className="flex items-center gap-2 mb-4">
+                  <Sparkles className="h-4 w-4 text-slate-400" />
+                  <h2 className="text-sm font-semibold text-slate-800">Case Summary</h2>
                 </div>
-              </ScrollArea>
-            </div>
-
-            <div className="flex flex-1 flex-col overflow-visible bg-[#f7f7f5] p-3 sm:p-6 lg:p-8 xl:overflow-hidden">
-              <div className="flex min-h-[520px] flex-col overflow-hidden rounded-[1.5rem] border border-slate-200 bg-white shadow-sm xl:h-full xl:min-h-0">
-                {visibleMismatches.length === 0 ? (
-                  <div className="flex min-h-[520px] flex-col items-center justify-center px-6 py-20 text-center xl:h-full xl:min-h-0">
-                    <CheckCircle2 className="mb-4 h-14 w-14 text-emerald-400 sm:h-16 sm:w-16" />
-                    <h2 className="text-2xl font-bold text-slate-900">All clear</h2>
-                    <p className="mt-2 max-w-md text-sm font-medium text-slate-500">
-                      No value conflicts were found in this case.
+                <div className="space-y-3">
+                  <div>
+                    <p className="text-xs font-medium text-slate-500">Receiver</p>
+                    <p className="text-sm font-medium text-slate-900 truncate" title={detail.case.receiverName || "—"}>
+                      {detail.case.receiverName || "—"}
                     </p>
                   </div>
-                ) : activeMismatch && activeGuidance ? (
-                  <ScrollArea className="h-full flex-1">
-                    <div className="space-y-6 p-5 sm:space-y-8 sm:p-8">
-                      <div className="flex flex-col gap-4 border-b border-slate-100 pb-6 sm:flex-row sm:items-start sm:justify-between">
-                        <div className="min-w-0">
-                          <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-400 mb-1">
-                            Issue
-                          </div>
-                          <h2 className="text-2xl font-extrabold text-slate-900 sm:text-3xl tracking-tight break-words">
-                            {activeFieldLabel}
-                          </h2>
-                          <p className="mt-2 max-w-2xl text-sm font-medium leading-6 text-slate-500">
-                            The documents show different values here. Confirm the correct value before accepting the case.
-                          </p>
-                        </div>
-                        <Badge
-                          variant="outline"
-                          className="w-fit shrink-0 border-rose-200 bg-rose-50 text-rose-700 font-bold px-3 py-1 shadow-sm"
-                        >
-                          Check this
-                        </Badge>
-                      </div>
-
-                      <div>
-                        <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-400 mb-3">
-                          Different values found
-                        </div>
-                        <div className="grid gap-4 sm:grid-cols-2">
-                          {(activeMismatch.values ?? []).map((value, index) => {
-                            const title = getDocumentName(documentLookup, value.docId, `Document ${index + 1}`);
-
-                            return (
-                              <div
-                                key={`${activeMismatch.id}-${value.docId ?? index}`}
-                                className="rounded-2xl border border-slate-200 bg-slate-50 p-5 shadow-sm"
-                              >
-                                <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-2">
-                                  <FileText className="h-3.5 w-3.5 shrink-0" />
-                                  <span className="truncate" title={title}>{title}</span>
-                                </div>
-                                <div className="text-base font-bold text-slate-900 break-words">
-                                  {displayValue(value.value)}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-
-                      {fieldCanonicalValues[activeMismatch.fieldName] && (
-                        <div className="rounded-2xl border border-indigo-200 bg-indigo-50 p-6 shadow-sm">
-                          <div className="text-[10px] font-bold uppercase tracking-widest text-indigo-500 mb-2">
-                            Most common value
-                          </div>
-                          <p className="mb-3 text-sm font-medium leading-6 text-indigo-900">
-                            Use this only as a starting point. Still check the source document before approving.
-                          </p>
-                          <div className="text-base font-bold text-indigo-950 break-words font-mono bg-white inline-block px-3 py-1 rounded-md border border-indigo-100">
-                            {fieldCanonicalValues[activeMismatch.fieldName]}
-                          </div>
-                        </div>
-                      )}
-
-                      <div className="rounded-2xl border border-slate-200 bg-[#f8fafc] p-6 shadow-sm">
-                        <div className="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-3">
-                          Why this matters
-                        </div>
-                        <p className="text-sm font-medium leading-7 text-slate-600">
-                          {activeGuidance.why}
-                        </p>
-                      </div>
-
-                      <div className="rounded-2xl border border-[#a7f3d0] bg-[#ecfdf5] p-6 shadow-sm">
-                        <div className="text-[10px] font-bold uppercase tracking-widest text-[#059669] mb-3 flex items-center gap-2">
-                          <CheckCircle2 className="h-3.5 w-3.5" /> What to do next
-                        </div>
-                        <ol className="space-y-3">
-                          {activeGuidance.steps.map((step, index) => (
-                            <li key={step} className="flex gap-3 text-sm font-medium leading-6 text-[#065f46]">
-                              <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-[#059669] text-xs font-bold text-white">
-                                {index + 1}
-                              </span>
-                              <span>{step}</span>
-                            </li>
-                          ))}
-                        </ol>
-                      </div>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-xs font-medium text-slate-500">Documents</p>
+                      <p className="text-sm font-medium text-slate-900">{detail.documents.length}</p>
                     </div>
-                  </ScrollArea>
+                    <div>
+                      <p className="text-xs font-medium text-amber-600">Conflicts</p>
+                      <p className="text-sm font-medium text-amber-700">{visibleMismatches.length}</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Mismatches List / Tabs */}
+              <div className="flex-1 overflow-hidden flex flex-col bg-slate-50/50 lg:bg-white">
+                <div className="px-4 py-3 lg:px-5 lg:py-4 border-b border-slate-100 flex items-center justify-between bg-white">
+                  <h3 className="text-sm font-semibold text-slate-900">Issues to resolve</h3>
+                </div>
+
+                {visibleMismatches.length === 0 ? (
+                  <div className="p-5 text-sm text-slate-500">
+                    No conflicting values found.
+                  </div>
                 ) : (
-                  <div className="flex h-full min-h-[520px] items-center justify-center px-6 py-20 text-center text-sm font-medium text-slate-500 lg:min-h-0">
-                    Select an issue from the list to see the values.
+                  <div className="flex gap-2 p-3 overflow-x-auto lg:p-0 lg:flex-col lg:overflow-y-auto lg:block hide-scrollbar [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none][scrollbar-width:none]">
+                    {visibleMismatches.map((mismatch) => {
+                      const isActive = activeMismatchId === mismatch.id;
+                      const fieldLabel = getFieldLabel(mismatch.fieldName);
+
+                      return (
+                        <button
+                          key={mismatch.id}
+                          onClick={() => setActiveMismatchId(mismatch.id)}
+                          className={`group relative flex items-center shrink-0 lg:w-full text-left transition-all ${isActive
+                              ? "bg-amber-100 text-amber-900 lg:bg-amber-50/50 lg:text-slate-900 lg:border-l-[3px] lg:border-amber-500"
+                              : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 lg:bg-transparent lg:border-0 lg:border-l-[3px] lg:border-transparent lg:hover:bg-slate-50"
+                            } rounded-full lg:rounded-none px-4 py-2 lg:px-5 lg:py-3`}
+                        >
+                          <div className="flex-1 min-w-0">
+                            <p className={`text-sm truncate ${isActive ? 'font-semibold' : 'font-medium'}`}>
+                              {fieldLabel}
+                            </p>
+                            <p className="hidden lg:block mt-0.5 text-xs text-slate-500 group-hover:text-slate-600">
+                              {getValueCount(mismatch)} value{getValueCount(mismatch) === 1 ? "" : "s"} found
+                            </p>
+                          </div>
+                          {isActive && (
+                            <ChevronRight className="hidden lg:block h-4 w-4 text-amber-500 shrink-0 ml-3" />
+                          )}
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </div>
-            </div>
+            </aside>
+
+            {/* Main Detail Content */}
+            <main className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
+              <div className="mx-auto max-w-3xl">
+                {visibleMismatches.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center rounded-2xl bg-white border border-slate-200 p-12 text-center shadow-sm mt-8">
+                    <div className="h-16 w-16 rounded-full bg-emerald-100 flex items-center justify-center mb-4">
+                      <CheckCircle2 className="h-8 w-8 text-emerald-600" />
+                    </div>
+                    <h2 className="text-2xl font-bold text-slate-900">All clear</h2>
+                    <p className="mt-2 text-slate-500">
+                      No value conflicts were found across the documents in this case.
+                    </p>
+                  </div>
+                ) : activeMismatch && activeGuidance ? (
+                  <div className="space-y-6">
+
+                    {/* Header for Active Issue */}
+                    <div>
+                      <h2 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
+                        {activeFieldLabel}
+                      </h2>
+                      <p className="mt-1 text-sm text-slate-500">
+                        Review the conflicting information across documents below.
+                      </p>
+                    </div>
+
+                    {/* Conflicting Values Grid */}
+                    <div>
+                      <h3 className="mb-3 text-sm font-semibold text-slate-900 flex items-center gap-2">
+                        <FileText className="h-4 w-4 text-slate-400" />
+                        Extracted Values
+                      </h3>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        {(activeMismatch.values ?? []).map((value, index) => {
+                          const title = getDocumentName(documentLookup, value.docId, `Document ${index + 1}`);
+
+                          return (
+                            <div
+                              key={`${activeMismatch.id}-${value.docId ?? index}`}
+                              className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm transition-all hover:shadow-md"
+                            >
+                              <div className="text-xs font-medium text-slate-500 mb-2 truncate" title={title}>
+                                {title}
+                              </div>
+                              <div className="text-sm font-semibold text-slate-900 break-words">
+                                {displayValue(value.value)}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Canonical Value Suggestion (Compact) */}
+                    {fieldCanonicalValues[activeMismatch.fieldName] && (
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-3 rounded-lg border border-indigo-100 bg-indigo-50/50 p-4">
+                        <div className="flex flex-1 items-start gap-2.5">
+                          <Info className="mt-0.5 h-4 w-4 shrink-0 text-indigo-500" />
+                          <div>
+                            <h4 className="text-sm font-semibold text-indigo-900">Suggested Value</h4>
+                            <p className="text-xs text-indigo-700/80 mt-0.5">
+                              Computed from standard comparison rules. Verify before approval.
+                            </p>
+                          </div>
+                        </div>
+                        <div className="inline-flex items-center self-start sm:self-auto rounded-md border border-indigo-200 bg-white px-3 py-1.5 text-sm font-mono font-medium text-indigo-950 shadow-sm">
+                          {fieldCanonicalValues[activeMismatch.fieldName]}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Bottom Compact Resolution Guide */}
+                    <div className="rounded-lg border border-slate-200 bg-slate-50/80 p-4 sm:p-5">
+                      <div className="flex items-center gap-2 mb-2.5">
+                        <Lightbulb className="h-4 w-4 text-amber-500" />
+                        <h3 className="text-sm font-semibold text-slate-900">Resolution Guide</h3>
+                      </div>
+                      <p className="text-sm text-slate-600 mb-4">
+                        <strong className="font-medium text-slate-800">Context:</strong> {activeGuidance.why}
+                      </p>
+
+                      <div className="space-y-2.5">
+                        {activeGuidance.steps.map((step, index) => (
+                          <div key={step} className="flex items-start gap-2.5 text-sm text-slate-700">
+                            <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full bg-white border border-slate-300 text-[10px] font-bold text-slate-500 shadow-sm mt-0.5">
+                              {index + 1}
+                            </span>
+                            <span className="leading-snug">{step}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                  </div>
+                ) : (
+                  <div className="flex h-[400px] items-center justify-center text-center text-sm text-slate-500">
+                    Select an issue from the list to review conflicting values.
+                  </div>
+                )}
+              </div>
+            </main>
           </div>
         )}
       </div>

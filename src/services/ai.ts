@@ -192,15 +192,15 @@ const FIELD_MAPPINGS: Record<FieldKey, string[]> = {
   vehicleClass: ["vehicleClass", "vehicleType"],
   documentDate: ["documentDate", "invoiceDate", "poDate", "receiptDate", "deliveryDate"],
   ackDate: ["ackDate", "acknowledgementDate", "acknowledgmentDate"],
-  transactionDate: ["transactionDate", "paymentDate", "statementDate"],
+  transactionDate: ["transactionDate", "transactionTime", "transactionDateTime", "paymentDate", "statementDate"],
   validityDate: ["validityDate", "permitValidityDate", "licenseValidityDate", "licenceValidityDate", "registrationValidityDate"],
   dateOfBirth: ["dateOfBirth", "dob", "birthDate"],
   currency: ["currency"],
   subtotal: ["subtotal", "subTotal", "taxableAmount"],
   taxAmount: ["taxAmount", "tax", "gstAmount"],
   totalAmount: ["totalAmount", "grandTotal", "documentTotal"],
-  paidAmount: ["paidAmount", "amountReceived", "receivedAmount"],
-  statementAmount: ["statementAmount", "debitAmount", "creditAmount", "transactionAmount"],
+  paidAmount: ["paidAmount", "amountPaid", "paidTollAmount", "tollAmount", "amountReceived", "receivedAmount"],
+  statementAmount: ["statementAmount", "availableBalance", "availableBal", "avblBal", "balance", "debitAmount", "creditAmount", "transactionAmount"],
   freightAmount: ["freightAmount", "freight", "transportCharge"],
   advanceAmount: ["advanceAmount", "advancePaid"],
   toPayAmount: ["toPayAmount", "toPay", "ttbAmount"],
@@ -229,7 +229,7 @@ const FIELD_MAPPINGS: Record<FieldKey, string[]> = {
   irnNumber: ["irnNumber", "irn"],
   ackNumber: ["ackNumber", "acknowledgementNumber", "acknowledgmentNumber"],
   transactionReference: ["transactionReference", "utrNumber", "referenceNumber", "paymentReference"],
-  fastagReference: ["fastagReference", "fastagId", "tagId", "transactionId"],
+  fastagReference: ["fastagReference", "fastagId", "tagId", "tagNumber", "tag", "transactionId"],
   tollPlaza: ["tollPlaza", "plazaName", "tollLocation"],
   dispatchFrom: ["dispatchFrom", "originAddress", "dispatchAddress"],
   shipTo: ["shipTo", "deliveryAddress", "consigneeAddress"],
@@ -367,14 +367,54 @@ function mapFields(
   return result;
 }
 
-function buildMarkdown(doc: CaseDoc): string {
+function toText(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => toText(entry))
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (value && typeof value === "object") {
+    return Object.values(value)
+      .map((entry) => toText(entry))
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (value === null || value === undefined) return "";
+  return String(value).trim();
+}
+
+function buildMarkdown(doc: CaseDoc, visibleTextPages: string[] = []): string {
   const lines = [`# ${doc.title}`, "", `Source: **${doc.sourceHint ?? "uploaded"}**`, ""];
+  let hasFields = false;
+
   for (const key of getOrderedFieldKeysForDocument(doc)) {
     const value = doc.fields[key];
     if (value) {
+      if (!hasFields) {
+        lines.push("## Extracted Fields", "");
+        hasFields = true;
+      }
       lines.push(`- **${FIELD_LABELS[key]}**: ${value}`);
     }
   }
+
+  const visibleText = visibleTextPages.map((text) => text.trim()).filter(Boolean);
+  if (visibleText.length) {
+    if (hasFields) lines.push("");
+    lines.push("## Visible Text", "");
+    visibleText.forEach((text, index) => {
+      if (visibleText.length > 1) {
+        lines.push(`### Page ${index + 1}`, "");
+      }
+      lines.push(text);
+      if (index < visibleText.length - 1) {
+        lines.push("");
+      }
+    });
+  }
+
   return lines.join("\n");
 }
 
@@ -468,7 +508,7 @@ export async function extractDataFromImages(params: {
   }
 
   try {
-    const extracted: Array<{ fields: Record<string, unknown> }> = [];
+    const extracted: Array<{ fields: Record<string, unknown>; visibleText: string }> = [];
 
     for (const image of pageImages) {
       const raw = await callOpenRouter(
@@ -476,11 +516,13 @@ export async function extractDataFromImages(params: {
             {
               role: "system",
               content:
-              `Extract structured fields from procurement, logistics, transport, vehicle KYC, FASTag, quality certificate, and photo-evidence documents and return only JSON with key "fields". ` +
+              `Extract structured fields and visible text from procurement, logistics, transport, vehicle KYC, FASTag, quality certificate, and photo-evidence documents and return only JSON with keys "fields" and "visibleText". ` +
               `This document is a ${documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
+              "visibleText must be a raw OCR-style transcription of the important visible text on the page, preserving line breaks where useful. " +
+              "For FASTag Toll Proof documents, map the toll paid amount to paidAmount, available balance to statementAmount, transaction date/time to transactionDate, vehicle number to vehicleNumber, tag id to fastagReference, and toll location/plaza to tollPlaza. " +
               "For party roles on seller-issued documents, vendorName is the issuing supplier/seller/consignor and buyerName is the receiving buyer, bill-to party, ship-to party, consignee, customer, or purchaser. " +
               "For Purchase Order or Amended Purchase Order documents, vendorName is the supplier/vendor receiving the order and buyerName is the purchaser issuing the order. Never swap these roles. " +
-              "Omit any field that is not visible or not applicable to this document type. Do not hallucinate.",
+              "Omit any field that is not visible or not applicable to this document type. If structured fields are hard to identify, still return visibleText. Do not hallucinate.",
             },
           {
             role: "user",
@@ -491,6 +533,7 @@ export async function extractDataFromImages(params: {
                   `This upload is likely a ${documentType}. ` +
                   "Pages may include invoices, purchase orders, e-way bills, weighment slips, lorry receipts, RC/DL/PAN cards, FASTag toll proofs, test certificates, permits, or photo evidence. " +
                   `Extract only clearly visible ${documentType}-specific fields from this allowed schema: ${allowedFieldKeysText}. ` +
+                  "Also transcribe the visible text into visibleText even if the structured fields object is empty. " +
                   "If both supplier and receiver are visible, map seller-issued documents as seller/consignor to vendorName and receiving buyer/bill-to/ship-to/consignee to buyerName. For purchase orders, map the supplier/vendor receiving the order to vendorName. " +
                   "Preserve exact document numbers, vehicle ids, GSTINs, weights, dates, and financial totals.",
               },
@@ -502,9 +545,20 @@ export async function extractDataFromImages(params: {
         true
       );
 
-      const parsed = safeJsonParse<{ fields?: Record<string, unknown> }>(raw, {});
+      const parsed = safeJsonParse<{
+        fields?: Record<string, unknown>;
+        visibleText?: unknown;
+        text?: unknown;
+        ocrText?: unknown;
+        markdown?: unknown;
+      }>(raw, {});
       extracted.push({
         fields: parsed.fields ?? {},
+        visibleText:
+          toText(parsed.visibleText) ||
+          toText(parsed.ocrText) ||
+          toText(parsed.text) ||
+          toText(parsed.markdown),
       });
     }
 
@@ -513,6 +567,7 @@ export async function extractDataFromImages(params: {
       {}
     );
     const fields = mapFields(combinedFields, documentType);
+    const visibleTextPages = extracted.map((page) => page.visibleText).filter(Boolean);
 
     const caseDoc: CaseDoc = {
       id: `${fileName}-${Date.now()}`,
@@ -523,7 +578,7 @@ export async function extractDataFromImages(params: {
       md: "",
       sourceHint: fileName,
     };
-    caseDoc.md = buildMarkdown(caseDoc);
+    caseDoc.md = buildMarkdown(caseDoc, visibleTextPages);
 
     return { doc: caseDoc, extractedDocuments: [] };
   } catch (error) {
