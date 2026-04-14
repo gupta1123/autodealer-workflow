@@ -9,29 +9,20 @@ import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
-  Clock,
   Eye,
   FileText,
-  Folder,
-  Info,
   Loader2,
-  MapPin,
   ShieldAlert,
   Sparkles,
   TriangleAlert,
   Database,
-  Play,
   Check,
   X,
   FileDigit,
   FileSearch,
-  LayoutDashboard,
   ZoomIn,
   ZoomOut,
   RotateCw,
-  Maximize,
-  Undo2,
-  Redo2,
   type LucideIcon,
 } from "lucide-react";
 
@@ -44,7 +35,6 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   areComparableValuesEqual,
   getComparableFieldValue,
-  getComparisonDisplayLabel,
   isPrimaryComparisonField,
   pickCanonicalComparableValue,
   readComparisonOptions,
@@ -839,13 +829,13 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
         <div className="flex flex-1 min-h-0 relative">
 
           {/* Left Sidebar (Desktop only) */}
-          <aside className="w-80 lg:w-[24rem] shrink-0 border-r border-slate-200 bg-[#fafafa] hidden md:flex flex-col">
-            <ScrollArea className="flex-1">
-              <div className="p-6 space-y-6">
+          <aside className="hidden w-[20rem] shrink-0 overflow-hidden border-r border-slate-200 bg-[#fafafa] md:flex md:flex-col xl:w-[22rem]">
+            <ScrollArea className="min-w-0 flex-1">
+              <div className="min-w-0 space-y-5 p-5">
 
                 {/* Unified AI Summary & Metadata Card */}
                 {detail && (
-                  <div className={`rounded-2xl border shadow-sm overflow-hidden flex flex-col ${visibleMismatches.length === 0 ? 'border-emerald-200' : 'border-rose-200'}`}>
+                  <div className={`flex w-full max-w-full flex-col overflow-hidden rounded-2xl border shadow-sm ${visibleMismatches.length === 0 ? 'border-emerald-200' : 'border-rose-200'}`}>
 
                     {/* Status Header Area */}
                     <div className={`p-5 ${visibleMismatches.length === 0 ? 'bg-emerald-50/50' : 'bg-rose-50/50'}`}>
@@ -858,10 +848,10 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                         </h3>
                       </div>
 
-                      <p className={`text-sm leading-relaxed ${visibleMismatches.length === 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                      <p className={`text-sm leading-relaxed break-words ${visibleMismatches.length === 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
                         {visibleMismatches.length === 0
-                          ? `The packet contains ${detail.documents.length} document${detail.documents.length === 1 ? "" : "s"}. All extracted key data points match perfectly across the set.`
-                          : `The AI found ${visibleMismatches.length} conflicting data points across the ${detail.documents.length} documents provided. Review is highly recommended.`}
+                          ? `${detail.documents.length} document${detail.documents.length === 1 ? "" : "s"} checked. Key extracted values match across this case.`
+                          : `${visibleMismatches.length} issue${visibleMismatches.length === 1 ? "" : "s"} found across ${detail.documents.length} document${detail.documents.length === 1 ? "" : "s"}. Review is recommended.`}
                       </p>
 
                       {/* Mismatches Action Button */}
@@ -882,20 +872,20 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                     </div>
 
                     {/* Metadata Grid */}
-                    <div className="bg-white p-5 border-t border-slate-100">
-                      <div className="grid grid-cols-2 gap-y-4 gap-x-2 text-sm">
+                    <div className="border-t border-slate-100 bg-white p-5">
+                      <div className="grid grid-cols-1 gap-4 text-sm">
                         <div>
                           <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Subject</span>
-                          <span className="text-slate-900 font-medium line-clamp-2">{formatCaseSubject(detail.case.category)}</span>
+                          <span className="text-slate-900 font-medium leading-snug break-words">{formatCaseSubject(detail.case.category)}</span>
                         </div>
                         <div>
                           <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Uploaded</span>
-                          <span className="text-slate-900 font-medium line-clamp-2">{formatDateTime(detail.case.createdAt)}</span>
+                          <span className="text-slate-900 font-medium leading-snug break-words">{formatDateTime(detail.case.createdAt)}</span>
                         </div>
 
-                        <div className="col-span-2">
+                        <div>
                           <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Receiver</span>
-                          <span className="text-slate-900 font-medium line-clamp-2">{detail.case.receiverName || "—"}</span>
+                          <span className="text-slate-900 font-medium leading-snug break-words">{detail.case.receiverName || "—"}</span>
                         </div>
                       </div>
                     </div>
@@ -906,7 +896,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 <div>
                   <div className="flex items-center justify-between mb-3 px-1">
                     <h3 className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">Documents in Packet</h3>
-                    <span className="text-[10px] font-bold text-slate-500 bg-slate-200/50 px-2 py-0.5 rounded-full">{detail?.documents.length}</span>
+                    <span className="rounded-full bg-slate-200/50 px-2 py-0.5 text-[10px] font-bold text-slate-500">{detail?.documents.length}</span>
                   </div>
                   <div className="space-y-1.5">
                     {detail?.documents.map((doc) => {
@@ -915,17 +905,17 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                         <button
                           key={doc.id}
                           onClick={() => setActiveDocumentId(doc.id)}
-                          className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl text-left transition-all ${isActive ? 'bg-white shadow-sm border border-slate-200 ring-1 ring-slate-200' : 'hover:bg-slate-200/50 border border-transparent'
+                          className={`flex w-full min-w-0 items-center gap-3 overflow-hidden rounded-xl px-3 py-3 text-left transition-all ${isActive ? 'bg-white shadow-sm border border-slate-200 ring-1 ring-slate-200' : 'hover:bg-slate-200/50 border border-transparent'
                             }`}
                         >
                           <div className={`shrink-0 h-8 w-8 rounded-lg flex items-center justify-center ${isActive ? 'bg-indigo-50 text-indigo-600' : 'bg-white text-slate-400 border border-slate-200'}`}>
                             <FileText className="h-4 w-4" />
                           </div>
-                          <div className="min-w-0 flex-1">
-                            <p className={`truncate text-sm font-bold ${isActive ? 'text-slate-900' : 'text-slate-600'}`}>
+                          <div className="min-w-0 flex-1 overflow-hidden">
+                            <p className={`line-clamp-2 break-words text-sm font-bold leading-snug ${isActive ? 'text-slate-900' : 'text-slate-600'}`}>
                               {doc.title}
                             </p>
-                            <p className="truncate text-[10px] font-medium text-slate-400 mt-0.5 uppercase tracking-wider">
+                            <p className="mt-1 truncate text-[10px] font-medium uppercase tracking-wider text-slate-400">
                               {doc.documentType}{doc.pageCount && doc.pageCount > 1 ? ` · ${doc.pageCount} pages` : ""}
                             </p>
                           </div>
@@ -1018,22 +1008,23 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                   <div className="absolute inset-0 flex flex-col bg-[#525659]">
 
                     {/* PDF/Image Canvas */}
-                    <div className="flex-1 relative overflow-auto">
+                    <div className="flex-1 relative overflow-hidden">
                       {activeFileUrl ? (
                         activeSourceIsImage ? (
                           <div className="absolute inset-0 overflow-auto">
-                            <div className="flex min-h-full min-w-full items-center justify-center p-4">
+                            <div className="flex min-h-full min-w-full items-start justify-center px-3 py-5 sm:px-6 sm:py-8">
                               <div
-                                className="relative h-[min(78vh,920px)] w-[min(88vw,1200px)] max-h-full max-w-full transition-transform duration-150 ease-out"
-                                style={{ transform: `scale(${previewZoom})`, transformOrigin: "center center" }}
+                                className="relative flex w-full max-w-[min(100%,880px)] justify-center transition-transform duration-150 ease-out"
+                                style={{ transform: `scale(${previewZoom})`, transformOrigin: "top center" }}
                               >
                                 <Image
                                   src={activeFileUrl}
                                   alt={`Document preview page ${previewPageIndex + 1}`}
-                                  fill
+                                  width={1200}
+                                  height={1600}
                                   unoptimized
                                   sizes="(min-width: 1024px) 70vw, 92vw"
-                                  className="object-contain drop-shadow-2xl"
+                                  className="h-auto max-h-[calc(100vh-13rem)] w-auto max-w-full rounded-sm bg-white object-contain shadow-2xl"
                                   draggable={false}
                                 />
                               </div>
