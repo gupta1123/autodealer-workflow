@@ -45,6 +45,10 @@ import { AnalysisOptionsDialog } from "@/components/workspace/AnalysisOptionsDia
 import { DuplicateUploadDialog } from "@/components/workspace/DuplicateUploadDialog";
 import { summarizeCase } from "@/lib/case-summary";
 import {
+  constrainImageDimensions,
+  normalizeUploadFiles,
+} from "@/lib/client-image-upload";
+import {
   areComparableValuesEqual,
   DEFAULT_COMPARISON_OPTIONS,
   getCommercialAmountValue,
@@ -597,8 +601,9 @@ export function WorkspacePage() {
     }
   };
 
-  const handleQueueFiles = (files?: FileList | File[] | null) => {
-    const result = queueFiles(files);
+  const handleQueueFiles = async (files?: FileList | File[] | null) => {
+    const preparedFiles = await normalizeUploadFiles(files);
+    const result = queueFiles(preparedFiles);
     if (result?.conflicts.length) {
       setDuplicateUploadConflicts(result.conflicts);
     }
@@ -633,13 +638,14 @@ export function WorkspacePage() {
     setCameraPageFiles([]);
   };
 
-  const handleUploadInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    handleQueueFiles(event.currentTarget.files);
+  const handleUploadInputChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files ?? []);
     if (event.currentTarget.value) event.currentTarget.value = "";
+    await handleQueueFiles(files);
   };
 
-  const handleCameraFallbackInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.currentTarget.files ?? []);
+  const handleCameraFallbackInputChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = await normalizeUploadFiles(event.currentTarget.files);
     if (event.currentTarget.value) event.currentTarget.value = "";
     if (!files.length) return;
 
@@ -693,8 +699,9 @@ export function WorkspacePage() {
       return;
     }
 
-    const width = video.videoWidth || 1280;
-    const height = video.videoHeight || 720;
+    const sourceWidth = video.videoWidth || 1280;
+    const sourceHeight = video.videoHeight || 720;
+    const { width, height } = constrainImageDimensions(sourceWidth, sourceHeight);
     const canvas = document.createElement("canvas");
     const context = canvas.getContext("2d");
 

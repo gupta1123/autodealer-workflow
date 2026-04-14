@@ -88,8 +88,41 @@ function appendUploadsToFormData(formData: FormData, uploads: QueuedUpload[]) {
   }
 }
 
-function extractApiError(payload: unknown, fallback: string) {
+async function readApiResponse<T>(response: Response) {
+  const contentType = response.headers.get("content-type") || "";
+
+  if (contentType.includes("application/json")) {
+    const payload = (await response.json().catch(() => ({}))) as Partial<T> & {
+      error?: unknown;
+    };
+
+    return {
+      payload,
+      rawText: "",
+    };
+  }
+
+  return {
+    payload: {} as Partial<T> & { error?: unknown },
+    rawText: await response.text().catch(() => ""),
+  };
+}
+
+function extractApiError(
+  payload: unknown,
+  fallback: string,
+  options?: { status?: number; rawText?: string }
+) {
   if (!payload || typeof payload !== "object") {
+    const rawText = options?.rawText?.trim() || "";
+
+    if (
+      options?.status === 413 ||
+      /payload|request entity too large|body exceeded|content length/i.test(rawText)
+    ) {
+      return "Selected image is too large to upload. Try again after using a smaller image or fewer pages.";
+    }
+
     return fallback;
   }
 
@@ -106,6 +139,13 @@ function extractApiError(payload: unknown, fallback: string) {
     if (parts.length > 0) {
       return parts.join(" ");
     }
+  }
+
+  if (
+    options?.status === 413 ||
+    /payload|request entity too large|body exceeded|content length/i.test(options?.rawText || "")
+  ) {
+    return "Selected image is too large to upload. Try again after using a smaller image or fewer pages.";
   }
 
   return fallback;
@@ -131,12 +171,15 @@ export async function persistProcessedCase(params: {
     body: formData,
   });
 
-  const payload = (await response.json().catch(() => ({}))) as Partial<CreateCaseResponse> & {
-    error?: string;
-  };
+  const { payload, rawText } = await readApiResponse<CreateCaseResponse>(response);
 
   if (!response.ok || !payload.case) {
-    throw new Error(extractApiError(payload, "Failed to save processed case to Supabase."));
+    throw new Error(
+      extractApiError(payload, "Failed to save processed case to Supabase.", {
+        status: response.status,
+        rawText,
+      })
+    );
   }
 
   return { case: payload.case };
@@ -155,12 +198,15 @@ export async function createDraftCase(params: {
     body: formData,
   });
 
-  const payload = (await response.json().catch(() => ({}))) as Partial<CreateCaseResponse> & {
-    error?: string;
-  };
+  const { payload, rawText } = await readApiResponse<CreateCaseResponse>(response);
 
   if (!response.ok || !payload.case) {
-    throw new Error(extractApiError(payload, "Failed to create draft case."));
+    throw new Error(
+      extractApiError(payload, "Failed to create draft case.", {
+        status: response.status,
+        rawText,
+      })
+    );
   }
 
   return { case: payload.case };
@@ -181,12 +227,15 @@ export async function appendCaseFiles(
     body: formData,
   });
 
-  const payload = (await response.json().catch(() => ({}))) as Partial<CreateCaseResponse> & {
-    error?: string;
-  };
+  const { payload, rawText } = await readApiResponse<CreateCaseResponse>(response);
 
   if (!response.ok || !payload.case) {
-    throw new Error(extractApiError(payload, "Failed to add files to case."));
+    throw new Error(
+      extractApiError(payload, "Failed to add files to case.", {
+        status: response.status,
+        rawText,
+      })
+    );
   }
 
   return { case: payload.case };
@@ -212,12 +261,15 @@ export async function saveCaseAnalysis(
     body: formData,
   });
 
-  const payload = (await response.json().catch(() => ({}))) as Partial<CreateCaseResponse> & {
-    error?: string;
-  };
+  const { payload, rawText } = await readApiResponse<CreateCaseResponse>(response);
 
   if (!response.ok || !payload.case) {
-    throw new Error(extractApiError(payload, "Failed to save case analysis."));
+    throw new Error(
+      extractApiError(payload, "Failed to save case analysis.", {
+        status: response.status,
+        rawText,
+      })
+    );
   }
 
   return { case: payload.case };
@@ -229,12 +281,15 @@ export async function fetchRecentCases(limit = 12): Promise<RecentCasesResponse>
   query.set("scope", "active");
 
   const response = await fetch(`/api/cases?${query.toString()}`, { cache: "no-store" });
-  const payload = (await response.json().catch(() => ({}))) as Partial<RecentCasesResponse> & {
-    error?: string;
-  };
+  const { payload, rawText } = await readApiResponse<RecentCasesResponse>(response);
 
   if (!response.ok || !Array.isArray(payload.cases)) {
-    throw new Error(extractApiError(payload, "Failed to load saved cases."));
+    throw new Error(
+      extractApiError(payload, "Failed to load saved cases.", {
+        status: response.status,
+        rawText,
+      })
+    );
   }
 
   return { cases: payload.cases };
@@ -249,12 +304,15 @@ export async function fetchCasesByScope(
   query.set("scope", scope);
 
   const response = await fetch(`/api/cases?${query.toString()}`, { cache: "no-store" });
-  const payload = (await response.json().catch(() => ({}))) as Partial<RecentCasesResponse> & {
-    error?: string;
-  };
+  const { payload, rawText } = await readApiResponse<RecentCasesResponse>(response);
 
   if (!response.ok || !Array.isArray(payload.cases)) {
-    throw new Error(extractApiError(payload, "Failed to load saved cases."));
+    throw new Error(
+      extractApiError(payload, "Failed to load saved cases.", {
+        status: response.status,
+        rawText,
+      })
+    );
   }
 
   return { cases: payload.cases };
@@ -267,12 +325,15 @@ async function mutateCase(
   path = `/api/cases/${caseId}`
 ): Promise<{ case: SavedCaseRecord }> {
   const response = await fetch(path, init);
-  const payload = (await response.json().catch(() => ({}))) as Partial<CreateCaseResponse> & {
-    error?: unknown;
-  };
+  const { payload, rawText } = await readApiResponse<CreateCaseResponse>(response);
 
   if (!response.ok || !payload.case) {
-    throw new Error(extractApiError(payload, fallback));
+    throw new Error(
+      extractApiError(payload, fallback, {
+        status: response.status,
+        rawText,
+      })
+    );
   }
 
   return { case: payload.case };
@@ -321,9 +382,7 @@ export async function deleteCaseForever(caseId: string) {
 
 export async function fetchCaseDetail(caseId: string): Promise<CaseDetailResponse> {
   const response = await fetch(`/api/cases/${caseId}`, { cache: "no-store" });
-  const payload = (await response.json().catch(() => ({}))) as Partial<CaseDetailResponse> & {
-    error?: string;
-  };
+  const { payload, rawText } = await readApiResponse<CaseDetailResponse>(response);
 
   if (
     !response.ok ||
@@ -332,7 +391,12 @@ export async function fetchCaseDetail(caseId: string): Promise<CaseDetailRespons
     !Array.isArray(payload.documents) ||
     !Array.isArray(payload.mismatches)
   ) {
-    throw new Error(extractApiError(payload, "Failed to load case details."));
+    throw new Error(
+      extractApiError(payload, "Failed to load case details.", {
+        status: response.status,
+        rawText,
+      })
+    );
   }
 
   return {
