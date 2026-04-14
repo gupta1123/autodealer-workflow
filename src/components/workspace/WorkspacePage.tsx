@@ -778,7 +778,7 @@ export function WorkspacePage() {
   );
 
   const cameraCaptureDialog = cameraOpen ? (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4 py-6 backdrop-blur-sm">
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/90 px-4 pb-24 pt-6 sm:py-6 backdrop-blur-md">
       <div className="flex w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-white/10 bg-slate-950 shadow-2xl">
         <div className="flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4 text-white">
           <div>
