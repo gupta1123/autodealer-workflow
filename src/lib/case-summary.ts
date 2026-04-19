@@ -39,6 +39,27 @@ const RECEIVER_DOC_WEIGHTS: Partial<Record<DocType, number>> = {
   "Material Test Certificate": 2,
 };
 
+const BUYER_COUNTERPARTY_DOC_WEIGHTS: Partial<Record<DocType, number>> = {
+  "Tax Invoice": 6,
+  Invoice: 6,
+  "E-Way Bill": 5,
+  "Delivery Note": 5,
+  "Delivery Challan": 5,
+  "Lorry Receipt": 4,
+  Receipt: 3,
+};
+
+const VENDOR_COUNTERPARTY_DOC_WEIGHTS: Partial<Record<DocType, number>> = {
+  "Purchase Order": 7,
+  "Amended Purchase Order": 7,
+  "Tax Invoice": 5,
+  Invoice: 5,
+  "Weighment Slip": 4,
+  "Material Test Certificate": 4,
+  "Lorry Receipt": 2,
+  "Delivery Challan": 2,
+};
+
 const RECEIVER_FIELD_PRIORITY_BY_DOC_TYPE: Record<DocType, FieldKey[]> = {
   "Purchase Order": ["vendorName", "buyerName"],
   "Amended Purchase Order": ["vendorName", "buyerName"],
@@ -141,6 +162,20 @@ function formatSourceDisplayName(value: string) {
     .trim();
 }
 
+export function isGeneratedCaptureDisplayName(value?: string | null) {
+  const normalized = normalizeMatchKey(normalizeValue(value));
+
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    normalized.startsWith("cameradocument") ||
+    normalized.startsWith("camerascan") ||
+    normalized === "newpacketcase"
+  );
+}
+
 function firstFieldValue(documents: CaseDoc[], field: FieldKey) {
   for (const document of documents) {
     const value = normalizeValue(document.fields[field]);
@@ -149,48 +184,57 @@ function firstFieldValue(documents: CaseDoc[], field: FieldKey) {
   return "";
 }
 
-function pickWeightedDocumentValue(
+type RankedDocumentValue = {
+  value: string;
+  score: number;
+  count: number;
+  firstSeenAt: number;
+};
+
+function rankWeightedDocumentValues(
   documents: CaseDoc[],
   getValue: (document: CaseDoc) => string,
   getWeight: (document: CaseDoc) => number
 ) {
   const ranked = new Map<
     string,
-    {
-      value: string;
-      score: number;
-      count: number;
-      firstSeenAt: number;
-    }
+    RankedDocumentValue
   >();
 
   documents.forEach((document, index) => {
     const value = normalizeValue(getValue(document));
-    if (!value) return;
+    const weight = getWeight(document);
+    if (!value || weight <= 0) return;
 
     const key = normalizeMatchKey(value);
     const current = ranked.get(key);
     if (current) {
-      current.score += getWeight(document);
+      current.score += weight;
       current.count += 1;
       return;
     }
 
     ranked.set(key, {
       value,
-      score: getWeight(document),
+      score: weight,
       count: 1,
       firstSeenAt: index,
     });
   });
 
-  const best = Array.from(ranked.values()).sort((left, right) => {
+  return Array.from(ranked.values()).sort((left, right) => {
     if (right.score !== left.score) return right.score - left.score;
     if (right.count !== left.count) return right.count - left.count;
     return left.firstSeenAt - right.firstSeenAt;
-  })[0];
+  });
+}
 
-  return best?.value ?? "";
+function pickWeightedDocumentValue(
+  documents: CaseDoc[],
+  getValue: (document: CaseDoc) => string,
+  getWeight: (document: CaseDoc) => number
+) {
+  return rankWeightedDocumentValues(documents, getValue, getWeight)[0]?.value ?? "";
 }
 
 function getReceiverWeight(document: CaseDoc) {
@@ -219,7 +263,49 @@ function getCaseSubjectCandidate(document: CaseDoc) {
   return firstDocumentPartyValue(document, CASE_SUBJECT_FIELD_PRIORITY_BY_DOC_TYPE[document.type] ?? []);
 }
 
+function getBuyerCounterpartyWeight(document: CaseDoc) {
+  return BUYER_COUNTERPARTY_DOC_WEIGHTS[document.type] ?? 0;
+}
+
+function getVendorCounterpartyWeight(document: CaseDoc) {
+  return VENDOR_COUNTERPARTY_DOC_WEIGHTS[document.type] ?? 0;
+}
+
+function derivePreferredCounterpartyName(documents: CaseDoc[]) {
+  const buyerCandidate = rankWeightedDocumentValues(
+    documents,
+    (document) => firstDocumentPartyValue(document, ["buyerName"]),
+    getBuyerCounterpartyWeight
+  )[0];
+
+  const vendorCandidate = rankWeightedDocumentValues(
+    documents,
+    (document) => firstDocumentPartyValue(document, ["vendorName"]),
+    getVendorCounterpartyWeight
+  )[0];
+
+  if (
+    buyerCandidate &&
+    vendorCandidate &&
+    normalizeMatchKey(buyerCandidate.value) !== normalizeMatchKey(vendorCandidate.value)
+  ) {
+    const buyerStrength = buyerCandidate.score + buyerCandidate.count;
+    const vendorStrength = vendorCandidate.score + vendorCandidate.count;
+
+    if (buyerStrength !== vendorStrength) {
+      return buyerStrength > vendorStrength ? buyerCandidate.value : vendorCandidate.value;
+    }
+  }
+
+  return buyerCandidate?.value || vendorCandidate?.value || "";
+}
+
 export function deriveCaseReceiverName(documents: CaseDoc[]) {
+  const preferredCounterpartyName = derivePreferredCounterpartyName(documents);
+  if (preferredCounterpartyName) {
+    return preferredCounterpartyName;
+  }
+
   const receiverName = pickWeightedDocumentValue(
     documents,
     getReceiverCandidate,
@@ -240,7 +326,7 @@ export function deriveCaseReceiverName(documents: CaseDoc[]) {
 function deriveSourceDisplayName(documents: CaseDoc[]) {
   const sourceName = documents
     .map((document) => normalizeValue(document.sourceHint))
-    .find((value) => value.length > 0);
+    .find((value) => value.length > 0 && !isGeneratedCaptureDisplayName(value));
 
   return sourceName ? formatSourceDisplayName(sourceName) : "";
 }
@@ -405,6 +491,9 @@ export function resolveStoredCaseDisplayName(params: {
   status?: string | null;
 }) {
   const storedDisplayName = normalizeValue(params.storedDisplayName);
+  const usableStoredDisplayName = isGeneratedCaptureDisplayName(storedDisplayName)
+    ? ""
+    : storedDisplayName;
   const receiverName = normalizeValue(params.receiverName);
   const primaryReference =
     normalizeValue(params.invoiceNumber) || normalizeValue(params.poNumber);
@@ -419,11 +508,11 @@ export function resolveStoredCaseDisplayName(params: {
   }
 
   if (params.status === "draft") {
-    return storedDisplayName ? `Receiver pending / ${storedDisplayName}` : "Receiver pending";
+    return usableStoredDisplayName ? `Receiver pending / ${usableStoredDisplayName}` : "Receiver pending";
   }
 
-  if (storedDisplayName) {
-    return storedDisplayName;
+  if (usableStoredDisplayName) {
+    return usableStoredDisplayName;
   }
 
   if (primaryReference) {

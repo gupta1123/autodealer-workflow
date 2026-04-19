@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import {
   getCaseCategoryFromProcessingMeta,
+  isGeneratedCaptureDisplayName,
   resolveCaseCategoryLabel,
   resolveStoredCaseDisplayName,
   summarizeCase,
@@ -155,6 +156,10 @@ function formatDraftName(fileName: string) {
     .replace(/[-_]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+
+  if (isGeneratedCaptureDisplayName(cleaned)) {
+    return "Receiver pending";
+  }
 
   return cleaned || "New packet case";
 }
