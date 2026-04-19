@@ -74,6 +74,21 @@ type CaseDetailResponse = SavedCaseDetail;
 export type CaseListScope = "active" | "deleted";
 export type CaseDecision = "accepted" | "rejected";
 
+const AUTH_SESSION_ERROR =
+  "Your session is not active on this device. Sign in again to continue.";
+
+class ApiRequestError extends Error {
+  status?: number;
+  isAuthError: boolean;
+
+  constructor(message: string, options?: { status?: number; isAuthError?: boolean }) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = options?.status;
+    this.isAuthError = Boolean(options?.isAuthError);
+  }
+}
+
 function appendUploadsToFormData(formData: FormData, uploads: QueuedUpload[]) {
   const uploadGroups = serializeQueuedUploadGroups(uploads);
 
@@ -108,11 +123,68 @@ async function readApiResponse<T>(response: Response) {
   };
 }
 
+async function performApiFetch(input: RequestInfo | URL, init?: RequestInit) {
+  try {
+    return await fetch(input, init);
+  } catch {
+    throw new ApiRequestError(
+      "Unable to reach the server. Check your connection and try again."
+    );
+  }
+}
+
+function isAuthErrorPayload(payload: unknown, status?: number) {
+  if (status === 401 || status === 403) {
+    return true;
+  }
+
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+
+  const errorValue = (payload as { error?: unknown }).error;
+
+  if (typeof errorValue === "string") {
+    return /unauthorized|forbidden|session|auth/i.test(errorValue);
+  }
+
+  if (errorValue && typeof errorValue === "object") {
+    const record = errorValue as Record<string, unknown>;
+    const combined = [record.message, record.details, record.hint]
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .join(" ");
+
+    return /unauthorized|forbidden|session|auth/i.test(combined);
+  }
+
+  return false;
+}
+
+function redirectToLogin(message: string) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  const loginUrl = new URL("/login", window.location.origin);
+  const next = `${window.location.pathname}${window.location.search}`;
+
+  if (next && next !== "/login") {
+    loginUrl.searchParams.set("next", next);
+  }
+
+  loginUrl.searchParams.set("message", message);
+  window.location.assign(loginUrl.toString());
+}
+
 function extractApiError(
   payload: unknown,
   fallback: string,
   options?: { status?: number; rawText?: string }
 ) {
+  if (isAuthErrorPayload(payload, options?.status)) {
+    return AUTH_SESSION_ERROR;
+  }
+
   if (!payload || typeof payload !== "object") {
     const rawText = options?.rawText?.trim() || "";
 
@@ -151,6 +223,24 @@ function extractApiError(
   return fallback;
 }
 
+function toApiRequestError(
+  payload: unknown,
+  fallback: string,
+  options?: { status?: number; rawText?: string }
+) {
+  const isAuthError = isAuthErrorPayload(payload, options?.status);
+  const message = extractApiError(payload, fallback, options);
+
+  if (isAuthError) {
+    redirectToLogin(message);
+  }
+
+  return new ApiRequestError(message, {
+    status: options?.status,
+    isAuthError,
+  });
+}
+
 export async function persistProcessedCase(params: {
   uploads: QueuedUpload[];
   documents: CaseDoc[];
@@ -166,7 +256,7 @@ export async function persistProcessedCase(params: {
 
   appendUploadsToFormData(formData, params.uploads);
 
-  const response = await fetch("/api/cases", {
+  const response = await performApiFetch("/api/cases", {
     method: "POST",
     body: formData,
   });
@@ -174,12 +264,10 @@ export async function persistProcessedCase(params: {
   const { payload, rawText } = await readApiResponse<CreateCaseResponse>(response);
 
   if (!response.ok || !payload.case) {
-    throw new Error(
-      extractApiError(payload, "Failed to save processed case to Supabase.", {
-        status: response.status,
-        rawText,
-      })
-    );
+    throw toApiRequestError(payload, "Failed to save processed case to Supabase.", {
+      status: response.status,
+      rawText,
+    });
   }
 
   return { case: payload.case };
@@ -193,7 +281,7 @@ export async function createDraftCase(params: {
 
   appendUploadsToFormData(formData, params.uploads);
 
-  const response = await fetch("/api/cases", {
+  const response = await performApiFetch("/api/cases", {
     method: "POST",
     body: formData,
   });
@@ -201,12 +289,10 @@ export async function createDraftCase(params: {
   const { payload, rawText } = await readApiResponse<CreateCaseResponse>(response);
 
   if (!response.ok || !payload.case) {
-    throw new Error(
-      extractApiError(payload, "Failed to create draft case.", {
-        status: response.status,
-        rawText,
-      })
-    );
+    throw toApiRequestError(payload, "Failed to create draft case.", {
+      status: response.status,
+      rawText,
+    });
   }
 
   return { case: payload.case };
@@ -222,7 +308,7 @@ export async function appendCaseFiles(
 
   appendUploadsToFormData(formData, uploads);
 
-  const response = await fetch(`/api/cases/${caseId}/files`, {
+  const response = await performApiFetch(`/api/cases/${caseId}/files`, {
     method: "POST",
     body: formData,
   });
@@ -230,12 +316,10 @@ export async function appendCaseFiles(
   const { payload, rawText } = await readApiResponse<CreateCaseResponse>(response);
 
   if (!response.ok || !payload.case) {
-    throw new Error(
-      extractApiError(payload, "Failed to add files to case.", {
-        status: response.status,
-        rawText,
-      })
-    );
+    throw toApiRequestError(payload, "Failed to add files to case.", {
+      status: response.status,
+      rawText,
+    });
   }
 
   return { case: payload.case };
@@ -256,7 +340,7 @@ export async function saveCaseAnalysis(
     formData.set("comparisonOptions", JSON.stringify(params.comparisonOptions));
   }
 
-  const response = await fetch(`/api/cases/${caseId}/analysis`, {
+  const response = await performApiFetch(`/api/cases/${caseId}/analysis`, {
     method: "POST",
     body: formData,
   });
@@ -264,12 +348,10 @@ export async function saveCaseAnalysis(
   const { payload, rawText } = await readApiResponse<CreateCaseResponse>(response);
 
   if (!response.ok || !payload.case) {
-    throw new Error(
-      extractApiError(payload, "Failed to save case analysis.", {
-        status: response.status,
-        rawText,
-      })
-    );
+    throw toApiRequestError(payload, "Failed to save case analysis.", {
+      status: response.status,
+      rawText,
+    });
   }
 
   return { case: payload.case };
@@ -280,16 +362,16 @@ export async function fetchRecentCases(limit = 12): Promise<RecentCasesResponse>
   query.set("limit", String(limit));
   query.set("scope", "active");
 
-  const response = await fetch(`/api/cases?${query.toString()}`, { cache: "no-store" });
+  const response = await performApiFetch(`/api/cases?${query.toString()}`, {
+    cache: "no-store",
+  });
   const { payload, rawText } = await readApiResponse<RecentCasesResponse>(response);
 
   if (!response.ok || !Array.isArray(payload.cases)) {
-    throw new Error(
-      extractApiError(payload, "Failed to load saved cases.", {
-        status: response.status,
-        rawText,
-      })
-    );
+    throw toApiRequestError(payload, "Failed to load saved cases.", {
+      status: response.status,
+      rawText,
+    });
   }
 
   return { cases: payload.cases };
@@ -303,16 +385,16 @@ export async function fetchCasesByScope(
   query.set("limit", String(limit));
   query.set("scope", scope);
 
-  const response = await fetch(`/api/cases?${query.toString()}`, { cache: "no-store" });
+  const response = await performApiFetch(`/api/cases?${query.toString()}`, {
+    cache: "no-store",
+  });
   const { payload, rawText } = await readApiResponse<RecentCasesResponse>(response);
 
   if (!response.ok || !Array.isArray(payload.cases)) {
-    throw new Error(
-      extractApiError(payload, "Failed to load saved cases.", {
-        status: response.status,
-        rawText,
-      })
-    );
+    throw toApiRequestError(payload, "Failed to load saved cases.", {
+      status: response.status,
+      rawText,
+    });
   }
 
   return { cases: payload.cases };
@@ -324,16 +406,14 @@ async function mutateCase(
   fallback: string,
   path = `/api/cases/${caseId}`
 ): Promise<{ case: SavedCaseRecord }> {
-  const response = await fetch(path, init);
+  const response = await performApiFetch(path, init);
   const { payload, rawText } = await readApiResponse<CreateCaseResponse>(response);
 
   if (!response.ok || !payload.case) {
-    throw new Error(
-      extractApiError(payload, fallback, {
-        status: response.status,
-        rawText,
-      })
-    );
+    throw toApiRequestError(payload, fallback, {
+      status: response.status,
+      rawText,
+    });
   }
 
   return { case: payload.case };
@@ -381,7 +461,7 @@ export async function deleteCaseForever(caseId: string) {
 }
 
 export async function fetchCaseDetail(caseId: string): Promise<CaseDetailResponse> {
-  const response = await fetch(`/api/cases/${caseId}`, { cache: "no-store" });
+  const response = await performApiFetch(`/api/cases/${caseId}`, { cache: "no-store" });
   const { payload, rawText } = await readApiResponse<CaseDetailResponse>(response);
 
   if (
@@ -391,12 +471,10 @@ export async function fetchCaseDetail(caseId: string): Promise<CaseDetailRespons
     !Array.isArray(payload.documents) ||
     !Array.isArray(payload.mismatches)
   ) {
-    throw new Error(
-      extractApiError(payload, "Failed to load case details.", {
-        status: response.status,
-        rawText,
-      })
-    );
+    throw toApiRequestError(payload, "Failed to load case details.", {
+      status: response.status,
+      rawText,
+    });
   }
 
   return {

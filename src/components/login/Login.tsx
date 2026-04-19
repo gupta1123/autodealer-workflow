@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import {
   CheckCircle2,
   Loader2,
@@ -19,7 +19,6 @@ function safeNextPath(value: string | null) {
 }
 
 export function Login() {
-  const router = useRouter();
   const searchParams = useSearchParams();
   const supabase = useMemo(() => createSupabaseBrowserClient(), []);
 
@@ -105,7 +104,7 @@ export function Login() {
     setError(null);
     setMessage(null);
 
-    const { error: signInError } = await supabase.auth.signInWithPassword({
+    const { data, error: signInError } = await supabase.auth.signInWithPassword({
       email,
       password,
     });
@@ -116,8 +115,19 @@ export function Login() {
       return;
     }
 
-    router.push(nextPath);
-    router.refresh();
+    if (!data.session) {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+
+      if (!session) {
+        setError("Signed in, but the secure session was not established. Refresh and try again.");
+        setLoadingMode(null);
+        return;
+      }
+    }
+
+    window.location.assign(nextPath);
   }
 
   return (
