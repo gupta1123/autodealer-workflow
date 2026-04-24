@@ -1,16 +1,30 @@
 {
-  "name": "auto-dealer",
-  "version": "0.1.0",
+  "name": "autodealer-workspace",
+  "version": "1.0.0",
   "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "engines": {
     "node": "24.x",
     "npm": "11.x"
   },
   "scripts": {
-    "dev": "next dev --turbopack",
-    "build": "next build --turbopack",
-    "start": "next start",
-    "lint": "eslint"
+    "dev:web": "npm run dev --workspace @autodealer/web",
+    "dev:api": "npm run dev --workspace @autodealer/api",
+    "build:web": "npm run build --workspace @autodealer/web",
+    "build:api": "npm run build --workspace @autodealer/api",
+    "heroku-postbuild": "npm run build:api",
+    "build": "npm run build:web && npm run build:api",
+    "lint:web": "npm run lint --workspace @autodealer/web",
+    "lint:api": "npm run lint --workspace @autodealer/api",
+    "lint": "npm run lint:web && npm run lint:api",
+    "typecheck:web": "npm run typecheck --workspace @autodealer/web",
+    "typecheck:api": "npm run typecheck --workspace @autodealer/api",
+    "typecheck": "npm run typecheck:web && npm run typecheck:api",
+    "worker": "npm run worker --workspace @autodealer/api",
+    "worker:local": "npm run worker:local --workspace @autodealer/api"
   },
   "dependencies": {
     "@google/genai": "^0.5.0",

@@ -1415,14 +1415,6 @@ export function WorkspacePage() {
                 Analyze case
               </Button>
 
-              <Button
-                type="button"
-                variant="ghost"
-                className="rounded-2xl px-6 py-6 text-base font-bold text-[#8a7f72] hover:bg-[#e5ddd0]/30 hover:text-[#1a1a1a]"
-                onClick={resetWorkspace}
-              >
-                Start new case
-              </Button>
             </div>
           </motion.div>
         </section>

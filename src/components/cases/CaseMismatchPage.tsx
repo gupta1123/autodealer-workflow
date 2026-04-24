@@ -657,27 +657,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                       </div>
                     )}
 
-                    {/* Bottom Compact Resolution Guide */}
-                    <div className="rounded-lg border border-slate-200 bg-slate-50/80 p-4 sm:p-5">
-                      <div className="flex items-center gap-2 mb-2.5">
-                        <Lightbulb className="h-4 w-4 text-amber-500" />
-                        <h3 className="text-sm font-semibold text-slate-900">Resolution Guide</h3>
-                      </div>
-                      <p className="text-sm text-slate-600 mb-4">
-                        <strong className="font-medium text-slate-800">Context:</strong> {activeGuidance.why}
-                      </p>
 
-                      <div className="space-y-2.5">
-                        {activeGuidance.steps.map((step, index) => (
-                          <div key={step} className="flex items-start gap-2.5 text-sm text-slate-700">
-                            <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full bg-white border border-slate-300 text-[10px] font-bold text-slate-500 shadow-sm mt-0.5">
-                              {index + 1}
-                            </span>
-                            <span className="leading-snug">{step}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
 
                   </div>
                 ) : (
