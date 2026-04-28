@@ -228,6 +228,17 @@ const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   ackNumber: ["ackNumber", "acknowledgementNumber", "acknowledgmentNumber"],
   transactionReference: ["transactionReference", "utrNumber", "referenceNumber", "paymentReference"],
   fastagReference: ["fastagReference", "fastagId", "tagId", "tagNumber", "tag", "transactionId"],
+  fastagStatementReference: ["fastagStatementReference", "statementReferenceNumber", "statementReference"],
+  fastagCustomerId: ["fastagCustomerId", "customerId", "customerID"],
+  fastagCustomerName: ["fastagCustomerName", "customerName", "tagCustomerName"],
+  statementPeriod: ["statementPeriod", "period"],
+  statementDate: ["statementDate"],
+  openingBalance: ["openingBalance", "openingBal"],
+  creditAmount: ["creditAmount", "credit", "totalCredit"],
+  debitAmount: ["debitAmount", "debit", "totalDebit"],
+  closingBalance: ["closingBalance", "closingBal"],
+  tripCount: ["tripCount", "totalTrips"],
+  tollTransactionSummary: ["tollTransactionSummary", "transactionSummary", "tripSummary"],
   tollPlaza: ["tollPlaza", "plazaName", "tollLocation"],
   dispatchFrom: ["dispatchFrom", "originAddress", "dispatchAddress"],
   shipTo: ["shipTo", "deliveryAddress", "consigneeAddress"],
@@ -358,13 +369,197 @@ function mapFields(
     const aliases = FIELD_MAPPINGS[fieldKey] ?? [];
     for (const alias of aliases) {
       const value = fields[alias];
-      if (value !== undefined && value !== null && value !== "") {
-        result[fieldKey] = String(value);
+      const normalizedValue = normalizeFieldValue(value);
+      if (normalizedValue) {
+        result[fieldKey] = normalizedValue;
         break;
       }
     }
   });
   return result;
+}
+
+function normalizeFieldValue(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    const text = String(value).trim();
+    return text || undefined;
+  }
+  if (Array.isArray(value)) {
+    const text = value
+      .map((entry) => {
+        if (entry && typeof entry === "object") {
+          const record = entry as Record<string, unknown>;
+          const parts = [
+            normalizeFieldValue(record.date ?? record.dateTime ?? record.transactionDate),
+            normalizeFieldValue(record.plaza ?? record.tollPlaza ?? record.location),
+            normalizeFieldValue(record.amount ?? record.debitAmount ?? record.paidAmount),
+          ].filter(Boolean);
+          return parts.length ? parts.join(" - ") : normalizeFieldValue(record.description ?? record.summary);
+        }
+        return normalizeFieldValue(entry);
+      })
+      .filter(Boolean)
+      .join("\n");
+    return text || undefined;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const text = normalizeFieldValue(record.value ?? record.text ?? record.summary ?? record.description);
+    if (text) return text;
+    const fallback = Object.entries(record)
+      .map(([key, entry]) => `${key}: ${normalizeFieldValue(entry) ?? ""}`.trim())
+      .filter((entry) => !entry.endsWith(":"))
+      .join(", ");
+    return fallback || undefined;
+  }
+  const text = String(value).trim();
+  return text || undefined;
+}
+
+function cleanEWayAddress(value?: string) {
+  const cleaned = value
+    ?.replace(/\s+/g, " ")
+    .replace(/\b(Address\s+Details|Dispatch\s+From|Ship\s+To|GSTIN|State|Pin\s*Code)\b\s*:*/gi, " ")
+    .replace(/^[\s:;,\-.]+/, "")
+    .replace(/[\s,.;:-]+$/, "")
+    .trim();
+  return cleaned || undefined;
+}
+
+function extractEWayBillAddresses(visibleText: string): Partial<Record<FieldKey, string>> {
+  const text = visibleText.replace(/\s+/g, " ").trim();
+  const match = text.match(/(?:Address\s+Details\s*)?(?:[:：]\s*)?(?:Dispatch\s+From|Dispatched\s+From)\s*[:：]?\s*(.+?)\s*(?:Ship\s+To|Ship-to)\s*[:：]?\s*(.+?)(?=\s*(?:Vehicle\s+Details|Part\s+B|Item\s+Details|Total|$))/i);
+  if (!match) return {};
+  return {
+    dispatchFrom: cleanEWayAddress(match[1]),
+    shipTo: cleanEWayAddress(match[2]),
+  };
+}
+
+function applyEWayBillAddressFallback(
+  fields: Partial<Record<FieldKey, string>>,
+  docType: DocType,
+  visibleText: string
+) {
+  if (docType !== "E-Way Bill" || !visibleText.trim()) return fields;
+  const addresses = extractEWayBillAddresses(visibleText);
+  return {
+    ...fields,
+    ...(fields.dispatchFrom || !addresses.dispatchFrom ? {} : { dispatchFrom: addresses.dispatchFrom }),
+    ...(fields.shipTo || !addresses.shipTo ? {} : { shipTo: addresses.shipTo }),
+  };
+}
+
+function extractFirstMatch(text: string, pattern: RegExp) {
+  const match = text.match(pattern);
+  return match?.[1]?.replace(/\s+/g, " ").trim();
+}
+
+function extractFastagTransactions(visibleText: string) {
+  const lines = visibleText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const entries: Array<{ dateTime: string; plaza: string; lane?: string; amount: string }> = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const dateTime = lines[index].match(/\d{2}[-/]\d{2}[-/]\d{4}\s+\d{2}:\d{2}:\d{2}/)?.[0];
+    if (!dateTime) continue;
+
+    const block: string[] = [lines[index]];
+    for (let next = index + 1; next < lines.length; next += 1) {
+      if (/\d{2}[-/]\d{2}[-/]\d{4}\s+\d{2}:\d{2}:\d{2}/.test(lines[next])) break;
+      block.push(lines[next]);
+    }
+
+    const blockText = block.join(" ");
+    if (!/Plaza\s+Name/i.test(blockText)) continue;
+
+    const plaza = blockText
+      .match(/Plaza\s+Name\s*:?\s*([A-Za-z][A-Za-z0-9 ()]+?)(?=\s*-\s*Lane|\s+Lane\s+ID|\s+0\.00|\s+\/?\d{8,}|$)/i)?.[1]
+      ?.replace(/\s+/g, " ")
+      .trim();
+    if (!plaza) continue;
+
+    const lane = blockText.match(/Lane\s+ID\s*:?\s*([A-Z0-9 ]+?)(?=\s+0\.00|\s+\d{1,3}(?:,\d{3})*(?:\.\d{2})|$)/i)?.[1]?.replace(/\s+/g, " ").trim();
+    const amounts = [...blockText.matchAll(/\b\d{1,3}(?:,\d{3})*(?:\.\d{2})\b/g)].map((match) => match[0]);
+    const amount = amounts.at(-1);
+    if (!amount) continue;
+
+    entries.push({ dateTime, plaza, lane, amount });
+  }
+
+  return entries;
+}
+
+function extractFastagDetails(visibleText: string): Partial<Record<FieldKey, string>> {
+  const compact = visibleText.replace(/\s+/g, " ").trim();
+  if (!compact) return {};
+
+  const summaryMatch = compact.match(
+    /(\d{6,})\s+([A-Z]{2}\d{2}[A-Z]{1,3}\d{4})\s+\S+\s+(\d+)\s+([\d,.]+)\s+([\d,.]+)\s+-?\s*([\d,.]+)\s+([\d,.]+)/i
+  );
+  const tagVehicleBlock = compact.match(/Tag\s+Account\s+No\.\s+Licence\s+Plate\s+No\..*?(\d{6,})\s+([A-Z]{2}\d{2}[A-Z]{1,3}\d{4})/i);
+  const vehicleTagMatch = compact.match(/\b([A-Z]{2}\d{2}[A-Z0-9]{1,4}\d{3,4})\s*[-–]\s*(\d{6,})\b/i);
+  const paymentMatch = compact.match(/\bPayment\b.*?([\d,]+\.\d{2})\s+0\.00/i);
+  const transactionRows = extractFastagTransactions(visibleText);
+  const transactionSummary = transactionRows
+    .slice(0, 12)
+    .map((entry) => {
+      const lane = entry.lane ? ` Lane ID:${entry.lane}` : "";
+      return `${entry.dateTime} Plaza Name: ${entry.plaza}${lane} Amount (DR) ${entry.amount}`;
+    })
+    .join("\n");
+  const statementDate = extractFirstMatch(compact, /Statement\s+Date\s*:?\s*(\d{2}[-/]\d{2}[-/]\d{4})/i);
+  const statementReference = (
+    extractFirstMatch(compact, /Statement\s+Reference\s+Number\s+([A-Z0-9/.-]+)/i) ??
+    extractFirstMatch(compact, /Statement\s+Reference\s+(?:Number\s+)?([A-Z0-9/.-]+)/i)
+  )?.replace(/t/gi, "/");
+  const customerId = extractFirstMatch(compact, /Customer\s+[Il1]?D\s*:?\s*(?:[A-Z0-9/.-]+\s+)?(\d{7,})/i);
+  const customerName = [...compact.matchAll(/Name\s*:\s*([A-Z][A-Z .'-]+?)(?=\s+(?:Branch|Statement\s+Period|Bill\s+From|GSTIN|Address:|supply:))/gi)]
+    .map((match) => match[1].replace(/\s+/g, " ").trim())
+    .find((name) => !/ICICI|BANK|BRANCH/i.test(name)) ??
+    extractFirstMatch(compact, /Address\s*:\s*([A-Z][A-Z .'-]+?)\s+\d{1,5}[,\s]/i);
+
+  return {
+    fastagStatementReference: statementReference,
+    fastagCustomerId: customerId,
+    fastagCustomerName: customerName,
+    statementPeriod: extractFirstMatch(compact, /Statement\s+Period\s*:?\s*(\d{2}[-/]\d{2}[-/]\d{4}\s+to\s+\d{2}[-/]\d{2}[-/]\d{4})/i),
+    statementDate,
+    transactionDate: statementDate,
+    ...(summaryMatch
+      ? {
+          fastagReference: summaryMatch[1],
+          vehicleNumber: summaryMatch[2],
+          tripCount: summaryMatch[3],
+          openingBalance: summaryMatch[4],
+          creditAmount: summaryMatch[5],
+          debitAmount: summaryMatch[6].replace(/^-/, ""),
+          closingBalance: summaryMatch[7],
+          statementAmount: summaryMatch[7],
+        }
+      : {}),
+    ...(!summaryMatch && tagVehicleBlock ? { fastagReference: tagVehicleBlock[1], vehicleNumber: tagVehicleBlock[2] } : {}),
+    ...(!summaryMatch && !tagVehicleBlock && vehicleTagMatch ? { vehicleNumber: vehicleTagMatch[1], fastagReference: vehicleTagMatch[2] } : {}),
+    ...(paymentMatch?.[1] ? { paidAmount: paymentMatch[1] } : {}),
+    ...(transactionRows[0]?.plaza ? { tollPlaza: transactionRows[0].plaza } : {}),
+    ...(transactionSummary ? { tollTransactionSummary: transactionSummary } : {}),
+  };
+}
+
+function applyFastagDetailsFallback(
+  fields: Partial<Record<FieldKey, string>>,
+  docType: DocType,
+  visibleText: string
+) {
+  if (docType !== "FASTag Toll Proof" || !visibleText.trim()) return fields;
+  const details = extractFastagDetails(visibleText);
+  return Object.entries(details).reduce(
+    (acc, [key, value]) => {
+      if (value) acc[key as FieldKey] = value;
+      return acc;
+    },
+    { ...fields } as Partial<Record<FieldKey, string>>
+  );
 }
 
 function toText(value: unknown): string {
@@ -519,7 +714,7 @@ export async function extractDataFromImages(params: {
               `Extract structured fields and visible text from procurement, logistics, transport, vehicle KYC, FASTag, quality certificate, and photo-evidence documents and return only JSON with keys "fields" and "visibleText". ` +
               `This document is a ${documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
               "visibleText must be a raw OCR-style transcription of the important visible text on the page, preserving line breaks where useful. " +
-              "For FASTag Toll Proof documents, map the toll paid amount to paidAmount, available balance to statementAmount, transaction date/time to transactionDate, vehicle number to vehicleNumber, tag id to fastagReference, and toll location/plaza to tollPlaza. " +
+              "For FASTag Toll Proof documents, extract statement reference, customer ID/name, statement period/date, vehicle number, tag account number, trip count, opening/credit/debit/closing balances, recharge/payment amount, toll plaza, and a compact toll transaction summary using the canonical FASTag keys. " +
               "For party roles on seller-issued documents, vendorName is the issuing supplier/seller/consignor and buyerName is the receiving buyer, bill-to party, ship-to party, consignee, customer, or purchaser. " +
               "For Purchase Order documents, vendorName is the supplier/vendor receiving the order and buyerName is the purchaser issuing the order. Never swap these roles. " +
               "Omit any field that is not visible or not applicable to this document type. If structured fields are hard to identify, still return visibleText. Do not hallucinate.",
@@ -566,8 +761,17 @@ export async function extractDataFromImages(params: {
       (acc, current) => ({ ...acc, ...current.fields }),
       {}
     );
-    const fields = mapFields(combinedFields, documentType);
     const visibleTextPages = extracted.map((page) => page.visibleText).filter(Boolean);
+    const visibleText = visibleTextPages.join("\n");
+    const fields = applyFastagDetailsFallback(
+      applyEWayBillAddressFallback(
+        mapFields(combinedFields, documentType),
+        documentType,
+        visibleText
+      ),
+      documentType,
+      visibleText
+    );
 
     const caseDoc: CaseDoc = {
       id: `${fileName}-${Date.now()}`,

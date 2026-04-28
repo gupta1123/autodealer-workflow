@@ -28,19 +28,19 @@ export function getFieldCategory(fieldKey: FieldKey): string {
   if (["licenseNumber", "registrationNumber", "chassisNumber", "engineNumber", "vehicleClass", "fuelType", "ownerName", "driverName", "holderName", "fatherName", "panNumber"].includes(fieldKey)) {
     return "identity";
   }
-  if (["totalAmount", "subtotal", "taxAmount", "paidAmount", "statementAmount", "freightAmount", "advanceAmount", "toPayAmount", "currency"].includes(fieldKey)) {
+  if (["totalAmount", "subtotal", "taxAmount", "paidAmount", "statementAmount", "freightAmount", "advanceAmount", "toPayAmount", "currency", "openingBalance", "creditAmount", "debitAmount", "closingBalance"].includes(fieldKey)) {
     return "financial";
   }
-  if (["vehicleNumber", "lorryReceiptNumber", "eWayBillNumber", "weighmentNumber", "weighbridgeName", "fastagReference", "tollPlaza", "transporterName"].includes(fieldKey)) {
+  if (["vehicleNumber", "lorryReceiptNumber", "eWayBillNumber", "weighmentNumber", "weighbridgeName", "fastagReference", "tollPlaza", "tollTransactionSummary", "tripCount", "transporterName"].includes(fieldKey)) {
     return "transport";
   }
-  if (["poNumber", "poAmendmentNumber", "invoiceNumber", "receiptNumber", "deliveryNoteNumber", "referencePoNumber", "referenceInvoiceNumber", "irnNumber", "ackNumber", "certificateNumber", "permitNumber"].includes(fieldKey)) {
+  if (["poNumber", "poAmendmentNumber", "invoiceNumber", "receiptNumber", "deliveryNoteNumber", "referencePoNumber", "referenceInvoiceNumber", "irnNumber", "ackNumber", "certificateNumber", "permitNumber", "fastagStatementReference", "fastagCustomerId", "statementPeriod", "statementDate"].includes(fieldKey)) {
     return "reference";
   }
   if (["grossWeight", "tareWeight", "netWeight", "itemQuantity", "unit", "materialGrade", "batchNumber", "heatNumber", "hsnSac"].includes(fieldKey)) {
     return "quantity";
   }
-  if (["vendorName", "supplierGstin", "buyerName", "buyerGstin", "dispatchFrom", "shipTo", "routeFrom", "routeTo", "mapLocation"].includes(fieldKey)) {
+  if (["vendorName", "supplierGstin", "buyerName", "buyerGstin", "fastagCustomerName", "dispatchFrom", "shipTo", "routeFrom", "routeTo", "mapLocation"].includes(fieldKey)) {
     return "party";
   }
   return "reference";
