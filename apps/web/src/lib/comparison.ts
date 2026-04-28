@@ -102,6 +102,14 @@ function normalizeNumericLikeValue(value: string) {
   return Number.isFinite(parsed) ? parsed.toString() : null;
 }
 
+function normalizeCurrencyLikeValue(value: string) {
+  const compact = value.replace(/[^a-z]/g, "");
+  if (["inr", "rs", "rupee", "rupees", "indianrupee", "indianrupees"].includes(compact)) {
+    return "inr";
+  }
+  return null;
+}
+
 export function normalizeComparableValue(
   value: string | number | null | undefined,
   options: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS
@@ -116,6 +124,11 @@ export function normalizeComparableValue(
 
   if (numericNormalized !== null) {
     return numericNormalized;
+  }
+
+  const currencyNormalized = normalizeCurrencyLikeValue(lowerCased);
+  if (currencyNormalized !== null) {
+    return currencyNormalized;
   }
 
   if (options.considerFormatting) {

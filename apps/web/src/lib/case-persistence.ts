@@ -1,4 +1,4 @@
-import type { CaseDoc, ComparisonOptions, Mismatch, QueuedUpload } from "@/types/pipeline";
+import type { CaseDoc, CommercialLineItem, ComparisonOptions, Mismatch, QueuedUpload } from "@/types/pipeline";
 import { apiFetch } from "@/lib/api-client";
 import { getQueuedUploadFiles, serializeQueuedUploadGroups } from "@/lib/upload-groups";
 
@@ -40,6 +40,7 @@ export type SavedCaseDocument = {
   title: string;
   pageCount: number;
   extractedFields: Record<string, unknown>;
+  lineItems?: CommercialLineItem[];
   markdown: string;
   createdAt: string;
 };
@@ -114,6 +115,15 @@ type UpdateCaseMismatchDecisionResponse = {
     resolutionStatus: "pending" | "accepted" | "rejected";
     resolvedAt: string | null;
   };
+};
+
+type UpdateCaseMismatchDecisionsResponse = {
+  caseStatus: string;
+  mismatches: Array<{
+    id: string;
+    resolutionStatus: "pending" | "accepted" | "rejected";
+    resolvedAt: string | null;
+  }>;
 };
 
 const AUTH_SESSION_ERROR =
@@ -573,6 +583,35 @@ export async function updateCaseMismatchDecision(
   return {
     caseStatus: payload.caseStatus,
     mismatch: payload.mismatch,
+  };
+}
+
+export async function updateCaseMismatchDecisions(
+  caseId: string,
+  mismatchIds: string[],
+  decision: MismatchDecision
+) {
+  const response = await performApiFetch(`/api/cases/${caseId}/mismatches`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: decision === "accepted" ? "accept" : "reject",
+      mismatchIds,
+    }),
+  });
+
+  const { payload, rawText } = await readApiResponse<UpdateCaseMismatchDecisionsResponse>(response);
+
+  if (!response.ok || typeof payload.caseStatus !== "string" || !Array.isArray(payload.mismatches)) {
+    throw toApiRequestError(payload, `Failed to ${decision === "accepted" ? "accept" : "reject"} selected issues.`, {
+      status: response.status,
+      rawText,
+    });
+  }
+
+  return {
+    caseStatus: payload.caseStatus,
+    mismatches: payload.mismatches,
   };
 }
 

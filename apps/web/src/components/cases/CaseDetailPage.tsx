@@ -59,6 +59,7 @@ import {
 } from "@/lib/case-persistence";
 import { readUploadGroupMeta } from "@/lib/upload-groups";
 import type {
+  CommercialLineItem,
   ComparisonOptions,
   DocType,
   FieldKey,
@@ -81,6 +82,23 @@ const FIELD_LABEL_LOOKUP = ACTIVE_FIELD_DEFINITIONS.reduce(
   },
   {} as Record<string, string>
 );
+
+const LINE_ITEM_COLUMNS: Array<{
+  key: keyof CommercialLineItem;
+  label: string;
+  className?: string;
+}> = [
+  { key: "lineNumber", label: "#", className: "w-12" },
+  { key: "itemCode", label: "Code", className: "min-w-24" },
+  { key: "description", label: "Description", className: "min-w-60" },
+  { key: "hsnSac", label: "HSN/SAC", className: "min-w-24" },
+  { key: "quantity", label: "Qty", className: "min-w-20 text-right" },
+  { key: "unit", label: "Unit", className: "min-w-16" },
+  { key: "rate", label: "Rate", className: "min-w-24 text-right" },
+  { key: "taxableAmount", label: "Taxable", className: "min-w-28 text-right" },
+  { key: "taxAmount", label: "Tax", className: "min-w-24 text-right" },
+  { key: "lineTotal", label: "Total", className: "min-w-28 text-right" },
+];
 
 const DRAFT_STAGE_SEQUENCE: PipelineStageProgress["stage"][] = [
   "upload_received",
@@ -153,6 +171,25 @@ function displayValue(value: unknown) {
   if (Array.isArray(value)) return value.join(", ");
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
+}
+
+function getLineItemValue(item: CommercialLineItem, key: keyof CommercialLineItem) {
+  if (key === "rate") {
+    return item.netRate || item.rate || "";
+  }
+  if (key === "taxAmount") {
+    return item.taxAmount || item.igstAmount || item.cgstAmount || item.sgstAmount || "";
+  }
+  return item[key] ?? "";
+}
+
+function getVisibleLineItemColumns(lineItems: CommercialLineItem[]) {
+  return LINE_ITEM_COLUMNS.filter(
+    (column) =>
+      column.key === "lineNumber" ||
+      column.key === "description" ||
+      lineItems.some((item) => String(getLineItemValue(item, column.key)).trim().length > 0)
+  );
 }
 
 function getSourceFileLabel(mimeType?: string | null, sourceName?: string | null) {
@@ -550,6 +587,14 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     if (!activeDocument) return [];
     return getOrderedDocumentEntries(activeDocument.documentType, activeDocument.extractedFields);
   }, [activeDocument]);
+  const activeDocumentLineItems = useMemo(
+    () => activeDocument?.lineItems ?? [],
+    [activeDocument]
+  );
+  const activeDocumentLineItemColumns = useMemo(
+    () => getVisibleLineItemColumns(activeDocumentLineItems),
+    [activeDocumentLineItems]
+  );
 
   const activeDocumentFiles = useMemo(() => {
     if (!detail || !activeDocument) return [];
@@ -1412,12 +1457,12 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 {/* 2. Data View */}
                 {activeTab === 'data' && (
                   <div className="absolute inset-0 overflow-y-auto">
-                    <div className="p-4 sm:p-8 max-w-4xl mx-auto pb-8">
-                      {activeDocumentEntries.length === 0 ? (
+                    <div className="p-4 sm:p-8 max-w-5xl mx-auto pb-8 space-y-6">
+                      {activeDocumentEntries.length === 0 && activeDocumentLineItems.length === 0 ? (
                         <div className="py-12 text-center text-sm font-medium text-slate-500">
                           No specific fields extracted for this document type.
                         </div>
-                      ) : (
+                      ) : activeDocumentEntries.length > 0 ? (
                         <div className="flex flex-col text-sm border border-slate-100 rounded-xl overflow-hidden shadow-sm">
                           {activeDocumentEntries.map(([key, value], index) => {
                             const currentValue = typeof value === "string" ? value : displayValue(value);
@@ -1442,6 +1487,56 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                               </div>
                             )
                           })}
+                        </div>
+                      ) : null}
+
+                      {activeDocumentLineItems.length > 0 && (
+                        <div className="rounded-xl border border-slate-100 bg-white shadow-sm">
+                          <div className="flex flex-col gap-1 border-b border-slate-100 px-4 py-3 sm:px-5">
+                            <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                              Line Items
+                            </div>
+                            <div className="text-sm font-medium text-slate-700">
+                              {activeDocumentLineItems.length} row{activeDocumentLineItems.length === 1 ? "" : "s"} extracted from the document table.
+                            </div>
+                          </div>
+                          <div className="overflow-x-auto">
+                            <table className="w-full min-w-[760px] border-collapse text-left text-xs sm:text-sm">
+                              <thead className="bg-slate-50 text-[10px] uppercase tracking-wider text-slate-500">
+                                <tr>
+                                  {activeDocumentLineItemColumns.map((column) => (
+                                    <th
+                                      key={column.key}
+                                      className={`border-b border-slate-100 px-3 py-2 font-bold ${column.className ?? ""}`}
+                                    >
+                                      {column.label}
+                                    </th>
+                                  ))}
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {activeDocumentLineItems.map((item, itemIndex) => (
+                                  <tr key={`${item.lineNumber ?? itemIndex}-${item.description ?? item.rawText ?? ""}`} className="border-b border-slate-100 last:border-0">
+                                    {activeDocumentLineItemColumns.map((column) => {
+                                      const value =
+                                        column.key === "lineNumber"
+                                          ? getLineItemValue(item, column.key) || String(itemIndex + 1)
+                                          : getLineItemValue(item, column.key);
+
+                                      return (
+                                        <td
+                                          key={column.key}
+                                          className={`align-top px-3 py-3 font-medium text-slate-800 ${column.className ?? ""}`}
+                                        >
+                                          {value ? String(value) : <span className="text-slate-300">-</span>}
+                                        </td>
+                                      );
+                                    })}
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
                         </div>
                       )}
                     </div>

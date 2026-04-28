@@ -1,5 +1,6 @@
 import { jsonWithCors } from "@/lib/api/cors";
 import { resolveCaseDisplayNameWithAI } from "@/lib/case-naming";
+import { serializeFieldsWithLineItems } from "@/lib/line-items";
 import { processStoredCaseFiles } from "@/lib/processing/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
@@ -113,7 +114,7 @@ export async function POST(
       document_type: document.type,
       title: document.title,
       page_count: document.pages,
-      extracted_fields: document.fields ?? {},
+      extracted_fields: serializeFieldsWithLineItems(document),
       markdown: document.md ?? "",
     }));
 

@@ -108,9 +108,35 @@ export interface CaseDoc {
   title: string;
   pages: number;
   fields: Partial<Record<FieldKey, string>>;
+  lineItems?: CommercialLineItem[];
   md: string;
   sourceFileName?: string;
   sourceHint?: string;
+}
+
+export interface CommercialLineItem {
+  lineNumber?: string;
+  itemCode?: string;
+  description?: string;
+  hsnSac?: string;
+  quantity?: string;
+  unit?: string;
+  rate?: string;
+  discountPercent?: string;
+  netRate?: string;
+  taxableAmount?: string;
+  cgstRate?: string;
+  cgstAmount?: string;
+  sgstRate?: string;
+  sgstAmount?: string;
+  igstRate?: string;
+  igstAmount?: string;
+  taxRate?: string;
+  taxAmount?: string;
+  lineTotal?: string;
+  referencePoLineNumber?: string;
+  rawText?: string;
+  sourcePage?: number;
 }
 
 export type PipelineStageId =

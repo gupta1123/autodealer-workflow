@@ -24,6 +24,10 @@ import {
   type PacketFieldConfiguration,
 } from "@/lib/document-schema";
 import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
+import {
+  isLineItemMismatchField,
+  serializeFieldsWithLineItems,
+} from "@/lib/line-items";
 import { getLatestProcessingJob, mapProcessingJob } from "@/lib/processing/jobs";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -105,6 +109,7 @@ function sanitizeDocumentsForStorage(
       document.fields ?? {},
       fieldConfiguration
     ) as CaseDoc["fields"],
+    lineItems: document.lineItems ?? [],
   }));
 }
 
@@ -127,10 +132,15 @@ function sanitizeMismatchesForStorage(
 ): Mismatch[] {
   return mismatches.filter((mismatch) => {
     if (
-      !shouldConsiderFieldKey(mismatch.field, undefined, fieldConfiguration) ||
-      !isPrimaryComparisonField(mismatch.field)
+      (!isLineItemMismatchField(mismatch.field) &&
+        (!shouldConsiderFieldKey(mismatch.field, undefined, fieldConfiguration) ||
+          !isPrimaryComparisonField(mismatch.field)))
     ) {
       return false;
+    }
+
+    if (isLineItemMismatchField(mismatch.field)) {
+      return true;
     }
 
     const supportingDocuments = documents.filter((document) =>
@@ -420,7 +430,7 @@ export async function POST(
       document_type: document.type,
       title: document.title,
       page_count: document.pages,
-      extracted_fields: document.fields ?? {},
+      extracted_fields: serializeFieldsWithLineItems(document),
       markdown: document.md ?? "",
     }));
 

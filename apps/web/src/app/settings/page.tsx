@@ -4,12 +4,22 @@ import { useEffect, useState } from "react";
 import {
   Check,
   Loader2,
+  Plus,
+  Trash2,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
 import { apiFetch } from "@/lib/api-client";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  DEFAULT_COMPARISON_FIELD_GROUPS,
+  fetchComparisonGroups,
+  normalizeComparisonGroupKey,
+  saveComparisonGroups,
+  sanitizeComparisonGroups,
+  type ComparisonFieldGroup,
+} from "@/lib/comparison-groups";
 import {
   DOC_TYPE_EXTRACTION_FIELDS,
   FIELD_DEFINITIONS,
@@ -20,7 +30,7 @@ import {
 } from "@/lib/document-schema";
 import type { DocType, FieldKey } from "@/types/pipeline";
 
-type ActiveTab = "documents" | "overview";
+type ActiveTab = "documents" | "groups";
 type BannerState = {
   tone: "success" | "error";
   text: string;
@@ -108,6 +118,22 @@ function serializeSettings(docTypeEnabled: DocTypeEnabledState, fieldEnabled: Fi
   });
 }
 
+function serializeComparisonGroups(groups: ComparisonFieldGroup[]) {
+  return JSON.stringify(
+    sanitizeComparisonGroups(groups).map((group, index) => ({
+      groupKey: group.groupKey,
+      label: group.label,
+      fields: group.fields,
+      enabled: group.enabled,
+      sortOrder: group.sortOrder || (index + 1) * 10,
+    }))
+  );
+}
+
+const AVAILABLE_GROUP_FIELDS = FIELD_DEFINITIONS.filter(
+  (field) => !HIDDEN_SETTING_FIELD_KEYS.has(field.key)
+);
+
 async function getResponseError(response: Response) {
   try {
     const payload = (await response.json()) as { error?: string };
@@ -133,6 +159,12 @@ export default function SettingsPage() {
     createDefaultDocTypeState()
   );
   const [fieldEnabled, setFieldEnabled] = useState<FieldEnabledState>(() => createDefaultFieldState());
+  const [comparisonGroups, setComparisonGroups] = useState<ComparisonFieldGroup[]>(() =>
+    DEFAULT_COMPARISON_FIELD_GROUPS
+  );
+  const [selectedGroupKey, setSelectedGroupKey] = useState(
+    DEFAULT_COMPARISON_FIELD_GROUPS[0]?.groupKey ?? ""
+  );
   const [savedSignature, setSavedSignature] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -146,10 +178,13 @@ export default function SettingsPage() {
         setLoading(true);
         setBanner(null);
 
-        const response = await apiFetch("/api/settings/field", {
-          method: "GET",
-          cache: "no-store",
-        });
+        const [response, loadedGroups] = await Promise.all([
+          apiFetch("/api/settings/field", {
+            method: "GET",
+            cache: "no-store",
+          }),
+          fetchComparisonGroups(),
+        ]);
 
         if (!response.ok) {
           throw new Error(await getResponseError(response));
@@ -164,12 +199,15 @@ export default function SettingsPage() {
 
         setDocTypeEnabled(hydratedState.docTypeEnabled);
         setFieldEnabled(hydratedState.fieldEnabled);
+        setComparisonGroups(loadedGroups);
+        setSelectedGroupKey(loadedGroups[0]?.groupKey ?? "");
         setSavedSignature(
-          serializeSettings(hydratedState.docTypeEnabled, hydratedState.fieldEnabled)
+          `${serializeSettings(hydratedState.docTypeEnabled, hydratedState.fieldEnabled)}:${serializeComparisonGroups(loadedGroups)}`
         );
       } catch (error) {
         const fallbackDocTypeState = createDefaultDocTypeState();
         const fallbackFieldState = createDefaultFieldState();
+        const fallbackGroups = DEFAULT_COMPARISON_FIELD_GROUPS;
 
         if (cancelled) {
           return;
@@ -177,7 +215,11 @@ export default function SettingsPage() {
 
         setDocTypeEnabled(fallbackDocTypeState);
         setFieldEnabled(fallbackFieldState);
-        setSavedSignature(serializeSettings(fallbackDocTypeState, fallbackFieldState));
+        setComparisonGroups(fallbackGroups);
+        setSelectedGroupKey(fallbackGroups[0]?.groupKey ?? "");
+        setSavedSignature(
+          `${serializeSettings(fallbackDocTypeState, fallbackFieldState)}:${serializeComparisonGroups(fallbackGroups)}`
+        );
         setBanner({
           tone: "error",
           text:
@@ -199,7 +241,7 @@ export default function SettingsPage() {
     };
   }, []);
 
-  const currentSignature = serializeSettings(docTypeEnabled, fieldEnabled);
+  const currentSignature = `${serializeSettings(docTypeEnabled, fieldEnabled)}:${serializeComparisonGroups(comparisonGroups)}`;
   const hasUnsavedChanges = savedSignature !== currentSignature;
 
   const selectedDocTypeEnabled = docTypeEnabled[selectedDocType] ?? true;
@@ -226,6 +268,8 @@ export default function SettingsPage() {
         .length,
     0
   );
+  const selectedGroup =
+    comparisonGroups.find((group) => group.groupKey === selectedGroupKey) ?? comparisonGroups[0] ?? null;
 
   function handleToggleDocType(docType: string) {
     setBanner(null);
@@ -258,8 +302,77 @@ export default function SettingsPage() {
 
   function handleResetDefaults() {
     setBanner(null);
+    if (activeTab === "groups") {
+      setComparisonGroups(DEFAULT_COMPARISON_FIELD_GROUPS);
+      setSelectedGroupKey(DEFAULT_COMPARISON_FIELD_GROUPS[0]?.groupKey ?? "");
+      return;
+    }
+
     setDocTypeEnabled(createDefaultDocTypeState());
     setFieldEnabled(createDefaultFieldState());
+  }
+
+  function handleAddGroup() {
+    setBanner(null);
+    const index = comparisonGroups.length + 1;
+    const group: ComparisonFieldGroup = {
+      groupKey: `custom_group_${Date.now()}`,
+      label: `New Group ${index}`,
+      fields: [],
+      enabled: true,
+      sortOrder: index * 10,
+    };
+    setComparisonGroups((current) => [...current, group]);
+    setSelectedGroupKey(group.groupKey);
+    setActiveTab("groups");
+  }
+
+  function handleUpdateGroup(groupKey: string, updates: Partial<ComparisonFieldGroup>) {
+    setBanner(null);
+    setComparisonGroups((current) =>
+      current.map((group) => (group.groupKey === groupKey ? { ...group, ...updates } : group))
+    );
+  }
+
+  function handleRenameGroup(groupKey: string, label: string) {
+    const nextKey = normalizeComparisonGroupKey(label, groupKey);
+    setBanner(null);
+    setComparisonGroups((current) =>
+      current.map((group) =>
+        group.groupKey === groupKey
+          ? {
+              ...group,
+              label,
+              groupKey: nextKey,
+            }
+          : group
+      )
+    );
+    setSelectedGroupKey(nextKey);
+  }
+
+  function handleToggleGroupField(groupKey: string, fieldKey: string) {
+    setBanner(null);
+    setComparisonGroups((current) =>
+      current.map((group) => {
+        if (group.groupKey !== groupKey) return group;
+        const fields = group.fields.includes(fieldKey)
+          ? group.fields.filter((field) => field !== fieldKey)
+          : [...group.fields, fieldKey];
+        return { ...group, fields };
+      })
+    );
+  }
+
+  function handleDeleteGroup(groupKey: string) {
+    setBanner(null);
+    setComparisonGroups((current) => {
+      const next = current.filter((group) => group.groupKey !== groupKey);
+      if (selectedGroupKey === groupKey) {
+        setSelectedGroupKey(next[0]?.groupKey ?? "");
+      }
+      return next;
+    });
   }
 
   async function handleSave() {
@@ -280,7 +393,7 @@ export default function SettingsPage() {
         }))
       );
 
-      const [docTypeResponse, fieldResponse] = await Promise.all([
+      const [docTypeResponse, fieldResponse, groupResponse] = await Promise.all([
         apiFetch("/api/settings/doctype", {
           method: "POST",
           headers: {
@@ -295,6 +408,12 @@ export default function SettingsPage() {
           },
           body: JSON.stringify({ settings: fieldSettingsPayload }),
         }),
+        saveComparisonGroups(
+          comparisonGroups.map((group, index) => ({
+            ...group,
+            sortOrder: (index + 1) * 10,
+          }))
+        ),
       ]);
 
       if (!docTypeResponse.ok) {
@@ -303,6 +422,10 @@ export default function SettingsPage() {
 
       if (!fieldResponse.ok) {
         throw new Error(await getResponseError(fieldResponse));
+      }
+
+      if (!groupResponse.success) {
+        throw new Error("Failed to save comparison groups.");
       }
 
       setPacketFieldConfiguration(
@@ -319,11 +442,13 @@ export default function SettingsPage() {
         })
       );
 
-      const nextSignature = serializeSettings(docTypeEnabled, fieldEnabled);
+      const savedGroups = sanitizeComparisonGroups(groupResponse.groups);
+      setComparisonGroups(savedGroups);
+      const nextSignature = `${serializeSettings(docTypeEnabled, fieldEnabled)}:${serializeComparisonGroups(savedGroups)}`;
       setSavedSignature(nextSignature);
       setBanner({
         tone: "success",
-        text: "Settings saved. New extraction, comparison, and mismatch checks will follow these rules.",
+        text: "Settings saved. New checks will follow field settings, and mismatch pages will use the saved groups.",
       });
     } catch (error) {
       setBanner({
@@ -381,8 +506,35 @@ export default function SettingsPage() {
             </div>
           ) : null}
 
+          <div className="mb-4 inline-flex rounded-xl border border-[#e5ddd0] bg-white p-1 shadow-sm">
+            <button
+              className={`rounded-lg px-4 py-2 text-sm font-bold transition ${
+                activeTab === "documents"
+                  ? "bg-[#1a1a1a] text-white"
+                  : "text-[#8a7f72] hover:bg-[#f3eee7] hover:text-[#1a1a1a]"
+              }`}
+              onClick={() => setActiveTab("documents")}
+              type="button"
+            >
+              Document fields
+            </button>
+            <button
+              className={`rounded-lg px-4 py-2 text-sm font-bold transition ${
+                activeTab === "groups"
+                  ? "bg-[#1a1a1a] text-white"
+                  : "text-[#8a7f72] hover:bg-[#f3eee7] hover:text-[#1a1a1a]"
+              }`}
+              onClick={() => setActiveTab("groups")}
+              type="button"
+            >
+              Comparison groups
+            </button>
+          </div>
+
           <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm">
             <div className="flex h-[calc(100vh-220px)] flex-col md:flex-row">
+              {activeTab === "documents" ? (
+                <>
                 <aside className="w-full overflow-y-auto border-r border-[#e5ddd0] bg-[#fafafa]/50 p-4 md:w-80">
                   <div className="mb-4 px-2 text-[10px] font-bold uppercase tracking-widest text-[#8a7f72]">
                     DOCUMENT TYPES
@@ -605,6 +757,191 @@ export default function SettingsPage() {
                     </>
                   )}
                 </main>
+                </>
+              ) : (
+                <>
+                  <aside className="w-full overflow-y-auto border-r border-[#e5ddd0] bg-[#fafafa]/50 p-4 md:w-80">
+                    <div className="mb-4 flex items-center justify-between gap-3 px-2">
+                      <div className="text-[10px] font-bold uppercase tracking-widest text-[#8a7f72]">
+                        GROUPS
+                      </div>
+                      <Button
+                        className="h-8 rounded-lg bg-[#1a1a1a] px-3 text-xs font-bold text-white"
+                        onClick={handleAddGroup}
+                        type="button"
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                        Add
+                      </Button>
+                    </div>
+
+                    <div className="space-y-2">
+                      {comparisonGroups.length === 0 ? (
+                        <div className="rounded-xl border border-dashed border-[#d8ccbc] bg-white p-4 text-sm font-medium text-[#8a7f72]">
+                          No groups configured.
+                        </div>
+                      ) : (
+                        comparisonGroups.map((group) => {
+                          const isSelected = selectedGroup?.groupKey === group.groupKey;
+
+                          return (
+                            <button
+                              key={group.groupKey}
+                              className={`w-full rounded-xl p-3 text-left transition-all ${
+                                isSelected
+                                  ? "bg-[#10b981]/10 ring-1 ring-[#10b981]/30"
+                                  : "hover:bg-[#f0ece6]"
+                              }`}
+                              onClick={() => setSelectedGroupKey(group.groupKey)}
+                              type="button"
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="min-w-0">
+                                  <div
+                                    className={`truncate text-sm font-bold ${
+                                      isSelected ? "text-[#065f46]" : "text-[#1a1a1a]"
+                                    }`}
+                                  >
+                                    {group.label}
+                                  </div>
+                                  <div
+                                    className={`mt-1 text-[11px] font-medium leading-tight ${
+                                      isSelected ? "text-[#065f46]/70" : "text-[#8a7f72]"
+                                    }`}
+                                  >
+                                    {group.fields.length} field{group.fields.length === 1 ? "" : "s"}
+                                  </div>
+                                </div>
+                                <Badge
+                                  className={
+                                    group.enabled
+                                      ? "border-[#10b981]/20 bg-[#ecfdf5] text-[#047857]"
+                                      : "border-[#e5ddd0] bg-white text-[#8a7f72]"
+                                  }
+                                  variant="outline"
+                                >
+                                  {group.enabled ? "On" : "Off"}
+                                </Badge>
+                              </div>
+                            </button>
+                          );
+                        })
+                      )}
+                    </div>
+                  </aside>
+
+                  <main className="flex-1 overflow-y-auto p-6 sm:p-8">
+                    {loading ? (
+                      <div className="space-y-4">
+                        <div className="h-14 animate-pulse rounded-2xl bg-[#f3eee7]" />
+                        <div className="grid gap-4 lg:grid-cols-2">
+                          {Array.from({ length: 8 }).map((_, index) => (
+                            <div key={index} className="h-16 animate-pulse rounded-2xl bg-[#f3eee7]" />
+                          ))}
+                        </div>
+                      </div>
+                    ) : selectedGroup ? (
+                      <div className="space-y-6">
+                        <div className="rounded-2xl border border-[#e5ddd0] bg-[#fafafa] p-4">
+                          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+                            <label className="flex-1">
+                              <div className="mb-1 text-[11px] font-black uppercase tracking-[0.2em] text-[#8a7f72]">
+                                Group name
+                              </div>
+                              <input
+                                className="w-full rounded-xl border border-[#d8ccbc] bg-white px-3 py-2 text-sm font-bold outline-none transition focus:border-[#10b981] focus:ring-2 focus:ring-[#10b981]/20"
+                                onChange={(event) =>
+                                  handleRenameGroup(selectedGroup.groupKey, event.target.value)
+                                }
+                                value={selectedGroup.label}
+                              />
+                            </label>
+
+                            <div className="flex flex-wrap gap-2">
+                              <Button
+                                className="rounded-xl border-[#e5ddd0] bg-white text-[#1a1a1a] hover:bg-[#f3eee7]"
+                                onClick={() =>
+                                  handleUpdateGroup(selectedGroup.groupKey, {
+                                    enabled: !selectedGroup.enabled,
+                                  })
+                                }
+                                type="button"
+                                variant="outline"
+                              >
+                                {selectedGroup.enabled ? "Disable group" : "Enable group"}
+                              </Button>
+                              <Button
+                                className="rounded-xl border-rose-200 bg-white text-rose-700 hover:bg-rose-50 hover:text-rose-800"
+                                onClick={() => handleDeleteGroup(selectedGroup.groupKey)}
+                                type="button"
+                                variant="outline"
+                              >
+                                <Trash2 className="h-4 w-4" />
+                                Delete
+                              </Button>
+                            </div>
+                          </div>
+                        </div>
+
+                        <section>
+                          <div className="mb-4">
+                            <h3 className="text-[11px] font-black uppercase tracking-[0.2em] text-[#8a7f72]">
+                              FIELDS IN THIS GROUP
+                            </h3>
+                            <p className="mt-0.5 text-[11px] font-medium uppercase tracking-wide text-[#b5aaa0]">
+                              These fields appear together on the mismatch review screen
+                            </p>
+                          </div>
+
+                          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+                            {AVAILABLE_GROUP_FIELDS.map((field) => {
+                              const isSelected = selectedGroup.fields.includes(field.key);
+
+                              return (
+                                <button
+                                  key={field.key}
+                                  aria-pressed={isSelected}
+                                  className={`rounded-xl border p-4 text-left transition-all ${
+                                    isSelected
+                                      ? "border-[#10b981]/30 bg-[#ecfdf5]"
+                                      : "border-[#e5ddd0] bg-white hover:bg-[#fafafa]"
+                                  }`}
+                                  onClick={() => handleToggleGroupField(selectedGroup.groupKey, field.key)}
+                                  type="button"
+                                >
+                                  <div className="flex items-start justify-between gap-4">
+                                    <div>
+                                      <div className="text-sm font-bold text-[#1a1a1a]">
+                                        {FIELD_LABELS[field.key]}
+                                      </div>
+                                      <div className="mt-1 text-[11px] font-medium text-[#8a7f72]">
+                                        {field.key}
+                                      </div>
+                                    </div>
+                                    <div
+                                      className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-md border ${
+                                        isSelected
+                                          ? "border-[#10b981] bg-[#10b981] text-white"
+                                          : "border-[#d8ccbc] bg-white text-transparent"
+                                      }`}
+                                    >
+                                      <Check className="h-4 w-4" />
+                                    </div>
+                                  </div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </section>
+                      </div>
+                    ) : (
+                      <div className="flex h-full items-center justify-center rounded-2xl border border-dashed border-[#d8ccbc] bg-[#fafafa] text-sm font-medium text-[#8a7f72]">
+                        Create a group to start.
+                      </div>
+                    )}
+                  </main>
+                </>
+              )}
               </div>
           </div>
         </div>

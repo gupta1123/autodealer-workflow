@@ -21,6 +21,12 @@ import {
   type PacketFieldConfiguration,
 } from "@/lib/document-schema";
 import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
+import {
+  isLineItemMismatchField,
+  readStoredLineItems,
+  serializeFieldsWithLineItems,
+  stripStoredLineItems,
+} from "@/lib/line-items";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { readUploadGroupMeta } from "@/lib/upload-groups";
@@ -190,6 +196,7 @@ function sanitizeDocumentsForStorage(
       document.fields ?? {},
       fieldConfiguration
     ) as CaseDoc["fields"],
+    lineItems: document.lineItems ?? [],
   }));
 }
 
@@ -212,10 +219,15 @@ function sanitizeMismatchesForStorage(
 ): Mismatch[] {
   return mismatches.filter((mismatch) => {
     if (
-      !shouldConsiderFieldKey(mismatch.field, undefined, fieldConfiguration) ||
-      !isPrimaryComparisonField(mismatch.field)
+      (!isLineItemMismatchField(mismatch.field) &&
+        (!shouldConsiderFieldKey(mismatch.field, undefined, fieldConfiguration) ||
+          !isPrimaryComparisonField(mismatch.field)))
     ) {
       return false;
+    }
+
+    if (isLineItemMismatchField(mismatch.field)) {
+      return true;
     }
 
     const supportingDocuments = documents.filter((document) =>
@@ -236,18 +248,19 @@ function mapDocumentRowForCaseSummary(row: {
   page_count: number | null;
   extracted_fields: unknown;
 }, fieldConfiguration: PacketFieldConfiguration): CaseDoc {
+  const storedLineItems = readStoredLineItems(row.extracted_fields);
   const extractedFields =
     row.extracted_fields && typeof row.extracted_fields === "object" && !Array.isArray(row.extracted_fields)
       ? sanitizeFieldsForDocType(
           row.document_type,
-          Object.fromEntries(
+          stripStoredLineItems(Object.fromEntries(
             Object.entries(row.extracted_fields).flatMap(([key, value]) => {
               if (typeof value === "string" || typeof value === "number") {
                 return [[key, String(value)]];
               }
               return [];
             })
-          ),
+          )),
           fieldConfiguration
         )
       : {};
@@ -258,6 +271,7 @@ function mapDocumentRowForCaseSummary(row: {
     title: row.title || row.document_type,
     pages: row.page_count || 1,
     fields: extractedFields as CaseDoc["fields"],
+    lineItems: storedLineItems,
     md: "",
     sourceHint: row.source_hint || row.source_file_name || undefined,
     sourceFileName: row.source_file_name || undefined,
@@ -730,7 +744,7 @@ export async function POST(request: Request) {
       document_type: document.type,
       title: document.title,
       page_count: document.pages,
-      extracted_fields: document.fields ?? {},
+      extracted_fields: serializeFieldsWithLineItems(document),
       markdown: document.md ?? "",
     }));
 

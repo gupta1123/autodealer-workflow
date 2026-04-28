@@ -26,6 +26,11 @@ import {
   type PacketFieldConfiguration,
 } from "@/lib/document-schema";
 import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
+import {
+  isLineItemMismatchField,
+  readStoredLineItems,
+  stripStoredLineItems,
+} from "@/lib/line-items";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import type { CaseDoc, FieldKey } from "@/types/pipeline";
 
@@ -78,7 +83,11 @@ function sanitizeExtractedFields(
     return {};
   }
 
-  return sanitizeFieldsForDocType(documentType, fields as Record<string, unknown>, fieldConfiguration);
+  return sanitizeFieldsForDocType(
+    documentType,
+    stripStoredLineItems(fields as Record<string, unknown>),
+    fieldConfiguration
+  );
 }
 
 function mapDocumentRowForCaseSummary(row: {
@@ -91,6 +100,7 @@ function mapDocumentRowForCaseSummary(row: {
   page_count: number | null;
   extracted_fields: unknown;
 }, fieldConfiguration: PacketFieldConfiguration): CaseDoc {
+  const storedLineItems = readStoredLineItems(row.extracted_fields);
   const extractedFields = Object.fromEntries(
     Object.entries(sanitizeExtractedFields(row.document_type, row.extracted_fields, fieldConfiguration)).flatMap(([key, value]) => {
       if (typeof value === "string" || typeof value === "number") {
@@ -106,6 +116,7 @@ function mapDocumentRowForCaseSummary(row: {
     title: row.title || row.document_type,
     pages: row.page_count || 1,
     fields: extractedFields as CaseDoc["fields"],
+    lineItems: storedLineItems,
     md: "",
     sourceFileName: row.source_file_name || undefined,
     sourceHint: row.source_hint || row.source_file_name || undefined,
@@ -434,15 +445,21 @@ export async function GET(
         document.extracted_fields,
         fieldConfiguration
       ),
+      lineItems: readStoredLineItems(document.extracted_fields),
       markdown: document.markdown,
       createdAt: document.created_at,
     }));
     const filteredMismatches = mismatches.filter((mismatch) => {
       if (
-        !shouldConsiderFieldKey(mismatch.fieldName, undefined, fieldConfiguration) ||
-        !isPrimaryComparisonField(mismatch.fieldName)
+        !isLineItemMismatchField(mismatch.fieldName) &&
+        (!shouldConsiderFieldKey(mismatch.fieldName, undefined, fieldConfiguration) ||
+          !isPrimaryComparisonField(mismatch.fieldName))
       ) {
         return false;
+      }
+
+      if (isLineItemMismatchField(mismatch.fieldName)) {
+        return true;
       }
 
       const supportingDocuments = caseSummaryDocuments.filter((document) => {

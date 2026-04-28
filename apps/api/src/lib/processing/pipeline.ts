@@ -1,6 +1,9 @@
+import { execFile } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 
 import { summarizeCase } from "@/lib/case-summary";
 import { DEFAULT_COMPARISON_OPTIONS, readComparisonOptions } from "@/lib/comparison";
@@ -11,13 +14,17 @@ import {
   omitIgnoredFields,
 } from "@/lib/document-schema";
 import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
+import { isCommercialDocType, sanitizeLineItems } from "@/lib/line-items";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { verifyCaseDocuments } from "@/services/verification";
-import type { CaseDoc, DocType, FieldKey, Mismatch } from "@/types/pipeline";
+import type { CaseDoc, CommercialLineItem, DocType, FieldKey, Mismatch } from "@/types/pipeline";
 
 import { callOpenRouter } from "./openrouter";
 
 const STORAGE_BUCKET = "packet-files";
+const execFileAsync = promisify(execFile);
+const PDF_RENDER_DPI = Number(process.env.PACKET_PDF_RENDER_DPI ?? 160);
+const PDF_RENDER_MAX_PAGES = Number(process.env.PACKET_PDF_RENDER_MAX_PAGES ?? 8);
 
 function resolvePdfJsWorkerSrc() {
   const candidates = [
@@ -176,6 +183,18 @@ function formatDocType(docType: DocType) {
 function getAllowedFieldKeysForDocType(docType: DocType) {
   const docTypeFieldKeys = getFieldKeysForDocType(docType);
   return docTypeFieldKeys.length > 0 ? docTypeFieldKeys : ALL_ALLOWED_FIELD_KEYS;
+}
+
+function getLineItemExtractionInstruction(docType: DocType) {
+  if (!isCommercialDocType(docType)) {
+    return "";
+  }
+
+  return (
+    "Also extract every commercial table row into a top-level lineItems array. " +
+    "Each line item may contain lineNumber, itemCode, description, hsnSac, quantity, unit, rate, discountPercent, netRate, taxableAmount, cgstRate, cgstAmount, sgstRate, sgstAmount, igstRate, igstAmount, taxRate, taxAmount, lineTotal, referencePoLineNumber, and rawText. " +
+    "Preserve one entry per visible PO/invoice row; do not merge different rows or sum unlike units. Use rawText for the original row text when OCR is uncertain. "
+  );
 }
 
 function mapFields(fields: Record<string, unknown>, docType?: DocType): Partial<Record<FieldKey, string>> {
@@ -444,6 +463,22 @@ function buildMarkdown(doc: CaseDoc, visibleTextPages: string[] = []) {
     }
   }
 
+  if (doc.lineItems?.length) {
+    lines.push("", "## Line Items", "");
+    doc.lineItems.forEach((item, index) => {
+      const label = item.lineNumber ? `Line ${item.lineNumber}` : `Line ${index + 1}`;
+      const parts = [
+        item.itemCode,
+        item.description,
+        item.hsnSac ? `HSN ${item.hsnSac}` : "",
+        item.quantity && item.unit ? `${item.quantity} ${item.unit}` : item.quantity,
+        item.rate ? `rate ${item.rate}` : "",
+        item.lineTotal ? `total ${item.lineTotal}` : "",
+      ].filter(Boolean);
+      lines.push(`- **${label}**: ${parts.join(" | ") || item.rawText || "Extracted row"}`);
+    });
+  }
+
   const visibleText = visibleTextPages.map((text) => text.trim()).filter(Boolean);
   if (visibleText.length) {
     lines.push("", "## Visible Text", "");
@@ -484,6 +519,47 @@ function getFileMimeType(fileName: string, mimeType: string | null) {
 
 function bufferToDataUrl(data: Uint8Array, mimeType: string) {
   return `data:${mimeType};base64,${Buffer.from(data).toString("base64")}`;
+}
+
+function hasMeaningfulTextPages(textPages: string[]) {
+  return textPages.some((page) => page.replace(/\s+/g, "").length > 20);
+}
+
+function renderedPageNumber(fileName: string) {
+  const match = fileName.match(/-(\d+)\.png$/);
+  return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+}
+
+async function renderPdfToImagePages(data: Uint8Array) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "packet-pdf-"));
+  const inputPath = path.join(tmpDir, "input.pdf");
+  const outputPrefix = path.join(tmpDir, "page");
+
+  try {
+    fs.writeFileSync(inputPath, Buffer.from(data));
+    await execFileAsync("pdftoppm", [
+      "-r",
+      String(PDF_RENDER_DPI),
+      "-png",
+      "-f",
+      "1",
+      "-l",
+      String(PDF_RENDER_MAX_PAGES),
+      inputPath,
+      outputPrefix,
+    ]);
+
+    return fs
+      .readdirSync(tmpDir)
+      .filter((fileName) => fileName.startsWith("page-") && fileName.endsWith(".png"))
+      .sort((left, right) => renderedPageNumber(left) - renderedPageNumber(right))
+      .map((fileName) => {
+        const bytes = fs.readFileSync(path.join(tmpDir, fileName));
+        return `data:image/png;base64,${bytes.toString("base64")}`;
+      });
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 }
 
 async function extractPdfTextPages(data: Uint8Array) {
@@ -585,17 +661,20 @@ async function extractDataFromImagePages(params: {
 }) {
   const allowedFieldKeys = getAllowedFieldKeysForDocType(params.documentType);
   const allowedFieldKeysText = allowedFieldKeys.join(", ");
-  const extracted: Array<{ fields: Record<string, unknown>; visibleText: string }> = [];
+  const extracted: Array<{ fields: Record<string, unknown>; lineItems: CommercialLineItem[]; visibleText: string }> = [];
+  const lineItemInstruction = getLineItemExtractionInstruction(params.documentType);
 
-  for (const image of params.pageImages) {
+  for (let index = 0; index < params.pageImages.length; index += 1) {
+    const image = params.pageImages[index];
     const raw = await callOpenRouter(
       [
         {
           role: "system",
           content:
-            `Extract structured fields and visible text from procurement, logistics, transport, vehicle KYC, FASTag, quality certificate, and photo-evidence documents and return only JSON with keys "fields" and "visibleText". ` +
+            `Extract structured fields and visible text from procurement, logistics, transport, vehicle KYC, FASTag, quality certificate, and photo-evidence documents and return only JSON with keys "fields", "lineItems", and "visibleText". ` +
             `This document is a ${params.documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
             "visibleText must be a raw OCR-style transcription of the important visible text on the page. " +
+            lineItemInstruction +
             "For FASTag Toll Proof documents, extract statement reference, customer ID/name, statement period/date, vehicle number, tag account number, trip count, opening/credit/debit/closing balances, recharge/payment amount, toll plaza, and a compact toll transaction summary using the canonical FASTag keys. " +
             "For seller-issued documents, vendorName is the issuing supplier/seller/consignor and buyerName is the receiving party. " +
             "For Purchase Order or Amended Purchase Order documents, vendorName is the supplier/vendor receiving the order and buyerName is the purchaser issuing the order.",
@@ -611,14 +690,16 @@ async function extractDataFromImagePages(params: {
       { expectJson: true }
     );
 
-    const parsed = safeJsonParse<{ fields?: Record<string, unknown>; visibleText?: unknown; text?: unknown; ocrText?: unknown }>(raw, {});
+    const parsed = safeJsonParse<{ fields?: Record<string, unknown>; lineItems?: unknown; visibleText?: unknown; text?: unknown; ocrText?: unknown }>(raw, {});
     extracted.push({
       fields: parsed.fields ?? {},
+      lineItems: sanitizeLineItems(parsed.lineItems).map((item) => ({ ...item, sourcePage: item.sourcePage ?? index + 1 })),
       visibleText: toText(parsed.visibleText) || toText(parsed.ocrText) || toText(parsed.text),
     });
   }
 
   const combinedFields = extracted.reduce((acc, current) => ({ ...acc, ...current.fields }), {});
+  const lineItems = extracted.flatMap((page) => page.lineItems);
   const visibleTextPages = extracted.map((page) => page.visibleText).filter(Boolean);
   const visibleText = visibleTextPages.join("\n");
   const fields = applyFastagDetailsFallback(
@@ -637,6 +718,7 @@ async function extractDataFromImagePages(params: {
     title: `${formatDocType(params.documentType)} — ${params.fileName}`,
     pages: params.pageImages.length,
     fields,
+    lineItems,
     md: "",
     sourceHint: params.fileName,
     sourceFileName: params.fileName,
@@ -652,6 +734,7 @@ async function extractDataFromTextPages(params: {
 }) {
   const allowedFieldKeys = getAllowedFieldKeysForDocType(params.documentType);
   const allowedFieldKeysText = allowedFieldKeys.join(", ");
+  const lineItemInstruction = getLineItemExtractionInstruction(params.documentType);
   const visibleText = params.textPages.map((page, index) => `Page ${index + 1}: ${page}`).join("\n\n");
 
   if (!visibleText.trim()) {
@@ -665,8 +748,9 @@ async function extractDataFromTextPages(params: {
       {
         role: "system",
         content:
-          `Extract structured fields from procurement packet text and return only JSON with keys "fields" and "visibleText". ` +
+          `Extract structured fields from procurement packet text and return only JSON with keys "fields", "lineItems", and "visibleText". ` +
           `This document is a ${params.documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
+          lineItemInstruction +
           "Use only information present in the visible text. For seller-issued documents, vendorName is the issuing supplier and buyerName is the receiving party. " +
           "For Purchase Order or Amended Purchase Order documents, vendorName is the supplier/vendor receiving the order and buyerName is the purchaser issuing the order.",
       },
@@ -678,7 +762,7 @@ async function extractDataFromTextPages(params: {
     { expectJson: true }
   );
 
-  const parsed = safeJsonParse<{ fields?: Record<string, unknown>; visibleText?: unknown }>(raw, {});
+  const parsed = safeJsonParse<{ fields?: Record<string, unknown>; lineItems?: unknown; visibleText?: unknown }>(raw, {});
   const fields = applyFastagDetailsFallback(
     applyEWayBillAddressFallback(
       mapFields(parsed.fields ?? {}, params.documentType),
@@ -694,6 +778,7 @@ async function extractDataFromTextPages(params: {
     title: `${formatDocType(params.documentType)} — ${params.fileName}`,
     pages: Math.max(1, params.textPages.length),
     fields,
+    lineItems: sanitizeLineItems(parsed.lineItems),
     md: "",
     sourceHint: params.fileName,
     sourceFileName: params.fileName,
@@ -703,7 +788,14 @@ async function extractDataFromTextPages(params: {
 }
 
 function buildMismatchCopy(mismatch: Omit<Mismatch, "analysis" | "fixPlan">): Pick<Mismatch, "analysis" | "fixPlan"> {
-  const label = FIELD_LABELS[mismatch.field as FieldKey] ?? mismatch.field;
+  const lineItemLabels: Record<string, string> = {
+    "lineItems.unmatchedInvoiceLine": "Invoice line item",
+    "lineItems.uninvoicedPoLine": "PO line item",
+    "lineItems.quantityExceeded": "Line item quantity",
+    "lineItems.rateMismatch": "Line item rate",
+    "lineItems.unitMismatch": "Line item unit",
+  };
+  const label = lineItemLabels[mismatch.field] ?? FIELD_LABELS[mismatch.field as FieldKey] ?? mismatch.field;
   return {
     analysis: `${label} does not reconcile across the uploaded documents. Review the packet before approval.`,
     fixPlan: `1. Confirm the correct ${label.toLowerCase()} from the source document.\n2. Correct or replace the inconsistent file.\n3. Run analysis again before accepting the case.`,
@@ -766,12 +858,42 @@ export async function processStoredCaseFiles(params: {
       });
     } else if (mimeType === "application/pdf") {
       const textPages = await extractPdfTextPages(bytes);
-      const documentType = await classifyDocumentFromText(textPages, file.original_name);
-      document = await extractDataFromTextPages({
-        fileName: file.original_name,
-        textPages,
-        documentType,
-      });
+      if (hasMeaningfulTextPages(textPages)) {
+        const documentType = await classifyDocumentFromText(textPages, file.original_name);
+        document = await extractDataFromTextPages({
+          fileName: file.original_name,
+          textPages,
+          documentType,
+        });
+      } else {
+        await params.onProgress?.({
+          progress: Math.max(10, Math.round((index / files.length) * 70)),
+          stage: `Rendering scanned PDF ${file.original_name}`,
+        });
+
+        let pageImages: string[] = [];
+        try {
+          pageImages = await renderPdfToImagePages(bytes);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error ?? "Unknown error");
+          throw new Error(
+            `Unable to render scanned PDF "${file.original_name}". Install poppler-utils/pdftoppm in the API runtime. ${reason}`
+          );
+        }
+
+        if (pageImages.length === 0) {
+          document = fallbackDoc(file.original_name, inferDocTypeFromFilename(file.original_name), {
+            pages: Math.max(1, textPages.length),
+          });
+        } else {
+          const documentType = await classifyDocumentFromImage(pageImages[0], file.original_name);
+          document = await extractDataFromImagePages({
+            fileName: file.original_name,
+            pageImages,
+            documentType,
+          });
+        }
+      }
     } else {
       document = fallbackDoc(file.original_name, inferDocTypeFromFilename(file.original_name));
     }
