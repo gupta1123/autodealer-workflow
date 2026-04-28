@@ -5,7 +5,7 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const OPENROUTER_MODEL =
   process.env.OPENROUTER_MODEL ||
   process.env.NEXT_PUBLIC_OPENROUTER_MODEL ||
-  "google/gemini-2.0-flash-001";
+  "google/gemini-2.5-flash-image";
 const MAX_RETRIES = Number(process.env.OPENROUTER_MAX_RETRIES ?? 2);
 const RETRY_BASE_MS = Number(process.env.OPENROUTER_RETRY_BASE_MS ?? 1200);
 
@@ -74,7 +74,6 @@ export async function POST(req: Request) {
           model: OPENROUTER_MODEL,
           messages,
           temperature: 0,
-          ...(expectJson ? { response_format: { type: "json_object" } } : {}),
         }),
       });
 
