@@ -20,7 +20,6 @@ import {
   Database,
   Check,
   X,
-  FileDigit,
   FileSearch,
   Play,
   ZoomIn,
@@ -68,12 +67,11 @@ import type {
 } from "@/types/pipeline";
 
 type LoadState = "loading" | "ready" | "error";
-type ActiveTab = "preview" | "data" | "ocr";
+type ActiveTab = "preview" | "data";
 
 const DETAIL_TABS: { id: ActiveTab; label: string; icon: LucideIcon }[] = [
   { id: "preview", label: "Original", icon: Eye },
   { id: "data", label: "Data", icon: Database },
-  { id: "ocr", label: "Text", icon: FileDigit },
 ];
 
 const FIELD_LABEL_LOOKUP = ACTIVE_FIELD_DEFINITIONS.reduce(
@@ -1260,9 +1258,9 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 {/* Left Side: Title & Badge (Desktop Only) */}
                 <div className="hidden sm:flex items-center gap-3">
                   <div className="flex items-center gap-2">
-                    {activeTab === 'preview' ? <Eye className="h-5 w-5 text-slate-500" /> : activeTab === 'data' ? <Database className="h-5 w-5 text-slate-500" /> : <FileDigit className="h-5 w-5 text-slate-500" />}
+                    {activeTab === 'preview' ? <Eye className="h-5 w-5 text-slate-500" /> : <Database className="h-5 w-5 text-slate-500" />}
                     <h2 className="text-base font-bold text-slate-900">
-                      {activeTab === 'preview' ? 'Preview' : activeTab === 'data' ? 'Extracted Data' : 'Raw Text'}
+                      {activeTab === 'preview' ? 'Preview' : 'Extracted Data'}
                     </h2>
                   </div>
                   <Badge variant="outline" className="rounded-full px-2.5 py-0.5 text-[10px] uppercase font-bold text-slate-500 bg-slate-50 border-slate-200">
@@ -1449,18 +1447,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                     </div>
                   </div>
                 )}
-
-                {/* 3. OCR View */}
-                {activeTab === 'ocr' && (
-                  <div className="absolute inset-0 overflow-y-auto bg-slate-50 text-slate-800">
-                    <div className="p-4 sm:p-8 max-w-4xl mx-auto font-mono text-[11px] sm:text-sm leading-relaxed whitespace-pre-wrap break-words">
-                      <ReactMarkdown>
-                        {activeDocument?.markdown || "No OCR transcription available."}
-                      </ReactMarkdown>
-                    </div>
-                  </div>
-                )}
-
               </div>
             </div>
 
