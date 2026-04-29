@@ -79,7 +79,12 @@ export type FieldKey =
   | "routeTo"
   | "mapLocation"
   | "photoTimestamp"
-  | "evidenceDescription";
+  | "evidenceDescription"
+  | "hasAuthorizedSignature"
+  | "hasVendorStamp"
+  | "hasStoreStamp"
+  | "hasStoreSignature"
+  | "hasGateStamp";
 
 export type DocType =
   | "Purchase Order"

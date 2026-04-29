@@ -88,6 +88,11 @@ export const FIELD_DEFINITIONS: FieldDefinition[] = [
   { key: 'mapLocation', label: 'Address / Location' },
   { key: 'photoTimestamp', label: 'Photo Timestamp' },
   { key: 'evidenceDescription', label: 'Evidence Description' },
+  { key: 'hasAuthorizedSignature', label: 'Authorized Signature Present' },
+  { key: 'hasVendorStamp', label: 'Vendor Stamp Present' },
+  { key: 'hasStoreStamp', label: 'Store Stamp Present' },
+  { key: 'hasStoreSignature', label: 'Store Signature Present' },
+  { key: 'hasGateStamp', label: 'Gate Stamp Present' },
 ];
 
 export const IGNORED_PACKET_FIELD_KEYS: readonly FieldKey[] = [
@@ -298,6 +303,8 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
     'subtotal',
     'taxAmount',
     'totalAmount',
+    'hasAuthorizedSignature',
+    'hasVendorStamp',
   ],
   'Amended Purchase Order': [
     'vendorName',
@@ -316,6 +323,8 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
     'subtotal',
     'taxAmount',
     'totalAmount',
+    'hasAuthorizedSignature',
+    'hasVendorStamp',
   ],
   Invoice: [
     'vendorName',
@@ -335,6 +344,11 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
     'taxAmount',
     'totalAmount',
     'vehicleNumber',
+    'hasAuthorizedSignature',
+    'hasVendorStamp',
+    'hasStoreStamp',
+    'hasStoreSignature',
+    'hasGateStamp',
   ],
   'Tax Invoice': [
     'vendorName',
@@ -359,6 +373,11 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
     'vehicleNumber',
     'bankName',
     'accountNumber',
+    'hasAuthorizedSignature',
+    'hasVendorStamp',
+    'hasStoreStamp',
+    'hasStoreSignature',
+    'hasGateStamp',
   ],
   Receipt: ['receiptNumber', 'referenceInvoiceNumber', 'documentDate', 'paidAmount', 'currency'],
   'Delivery Note': [
@@ -370,6 +389,11 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
     'itemDescription',
     'itemQuantity',
     'vehicleNumber',
+    'hasAuthorizedSignature',
+    'hasVendorStamp',
+    'hasStoreStamp',
+    'hasStoreSignature',
+    'hasGateStamp',
   ],
   'Delivery Challan': [
     'deliveryNoteNumber',
@@ -383,6 +407,11 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
     'vehicleNumber',
     'routeFrom',
     'routeTo',
+    'hasAuthorizedSignature',
+    'hasVendorStamp',
+    'hasStoreStamp',
+    'hasStoreSignature',
+    'hasGateStamp',
   ],
   'E-Way Bill': [
     'eWayBillNumber',
@@ -403,6 +432,7 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
     'grossWeight',
     'tareWeight',
     'netWeight',
+    'hasAuthorizedSignature',
   ],
   'Lorry Receipt': [
     'lorryReceiptNumber',
@@ -418,6 +448,7 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
     'freightAmount',
     'advanceAmount',
     'toPayAmount',
+    'hasAuthorizedSignature',
   ],
   'Vehicle Registration Certificate': [
     'registrationNumber',

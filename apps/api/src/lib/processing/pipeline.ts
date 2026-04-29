@@ -152,6 +152,11 @@ const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   mapLocation: ["mapLocation", "address", "registeredAddress", "holderAddress"],
   photoTimestamp: ["photoTimestamp", "captureTimestamp", "evidenceTimestamp"],
   evidenceDescription: ["evidenceDescription", "photoDescription", "observation"],
+  hasAuthorizedSignature: ["hasAuthorizedSignature", "authorizedSignature", "authorisedSignature", "signaturePresent", "hasSignature"],
+  hasVendorStamp: ["hasVendorStamp", "vendorStamp", "supplierStamp", "sellerStamp", "stampPresent"],
+  hasStoreStamp: ["hasStoreStamp", "storeStamp", "receivingStoreStamp", "warehouseStamp"],
+  hasStoreSignature: ["hasStoreSignature", "storeSignature", "receivingSignature", "warehouseSignature"],
+  hasGateStamp: ["hasGateStamp", "gateStamp", "gateEntryStamp", "securityStamp"],
 };
 
 function safeJsonParse<T>(raw: string, fallback: T): T {
@@ -675,6 +680,7 @@ async function extractDataFromImagePages(params: {
             `This document is a ${params.documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
             "visibleText must be a raw OCR-style transcription of the important visible text on the page. " +
             lineItemInstruction +
+            "For stamp/signature presence fields, return only Yes, No, or Unclear. Use Yes only when the mark is visibly present, No only when the relevant area is visible and clearly absent, otherwise Unclear. " +
             "For FASTag Toll Proof documents, extract statement reference, customer ID/name, statement period/date, vehicle number, tag account number, trip count, opening/credit/debit/closing balances, recharge/payment amount, toll plaza, and a compact toll transaction summary using the canonical FASTag keys. " +
             "For seller-issued documents, vendorName is the issuing supplier/seller/consignor and buyerName is the receiving party. " +
             "For Purchase Order or Amended Purchase Order documents, vendorName is the supplier/vendor receiving the order and buyerName is the purchaser issuing the order.",
@@ -751,6 +757,7 @@ async function extractDataFromTextPages(params: {
           `Extract structured fields from procurement packet text and return only JSON with keys "fields", "lineItems", and "visibleText". ` +
           `This document is a ${params.documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
           lineItemInstruction +
+          "For stamp/signature presence fields, return only Yes, No, or Unclear. Use Yes only when the text explicitly indicates a signature/stamp is present, No only when it explicitly indicates absence, otherwise Unclear. " +
           "Use only information present in the visible text. For seller-issued documents, vendorName is the issuing supplier and buyerName is the receiving party. " +
           "For Purchase Order or Amended Purchase Order documents, vendorName is the supplier/vendor receiving the order and buyerName is the purchaser issuing the order.",
       },
@@ -857,7 +864,7 @@ export async function processStoredCaseFiles(params: {
         documentType,
       });
     } else if (mimeType === "application/pdf") {
-      const textPages = await extractPdfTextPages(bytes);
+      const textPages = await extractPdfTextPages(bytes.slice());
       if (hasMeaningfulTextPages(textPages)) {
         const documentType = await classifyDocumentFromText(textPages, file.original_name);
         document = await extractDataFromTextPages({
