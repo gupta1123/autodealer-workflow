@@ -1,4 +1,11 @@
-import type { CaseDoc, CommercialLineItem, ComparisonOptions, Mismatch, QueuedUpload } from "@/types/pipeline";
+import type {
+  CaseAnalysisMode,
+  CaseDoc,
+  CommercialLineItem,
+  ComparisonOptions,
+  Mismatch,
+  QueuedUpload,
+} from "@/types/pipeline";
 import { apiFetch } from "@/lib/api-client";
 import { getQueuedUploadFiles, serializeQueuedUploadGroups } from "@/lib/upload-groups";
 
@@ -380,10 +387,14 @@ export async function appendCaseFiles(
 export async function enqueueCaseAnalysis(
   caseId: string,
   params: {
+    analysisMode?: CaseAnalysisMode;
     comparisonOptions?: ComparisonOptions;
   }
 ): Promise<EnqueueCaseAnalysisResponse> {
   const formData = new FormData();
+  if (params.analysisMode) {
+    formData.set("analysisMode", params.analysisMode);
+  }
   if (params.comparisonOptions) {
     formData.set("comparisonOptions", JSON.stringify(params.comparisonOptions));
   }

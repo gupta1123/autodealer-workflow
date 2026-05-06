@@ -59,6 +59,7 @@ import {
 } from "@/lib/case-persistence";
 import { readUploadGroupMeta } from "@/lib/upload-groups";
 import type {
+  CaseAnalysisMode,
   CommercialLineItem,
   ComparisonOptions,
   DocType,
@@ -206,6 +207,16 @@ function isImageSourceFile(mimeType?: string | null, sourceName?: string | null)
   return false;
 }
 
+function getDocumentSourcePage(document?: SavedCaseDetail["documents"][number] | null) {
+  const sourceText = [document?.sourceHint, document?.sourceFileName, document?.title]
+    .filter(Boolean)
+    .join(" ");
+  const match = sourceText.match(/\bpages?\s+(\d+)/i);
+  if (!match) return 1;
+  const page = Number(match[1]);
+  return Number.isFinite(page) && page > 0 ? Math.round(page) : 1;
+}
+
 function formatCaseSubject(category: string) {
   return /packet$/i.test(category.trim()) ? category.trim() : `${category} Packet`;
 }
@@ -243,6 +254,9 @@ function getFriendlyAnalysisStage(stage: string | null, status: "idle" | "proces
   }
   if (normalized.includes("queue")) {
     return "Preparing analysis...";
+  }
+  if (normalized.includes("split")) {
+    return "Organizing PDF documents...";
   }
   if (normalized.includes("extract")) {
     return "Extracting fields...";
@@ -373,6 +387,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   const [analysisStage, setAnalysisStage] = useState<string | null>(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [analysisOptionsOpen, setAnalysisOptionsOpen] = useState(false);
+  const [pendingAnalysisMode, setPendingAnalysisMode] = useState<CaseAnalysisMode>("standard");
   const [draftFileStatus, setDraftFileStatus] = useState<"idle" | "saving" | "error">("idle");
   const [draftFileError, setDraftFileError] = useState<string | null>(null);
   const [decisionStatus, setDecisionStatus] = useState<"idle" | "updating" | "error">("idle");
@@ -651,6 +666,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     activePreviewFile?.mimeType,
     activePreviewFile?.originalName || activeDocument?.sourceFileName || activeDocument?.sourceHint
   );
+  const activeDocumentSourcePage = getDocumentSourcePage(activeDocument);
   const canGoToPreviousPreviewPage = previewPageIndex > 0;
   const canGoToNextPreviewPage =
     activeDocumentFiles.length > 0 && previewPageIndex < activeDocumentFiles.length - 1;
@@ -700,15 +716,19 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     return result;
   }, [comparisonOptions, detail]);
 
-  async function handleAnalyzeDraftCase(comparisonOptions: ComparisonOptions) {
+  async function handleAnalyzeDraftCase(
+    comparisonOptions: ComparisonOptions,
+    analysisMode: CaseAnalysisMode = "standard"
+  ) {
     if (!detail || detail.files.length === 0) return;
 
     try {
       setAnalysisStatus("processing");
       setAnalysisError(null);
       setAnalysisProgress(0);
-      setAnalysisStage("Queued for analysis");
+      setAnalysisStage(analysisMode === "smart_split" ? "Queued for multi-document analysis" : "Queued for analysis");
       const started = await enqueueCaseAnalysis(detail.case.id, {
+        analysisMode,
         comparisonOptions,
       });
       setDetail((current) =>
@@ -953,10 +973,27 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                     type="button"
                     disabled={detail.files.length === 0}
                     className="flex-1 rounded-2xl bg-[#1a1a1a] px-8 py-6 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] transition-transform hover:scale-[1.02]"
-                    onClick={() => setAnalysisOptionsOpen(true)}
+                    onClick={() => {
+                      setPendingAnalysisMode("standard");
+                      setAnalysisOptionsOpen(true);
+                    }}
                   >
                     <Play className="mr-2 h-5 w-5 fill-white" />
                     {canRetry ? "Retry analysis" : "Analyze case"}
+                  </Button>
+
+                  <Button
+                    type="button"
+                    disabled={detail.files.length === 0}
+                    variant="outline"
+                    className="rounded-2xl border-emerald-200 bg-emerald-50 px-6 py-6 text-base font-bold text-emerald-800 shadow-sm transition-transform hover:scale-[1.02] hover:bg-emerald-100 hover:text-emerald-900"
+                    onClick={() => {
+                      setPendingAnalysisMode("smart_split");
+                      setAnalysisOptionsOpen(true);
+                    }}
+                  >
+                    <Sparkles className="mr-2 h-5 w-5" />
+                    Analyze multi-doc PDF
                   </Button>
                 </div>
               )}
@@ -968,7 +1005,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
             onOpenChange={setAnalysisOptionsOpen}
             onSelect={(nextOptions) => {
               setAnalysisOptionsOpen(false);
-              void handleAnalyzeDraftCase(nextOptions);
+              void handleAnalyzeDraftCase(nextOptions, pendingAnalysisMode);
             }}
           />
         </div>
@@ -1277,8 +1314,8 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 {detail?.documents.map((doc) => {
                   const isActive = activeDocumentId === doc.id;
                   return (
-                    <button
-                      key={doc.id}
+                      <button
+                        key={doc.id}
                       onClick={() => setActiveDocumentId(doc.id)}
                       className={`snap-start shrink-0 flex flex-col items-center justify-center px-4 py-2 rounded-lg text-center transition-all border ${isActive 
                         ? 'bg-[#1a1a1a] border-slate-900 shadow-md text-white' 
@@ -1371,7 +1408,8 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                           </div>
                         ) : (
                           <iframe
-                            src={`${activeFileUrl}#toolbar=0&navpanes=0`}
+                            key={`${activeFileUrl}-${activeDocumentSourcePage}`}
+                            src={`${activeFileUrl}#page=${activeDocumentSourcePage}&toolbar=0&navpanes=0`}
                             className="absolute inset-0 w-full h-full border-0 bg-white"
                             title="Document Preview"
                           />

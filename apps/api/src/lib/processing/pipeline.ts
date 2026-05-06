@@ -17,14 +17,15 @@ import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-servi
 import { isCommercialDocType, sanitizeLineItems } from "@/lib/line-items";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { verifyCaseDocuments } from "@/services/verification";
-import type { CaseDoc, CommercialLineItem, DocType, FieldKey, Mismatch } from "@/types/pipeline";
+import type { CaseAnalysisMode, CaseDoc, CommercialLineItem, DocType, FieldKey, Mismatch } from "@/types/pipeline";
 
-import { callOpenRouter } from "./openrouter";
+import { callOpenRouter, getQualityExtractionModel, getQualityExtractionReasoning } from "./openrouter";
 
 const STORAGE_BUCKET = "packet-files";
 const execFileAsync = promisify(execFile);
 const PDF_RENDER_DPI = Number(process.env.PACKET_PDF_RENDER_DPI ?? 160);
 const PDF_RENDER_MAX_PAGES = Number(process.env.PACKET_PDF_RENDER_MAX_PAGES ?? 8);
+const PDF_SMART_SPLIT_MAX_PAGES = Number(process.env.PACKET_PDF_SMART_SPLIT_MAX_PAGES ?? 20);
 
 function resolvePdfJsWorkerSrc() {
   const candidates = [
@@ -202,6 +203,32 @@ function getLineItemExtractionInstruction(docType: DocType) {
   );
 }
 
+function getDocumentSpecificExtractionInstruction(docType: DocType) {
+  switch (docType) {
+    case "PAN Card":
+      return (
+        "For PAN Card documents, prioritize panNumber, holderName, fatherName, and dateOfBirth. " +
+        "PAN number is a 10-character Indian PAN like ABCDE1234F; do not leave it blank if visible. "
+      );
+    case "Driving Licence":
+      return (
+        "For Driving Licence documents, prioritize licenseNumber, driverName, dateOfBirth, validityDate, and mapLocation/address. " +
+        "The licence number may be labelled DL No, Licence No, License No, or DL Number. "
+      );
+    case "Vehicle Registration Certificate":
+      return (
+        "For Vehicle Registration Certificate documents, prioritize registrationNumber, vehicleNumber, ownerName, chassisNumber, engineNumber, vehicleClass, fuelType, validityDate, and address. "
+      );
+    case "Weighment Slip":
+      return (
+        "For Weighment Slip documents, prioritize vehicleNumber/lorry number, grossWeight, tareWeight, netWeight, weighmentNumber, weighbridgeName, and authorized signature presence. " +
+        "Read Indian vehicle numbers carefully from the image; distinguish letters from similar-looking digits, especially G/9, L/1, O/0, and S/5. "
+      );
+    default:
+      return "";
+  }
+}
+
 function mapFields(fields: Record<string, unknown>, docType?: DocType): Partial<Record<FieldKey, string>> {
   const result: Partial<Record<FieldKey, string>> = {};
   const allowedFieldKeys = docType ? getAllowedFieldKeysForDocType(docType) : ALL_ALLOWED_FIELD_KEYS;
@@ -219,6 +246,58 @@ function mapFields(fields: Record<string, unknown>, docType?: DocType): Partial<
   });
 
   return omitIgnoredFields(result) as Partial<Record<FieldKey, string>>;
+}
+
+function mergeFieldRecords(
+  primary: Partial<Record<FieldKey, string>>,
+  fallback: Partial<Record<FieldKey, string>>
+) {
+  return {
+    ...fallback,
+    ...Object.fromEntries(
+      Object.entries(primary).filter(([, value]) => value !== undefined && value !== null && String(value).trim())
+    ),
+  } as Partial<Record<FieldKey, string>>;
+}
+
+function mergeExtractedDocs(primary: CaseDoc, fallback: CaseDoc): CaseDoc {
+  return {
+    ...primary,
+    fields: mergeFieldRecords(primary.fields, fallback.fields),
+    lineItems: primary.lineItems?.length ? primary.lineItems : fallback.lineItems,
+    md: primary.md?.trim() ? primary.md : fallback.md,
+  };
+}
+
+function countMeaningfulFields(fields: Partial<Record<FieldKey, string>>) {
+  return Object.values(fields).filter((value) => value !== undefined && value !== null && String(value).trim()).length;
+}
+
+function isWeakExtraction(doc: CaseDoc) {
+  const fields = doc.fields ?? {};
+  const meaningfulFieldCount = countMeaningfulFields(fields);
+
+  switch (doc.type) {
+    case "PAN Card":
+      return !fields.panNumber && !fields.holderName;
+    case "Driving Licence":
+      return !fields.licenseNumber && !fields.driverName;
+    case "Vehicle Registration Certificate":
+      return !fields.registrationNumber && !fields.vehicleNumber && !fields.ownerName;
+    case "FASTag Toll Proof":
+      return !fields.vehicleNumber && !fields.fastagReference && !fields.tollTransactionSummary;
+    case "E-Way Bill":
+      return !fields.eWayBillNumber && !fields.vehicleNumber;
+    case "Tax Invoice":
+    case "Invoice":
+      return !fields.invoiceNumber && !fields.vendorName && !fields.buyerName && !fields.totalAmount;
+    case "Weighment Slip":
+      return !fields.netWeight && !fields.grossWeight && !fields.vehicleNumber;
+    case "Lorry Receipt":
+      return !fields.lorryReceiptNumber && !fields.vehicleNumber && !fields.transporterName;
+    default:
+      return doc.type !== "Unknown" && meaningfulFieldCount === 0;
+  }
 }
 
 function normalizeFieldValue(value: unknown): string | undefined {
@@ -535,10 +614,11 @@ function renderedPageNumber(fileName: string) {
   return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
 }
 
-async function renderPdfToImagePages(data: Uint8Array) {
+async function renderPdfToImagePages(data: Uint8Array, options?: { maxPages?: number }) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "packet-pdf-"));
   const inputPath = path.join(tmpDir, "input.pdf");
   const outputPrefix = path.join(tmpDir, "page");
+  const maxPages = options?.maxPages ?? PDF_RENDER_MAX_PAGES;
 
   try {
     fs.writeFileSync(inputPath, Buffer.from(data));
@@ -549,7 +629,7 @@ async function renderPdfToImagePages(data: Uint8Array) {
       "-f",
       "1",
       "-l",
-      String(PDF_RENDER_MAX_PAGES),
+      String(maxPages),
       inputPath,
       outputPrefix,
     ]);
@@ -659,15 +739,447 @@ async function classifyDocumentFromText(textPages: string[], fileName = ""): Pro
   return classified === "Unknown" ? inferred : classified;
 }
 
+type PdfDocumentGroup = {
+  documentType: DocType;
+  pageStart: number;
+  pageEnd: number;
+  confidence?: number;
+};
+
+function pageRangeLabel(group: PdfDocumentGroup) {
+  return group.pageStart === group.pageEnd
+    ? `page ${group.pageStart}`
+    : `pages ${group.pageStart}-${group.pageEnd}`;
+}
+
+function normalizePageNumber(value: unknown) {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? Math.round(numberValue) : NaN;
+}
+
+function normalizePdfDocumentGroups(
+  rawGroups: unknown,
+  pageCount: number,
+  fileName: string
+): PdfDocumentGroup[] {
+  const inferred = inferDocTypeFromFilename(fileName);
+  const groups = Array.isArray(rawGroups) ? rawGroups : [];
+  const parsedGroups = groups
+    .map((entry): PdfDocumentGroup | null => {
+      if (!entry || typeof entry !== "object") return null;
+      const record = entry as Record<string, unknown>;
+      const pageValues = Array.isArray(record.pages) ? record.pages : [];
+      const pageStart = normalizePageNumber(record.pageStart ?? record.startPage ?? record.fromPage ?? pageValues[0]);
+      const pageEnd = normalizePageNumber(record.pageEnd ?? record.endPage ?? record.toPage ?? pageValues[1] ?? pageValues[0]);
+      if (!Number.isFinite(pageStart) || !Number.isFinite(pageEnd)) return null;
+
+      const group: PdfDocumentGroup = {
+        documentType: normaliseDocType(String(record.documentType ?? record.type ?? record.docType ?? "")),
+        pageStart: Math.max(1, Math.min(pageCount, pageStart)),
+        pageEnd: Math.max(1, Math.min(pageCount, pageEnd)),
+      };
+
+      if (typeof record.confidence === "number") {
+        group.confidence = record.confidence;
+      }
+
+      return group;
+    })
+    .filter((entry): entry is PdfDocumentGroup => entry !== null)
+    .map((entry): PdfDocumentGroup => {
+      const pageStart = Math.min(entry.pageStart, entry.pageEnd);
+      const pageEnd = Math.max(entry.pageStart, entry.pageEnd);
+      return { ...entry, pageStart, pageEnd };
+    })
+    .sort((left, right) => left.pageStart - right.pageStart || left.pageEnd - right.pageEnd);
+
+  if (pageCount <= 0) {
+    return [];
+  }
+
+  if (!parsedGroups.length) {
+    return [{ documentType: inferred, pageStart: 1, pageEnd: pageCount }];
+  }
+
+  const seen = new Set<string>();
+  const normalized = parsedGroups.filter((group) => {
+    const key = `${group.documentType}:${group.pageStart}:${group.pageEnd}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const isPageCovered = (pageNumber: number) =>
+    normalized.some((group) => group.pageStart <= pageNumber && group.pageEnd >= pageNumber);
+
+  let cursor = 1;
+  while (cursor <= pageCount) {
+    if (isPageCovered(cursor)) {
+      cursor += 1;
+      continue;
+    }
+
+    let gapEnd = cursor;
+    while (gapEnd + 1 <= pageCount && !isPageCovered(gapEnd + 1)) {
+      gapEnd += 1;
+    }
+
+    normalized.push({
+      documentType: "Unknown",
+      pageStart: cursor,
+      pageEnd: gapEnd,
+    });
+    cursor = gapEnd + 1;
+  }
+
+  normalized.sort((left, right) => left.pageStart - right.pageStart || left.pageEnd - right.pageEnd);
+
+  return normalized.length ? normalized : [{ documentType: inferred, pageStart: 1, pageEnd: pageCount }];
+}
+
+function isCollapsedPdfSplit(groups: PdfDocumentGroup[], pageCount: number) {
+  return (
+    pageCount > 1 &&
+    groups.length === 1 &&
+    groups[0]?.pageStart === 1 &&
+    groups[0]?.pageEnd === pageCount
+  );
+}
+
+function compactConsecutivePdfGroups(groups: PdfDocumentGroup[]) {
+  const sorted = [...groups].sort((left, right) => left.pageStart - right.pageStart || left.pageEnd - right.pageEnd);
+  const compacted: PdfDocumentGroup[] = [];
+
+  for (const group of sorted) {
+    const previous = compacted[compacted.length - 1];
+    if (
+      previous &&
+      previous.documentType === group.documentType &&
+      previous.pageEnd + 1 === group.pageStart
+    ) {
+      previous.pageEnd = group.pageEnd;
+      previous.confidence =
+        typeof previous.confidence === "number" && typeof group.confidence === "number"
+          ? Math.min(previous.confidence, group.confidence)
+          : previous.confidence ?? group.confidence;
+      continue;
+    }
+
+    compacted.push({ ...group });
+  }
+
+  return compacted;
+}
+
+async function splitPdfPagesIndividually(params: {
+  fileName: string;
+  textPages: string[];
+  pageImages: string[];
+  pageCount: number;
+}) {
+  const pageGroups: PdfDocumentGroup[] = [];
+  const systemPrompt =
+    `Classify one page from a procurement packet PDF. Return only JSON with a top-level "documents" array. ` +
+    `Each item must contain documentType and confidence. Use only these documentType values: ${SUPPORTED_DOC_TYPES.join(", ")}. ` +
+    `Use the rendered page image as the source of truth when available; use text only as supporting context. ` +
+    `If this one page visibly contains multiple separate documents or cards, return multiple records. ` +
+    `Do not infer document type from the file name when the page image/text shows a different document.`;
+
+  for (let index = 0; index < params.pageCount; index += 1) {
+    const pageNumber = index + 1;
+    const pageText = params.textPages[index] || "[No text extracted]";
+    const pageImage = params.pageImages[index];
+
+    const raw = pageImage
+      ? await callOpenRouter(
+          [
+            {
+              role: "system",
+              content: systemPrompt,
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `File name: ${params.fileName}. Classify rendered page ${pageNumber} of ${params.pageCount}.\n\n` +
+                    `OCR text for this page:\n${pageText.slice(0, 8000)}`,
+                },
+                { type: "image_url" as const, image_url: { url: pageImage } },
+              ],
+            },
+          ],
+          {
+            expectJson: true,
+            model: getQualityExtractionModel(),
+            reasoning: getQualityExtractionReasoning(),
+          }
+        )
+      : await callOpenRouter(
+          [
+            {
+              role: "system",
+              content: systemPrompt,
+            },
+            {
+              role: "user",
+              content:
+                `File name: ${params.fileName}. Classify page ${pageNumber} of ${params.pageCount}.\n\n` +
+                `Visible text:\n${pageText.slice(0, 12000)}`,
+            },
+          ],
+          {
+            expectJson: true,
+            model: getQualityExtractionModel(),
+            reasoning: getQualityExtractionReasoning(),
+          }
+        );
+
+    const parsed = safeJsonParse<{ documents?: unknown }>(raw, {});
+    const pageDocuments = Array.isArray(parsed.documents) ? parsed.documents : [];
+    const normalizedPageGroups = normalizePdfDocumentGroups(
+      pageDocuments.map((entry) =>
+        entry && typeof entry === "object"
+          ? {
+              ...(entry as Record<string, unknown>),
+              pageStart: pageNumber,
+              pageEnd: pageNumber,
+            }
+          : entry
+      ),
+      params.pageCount,
+      params.fileName
+    ).filter((group) => group.pageStart === pageNumber && group.pageEnd === pageNumber);
+
+    pageGroups.push(
+      ...(normalizedPageGroups.length
+        ? normalizedPageGroups
+        : [{ documentType: "Unknown" as DocType, pageStart: pageNumber, pageEnd: pageNumber }])
+    );
+  }
+
+  return compactConsecutivePdfGroups(pageGroups);
+}
+
+async function splitPdfIntoDocumentGroups(params: {
+  fileName: string;
+  textPages: string[];
+  pageImages: string[];
+}) {
+  const pageCount = Math.max(params.textPages.length, params.pageImages.length);
+  if (pageCount <= 1) {
+    return [
+      {
+        documentType: params.textPages.some((page) => page.trim())
+          ? await classifyDocumentFromText(params.textPages, params.fileName)
+          : await classifyDocumentFromImage(params.pageImages[0] ?? "", params.fileName),
+        pageStart: 1,
+        pageEnd: 1,
+      },
+    ];
+  }
+
+  const hasText = hasMeaningfulTextPages(params.textPages);
+  const systemPrompt =
+    `You split uploaded procurement packet PDFs into separate documents. Return only JSON with a top-level "documents" array. ` +
+    `Each item must contain documentType, pageStart, pageEnd, and confidence. Use only these documentType values: ${SUPPORTED_DOC_TYPES.join(", ")}. ` +
+    `Group consecutive pages belonging to the same physical/logical document. Do not merge different document types just because they are in one PDF. ` +
+    `If one scanned page visibly contains multiple separate cards/documents, output multiple records with the same pageStart and pageEnd. ` +
+    `For example, one page may contain Vehicle Registration Certificate, Driving Licence, and PAN Card together; emit three records all pointing to that page. ` +
+    `Do not invent PAN Card or Driving Licence records on later pages just because they appeared on an earlier multi-document scan. ` +
+    `Pages showing camera overlays, vehicle loading/unloading photos, gate photos, or timestamped vehicle photos are Photo Evidence. ` +
+    `Use PAN Card only when the page visibly contains Income Tax/Permanent Account Number/PAN card content. Use Driving Licence only when the page visibly contains a licence card.`;
+
+  const pageTextSummary = params.textPages
+    .map((page, index) => `Page ${index + 1} text:\n${page || "[No text extracted]"}`)
+    .join("\n\n")
+    .slice(0, 30000);
+
+  if (!params.pageImages.length && !hasText) {
+    return [{ documentType: inferDocTypeFromFilename(params.fileName), pageStart: 1, pageEnd: pageCount }];
+  }
+
+  const raw = params.pageImages.length
+    ? await callOpenRouter(
+        [
+          {
+            role: "system",
+            content: systemPrompt,
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text:
+                  `File name: ${params.fileName}. There are ${pageCount} pages. Identify which document is on which pages. ` +
+                  `Use the rendered page images as the source of truth; use the OCR text only as supporting context.\n\n${pageTextSummary}`,
+              },
+              ...params.pageImages.flatMap((image, index) => [
+                { type: "text" as const, text: `Rendered page ${index + 1}` },
+                { type: "image_url" as const, image_url: { url: image } },
+              ]),
+            ],
+          },
+        ],
+        {
+          expectJson: true,
+          model: getQualityExtractionModel(),
+          reasoning: getQualityExtractionReasoning(),
+        }
+      )
+    : hasText
+    ? await callOpenRouter(
+        [
+          {
+            role: "system",
+            content: systemPrompt,
+          },
+          {
+            role: "user",
+            content:
+              `File name: ${params.fileName}\n` +
+              `There are ${params.textPages.length} pages. Identify which document is on which pages.\n\n` +
+              pageTextSummary,
+          },
+        ],
+        { expectJson: true }
+      )
+    : await callOpenRouter(
+        [
+          {
+            role: "system",
+            content: systemPrompt,
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: `File name: ${params.fileName}. There are ${params.pageImages.length} rendered pages. Identify which document is on which pages.`,
+              },
+              ...params.pageImages.flatMap((image, index) => [
+                { type: "text" as const, text: `Page ${index + 1}` },
+                { type: "image_url" as const, image_url: { url: image } },
+              ]),
+            ],
+          },
+        ],
+        { expectJson: true }
+      );
+
+  const parsed = safeJsonParse<{ documents?: unknown; groups?: unknown }>(raw, {});
+  const normalized = normalizePdfDocumentGroups(parsed.documents ?? parsed.groups, pageCount, params.fileName);
+
+  if (isCollapsedPdfSplit(normalized, pageCount)) {
+    try {
+      const pageLevelGroups = await splitPdfPagesIndividually({ ...params, pageCount });
+      if (
+        pageLevelGroups.length > 1 ||
+        (pageLevelGroups.length === 1 && pageLevelGroups[0]?.documentType !== normalized[0]?.documentType)
+      ) {
+        return pageLevelGroups;
+      }
+    } catch (error) {
+      console.warn("Page-level smart split fallback failed", error);
+    }
+  }
+
+  return normalized;
+}
+
+async function extractPdfDocumentGroups(params: {
+  fileName: string;
+  textPages: string[];
+  pageImages: string[];
+  groups: PdfDocumentGroup[];
+}) {
+  const documents: CaseDoc[] = [];
+  const hasText = hasMeaningfulTextPages(params.textPages);
+
+  for (const group of params.groups) {
+    const pageStartIndex = group.pageStart - 1;
+    const pageEndIndex = group.pageEnd;
+    const sourceHint = `${params.fileName} (${pageRangeLabel(group)})`;
+    const groupFileName = sourceHint;
+    const groupTextPages = params.textPages.slice(pageStartIndex, pageEndIndex);
+    const groupPageImages = params.pageImages.slice(pageStartIndex, pageEndIndex);
+
+    let document =
+      groupPageImages.length
+        ? await extractDataFromImagePages({
+            fileName: groupFileName,
+            pageImages: groupPageImages,
+            documentType: group.documentType,
+          })
+        : hasText && groupTextPages.some((page) => page.trim())
+          ? await extractDataFromTextPages({
+              fileName: groupFileName,
+              textPages: groupTextPages,
+              documentType: group.documentType,
+            })
+          : fallbackDoc(groupFileName, group.documentType, {
+              pages: Math.max(1, group.pageEnd - group.pageStart + 1),
+              visibleTextPages: groupTextPages,
+            });
+
+    if (isWeakExtraction(document) && group.documentType !== "Unknown") {
+      const qualityModel = getQualityExtractionModel();
+      const qualityReasoning = getQualityExtractionReasoning();
+      const retryDocument =
+        groupPageImages.length
+          ? await extractDataFromImagePages({
+              fileName: groupFileName,
+              pageImages: groupPageImages,
+              documentType: group.documentType,
+              model: qualityModel,
+              reasoning: qualityReasoning,
+              qualityRetry: true,
+            })
+          : hasText && groupTextPages.some((page) => page.trim())
+          ? await extractDataFromTextPages({
+              fileName: groupFileName,
+              textPages: groupTextPages,
+              documentType: group.documentType,
+              model: qualityModel,
+              reasoning: qualityReasoning,
+              qualityRetry: true,
+            })
+          : null;
+
+      if (retryDocument && !isWeakExtraction(retryDocument)) {
+        document = mergeExtractedDocs(retryDocument, document);
+      } else if (retryDocument) {
+        document = mergeExtractedDocs(document, retryDocument);
+      }
+    }
+
+    document.sourceHint = sourceHint;
+    document.sourceFileName = params.fileName;
+    document.pages = Math.max(1, group.pageEnd - group.pageStart + 1);
+    documents.push(document);
+  }
+
+  return documents;
+}
+
 async function extractDataFromImagePages(params: {
   fileName: string;
   pageImages: string[];
   documentType: DocType;
+  model?: string;
+  reasoning?: ReturnType<typeof getQualityExtractionReasoning>;
+  qualityRetry?: boolean;
 }) {
   const allowedFieldKeys = getAllowedFieldKeysForDocType(params.documentType);
   const allowedFieldKeysText = allowedFieldKeys.join(", ");
   const extracted: Array<{ fields: Record<string, unknown>; lineItems: CommercialLineItem[]; visibleText: string }> = [];
   const lineItemInstruction = getLineItemExtractionInstruction(params.documentType);
+  const documentSpecificInstruction = getDocumentSpecificExtractionInstruction(params.documentType);
+  const qualityInstruction = params.qualityRetry
+    ? "This is a quality retry because the first extraction was weak. Re-read the page carefully, including small text, IDs, stamps, QR-adjacent text, and rotated/cropped regions. Do not return empty fields when any requested value is visible. "
+    : "";
 
   for (let index = 0; index < params.pageImages.length; index += 1) {
     const image = params.pageImages[index];
@@ -679,6 +1191,8 @@ async function extractDataFromImagePages(params: {
             `Extract structured fields and visible text from procurement, logistics, transport, vehicle KYC, FASTag, quality certificate, and photo-evidence documents and return only JSON with keys "fields", "lineItems", and "visibleText". ` +
             `This document is a ${params.documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
             "visibleText must be a raw OCR-style transcription of the important visible text on the page. " +
+            qualityInstruction +
+            documentSpecificInstruction +
             lineItemInstruction +
             "For stamp/signature presence fields, return only Yes, No, or Unclear. Use Yes only when the mark is visibly present, No only when the relevant area is visible and clearly absent, otherwise Unclear. " +
             "For FASTag Toll Proof documents, extract statement reference, customer ID/name, statement period/date, vehicle number, tag account number, trip count, opening/credit/debit/closing balances, recharge/payment amount, toll plaza, and a compact toll transaction summary using the canonical FASTag keys. " +
@@ -693,7 +1207,7 @@ async function extractDataFromImagePages(params: {
           ],
         },
       ],
-      { expectJson: true }
+      { expectJson: true, model: params.model, reasoning: params.reasoning }
     );
 
     const parsed = safeJsonParse<{ fields?: Record<string, unknown>; lineItems?: unknown; visibleText?: unknown; text?: unknown; ocrText?: unknown }>(raw, {});
@@ -737,10 +1251,17 @@ async function extractDataFromTextPages(params: {
   fileName: string;
   textPages: string[];
   documentType: DocType;
+  model?: string;
+  reasoning?: ReturnType<typeof getQualityExtractionReasoning>;
+  qualityRetry?: boolean;
 }) {
   const allowedFieldKeys = getAllowedFieldKeysForDocType(params.documentType);
   const allowedFieldKeysText = allowedFieldKeys.join(", ");
   const lineItemInstruction = getLineItemExtractionInstruction(params.documentType);
+  const documentSpecificInstruction = getDocumentSpecificExtractionInstruction(params.documentType);
+  const qualityInstruction = params.qualityRetry
+    ? "This is a quality retry because the first extraction was weak. Re-read the text carefully and do not return empty fields when any requested value is visible. "
+    : "";
   const visibleText = params.textPages.map((page, index) => `Page ${index + 1}: ${page}`).join("\n\n");
 
   if (!visibleText.trim()) {
@@ -756,6 +1277,8 @@ async function extractDataFromTextPages(params: {
         content:
           `Extract structured fields from procurement packet text and return only JSON with keys "fields", "lineItems", and "visibleText". ` +
           `This document is a ${params.documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
+          qualityInstruction +
+          documentSpecificInstruction +
           lineItemInstruction +
           "For stamp/signature presence fields, return only Yes, No, or Unclear. Use Yes only when the text explicitly indicates a signature/stamp is present, No only when it explicitly indicates absence, otherwise Unclear. " +
           "Use only information present in the visible text. For seller-issued documents, vendorName is the issuing supplier and buyerName is the receiving party. " +
@@ -766,7 +1289,7 @@ async function extractDataFromTextPages(params: {
         content: `File name: ${params.fileName}\n\nVisible text:\n${visibleText.slice(0, 24000)}`,
       },
     ],
-    { expectJson: true }
+    { expectJson: true, model: params.model, reasoning: params.reasoning }
   );
 
   const parsed = safeJsonParse<{ fields?: Record<string, unknown>; lineItems?: unknown; visibleText?: unknown }>(raw, {});
@@ -811,12 +1334,14 @@ function buildMismatchCopy(mismatch: Omit<Mismatch, "analysis" | "fixPlan">): Pi
 
 export async function processStoredCaseFiles(params: {
   caseId: string;
+  analysisMode?: CaseAnalysisMode;
   comparisonOptions?: unknown;
   onProgress?: (details: { progress: number; stage: string }) => Promise<void> | void;
 }) {
   const supabase = createSupabaseAdminClient();
   const fieldConfiguration = await getPersistedPacketFieldConfiguration();
   const comparisonOptions = readComparisonOptions(params.comparisonOptions ?? DEFAULT_COMPARISON_OPTIONS);
+  const analysisMode = params.analysisMode ?? "standard";
 
   const { data: files, error: filesError } = await supabase
     .from("packet_case_files")
@@ -850,7 +1375,7 @@ export async function processStoredCaseFiles(params: {
     const bytes = new Uint8Array(await download.data.arrayBuffer());
     const mimeType = getFileMimeType(file.original_name, file.mime_type);
 
-    let document: CaseDoc;
+    let fileDocuments: CaseDoc[] = [];
     if (mimeType.startsWith("image/")) {
       await params.onProgress?.({
         progress: Math.max(10, Math.round((index / files.length) * 70)),
@@ -858,20 +1383,53 @@ export async function processStoredCaseFiles(params: {
       });
       const image = bufferToDataUrl(bytes, mimeType);
       const documentType = await classifyDocumentFromImage(image, file.original_name);
-      document = await extractDataFromImagePages({
+      const document = await extractDataFromImagePages({
         fileName: file.original_name,
         pageImages: [image],
         documentType,
       });
+      fileDocuments = [document];
     } else if (mimeType === "application/pdf") {
       const textPages = await extractPdfTextPages(bytes.slice());
-      if (hasMeaningfulTextPages(textPages)) {
+      if (analysisMode === "smart_split") {
+        await params.onProgress?.({
+          progress: Math.max(10, Math.round((index / files.length) * 70)),
+          stage: `Splitting ${file.original_name} into documents`,
+        });
+
+        let pageImages: string[] = [];
+        try {
+          pageImages = await renderPdfToImagePages(bytes, { maxPages: PDF_SMART_SPLIT_MAX_PAGES });
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error ?? "Unknown error");
+          if (!hasMeaningfulTextPages(textPages)) {
+            throw new Error(
+              `Unable to render scanned PDF "${file.original_name}". Install poppler-utils/pdftoppm in the API runtime. ${reason}`
+            );
+          }
+          console.warn(`Unable to render PDF "${file.original_name}" for smart split image fallback. Continuing with text only. ${reason}`);
+        }
+
+        const groups = await splitPdfIntoDocumentGroups({
+          fileName: file.original_name,
+          textPages,
+          pageImages,
+        });
+
+        fileDocuments = await extractPdfDocumentGroups({
+          fileName: file.original_name,
+          textPages,
+          pageImages,
+          groups,
+        });
+      } else if (hasMeaningfulTextPages(textPages)) {
         const documentType = await classifyDocumentFromText(textPages, file.original_name);
-        document = await extractDataFromTextPages({
+        const document = await extractDataFromTextPages({
           fileName: file.original_name,
           textPages,
           documentType,
         });
+        fileDocuments = [document];
       } else {
         await params.onProgress?.({
           progress: Math.max(10, Math.round((index / files.length) * 70)),
@@ -889,25 +1447,29 @@ export async function processStoredCaseFiles(params: {
         }
 
         if (pageImages.length === 0) {
-          document = fallbackDoc(file.original_name, inferDocTypeFromFilename(file.original_name), {
+          const document = fallbackDoc(file.original_name, inferDocTypeFromFilename(file.original_name), {
             pages: Math.max(1, textPages.length),
           });
+          fileDocuments = [document];
         } else {
           const documentType = await classifyDocumentFromImage(pageImages[0], file.original_name);
-          document = await extractDataFromImagePages({
+          const document = await extractDataFromImagePages({
             fileName: file.original_name,
             pageImages,
             documentType,
           });
+          fileDocuments = [document];
         }
       }
     } else {
-      document = fallbackDoc(file.original_name, inferDocTypeFromFilename(file.original_name));
+      fileDocuments = [fallbackDoc(file.original_name, inferDocTypeFromFilename(file.original_name))];
     }
 
-    document.sourceHint = file.original_name;
-    document.sourceFileName = file.original_name;
-    documents.push(document);
+    for (const document of fileDocuments) {
+      document.sourceHint = document.sourceHint ?? file.original_name;
+      document.sourceFileName = document.sourceFileName ?? file.original_name;
+      documents.push(document);
+    }
   }
 
   await params.onProgress?.({ progress: 80, stage: "Comparing extracted fields" });
@@ -925,6 +1487,7 @@ export async function processStoredCaseFiles(params: {
     mismatches,
     summary,
     comparisonOptions,
+    analysisMode,
     fieldConfiguration,
   };
 }

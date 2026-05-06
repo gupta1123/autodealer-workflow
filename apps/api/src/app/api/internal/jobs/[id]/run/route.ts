@@ -3,6 +3,7 @@ import { resolveCaseDisplayNameWithAI } from "@/lib/case-naming";
 import { serializeFieldsWithLineItems } from "@/lib/line-items";
 import { processStoredCaseFiles } from "@/lib/processing/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import type { CaseAnalysisMode } from "@/types/pipeline";
 
 const WORKER_SECRET = process.env.WORKER_SECRET || "";
 
@@ -12,6 +13,10 @@ function unauthorized(request: Request) {
 
 function toMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error ?? "Unknown error");
+}
+
+function readAnalysisMode(value: unknown): CaseAnalysisMode {
+  return value === "smart_split" ? "smart_split" : "standard";
 }
 
 export async function POST(
@@ -65,11 +70,13 @@ export async function POST(
       locked_at: now,
     });
 
-    const comparisonOptions =
-      job.result && typeof job.result === "object" ? (job.result as Record<string, unknown>).comparisonOptions : undefined;
+    const jobResult = job.result && typeof job.result === "object" ? (job.result as Record<string, unknown>) : {};
+    const analysisMode = readAnalysisMode(jobResult.analysisMode);
+    const comparisonOptions = jobResult.comparisonOptions;
 
     const processed = await processStoredCaseFiles({
       caseId: job.case_id,
+      analysisMode,
       comparisonOptions,
       onProgress: async ({ progress, stage }) => {
         await updateJob({
@@ -166,6 +173,7 @@ export async function POST(
           documentTypes: processed.summary.documentTypes,
           missingDocumentGroups: processed.summary.missingDocTypes,
           paymentGap: processed.summary.paymentGap,
+          analysisMode,
           comparisonOptions: processed.comparisonOptions,
           lastProcessingError: null,
         },
@@ -183,6 +191,7 @@ export async function POST(
       error: null,
       result: {
         summary: processed.summary,
+        analysisMode,
         documentCount: processed.documents.length,
         mismatchCount: processed.mismatches.length,
       },

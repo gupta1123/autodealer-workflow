@@ -201,6 +201,8 @@ export interface ComparisonOptions {
   considerFormatting: boolean;
 }
 
+export type CaseAnalysisMode = "standard" | "smart_split";
+
 export type ProcessingStep =
   | "idle"
   | "reading_files"

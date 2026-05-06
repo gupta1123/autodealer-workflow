@@ -62,6 +62,7 @@ import {
 import {
   appendCaseFiles,
   createDraftCase,
+  enqueueCaseAnalysis,
   updateCaseDecision,
   type CaseDecision,
 } from "@/lib/case-persistence";
@@ -92,6 +93,7 @@ import {
   Database
 } from "lucide-react";
 import type {
+  CaseAnalysisMode,
   CaseDoc,
   ComparisonOptions,
   DocType,
@@ -482,6 +484,7 @@ export function WorkspacePage() {
   const [caseDecisionStatus, setCaseDecisionStatus] = useState<"idle" | "updating" | "error">("idle");
   const [caseDecisionError, setCaseDecisionError] = useState<string | null>(null);
   const [analysisOptionsOpen, setAnalysisOptionsOpen] = useState(false);
+  const [pendingAnalysisMode, setPendingAnalysisMode] = useState<CaseAnalysisMode>("standard");
   const [comparisonOptions, setComparisonOptions] = useState<ComparisonOptions>(
     DEFAULT_COMPARISON_OPTIONS
   );
@@ -954,6 +957,10 @@ export function WorkspacePage() {
       onSelect={(nextOptions) => {
         setComparisonOptions(nextOptions);
         setAnalysisOptionsOpen(false);
+        if (pendingAnalysisMode === "smart_split") {
+          void startSmartSplitAnalysis(nextOptions);
+          return;
+        }
         void startProcessing(nextOptions);
       }}
     />
@@ -1015,7 +1022,46 @@ export function WorkspacePage() {
 
   const handleAnalyzeRequest = () => {
     if (!hasUploads) return;
+    setPendingAnalysisMode("standard");
     setAnalysisOptionsOpen(true);
+  };
+
+  const handleSmartSplitAnalyzeRequest = () => {
+    if (!hasUploads) return;
+    setPendingAnalysisMode("smart_split");
+    setAnalysisOptionsOpen(true);
+  };
+
+  const startSmartSplitAnalysis = async (nextOptions: ComparisonOptions) => {
+    if (!hasUploads) return;
+
+    try {
+      setDraftCaseStatus("saving");
+      setDraftCaseError(null);
+
+      let caseRecord = persistence.savedCase;
+      if (!caseRecord) {
+        const created = await createDraftCase({ uploads: queuedUploads });
+        updateSavedCase(created.case);
+        caseRecord = created.case;
+      }
+
+      const started = await enqueueCaseAnalysis(caseRecord.id, {
+        analysisMode: "smart_split",
+        comparisonOptions: nextOptions,
+      });
+
+      updateSavedCase(started.case);
+      setDraftCaseStatus("saved");
+      router.replace(`/cases/${caseRecord.id}`);
+    } catch (smartSplitError) {
+      setDraftCaseError(
+        smartSplitError instanceof Error
+          ? smartSplitError.message
+          : "Failed to start multi-document analysis."
+      );
+      setDraftCaseStatus("error");
+    }
   };
 
   const queuedUploadRail = hasUploads ? (
@@ -1413,6 +1459,17 @@ export function WorkspacePage() {
               >
                 <Play className="mr-2 h-5 w-5 fill-white" />
                 Analyze case
+              </Button>
+
+              <Button
+                type="button"
+                disabled={!hasUploads || draftCaseStatus === "saving"}
+                variant="outline"
+                className="rounded-2xl border-emerald-200 bg-emerald-50 px-6 py-6 text-base font-bold text-emerald-800 shadow-sm transition-transform hover:scale-[1.02] hover:bg-emerald-100 hover:text-emerald-900"
+                onClick={handleSmartSplitAnalyzeRequest}
+              >
+                <Sparkles className="mr-2 h-5 w-5" />
+                Analyze multi-doc PDF
               </Button>
             </div>
           </motion.div>

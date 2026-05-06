@@ -35,6 +35,21 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import type { CaseDoc, FieldKey } from "@/types/pipeline";
 
 const STORAGE_BUCKET = "packet-files";
+const DOCUMENT_DISPLAY_ORDER = [
+  "Weighment Slip",
+  "FASTag Toll Proof",
+  "Tax Invoice",
+  "Invoice",
+  "E-Way Bill",
+  "Lorry Receipt",
+  "Vehicle Registration Certificate",
+  "Driving Licence",
+  "PAN Card",
+  "Photo Evidence",
+];
+const DOCUMENT_DISPLAY_ORDER_LOOKUP = new Map(
+  DOCUMENT_DISPLAY_ORDER.map((documentType, index) => [documentType, index])
+);
 
 type CaseFileRow = {
   id: string;
@@ -121,6 +136,26 @@ function mapDocumentRowForCaseSummary(row: {
     sourceFileName: row.source_file_name || undefined,
     sourceHint: row.source_hint || row.source_file_name || undefined,
   };
+}
+
+function getDocumentStartPage(row: Pick<CaseDocumentRow, "source_hint" | "title">) {
+  const source = `${row.source_hint ?? ""} ${row.title ?? ""}`;
+  const match = source.match(/\(pages?\s+(\d+)/i);
+  return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+}
+
+function sortCaseDocuments(rows: CaseDocumentRow[]) {
+  return [...rows].sort((left, right) => {
+    const pageDelta = getDocumentStartPage(left) - getDocumentStartPage(right);
+    if (pageDelta !== 0) return pageDelta;
+
+    const typeDelta =
+      (DOCUMENT_DISPLAY_ORDER_LOOKUP.get(left.document_type) ?? Number.MAX_SAFE_INTEGER) -
+      (DOCUMENT_DISPLAY_ORDER_LOOKUP.get(right.document_type) ?? Number.MAX_SAFE_INTEGER);
+    if (typeDelta !== 0) return typeDelta;
+
+    return left.created_at.localeCompare(right.created_at) || left.id.localeCompare(right.id);
+  });
 }
 
 function isRecycleBinSchemaMissing(error: unknown) {
@@ -429,10 +464,11 @@ export async function GET(
       })
     );
 
-    const caseSummaryDocuments = ((documents ?? []) as CaseDocumentRow[]).map((document) =>
+    const orderedDocuments = sortCaseDocuments((documents ?? []) as CaseDocumentRow[]);
+    const caseSummaryDocuments = orderedDocuments.map((document) =>
       mapDocumentRowForCaseSummary(document, fieldConfiguration)
     );
-    const sanitizedDocuments = ((documents ?? []) as CaseDocumentRow[]).map((document) => ({
+    const sanitizedDocuments = orderedDocuments.map((document) => ({
       id: document.id,
       clientDocumentId: document.client_document_id,
       sourceFileName: document.source_file_name,

@@ -32,7 +32,7 @@ import { getLatestProcessingJob, mapProcessingJob } from "@/lib/processing/jobs"
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import type { CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
+import type { CaseAnalysisMode, CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
 
 function isRecycleBinSchemaMissing(error: unknown) {
   if (!error || typeof error !== "object") {
@@ -96,6 +96,10 @@ function parseComparisonOptions(value: FormDataEntryValue | null) {
   }
 
   return readComparisonOptions(JSON.parse(value));
+}
+
+function parseAnalysisMode(value: FormDataEntryValue | null): CaseAnalysisMode {
+  return value === "smart_split" ? "smart_split" : "standard";
 }
 
 function sanitizeDocumentsForStorage(
@@ -213,6 +217,7 @@ export async function POST(
     const supabase = createSupabaseAdminClient();
     const fieldConfiguration = await getPersistedPacketFieldConfiguration();
     const formData = await request.formData();
+    const analysisMode = parseAnalysisMode(formData.get("analysisMode"));
     const comparisonOptions = parseComparisonOptions(formData.get("comparisonOptions"));
     const rawDocuments = parseOptionalJsonField<CaseDoc[]>(formData.get("documents"));
     const rawMismatches = parseOptionalJsonField<Mismatch[]>(formData.get("mismatches"));
@@ -304,6 +309,7 @@ export async function POST(
         status: "processing",
         processing_meta: {
           ...existingMeta,
+          analysisMode,
           comparisonOptions,
         },
       };
@@ -372,6 +378,7 @@ export async function POST(
           stage: "Queued for analysis",
           error: null,
           result: {
+            analysisMode,
             comparisonOptions,
           },
         })

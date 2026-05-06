@@ -8,12 +8,17 @@ import {
 } from "@/lib/comparison";
 import type { ComparisonOptions } from "@/types/pipeline";
 
-const PRESENCE_CHECK_FIELDS = new Set<FieldKey>(["eWayBillNumber"]);
+const PRESENCE_CHECK_FIELDS = new Set<FieldKey>();
 const PURCHASE_DOC_TYPES = new Set(["Purchase Order", "Amended Purchase Order"]);
 const INVOICE_DOC_TYPES = new Set(["Invoice", "Tax Invoice"]);
 const PARTY_NAME_FIELDS = new Set<FieldKey>(["vendorName", "buyerName", "transporterName", "ownerName", "driverName", "holderName"]);
+const PURCHASE_ORDER_TOTAL_FIELDS = new Set<FieldKey>(["subtotal", "taxAmount", "totalAmount"]);
 
 function shouldExpectField(doc: CaseDoc, field: FieldKey) {
+  if (PURCHASE_DOC_TYPES.has(doc.type) && PURCHASE_ORDER_TOTAL_FIELDS.has(field)) {
+    return false;
+  }
+
   return (
     shouldConsiderFieldKey(field, doc.type) &&
     getFieldKeysForDocType(doc.type).includes(field)
@@ -33,6 +38,10 @@ function normalizePartyName(value: string | number | null | undefined) {
     .map((token) => {
       if (token === "pvt") return "private";
       if (token === "ltd") return "limited";
+      if (["kaliko", "xarixa", "xarika"].includes(token)) return "kalika";
+      if (token === "sted" || token === "steei") return "steel";
+      if (token === "steels") return "steel";
+      if (token === "alloys") return "alloy";
       return token;
     })
     .filter(
@@ -49,14 +58,22 @@ function areFieldValuesEqual(
   right: string | number | null | undefined,
   comparisonOptions: ComparisonOptions
 ) {
-  if (areComparableValuesEqual(left, right, comparisonOptions)) {
+  if (areComparableValuesEqual(left, right, comparisonOptions, field)) {
     return true;
   }
 
   if (PARTY_NAME_FIELDS.has(field)) {
     const normalizedLeft = normalizePartyName(left);
     const normalizedRight = normalizePartyName(right);
-    return Boolean(normalizedLeft && normalizedRight && normalizedLeft.length >= 8 && normalizedLeft === normalizedRight);
+    return Boolean(
+      normalizedLeft &&
+      normalizedRight &&
+      normalizedLeft.length >= 8 &&
+      normalizedRight.length >= 8 &&
+      (normalizedLeft === normalizedRight ||
+        normalizedLeft.includes(normalizedRight) ||
+        normalizedRight.includes(normalizedLeft))
+    );
   }
 
   return false;
@@ -145,6 +162,33 @@ function normalizeUnit(value?: string) {
   return compact;
 }
 
+function unitFactorToBase(unit?: string) {
+  const normalized = normalizeUnit(unit);
+  if (normalized === "kg") return 1;
+  if (normalized === "mt") return 1000;
+  return null;
+}
+
+function areUnitsCompatible(left?: string, right?: string) {
+  const leftUnit = normalizeUnit(left);
+  const rightUnit = normalizeUnit(right);
+  return Boolean(leftUnit && rightUnit && (leftUnit === rightUnit || (unitFactorToBase(leftUnit) && unitFactorToBase(rightUnit))));
+}
+
+function convertQuantityToBase(quantity?: string | number | null, unit?: string) {
+  const parsed = parseNumber(quantity);
+  if (parsed === null) return null;
+  const factor = unitFactorToBase(unit);
+  return factor ? parsed * factor : parsed;
+}
+
+function convertRateToBase(rate?: string | number | null, unit?: string) {
+  const parsed = parseNumber(rate);
+  if (parsed === null) return null;
+  const factor = unitFactorToBase(unit);
+  return factor ? parsed / factor : parsed;
+}
+
 function lineIdentity(item: CommercialLineItem) {
   const itemCode = compactText(item.itemCode);
   const hsnSac = compactText(item.hsnSac);
@@ -164,7 +208,10 @@ function findBestPoLine(invoiceLine: CommercialLineItem, poLines: CommercialLine
   const invoiceItemCode = compactText(invoiceLine.itemCode);
   const invoiceHsn = compactText(invoiceLine.hsnSac);
   const invoiceUnit = normalizeUnit(invoiceLine.unit);
-  const invoiceRate = parseNumber(invoiceLine.netRate ?? invoiceLine.rate);
+  const invoiceRate = parseNumber(invoiceLine.rate ?? invoiceLine.netRate);
+  const invoiceBaseRate = convertRateToBase(invoiceLine.rate ?? invoiceLine.netRate, invoiceLine.unit);
+  const invoiceBaseQuantity = convertQuantityToBase(invoiceLine.quantity, invoiceLine.unit);
+  const invoiceLineTotal = parseNumber(invoiceLine.lineTotal ?? invoiceLine.taxableAmount);
 
   for (const poLine of poLines) {
     let score = 0;
@@ -174,15 +221,21 @@ function findBestPoLine(invoiceLine: CommercialLineItem, poLines: CommercialLine
     const poItemCode = compactText(poLine.itemCode);
     const poHsn = compactText(poLine.hsnSac);
     const poUnit = normalizeUnit(poLine.unit);
-    const poRate = parseNumber(poLine.netRate ?? poLine.rate);
+    const poRate = parseNumber(poLine.rate ?? poLine.netRate);
+    const poBaseRate = convertRateToBase(poLine.rate ?? poLine.netRate, poLine.unit);
+    const poBaseQuantity = convertQuantityToBase(poLine.quantity, poLine.unit);
+    const poLineTotal = parseNumber(poLine.lineTotal ?? poLine.taxableAmount);
 
     if (invoiceIdentity && poIdentity && invoiceIdentity === poIdentity) score += 6;
     if (invoiceItemCode && poItemCode && invoiceItemCode === poItemCode) score += 5;
     if (invoiceItemCode && poSearch.includes(invoiceItemCode)) score += 5;
     if (poItemCode && invoiceSearch.includes(poItemCode)) score += 5;
     if (invoiceHsn && poHsn && invoiceHsn === poHsn) score += 3;
-    if (invoiceUnit && poUnit && invoiceUnit === poUnit) score += 1;
+    if (invoiceUnit && poUnit && areUnitsCompatible(invoiceUnit, poUnit)) score += 1;
     if (invoiceRate !== null && poRate !== null && Math.abs(invoiceRate - poRate) <= Math.max(1, poRate * 0.01)) score += 2;
+    if (invoiceBaseRate !== null && poBaseRate !== null && nearlyEqual(invoiceBaseRate, poBaseRate)) score += 2;
+    if (invoiceBaseQuantity !== null && poBaseQuantity !== null && nearlyEqual(invoiceBaseQuantity, poBaseQuantity)) score += 2;
+    if (invoiceLineTotal !== null && poLineTotal !== null && nearlyEqual(invoiceLineTotal, poLineTotal)) score += 2;
     score += tokenOverlapScore(invoiceLine, poLine);
     if (invoiceDescription && poDescription) {
       if (invoiceDescription.includes(poDescription.slice(0, 24)) || poDescription.includes(invoiceDescription.slice(0, 24))) {
@@ -293,7 +346,9 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
 
       const invoiceQty = parseNumber(invoiceLine.quantity);
       const poQty = parseNumber(poLine.quantity);
-      if (invoiceQty !== null && poQty !== null && invoiceQty > poQty * 1.01) {
+      const invoiceBaseQty = convertQuantityToBase(invoiceLine.quantity, invoiceLine.unit) ?? invoiceQty;
+      const poBaseQty = convertQuantityToBase(poLine.quantity, poLine.unit) ?? poQty;
+      if (invoiceBaseQty !== null && poBaseQty !== null && invoiceBaseQty > poBaseQty * 1.01) {
         mismatches.push(
           buildLineMismatch(
             "lineItems.quantityExceeded",
@@ -309,8 +364,10 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
         );
       }
 
-      const invoiceRate = parseNumber(invoiceLine.netRate ?? invoiceLine.rate);
-      const poRate = parseNumber(poLine.netRate ?? poLine.rate);
+      const invoiceRateValue = invoiceLine.rate ?? invoiceLine.netRate;
+      const poRateValue = poLine.rate ?? poLine.netRate;
+      const invoiceRate = convertRateToBase(invoiceRateValue, invoiceLine.unit) ?? parseNumber(invoiceRateValue);
+      const poRate = convertRateToBase(poRateValue, poLine.unit) ?? parseNumber(poRateValue);
       if (!nearlyEqual(invoiceRate, poRate)) {
         mismatches.push(
           buildLineMismatch(
@@ -320,16 +377,16 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
             poLine,
             invoiceLine,
             index,
-            `invoice rate ${invoiceLine.netRate ?? invoiceLine.rate} differs from PO rate ${poLine.netRate ?? poLine.rate}`,
-            `PO rate ${poLine.netRate ?? poLine.rate}`,
-            `Invoice rate ${invoiceLine.netRate ?? invoiceLine.rate}`
+            `invoice rate ${invoiceRateValue} differs from PO rate ${poRateValue}`,
+            `PO rate ${poRateValue}`,
+            `Invoice rate ${invoiceRateValue}`
           )
         );
       }
 
       const invoiceUnit = normalizeUnit(invoiceLine.unit);
       const poUnit = normalizeUnit(poLine.unit);
-      if (invoiceUnit && poUnit && invoiceUnit !== poUnit) {
+      if (invoiceUnit && poUnit && !areUnitsCompatible(invoiceUnit, poUnit)) {
         mismatches.push(
           buildLineMismatch(
             "lineItems.unitMismatch",

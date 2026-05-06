@@ -92,17 +92,45 @@ const PRIMARY_COMPARISON_FIELD_SET = new Set<string>(PRIMARY_COMPARISON_FIELDS);
 
 type ComparableDoc = Pick<CaseDoc, "type" | "fields">;
 
-function normalizeNumericLikeValue(value: string) {
+const GSTIN_FIELDS = new Set<FieldKey>(["supplierGstin", "buyerGstin"]);
+const GSTIN_DIGIT_INDICES = new Set([0, 1, 7, 8, 9, 10, 12]);
+const AMOUNT_FIELDS = new Set<FieldKey>([
+  "subtotal",
+  "taxAmount",
+  "totalAmount",
+  "paidAmount",
+  "statementAmount",
+  "freightAmount",
+  "advanceAmount",
+  "toPayAmount",
+  "openingBalance",
+  "creditAmount",
+  "debitAmount",
+  "closingBalance",
+]);
+const WEIGHT_FIELDS = new Set<FieldKey>(["grossWeight", "tareWeight", "netWeight", "itemQuantity"]);
+const COUNT_UNIT_VALUES = new Set(["nos", "no", "number", "numbers", "pcs", "piece", "pieces", "pc"]);
+
+function parseNumericValue(value: string) {
   const compact = value.replace(/[₹$€£,\s]/g, "");
   if (!/^-?\d+(\.\d+)?$/.test(compact)) {
     return null;
   }
 
   const parsed = Number(compact);
-  return Number.isFinite(parsed) ? parsed.toString() : null;
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeNumericLikeValue(value: string) {
+  const parsed = parseNumericValue(value);
+  return parsed === null ? null : parsed.toString();
 }
 
 function normalizeCurrencyLikeValue(value: string) {
+  if (/[₹$€£]/.test(value)) {
+    return "inr";
+  }
+
   const compact = value.replace(/[^a-z]/g, "");
   if (["inr", "rs", "rupee", "rupees", "indianrupee", "indianrupees"].includes(compact)) {
     return "inr";
@@ -110,9 +138,35 @@ function normalizeCurrencyLikeValue(value: string) {
   return null;
 }
 
+function normalizeGstinValue(value: string) {
+  const compact = value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!compact) return null;
+
+  return compact
+    .split("")
+    .map((character, index) => {
+      if (!GSTIN_DIGIT_INDICES.has(index)) return character;
+      if (character === "I" || character === "L") return "1";
+      if (character === "O" || character === "Q") return "0";
+      if (character === "S") return "5";
+      if (character === "B") return "8";
+      return character;
+    })
+    .join("");
+}
+
+function normalizeUnitValue(value: string) {
+  const compact = value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (COUNT_UNIT_VALUES.has(compact)) return "nos";
+  if (["kg", "kgs", "kilogram", "kilograms"].includes(compact)) return "kg";
+  if (["mt", "mton", "metricton", "metrictons"].includes(compact)) return "mt";
+  return compact || null;
+}
+
 export function normalizeComparableValue(
   value: string | number | null | undefined,
-  options: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS
+  options: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS,
+  fieldKey?: FieldKey
 ) {
   if (value == null) return null;
 
@@ -120,6 +174,15 @@ export function normalizeComparableValue(
   if (!raw) return null;
 
   const lowerCased = raw.toLowerCase();
+
+  if (fieldKey && GSTIN_FIELDS.has(fieldKey)) {
+    return normalizeGstinValue(raw);
+  }
+
+  if (fieldKey === "unit") {
+    return normalizeUnitValue(raw);
+  }
+
   const numericNormalized = normalizeNumericLikeValue(lowerCased);
 
   if (numericNormalized !== null) {
@@ -141,10 +204,39 @@ export function normalizeComparableValue(
 export function areComparableValuesEqual(
   left: string | number | null | undefined,
   right: string | number | null | undefined,
-  options: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS
+  options: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS,
+  fieldKey?: FieldKey
 ) {
-  const normalizedLeft = normalizeComparableValue(left, options);
-  const normalizedRight = normalizeComparableValue(right, options);
+  if (fieldKey && (AMOUNT_FIELDS.has(fieldKey) || WEIGHT_FIELDS.has(fieldKey))) {
+    const leftNumber = parseNumericValue(String(left ?? "").toLowerCase());
+    const rightNumber = parseNumericValue(String(right ?? "").toLowerCase());
+
+    if (leftNumber !== null && rightNumber !== null) {
+      const directTolerance = AMOUNT_FIELDS.has(fieldKey) ? 1 : 0.01;
+      if (Math.abs(leftNumber - rightNumber) <= Math.max(directTolerance, Math.abs(rightNumber) * 0.001)) {
+        return true;
+      }
+
+      if (fieldKey === "taxAmount") {
+        return (
+          Math.abs(leftNumber * 2 - rightNumber) <= Math.max(1, Math.abs(rightNumber) * 0.001) ||
+          Math.abs(leftNumber - rightNumber * 2) <= Math.max(1, Math.abs(leftNumber) * 0.001)
+        );
+      }
+
+      if (WEIGHT_FIELDS.has(fieldKey)) {
+        const leftAsKg = leftNumber * 1000;
+        const rightAsKg = rightNumber * 1000;
+        return (
+          Math.abs(leftAsKg - rightNumber) <= Math.max(1, Math.abs(rightNumber) * 0.001) ||
+          Math.abs(leftNumber - rightAsKg) <= Math.max(1, Math.abs(rightAsKg) * 0.001)
+        );
+      }
+    }
+  }
+
+  const normalizedLeft = normalizeComparableValue(left, options, fieldKey);
+  const normalizedRight = normalizeComparableValue(right, options, fieldKey);
 
   if (!normalizedLeft || !normalizedRight) {
     return false;

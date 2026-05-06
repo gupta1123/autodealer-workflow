@@ -3,6 +3,11 @@ const OPENROUTER_MODEL =
   process.env.OPENROUTER_MODEL ||
   process.env.NEXT_PUBLIC_OPENROUTER_MODEL ||
   "google/gemini-2.5-flash-image";
+const OPENROUTER_QUALITY_MODEL =
+  process.env.OPENROUTER_QUALITY_MODEL ||
+  process.env.GEMINI_THINKING_MODEL ||
+  "google/gemini-2.5-flash";
+const OPENROUTER_QUALITY_REASONING_TOKENS = Number(process.env.OPENROUTER_QUALITY_REASONING_TOKENS ?? 2000);
 const MAX_RETRIES = Number(process.env.OPENROUTER_MAX_RETRIES ?? 2);
 const RETRY_BASE_MS = Number(process.env.OPENROUTER_RETRY_BASE_MS ?? 1200);
 
@@ -18,6 +23,12 @@ export type OpenRouterMessage = {
 
 type OpenRouterContentPart = {
   text?: string;
+};
+
+type OpenRouterReasoningOptions = {
+  max_tokens?: number;
+  effort?: "low" | "medium" | "high";
+  exclude?: boolean;
 };
 
 function sleep(ms: number) {
@@ -40,7 +51,7 @@ function isRetryableStatus(status: number) {
 
 export async function callOpenRouter(
   messages: OpenRouterMessage[],
-  options?: { expectJson?: boolean }
+  options?: { expectJson?: boolean; model?: string; reasoning?: OpenRouterReasoningOptions }
 ) {
   if (!OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY is not configured.");
@@ -60,9 +71,10 @@ export async function callOpenRouter(
           "X-Title": "Autodealer Workflow Backend",
         },
         body: JSON.stringify({
-          model: OPENROUTER_MODEL,
+          model: options?.model || OPENROUTER_MODEL,
           messages,
           temperature: 0,
+          ...(options?.reasoning ? { reasoning: options.reasoning } : {}),
         }),
       });
 
@@ -100,4 +112,19 @@ export async function callOpenRouter(
   }
 
   throw new Error(lastError);
+}
+
+export function getQualityExtractionModel() {
+  return OPENROUTER_QUALITY_MODEL;
+}
+
+export function getQualityExtractionReasoning() {
+  if (!Number.isFinite(OPENROUTER_QUALITY_REASONING_TOKENS) || OPENROUTER_QUALITY_REASONING_TOKENS <= 0) {
+    return undefined;
+  }
+
+  return {
+    max_tokens: OPENROUTER_QUALITY_REASONING_TOKENS,
+    exclude: true,
+  } satisfies OpenRouterReasoningOptions;
 }
