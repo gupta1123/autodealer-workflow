@@ -255,7 +255,10 @@ function getFriendlyAnalysisStage(stage: string | null, status: "idle" | "proces
   if (normalized.includes("queue")) {
     return "Preparing analysis...";
   }
-  if (normalized.includes("split")) {
+  if (/\b(file|pdf|document)\s+\d+\s+of\s+\d+\b/.test(normalized)) {
+    return stage;
+  }
+  if (normalized.includes("split") || normalized.includes("organizing")) {
     return "Organizing PDF documents...";
   }
   if (normalized.includes("extract")) {
@@ -720,13 +723,13 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     comparisonOptions: ComparisonOptions,
     analysisMode: CaseAnalysisMode = "standard"
   ) {
-    if (!detail || detail.files.length === 0) return;
+    if (!detail || detail.files.length === 0 || draftFileStatus === "saving") return;
 
     try {
       setAnalysisStatus("processing");
       setAnalysisError(null);
       setAnalysisProgress(0);
-      setAnalysisStage(analysisMode === "smart_split" ? "Queued for multi-document analysis" : "Queued for analysis");
+      setAnalysisStage(analysisMode === "smart_split" ? "Queued for multi-PDF document analysis" : "Queued for analysis");
       const started = await enqueueCaseAnalysis(detail.case.id, {
         analysisMode,
         comparisonOptions,
@@ -971,7 +974,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
                   <Button
                     type="button"
-                    disabled={detail.files.length === 0}
+                    disabled={detail.files.length === 0 || draftFileStatus === "saving"}
                     className="flex-1 rounded-2xl bg-[#1a1a1a] px-8 py-6 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] transition-transform hover:scale-[1.02]"
                     onClick={() => {
                       setPendingAnalysisMode("standard");
@@ -984,7 +987,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
                   <Button
                     type="button"
-                    disabled={detail.files.length === 0}
+                    disabled={detail.files.length === 0 || draftFileStatus === "saving"}
                     variant="outline"
                     className="rounded-2xl border-emerald-200 bg-emerald-50 px-6 py-6 text-base font-bold text-emerald-800 shadow-sm transition-transform hover:scale-[1.02] hover:bg-emerald-100 hover:text-emerald-900"
                     onClick={() => {
@@ -993,7 +996,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                     }}
                   >
                     <Sparkles className="mr-2 h-5 w-5" />
-                    Analyze multi-doc PDF
+                    Analyze multi-doc PDFs
                   </Button>
                 </div>
               )}

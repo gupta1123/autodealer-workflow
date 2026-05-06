@@ -55,8 +55,12 @@ export async function POST(
     return jsonWithCors(request, { error: toMessage(caseError) }, { status: 500 });
   }
 
-  const updateJob = async (fields: Record<string, unknown>) => {
-    const { error } = await supabase.from("packet_processing_jobs").update(fields).eq("id", id);
+  const updateJob = async (fields: Record<string, unknown>, options?: { onlyWhenRunning?: boolean }) => {
+    let query = supabase.from("packet_processing_jobs").update(fields).eq("id", id);
+    if (options?.onlyWhenRunning) {
+      query = query.eq("status", "running");
+    }
+    const { error } = await query;
     if (error) {
       throw error;
     }
@@ -83,7 +87,7 @@ export async function POST(
           progress,
           stage,
           error: null,
-        });
+        }, { onlyWhenRunning: true });
       },
     });
     const displayName = await resolveCaseDisplayNameWithAI(
@@ -175,6 +179,7 @@ export async function POST(
           paymentGap: processed.summary.paymentGap,
           analysisMode,
           comparisonOptions: processed.comparisonOptions,
+          verificationGroups: processed.verificationGroups,
           lastProcessingError: null,
         },
       })
@@ -194,6 +199,7 @@ export async function POST(
         analysisMode,
         documentCount: processed.documents.length,
         mismatchCount: processed.mismatches.length,
+        verificationGroupCount: processed.verificationGroups.length,
       },
       finished_at: new Date().toISOString(),
     });

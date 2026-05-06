@@ -1021,19 +1021,19 @@ export function WorkspacePage() {
   };
 
   const handleAnalyzeRequest = () => {
-    if (!hasUploads) return;
+    if (!hasUploads || draftCaseStatus === "saving") return;
     setPendingAnalysisMode("standard");
     setAnalysisOptionsOpen(true);
   };
 
   const handleSmartSplitAnalyzeRequest = () => {
-    if (!hasUploads) return;
+    if (!hasUploads || draftCaseStatus === "saving") return;
     setPendingAnalysisMode("smart_split");
     setAnalysisOptionsOpen(true);
   };
 
   const startSmartSplitAnalysis = async (nextOptions: ComparisonOptions) => {
-    if (!hasUploads) return;
+    if (!hasUploads || draftCaseStatus === "saving") return;
 
     try {
       setDraftCaseStatus("saving");
@@ -1453,7 +1453,7 @@ export function WorkspacePage() {
 
               <Button
                 type="button"
-                disabled={!hasUploads}
+                disabled={!hasUploads || draftCaseStatus === "saving"}
                 className="flex-1 rounded-2xl bg-[#1a1a1a] px-8 py-6 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] transition-transform hover:scale-[1.02]"
                 onClick={handleAnalyzeRequest}
               >
@@ -1469,7 +1469,7 @@ export function WorkspacePage() {
                 onClick={handleSmartSplitAnalyzeRequest}
               >
                 <Sparkles className="mr-2 h-5 w-5" />
-                Analyze multi-doc PDF
+                Analyze multi-doc PDFs
               </Button>
             </div>
           </motion.div>

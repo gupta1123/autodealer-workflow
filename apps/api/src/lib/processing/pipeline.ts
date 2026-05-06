@@ -16,7 +16,7 @@ import {
 import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
 import { isCommercialDocType, sanitizeLineItems } from "@/lib/line-items";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
-import { verifyCaseDocuments } from "@/services/verification";
+import { verifyGroupedCaseDocuments } from "@/services/verification";
 import type { CaseAnalysisMode, CaseDoc, CommercialLineItem, DocType, FieldKey, Mismatch } from "@/types/pipeline";
 
 import { callOpenRouter, getQualityExtractionModel, getQualityExtractionReasoning } from "./openrouter";
@@ -1094,11 +1094,19 @@ async function extractPdfDocumentGroups(params: {
   textPages: string[];
   pageImages: string[];
   groups: PdfDocumentGroup[];
+  onGroupProgress?: (details: { current: number; total: number; group: PdfDocumentGroup }) => Promise<void> | void;
 }) {
   const documents: CaseDoc[] = [];
   const hasText = hasMeaningfulTextPages(params.textPages);
 
-  for (const group of params.groups) {
+  for (let index = 0; index < params.groups.length; index += 1) {
+    const group = params.groups[index];
+    await params.onGroupProgress?.({
+      current: index + 1,
+      total: params.groups.length,
+      group,
+    });
+
     const pageStartIndex = group.pageStart - 1;
     const pageEndIndex = group.pageEnd;
     const sourceHint = `${params.fileName} (${pageRangeLabel(group)})`;
@@ -1362,9 +1370,12 @@ export async function processStoredCaseFiles(params: {
   for (let index = 0; index < files.length; index += 1) {
     const file = files[index];
     const bucket = file.storage_bucket || STORAGE_BUCKET;
+    const fileProgress = (phase: number) =>
+      Math.min(79, Math.max(5, Math.round(5 + ((index + phase) / files.length) * 72)));
+
     await params.onProgress?.({
-      progress: Math.max(5, Math.round((index / files.length) * 70)),
-      stage: `Reading ${file.original_name}`,
+      progress: fileProgress(0.05),
+      stage: `Reading file ${index + 1} of ${files.length}: ${file.original_name}`,
     });
 
     const download = await supabase.storage.from(bucket).download(file.storage_path);
@@ -1378,8 +1389,8 @@ export async function processStoredCaseFiles(params: {
     let fileDocuments: CaseDoc[] = [];
     if (mimeType.startsWith("image/")) {
       await params.onProgress?.({
-        progress: Math.max(10, Math.round((index / files.length) * 70)),
-        stage: `Extracting ${file.original_name}`,
+        progress: fileProgress(0.35),
+        stage: `Extracting file ${index + 1} of ${files.length}: ${file.original_name}`,
       });
       const image = bufferToDataUrl(bytes, mimeType);
       const documentType = await classifyDocumentFromImage(image, file.original_name);
@@ -1393,8 +1404,8 @@ export async function processStoredCaseFiles(params: {
       const textPages = await extractPdfTextPages(bytes.slice());
       if (analysisMode === "smart_split") {
         await params.onProgress?.({
-          progress: Math.max(10, Math.round((index / files.length) * 70)),
-          stage: `Splitting ${file.original_name} into documents`,
+          progress: fileProgress(0.18),
+          stage: `Organizing PDF ${index + 1} of ${files.length}: ${file.original_name}`,
         });
 
         let pageImages: string[] = [];
@@ -1421,6 +1432,12 @@ export async function processStoredCaseFiles(params: {
           textPages,
           pageImages,
           groups,
+          onGroupProgress: async ({ current, total, group }) => {
+            await params.onProgress?.({
+              progress: fileProgress(0.2 + (current / Math.max(1, total)) * 0.72),
+              stage: `Extracting document ${current} of ${total} from PDF ${index + 1} of ${files.length}: ${formatDocType(group.documentType)}`,
+            });
+          },
         });
       } else if (hasMeaningfulTextPages(textPages)) {
         const documentType = await classifyDocumentFromText(textPages, file.original_name);
@@ -1432,8 +1449,8 @@ export async function processStoredCaseFiles(params: {
         fileDocuments = [document];
       } else {
         await params.onProgress?.({
-          progress: Math.max(10, Math.round((index / files.length) * 70)),
-          stage: `Rendering scanned PDF ${file.original_name}`,
+          progress: fileProgress(0.25),
+          stage: `Rendering scanned PDF ${index + 1} of ${files.length}: ${file.original_name}`,
         });
 
         let pageImages: string[] = [];
@@ -1472,8 +1489,12 @@ export async function processStoredCaseFiles(params: {
     }
   }
 
-  await params.onProgress?.({ progress: 80, stage: "Comparing extracted fields" });
-  const rawMismatches = verifyCaseDocuments(documents, comparisonOptions);
+  const verificationResult = verifyGroupedCaseDocuments(documents, comparisonOptions);
+  await params.onProgress?.({
+    progress: 80,
+    stage: `Comparing ${documents.length} extracted documents across ${verificationResult.groups.length} packet group${verificationResult.groups.length === 1 ? "" : "s"}`,
+  });
+  const rawMismatches = verificationResult.mismatches;
   const mismatches: Mismatch[] = rawMismatches.map((mismatch) => ({
     ...mismatch,
     ...buildMismatchCopy(mismatch),
@@ -1489,5 +1510,6 @@ export async function processStoredCaseFiles(params: {
     comparisonOptions,
     analysisMode,
     fieldConfiguration,
+    verificationGroups: verificationResult.groups,
   };
 }

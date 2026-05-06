@@ -4,6 +4,7 @@ import {
   areComparableValuesEqual,
   DEFAULT_COMPARISON_OPTIONS,
   getComparableFieldValue,
+  normalizeComparableValue,
   PRIMARY_COMPARISON_FIELDS,
 } from "@/lib/comparison";
 import type { ComparisonOptions } from "@/types/pipeline";
@@ -13,6 +14,30 @@ const PURCHASE_DOC_TYPES = new Set(["Purchase Order", "Amended Purchase Order"])
 const INVOICE_DOC_TYPES = new Set(["Invoice", "Tax Invoice"]);
 const PARTY_NAME_FIELDS = new Set<FieldKey>(["vendorName", "buyerName", "transporterName", "ownerName", "driverName", "holderName"]);
 const PURCHASE_ORDER_TOTAL_FIELDS = new Set<FieldKey>(["subtotal", "taxAmount", "totalAmount"]);
+const GROUP_REFERENCE_FIELDS: FieldKey[] = [
+  "poNumber",
+  "invoiceNumber",
+  "eWayBillNumber",
+  "lorryReceiptNumber",
+  "weighmentNumber",
+  "fastagReference",
+  "transactionReference",
+  "vehicleNumber",
+];
+
+export interface VerificationGroup {
+  groupId: string;
+  label: string;
+  reason: "shared_reference" | "source_file" | "single_document";
+  documentIds: string[];
+  sourceFileNames: string[];
+  referenceKeys: string[];
+}
+
+export interface GroupedVerificationResult {
+  groups: VerificationGroup[];
+  mismatches: Omit<Mismatch, "analysis" | "fixPlan">[];
+}
 
 function shouldExpectField(doc: CaseDoc, field: FieldKey) {
   if (PURCHASE_DOC_TYPES.has(doc.type) && PURCHASE_ORDER_TOTAL_FIELDS.has(field)) {
@@ -50,6 +75,240 @@ function normalizePartyName(value: string | number | null | undefined) {
     );
 
   return tokens.join("");
+}
+
+function normalizeGroupValue(
+  value: string | number | null | undefined,
+  comparisonOptions: ComparisonOptions,
+  field?: FieldKey
+) {
+  return normalizeComparableValue(value, comparisonOptions, field) || null;
+}
+
+function normalizeSourceName(value?: string) {
+  return value?.trim().toLowerCase().replace(/\s+/g, " ") || null;
+}
+
+function normalizeAmountValue(value: string | number | null | undefined) {
+  const parsed = parseNumber(value);
+  return parsed === null ? null : Math.round(parsed * 100).toString();
+}
+
+function getVendorIdentity(doc: CaseDoc, comparisonOptions: ComparisonOptions) {
+  return (
+    normalizeGroupValue(doc.fields.supplierGstin, comparisonOptions, "supplierGstin") ||
+    normalizeGroupValue(doc.fields.vendorName, comparisonOptions, "vendorName") ||
+    normalizeGroupValue(doc.fields.transporterName, comparisonOptions, "transporterName") ||
+    null
+  );
+}
+
+function isUsefulInvoiceReference(value: string | null) {
+  if (!value) return false;
+  return value.length >= 4 || /[a-z]/i.test(value);
+}
+
+function getPacketReferenceKeys(doc: CaseDoc, comparisonOptions: ComparisonOptions) {
+  const keys: string[] = [];
+  const vendorIdentity = getVendorIdentity(doc, comparisonOptions);
+
+  const poNumber = normalizeGroupValue(getComparableFieldValue(doc, "poNumber"), comparisonOptions, "poNumber");
+  if (poNumber) keys.push(`po:${poNumber}`);
+
+  const invoiceNumber = normalizeGroupValue(
+    getComparableFieldValue(doc, "invoiceNumber"),
+    comparisonOptions,
+    "invoiceNumber"
+  );
+  if (isUsefulInvoiceReference(invoiceNumber)) {
+    keys.push(`invoice:${invoiceNumber}`);
+    if (vendorIdentity) keys.push(`invoice-party:${invoiceNumber}:${vendorIdentity}`);
+  }
+
+  const eWayBillNumber = normalizeGroupValue(doc.fields.eWayBillNumber, comparisonOptions, "eWayBillNumber");
+  if (eWayBillNumber) keys.push(`eway:${eWayBillNumber}`);
+
+  const lorryReceiptNumber = normalizeGroupValue(
+    doc.fields.lorryReceiptNumber,
+    comparisonOptions,
+    "lorryReceiptNumber"
+  );
+  if (lorryReceiptNumber) keys.push(`lr:${lorryReceiptNumber}`);
+
+  const weighmentNumber = normalizeGroupValue(doc.fields.weighmentNumber, comparisonOptions, "weighmentNumber");
+  if (weighmentNumber && vendorIdentity) keys.push(`weighment-party:${weighmentNumber}:${vendorIdentity}`);
+
+  const fastagReference = normalizeGroupValue(doc.fields.fastagReference, comparisonOptions, "fastagReference");
+  if (fastagReference) keys.push(`fastag:${fastagReference}`);
+
+  const transactionReference = normalizeGroupValue(
+    doc.fields.transactionReference,
+    comparisonOptions,
+    "transactionReference"
+  );
+  if (transactionReference) keys.push(`transaction:${transactionReference}`);
+
+  return [...new Set(keys)];
+}
+
+function shareReferenceKey(left: CaseDoc, right: CaseDoc, comparisonOptions: ComparisonOptions) {
+  const leftKeys = new Set(getPacketReferenceKeys(left, comparisonOptions));
+  return getPacketReferenceKeys(right, comparisonOptions).some((key) => leftKeys.has(key));
+}
+
+function shareCommercialIdentity(left: CaseDoc, right: CaseDoc, comparisonOptions: ComparisonOptions) {
+  const leftAmount = normalizeAmountValue(getComparableFieldValue(left, "totalAmount"));
+  const rightAmount = normalizeAmountValue(getComparableFieldValue(right, "totalAmount"));
+  if (!leftAmount || !rightAmount || leftAmount !== rightAmount) {
+    return false;
+  }
+
+  const leftVendor = getVendorIdentity(left, comparisonOptions);
+  const rightVendor = getVendorIdentity(right, comparisonOptions);
+  if (leftVendor && rightVendor && leftVendor === rightVendor) {
+    return true;
+  }
+
+  const leftBuyerGstin = normalizeGroupValue(left.fields.buyerGstin, comparisonOptions, "buyerGstin");
+  const rightBuyerGstin = normalizeGroupValue(right.fields.buyerGstin, comparisonOptions, "buyerGstin");
+  const leftSupplierGstin = normalizeGroupValue(left.fields.supplierGstin, comparisonOptions, "supplierGstin");
+  const rightSupplierGstin = normalizeGroupValue(right.fields.supplierGstin, comparisonOptions, "supplierGstin");
+
+  return Boolean(
+    leftSupplierGstin &&
+      rightSupplierGstin &&
+      leftSupplierGstin === rightSupplierGstin &&
+      leftBuyerGstin &&
+      rightBuyerGstin &&
+      leftBuyerGstin === rightBuyerGstin
+  );
+}
+
+function shouldGroupBySourceFile(
+  left: CaseDoc,
+  right: CaseDoc,
+  sourceDocs: CaseDoc[],
+  comparisonOptions: ComparisonOptions
+) {
+  if (shareReferenceKey(left, right, comparisonOptions) || shareCommercialIdentity(left, right, comparisonOptions)) {
+    return true;
+  }
+
+  const invoiceCount = sourceDocs.filter((doc) => INVOICE_DOC_TYPES.has(doc.type)).length;
+  if (invoiceCount <= 1) {
+    return true;
+  }
+
+  const purchaseCount = sourceDocs.filter((doc) => PURCHASE_DOC_TYPES.has(doc.type)).length;
+  return invoiceCount === 0 && purchaseCount <= 1;
+}
+
+function packetReferenceLabel(doc: CaseDoc, comparisonOptions: ComparisonOptions) {
+  for (const field of GROUP_REFERENCE_FIELDS) {
+    const value = getComparableFieldValue(doc, field);
+    if (normalizeGroupValue(value, comparisonOptions, field)) {
+      return `${field}:${value}`;
+    }
+  }
+
+  return doc.sourceFileName || doc.sourceHint || doc.title || doc.id;
+}
+
+function makeVerificationGroup(
+  docs: CaseDoc[],
+  comparisonOptions: ComparisonOptions,
+  groupIndex: number
+): VerificationGroup {
+  const sourceFileNames = [...new Set(docs.map((doc) => doc.sourceFileName).filter((value): value is string => Boolean(value)))];
+  const referenceKeys = [...new Set(docs.flatMap((doc) => getPacketReferenceKeys(doc, comparisonOptions)))];
+  const labelReference =
+    docs
+      .map((doc) => packetReferenceLabel(doc, comparisonOptions))
+      .find((value) => value && !value.startsWith("sourceFileName:")) ?? sourceFileNames[0] ?? `Packet ${groupIndex + 1}`;
+  const singleSource = sourceFileNames.length === 1;
+
+  return {
+    groupId: `packet-group-${groupIndex + 1}`,
+    label: labelReference,
+    reason: docs.length <= 1 ? "single_document" : singleSource ? "source_file" : "shared_reference",
+    documentIds: docs.map((doc) => doc.id),
+    sourceFileNames,
+    referenceKeys,
+  };
+}
+
+export function groupDocumentsForVerification(
+  docs: CaseDoc[],
+  comparisonOptions: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS
+) {
+  const parent = docs.map((_, index) => index);
+
+  const find = (index: number): number => {
+    if (parent[index] !== index) {
+      parent[index] = find(parent[index]);
+    }
+    return parent[index];
+  };
+
+  const union = (left: number, right: number) => {
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot !== rightRoot) {
+      parent[rightRoot] = leftRoot;
+    }
+  };
+
+  const byReference = new Map<string, number[]>();
+  docs.forEach((doc, index) => {
+    getPacketReferenceKeys(doc, comparisonOptions).forEach((key) => {
+      byReference.set(key, [...(byReference.get(key) ?? []), index]);
+    });
+  });
+
+  byReference.forEach((indices) => {
+    const [first, ...rest] = indices;
+    rest.forEach((index) => union(first, index));
+  });
+
+  const bySource = new Map<string, number[]>();
+  docs.forEach((doc, index) => {
+    const source = normalizeSourceName(doc.sourceFileName);
+    if (!source) return;
+    bySource.set(source, [...(bySource.get(source) ?? []), index]);
+  });
+
+  bySource.forEach((indices) => {
+    const sourceDocs = indices.map((index) => docs[index]);
+    for (let left = 0; left < indices.length; left += 1) {
+      for (let right = left + 1; right < indices.length; right += 1) {
+        const leftIndex = indices[left];
+        const rightIndex = indices[right];
+        if (shouldGroupBySourceFile(docs[leftIndex], docs[rightIndex], sourceDocs, comparisonOptions)) {
+          union(leftIndex, rightIndex);
+        }
+      }
+    }
+  });
+
+  for (let left = 0; left < docs.length; left += 1) {
+    for (let right = left + 1; right < docs.length; right += 1) {
+      if (find(left) === find(right)) continue;
+      if (shareCommercialIdentity(docs[left], docs[right], comparisonOptions)) {
+        union(left, right);
+      }
+    }
+  }
+
+  const grouped = new Map<number, CaseDoc[]>();
+  docs.forEach((doc, index) => {
+    const root = find(index);
+    grouped.set(root, [...(grouped.get(root) ?? []), doc]);
+  });
+
+  return [...grouped.values()].map((groupDocs, index) => ({
+    group: makeVerificationGroup(groupDocs, comparisonOptions, index),
+    docs: groupDocs,
+  }));
 }
 
 function areFieldValuesEqual(
@@ -431,4 +690,23 @@ export function verifyCaseDocuments(
   }
 
   return [...mismatches, ...verifyCommercialLineItems(docs)];
+}
+
+export function verifyGroupedCaseDocuments(
+  docs: CaseDoc[],
+  comparisonOptions: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS
+): GroupedVerificationResult {
+  const groups = groupDocumentsForVerification(docs, comparisonOptions);
+  const mismatches = groups.flatMap(({ docs: groupDocs, group }) => {
+    if (groupDocs.length < 2) return [];
+    return verifyCaseDocuments(groupDocs, comparisonOptions).map((mismatch) => ({
+      ...mismatch,
+      id: `${group.groupId}-${mismatch.id}`,
+    }));
+  });
+
+  return {
+    groups: groups.map(({ group }) => group),
+    mismatches,
+  };
 }
