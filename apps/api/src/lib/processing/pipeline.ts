@@ -26,6 +26,7 @@ const execFileAsync = promisify(execFile);
 const PDF_RENDER_DPI = Number(process.env.PACKET_PDF_RENDER_DPI ?? 160);
 const PDF_RENDER_MAX_PAGES = Number(process.env.PACKET_PDF_RENDER_MAX_PAGES ?? 8);
 const PDF_SMART_SPLIT_MAX_PAGES = Number(process.env.PACKET_PDF_SMART_SPLIT_MAX_PAGES ?? 20);
+const PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY = "Vehicle number is not clearly visible in this image.";
 
 function resolvePdfJsWorkerSrc() {
   const candidates = [
@@ -224,9 +225,67 @@ function getDocumentSpecificExtractionInstruction(docType: DocType) {
         "For Weighment Slip documents, prioritize vehicleNumber/lorry number, grossWeight, tareWeight, netWeight, weighmentNumber, weighbridgeName, and authorized signature presence. " +
         "Read Indian vehicle numbers carefully from the image; distinguish letters from similar-looking digits, especially G/9, L/1, O/0, and S/5. "
       );
+    case "Photo Evidence":
+      return (
+        "For Photo Evidence documents, only return vehicleNumber when the full registration plate characters are clearly readable in the image itself. " +
+        `Do not infer a vehicle number from the file name, surrounding documents, or a partial/blurred/cropped plate. If the plate is not clearly visible, omit vehicleNumber and set evidenceDescription to "${PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY}" `
+      );
     default:
       return "";
   }
+}
+
+function isNonVisibleVehicleNumberValue(value?: string) {
+  const compact = value?.toLowerCase().replace(/[^a-z0-9]/g, "") ?? "";
+  if (!compact) return true;
+
+  return (
+    compact === "na" ||
+    compact === "notavailable" ||
+    compact === "unknown" ||
+    compact === "unclear" ||
+    compact === "illegible" ||
+    compact === "unreadable" ||
+    compact.includes("notvisible") ||
+    compact.includes("notclearlyvisible") ||
+    compact.includes("notreadable") ||
+    compact.includes("numbernotvisible") ||
+    compact.includes("platenotvisible") ||
+    compact.includes("blurred") ||
+    compact.includes("obscured") ||
+    compact.includes("cropped") ||
+    compact.includes("partial")
+  );
+}
+
+function isLikelyVisibleVehicleNumber(value?: string) {
+  if (!value || isNonVisibleVehicleNumberValue(value)) return false;
+  const compact = value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return compact.length >= 7 && compact.length <= 12 && /[A-Z]/.test(compact) && /\d/.test(compact);
+}
+
+function applyPhotoEvidenceVehicleVisibilityCopy(
+  fields: Partial<Record<FieldKey, string>>,
+  docType: DocType
+) {
+  if (docType !== "Photo Evidence") return fields;
+
+  const next = { ...fields };
+  if (isLikelyVisibleVehicleNumber(next.vehicleNumber)) return next;
+
+  delete next.vehicleNumber;
+  const description = next.evidenceDescription?.trim();
+  if (!description) {
+    next.evidenceDescription = PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY;
+    return next;
+  }
+
+  const compactDescription = description.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!compactDescription.includes("vehiclenumber") || !compactDescription.includes("visible")) {
+    next.evidenceDescription = `${description} ${PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY}`;
+  }
+
+  return next;
 }
 
 function mapFields(fields: Record<string, unknown>, docType?: DocType): Partial<Record<FieldKey, string>> {
@@ -1230,14 +1289,17 @@ async function extractDataFromImagePages(params: {
   const lineItems = extracted.flatMap((page) => page.lineItems);
   const visibleTextPages = extracted.map((page) => page.visibleText).filter(Boolean);
   const visibleText = visibleTextPages.join("\n");
-  const fields = applyFastagDetailsFallback(
-    applyEWayBillAddressFallback(
-      mapFields(combinedFields, params.documentType),
+  const fields = applyPhotoEvidenceVehicleVisibilityCopy(
+    applyFastagDetailsFallback(
+      applyEWayBillAddressFallback(
+        mapFields(combinedFields, params.documentType),
+        params.documentType,
+        visibleText
+      ),
       params.documentType,
       visibleText
     ),
-    params.documentType,
-    visibleText
+    params.documentType
   );
 
   const doc: CaseDoc = {
@@ -1301,14 +1363,17 @@ async function extractDataFromTextPages(params: {
   );
 
   const parsed = safeJsonParse<{ fields?: Record<string, unknown>; lineItems?: unknown; visibleText?: unknown }>(raw, {});
-  const fields = applyFastagDetailsFallback(
-    applyEWayBillAddressFallback(
-      mapFields(parsed.fields ?? {}, params.documentType),
+  const fields = applyPhotoEvidenceVehicleVisibilityCopy(
+    applyFastagDetailsFallback(
+      applyEWayBillAddressFallback(
+        mapFields(parsed.fields ?? {}, params.documentType),
+        params.documentType,
+        visibleText
+      ),
       params.documentType,
       visibleText
     ),
-    params.documentType,
-    visibleText
+    params.documentType
   );
   const doc: CaseDoc = {
     id: `${params.fileName}-${Date.now()}`,

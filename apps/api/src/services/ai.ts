@@ -17,6 +17,7 @@ const CLIENT_RETRY_BASE_MS = Number(
     process.env.NEXT_PUBLIC_GEMINI_RETRY_BASE_MS ??
     900
 );
+const PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY = "Vehicle number is not clearly visible in this image.";
 
 type OpenRouterMessage = {
   role: "system" | "user" | "assistant";
@@ -344,6 +345,67 @@ function formatDocType(docType: DocType): string {
 function getAllowedFieldKeysForDocType(docType: DocType) {
   const docTypeFieldKeys = getFieldKeysForDocType(docType);
   return docTypeFieldKeys.length > 0 ? docTypeFieldKeys : ALL_ALLOWED_FIELD_KEYS;
+}
+
+function getPhotoEvidenceVehicleInstruction(docType: DocType) {
+  if (docType !== "Photo Evidence") return "";
+  return (
+    "For Photo Evidence documents, only return vehicleNumber when the full registration plate characters are clearly readable in the image itself. " +
+    `Do not infer a vehicle number from the file name, surrounding documents, or a partial/blurred/cropped plate. If the plate is not clearly visible, omit vehicleNumber and set evidenceDescription to "${PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY}" `
+  );
+}
+
+function isNonVisibleVehicleNumberValue(value?: string) {
+  const compact = value?.toLowerCase().replace(/[^a-z0-9]/g, "") ?? "";
+  if (!compact) return true;
+
+  return (
+    compact === "na" ||
+    compact === "notavailable" ||
+    compact === "unknown" ||
+    compact === "unclear" ||
+    compact === "illegible" ||
+    compact === "unreadable" ||
+    compact.includes("notvisible") ||
+    compact.includes("notclearlyvisible") ||
+    compact.includes("notreadable") ||
+    compact.includes("numbernotvisible") ||
+    compact.includes("platenotvisible") ||
+    compact.includes("blurred") ||
+    compact.includes("obscured") ||
+    compact.includes("cropped") ||
+    compact.includes("partial")
+  );
+}
+
+function isLikelyVisibleVehicleNumber(value?: string) {
+  if (!value || isNonVisibleVehicleNumberValue(value)) return false;
+  const compact = value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  return compact.length >= 7 && compact.length <= 12 && /[A-Z]/.test(compact) && /\d/.test(compact);
+}
+
+function applyPhotoEvidenceVehicleVisibilityCopy(
+  fields: Partial<Record<FieldKey, string>>,
+  docType: DocType
+) {
+  if (docType !== "Photo Evidence") return fields;
+
+  const next = { ...fields };
+  if (isLikelyVisibleVehicleNumber(next.vehicleNumber)) return next;
+
+  delete next.vehicleNumber;
+  const description = next.evidenceDescription?.trim();
+  if (!description) {
+    next.evidenceDescription = PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY;
+    return next;
+  }
+
+  const compactDescription = description.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!compactDescription.includes("vehiclenumber") || !compactDescription.includes("visible")) {
+    next.evidenceDescription = `${description} ${PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY}`;
+  }
+
+  return next;
 }
 
 function getOrderedFieldKeysForDocument(doc: CaseDoc): FieldKey[] {
@@ -697,6 +759,7 @@ export async function extractDataFromImages(params: {
   const { fileName, pageImages, documentType } = params;
   const allowedFieldKeys = getAllowedFieldKeysForDocType(documentType);
   const allowedFieldKeysText = allowedFieldKeys.join(", ");
+  const photoEvidenceVehicleInstruction = getPhotoEvidenceVehicleInstruction(documentType);
 
   if (!pageImages.length || pageImages.some((image) => !image.startsWith("data:image/"))) {
     return { doc: fallbackDoc(fileName, documentType), extractedDocuments: [] };
@@ -718,6 +781,7 @@ export async function extractDataFromImages(params: {
               `Extract structured fields and visible text from procurement, logistics, transport, vehicle KYC, FASTag, quality certificate, and photo-evidence documents and return only JSON with keys "fields" and "visibleText". ` +
               `This document is a ${documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
               "visibleText must be a raw OCR-style transcription of the important visible text on the page, preserving line breaks where useful. " +
+              photoEvidenceVehicleInstruction +
               "For stamp/signature presence fields, return only Yes, No, or Unclear. Use Yes only when the mark is visibly present, No only when the relevant area is visible and clearly absent, otherwise Unclear. " +
               "For FASTag Toll Proof documents, extract statement reference, customer ID/name, statement period/date, vehicle number, tag account number, trip count, opening/credit/debit/closing balances, recharge/payment amount, toll plaza, and a compact toll transaction summary using the canonical FASTag keys. " +
               "For party roles on seller-issued documents, vendorName is the issuing supplier/seller/consignor and buyerName is the receiving buyer, bill-to party, ship-to party, consignee, customer, or purchaser. " +
@@ -768,14 +832,17 @@ export async function extractDataFromImages(params: {
     );
     const visibleTextPages = extracted.map((page) => page.visibleText).filter(Boolean);
     const visibleText = visibleTextPages.join("\n");
-    const fields = applyFastagDetailsFallback(
-      applyEWayBillAddressFallback(
-        mapFields(combinedFields, documentType),
+    const fields = applyPhotoEvidenceVehicleVisibilityCopy(
+      applyFastagDetailsFallback(
+        applyEWayBillAddressFallback(
+          mapFields(combinedFields, documentType),
+          documentType,
+          visibleText
+        ),
         documentType,
         visibleText
       ),
-      documentType,
-      visibleText
+      documentType
     );
 
     const caseDoc: CaseDoc = {

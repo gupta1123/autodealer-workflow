@@ -163,6 +163,27 @@ function normalizeUnitValue(value: string) {
   return compact || null;
 }
 
+function isNonComparablePlaceholder(value: string) {
+  const compact = value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!compact) return true;
+
+  return (
+    compact === "na" ||
+    compact === "notapplicable" ||
+    compact === "notavailable" ||
+    compact === "unknown" ||
+    compact === "unclear" ||
+    compact === "none" ||
+    compact === "nil" ||
+    compact === "illegible" ||
+    compact === "unreadable" ||
+    compact.includes("notvisible") ||
+    compact.includes("notclearlyvisible") ||
+    compact.includes("numbernotvisible") ||
+    compact.includes("platenotvisible")
+  );
+}
+
 export function normalizeComparableValue(
   value: string | number | null | undefined,
   options: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS,
@@ -172,6 +193,8 @@ export function normalizeComparableValue(
 
   const raw = String(value).trim();
   if (!raw) return null;
+
+  if (isNonComparablePlaceholder(raw)) return null;
 
   const lowerCased = raw.toLowerCase();
 
