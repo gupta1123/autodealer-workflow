@@ -18,6 +18,9 @@ const CLIENT_RETRY_BASE_MS = Number(
     900
 );
 const PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY = "Vehicle number is not clearly visible in this image.";
+const PO_NUMBER_FIELD_KEYS: FieldKey[] = ["poNumber", "referencePoNumber"];
+const INDENT_LABEL_PATTERN = /\b(?:indent|ind\.?\s*no|indent\s*(?:no|number|form|ref|reference)?)\b/i;
+const PURCHASE_ORDER_LABEL_PATTERN = /\b(?:(?:p\.?\s*o\.?|po|purchase\s+order)\s*(?:no|number|#)?|order\s*(?:no|number|#))\b/i;
 
 type OpenRouterMessage = {
   role: "system" | "user" | "assistant";
@@ -355,6 +358,43 @@ function getPhotoEvidenceVehicleInstruction(docType: DocType) {
   );
 }
 
+function getPoNumberExtractionInstruction(docType: DocType) {
+  if (docType === "Purchase Order" || docType === "Amended Purchase Order") {
+    return (
+      "For Purchase Order documents, poNumber must be the value explicitly labelled PO No, P.O. No, Purchase Order No, or Order No. " +
+      "Never use Indent No, Indent Number, Indent Form, requisition number, or internal indent reference as poNumber; omit poNumber if only an indent number is visible. "
+    );
+  }
+
+  if (docType === "Tax Invoice" || docType === "Invoice") {
+    return (
+      "For invoice documents, referencePoNumber must be a value explicitly labelled PO No, P.O. No, Purchase Order No, Buyer PO, or Order No. " +
+      "Never use Indent No, Indent Number, Indent Form, requisition number, or internal indent reference as referencePoNumber. "
+    );
+  }
+
+  return "";
+}
+
+function getDeliveryQuantityExtractionInstruction(docType: DocType) {
+  if (docType !== "Delivery Challan" && docType !== "Delivery Note") return "";
+
+  return (
+    "For Delivery Challan or Delivery Note documents, itemQuantity must be the actual goods/item quantity from a goods row. " +
+    "Never set itemQuantity from Total Packages, No. of packages, boxes, cartons, bundles, bags, coils packed, packing count, or shipment count. " +
+    "If only package count is visible and no actual goods quantity is shown, omit itemQuantity. "
+  );
+}
+
+function getEWayBillExtractionInstruction(docType: DocType) {
+  if (docType !== "E-Way Bill") return "";
+
+  return (
+    "For E-Way Bill documents, vendorName is the From party name in Address Details after the first GSTIN, and buyerName is the To party name after the second GSTIN. " +
+    "Do not use Dispatch From or Ship To address text as party names; those belong in dispatchFrom and shipTo. "
+  );
+}
+
 function isNonVisibleVehicleNumberValue(value?: string) {
   const compact = value?.toLowerCase().replace(/[^a-z0-9]/g, "") ?? "";
   if (!compact) return true;
@@ -404,6 +444,60 @@ function applyPhotoEvidenceVehicleVisibilityCopy(
   if (!compactDescription.includes("vehiclenumber") || !compactDescription.includes("visible")) {
     next.evidenceDescription = `${description} ${PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY}`;
   }
+
+  return next;
+}
+
+function normalizeIdentifierForContext(value?: string) {
+  return value?.toUpperCase().replace(/[^A-Z0-9]/g, "") ?? "";
+}
+
+function getValueContexts(visibleText: string, value: string) {
+  const candidate = normalizeIdentifierForContext(value);
+  if (!candidate) return [];
+
+  const lines = visibleText
+    .split(/\n+/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const contexts = new Set<string>();
+
+  lines.forEach((line, index) => {
+    if (normalizeIdentifierForContext(line).includes(candidate)) {
+      contexts.add(line);
+      if (index > 0) contexts.add(`${lines[index - 1]} ${line}`);
+      if (index < lines.length - 1) contexts.add(`${line} ${lines[index + 1]}`);
+    }
+  });
+
+  return [...contexts];
+}
+
+function isIndentNumberMasqueradingAsPo(value: string, visibleText: string) {
+  const contexts = getValueContexts(visibleText, value);
+  if (!contexts.length) return false;
+
+  const hasIndentContext = contexts.some((context) => INDENT_LABEL_PATTERN.test(context));
+  const hasExplicitPoContext = contexts.some(
+    (context) => PURCHASE_ORDER_LABEL_PATTERN.test(context) && !INDENT_LABEL_PATTERN.test(context)
+  );
+
+  return hasIndentContext && !hasExplicitPoContext;
+}
+
+function applyPoNumberLabelGuard(
+  fields: Partial<Record<FieldKey, string>>,
+  visibleText: string
+) {
+  if (!visibleText.trim()) return fields;
+
+  const next = { ...fields };
+  PO_NUMBER_FIELD_KEYS.forEach((fieldKey) => {
+    const value = next[fieldKey];
+    if (value && isIndentNumberMasqueradingAsPo(value, visibleText)) {
+      delete next[fieldKey];
+    }
+  });
 
   return next;
 }
@@ -493,6 +587,137 @@ function cleanEWayAddress(value?: string) {
   return cleaned || undefined;
 }
 
+const EWAY_PARTY_STOP_PATTERN =
+  /\b(?:::?\s*)?(?:Dispatch\s+From|Dispatched\s+From|Ship\s+To|Ship-to|Goods\s+Details|Vehicle\s+Details|Part\s+B|Transporter\s+Details|Total\s+Invoice|Taxable\s+Amount|Recipient)\b/i;
+const EWAY_PARTY_NAME_END_PATTERN =
+  /\b(?:PRIVATE\s+LIMITED|PVT\.?\s*LTD\.?|LTD\.?|LIMITED|LLP|ENTERPRISES|INDUSTRIES|IMPEX|LOGISTICS|MARKETING|FABRICATORS|SYSTEMS|SOLUTIONS|TRADE\s+LINK|WIRES\s*&\s*INFRA\s+LIMITED)\b/i;
+const INDIAN_STATE_SUFFIX_PATTERN =
+  /\b(?:ANDHRA\s+PRADESH|ARUNACHAL\s+PRADESH|ASSAM|BIHAR|CHHATTISGARH|CHATTISGARH|GOA|GUJARAT|HARYANA|HIMACHAL\s+PRADESH|JHARKHAND|KARNATAKA|KERALA|MADHYA\s+PRADESH|MAHARASHTRA|MANIPUR|MEGHALAYA|MIZORAM|NAGALAND|ODISHA|ORISSA|PUNJAB|RAJASTHAN|SIKKIM|TAMIL\s+NADU|TELANGANA|TRIPURA|UTTAR\s+PRADESH|UTTARAKHAND|WEST\s+BENGAL|DELHI|CHANDIGARH|PUDUCHERRY|JAMMU\s+AND\s+KASHMIR|LADAKH|INDIA|MAH)\b\.?$/i;
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripLeadingGstinToken(value: string, knownGstin?: string) {
+  const compactKnownGstin = knownGstin?.replace(/[^a-z0-9]/gi, "");
+  if (compactKnownGstin && compactKnownGstin.length >= 10) {
+    const knownPattern = new RegExp(`^\\s*${compactKnownGstin.split("").map(escapeRegExp).join("\\s*")}\\s*`, "i");
+    const stripped = value.replace(knownPattern, "");
+    if (stripped !== value) return stripped;
+  }
+
+  if (!/^\s*\d{2}/.test(value)) return value;
+
+  let alnumCount = 0;
+  let endIndex = -1;
+
+  for (let index = 0; index < value.length; index += 1) {
+    if (/[a-z0-9]/i.test(value[index])) {
+      alnumCount += 1;
+      if (alnumCount >= 15) {
+        endIndex = index + 1;
+        break;
+      }
+    }
+  }
+
+  return endIndex > 0 ? value.slice(endIndex) : value;
+}
+
+function cleanEWayPartyName(value?: string, knownGstin?: string) {
+  if (!value) return undefined;
+  const beforeStop = value.split(EWAY_PARTY_STOP_PATTERN)[0] ?? value;
+  let cleaned = stripLeadingGstinToken(beforeStop, knownGstin)
+    .replace(/\s+/g, " ")
+    .replace(/\b(?:Address\s+Details|From|To|GSTIN|State|Portal)\b\s*:*/gi, " ")
+    .replace(/^\W*\d+\s+/, "")
+    .replace(/^[\s:;,\-.]+/, "")
+    .replace(/[\s,.;:-]+$/, "")
+    .trim();
+
+  while (INDIAN_STATE_SUFFIX_PATTERN.test(cleaned)) {
+    cleaned = cleaned.replace(INDIAN_STATE_SUFFIX_PATTERN, "").replace(/[\s,.;:-]+$/, "").trim();
+  }
+
+  if (/\b(?:ltd|limited|private|pvt|llp|industries|enterprises|logistics|alloys|steel|link|wires|solutions)\b/i.test(cleaned)) {
+    cleaned = cleaned.replace(/,\s*[^,]+$/i, "").trim();
+  }
+
+  const legalPrefix = extractEWayLegalNamePrefix(cleaned);
+  if (legalPrefix && (cleaned.length > 90 || /@|\b(?:building\s+no|flat\s+no|name\s+of\s+building|phone|plot\s+no|survey\s+no)\b/i.test(cleaned))) {
+    cleaned = legalPrefix;
+  }
+
+  if (!/[a-z]/i.test(cleaned)) return undefined;
+  if (cleaned.length > 90) return undefined;
+  if (/\*/.test(cleaned)) return undefined;
+  if (/\b(?:recipient|consignor|building\s+no|flat\s+no|name\s+of\s+building|phone|survey\s+no|plot\s+no|moudha|phase\s+\d|@)\b/i.test(cleaned)) {
+    return undefined;
+  }
+  if (/\bkalika\b/i.test(cleaned) && !/^kalika\b/i.test(cleaned)) return undefined;
+
+  return cleaned;
+}
+
+function extractEWayLegalNamePrefix(value: string) {
+  const match = value.match(EWAY_PARTY_NAME_END_PATTERN);
+  if (!match || match.index === undefined) return undefined;
+  return value.slice(0, match.index + match[0].length).trim();
+}
+
+function splitEWayPartyPair(value?: string): Partial<Record<"vendorName" | "buyerName", string>> {
+  const candidate = value
+    ?.split(EWAY_PARTY_STOP_PATTERN)[0]
+    ?.replace(/\s+/g, " ")
+    .replace(/\b(?:Address\s+Details|From|To|GSTIN|State|Portal)\b\s*:*/gi, " ")
+    .trim();
+  if (!candidate) return {};
+
+  const kalikaMatch = candidate.match(/\bKALIKA\b/i);
+  if (kalikaMatch?.index && kalikaMatch.index > 0) {
+    return {
+      vendorName: cleanEWayPartyName(candidate.slice(0, kalikaMatch.index)),
+      buyerName: cleanEWayPartyName(candidate.slice(kalikaMatch.index)),
+    };
+  }
+
+  const firstParty = extractEWayLegalNamePrefix(candidate);
+  if (!firstParty) return {};
+  const secondCandidate = candidate.slice(firstParty.length).trim();
+  const secondParty = extractEWayLegalNamePrefix(secondCandidate) ?? secondCandidate;
+
+  return {
+    vendorName: cleanEWayPartyName(firstParty),
+    buyerName: cleanEWayPartyName(secondParty),
+  };
+}
+
+function extractEWayBillPartyNames(
+  visibleText: string,
+  fields: Partial<Record<FieldKey, string>>
+): Partial<Record<FieldKey, string>> {
+  const text = visibleText.replace(/\s+/g, " ").trim();
+  const section = text.match(/\bAddress\s+Details\b\s*(.+?)(?=\b(?:Vehicle\s+Details|Part\s+B|Transporter\s+Details|Total\s+Invoice|Taxable\s+Amount)\b|$)/i)?.[1] ?? text;
+  const namesBeforeGstin = section.match(/\bFrom\s+To\s+(.+?)\bGSTIN\s*:?\s*/i)?.[1];
+  const preGstinPair = splitEWayPartyPair(namesBeforeGstin);
+  const gstinBlocks = section.split(/\bGSTIN\s*:?\s*/i).slice(1);
+  const postGstinText = stripLeadingGstinToken(gstinBlocks[1] ?? "", fields.buyerGstin);
+  const postGstinPair = splitEWayPartyPair(postGstinText);
+
+  return {
+    vendorName:
+      cleanEWayPartyName(gstinBlocks[0], fields.supplierGstin) ??
+      preGstinPair.vendorName ??
+      (postGstinPair.buyerName ? postGstinPair.vendorName : undefined),
+    buyerName:
+      preGstinPair.buyerName ??
+      postGstinPair.buyerName ??
+      cleanEWayPartyName(gstinBlocks[1], fields.buyerGstin) ??
+      postGstinPair.vendorName ??
+      cleanEWayPartyName(postGstinText),
+  };
+}
+
 function extractEWayBillAddresses(visibleText: string): Partial<Record<FieldKey, string>> {
   const text = visibleText.replace(/\s+/g, " ").trim();
   const match = text.match(/(?:Address\s+Details\s*)?(?:[:：]\s*)?(?:Dispatch\s+From|Dispatched\s+From)\s*[:：]?\s*(.+?)\s*(?:Ship\s+To|Ship-to)\s*[:：]?\s*(.+?)(?=\s*(?:Vehicle\s+Details|Part\s+B|Item\s+Details|Total|$))/i);
@@ -510,8 +735,11 @@ function applyEWayBillAddressFallback(
 ) {
   if (docType !== "E-Way Bill" || !visibleText.trim()) return fields;
   const addresses = extractEWayBillAddresses(visibleText);
+  const parties = extractEWayBillPartyNames(visibleText, fields);
   return {
     ...fields,
+    ...(fields.vendorName || !parties.vendorName ? {} : { vendorName: parties.vendorName }),
+    ...(fields.buyerName || !parties.buyerName ? {} : { buyerName: parties.buyerName }),
     ...(fields.dispatchFrom || !addresses.dispatchFrom ? {} : { dispatchFrom: addresses.dispatchFrom }),
     ...(fields.shipTo || !addresses.shipTo ? {} : { shipTo: addresses.shipTo }),
   };
@@ -760,6 +988,9 @@ export async function extractDataFromImages(params: {
   const allowedFieldKeys = getAllowedFieldKeysForDocType(documentType);
   const allowedFieldKeysText = allowedFieldKeys.join(", ");
   const photoEvidenceVehicleInstruction = getPhotoEvidenceVehicleInstruction(documentType);
+  const poNumberExtractionInstruction = getPoNumberExtractionInstruction(documentType);
+  const deliveryQuantityExtractionInstruction = getDeliveryQuantityExtractionInstruction(documentType);
+  const eWayBillExtractionInstruction = getEWayBillExtractionInstruction(documentType);
 
   if (!pageImages.length || pageImages.some((image) => !image.startsWith("data:image/"))) {
     return { doc: fallbackDoc(fileName, documentType), extractedDocuments: [] };
@@ -782,6 +1013,9 @@ export async function extractDataFromImages(params: {
               `This document is a ${documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
               "visibleText must be a raw OCR-style transcription of the important visible text on the page, preserving line breaks where useful. " +
               photoEvidenceVehicleInstruction +
+              poNumberExtractionInstruction +
+              deliveryQuantityExtractionInstruction +
+              eWayBillExtractionInstruction +
               "For stamp/signature presence fields, return only Yes, No, or Unclear. Use Yes only when the mark is visibly present, No only when the relevant area is visible and clearly absent, otherwise Unclear. " +
               "For FASTag Toll Proof documents, extract statement reference, customer ID/name, statement period/date, vehicle number, tag account number, trip count, opening/credit/debit/closing balances, recharge/payment amount, toll plaza, and a compact toll transaction summary using the canonical FASTag keys. " +
               "For party roles on seller-issued documents, vendorName is the issuing supplier/seller/consignor and buyerName is the receiving buyer, bill-to party, ship-to party, consignee, customer, or purchaser. " +
@@ -832,17 +1066,20 @@ export async function extractDataFromImages(params: {
     );
     const visibleTextPages = extracted.map((page) => page.visibleText).filter(Boolean);
     const visibleText = visibleTextPages.join("\n");
-    const fields = applyPhotoEvidenceVehicleVisibilityCopy(
-      applyFastagDetailsFallback(
-        applyEWayBillAddressFallback(
-          mapFields(combinedFields, documentType),
+    const fields = applyPoNumberLabelGuard(
+      applyPhotoEvidenceVehicleVisibilityCopy(
+        applyFastagDetailsFallback(
+          applyEWayBillAddressFallback(
+            mapFields(combinedFields, documentType),
+            documentType,
+            visibleText
+          ),
           documentType,
           visibleText
         ),
-        documentType,
-        visibleText
+        documentType
       ),
-      documentType
+      visibleText
     );
 
     const caseDoc: CaseDoc = {

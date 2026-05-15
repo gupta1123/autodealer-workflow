@@ -50,6 +50,19 @@ function shouldExpectField(doc: CaseDoc, field: FieldKey) {
   );
 }
 
+function shouldCompareItemQuantityValues(
+  values: Array<{ doc: CaseDoc; value: string | number | null | undefined }>
+) {
+  const populated = values.filter((entry) => entry.value !== undefined && entry.value !== null && String(entry.value).trim() !== "");
+  if (populated.length < 2) return false;
+
+  const units = populated.map((entry) => normalizeUnit(entry.doc.fields.unit));
+  if (units.some((unit) => !unit)) return false;
+
+  const [firstUnit, ...restUnits] = units;
+  return restUnits.every((unit) => areUnitsCompatible(firstUnit, unit));
+}
+
 function normalizePartyName(value: string | number | null | undefined) {
   if (value === null || value === undefined) return null;
   const tokens = String(value)
@@ -343,12 +356,19 @@ function buildMismatch(
   docs: CaseDoc[],
   comparisonOptions: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS
 ): Omit<Mismatch, "analysis" | "fixPlan"> | null {
-  const values = docs
+  const comparableEntries = docs
     .filter((doc) => shouldExpectField(doc, field))
     .map((doc) => ({
+      doc,
       docId: doc.id,
       value: getComparableFieldValue(doc, field),
     }));
+
+  if (field === "itemQuantity" && !shouldCompareItemQuantityValues(comparableEntries)) {
+    return null;
+  }
+
+  const values = comparableEntries.map(({ doc: _doc, ...entry }) => entry);
   const populated = values.filter((entry) => entry.value !== undefined && entry.value !== null && String(entry.value).trim() !== "");
   const missing = values.filter((entry) => entry.value === undefined || entry.value === null || String(entry.value).trim() === "");
   const firstValue = populated[0]?.value;
@@ -371,18 +391,65 @@ function compactText(value?: string) {
   return (value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+const GENERIC_LINE_TOKENS = new Set([
+  "and",
+  "amt",
+  "amount",
+  "code",
+  "description",
+  "goods",
+  "gst",
+  "guide",
+  "hsn",
+  "igst",
+  "item",
+  "nos",
+  "qty",
+  "rate",
+  "roller",
+  "sac",
+  "sgst",
+  "spare",
+  "spares",
+  "tax",
+  "total",
+  "unit",
+]);
+
+function normalizeLineToken(token: string) {
+  if (token === "daneli" || token === "danieil") return "danieli";
+  return token;
+}
+
+function stripLeadingLineNumber(value: string) {
+  return value.replace(/^\s*\d+\s+/, "");
+}
+
 function lineSearchText(item: CommercialLineItem) {
-  return compactText([item.itemCode, item.description, item.rawText].filter(Boolean).join(" "));
+  return compactText(
+    [
+      item.itemCode,
+      item.description,
+      item.rawText ? stripLeadingLineNumber(item.rawText) : undefined,
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
 }
 
 function lineTokens(item: CommercialLineItem) {
-  return [item.itemCode, item.description, item.rawText]
+  return [
+    item.itemCode,
+    item.description,
+    item.rawText ? stripLeadingLineNumber(item.rawText) : undefined,
+  ]
     .filter(Boolean)
     .join(" ")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
     .split(/\s+/)
-    .filter((token) => token.length > 2);
+    .map(normalizeLineToken)
+    .filter((token) => token.length > 2 && !GENERIC_LINE_TOKENS.has(token));
 }
 
 function tokenOverlapScore(left: CommercialLineItem, right: CommercialLineItem) {
@@ -400,6 +467,23 @@ function tokenOverlapScore(left: CommercialLineItem, right: CommercialLineItem) 
   if (overlap >= 3) return 3;
   if (overlap >= 2) return 2;
   return 0;
+}
+
+function meaningfulTokenOverlap(left: CommercialLineItem, right: CommercialLineItem) {
+  const leftTokens = new Set(lineTokens(left));
+  const rightTokens = new Set(lineTokens(right));
+  let overlap = 0;
+
+  leftTokens.forEach((token) => {
+    if (rightTokens.has(token)) overlap += 1;
+  });
+
+  return overlap;
+}
+
+function hasUsableItemCode(value?: string) {
+  const compact = compactText(value);
+  return compact.length >= 4 ? compact : "";
 }
 
 function parseNumber(value?: string | number | null) {
@@ -460,11 +544,11 @@ function lineLabel(item: CommercialLineItem, index: number) {
 }
 
 function findBestPoLine(invoiceLine: CommercialLineItem, poLines: CommercialLineItem[]) {
-  let best: { line: CommercialLineItem; score: number } | null = null;
+  let best: { line: CommercialLineItem; score: number; hasStrongAnchor: boolean } | null = null;
   const invoiceIdentity = lineIdentity(invoiceLine);
   const invoiceDescription = compactText(invoiceLine.description || invoiceLine.rawText);
   const invoiceSearch = lineSearchText(invoiceLine);
-  const invoiceItemCode = compactText(invoiceLine.itemCode);
+  const invoiceItemCode = hasUsableItemCode(invoiceLine.itemCode);
   const invoiceHsn = compactText(invoiceLine.hsnSac);
   const invoiceUnit = normalizeUnit(invoiceLine.unit);
   const invoiceRate = parseNumber(invoiceLine.rate ?? invoiceLine.netRate);
@@ -477,41 +561,64 @@ function findBestPoLine(invoiceLine: CommercialLineItem, poLines: CommercialLine
     const poIdentity = lineIdentity(poLine);
     const poDescription = compactText(poLine.description || poLine.rawText);
     const poSearch = lineSearchText(poLine);
-    const poItemCode = compactText(poLine.itemCode);
+    const poItemCode = hasUsableItemCode(poLine.itemCode);
     const poHsn = compactText(poLine.hsnSac);
     const poUnit = normalizeUnit(poLine.unit);
     const poRate = parseNumber(poLine.rate ?? poLine.netRate);
     const poBaseRate = convertRateToBase(poLine.rate ?? poLine.netRate, poLine.unit);
     const poBaseQuantity = convertQuantityToBase(poLine.quantity, poLine.unit);
     const poLineTotal = parseNumber(poLine.lineTotal ?? poLine.taxableAmount);
+    const tokenOverlap = meaningfulTokenOverlap(invoiceLine, poLine);
+    let hasStrongAnchor = false;
 
-    if (invoiceIdentity && poIdentity && invoiceIdentity === poIdentity) score += 6;
-    if (invoiceItemCode && poItemCode && invoiceItemCode === poItemCode) score += 5;
-    if (invoiceItemCode && poSearch.includes(invoiceItemCode)) score += 5;
-    if (poItemCode && invoiceSearch.includes(poItemCode)) score += 5;
+    if (invoiceIdentity && poIdentity && invoiceIdentity === poIdentity) {
+      score += 6;
+      hasStrongAnchor = true;
+    }
+    if (invoiceItemCode && poItemCode && invoiceItemCode === poItemCode) {
+      score += 5;
+      hasStrongAnchor = true;
+    }
+    if (invoiceItemCode && poSearch.includes(invoiceItemCode)) {
+      score += 5;
+      hasStrongAnchor = true;
+    }
+    if (poItemCode && invoiceSearch.includes(poItemCode)) {
+      score += 5;
+      hasStrongAnchor = true;
+    }
     if (invoiceHsn && poHsn && invoiceHsn === poHsn) score += 3;
     if (invoiceUnit && poUnit && areUnitsCompatible(invoiceUnit, poUnit)) score += 1;
-    if (invoiceRate !== null && poRate !== null && Math.abs(invoiceRate - poRate) <= Math.max(1, poRate * 0.01)) score += 2;
-    if (invoiceBaseRate !== null && poBaseRate !== null && nearlyEqual(invoiceBaseRate, poBaseRate)) score += 2;
-    if (invoiceBaseQuantity !== null && poBaseQuantity !== null && nearlyEqual(invoiceBaseQuantity, poBaseQuantity)) score += 2;
-    if (invoiceLineTotal !== null && poLineTotal !== null && nearlyEqual(invoiceLineTotal, poLineTotal)) score += 2;
+    if (invoiceRate !== null && poRate !== null && Math.abs(invoiceRate - poRate) <= Math.max(1, poRate * 0.01)) {
+      score += 2;
+      if (invoiceHsn && poHsn && invoiceHsn === poHsn) hasStrongAnchor = true;
+    }
+    if (invoiceBaseRate !== null && poBaseRate !== null && nearlyEqual(invoiceBaseRate, poBaseRate)) {
+      score += 2;
+      if (invoiceHsn && poHsn && invoiceHsn === poHsn) hasStrongAnchor = true;
+    }
+    if (invoiceBaseQuantity !== null && poBaseQuantity !== null && nearlyEqual(invoiceBaseQuantity, poBaseQuantity)) {
+      score += 2;
+    }
+    if (invoiceLineTotal !== null && poLineTotal !== null && nearlyEqual(invoiceLineTotal, poLineTotal)) {
+      score += 2;
+      hasStrongAnchor = true;
+    }
     score += tokenOverlapScore(invoiceLine, poLine);
+    if (tokenOverlap >= 2) hasStrongAnchor = true;
     if (invoiceDescription && poDescription) {
       if (invoiceDescription.includes(poDescription.slice(0, 24)) || poDescription.includes(invoiceDescription.slice(0, 24))) {
         score += 3;
+        hasStrongAnchor = true;
       }
     }
 
     if (!best || score > best.score) {
-      best = { line: poLine, score };
+      best = { line: poLine, score, hasStrongAnchor };
     }
   }
 
-  return best && best.score >= 4 ? best.line : null;
-}
-
-function findBestInvoiceLine(poLine: CommercialLineItem, invoiceLines: CommercialLineItem[]) {
-  return findBestPoLine(poLine, invoiceLines);
+  return best && best.score >= 5 && best.hasStrongAnchor ? best.line : null;
 }
 
 function nearlyEqual(left: number | null, right: number | null, tolerance = 0.01) {
@@ -546,28 +653,6 @@ function buildLineMismatch(
   };
 }
 
-function buildPoLineMissingFromInvoiceMismatch(
-  poDoc: CaseDoc,
-  invoiceDoc: CaseDoc,
-  poLine: CommercialLineItem,
-  index: number
-): Omit<Mismatch, "analysis" | "fixPlan"> {
-  return {
-    id: `line-mismatch-lineItems.uninvoicedPoLine-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    field: "lineItems.uninvoicedPoLine",
-    values: [
-      {
-        docId: poDoc.id,
-        value: `${lineLabel(poLine, index)}: PO line has no matching invoice line`,
-      },
-      {
-        docId: invoiceDoc.id,
-        value: "No matching invoice line",
-      },
-    ],
-  };
-}
-
 function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" | "fixPlan">[] {
   const poDocs = docs.filter((doc) => PURCHASE_DOC_TYPES.has(doc.type) && doc.lineItems?.length);
   const invoiceDocs = docs.filter((doc) => INVOICE_DOC_TYPES.has(doc.type) && doc.lineItems?.length);
@@ -584,7 +669,6 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
       ) ?? poDocs[0];
 
     const poLines = matchingPo.lineItems ?? [];
-    const matchedPoLines = new Set<CommercialLineItem>();
     for (const [index, invoiceLine] of (invoiceDoc.lineItems ?? []).entries()) {
       const poLine = findBestPoLine(invoiceLine, poLines);
       if (!poLine) {
@@ -601,7 +685,6 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
         );
         continue;
       }
-      matchedPoLines.add(poLine);
 
       const invoiceQty = parseNumber(invoiceLine.quantity);
       const poQty = parseNumber(poLine.quantity);
@@ -659,14 +742,6 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
             `Invoice unit ${invoiceLine.unit}`
           )
         );
-      }
-    }
-
-    for (const [index, poLine] of poLines.entries()) {
-      if (matchedPoLines.has(poLine)) continue;
-      const invoiceLine = findBestInvoiceLine(poLine, invoiceDoc.lineItems ?? []);
-      if (!invoiceLine) {
-        mismatches.push(buildPoLineMissingFromInvoiceMismatch(matchingPo, invoiceDoc, poLine, index));
       }
     }
   }
