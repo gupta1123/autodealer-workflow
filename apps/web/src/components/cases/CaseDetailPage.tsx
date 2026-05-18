@@ -70,6 +70,7 @@ import type {
 
 type LoadState = "loading" | "ready" | "error";
 type ActiveTab = "preview" | "data";
+type DataViewMode = "fields" | "lineItems";
 
 const DETAIL_TABS: { id: ActiveTab; label: string; icon: LucideIcon }[] = [
   { id: "preview", label: "Original", icon: Eye },
@@ -398,6 +399,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<ActiveTab>("preview");
+  const [activeDataView, setActiveDataView] = useState<DataViewMode>("fields");
   const [previewPageIndex, setPreviewPageIndex] = useState(0);
   const [previewZoom, setPreviewZoom] = useState(1);
   const draftFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -613,6 +615,10 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     () => getVisibleLineItemColumns(activeDocumentLineItems),
     [activeDocumentLineItems]
   );
+
+  useEffect(() => {
+    setActiveDataView(activeDocumentLineItems.length > 0 ? "lineItems" : "fields");
+  }, [activeDocumentId, activeDocumentLineItems.length]);
 
   const activeDocumentFiles = useMemo(() => {
     if (!detail || !activeDocument) return [];
@@ -1499,11 +1505,49 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 {activeTab === 'data' && (
                   <div className="absolute inset-0 overflow-y-auto">
                     <div className="p-4 sm:p-8 max-w-5xl mx-auto pb-8 space-y-6">
+                      {(activeDocumentEntries.length > 0 || activeDocumentLineItems.length > 0) && (
+                        <div className="flex flex-col gap-3 rounded-xl border border-slate-100 bg-white p-3 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+                          <div>
+                            <div className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                              Data View
+                            </div>
+                            <div className="text-sm font-semibold text-slate-700">
+                              {activeDocument?.title ?? "Selected document"}
+                            </div>
+                          </div>
+                          <div className="inline-flex rounded-xl border border-slate-200 bg-slate-50 p-1">
+                            <button
+                              type="button"
+                              className={`rounded-lg px-3 py-2 text-xs font-bold transition-colors ${
+                                activeDataView === "fields"
+                                  ? "bg-white text-slate-950 shadow-sm"
+                                  : "text-slate-500 hover:text-slate-800"
+                              }`}
+                              onClick={() => setActiveDataView("fields")}
+                            >
+                              Fields ({activeDocumentEntries.length})
+                            </button>
+                            <button
+                              type="button"
+                              disabled={activeDocumentLineItems.length === 0}
+                              className={`rounded-lg px-3 py-2 text-xs font-bold transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
+                                activeDataView === "lineItems"
+                                  ? "bg-white text-slate-950 shadow-sm"
+                                  : "text-slate-500 hover:text-slate-800"
+                              }`}
+                              onClick={() => setActiveDataView("lineItems")}
+                            >
+                              Line items ({activeDocumentLineItems.length})
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
                       {activeDocumentEntries.length === 0 && activeDocumentLineItems.length === 0 ? (
                         <div className="py-12 text-center text-sm font-medium text-slate-500">
                           No specific fields extracted for this document type.
                         </div>
-                      ) : activeDocumentEntries.length > 0 ? (
+                      ) : activeDataView === "fields" && activeDocumentEntries.length > 0 ? (
                         <div className="flex flex-col text-sm border border-slate-100 rounded-xl overflow-hidden shadow-sm">
                           {activeDocumentEntries.map(([key, value], index) => {
                             const currentValue = typeof value === "string" ? value : displayValue(value);
@@ -1529,9 +1573,13 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                             )
                           })}
                         </div>
+                      ) : activeDataView === "fields" ? (
+                        <div className="rounded-xl border border-dashed border-slate-200 bg-white p-8 text-center text-sm font-medium text-slate-500">
+                          No scalar fields were extracted for this document.
+                        </div>
                       ) : null}
 
-                      {activeDocumentLineItems.length > 0 && (
+                      {activeDataView === "lineItems" && activeDocumentLineItems.length > 0 && (
                         <div className="rounded-xl border border-slate-100 bg-white shadow-sm">
                           <div className="flex flex-col gap-1 border-b border-slate-100 px-4 py-3 sm:px-5">
                             <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
@@ -1578,6 +1626,11 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                               </tbody>
                             </table>
                           </div>
+                        </div>
+                      )}
+                      {activeDataView === "lineItems" && activeDocumentLineItems.length === 0 && (
+                        <div className="rounded-xl border border-dashed border-slate-200 bg-white p-8 text-center text-sm font-medium text-slate-500">
+                          No line-item table was extracted for this document.
                         </div>
                       )}
                     </div>
