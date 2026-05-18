@@ -1,6 +1,8 @@
 import { jsonWithCors } from "@/lib/api/cors";
 import { resolveCaseDisplayNameWithAI } from "@/lib/case-naming";
+import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
 import { serializeFieldsWithLineItems } from "@/lib/line-items";
+import { mergePersistedStructuredData } from "@/lib/persisted-structured-data";
 import { processStoredCaseFiles } from "@/lib/processing/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import type { CaseAnalysisMode } from "@/types/pipeline";
@@ -77,6 +79,7 @@ export async function POST(
     const jobResult = job.result && typeof job.result === "object" ? (job.result as Record<string, unknown>) : {};
     const analysisMode = readAnalysisMode(jobResult.analysisMode);
     const comparisonOptions = jobResult.comparisonOptions;
+    const fieldConfiguration = await getPersistedPacketFieldConfiguration();
 
     const processed = await processStoredCaseFiles({
       caseId: job.case_id,
@@ -101,10 +104,15 @@ export async function POST(
     });
 
     const [
+      { data: existingDocuments, error: existingDocumentsError },
       { count: uploadCount, error: countError },
       { error: documentDeleteError },
       { error: mismatchDeleteError },
     ] = await Promise.all([
+      supabase
+        .from("packet_documents")
+        .select("client_document_id, source_file_name, source_hint, document_type, title, extracted_fields")
+        .eq("case_id", job.case_id),
       supabase
         .from("packet_case_files")
         .select("id", { count: "exact", head: true })
@@ -113,11 +121,18 @@ export async function POST(
       supabase.from("packet_mismatches").delete().eq("case_id", job.case_id),
     ]);
 
+    if (existingDocumentsError) throw existingDocumentsError;
     if (countError) throw countError;
     if (documentDeleteError) throw documentDeleteError;
     if (mismatchDeleteError) throw mismatchDeleteError;
 
-    const documentRows = processed.documents.map((document) => ({
+    const documents = mergePersistedStructuredData(
+      processed.documents,
+      existingDocuments ?? [],
+      fieldConfiguration
+    );
+
+    const documentRows = documents.map((document) => ({
       case_id: job.case_id,
       client_document_id: document.id,
       source_file_name: document.sourceFileName ?? document.sourceHint ?? null,

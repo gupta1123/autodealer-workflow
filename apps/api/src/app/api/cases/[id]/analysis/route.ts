@@ -28,6 +28,7 @@ import {
   isLineItemMismatchField,
   serializeFieldsWithLineItems,
 } from "@/lib/line-items";
+import { mergePersistedStructuredData } from "@/lib/persisted-structured-data";
 import { getLatestProcessingJob, mapProcessingJob } from "@/lib/processing/jobs";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -413,10 +414,15 @@ export async function POST(
     }
 
     const [
+      { data: existingDocuments, error: existingDocumentsError },
       { count: uploadCount, error: fileCountError },
       { error: documentDeleteError },
       { error: mismatchDeleteError },
     ] = await Promise.all([
+      supabase
+        .from("packet_documents")
+        .select("client_document_id, source_file_name, source_hint, document_type, title, extracted_fields")
+        .eq("case_id", id),
       supabase
         .from("packet_case_files")
         .select("id", { count: "exact", head: true })
@@ -425,11 +431,18 @@ export async function POST(
       supabase.from("packet_mismatches").delete().eq("case_id", id),
     ]);
 
+    if (existingDocumentsError) throw existingDocumentsError;
     if (fileCountError) throw fileCountError;
     if (documentDeleteError) throw documentDeleteError;
     if (mismatchDeleteError) throw mismatchDeleteError;
 
-    const documentRows = documents.map((document) => ({
+    const documentsWithPersistedStructuredData = mergePersistedStructuredData(
+      documents,
+      existingDocuments ?? [],
+      fieldConfiguration
+    );
+
+    const documentRows = documentsWithPersistedStructuredData.map((document) => ({
       case_id: id,
       client_document_id: document.id,
       source_file_name: document.sourceFileName ?? document.sourceHint ?? null,
@@ -458,8 +471,15 @@ export async function POST(
       if (mismatchInsertError) throw mismatchInsertError;
     }
 
-    const summary = summarizeCase(documents, mismatches, fieldConfiguration);
-    const displayName = await resolveCaseDisplayNameWithAI(documents, summary);
+    const summary = summarizeCase(
+      documentsWithPersistedStructuredData,
+      mismatches,
+      fieldConfiguration
+    );
+    const displayName = await resolveCaseDisplayNameWithAI(
+      documentsWithPersistedStructuredData,
+      summary
+    );
     const existingMeta =
       existing.processing_meta && typeof existing.processing_meta === "object"
         ? (existing.processing_meta as Record<string, unknown>)
@@ -472,8 +492,8 @@ export async function POST(
       invoice_number: summary.invoiceNumber || null,
       status: "completed",
       risk_score: summary.riskScore,
-      upload_count: uploadCount ?? documents.length,
-      document_count: documents.length,
+      upload_count: uploadCount ?? documentsWithPersistedStructuredData.length,
+      document_count: documentsWithPersistedStructuredData.length,
       mismatch_count: mismatches.length,
       processing_meta: {
         ...existingMeta,
