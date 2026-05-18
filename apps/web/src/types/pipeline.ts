@@ -88,6 +88,8 @@ export type FieldKey =
 
 export type DocType =
   | "Purchase Order"
+  | "Amended Purchase Order"
+  | "Invoice"
   | "Tax Invoice"
   | "Receipt"
   | "Delivery Note"

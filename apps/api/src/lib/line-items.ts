@@ -7,6 +7,12 @@ const COMMERCIAL_DOC_TYPES = new Set<DocType>([
   "Amended Purchase Order",
   "Invoice",
   "Tax Invoice",
+  "Delivery Note",
+  "Delivery Challan",
+  "E-Way Bill",
+  "Lorry Receipt",
+  "Weighment Slip",
+  "Material Test Certificate",
 ]);
 
 const HSN_SAC_CODE_PATTERN = /\b\d{4,8}\b/;
@@ -58,6 +64,19 @@ function toLineItemText(value: unknown) {
 
 function cleanWhitespace(value: string) {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function cleanItemCode(value?: string) {
+  if (!value) return undefined;
+  const cleaned = cleanWhitespace(value)
+    .replace(/^[&|,;:/\\-]+/, "")
+    .replace(/[&|,;:/\\-]+$/, "")
+    .trim();
+  return cleaned || undefined;
+}
+
+function compactIdentifier(value?: string) {
+  return (value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 function stripLeadingLineNumber(value: string, lineNumber?: string) {
@@ -112,11 +131,39 @@ function cleanLineItemDescription(item: CommercialLineItem) {
   return stripped || undefined;
 }
 
+function deriveItemCodeFromRawDescription(item: CommercialLineItem, description?: string) {
+  if (item.itemCode || !description) return undefined;
+
+  const rawDescription = descriptionFromRawText(item.rawText, item.lineNumber, item.hsnSac);
+  if (!rawDescription) return undefined;
+
+  const normalizedDescription = cleanWhitespace(description);
+  const normalizedRawDescription = cleanWhitespace(rawDescription);
+  if (!normalizedRawDescription.toLowerCase().startsWith(normalizedDescription.toLowerCase())) {
+    return undefined;
+  }
+
+  const suffix = cleanWhitespace(normalizedRawDescription.slice(normalizedDescription.length));
+  if (!suffix || !/[a-z0-9]/i.test(suffix)) return undefined;
+  return suffix;
+}
+
 function cleanLineItem(item: CommercialLineItem) {
   const next = { ...item };
+  const itemCode = cleanItemCode(next.itemCode);
+  if (itemCode) {
+    next.itemCode = itemCode;
+  } else {
+    delete next.itemCode;
+  }
+
   const hsnSac = extractHsnSac(next.hsnSac, next.rawText);
   if (hsnSac) {
     next.hsnSac = hsnSac;
+  }
+
+  if (next.itemCode && next.hsnSac && compactIdentifier(next.itemCode) === compactIdentifier(next.hsnSac)) {
+    delete next.itemCode;
   }
 
   const description = cleanLineItemDescription(next);
@@ -124,6 +171,11 @@ function cleanLineItem(item: CommercialLineItem) {
     next.description = description;
   } else {
     delete next.description;
+  }
+
+  const derivedItemCode = deriveItemCodeFromRawDescription(next, next.description);
+  if (derivedItemCode) {
+    next.itemCode = derivedItemCode;
   }
 
   return next;

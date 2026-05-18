@@ -23,8 +23,6 @@ const VEHICLE_REGISTRATION_DOC_TYPES = new Set<DocType>(["Vehicle Registration C
 const COMPARISON_FIELD_ALIASES: Partial<Record<FieldKey, FieldKey>> = {
   referencePoNumber: "poNumber",
   referenceInvoiceNumber: "invoiceNumber",
-  paidAmount: "totalAmount",
-  statementAmount: "totalAmount",
   registrationNumber: "vehicleNumber",
   routeFrom: "dispatchFrom",
   routeTo: "shipTo",
@@ -108,7 +106,7 @@ const AMOUNT_FIELDS = new Set<FieldKey>([
   "debitAmount",
   "closingBalance",
 ]);
-const WEIGHT_FIELDS = new Set<FieldKey>(["grossWeight", "tareWeight", "netWeight", "itemQuantity"]);
+const WEIGHT_FIELDS = new Set<FieldKey>(["grossWeight", "tareWeight", "netWeight"]);
 const COUNT_UNIT_VALUES = new Set(["nos", "no", "number", "numbers", "pcs", "piece", "pieces", "pc"]);
 
 function parseNumericValue(value: string) {
@@ -161,6 +159,25 @@ function normalizeUnitValue(value: string) {
   if (["kg", "kgs", "kilogram", "kilograms"].includes(compact)) return "kg";
   if (["mt", "mton", "metricton", "metrictons"].includes(compact)) return "mt";
   return compact || null;
+}
+
+function normalizeWeightToKg(value: string | number | null | undefined) {
+  if (value === null || value === undefined) return null;
+
+  const raw = String(value).toLowerCase().trim();
+  if (!raw) return null;
+
+  const numericMatch = raw.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+  if (!numericMatch) return null;
+
+  const parsed = Number(numericMatch[0]);
+  if (!Number.isFinite(parsed)) return null;
+
+  if (/\b(?:mt|m\.t\.?|metric\s*tons?|tonnes?|tons?)\b/i.test(raw)) {
+    return parsed * 1000;
+  }
+
+  return parsed;
 }
 
 function isNonComparablePlaceholder(value: string) {
@@ -231,6 +248,14 @@ export function areComparableValuesEqual(
   fieldKey?: FieldKey
 ) {
   if (fieldKey && (AMOUNT_FIELDS.has(fieldKey) || WEIGHT_FIELDS.has(fieldKey))) {
+    if (WEIGHT_FIELDS.has(fieldKey)) {
+      const leftWeight = normalizeWeightToKg(left);
+      const rightWeight = normalizeWeightToKg(right);
+      if (leftWeight !== null && rightWeight !== null) {
+        return Math.abs(leftWeight - rightWeight) <= Math.max(5, Math.abs(rightWeight) * 0.005);
+      }
+    }
+
     const leftNumber = parseNumericValue(String(left ?? "").toLowerCase());
     const rightNumber = parseNumericValue(String(right ?? "").toLowerCase());
 
@@ -244,15 +269,6 @@ export function areComparableValuesEqual(
         return (
           Math.abs(leftNumber * 2 - rightNumber) <= Math.max(1, Math.abs(rightNumber) * 0.001) ||
           Math.abs(leftNumber - rightNumber * 2) <= Math.max(1, Math.abs(leftNumber) * 0.001)
-        );
-      }
-
-      if (WEIGHT_FIELDS.has(fieldKey)) {
-        const leftAsKg = leftNumber * 1000;
-        const rightAsKg = rightNumber * 1000;
-        return (
-          Math.abs(leftAsKg - rightNumber) <= Math.max(1, Math.abs(rightNumber) * 0.001) ||
-          Math.abs(leftNumber - rightAsKg) <= Math.max(1, Math.abs(rightAsKg) * 0.001)
         );
       }
     }
@@ -323,9 +339,7 @@ export function getComparableFieldValue(doc: ComparableDoc, fieldKey: FieldKey) 
         ? doc.fields.referenceInvoiceNumber ?? doc.fields.invoiceNumber
         : doc.fields.invoiceNumber ?? doc.fields.referenceInvoiceNumber;
     case "totalAmount":
-      return PAYMENT_EVIDENCE_DOC_TYPES.has(doc.type)
-        ? doc.fields.paidAmount ?? doc.fields.statementAmount ?? doc.fields.totalAmount
-        : doc.fields.totalAmount ?? doc.fields.paidAmount ?? doc.fields.statementAmount;
+      return doc.fields.totalAmount;
     case "vehicleNumber":
       return VEHICLE_REGISTRATION_DOC_TYPES.has(doc.type)
         ? doc.fields.registrationNumber ?? doc.fields.vehicleNumber

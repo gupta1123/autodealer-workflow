@@ -1,9 +1,10 @@
 import { jsonWithCors } from "@/lib/api/cors";
 import { resolveCaseDisplayNameWithAI } from "@/lib/case-naming";
+import { summarizeCase } from "@/lib/case-summary";
 import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
 import { serializeFieldsWithLineItems } from "@/lib/line-items";
 import { mergePersistedStructuredData } from "@/lib/persisted-structured-data";
-import { processStoredCaseFiles } from "@/lib/processing/pipeline";
+import { enrichProcessedDocuments, processStoredCaseFiles, verifyProcessedDocuments } from "@/lib/processing/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import type { CaseAnalysisMode } from "@/types/pipeline";
 
@@ -93,10 +94,6 @@ export async function POST(
         }, { onlyWhenRunning: true });
       },
     });
-    const displayName = await resolveCaseDisplayNameWithAI(
-      processed.documents,
-      processed.summary
-    );
 
     await updateJob({
       stage: "Saving extracted results",
@@ -126,11 +123,16 @@ export async function POST(
     if (documentDeleteError) throw documentDeleteError;
     if (mismatchDeleteError) throw mismatchDeleteError;
 
-    const documents = mergePersistedStructuredData(
-      processed.documents,
-      existingDocuments ?? [],
-      fieldConfiguration
+    const documents = enrichProcessedDocuments(
+      mergePersistedStructuredData(
+        processed.documents,
+        existingDocuments ?? [],
+        fieldConfiguration
+      )
     );
+    const verified = verifyProcessedDocuments(documents, processed.comparisonOptions);
+    const summary = summarizeCase(documents, verified.mismatches, fieldConfiguration);
+    const displayName = await resolveCaseDisplayNameWithAI(documents, summary);
 
     const documentRows = documents.map((document) => ({
       case_id: job.case_id,
@@ -149,8 +151,8 @@ export async function POST(
       throw insertDocumentError;
     }
 
-    if (processed.mismatches.length > 0) {
-      const mismatchRows = processed.mismatches.map((mismatch) => ({
+    if (verified.mismatches.length > 0) {
+      const mismatchRows = verified.mismatches.map((mismatch) => ({
         case_id: job.case_id,
         client_mismatch_id: mismatch.id,
         field_name: mismatch.field,
@@ -173,28 +175,28 @@ export async function POST(
     const { error: updateCaseError } = await supabase
       .from("packet_cases")
       .update({
-        slug: processed.summary.slug,
+        slug: summary.slug,
         display_name: displayName,
-        buyer_name: processed.summary.buyerName || null,
-        po_number: processed.summary.poNumber || null,
-        invoice_number: processed.summary.invoiceNumber || null,
+        buyer_name: summary.buyerName || null,
+        po_number: summary.poNumber || null,
+        invoice_number: summary.invoiceNumber || null,
         status: "completed",
-        risk_score: processed.summary.riskScore,
+        risk_score: summary.riskScore,
         upload_count: uploadCount ?? caseRow.upload_count,
-        document_count: processed.documents.length,
-        mismatch_count: processed.mismatches.length,
+        document_count: documents.length,
+        mismatch_count: verified.mismatches.length,
         processing_meta: {
           ...existingMeta,
           draft: false,
           analyzedAt: new Date().toISOString(),
-          caseCategory: processed.summary.category,
-          packetCategory: processed.summary.packetCategory,
-          documentTypes: processed.summary.documentTypes,
-          missingDocumentGroups: processed.summary.missingDocTypes,
-          paymentGap: processed.summary.paymentGap,
+          caseCategory: summary.category,
+          packetCategory: summary.packetCategory,
+          documentTypes: summary.documentTypes,
+          missingDocumentGroups: summary.missingDocTypes,
+          paymentGap: summary.paymentGap,
           analysisMode,
           comparisonOptions: processed.comparisonOptions,
-          verificationGroups: processed.verificationGroups,
+          verificationGroups: verified.verificationGroups,
           lastProcessingError: null,
         },
       })
@@ -210,11 +212,11 @@ export async function POST(
       stage: "Completed",
       error: null,
       result: {
-        summary: processed.summary,
+        summary,
         analysisMode,
-        documentCount: processed.documents.length,
-        mismatchCount: processed.mismatches.length,
-        verificationGroupCount: processed.verificationGroups.length,
+        documentCount: documents.length,
+        mismatchCount: verified.mismatches.length,
+        verificationGroupCount: verified.verificationGroups.length,
       },
       finished_at: new Date().toISOString(),
     });

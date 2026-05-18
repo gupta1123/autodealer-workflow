@@ -52,11 +52,15 @@ const FIELD_LABEL_LOOKUP = ACTIVE_FIELD_DEFINITIONS.reduce(
 );
 
 const LINE_ITEM_FIELD_LABELS: Record<string, string> = {
+  "lineItems.unmatchedDocumentLine": "Document line item",
   "lineItems.unmatchedInvoiceLine": "Invoice line item",
   "lineItems.uninvoicedPoLine": "PO line item",
   "lineItems.quantityExceeded": "Line item quantity",
+  "lineItems.quantityMismatch": "Line item quantity",
   "lineItems.rateMismatch": "Line item rate",
   "lineItems.unitMismatch": "Line item unit",
+  "lineItems.hsnSacMismatch": "Line item HSN/SAC",
+  "lineItems.amountMismatch": "Line item amount",
 };
 
 function getGroupForField(field: string, groups: ComparisonFieldGroup[]) {
@@ -191,12 +195,20 @@ function getIssueDescription(fieldName: string) {
       return "The item was matched, but the PO and invoice use different units. Confirm whether these units mean the same thing before approving.";
     case "lineItems.rateMismatch":
       return "The item was matched, but the invoice rate is different from the effective PO rate.";
+    case "lineItems.hsnSacMismatch":
+      return "The item was matched, but the HSN/SAC code differs between the documents.";
+    case "lineItems.amountMismatch":
+      return "The item was matched, but the line amount differs between the documents.";
     case "lineItems.uninvoicedPoLine":
       return "This PO line was ordered but was not found on the invoice.";
+    case "lineItems.unmatchedDocumentLine":
+      return "This document line could not be confidently matched to the reference document line.";
     case "lineItems.unmatchedInvoiceLine":
       return "This invoice line could not be matched to a PO line.";
     case "lineItems.quantityExceeded":
       return "The invoice quantity is greater than the matching PO quantity.";
+    case "lineItems.quantityMismatch":
+      return "The matched line quantity differs between the documents.";
     case "taxAmount":
       return "The invoice tax amount and PO tax amount do not match.";
     case "totalAmount":

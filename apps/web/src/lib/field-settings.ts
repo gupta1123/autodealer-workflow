@@ -48,6 +48,8 @@ export function getFieldCategory(fieldKey: FieldKey): string {
 
 export const DOC_TYPE_INFO: Record<DocType, { label: string; icon: string }> = {
   "Purchase Order": { label: "Purchase Order", icon: "FileText" },
+  "Amended Purchase Order": { label: "Amended PO", icon: "FileEdit" },
+  Invoice: { label: "Invoice", icon: "Receipt" },
   "Tax Invoice": { label: "Tax Invoice", icon: "Receipt" },
   Receipt: { label: "Receipt", icon: "CreditCard" },
   "Delivery Note": { label: "Delivery Note", icon: "Package" },

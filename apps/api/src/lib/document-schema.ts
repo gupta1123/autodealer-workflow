@@ -415,7 +415,10 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
   ],
   'E-Way Bill': [
     'eWayBillNumber',
+    'referenceInvoiceNumber',
     'vehicleNumber',
+    'vendorName',
+    'buyerName',
     'supplierGstin',
     'buyerGstin',
     'dispatchFrom',

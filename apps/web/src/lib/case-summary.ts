@@ -28,7 +28,9 @@ type ProcessingMetaLike = {
 
 const RECEIVER_DOC_WEIGHTS: Partial<Record<DocType, number>> = {
   "Tax Invoice": 6,
+  Invoice: 6,
   "Purchase Order": 6,
+  "Amended Purchase Order": 6,
   "E-Way Bill": 4,
   "Delivery Note": 4,
   "Delivery Challan": 4,
@@ -39,6 +41,7 @@ const RECEIVER_DOC_WEIGHTS: Partial<Record<DocType, number>> = {
 
 const BUYER_COUNTERPARTY_DOC_WEIGHTS: Partial<Record<DocType, number>> = {
   "Tax Invoice": 6,
+  Invoice: 6,
   "E-Way Bill": 5,
   "Delivery Note": 5,
   "Delivery Challan": 5,
@@ -48,7 +51,9 @@ const BUYER_COUNTERPARTY_DOC_WEIGHTS: Partial<Record<DocType, number>> = {
 
 const VENDOR_COUNTERPARTY_DOC_WEIGHTS: Partial<Record<DocType, number>> = {
   "Purchase Order": 7,
+  "Amended Purchase Order": 7,
   "Tax Invoice": 5,
+  Invoice: 5,
   "Weighment Slip": 4,
   "Material Test Certificate": 4,
   "Lorry Receipt": 2,
@@ -57,6 +62,8 @@ const VENDOR_COUNTERPARTY_DOC_WEIGHTS: Partial<Record<DocType, number>> = {
 
 const RECEIVER_FIELD_PRIORITY_BY_DOC_TYPE: Record<DocType, FieldKey[]> = {
   "Purchase Order": ["vendorName", "buyerName"],
+  "Amended Purchase Order": ["vendorName", "buyerName"],
+  Invoice: ["buyerName"],
   "Tax Invoice": ["buyerName"],
   Receipt: ["buyerName"],
   "Delivery Note": ["buyerName"],
@@ -86,6 +93,8 @@ const CASE_SUBJECT_FIELD_PRIORITY_BY_DOC_TYPE: Partial<Record<DocType, FieldKey[
 
 const CASE_CATEGORY_BY_DOC_TYPE: Record<DocType, string> = {
   "Purchase Order": "Purchase packet",
+  "Amended Purchase Order": "Purchase packet",
+  Invoice: "Commercial packet",
   "Tax Invoice": "Commercial packet",
   Receipt: "Payment packet",
   "Delivery Note": "Logistics packet",

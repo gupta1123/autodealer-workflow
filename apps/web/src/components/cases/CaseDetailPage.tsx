@@ -48,11 +48,13 @@ import {
   getFieldDefinitionsForDocType,
   shouldConsiderFieldKey,
 } from "@/lib/document-schema";
+import { isLineItemMismatchField } from "@/lib/line-items";
 import {
   appendCaseFiles,
   enqueueCaseAnalysis,
   fetchCaseAnalysisStatus,
   fetchCaseDetail,
+  fetchCaseFileSignedUrl,
   updateCaseDecision,
   type CaseDecision,
   type SavedCaseDetail,
@@ -91,7 +93,7 @@ const LINE_ITEM_COLUMNS: Array<{
   className?: string;
 }> = [
   { key: "lineNumber", label: "#", className: "w-12" },
-  { key: "itemCode", label: "Code", className: "min-w-24" },
+  { key: "itemCode", label: "Item Code", className: "min-w-32" },
   { key: "description", label: "Description", className: "min-w-60" },
   { key: "hsnSac", label: "HSN/SAC", className: "min-w-24" },
   { key: "quantity", label: "Qty", className: "min-w-20 text-right" },
@@ -402,6 +404,9 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   const [activeDataView, setActiveDataView] = useState<DataViewMode>("fields");
   const [previewPageIndex, setPreviewPageIndex] = useState(0);
   const [previewZoom, setPreviewZoom] = useState(1);
+  const [signedFileUrls, setSignedFileUrls] = useState<Record<string, string | null>>({});
+  const [loadingPreviewFileId, setLoadingPreviewFileId] = useState<string | null>(null);
+  const [previewUrlError, setPreviewUrlError] = useState<string | null>(null);
   const draftFileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -422,6 +427,12 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     return () => {
       active = false;
     };
+  }, [caseId]);
+
+  useEffect(() => {
+    setSignedFileUrls({});
+    setLoadingPreviewFileId(null);
+    setPreviewUrlError(null);
   }, [caseId]);
 
   useEffect(() => {
@@ -517,7 +528,8 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     () =>
       detail?.mismatches.filter(
         (mismatch) =>
-          shouldConsiderFieldKey(mismatch.fieldName) && isPrimaryComparisonField(mismatch.fieldName)
+          isLineItemMismatchField(mismatch.fieldName) ||
+          (shouldConsiderFieldKey(mismatch.fieldName) && isPrimaryComparisonField(mismatch.fieldName))
       ) ?? [],
     [detail]
   );
@@ -665,7 +677,11 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
   const activePreviewFile =
     activeDocumentFiles[previewPageIndex] ?? activeDocumentFiles[0] ?? null;
-  const activeFileUrl = activePreviewFile?.signedUrl ?? null;
+  const activeFileUrl = activePreviewFile
+    ? signedFileUrls[activePreviewFile.id] ?? activePreviewFile.signedUrl ?? null
+    : null;
+  const isPreviewUrlLoading =
+    Boolean(activePreviewFile) && loadingPreviewFileId === activePreviewFile?.id;
   const previewPageCount = activeDocumentFiles.length || activeDocument?.pageCount || 1;
   const activeSourceLabel = getSourceFileLabel(
     activePreviewFile?.mimeType,
@@ -694,6 +710,52 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   useEffect(() => {
     setPreviewZoom(1);
   }, [previewPageIndex]);
+
+  useEffect(() => {
+    if (!detail || activeTab !== "preview" || !activePreviewFile) {
+      return;
+    }
+
+    if (
+      activePreviewFile.signedUrl ||
+      Object.prototype.hasOwnProperty.call(signedFileUrls, activePreviewFile.id)
+    ) {
+      return;
+    }
+
+    let active = true;
+    setLoadingPreviewFileId(activePreviewFile.id);
+    setPreviewUrlError(null);
+
+    fetchCaseFileSignedUrl(detail.case.id, activePreviewFile.id)
+      .then((payload) => {
+        if (!active) return;
+        setSignedFileUrls((current) => ({
+          ...current,
+          [payload.fileId]: payload.signedUrl,
+        }));
+      })
+      .catch((loadError) => {
+        if (!active) return;
+        setPreviewUrlError(
+          loadError instanceof Error ? loadError.message : "Failed to load source preview."
+        );
+        setSignedFileUrls((current) => ({
+          ...current,
+          [activePreviewFile.id]: null,
+        }));
+      })
+      .finally(() => {
+        if (!active) return;
+        setLoadingPreviewFileId((current) =>
+          current === activePreviewFile.id ? null : current
+        );
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [activePreviewFile, activeTab, detail, signedFileUrls]);
 
   const comparisonOptions = useMemo(
     () =>
@@ -1423,10 +1485,17 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                             title="Document Preview"
                           />
                         )
+                      ) : isPreviewUrlLoading ? (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-300 gap-4 p-6 text-center">
+                          <Loader2 className="w-12 h-12 animate-spin opacity-70" />
+                          <p className="text-sm font-medium">Loading source preview...</p>
+                        </div>
                       ) : (
                         <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-300 gap-4 p-6 text-center">
                           <FileSearch className="w-12 h-12 opacity-50" />
-                          <p className="text-sm font-medium">Source preview not available for this document.</p>
+                          <p className="text-sm font-medium">
+                            {previewUrlError || "Source preview not available for this document."}
+                          </p>
                         </div>
                       )}
 

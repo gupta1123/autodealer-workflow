@@ -7,6 +7,7 @@ import {
   omitIgnoredFields,
 } from "@/lib/document-schema";
 import { isCommercialDocType, sanitizeLineItems } from "@/lib/line-items";
+import { DEFAULT_COMPARISON_OPTIONS, normalizeComparableValue } from "@/lib/comparison";
 
 let aiUnavailableReason: string | null = null;
 const CLIENT_MAX_RETRIES = Number(
@@ -360,9 +361,10 @@ function getLineItemExtractionInstruction(docType: DocType) {
   return (
     "Also extract every commercial table row into a top-level lineItems array. " +
     "Each line item may contain lineNumber, itemCode, description, hsnSac, quantity, unit, rate, discountPercent, netRate, taxableAmount, cgstRate, cgstAmount, sgstRate, sgstAmount, igstRate, igstAmount, taxRate, taxAmount, lineTotal, referencePoLineNumber, and rawText. " +
-    "Preserve one entry per visible PO/invoice row; do not merge different rows or sum unlike units. Use rawText for the original row text when OCR is uncertain. " +
+    "When the item description cell contains a generic item name plus a product/model/specification code, split it: put the generic item name in description and put the remaining product/model/specification text in itemCode. For example, extract \"Guide Roller 5374 ERG150\" as description \"Guide Roller\" and itemCode \"5374 ERG150\". " +
+    "Preserve one entry per visible PO, invoice, delivery, e-way bill, LR, weighment, or material table row; do not merge different rows or sum unlike units. Use rawText for the original row text when OCR is uncertain. " +
     "Do not extract HSN/SAC-wise tax summary rows as lineItems. Rows that only contain HSN/SAC, taxable value, and tax amount are summary rows, not product/service lines. " +
-    "For product/service rows, keep product text only in description and keep HSN/SAC only in hsnSac. Never copy HSN/SAC codes, GST labels, quantities, units, rates, tax rates, taxable amounts, tax amounts, or totals into description. "
+    "For product/service rows, keep item name only in description, keep product/model/specification identifiers in itemCode, and keep HSN/SAC only in hsnSac. Never copy HSN/SAC codes, GST labels, quantities, units, rates, tax rates, taxable amounts, tax amounts, or totals into description or itemCode. "
   );
 }
 
@@ -407,7 +409,8 @@ function getEWayBillExtractionInstruction(docType: DocType) {
 
   return (
     "For E-Way Bill documents, vendorName is the From party name in Address Details after the first GSTIN, and buyerName is the To party name after the second GSTIN. " +
-    "Do not use Dispatch From or Ship To address text as party names; those belong in dispatchFrom and shipTo. "
+    "Do not use Dispatch From or Ship To address text as party names; those belong in dispatchFrom and shipTo. " +
+    "If Part-A shows Doc No, Document No, Invoice No, Tax Invoice No, or Delivery Challan No, extract that value as referenceInvoiceNumber unless it is the E-Way Bill No itself. "
   );
 }
 
@@ -744,6 +747,23 @@ function extractEWayBillAddresses(visibleText: string): Partial<Record<FieldKey,
   };
 }
 
+function normalizeEWayReferenceText(value: string) {
+  return value
+    .replace(/[ΚK]\s*[ΑA]/g, "KA")
+    .replace(/[ΟO]/g, "O")
+    .replace(/\s+/g, "")
+    .replace(/[^A-Z0-9/-]/gi, "")
+    .toUpperCase();
+}
+
+function extractEWayBillReferenceInvoiceNumber(visibleText: string) {
+  const text = visibleText.replace(/\s+/g, " ").trim();
+  const documentDetails = text.match(/\bDocument\s+Details\s*:?\s*(?:Tax\s+Invoice|Invoice|Delivery\s+Challan)?\s*([A-ZΑ-Ω0-9][A-ZΑ-Ω0-9\s/-]{4,40}?)(?:\s*[-–]\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\s+\bIRN\b|\s+\bAddress\s+Details\b|$)/i)?.[1];
+  if (!documentDetails) return undefined;
+  const normalized = normalizeEWayReferenceText(documentDetails);
+  return normalized.length >= 5 ? normalized : undefined;
+}
+
 function applyEWayBillAddressFallback(
   fields: Partial<Record<FieldKey, string>>,
   docType: DocType,
@@ -752,10 +772,12 @@ function applyEWayBillAddressFallback(
   if (docType !== "E-Way Bill" || !visibleText.trim()) return fields;
   const addresses = extractEWayBillAddresses(visibleText);
   const parties = extractEWayBillPartyNames(visibleText, fields);
+  const referenceInvoiceNumber = extractEWayBillReferenceInvoiceNumber(visibleText);
   return {
     ...fields,
     ...(fields.vendorName || !parties.vendorName ? {} : { vendorName: parties.vendorName }),
     ...(fields.buyerName || !parties.buyerName ? {} : { buyerName: parties.buyerName }),
+    ...(fields.referenceInvoiceNumber || !referenceInvoiceNumber ? {} : { referenceInvoiceNumber }),
     ...(fields.dispatchFrom || !addresses.dispatchFrom ? {} : { dispatchFrom: addresses.dispatchFrom }),
     ...(fields.shipTo || !addresses.shipTo ? {} : { shipTo: addresses.shipTo }),
   };
@@ -869,6 +891,275 @@ function applyFastagDetailsFallback(
       return acc;
     },
     { ...fields } as Partial<Record<FieldKey, string>>
+  );
+}
+
+const FASTAG_CONTEXT_FIELDS: FieldKey[] = [
+  "vehicleNumber",
+  "fastagReference",
+  "fastagStatementReference",
+  "fastagCustomerId",
+  "fastagCustomerName",
+  "statementPeriod",
+  "statementDate",
+];
+
+const PARTY_CONTEXT_DOC_TYPES = new Set<DocType>([
+  "Purchase Order",
+  "Amended Purchase Order",
+  "Invoice",
+  "Tax Invoice",
+]);
+
+const COMMERCIAL_TOTAL_DOC_TYPES = new Set<DocType>([
+  "Purchase Order",
+  "Amended Purchase Order",
+  "Invoice",
+  "Tax Invoice",
+]);
+
+function normalizePacketValue(value: string | number | null | undefined, field?: FieldKey) {
+  return normalizeComparableValue(value, DEFAULT_COMPARISON_OPTIONS, field) || null;
+}
+
+function getSinglePacketValue(documents: CaseDoc[], field: FieldKey) {
+  const values = [
+    ...new Set(
+      documents
+        .map((doc) => normalizePacketValue(doc.fields[field], field))
+        .filter((value): value is string => Boolean(value))
+    ),
+  ];
+  return values.length === 1 ? documents.find((doc) => normalizePacketValue(doc.fields[field], field) === values[0])?.fields[field] : undefined;
+}
+
+function hasOnlyTransactionSummary(fields: Partial<Record<FieldKey, string>>) {
+  const identityFields: FieldKey[] = [
+    "vehicleNumber",
+    "fastagReference",
+    "fastagStatementReference",
+    "fastagCustomerId",
+    "fastagCustomerName",
+    "statementPeriod",
+    "statementDate",
+  ];
+
+  return Boolean(fields.tollTransactionSummary && identityFields.every((field) => !fields[field]));
+}
+
+function findBestFastagContext(documents: CaseDoc[]) {
+  const fastagDocs = documents.filter((doc) => doc.type === "FASTag Toll Proof");
+  return fastagDocs
+    .filter((doc) => FASTAG_CONTEXT_FIELDS.some((field) => doc.fields[field]))
+    .sort((left, right) => {
+      const leftScore = FASTAG_CONTEXT_FIELDS.filter((field) => left.fields[field]).length;
+      const rightScore = FASTAG_CONTEXT_FIELDS.filter((field) => right.fields[field]).length;
+      return rightScore - leftScore;
+    })[0];
+}
+
+function enrichFastagContinuationDocs(documents: CaseDoc[]) {
+  const bestFastag = findBestFastagContext(documents);
+  const packetVehicleNumber = bestFastag?.fields.vehicleNumber ?? getSinglePacketValue(documents, "vehicleNumber");
+
+  return documents.map((doc) => {
+    if (doc.type !== "FASTag Toll Proof") return doc;
+    if (!hasOnlyTransactionSummary(doc.fields) && !FASTAG_CONTEXT_FIELDS.some((field) => !doc.fields[field] && bestFastag?.fields[field])) {
+      return doc;
+    }
+
+    const fields = { ...doc.fields };
+    for (const field of FASTAG_CONTEXT_FIELDS) {
+      const sourceValue = bestFastag?.id !== doc.id ? bestFastag?.fields[field] : undefined;
+      if (!fields[field] && sourceValue) {
+        fields[field] = sourceValue;
+      }
+    }
+    if (!fields.vehicleNumber && packetVehicleNumber) {
+      fields.vehicleNumber = packetVehicleNumber;
+    }
+
+    return { ...doc, fields };
+  });
+}
+
+function getBestPartyNameByGstin(
+  documents: CaseDoc[],
+  gstinField: "supplierGstin" | "buyerGstin",
+  nameField: "vendorName" | "buyerName",
+  gstin: string | undefined
+) {
+  const normalizedGstin = normalizePacketValue(gstin, gstinField);
+  if (!normalizedGstin) return undefined;
+
+  const candidates = documents
+    .filter((doc) => PARTY_CONTEXT_DOC_TYPES.has(doc.type))
+    .filter((doc) => normalizePacketValue(doc.fields[gstinField], gstinField) === normalizedGstin)
+    .map((doc) => doc.fields[nameField])
+    .filter((name): name is string => Boolean(name && /[a-z]/i.test(name)))
+    .filter((name) => !/\b(?:pcr|portal|address|dispatch|ship|recipient)\b/i.test(name));
+
+  return candidates.sort((left, right) => right.length - left.length)[0];
+}
+
+function enrichEWayBillParties(documents: CaseDoc[]) {
+  return documents.map((doc) => {
+    if (doc.type !== "E-Way Bill") return doc;
+
+    const vendorName = getBestPartyNameByGstin(documents, "supplierGstin", "vendorName", doc.fields.supplierGstin);
+    const buyerName = getBestPartyNameByGstin(documents, "buyerGstin", "buyerName", doc.fields.buyerGstin);
+    const fields = { ...doc.fields };
+
+    if (vendorName && vendorName !== fields.vendorName) {
+      fields.vendorName = vendorName;
+    }
+    if (buyerName && buyerName !== fields.buyerName) {
+      fields.buyerName = buyerName;
+    }
+
+    return fields.vendorName === doc.fields.vendorName && fields.buyerName === doc.fields.buyerName
+      ? doc
+      : { ...doc, fields };
+  });
+}
+
+function normalizeGstinForDisplay(value: string | undefined, field: "supplierGstin" | "buyerGstin") {
+  const normalized = normalizeComparableValue(value, DEFAULT_COMPARISON_OPTIONS, field);
+  return normalized && /^[0-9A-Z]{15}$/.test(normalized) ? normalized : value;
+}
+
+function normalizeEWayBillNumberForDisplay(value: string | undefined) {
+  if (!value) return value;
+  const digits = value.replace(/\D/g, "");
+  return digits.length === 12 ? digits : value;
+}
+
+function normalizeIdentifierDisplayFields(documents: CaseDoc[]) {
+  return documents.map((doc) => {
+    const fields = { ...doc.fields };
+    let changed = false;
+
+    const supplierGstin = normalizeGstinForDisplay(fields.supplierGstin, "supplierGstin");
+    if (supplierGstin && supplierGstin !== fields.supplierGstin) {
+      fields.supplierGstin = supplierGstin;
+      changed = true;
+    }
+
+    const buyerGstin = normalizeGstinForDisplay(fields.buyerGstin, "buyerGstin");
+    if (buyerGstin && buyerGstin !== fields.buyerGstin) {
+      fields.buyerGstin = buyerGstin;
+      changed = true;
+    }
+
+    if (doc.type === "E-Way Bill") {
+      const eWayBillNumber = normalizeEWayBillNumberForDisplay(fields.eWayBillNumber);
+      if (eWayBillNumber && eWayBillNumber !== fields.eWayBillNumber) {
+        fields.eWayBillNumber = eWayBillNumber;
+        changed = true;
+      }
+    }
+
+    return changed ? { ...doc, fields } : doc;
+  });
+}
+
+function parseLooseNumber(value: string | number | null | undefined) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (!value) return null;
+
+  const compact = String(value).replace(/[₹$€£,\s]/g, "");
+  const match = compact.match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+
+  const parsed = Number(match[0]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatNumberForField(value: number) {
+  const rounded = Math.round(value * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function numbersClose(left: number, right: number, tolerance = 0.01) {
+  return Math.abs(left - right) <= Math.max(tolerance, Math.abs(right) * 0.001);
+}
+
+function isClearMagnitudeError(current: number, expected: number) {
+  if (expected <= 0 || current <= 0) return false;
+  if (numbersClose(current, expected)) return false;
+
+  const ratio = current / expected;
+  return [10, 100, 1000, 0.1, 0.01, 0.001].some((factor) => Math.abs(ratio - factor) <= factor * 0.02);
+}
+
+function correctLineItemAmounts(lineItems: CommercialLineItem[] | undefined) {
+  if (!lineItems?.length) return lineItems;
+
+  let changed = false;
+  const corrected = lineItems.map((item) => {
+    const quantity = parseLooseNumber(item.quantity);
+    const rate = parseLooseNumber(item.rate ?? item.netRate);
+    if (quantity === null || rate === null || quantity <= 0 || rate < 0) return item;
+
+    const expected = quantity * rate;
+    const next = { ...item };
+    const lineTotal = parseLooseNumber(item.lineTotal);
+    const taxableAmount = parseLooseNumber(item.taxableAmount);
+
+    if (lineTotal !== null && isClearMagnitudeError(lineTotal, expected)) {
+      next.lineTotal = formatNumberForField(expected);
+      changed = true;
+    }
+    if (taxableAmount !== null && isClearMagnitudeError(taxableAmount, expected)) {
+      next.taxableAmount = formatNumberForField(expected);
+      changed = true;
+    }
+
+    return next;
+  });
+
+  return changed ? corrected : lineItems;
+}
+
+function correctCommercialTotals(doc: CaseDoc) {
+  if (!COMMERCIAL_TOTAL_DOC_TYPES.has(doc.type) || !doc.lineItems?.length) return doc;
+
+  const lineItems = correctLineItemAmounts(doc.lineItems);
+  const lineSum = lineItems
+    ?.map((item) => parseLooseNumber(item.lineTotal ?? item.taxableAmount))
+    .filter((value): value is number => value !== null && value >= 0)
+    .reduce((total, value) => total + value, 0);
+  if (!lineSum || lineSum <= 0) {
+    return lineItems === doc.lineItems ? doc : { ...doc, lineItems };
+  }
+
+  const fields = { ...doc.fields };
+  const subtotal = parseLooseNumber(fields.subtotal);
+  const totalAmount = parseLooseNumber(fields.totalAmount);
+  const taxAmount = parseLooseNumber(fields.taxAmount);
+  let changed = lineItems !== doc.lineItems;
+
+  if (subtotal !== null && isClearMagnitudeError(subtotal, lineSum)) {
+    fields.subtotal = formatNumberForField(lineSum);
+    changed = true;
+  }
+
+  const expectedTotal = taxAmount !== null ? lineSum + taxAmount : lineSum;
+  if (totalAmount !== null && isClearMagnitudeError(totalAmount, expectedTotal)) {
+    fields.totalAmount = formatNumberForField(expectedTotal);
+    changed = true;
+  }
+
+  return changed ? { ...doc, fields, lineItems } : doc;
+}
+
+function enrichCommercialAmounts(documents: CaseDoc[]) {
+  return documents.map(correctCommercialTotals);
+}
+
+export function enrichProcessedDocuments(documents: CaseDoc[]) {
+  return normalizeIdentifierDisplayFields(
+    enrichCommercialAmounts(enrichEWayBillParties(enrichFastagContinuationDocs(documents)))
   );
 }
 

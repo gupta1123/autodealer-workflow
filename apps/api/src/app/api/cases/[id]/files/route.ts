@@ -136,6 +136,103 @@ function mapCaseRow(row: {
   };
 }
 
+export async function GET(
+  request: Request,
+  context: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await context.params;
+    const fileId = new URL(request.url).searchParams.get("fileId");
+
+    if (!fileId) {
+      return jsonWithCors(request, { error: "Missing fileId." }, { status: 400 });
+    }
+
+    const user = await requireRequestUser(request);
+    if (!user) {
+      return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
+    }
+
+    const supabase = createSupabaseAdminClient();
+    let existing: { processing_meta?: unknown; deleted_at?: string | null } | null = null;
+
+    try {
+      const result = await supabase
+        .from("packet_cases")
+        .select("id, owner_user_id, processing_meta, deleted_at")
+        .eq("id", id)
+        .eq("owner_user_id", user.id)
+        .single();
+
+      if (result.error) {
+        if (result.error.code === "PGRST116") {
+          return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
+        }
+        throw result.error;
+      }
+
+      existing = result.data;
+    } catch (error) {
+      if (!isRecycleBinSchemaMissing(error)) {
+        throw error;
+      }
+
+      const fallback = await supabase
+        .from("packet_cases")
+        .select("id, owner_user_id, processing_meta")
+        .eq("id", id)
+        .eq("owner_user_id", user.id)
+        .single();
+
+      if (fallback.error) {
+        if (fallback.error.code === "PGRST116") {
+          return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
+        }
+        throw fallback.error;
+      }
+
+      existing = {
+        ...fallback.data,
+        deleted_at: getRecycleBinDeletedAt(fallback.data.processing_meta),
+      };
+    }
+
+    if ((existing.deleted_at ?? null) || isCaseRecycled(existing.processing_meta)) {
+      return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
+    }
+
+    const { data: file, error: fileError } = await supabase
+      .from("packet_case_files")
+      .select("id, storage_bucket, storage_path")
+      .eq("id", fileId)
+      .eq("case_id", id)
+      .single();
+
+    if (fileError) {
+      if (fileError.code === "PGRST116") {
+        return jsonWithCors(request, { error: "File not found." }, { status: 404 });
+      }
+      throw fileError;
+    }
+
+    const bucketName = file.storage_bucket || STORAGE_BUCKET;
+    const { data: signedData, error: signedError } = await supabase.storage
+      .from(bucketName)
+      .createSignedUrl(file.storage_path, 60 * 60);
+
+    if (signedError || !signedData?.signedUrl) {
+      throw signedError ?? new Error("Unable to create preview URL.");
+    }
+
+    return jsonWithCors(request, {
+      fileId: file.id,
+      signedUrl: signedData.signedUrl,
+    });
+  } catch (error) {
+    return jsonWithCors(request, { error: serializeError(error) }, { status: 500 });
+  }
+}
+
 export async function POST(
   request: Request,
   context: { params: Promise<{ id: string }> }

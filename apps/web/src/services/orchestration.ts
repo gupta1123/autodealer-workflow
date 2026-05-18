@@ -10,6 +10,7 @@ import { fileToImagePages } from "@/services/pdf";
 import { getQueuedUploadFiles } from "@/lib/upload-groups";
 import {
   classifyDocumentFromImage,
+  enrichProcessedDocuments,
   extractDataFromImages,
   generateMismatchAnalysis,
 } from "@/services/ai";
@@ -89,10 +90,11 @@ export async function orchestrateUploads(
     onStageUpdate(upload.id, "complete", { document: finalizedDoc });
   }
 
-  const rawMismatches = verifyCaseDocuments(documents, comparisonOptions);
+  const enrichedDocuments = enrichProcessedDocuments(documents);
+  const rawMismatches = verifyCaseDocuments(enrichedDocuments, comparisonOptions);
   const mismatches = rawMismatches.length
-    ? await generateMismatchAnalysis(rawMismatches as Mismatch[], documents)
+    ? await generateMismatchAnalysis(rawMismatches as Mismatch[], enrichedDocuments)
     : [];
 
-  return { documents, mismatches };
+  return { documents: enrichedDocuments, mismatches };
 }

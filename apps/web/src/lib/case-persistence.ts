@@ -111,6 +111,10 @@ type RecentCasesResponse = {
 };
 
 type CaseDetailResponse = SavedCaseDetail;
+type CaseFileSignedUrlResponse = {
+  fileId: string;
+  signedUrl: string;
+};
 export type CaseListScope = "active" | "deleted";
 export type CaseDecision = "accepted" | "rejected";
 export type MismatchDecision = "accepted" | "rejected";
@@ -657,5 +661,28 @@ export async function fetchCaseDetail(caseId: string): Promise<CaseDetailRespons
     files: payload.files,
     documents: payload.documents,
     mismatches: payload.mismatches,
+  };
+}
+
+export async function fetchCaseFileSignedUrl(
+  caseId: string,
+  fileId: string
+): Promise<CaseFileSignedUrlResponse> {
+  const searchParams = new URLSearchParams({ fileId });
+  const response = await performApiFetch(`/api/cases/${caseId}/files?${searchParams.toString()}`, {
+    cache: "no-store",
+  });
+  const { payload, rawText } = await readApiResponse<CaseFileSignedUrlResponse>(response);
+
+  if (!response.ok || typeof payload.fileId !== "string" || typeof payload.signedUrl !== "string") {
+    throw toApiRequestError(payload, "Failed to load source preview.", {
+      status: response.status,
+      rawText,
+    });
+  }
+
+  return {
+    fileId: payload.fileId,
+    signedUrl: payload.signedUrl,
   };
 }

@@ -444,25 +444,16 @@ export async function GET(
     if (filesError) throw filesError;
     if (docsError) throw docsError;
 
-    const filesWithUrls = await Promise.all(
-      ((files ?? []) as CaseFileRow[]).map(async (file) => {
-        const bucketName = file.storage_bucket || STORAGE_BUCKET;
-        const { data: signedData, error: signedError } = await supabase.storage
-          .from(bucketName)
-          .createSignedUrl(file.storage_path, 60 * 60);
-
-        return {
-          id: file.id,
-          originalName: file.original_name,
-          storageBucket: bucketName,
-          storagePath: file.storage_path,
-          mimeType: file.mime_type,
-          sizeBytes: file.size_bytes,
-          createdAt: file.created_at,
-          signedUrl: signedError ? null : signedData?.signedUrl ?? null,
-        };
-      })
-    );
+    const filesWithUrls = ((files ?? []) as CaseFileRow[]).map((file) => ({
+      id: file.id,
+      originalName: file.original_name,
+      storageBucket: file.storage_bucket || STORAGE_BUCKET,
+      storagePath: file.storage_path,
+      mimeType: file.mime_type,
+      sizeBytes: file.size_bytes,
+      createdAt: file.created_at,
+      signedUrl: null,
+    }));
 
     const orderedDocuments = sortCaseDocuments((documents ?? []) as CaseDocumentRow[]);
     const caseSummaryDocuments = orderedDocuments.map((document) =>
