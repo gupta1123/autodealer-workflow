@@ -14,6 +14,7 @@ const PURCHASE_DOC_TYPES = new Set(["Purchase Order", "Amended Purchase Order"])
 const INVOICE_DOC_TYPES = new Set(["Invoice", "Tax Invoice"]);
 const LOGISTICS_SUMMARY_LINE_DOC_TYPES = new Set(["Lorry Receipt", "Weighment Slip", "Transport Permit"]);
 const FULFILLMENT_LINE_DOC_TYPES = new Set<CaseDoc["type"]>(["Delivery Challan", "Delivery Note"]);
+const WEIGHT_FIELDS = new Set<FieldKey>(["grossWeight", "tareWeight", "netWeight"]);
 const PARTY_NAME_FIELDS = new Set<FieldKey>(["vendorName", "buyerName", "transporterName", "ownerName", "driverName", "holderName"]);
 const PURCHASE_ORDER_TOTAL_FIELDS = new Set<FieldKey>(["subtotal", "taxAmount", "totalAmount"]);
 const EWAY_VALIDITY_RELATED_DOC_TYPES = new Set<CaseDoc["type"]>([
@@ -127,6 +128,113 @@ function shouldCompareItemQuantityValues(
   return restUnits.every((unit) => areUnitsCompatible(firstUnit, unit));
 }
 
+function parseWeightToKg(value?: string | number | null, unit?: string) {
+  const parsed = parseNumber(value);
+  if (parsed === null) return null;
+
+  const unitFactor = unitFactorToBase(unit);
+  if (unitFactor) return parsed * unitFactor;
+
+  const raw = String(value ?? "").toLowerCase();
+  if (/\b(?:m\.?t\.?s?\.?|metric\s*ton(?:ne)?s?|tonnes?|tons?)\b/i.test(raw)) {
+    return parsed * 1000;
+  }
+
+  return parsed;
+}
+
+function weightsNearlyEqual(left: number | null, right: number | null) {
+  if (left === null || right === null) return false;
+  return Math.abs(left - right) <= Math.max(5, Math.abs(right) * 0.005);
+}
+
+function getWeightLineQuantity(line: CommercialLineItem) {
+  const normalizedUnit = normalizeUnit(line.unit);
+  if (normalizedUnit !== "kg" && normalizedUnit !== "mt") return null;
+  return convertQuantityToBase(line.quantity, line.unit);
+}
+
+function sumWeightLineQuantities(lines: CommercialLineItem[] | undefined) {
+  let total = 0;
+  let count = 0;
+
+  for (const line of lines ?? []) {
+    const quantity = getWeightLineQuantity(line);
+    if (quantity === null) continue;
+    total += quantity;
+    count += 1;
+  }
+
+  return count > 0 ? total : null;
+}
+
+function getDocumentShipmentWeightTargets(docs: CaseDoc[]) {
+  const targets: Array<{ doc: CaseDoc; value: number }> = [];
+
+  for (const doc of docs) {
+    if (doc.type === "Weighment Slip") continue;
+
+    const directNetWeight = parseWeightToKg(doc.fields.netWeight);
+    if (directNetWeight !== null) targets.push({ doc, value: directNetWeight });
+
+    const itemQuantityWeight = parseWeightToKg(doc.fields.itemQuantity, doc.fields.unit);
+    if (itemQuantityWeight !== null) targets.push({ doc, value: itemQuantityWeight });
+
+    const lineQuantityWeight = sumWeightLineQuantities(doc.lineItems);
+    if (lineQuantityWeight !== null) targets.push({ doc, value: lineQuantityWeight });
+  }
+
+  return targets;
+}
+
+function getSingleKnownVehicle(docs: CaseDoc[], comparisonOptions: ComparisonOptions) {
+  const vehicles = [
+    ...new Set(
+      docs
+        .map((doc) => getVehicleReference(doc, comparisonOptions))
+        .filter((value): value is string => Boolean(value))
+    ),
+  ];
+
+  return vehicles.length === 1 ? vehicles[0] : null;
+}
+
+function splitWeighmentNetContext(docs: CaseDoc[], comparisonOptions: ComparisonOptions) {
+  const weighmentEntries = docs
+    .filter((doc) => doc.type === "Weighment Slip")
+    .map((doc) => ({ doc, value: parseWeightToKg(doc.fields.netWeight) }))
+    .filter((entry): entry is { doc: CaseDoc; value: number } => entry.value !== null);
+
+  if (weighmentEntries.length < 2) {
+    return { candidate: false, aggregateMatches: false };
+  }
+
+  const weighmentVehicles = [
+    ...new Set(
+      weighmentEntries
+        .map((entry) => getVehicleReference(entry.doc, comparisonOptions))
+        .filter((value): value is string => Boolean(value))
+    ),
+  ];
+  if (weighmentVehicles.length > 1) {
+    return { candidate: false, aggregateMatches: false };
+  }
+
+  const weighmentVehicle = weighmentVehicles[0] ?? null;
+  const aggregateNetWeight = weighmentEntries.reduce((sum, entry) => sum + entry.value, 0);
+  const shipmentTargets = getDocumentShipmentWeightTargets(docs);
+  const aggregateMatches = shipmentTargets.some((target) => {
+    const targetVehicle = getSingleKnownVehicle([target.doc], comparisonOptions);
+    return (!weighmentVehicle || !targetVehicle || weighmentVehicle === targetVehicle) &&
+      weightsNearlyEqual(aggregateNetWeight, target.value);
+  });
+
+  return {
+    candidate: true,
+    aggregateMatches,
+  };
+}
+
 function isComparableFieldValue(
   field: FieldKey,
   value: string | number | null | undefined,
@@ -183,6 +291,30 @@ function shouldCompareInstanceIdentifierField(
   );
 
   return populatedDocTypes.size > 1;
+}
+
+function shouldSuppressSplitWeighmentMismatch(
+  field: FieldKey,
+  docs: CaseDoc[],
+  entries: Array<{ doc: CaseDoc; docId: string; value: string | number | null | undefined }>,
+  comparisonOptions: ComparisonOptions
+) {
+  if (!WEIGHT_FIELDS.has(field)) return false;
+
+  const populated = entries.filter((entry) => isComparableFieldValue(field, entry.value, comparisonOptions));
+  const weighmentEntries = populated.filter((entry) => entry.doc.type === "Weighment Slip");
+  if (weighmentEntries.length < 2) return false;
+
+  const context = splitWeighmentNetContext(docs, comparisonOptions);
+  if (!context.candidate) return false;
+
+  if (field === "netWeight") {
+    const hasShipmentNetValue = populated.some((entry) => entry.doc.type !== "Weighment Slip");
+    return !hasShipmentNetValue || context.aggregateMatches;
+  }
+
+  const hasNonWeighmentValue = populated.some((entry) => entry.doc.type !== "Weighment Slip");
+  return !hasNonWeighmentValue || context.aggregateMatches;
 }
 
 function normalizePartyName(value: string | number | null | undefined) {
@@ -665,6 +797,10 @@ function buildMismatch(
   }
 
   if (!shouldCompareInstanceIdentifierField(field, comparableEntries, comparisonOptions)) {
+    return null;
+  }
+
+  if (shouldSuppressSplitWeighmentMismatch(field, docs, comparableEntries, comparisonOptions)) {
     return null;
   }
 
