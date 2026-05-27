@@ -48,6 +48,15 @@ export const FIELD_DEFINITIONS: FieldDefinition[] = [
   { key: 'subtotal', label: 'Subtotal' },
   { key: 'taxAmount', label: 'Tax Amount' },
   { key: 'totalAmount', label: 'Total Amount', important: true },
+  { key: 'paymentTerms', label: 'Payment Terms' },
+  { key: 'deliveryTerms', label: 'Delivery Terms' },
+  { key: 'freightTerms', label: 'Freight / Transport Terms' },
+  { key: 'packingForwardingTerms', label: 'Packing / Forwarding Terms' },
+  { key: 'priceBasis', label: 'Price Basis' },
+  { key: 'taxTerms', label: 'Tax / GST Terms' },
+  { key: 'inspectionTerms', label: 'Inspection / Quality Terms' },
+  { key: 'warrantyTerms', label: 'Warranty / Guarantee Terms' },
+  { key: 'termsAndConditions', label: 'Terms and Conditions' },
   { key: 'paidAmount', label: 'Paid Amount' },
   { key: 'statementAmount', label: 'Statement Amount' },
   { key: 'freightAmount', label: 'Freight Amount' },
@@ -108,6 +117,15 @@ export const IGNORED_PACKET_FIELD_KEYS: readonly FieldKey[] = [
 
 const IGNORED_PACKET_FIELD_KEY_SET = new Set<FieldKey>(IGNORED_PACKET_FIELD_KEYS);
 const REMOVED_PACKET_FIELD_KEY_SET = new Set(["materialDescription"]);
+const DOC_TYPE_IGNORED_FIELD_EXCEPTIONS: Partial<Record<DocType, readonly FieldKey[]>> = {
+  Invoice: ['documentDate'],
+  'Tax Invoice': ['documentDate', 'ackDate'],
+  'Delivery Note': ['documentDate'],
+  'Delivery Challan': ['documentDate'],
+  'E-Way Bill': ['documentDate', 'validityDate'],
+  'Lorry Receipt': ['documentDate'],
+  'Weighment Slip': ['documentDate'],
+};
 
 export type PacketFieldConfiguration = {
   enabledFields: Set<string> | null;
@@ -207,7 +225,10 @@ export function shouldConsiderFieldKey(
   if (REMOVED_PACKET_FIELD_KEY_SET.has(fieldKey)) {
     return false;
   }
-  if (IGNORED_PACKET_FIELD_KEY_SET.has(fieldKey as FieldKey)) {
+  const isDocTypeException =
+    docType &&
+    DOC_TYPE_IGNORED_FIELD_EXCEPTIONS[docType as DocType]?.includes(fieldKey as FieldKey);
+  if (IGNORED_PACKET_FIELD_KEY_SET.has(fieldKey as FieldKey) && !isDocTypeException) {
     return false;
   }
   const resolvedConfiguration = resolvePacketFieldConfiguration(configuration);
@@ -303,6 +324,15 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
     'subtotal',
     'taxAmount',
     'totalAmount',
+    'paymentTerms',
+    'deliveryTerms',
+    'freightTerms',
+    'packingForwardingTerms',
+    'priceBasis',
+    'taxTerms',
+    'inspectionTerms',
+    'warrantyTerms',
+    'termsAndConditions',
     'hasAuthorizedSignature',
     'hasVendorStamp',
   ],
@@ -323,6 +353,15 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
     'subtotal',
     'taxAmount',
     'totalAmount',
+    'paymentTerms',
+    'deliveryTerms',
+    'freightTerms',
+    'packingForwardingTerms',
+    'priceBasis',
+    'taxTerms',
+    'inspectionTerms',
+    'warrantyTerms',
+    'termsAndConditions',
     'hasAuthorizedSignature',
     'hasVendorStamp',
   ],
@@ -416,13 +455,18 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
   'E-Way Bill': [
     'eWayBillNumber',
     'referenceInvoiceNumber',
+    'documentDate',
+    'validityDate',
     'vehicleNumber',
+    'transporterName',
+    'lorryReceiptNumber',
     'vendorName',
     'buyerName',
     'supplierGstin',
     'buyerGstin',
     'dispatchFrom',
     'shipTo',
+    'subtotal',
     'taxAmount',
     'totalAmount',
   ],

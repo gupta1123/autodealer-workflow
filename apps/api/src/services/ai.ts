@@ -21,6 +21,11 @@ const PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY = "Vehicle number is not clearly vis
 const PO_NUMBER_FIELD_KEYS: FieldKey[] = ["poNumber", "referencePoNumber"];
 const INDENT_LABEL_PATTERN = /\b(?:indent|ind\.?\s*no|indent\s*(?:no|number|form|ref|reference)?)\b/i;
 const PURCHASE_ORDER_LABEL_PATTERN = /\b(?:(?:p\.?\s*o\.?|po|purchase\s+order)\s*(?:no|number|#)?|order\s*(?:no|number|#))\b/i;
+const INTERNAL_PO_REFERENCE_PATTERN = /\b[A-Z]{1,4}\/\d{2}-\d{2}\/[A-Z0-9][A-Z0-9/-]{2,}\b/g;
+const IMAGE_HANDWRITTEN_EXTRACTION_INSTRUCTION =
+  "Some packet documents are handwritten/manual or mixed printed and handwritten. Treat handwritten entries as first-class visible text, not as noise. Carefully inspect handwritten numbers, dates, party names, vehicle numbers, challan/receipt/permit/certificate numbers, financial amounts, weights, quantities, table cells, stamps, and signatures. Preserve readable handwriting in visibleText. Do not infer a handwritten value from other documents, file names, or nearby labels; if a value is only partly legible, omit the structured field and keep the uncertain transcription in visibleText. ";
+const AMOUNT_EXTRACTION_INSTRUCTION =
+  "Copy financial amounts exactly as printed, preserving digit count and decimal placement after removing separators. Do not add or drop zeros. Cross-check quantity x rate, taxable amount + tax amount, and subtotal + tax amount before returning totals; if arithmetic conflicts with a visually uncertain amount, prefer the arithmetically consistent value visible in the row/summary. ";
 
 type OpenRouterMessage = {
   role: "system" | "user" | "assistant";
@@ -181,11 +186,11 @@ const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   receiptNumber: ["receiptNumber"],
   deliveryNoteNumber: ["deliveryNoteNumber", "challanNumber"],
   referencePoNumber: ["referencePoNumber", "poReference", "purchaseOrderReference"],
-  referenceInvoiceNumber: ["referenceInvoiceNumber", "invoiceReference"],
-  eWayBillNumber: ["eWayBillNumber", "ewayBillNumber", "ewayNumber"],
+  referenceInvoiceNumber: ["referenceInvoiceNumber", "invoiceReference", "documentNumber", "docNumber", "docNo"],
+  eWayBillNumber: ["eWayBillNumber", "ewayBillNumber", "ewayNumber", "wayBillNumber"],
   weighmentNumber: ["weighmentNumber", "weighmentReceiptNumber", "weighmentSlipNumber"],
   weighbridgeName: ["weighbridgeName", "weighBridgeName", "weightBridgeName"],
-  lorryReceiptNumber: ["lorryReceiptNumber", "lrNumber", "lorryNumber", "transportReceiptNumber", "consignmentNumber"],
+  lorryReceiptNumber: ["lorryReceiptNumber", "lrNumber", "transportReceiptNumber", "transporterDocNumber", "transporterDocumentNumber", "consignmentNumber"],
   certificateNumber: ["certificateNumber", "testCertificateNumber", "mtcNumber", "mtrNumber"],
   certificateDate: ["certificateDate", "testCertificateDate", "mtcDate", "certificateIssuedDate"],
   permitNumber: ["permitNumber", "authorisationNumber", "authorizationNumber"],
@@ -194,15 +199,24 @@ const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   chassisNumber: ["chassisNumber", "vin", "vehicleIdentificationNumber"],
   engineNumber: ["engineNumber", "motorNumber"],
   vehicleClass: ["vehicleClass", "vehicleType"],
-  documentDate: ["documentDate", "invoiceDate", "poDate", "receiptDate", "deliveryDate"],
+  documentDate: ["documentDate", "invoiceDate", "poDate", "receiptDate", "deliveryDate", "generatedDate", "eWayBillDate"],
   ackDate: ["ackDate", "acknowledgementDate", "acknowledgmentDate"],
   transactionDate: ["transactionDate", "transactionTime", "transactionDateTime", "paymentDate", "statementDate"],
-  validityDate: ["validityDate", "permitValidityDate", "licenseValidityDate", "licenceValidityDate", "registrationValidityDate"],
+  validityDate: ["validityDate", "validUpto", "validUntil", "permitValidityDate", "licenseValidityDate", "licenceValidityDate", "registrationValidityDate"],
   dateOfBirth: ["dateOfBirth", "dob", "birthDate"],
   currency: ["currency"],
-  subtotal: ["subtotal", "subTotal", "taxableAmount"],
+  subtotal: ["subtotal", "subTotal", "taxableAmount", "taxableValue", "taxableAmountRs", "totalTaxableAmount"],
   taxAmount: ["taxAmount", "tax", "gstAmount"],
   totalAmount: ["totalAmount", "grandTotal", "documentTotal"],
+  paymentTerms: ["paymentTerms", "paymentTerm", "termsOfPayment", "paymentCondition"],
+  deliveryTerms: ["deliveryTerms", "deliveryTerm", "deliveryPeriod", "deliverySchedule", "deliveryCondition"],
+  freightTerms: ["freightTerms", "freightTerm", "transportTerms", "transportationTerms", "freightCondition"],
+  packingForwardingTerms: ["packingForwardingTerms", "packingTerms", "forwardingTerms", "pfTerms", "pAndFTerms", "packingAndForwarding"],
+  priceBasis: ["priceBasis", "basisOfPrice", "pricingBasis", "rateBasis"],
+  taxTerms: ["taxTerms", "gstTerms", "taxCondition", "dutiesAndTaxes"],
+  inspectionTerms: ["inspectionTerms", "qualityTerms", "testingTerms", "testCertificateTerms"],
+  warrantyTerms: ["warrantyTerms", "guaranteeTerms", "warrantyGuaranteeTerms"],
+  termsAndConditions: ["termsAndConditions", "termsConditions", "commercialTerms", "specialTerms", "generalTerms", "remarks"],
   paidAmount: ["paidAmount", "amountPaid", "paidTollAmount", "tollAmount", "amountReceived", "receivedAmount"],
   statementAmount: ["statementAmount", "availableBalance", "availableBal", "avblBal", "balance", "debitAmount", "creditAmount", "transactionAmount"],
   freightAmount: ["freightAmount", "freight", "transportCharge"],
@@ -362,13 +376,19 @@ function getPoNumberExtractionInstruction(docType: DocType) {
   if (docType === "Purchase Order" || docType === "Amended Purchase Order") {
     return (
       "For Purchase Order documents, poNumber must be the value explicitly labelled PO No, P.O. No, Purchase Order No, or Order No. " +
-      "Never use Indent No, Indent Number, Indent Form, requisition number, or internal indent reference as poNumber; omit poNumber if only an indent number is visible. "
+      "Never use Indent No, Indent Number, Indent Form, requisition number, or internal indent reference as poNumber; omit poNumber if only an indent number is visible. " +
+      "Extract Order Date, PO Date, P.O. Date, or Purchase Order Date as documentDate. Prefer Order Date over Party Ref Date, delivery date, or validity date. " +
+      "Capture PO commercial terms from header, footer, remarks, notes, special instructions, and Terms & Conditions sections. " +
+      "Extract paymentTerms, deliveryTerms, freightTerms, packingForwardingTerms, priceBasis, taxTerms, inspectionTerms, and warrantyTerms when visible. " +
+      "Also fill termsAndConditions with a compact semicolon-separated summary of all visible PO clauses, preserving the original commercial meaning. Do not invent missing terms. "
     );
   }
 
   if (docType === "Tax Invoice" || docType === "Invoice") {
     return (
       "For invoice documents, referencePoNumber must be a value explicitly labelled PO No, P.O. No, Purchase Order No, Buyer PO, or Order No. " +
+      "If the same order block contains an internal PO number shaped like IF/25-26/PF25Y-04165 or RM/25-26/PR25Y-00001 and another buyer/document reference, use the internal PO-shaped value as referencePoNumber. " +
+      "For invoice documents, eWayBillNumber must be the 12-digit E-Way Bill number only. Do not use transporter document numbers, online order tracking numbers, LR numbers, acknowledgement numbers, or receipt numbers as eWayBillNumber. Do not put a 12-digit E-Way Bill number into irnNumber; IRN is the long invoice reference hash. " +
       "Never use Indent No, Indent Number, Indent Form, requisition number, or internal indent reference as referencePoNumber. "
     );
   }
@@ -386,12 +406,24 @@ function getDeliveryQuantityExtractionInstruction(docType: DocType) {
   );
 }
 
+function getWeighmentSlipExtractionInstruction(docType: DocType) {
+  if (docType !== "Weighment Slip") return "";
+  return (
+    "For Weighment Slip documents, prioritize vehicleNumber/lorry number, grossWeight, tareWeight, netWeight, weighmentNumber, weighbridgeName, and authorized signature presence. " +
+    "Lorry No or Vehicle No on a weighment slip is the vehicleNumber, not lorryReceiptNumber. Do not use RST No, receipt number, ticket number, tare/gross/net weight, date, or charges as vehicleNumber. " +
+    "Read Indian vehicle numbers carefully from the image; distinguish letters from similar-looking digits, especially G/9, L/1, O/0, S/5, T/7, D/G, and C/G. "
+  );
+}
+
 function getEWayBillExtractionInstruction(docType: DocType) {
   if (docType !== "E-Way Bill") return "";
 
   return (
     "For E-Way Bill documents, vendorName is the From party name in Address Details after the first GSTIN, and buyerName is the To party name after the second GSTIN. " +
-    "Do not use Dispatch From or Ship To address text as party names; those belong in dispatchFrom and shipTo. "
+    "Do not use Dispatch From or Ship To address text as party names; those belong in dispatchFrom and shipTo. " +
+    "Extract Generated Date as documentDate, Valid Upto/Valid Until as validityDate, Tot. Tax'ble Amt or Taxable Amount as subtotal, Total Inv. Amt as totalAmount, and CGST+SGST+IGST+Cess amounts or total minus taxable amount as taxAmount. " +
+    "Extract Transporter ID & Name into transporterName, Transporter Doc. No into lorryReceiptNumber, and the Part-B Vehicle/Trans number into vehicleNumber. " +
+    "If Part-A shows Doc No, Document No, Invoice No, Tax Invoice No, or Delivery Challan No, extract that value as referenceInvoiceNumber unless it is the E-Way Bill No itself. "
   );
 }
 
@@ -500,6 +532,95 @@ function applyPoNumberLabelGuard(
   });
 
   return next;
+}
+
+function isInvoiceDocType(docType: DocType) {
+  return docType === "Invoice" || docType === "Tax Invoice";
+}
+
+function isPurchaseOrderDocType(docType: DocType) {
+  return docType === "Purchase Order" || docType === "Amended Purchase Order";
+}
+
+const PURCHASE_ORDER_DOCUMENT_DATE_PATTERN =
+  "(\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}|\\d{1,2}\\s*[-/.]\\s*[A-Za-z]{3,9}\\s*[-/.]\\s*\\d{2,4})";
+
+function cleanPurchaseOrderDocumentDate(value?: string) {
+  return value
+    ?.replace(/\s*([-/])\s*/g, "$1")
+    .replace(/\s*\.\s*/g, ".")
+    .trim()
+    .toUpperCase();
+}
+
+function extractPurchaseOrderDocumentDate(visibleText: string) {
+  const text = visibleText.replace(/\s+/g, " ").trim();
+  const dateLabel =
+    "(?:(?:Purchase\\s+Order|P\\.?\\s*O\\.?|PO|Order)\\s+Date|Date\\s+of\\s+(?:Purchase\\s+Order|P\\.?\\s*O\\.?|PO|Order))";
+  const direct = text.match(new RegExp(`\\b${dateLabel}\\s*:?\\s*${PURCHASE_ORDER_DOCUMENT_DATE_PATTERN}`, "i"))?.[1];
+  const reversed = text.match(new RegExp(`${PURCHASE_ORDER_DOCUMENT_DATE_PATTERN}\\s*${dateLabel}\\b`, "i"))?.[1];
+  return cleanPurchaseOrderDocumentDate(direct ?? reversed);
+}
+
+function applyPurchaseOrderDateFallback(
+  fields: Partial<Record<FieldKey, string>>,
+  docType: DocType,
+  visibleText: string
+) {
+  if (!isPurchaseOrderDocType(docType) || fields.documentDate || !visibleText.trim()) return fields;
+
+  const documentDate = extractPurchaseOrderDocumentDate(visibleText);
+  return documentDate ? { ...fields, documentDate } : fields;
+}
+
+function cleanPoReferenceCandidate(value: string) {
+  return value.replace(/[.,;:)\]]+$/, "").trim();
+}
+
+function isInternalPoReference(value?: string) {
+  if (!value) return false;
+  const normalized = cleanPoReferenceCandidate(value.toUpperCase());
+  return new RegExp(`^${INTERNAL_PO_REFERENCE_PATTERN.source}$`).test(normalized);
+}
+
+function findBestInternalPoReference(visibleText: string) {
+  const matches = [...visibleText.toUpperCase().matchAll(INTERNAL_PO_REFERENCE_PATTERN)]
+    .map((match) => ({
+      value: cleanPoReferenceCandidate(match[0]),
+      index: match.index ?? 0,
+    }))
+    .filter((match, index, all) => all.findIndex((candidate) => candidate.value === match.value) === index);
+
+  if (!matches.length) return undefined;
+
+  return matches
+    .map((match) => {
+      const contexts = getValueContexts(visibleText, match.value);
+      const contextText = contexts.join(" ");
+      const score =
+        (PURCHASE_ORDER_LABEL_PATTERN.test(contextText) ? 5 : 0) +
+        (/\bbuyer'?s?\s+order\b/i.test(contextText) ? 2 : 0) +
+        (/\b(?:dated|dtd)\b/i.test(contextText) ? 1 : 0) +
+        (/\/P[FR][A-Z0-9-]*/i.test(match.value) ? 2 : 0);
+      return { ...match, score };
+    })
+    .sort((left, right) => right.score - left.score || left.index - right.index)[0]?.value;
+}
+
+function applyInvoicePoReferenceFallback(
+  fields: Partial<Record<FieldKey, string>>,
+  docType: DocType,
+  visibleText: string
+) {
+  if (!isInvoiceDocType(docType) || !visibleText.trim()) return fields;
+
+  const candidate = findBestInternalPoReference(visibleText);
+  if (!candidate) return fields;
+
+  const current = fields.referencePoNumber;
+  if (current && isInternalPoReference(current)) return fields;
+
+  return { ...fields, referencePoNumber: candidate };
 }
 
 function getOrderedFieldKeysForDocument(doc: CaseDoc): FieldKey[] {
@@ -728,18 +849,195 @@ function extractEWayBillAddresses(visibleText: string): Partial<Record<FieldKey,
   };
 }
 
+function normalizeEWayReferenceText(value: string) {
+  const withoutDocumentType = value
+    .replace(/^\s*(?:tax\s*invoice|invoice|delivery\s*challan|document|doc(?:ument)?\s*no\.?)\s*[-:/]?\s*/i, "")
+    .replace(/^\s*(?:taxinvoice|deliverychallan|invoice|document|docno)\s*[-:/]?\s*/i, "");
+  const normalized = withoutDocumentType
+    .replace(/[ΚK]\s*[ΑA]/g, "KA")
+    .replace(/[ΟO]/g, "O")
+    .replace(/\s+/g, "")
+    .replace(/[^A-Z0-9/-]/gi, "")
+    .toUpperCase();
+  const withoutTrailingDate = normalized.replace(/-\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/, "");
+  return /[A-Z]/.test(withoutTrailingDate) && withoutTrailingDate.length >= 5
+    ? withoutTrailingDate
+    : normalized;
+}
+
+function extractEWayBillReferenceInvoiceNumber(visibleText: string) {
+  const text = visibleText.replace(/\s+/g, " ").trim();
+  const documentDetails = text.match(/\bDocument\s+Details\s*:?\s*(?:Tax\s+Invoice|Invoice|Delivery\s+Challan)?\s*[-:]?\s*([A-ZΑ-Ω0-9][A-ZΑ-Ω0-9\s/-]{1,40}?)(?:\s*[-–]\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\s+\bIRN\b|\s+\bAddress\s+Details\b|$)/i)?.[1];
+  if (!documentDetails) return undefined;
+  const normalized = normalizeEWayReferenceText(documentDetails);
+  return normalized.length >= 2 && /\d/.test(normalized) ? normalized : undefined;
+}
+
+function cleanExistingEWayReferenceInvoiceNumber(value?: string) {
+  if (!value) return undefined;
+  const normalized = normalizeEWayReferenceText(value);
+  return normalized.length >= 2 && /\d/.test(normalized) ? normalized : undefined;
+}
+
+const EWAY_DATE_PATTERN =
+  "(?:\\d{4}[/-]\\d{1,2}[/-]\\d{1,2}|\\d{1,2}[/. -]\\d{1,2}[/. -]\\d{2,4}|\\d{1,2}-[A-Za-z]{3}-\\d{2,4})(?:\\s+\\d{1,2}:\\d{2}(?::\\d{2})?\\s*(?:AM|PM)?)?";
+const EWAY_VEHICLE_PATTERN = /\b[A-Z]{2}\s*\d{1,2}\s*[A-Z]{1,3}\s*\d{3,4}\b/gi;
+const EWAY_GSTIN_PATTERN = /\b\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b/gi;
+
+function cleanEWayDateValue(value?: string) {
+  const raw = value?.match(new RegExp(EWAY_DATE_PATTERN, "i"))?.[0];
+  return raw
+    ?.replace(/\s*([/-])\s*/g, "$1")
+    .replace(/\s*\.\s*/g, ".")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractEWayDate(text: string, labelPattern: string) {
+  const direct = text.match(new RegExp(`\\b${labelPattern}\\s*:?\\s*(${EWAY_DATE_PATTERN})`, "i"))?.[1];
+  if (direct) return cleanEWayDateValue(direct);
+
+  const context = text.match(new RegExp(`\\b${labelPattern}\\b([\\s\\S]{0,140})`, "i"))?.[1];
+  return cleanEWayDateValue(context);
+}
+
+function normalizeEWayAmount(value?: string) {
+  if (!value) return null;
+  let compact = value.replace(/[₹$€£\s]/g, "");
+  if (/^-?\d+,\d{2}$/.test(compact) && !compact.includes(".")) {
+    compact = compact.replace(/,(\d{2})$/, ".$1");
+  }
+  compact = compact.replace(/,/g, "");
+  const parsed = Number(compact);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatEWayNumberForField(value: number) {
+  const rounded = Math.round(value * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function extractEWayAmounts(value: string) {
+  return [...value.matchAll(/-?\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|-?\d+,\d{2}\b|-?\d+\.\d{1,2}\b/g)]
+    .map((match) => normalizeEWayAmount(match[0]))
+    .filter((amount): amount is number => amount !== null);
+}
+
+function extractEWayCommercialAmounts(text: string, fields: Partial<Record<FieldKey, string>>) {
+  const summaryBlock =
+    text.match(/\b(?:Tot\.?\s*Tax'?ble\s*Amt|Total\s+Taxable\s+Amt)\b[\s\S]{0,700}?(?=\b(?:Transportation\s+Details|Transporter\s+ID|Vehicle\s+Details|Part\s*-?\s*B)\b|$)/i)?.[0] ??
+    text.match(/\b(?:Taxable\s+Amount|Taxable\s+Value)\b[\s\S]{0,700}?(?=\b(?:Transportation\s+Details|Transporter\s+ID|Vehicle\s+Details|Part\s*-?\s*B)\b|$)/i)?.[0];
+  const amounts = summaryBlock ? extractEWayAmounts(summaryBlock) : [];
+  const existingSubtotal = normalizeEWayAmount(fields.subtotal);
+  const existingTax = normalizeEWayAmount(fields.taxAmount);
+  const existingTotal = normalizeEWayAmount(fields.totalAmount);
+  const subtotal = existingSubtotal ?? amounts[0] ?? null;
+  const blockTotal = amounts.length >= 2 ? amounts[amounts.length - 1] : null;
+  const total = existingTotal ?? (blockTotal !== null && subtotal !== null && blockTotal >= subtotal ? blockTotal : null);
+  const taxAmount =
+    existingTax ??
+    (subtotal !== null && total !== null && total >= subtotal
+      ? Math.round((total - subtotal) * 100) / 100
+      : null);
+  const derivedSubtotal =
+    subtotal ??
+    (total !== null && taxAmount !== null && total >= taxAmount
+      ? Math.round((total - taxAmount) * 100) / 100
+      : null);
+
+  return {
+    subtotal: derivedSubtotal === null ? undefined : formatEWayNumberForField(derivedSubtotal),
+    taxAmount: taxAmount === null ? undefined : formatEWayNumberForField(taxAmount),
+    totalAmount: total === null ? undefined : formatEWayNumberForField(total),
+  } satisfies Partial<Record<FieldKey, string>>;
+}
+
+function cleanEWayTransporterName(value?: string) {
+  const cleaned = value
+    ?.replace(/^\s*(?:\d{2}\s*[A-Z]{5}\s*\d{4}\s*[A-Z]\s*[0-9A-Z]\s*Z\s*[0-9A-Z]|[0-9A-Z\s]{10,20})\s*&\s*/i, "")
+    .replace(EWAY_GSTIN_PATTERN, "")
+    .replace(/^[\s&:;,\-.]+/, "")
+    .replace(/\b(?:Transporter\s+Doc|Vehicle\s+Details|Part\s*-?\s*B|Vehicle\s*\/\s*Trans|Mode\s+From|Entered\s+Date)\b[\s\S]*$/i, "")
+    .replace(/\s+/g, " ")
+    .replace(/[\s,.;:-]+$/, "")
+    .trim();
+  if (!cleaned || !/[a-z]/i.test(cleaned) || cleaned.length > 90) return undefined;
+  return cleaned;
+}
+
+function formatEWayVehicleNumber(value?: string) {
+  const compact = value?.replace(/\s+/g, "").toUpperCase();
+  return compact && /^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}$/.test(compact) ? compact : undefined;
+}
+
+function extractEWayVehicleNumber(text: string) {
+  const vehicleBlock = text.match(/\b(?:Vehicle\s+Details|Part\s*-?\s*B)\b([\s\S]{0,900})/i)?.[1] ?? text;
+  const roadVehicle = formatEWayVehicleNumber(
+    vehicleBlock.match(new RegExp(`\\bRoad\\s+(${EWAY_VEHICLE_PATTERN.source})`, "i"))?.[1]
+  );
+  if (roadVehicle) return roadVehicle;
+
+  return [...vehicleBlock.matchAll(EWAY_VEHICLE_PATTERN)]
+    .map((match) => formatEWayVehicleNumber(match[0]))
+    .find((value): value is string => Boolean(value));
+}
+
+function extractEWayTransporterDocFromVehicleRow(text: string, vehicleNumber?: string) {
+  if (!vehicleNumber) return undefined;
+  const vehicleWithSpaces = vehicleNumber.replace(/([A-Z]{2})(\d{1,2})([A-Z]{1,3})(\d{3,4})/, "$1\\s*$2\\s*$3\\s*$4");
+  const rowDoc = text.match(new RegExp(`\\bRoad\\s+${vehicleWithSpaces}\\s*&\\s*([A-Z0-9/-]{2,})\\s*&\\s*${EWAY_DATE_PATTERN}`, "i"))?.[1];
+  return rowDoc && rowDoc !== "0" ? rowDoc.trim() : undefined;
+}
+
+function extractEWayTransportDetails(text: string) {
+  const transporterName = cleanEWayTransporterName(
+    text.match(/\bTransporter\s+ID\s*&\s*Name\s*:?\s*(?:[0-9A-Z\s]{10,20}\s*&\s*)?(.+?)(?=\s*(?:Transporter\s+Doc|Vehicle\s+Details|Part\s*-?\s*B|$))/i)?.[1]
+  );
+  const vehicleNumber = extractEWayVehicleNumber(text);
+  const transporterDoc = text
+    .match(/\bTransporter\s+Doc\.?\s*(?:No\.?|Number)?\s*&\s*Date\s*:?\s*([A-Z0-9/-]+)(?=\s*&|\s+\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\s|$)/i)?.[1]
+    ?.trim() ?? extractEWayTransporterDocFromVehicleRow(text, vehicleNumber);
+
+  return {
+    transporterName,
+    lorryReceiptNumber: transporterDoc && transporterDoc !== "0" ? transporterDoc : undefined,
+    vehicleNumber,
+  } satisfies Partial<Record<FieldKey, string>>;
+}
+
 function applyEWayBillAddressFallback(
   fields: Partial<Record<FieldKey, string>>,
   docType: DocType,
   visibleText: string
 ) {
   if (docType !== "E-Way Bill" || !visibleText.trim()) return fields;
+  const text = visibleText.replace(/\s+/g, " ").trim();
   const addresses = extractEWayBillAddresses(visibleText);
   const parties = extractEWayBillPartyNames(visibleText, fields);
+  const referenceInvoiceNumber =
+    cleanExistingEWayReferenceInvoiceNumber(fields.referenceInvoiceNumber) ??
+    extractEWayBillReferenceInvoiceNumber(visibleText);
+  const amounts = extractEWayCommercialAmounts(text, fields);
+  const transport = extractEWayTransportDetails(text);
+  const transporterName = transport.transporterName ?? cleanEWayTransporterName(fields.transporterName);
+  const vehicleNumber = formatEWayVehicleNumber(fields.vehicleNumber) ?? transport.vehicleNumber;
+  const documentDate = extractEWayDate(text, "(?:Generated\\s+Date|E-?Way\\s+Bill\\s+Date|Way\\s+Bill\\s+Date)");
+  const validityDate =
+    cleanEWayDateValue(fields.validityDate) ??
+    extractEWayDate(text, "(?:Valid\\s*(?:Upto|Up\\s*To|Until|Till))");
   return {
     ...fields,
     ...(fields.vendorName || !parties.vendorName ? {} : { vendorName: parties.vendorName }),
     ...(fields.buyerName || !parties.buyerName ? {} : { buyerName: parties.buyerName }),
+    ...(!referenceInvoiceNumber || referenceInvoiceNumber === fields.referenceInvoiceNumber ? {} : { referenceInvoiceNumber }),
+    ...(fields.documentDate || !documentDate ? {} : { documentDate }),
+    ...(!validityDate || validityDate === fields.validityDate ? {} : { validityDate }),
+    ...(fields.subtotal || !amounts.subtotal ? {} : { subtotal: amounts.subtotal }),
+    ...(fields.taxAmount || !amounts.taxAmount ? {} : { taxAmount: amounts.taxAmount }),
+    ...(fields.totalAmount || !amounts.totalAmount ? {} : { totalAmount: amounts.totalAmount }),
+    ...(!transporterName ? {} : { transporterName }),
+    ...(fields.lorryReceiptNumber || !transport.lorryReceiptNumber ? {} : { lorryReceiptNumber: transport.lorryReceiptNumber }),
+    ...(!vehicleNumber || vehicleNumber === fields.vehicleNumber ? {} : { vehicleNumber }),
     ...(fields.dispatchFrom || !addresses.dispatchFrom ? {} : { dispatchFrom: addresses.dispatchFrom }),
     ...(fields.shipTo || !addresses.shipTo ? {} : { shipTo: addresses.shipTo }),
   };
@@ -953,7 +1251,8 @@ export async function classifyDocumentFromImage(image: string, fileName = ""): P
         {
           role: "system",
           content:
-            `Classify procurement packet pages. Return only JSON like {"documentType":"Purchase Order"} using one of: ${SUPPORTED_DOC_TYPES.join(", ")}.`,
+            `Classify procurement packet pages. Return only JSON like {"documentType":"Purchase Order"} using one of: ${SUPPORTED_DOC_TYPES.join(", ")}. ` +
+            "Some pages may be handwritten/manual or mixed printed and handwritten; classify by the document layout and purpose, not only by machine-readable printed text.",
         },
         {
           role: "user",
@@ -990,6 +1289,7 @@ export async function extractDataFromImages(params: {
   const photoEvidenceVehicleInstruction = getPhotoEvidenceVehicleInstruction(documentType);
   const poNumberExtractionInstruction = getPoNumberExtractionInstruction(documentType);
   const deliveryQuantityExtractionInstruction = getDeliveryQuantityExtractionInstruction(documentType);
+  const weighmentSlipExtractionInstruction = getWeighmentSlipExtractionInstruction(documentType);
   const eWayBillExtractionInstruction = getEWayBillExtractionInstruction(documentType);
 
   if (!pageImages.length || pageImages.some((image) => !image.startsWith("data:image/"))) {
@@ -1012,9 +1312,12 @@ export async function extractDataFromImages(params: {
               `Extract structured fields and visible text from procurement, logistics, transport, vehicle KYC, FASTag, quality certificate, and photo-evidence documents and return only JSON with keys "fields" and "visibleText". ` +
               `This document is a ${documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
               "visibleText must be a raw OCR-style transcription of the important visible text on the page, preserving line breaks where useful. " +
+              IMAGE_HANDWRITTEN_EXTRACTION_INSTRUCTION +
+              AMOUNT_EXTRACTION_INSTRUCTION +
               photoEvidenceVehicleInstruction +
               poNumberExtractionInstruction +
               deliveryQuantityExtractionInstruction +
+              weighmentSlipExtractionInstruction +
               eWayBillExtractionInstruction +
               "For stamp/signature presence fields, return only Yes, No, or Unclear. Use Yes only when the mark is visibly present, No only when the relevant area is visible and clearly absent, otherwise Unclear. " +
               "For FASTag Toll Proof documents, extract statement reference, customer ID/name, statement period/date, vehicle number, tag account number, trip count, opening/credit/debit/closing balances, recharge/payment amount, toll plaza, and a compact toll transaction summary using the canonical FASTag keys. " +
@@ -1032,6 +1335,7 @@ export async function extractDataFromImages(params: {
                   "Pages may include invoices, purchase orders, e-way bills, weighment slips, lorry receipts, RC/DL/PAN cards, FASTag toll proofs, test certificates, permits, or photo evidence. " +
                   `Extract only clearly visible ${documentType}-specific fields from this allowed schema: ${allowedFieldKeysText}. ` +
                   "Also transcribe the visible text into visibleText even if the structured fields object is empty. " +
+                  "Treat printed and handwritten entries equally when they are readable. " +
                   "If both supplier and receiver are visible, map seller-issued documents as seller/consignor to vendorName and receiving buyer/bill-to/ship-to/consignee to buyerName. For purchase orders, map the supplier/vendor receiving the order to vendorName. " +
                   "Preserve exact document numbers, vehicle ids, GSTINs, weights, dates, and financial totals.",
               },
@@ -1066,18 +1370,23 @@ export async function extractDataFromImages(params: {
     );
     const visibleTextPages = extracted.map((page) => page.visibleText).filter(Boolean);
     const visibleText = visibleTextPages.join("\n");
+    const mappedFields = mapFields(combinedFields, documentType);
     const fields = applyPoNumberLabelGuard(
-      applyPhotoEvidenceVehicleVisibilityCopy(
-        applyFastagDetailsFallback(
-          applyEWayBillAddressFallback(
-            mapFields(combinedFields, documentType),
+      applyInvoicePoReferenceFallback(
+        applyPhotoEvidenceVehicleVisibilityCopy(
+          applyFastagDetailsFallback(
+            applyEWayBillAddressFallback(
+              applyPurchaseOrderDateFallback(mappedFields, documentType, visibleText),
+              documentType,
+              visibleText
+            ),
             documentType,
             visibleText
           ),
-          documentType,
-          visibleText
+          documentType
         ),
-        documentType
+        documentType,
+        visibleText
       ),
       visibleText
     );

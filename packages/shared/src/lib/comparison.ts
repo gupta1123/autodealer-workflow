@@ -37,6 +37,7 @@ const COMPARISON_FIELD_LABELS: Partial<Record<FieldKey, string>> = {
   vehicleNumber: "Vehicle / Registration Number",
   dispatchFrom: "Origin / Dispatch From",
   shipTo: "Destination / Ship To",
+  subtotal: "Taxable / Basic Amount",
 };
 
 export const PRIMARY_COMPARISON_FIELDS: FieldKey[] = [
@@ -61,6 +62,7 @@ export const PRIMARY_COMPARISON_FIELDS: FieldKey[] = [
   "vehicleNumber",
   "fuelType",
   "currency",
+  "subtotal",
   "taxAmount",
   "totalAmount",
   "freightAmount",
@@ -92,6 +94,49 @@ const PRIMARY_COMPARISON_FIELD_SET = new Set<string>(PRIMARY_COMPARISON_FIELDS);
 
 type ComparableDoc = Pick<CaseDoc, "type" | "fields">;
 
+const GSTIN_FIELDS = new Set<FieldKey>(["supplierGstin", "buyerGstin"]);
+const GSTIN_DIGIT_INDICES = new Set([0, 1, 7, 8, 9, 10, 12]);
+const FORMAT_INSENSITIVE_IDENTIFIER_FIELDS = new Set<FieldKey>([
+  "poNumber",
+  "referencePoNumber",
+  "invoiceNumber",
+  "referenceInvoiceNumber",
+  "eWayBillNumber",
+  "weighmentNumber",
+  "lorryReceiptNumber",
+  "certificateNumber",
+  "permitNumber",
+  "licenseNumber",
+  "chassisNumber",
+  "engineNumber",
+  "vehicleNumber",
+  "registrationNumber",
+  "fastagReference",
+  "transactionReference",
+]);
+const COUNT_UNIT_VALUES = new Set(["nos", "no", "number", "numbers", "pcs", "piece", "pieces", "pc"]);
+
+function normalizeGstinValue(value: string) {
+  const compact = value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!compact) return null;
+
+  const normalized = compact
+    .split("")
+    .map((character, index) => {
+      if (!GSTIN_DIGIT_INDICES.has(index)) return character;
+      if (character === "I" || character === "L") return "1";
+      if (character === "O" || character === "Q") return "0";
+      if (character === "S") return "5";
+      if (character === "B") return "8";
+      return character;
+    })
+    .join("");
+
+  return /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]$/.test(normalized)
+    ? normalized
+    : null;
+}
+
 function normalizeNumericLikeValue(value: string) {
   const compact = value.replace(/[₹$€£,\s]/g, "");
   if (!/^-?\d+(\.\d+)?$/.test(compact)) {
@@ -102,20 +147,57 @@ function normalizeNumericLikeValue(value: string) {
   return Number.isFinite(parsed) ? parsed.toString() : null;
 }
 
+function normalizeUnitValue(value: string) {
+  const compact = value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (COUNT_UNIT_VALUES.has(compact) || ["cyl", "cylinder", "cylinders"].includes(compact)) return "nos";
+  if (["kg", "kgs", "kilogram", "kilograms"].includes(compact)) return "kg";
+  if (["mt", "mts", "mton", "mtons", "metricton", "metrictons", "metrictonne", "metrictonnes", "tonne", "tonnes"].includes(compact)) return "mt";
+  return compact || null;
+}
+
+function normalizeIdentifierValue(value: string) {
+  const compact = value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return compact || null;
+}
+
+function normalizeInvoiceReferenceValue(value: string) {
+  const compact = normalizeIdentifierValue(value);
+  if (!compact) return null;
+  const withoutDocumentLabel = compact.replace(/^(?:taxinvoice|invoice|documentno|docno|document)(?=[a-z0-9]*\d)/, "");
+  return withoutDocumentLabel || compact;
+}
+
 export function normalizeComparableValue(
   value: string | number | null | undefined,
-  options: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS
+  options: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS,
+  fieldKey?: FieldKey
 ) {
   if (value == null) return null;
 
   const raw = String(value).trim();
   if (!raw) return null;
 
+  if (fieldKey && GSTIN_FIELDS.has(fieldKey)) {
+    return normalizeGstinValue(raw);
+  }
+
+  if (fieldKey === "unit") {
+    return normalizeUnitValue(raw);
+  }
+
+  if (fieldKey === "invoiceNumber" || fieldKey === "referenceInvoiceNumber") {
+    return normalizeInvoiceReferenceValue(raw);
+  }
+
   const lowerCased = raw.toLowerCase();
   const numericNormalized = normalizeNumericLikeValue(lowerCased);
 
   if (numericNormalized !== null) {
     return numericNormalized;
+  }
+
+  if (fieldKey && FORMAT_INSENSITIVE_IDENTIFIER_FIELDS.has(fieldKey)) {
+    return normalizeIdentifierValue(raw);
   }
 
   if (options.considerFormatting) {
@@ -128,16 +210,37 @@ export function normalizeComparableValue(
 export function areComparableValuesEqual(
   left: string | number | null | undefined,
   right: string | number | null | undefined,
-  options: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS
+  options: ComparisonOptions = DEFAULT_COMPARISON_OPTIONS,
+  fieldKey?: FieldKey
 ) {
-  const normalizedLeft = normalizeComparableValue(left, options);
-  const normalizedRight = normalizeComparableValue(right, options);
+  const normalizedLeft = normalizeComparableValue(left, options, fieldKey);
+  const normalizedRight = normalizeComparableValue(right, options, fieldKey);
 
   if (!normalizedLeft || !normalizedRight) {
     return false;
   }
 
-  return normalizedLeft === normalizedRight;
+  if (normalizedLeft === normalizedRight) return true;
+
+  const splitIdentifierList = (value: string | number | null | undefined) =>
+    String(value ?? "")
+      .split(/(?:,|;|\||\+|\band\b)/i)
+      .map((part) => normalizeComparableValue(part, options, fieldKey))
+      .filter((part): part is string => Boolean(part));
+
+  if (
+    fieldKey &&
+    FORMAT_INSENSITIVE_IDENTIFIER_FIELDS.has(fieldKey) &&
+    (/[;,|+]|\band\b/i.test(String(left ?? "")) || /[;,|+]|\band\b/i.test(String(right ?? "")))
+  ) {
+    const leftParts = splitIdentifierList(left);
+    const rightParts = splitIdentifierList(right);
+    if (leftParts.length && rightParts.length) {
+      return leftParts.some((leftPart) => rightParts.includes(leftPart));
+    }
+  }
+
+  return false;
 }
 
 export function pickCanonicalComparableValue(

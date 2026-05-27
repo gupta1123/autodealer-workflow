@@ -4,7 +4,7 @@ export type FieldConfig = {
   fieldKey: FieldKey;
   label: string;
   enabled: boolean;
-  category: "identity" | "financial" | "transport" | "reference" | "quantity" | "party";
+  category: "identity" | "financial" | "transport" | "reference" | "quantity" | "party" | "terms";
 };
 
 export type DocumentTypeConfig = {
@@ -22,6 +22,7 @@ export const FIELD_CATEGORIES: Record<string, string> = {
   reference: "Reference Numbers",
   quantity: "Quantity & Weight",
   party: "Party Details",
+  terms: "Terms & Conditions",
 };
 
 export function getFieldCategory(fieldKey: FieldKey): string {
@@ -42,6 +43,9 @@ export function getFieldCategory(fieldKey: FieldKey): string {
   }
   if (["vendorName", "supplierGstin", "buyerName", "buyerGstin", "fastagCustomerName", "dispatchFrom", "shipTo", "routeFrom", "routeTo", "mapLocation"].includes(fieldKey)) {
     return "party";
+  }
+  if (["paymentTerms", "deliveryTerms", "freightTerms", "packingForwardingTerms", "priceBasis", "taxTerms", "inspectionTerms", "warrantyTerms", "termsAndConditions"].includes(fieldKey)) {
+    return "terms";
   }
   return "reference";
 }

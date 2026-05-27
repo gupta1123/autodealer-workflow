@@ -35,6 +35,7 @@ const COMPARISON_FIELD_LABELS: Partial<Record<FieldKey, string>> = {
   vehicleNumber: "Vehicle / Registration Number",
   dispatchFrom: "Origin / Dispatch From",
   shipTo: "Destination / Ship To",
+  subtotal: "Taxable / Basic Amount",
 };
 
 export const PRIMARY_COMPARISON_FIELDS: FieldKey[] = [
@@ -59,6 +60,7 @@ export const PRIMARY_COMPARISON_FIELDS: FieldKey[] = [
   "vehicleNumber",
   "fuelType",
   "currency",
+  "subtotal",
   "taxAmount",
   "totalAmount",
   "freightAmount",
@@ -92,6 +94,24 @@ type ComparableDoc = Pick<CaseDoc, "type" | "fields">;
 
 const GSTIN_FIELDS = new Set<FieldKey>(["supplierGstin", "buyerGstin"]);
 const GSTIN_DIGIT_INDICES = new Set([0, 1, 7, 8, 9, 10, 12]);
+const FORMAT_INSENSITIVE_IDENTIFIER_FIELDS = new Set<FieldKey>([
+  "poNumber",
+  "referencePoNumber",
+  "invoiceNumber",
+  "referenceInvoiceNumber",
+  "eWayBillNumber",
+  "weighmentNumber",
+  "lorryReceiptNumber",
+  "certificateNumber",
+  "permitNumber",
+  "licenseNumber",
+  "chassisNumber",
+  "engineNumber",
+  "vehicleNumber",
+  "registrationNumber",
+  "fastagReference",
+  "transactionReference",
+]);
 const AMOUNT_FIELDS = new Set<FieldKey>([
   "subtotal",
   "taxAmount",
@@ -140,7 +160,7 @@ function normalizeGstinValue(value: string) {
   const compact = value.toUpperCase().replace(/[^A-Z0-9]/g, "");
   if (!compact) return null;
 
-  return compact
+  const normalized = compact
     .split("")
     .map((character, index) => {
       if (!GSTIN_DIGIT_INDICES.has(index)) return character;
@@ -151,14 +171,30 @@ function normalizeGstinValue(value: string) {
       return character;
     })
     .join("");
+
+  return /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]$/.test(normalized)
+    ? normalized
+    : null;
 }
 
 function normalizeUnitValue(value: string) {
   const compact = value.toLowerCase().replace(/[^a-z0-9]/g, "");
-  if (COUNT_UNIT_VALUES.has(compact)) return "nos";
+  if (COUNT_UNIT_VALUES.has(compact) || ["cyl", "cylinder", "cylinders"].includes(compact)) return "nos";
   if (["kg", "kgs", "kilogram", "kilograms"].includes(compact)) return "kg";
-  if (["mt", "mton", "metricton", "metrictons"].includes(compact)) return "mt";
+  if (["mt", "mts", "mton", "mtons", "metricton", "metrictons", "metrictonne", "metrictonnes", "tonne", "tonnes"].includes(compact)) return "mt";
   return compact || null;
+}
+
+function normalizeIdentifierValue(value: string) {
+  const compact = value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return compact || null;
+}
+
+function normalizeInvoiceReferenceValue(value: string) {
+  const compact = normalizeIdentifierValue(value);
+  if (!compact) return null;
+  const withoutDocumentLabel = compact.replace(/^(?:taxinvoice|invoice|documentno|docno|document)(?=[a-z0-9]*\d)/, "");
+  return withoutDocumentLabel || compact;
 }
 
 function normalizeWeightToKg(value: string | number | null | undefined) {
@@ -173,7 +209,7 @@ function normalizeWeightToKg(value: string | number | null | undefined) {
   const parsed = Number(numericMatch[0]);
   if (!Number.isFinite(parsed)) return null;
 
-  if (/\b(?:mt|m\.t\.?|metric\s*tons?|tonnes?|tons?)\b/i.test(raw)) {
+  if (/\b(?:m\.?t\.?s?\.?|metric\s*ton(?:ne)?s?|tonnes?|tons?)\b/i.test(raw)) {
     return parsed * 1000;
   }
 
@@ -223,10 +259,18 @@ export function normalizeComparableValue(
     return normalizeUnitValue(raw);
   }
 
+  if (fieldKey === "invoiceNumber" || fieldKey === "referenceInvoiceNumber") {
+    return normalizeInvoiceReferenceValue(raw);
+  }
+
   const numericNormalized = normalizeNumericLikeValue(lowerCased);
 
   if (numericNormalized !== null) {
     return numericNormalized;
+  }
+
+  if (fieldKey && FORMAT_INSENSITIVE_IDENTIFIER_FIELDS.has(fieldKey)) {
+    return normalizeIdentifierValue(raw);
   }
 
   const currencyNormalized = normalizeCurrencyLikeValue(lowerCased);
@@ -281,7 +325,27 @@ export function areComparableValuesEqual(
     return false;
   }
 
-  return normalizedLeft === normalizedRight;
+  if (normalizedLeft === normalizedRight) return true;
+
+  const splitIdentifierList = (value: string | number | null | undefined) =>
+    String(value ?? "")
+      .split(/(?:,|;|\||\+|\band\b)/i)
+      .map((part) => normalizeComparableValue(part, options, fieldKey))
+      .filter((part): part is string => Boolean(part));
+
+  if (
+    fieldKey &&
+    FORMAT_INSENSITIVE_IDENTIFIER_FIELDS.has(fieldKey) &&
+    (/[;,|+]|\band\b/i.test(String(left ?? "")) || /[;,|+]|\band\b/i.test(String(right ?? "")))
+  ) {
+    const leftParts = splitIdentifierList(left);
+    const rightParts = splitIdentifierList(right);
+    if (leftParts.length && rightParts.length) {
+      return leftParts.some((leftPart) => rightParts.includes(leftPart));
+    }
+  }
+
+  return false;
 }
 
 export function pickCanonicalComparableValue(

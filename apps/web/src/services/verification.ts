@@ -12,8 +12,22 @@ import type { ComparisonOptions } from "@/types/pipeline";
 const PRESENCE_CHECK_FIELDS = new Set<FieldKey>();
 const PURCHASE_DOC_TYPES = new Set(["Purchase Order", "Amended Purchase Order"]);
 const INVOICE_DOC_TYPES = new Set(["Invoice", "Tax Invoice"]);
+const LOGISTICS_SUMMARY_LINE_DOC_TYPES = new Set(["Lorry Receipt", "Weighment Slip", "Transport Permit"]);
+const FULFILLMENT_LINE_DOC_TYPES = new Set<CaseDoc["type"]>(["Delivery Challan", "Delivery Note"]);
 const PARTY_NAME_FIELDS = new Set<FieldKey>(["vendorName", "buyerName", "transporterName", "ownerName", "driverName", "holderName"]);
 const PURCHASE_ORDER_TOTAL_FIELDS = new Set<FieldKey>(["subtotal", "taxAmount", "totalAmount"]);
+const EWAY_VALIDITY_RELATED_DOC_TYPES = new Set<CaseDoc["type"]>([
+  "Invoice",
+  "Tax Invoice",
+  "Delivery Challan",
+  "Delivery Note",
+  "Lorry Receipt",
+  "Weighment Slip",
+  "Transport Permit",
+  "Photo Evidence",
+]);
+const COMMERCIAL_CHARGE_LINE_PATTERN =
+  /\b(?:packing|p\s*&\s*f|p\s+and\s+f|freight|cartage|loading|unloading|handling|forwarding|insurance|transport(?:ation)?|courier|postage|delivery|other\s+charges?)\b/i;
 const SAME_TYPE_ONLY_DESCRIPTIVE_FIELDS = new Set<FieldKey>([
   "driverName",
   "evidenceDescription",
@@ -24,6 +38,21 @@ const SAME_TYPE_ONLY_DESCRIPTIVE_FIELDS = new Set<FieldKey>([
   "panNumber",
   "permitType",
   "vehicleClass",
+]);
+const MULTI_INSTANCE_IDENTIFIER_FIELDS = new Set<FieldKey>([
+  "poNumber",
+  "invoiceNumber",
+  "receiptNumber",
+  "deliveryNoteNumber",
+  "eWayBillNumber",
+  "weighmentNumber",
+  "lorryReceiptNumber",
+  "certificateNumber",
+  "permitNumber",
+  "licenseNumber",
+  "vehicleNumber",
+  "fastagReference",
+  "transactionReference",
 ]);
 const EXPECTATION_FIELD_ALIASES: Partial<Record<FieldKey, FieldKey[]>> = {
   poNumber: ["poNumber", "referencePoNumber"],
@@ -116,6 +145,22 @@ function shouldCompareDescriptiveField(
   return populatedDocTypes.size > 1;
 }
 
+function shouldCompareInstanceIdentifierField(
+  field: FieldKey,
+  entries: Array<{ doc: CaseDoc; value: string | number | null | undefined }>,
+  comparisonOptions: ComparisonOptions
+) {
+  if (!MULTI_INSTANCE_IDENTIFIER_FIELDS.has(field)) return true;
+
+  const populatedDocTypes = new Set(
+    entries
+      .filter((entry) => isComparableFieldValue(field, entry.value, comparisonOptions))
+      .map((entry) => entry.doc.type)
+  );
+
+  return populatedDocTypes.size > 1;
+}
+
 function normalizePartyName(value: string | number | null | undefined) {
   if (value === null || value === undefined) return null;
   const tokens = String(value)
@@ -143,12 +188,173 @@ function normalizePartyName(value: string | number | null | undefined) {
   return tokens.join("");
 }
 
+function editDistance(left: string, right: string) {
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  const current = Array.from({ length: right.length + 1 }, () => 0);
+
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    current[0] = leftIndex;
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      current[rightIndex] = Math.min(
+        previous[rightIndex] + 1,
+        current[rightIndex - 1] + 1,
+        previous[rightIndex - 1] + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1)
+      );
+    }
+    previous.splice(0, previous.length, ...current);
+  }
+
+  return previous[right.length];
+}
+
+function arePartyNamesEffectivelyEqual(left: string | number | null | undefined, right: string | number | null | undefined) {
+  const normalizedLeft = normalizePartyName(left);
+  const normalizedRight = normalizePartyName(right);
+  if (!normalizedLeft || !normalizedRight || normalizedLeft.length < 5 || normalizedRight.length < 5) {
+    return false;
+  }
+
+  if (
+    normalizedLeft === normalizedRight ||
+    normalizedLeft.includes(normalizedRight) ||
+    normalizedRight.includes(normalizedLeft)
+  ) {
+    return true;
+  }
+
+  const maxLength = Math.max(normalizedLeft.length, normalizedRight.length);
+  if (maxLength < 8) return false;
+
+  return editDistance(normalizedLeft, normalizedRight) <= Math.max(2, Math.floor(maxLength * 0.25));
+}
+
 function normalizeGroupValue(
   value: string | number | null | undefined,
   comparisonOptions: ComparisonOptions,
   field?: FieldKey
 ) {
   return normalizeComparableValue(value, comparisonOptions, field) || null;
+}
+
+const MONTH_NAME_TO_INDEX: Record<string, number> = {
+  jan: 1,
+  january: 1,
+  feb: 2,
+  february: 2,
+  mar: 3,
+  march: 3,
+  apr: 4,
+  april: 4,
+  may: 5,
+  jun: 6,
+  june: 6,
+  jul: 7,
+  july: 7,
+  aug: 8,
+  august: 8,
+  sep: 9,
+  sept: 9,
+  september: 9,
+  oct: 10,
+  october: 10,
+  nov: 11,
+  november: 11,
+  dec: 12,
+  december: 12,
+};
+
+function normalizeYear(value: number) {
+  return value < 100 ? 2000 + value : value;
+}
+
+function dayStamp(year: number, month: number, day: number) {
+  const normalizedYear = normalizeYear(year);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const date = new Date(Date.UTC(normalizedYear, month - 1, day));
+  if (
+    date.getUTCFullYear() !== normalizedYear ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return Math.floor(date.getTime() / 86400000);
+}
+
+function parseDocumentDay(value: string | number | null | undefined) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+
+  const isoMatch = text.match(/\b(\d{4})[/-](\d{1,2})[/-](\d{1,2})\b/);
+  if (isoMatch) {
+    return dayStamp(Number(isoMatch[1]), Number(isoMatch[2]), Number(isoMatch[3]));
+  }
+
+  const numericMatch = text.match(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b/);
+  if (numericMatch) {
+    return dayStamp(Number(numericMatch[3]), Number(numericMatch[2]), Number(numericMatch[1]));
+  }
+
+  const namedMonthMatch = text.match(/\b(\d{1,2})[-\s]([A-Za-z]{3,9})[-\s](\d{2,4})\b/);
+  const month = namedMonthMatch ? MONTH_NAME_TO_INDEX[namedMonthMatch[2].toLowerCase()] : undefined;
+  if (namedMonthMatch && month) {
+    return dayStamp(Number(namedMonthMatch[3]), month, Number(namedMonthMatch[1]));
+  }
+
+  return null;
+}
+
+function getDocumentDateForValidity(doc: CaseDoc) {
+  const candidates: FieldKey[] = ["documentDate", "ackDate", "transactionDate"];
+  for (const field of candidates) {
+    const value = doc.fields[field];
+    const stamp = parseDocumentDay(value);
+    if (stamp !== null) return { field, value, stamp };
+  }
+  return null;
+}
+
+function verifyEWayBillValidity(docs: CaseDoc[]): Omit<Mismatch, "analysis" | "fixPlan">[] {
+  const mismatches: Omit<Mismatch, "analysis" | "fixPlan">[] = [];
+  const eWayBills = docs.filter((doc) => doc.type === "E-Way Bill");
+  const relatedDocs = docs.filter((doc) => doc.type !== "E-Way Bill" && EWAY_VALIDITY_RELATED_DOC_TYPES.has(doc.type));
+
+  for (const eWayBill of eWayBills) {
+    const validUntilValue = eWayBill.fields.validityDate;
+    const validUntilStamp = parseDocumentDay(validUntilValue);
+    const generatedValue = eWayBill.fields.documentDate;
+    const generatedStamp = parseDocumentDay(generatedValue);
+
+    if (validUntilStamp !== null && generatedStamp !== null && validUntilStamp < generatedStamp) {
+      mismatches.push({
+        id: `mismatch-eway-validity-order-${eWayBill.id}`,
+        field: "validityDate",
+        values: [
+          { docId: eWayBill.id, value: `Generated Date: ${generatedValue}` },
+          { docId: eWayBill.id, value: `Valid Upto: ${validUntilValue}` },
+        ],
+      });
+    }
+
+    if (validUntilStamp === null) continue;
+
+    for (const relatedDoc of relatedDocs) {
+      const relatedDate = getDocumentDateForValidity(relatedDoc);
+      if (!relatedDate || relatedDate.stamp <= validUntilStamp) continue;
+
+      mismatches.push({
+        id: `mismatch-eway-validity-${eWayBill.id}-${relatedDoc.id}`,
+        field: "validityDate",
+        values: [
+          { docId: eWayBill.id, value: `E-Way Bill Valid Upto: ${validUntilValue}` },
+          { docId: relatedDoc.id, value: `${relatedDoc.type} ${relatedDate.field}: ${relatedDate.value}` },
+        ],
+      });
+    }
+  }
+
+  return mismatches;
 }
 
 function areFieldValuesEqual(
@@ -162,17 +368,7 @@ function areFieldValuesEqual(
   }
 
   if (PARTY_NAME_FIELDS.has(field)) {
-    const normalizedLeft = normalizePartyName(left);
-    const normalizedRight = normalizePartyName(right);
-    return Boolean(
-      normalizedLeft &&
-      normalizedRight &&
-      normalizedLeft.length >= 8 &&
-      normalizedRight.length >= 8 &&
-      (normalizedLeft === normalizedRight ||
-        normalizedLeft.includes(normalizedRight) ||
-        normalizedRight.includes(normalizedLeft))
-    );
+    return arePartyNamesEffectivelyEqual(left, right);
   }
 
   return false;
@@ -203,6 +399,10 @@ function buildMismatch(
   }
 
   if (!shouldCompareDescriptiveField(field, comparableEntries, comparisonOptions)) {
+    return null;
+  }
+
+  if (!shouldCompareInstanceIdentifierField(field, comparableEntries, comparisonOptions)) {
     return null;
   }
 
@@ -238,6 +438,9 @@ const GENERIC_LINE_TOKENS = new Set([
   "amount",
   "code",
   "description",
+  "cylinder",
+  "cylinders",
+  "gas",
   "goods",
   "gst",
   "guide",
@@ -391,9 +594,9 @@ function parseNumber(value?: string | number | null) {
 
 function normalizeUnit(value?: string) {
   const compact = compactText(value);
+  if (["ea", "each", "nos", "no", "nr", "number", "numbers", "pcs", "piece", "pieces", "pc", "cyl", "cylinder", "cylinders"].includes(compact)) return "nos";
   if (["kg", "kgs", "kilogram", "kilograms"].includes(compact)) return "kg";
-  if (["mt", "mton", "metricton", "metrictons", "m.t"].includes(compact)) return "mt";
-  if (["nos", "no", "number", "numbers", "pcs", "piece", "pieces"].includes(compact)) return "nos";
+  if (["mt", "mts", "mton", "mtons", "metricton", "metrictons", "metrictonne", "metrictonnes", "tonne", "tonnes"].includes(compact)) return "mt";
   if (["set", "sets"].includes(compact)) return "set";
   if (["ltr", "liter", "litre", "liters", "litres"].includes(compact)) return "ltr";
   return compact;
@@ -424,6 +627,22 @@ function convertRateToBase(rate?: string | number | null, unit?: string) {
   if (parsed === null) return null;
   const factor = unitFactorToBase(unit);
   return factor ? parsed / factor : parsed;
+}
+
+function isLikelyScaledOcrNumber(left: number | null, right: number | null) {
+  if (left === null || right === null || left <= 0 || right <= 0) return false;
+  const ratio = Math.max(left, right) / Math.min(left, right);
+  return [10, 100, 1000].some((scale) => Math.abs(ratio - scale) <= scale * 0.01);
+}
+
+function areHsnSacValuesCompatible(left: string, right: string) {
+  if (left === right) return true;
+  const shorter = left.length <= right.length ? left : right;
+  const longer = left.length > right.length ? left : right;
+  if (/^\d+$/.test(shorter) && /^\d+$/.test(longer)) {
+    return shorter.length >= 2 && longer.startsWith(shorter);
+  }
+  return shorter.length >= 4 && longer.startsWith(shorter);
 }
 
 function lineIdentity(item: CommercialLineItem) {
@@ -468,9 +687,21 @@ function findBestReferenceLine(comparedLine: CommercialLineItem, referenceLines:
     const itemCodeOverlap = countTokenOverlap(comparedItemCodeTokens, referenceItemCodeTokens);
     const bothHaveSpecificItemCodes = comparedItemCodeTokens.length > 0 && referenceItemCodeTokens.length > 0;
     const hasDescriptionAnchor = hasDistinctiveDescriptionOverlap(comparedLine.description, referenceLine.description);
+    const hsnCompatible = Boolean(comparedHsn && referenceHsn && areHsnSacValuesCompatible(comparedHsn, referenceHsn));
+    const quantityMatches =
+      comparedBaseQuantity !== null &&
+      referenceBaseQuantity !== null &&
+      nearlyEqual(comparedBaseQuantity, referenceBaseQuantity);
+    const lineTotalMatches =
+      comparedLineTotal !== null && referenceLineTotal !== null && nearlyEqual(comparedLineTotal, referenceLineTotal);
+    const directRateMatches =
+      comparedRate !== null && referenceRate !== null && Math.abs(comparedRate - referenceRate) <= Math.max(1, referenceRate * 0.01);
+    const baseRateMatches =
+      comparedBaseRate !== null && referenceBaseRate !== null && nearlyEqual(comparedBaseRate, referenceBaseRate);
+    const hasCommercialValueAnchor = hsnCompatible && (lineTotalMatches || (quantityMatches && (directRateMatches || baseRateMatches)));
     let hasStrongAnchor = false;
 
-    if (bothHaveSpecificItemCodes && itemCodeOverlap === 0) {
+    if (bothHaveSpecificItemCodes && itemCodeOverlap === 0 && !hasDescriptionAnchor && tokenOverlap < 2 && !hasCommercialValueAnchor) {
       continue;
     }
 
@@ -494,24 +725,28 @@ function findBestReferenceLine(comparedLine: CommercialLineItem, referenceLines:
       score += 5;
       hasStrongAnchor = true;
     }
-    if (comparedHsn && referenceHsn && comparedHsn === referenceHsn) score += 3;
+    if (hsnCompatible) score += comparedHsn === referenceHsn ? 3 : 2;
+    if (hasCommercialValueAnchor) {
+      score += 5;
+      hasStrongAnchor = true;
+    }
     if (comparedUnit && referenceUnit && areUnitsCompatible(comparedUnit, referenceUnit)) score += 1;
-    if (comparedRate !== null && referenceRate !== null && Math.abs(comparedRate - referenceRate) <= Math.max(1, referenceRate * 0.01)) {
+    if (directRateMatches) {
       score += 2;
-      if (comparedHsn && referenceHsn && comparedHsn === referenceHsn && (!bothHaveSpecificItemCodes || itemCodeOverlap > 0 || hasDescriptionAnchor)) {
+      if (hsnCompatible && (!bothHaveSpecificItemCodes || itemCodeOverlap > 0 || hasDescriptionAnchor)) {
         hasStrongAnchor = true;
       }
     }
-    if (comparedBaseRate !== null && referenceBaseRate !== null && nearlyEqual(comparedBaseRate, referenceBaseRate)) {
+    if (baseRateMatches) {
       score += 2;
-      if (comparedHsn && referenceHsn && comparedHsn === referenceHsn && (!bothHaveSpecificItemCodes || itemCodeOverlap > 0 || hasDescriptionAnchor)) {
+      if (hsnCompatible && (!bothHaveSpecificItemCodes || itemCodeOverlap > 0 || hasDescriptionAnchor)) {
         hasStrongAnchor = true;
       }
     }
-    if (comparedBaseQuantity !== null && referenceBaseQuantity !== null && nearlyEqual(comparedBaseQuantity, referenceBaseQuantity)) {
+    if (quantityMatches) {
       score += 2;
     }
-    if (comparedLineTotal !== null && referenceLineTotal !== null && nearlyEqual(comparedLineTotal, referenceLineTotal)) {
+    if (lineTotalMatches) {
       score += 2;
       if (!bothHaveSpecificItemCodes || itemCodeOverlap > 0 || hasDescriptionAnchor) {
         hasStrongAnchor = true;
@@ -535,6 +770,11 @@ function findBestReferenceLine(comparedLine: CommercialLineItem, referenceLines:
 function nearlyEqual(left: number | null, right: number | null, tolerance = 0.01) {
   if (left === null || right === null) return true;
   return Math.abs(left - right) <= Math.max(tolerance, Math.abs(right) * 0.01);
+}
+
+function monetaryAmountsEqual(left: number | null, right: number | null) {
+  if (left === null || right === null) return false;
+  return Math.abs(left - right) <= Math.max(0.5, Math.abs(right) * 0.002);
 }
 
 function buildLineMismatch(
@@ -634,6 +874,182 @@ function getComparableLineAmountValue(line: CommercialLineItem) {
   return line.taxableAmount ?? line.lineTotal;
 }
 
+function isLogisticsSummaryLine(doc: CaseDoc, line: CommercialLineItem) {
+  return (
+    LOGISTICS_SUMMARY_LINE_DOC_TYPES.has(doc.type) &&
+    !line.itemCode &&
+    !line.hsnSac &&
+    !line.rate &&
+    !line.netRate &&
+    !line.taxableAmount &&
+    !line.lineTotal
+  );
+}
+
+function getCountLikeQuantity(quantity?: string | number | null, unit?: string) {
+  const parsed = parseNumber(quantity);
+  if (parsed === null) return null;
+
+  const normalizedUnit = normalizeUnit(unit);
+  if (!normalizedUnit || normalizedUnit === "nos") return parsed;
+  return null;
+}
+
+function sumCountLikeLineQuantities(lines: CommercialLineItem[] | undefined) {
+  let total = 0;
+  let count = 0;
+
+  for (const line of lines ?? []) {
+    const quantity = getCountLikeQuantity(line.quantity, line.unit);
+    if (quantity === null) continue;
+    total += quantity;
+    count += 1;
+  }
+
+  return count > 0 ? total : null;
+}
+
+function getFulfillmentDocumentQuantity(doc: CaseDoc) {
+  const documentQuantity = getCountLikeQuantity(doc.fields.itemQuantity, doc.fields.unit);
+  return documentQuantity ?? sumCountLikeLineQuantities(doc.lineItems);
+}
+
+function fulfillmentQuantityReconcilesWithReference(docs: CaseDoc[], referenceDoc: CaseDoc) {
+  if (!INVOICE_DOC_TYPES.has(referenceDoc.type)) return false;
+
+  const referenceQuantity = sumCountLikeLineQuantities(referenceDoc.lineItems);
+  if (referenceQuantity === null) return false;
+
+  let fulfillmentQuantity = 0;
+  let fulfillmentDocCount = 0;
+
+  for (const doc of docs) {
+    if (!FULFILLMENT_LINE_DOC_TYPES.has(doc.type)) continue;
+    const quantity = getFulfillmentDocumentQuantity(doc);
+    if (quantity === null) continue;
+    fulfillmentQuantity += quantity;
+    fulfillmentDocCount += 1;
+  }
+
+  return fulfillmentDocCount > 0 && nearlyEqual(fulfillmentQuantity, referenceQuantity);
+}
+
+function hasStrongLineAnchorAgainstReference(line: CommercialLineItem, referenceLines: CommercialLineItem[]) {
+  if (line.hsnSac || line.rate || line.netRate || line.taxableAmount || line.lineTotal) return true;
+  if (hasUsableItemCode(line.itemCode)) return true;
+  return referenceLines.some((referenceLine) => meaningfulTokenOverlap(line, referenceLine) >= 1);
+}
+
+function shouldIgnoreWeakFulfillmentLineMismatch(
+  docs: CaseDoc[],
+  referenceDoc: CaseDoc,
+  comparedDoc: CaseDoc,
+  comparedLine: CommercialLineItem,
+  referenceLines: CommercialLineItem[]
+) {
+  return (
+    FULFILLMENT_LINE_DOC_TYPES.has(comparedDoc.type) &&
+    INVOICE_DOC_TYPES.has(referenceDoc.type) &&
+    !hasStrongLineAnchorAgainstReference(comparedLine, referenceLines) &&
+    fulfillmentQuantityReconcilesWithReference(docs, referenceDoc)
+  );
+}
+
+function isCommercialChargeLine(line: CommercialLineItem) {
+  return COMMERCIAL_CHARGE_LINE_PATTERN.test([line.description, line.rawText].filter(Boolean).join(" "));
+}
+
+function isSupplementalInvoiceChargeLine(line: CommercialLineItem) {
+  const context = [line.description, line.rawText].filter(Boolean).join(" ");
+  return (
+    isCommercialChargeLine(line) ||
+    (!line.quantity && !line.rate && !line.netRate && /\bcharges?\b/i.test(context))
+  );
+}
+
+function documentMentionsChargeAllowance(doc: CaseDoc) {
+  const fieldText = Object.values(doc.fields ?? {}).filter(Boolean).join(" ");
+  return COMMERCIAL_CHARGE_LINE_PATTERN.test(`${fieldText} ${doc.md ?? ""}`);
+}
+
+function hasGroupedEWayBaseAnchor(comparedLine: CommercialLineItem, referenceLine: CommercialLineItem) {
+  const comparedHsn = compactLineField(comparedLine.hsnSac);
+  const referenceHsn = compactLineField(referenceLine.hsnSac);
+  const hsnMatches = Boolean(
+    comparedHsn &&
+      referenceHsn &&
+      areHsnSacValuesCompatible(comparedHsn, referenceHsn)
+  );
+  const comparedQuantity = convertQuantityToBase(comparedLine.quantity, comparedLine.unit);
+  const referenceQuantity = convertQuantityToBase(referenceLine.quantity, referenceLine.unit);
+  const quantityMatches =
+    comparedQuantity !== null &&
+    referenceQuantity !== null &&
+    monetaryAmountsEqual(comparedQuantity, referenceQuantity);
+  const comparedRate = convertRateToBase(comparedLine.rate ?? comparedLine.netRate, comparedLine.unit);
+  const referenceRate = convertRateToBase(referenceLine.rate ?? referenceLine.netRate, referenceLine.unit);
+  const rateMatches = comparedRate !== null && referenceRate !== null && monetaryAmountsEqual(comparedRate, referenceRate);
+  const tokenOverlap = meaningfulTokenOverlap(comparedLine, referenceLine);
+
+  return (hsnMatches && (quantityMatches || rateMatches || tokenOverlap >= 1)) || tokenOverlap >= 2;
+}
+
+function hasSupplementalChargeAmountCombination(
+  referenceLines: CommercialLineItem[],
+  baseLine: CommercialLineItem,
+  residualAmount: number
+) {
+  if (residualAmount <= 0 || monetaryAmountsEqual(residualAmount, 0)) return false;
+
+  const candidates = referenceLines
+    .filter((line) => line !== baseLine && isSupplementalInvoiceChargeLine(line))
+    .map((line) => parseNumber(getComparableLineAmountValue(line)))
+    .filter((amount): amount is number => amount !== null && amount > 0 && amount <= residualAmount + Math.max(0.5, residualAmount * 0.002))
+    .sort((left, right) => right - left)
+    .slice(0, 8);
+
+  function search(index: number, total: number): boolean {
+    if (monetaryAmountsEqual(total, residualAmount)) return true;
+    if (index >= candidates.length || total > residualAmount + Math.max(0.5, residualAmount * 0.002)) return false;
+    return search(index + 1, total + candidates[index]) || search(index + 1, total);
+  }
+
+  return search(0, 0);
+}
+
+function isEWayInvoiceGroupedAmountMatch(
+  referenceDoc: CaseDoc,
+  comparedDoc: CaseDoc,
+  comparedLine: CommercialLineItem,
+  referenceLine: CommercialLineItem,
+  referenceLines: CommercialLineItem[]
+) {
+  if (comparedDoc.type !== "E-Way Bill" || !INVOICE_DOC_TYPES.has(referenceDoc.type)) return false;
+  if (!hasGroupedEWayBaseAnchor(comparedLine, referenceLine)) return false;
+
+  const comparedAmount = parseNumber(getComparableLineAmountValue(comparedLine));
+  const referenceAmount = parseNumber(getComparableLineAmountValue(referenceLine));
+  if (comparedAmount === null || referenceAmount === null || comparedAmount <= referenceAmount) return false;
+
+  return hasSupplementalChargeAmountCombination(referenceLines, referenceLine, comparedAmount - referenceAmount);
+}
+
+function findGroupedEWayReferenceLine(
+  referenceDoc: CaseDoc,
+  comparedDoc: CaseDoc,
+  comparedLine: CommercialLineItem,
+  referenceLines: CommercialLineItem[]
+) {
+  if (comparedDoc.type !== "E-Way Bill" || !INVOICE_DOC_TYPES.has(referenceDoc.type)) return null;
+
+  return (
+    referenceLines.find((referenceLine) =>
+      !isSupplementalInvoiceChargeLine(referenceLine) &&
+      isEWayInvoiceGroupedAmountMatch(referenceDoc, comparedDoc, comparedLine, referenceLine, referenceLines)
+    ) ?? null
+  );
+}
+
 function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" | "fixPlan">[] {
   const docsWithLineItems = docs.filter((doc) => doc.lineItems?.length);
   const mismatches: Omit<Mismatch, "analysis" | "fixPlan">[] = [];
@@ -659,8 +1075,20 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
     const comparedRole = formatLineDocRole(comparedDoc);
 
     for (const [index, comparedLine] of (comparedDoc.lineItems ?? []).entries()) {
-      const referenceLine = findBestReferenceLine(comparedLine, referenceLines);
+      const referenceLine =
+        findBestReferenceLine(comparedLine, referenceLines) ??
+        findGroupedEWayReferenceLine(referenceDoc, comparedDoc, comparedLine, referenceLines);
       if (!referenceLine) {
+        if (
+          isLogisticsSummaryLine(comparedDoc, comparedLine) ||
+          shouldIgnoreWeakFulfillmentLineMismatch(docs, referenceDoc, comparedDoc, comparedLine, referenceLines) ||
+          (PURCHASE_DOC_TYPES.has(referenceDoc.type) &&
+            isCommercialChargeLine(comparedLine) &&
+            documentMentionsChargeAllowance(referenceDoc))
+        ) {
+          continue;
+        }
+
         mismatches.push(buildLineMismatch("lineItems.unmatchedDocumentLine", referenceDoc, comparedDoc, null, comparedLine, index, `${comparedRole} line has no confident ${referenceRole} line match`));
         continue;
       }
@@ -669,6 +1097,25 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
       const referenceQty = parseNumber(referenceLine.quantity);
       const comparedBaseQty = convertQuantityToBase(comparedLine.quantity, comparedLine.unit) ?? comparedQty;
       const referenceBaseQty = convertQuantityToBase(referenceLine.quantity, referenceLine.unit) ?? referenceQty;
+      const comparedLineAmountValue = getComparableLineAmountValue(comparedLine);
+      const referenceLineAmountValue = getComparableLineAmountValue(referenceLine);
+      const comparedLineAmount = parseNumber(comparedLineAmountValue);
+      const referenceLineAmount = parseNumber(referenceLineAmountValue);
+      const groupedAmountMatch = isEWayInvoiceGroupedAmountMatch(
+        referenceDoc,
+        comparedDoc,
+        comparedLine,
+        referenceLine,
+        referenceLines
+      );
+      const lineAmountsAgree =
+        nearlyEqual(comparedLineAmount, referenceLineAmount) ||
+        isLikelyScaledOcrNumber(comparedLineAmount, referenceLineAmount) ||
+        groupedAmountMatch;
+      const quantitiesAgree =
+        comparedBaseQty === null ||
+        referenceBaseQty === null ||
+        nearlyEqual(comparedBaseQty, referenceBaseQty);
       if (
         comparedBaseQty !== null &&
         referenceBaseQty !== null &&
@@ -690,7 +1137,11 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
       const referenceRateValue = referenceLine.rate ?? referenceLine.netRate;
       const comparedRate = convertRateToBase(comparedRateValue, comparedLine.unit) ?? parseNumber(comparedRateValue);
       const referenceRate = convertRateToBase(referenceRateValue, referenceLine.unit) ?? parseNumber(referenceRateValue);
-      if (!nearlyEqual(comparedRate, referenceRate)) {
+      if (
+        !(lineAmountsAgree && quantitiesAgree) &&
+        !nearlyEqual(comparedRate, referenceRate) &&
+        !isLikelyScaledOcrNumber(comparedRate, referenceRate)
+      ) {
         mismatches.push(buildLineMismatch("lineItems.rateMismatch", referenceDoc, comparedDoc, referenceLine, comparedLine, index, `${comparedRole} rate ${comparedRateValue} differs from ${referenceRole} rate ${referenceRateValue}`, `${referenceRole} rate ${referenceRateValue}`, `${comparedRole} rate ${comparedRateValue}`));
       }
 
@@ -702,20 +1153,19 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
 
       const comparedHsnSac = compactLineField(comparedLine.hsnSac);
       const referenceHsnSac = compactLineField(referenceLine.hsnSac);
-      if (comparedHsnSac && referenceHsnSac && comparedHsnSac !== referenceHsnSac) {
+      if (comparedHsnSac && referenceHsnSac && !areHsnSacValuesCompatible(comparedHsnSac, referenceHsnSac)) {
         mismatches.push(buildLineMismatch("lineItems.hsnSacMismatch", referenceDoc, comparedDoc, referenceLine, comparedLine, index, `${comparedRole} HSN/SAC ${comparedLine.hsnSac} differs from ${referenceRole} HSN/SAC ${referenceLine.hsnSac}`, `${referenceRole} HSN/SAC ${referenceLine.hsnSac}`, `${comparedRole} HSN/SAC ${comparedLine.hsnSac}`));
       }
 
-      const comparedLineAmountValue = getComparableLineAmountValue(comparedLine);
-      const referenceLineAmountValue = getComparableLineAmountValue(referenceLine);
-      const comparedLineAmount = parseNumber(comparedLineAmountValue);
-      const referenceLineAmount = parseNumber(referenceLineAmountValue);
       const shouldCompareLineAmount =
         !PURCHASE_DOC_TYPES.has(referenceDoc.type) ||
         comparedBaseQty === null ||
         referenceBaseQty === null ||
         nearlyEqual(comparedBaseQty, referenceBaseQty);
-      if (shouldCompareLineAmount && !nearlyEqual(comparedLineAmount, referenceLineAmount)) {
+      if (
+        shouldCompareLineAmount &&
+        !lineAmountsAgree
+      ) {
         mismatches.push(buildLineMismatch("lineItems.amountMismatch", referenceDoc, comparedDoc, referenceLine, comparedLine, index, `${comparedRole} line amount ${comparedLineAmountValue} differs from ${referenceRole} line amount ${referenceLineAmountValue}`, `${referenceRole} line amount ${referenceLineAmountValue}`, `${comparedRole} line amount ${comparedLineAmountValue}`));
       }
     }
@@ -739,5 +1189,5 @@ export function verifyCaseDocuments(
     if (mismatch) mismatches.push(mismatch);
   }
 
-  return [...mismatches, ...verifyCommercialLineItems(docs)];
+  return [...mismatches, ...verifyEWayBillValidity(docs), ...verifyCommercialLineItems(docs)];
 }
