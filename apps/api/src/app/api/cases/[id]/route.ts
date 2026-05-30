@@ -27,6 +27,8 @@ import {
 } from "@/lib/document-schema";
 import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
 import {
+  enrichDocumentsWithPacketGstTaxContext,
+  enrichFieldsWithLineItemTaxRates,
   isLineItemMismatchField,
   readStoredLineItems,
   stripStoredLineItems,
@@ -124,13 +126,21 @@ function mapDocumentRowForCaseSummary(row: {
       return [];
     })
   );
+  const enrichedFields = sanitizeFieldsForDocType(
+    row.document_type,
+    enrichFieldsWithLineItemTaxRates(
+      extractedFields as Partial<Record<FieldKey, string>>,
+      storedLineItems
+    ),
+    fieldConfiguration
+  );
 
   return {
     id: row.client_document_id || row.id,
     type: row.document_type as CaseDoc["type"],
     title: row.title || row.document_type,
     pages: row.page_count || 1,
-    fields: extractedFields as CaseDoc["fields"],
+    fields: enrichedFields as CaseDoc["fields"],
     lineItems: storedLineItems,
     md: "",
     sourceFileName: row.source_file_name || undefined,
@@ -456,26 +466,50 @@ export async function GET(
     }));
 
     const orderedDocuments = sortCaseDocuments((documents ?? []) as CaseDocumentRow[]);
-    const caseSummaryDocuments = orderedDocuments.map((document) =>
-      mapDocumentRowForCaseSummary(document, fieldConfiguration)
+    const caseSummaryDocuments = enrichDocumentsWithPacketGstTaxContext(
+      orderedDocuments.map((document) =>
+        mapDocumentRowForCaseSummary(document, fieldConfiguration)
+      )
     );
-    const sanitizedDocuments = orderedDocuments.map((document) => ({
-      id: document.id,
-      clientDocumentId: document.client_document_id,
-      sourceFileName: document.source_file_name,
-      sourceHint: document.source_hint,
-      documentType: document.document_type,
-      title: document.title,
-      pageCount: document.page_count,
-      extractedFields: sanitizeExtractedFields(
+    const sanitizedCaseDocuments = enrichDocumentsWithPacketGstTaxContext(orderedDocuments.map((document) => {
+      const lineItems = readStoredLineItems(document.extracted_fields);
+      const extractedFields = sanitizeExtractedFields(
         document.document_type,
         document.extracted_fields,
         fieldConfiguration
-      ),
-      lineItems: readStoredLineItems(document.extracted_fields),
-      markdown: document.markdown,
-      createdAt: document.created_at,
+      );
+      return {
+        id: document.id,
+        type: document.document_type as CaseDoc["type"],
+        title: document.title,
+        pages: document.page_count,
+        fields: sanitizeFieldsForDocType(
+          document.document_type,
+          enrichFieldsWithLineItemTaxRates(extractedFields, lineItems),
+          fieldConfiguration
+        ),
+        lineItems,
+        md: document.markdown,
+        sourceFileName: document.source_file_name || undefined,
+        sourceHint: document.source_hint || document.source_file_name || undefined,
+      };
     }));
+    const sanitizedDocuments = sanitizedCaseDocuments.map((document, index) => {
+      const row = orderedDocuments[index];
+      return {
+        id: row.id,
+        clientDocumentId: row.client_document_id,
+        sourceFileName: row.source_file_name,
+        sourceHint: row.source_hint,
+        documentType: row.document_type,
+        title: row.title,
+        pageCount: row.page_count,
+        extractedFields: sanitizeFieldsForDocType(row.document_type, document.fields, fieldConfiguration),
+        lineItems: document.lineItems,
+        markdown: row.markdown,
+        createdAt: row.created_at,
+      };
+    });
     const filteredMismatches = mismatches.filter((mismatch) => {
       if (
         !isLineItemMismatchField(mismatch.fieldName) &&

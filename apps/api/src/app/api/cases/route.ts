@@ -22,6 +22,8 @@ import {
 } from "@/lib/document-schema";
 import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
 import {
+  enrichDocumentsWithPacketGstTaxContext,
+  enrichFieldsWithLineItemTaxRates,
   isLineItemMismatchField,
   readStoredLineItems,
   serializeFieldsWithLineItems,
@@ -33,6 +35,168 @@ import { readUploadGroupMeta } from "@/lib/upload-groups";
 import type { CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
 
 const STORAGE_BUCKET = "packet-files";
+const DEFAULT_CASE_LIST_LIMIT = 25;
+const MAX_CASE_LIST_LIMIT = 100;
+const LIST_COLUMNS =
+  "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at";
+const LIST_COLUMNS_WITHOUT_RECYCLE_BIN =
+  "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta";
+
+type CaseListScope = "active" | "deleted";
+type CaseListCursor = {
+  sortValue: string;
+  id: string;
+};
+type CaseListTiming = Partial<Record<"auth" | "caseQuery" | "serialize" | "total", number>>;
+type CaseListRow = {
+  id: string;
+  slug: string;
+  display_name: string;
+  buyer_name: string | null;
+  po_number: string | null;
+  invoice_number: string | null;
+  status: string;
+  risk_score: number;
+  upload_count: number;
+  document_count: number;
+  mismatch_count: number;
+  created_at: string;
+  processing_meta?: unknown;
+  deleted_at?: string | null;
+};
+type PreparedUploadFile = {
+  originalName: string;
+  contentType: string;
+  bytes: Uint8Array;
+  sizeBytes: number;
+  sha256: string;
+};
+type DuplicateCaseCandidate = {
+  id: string;
+  display_name: string;
+  status: string;
+  created_at: string;
+  upload_count?: number | null;
+  processing_meta?: unknown;
+};
+type DuplicateCaseResponse = {
+  id: string;
+  displayName: string;
+  status: string;
+  createdAt: string;
+};
+type StoredCaseFileIdentity = {
+  original_name: string;
+  size_bytes: number | null;
+  storage_bucket: string | null;
+  storage_path: string | null;
+};
+
+function nowMs() {
+  return performance.now();
+}
+
+function formatTimingValue(value: number) {
+  return Math.max(0, value).toFixed(1);
+}
+
+function getServerTimingHeader(timing: CaseListTiming) {
+  return Object.entries(timing)
+    .filter((entry): entry is [string, number] => typeof entry[1] === "number")
+    .map(([key, value]) => `${key};dur=${formatTimingValue(value)}`)
+    .join(", ");
+}
+
+function attachCaseListTiming(response: Response, timing: CaseListTiming) {
+  const header = getServerTimingHeader(timing);
+  if (header) {
+    response.headers.set("Server-Timing", header);
+  }
+  return response;
+}
+
+function logSlowCaseListRequest(params: {
+  scope: CaseListScope;
+  limit: number;
+  hasSearch: boolean;
+  timing: CaseListTiming;
+}) {
+  if ((params.timing.total ?? 0) < 750) {
+    return;
+  }
+
+  console.warn("Slow GET /api/cases", {
+    route: "/api/cases",
+    scope: params.scope,
+    limit: params.limit,
+    hasSearch: params.hasSearch,
+    timings: Object.fromEntries(
+      Object.entries(params.timing).map(([key, value]) => [
+        key,
+        typeof value === "number" ? Number(formatTimingValue(value)) : value,
+      ])
+    ),
+  });
+}
+
+function isMissingSearchTextColumn(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const record = error as Record<string, unknown>;
+  const message = [record.message, record.details, record.hint, record.code]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+
+  return /search_text|schema cache|could not find|column .* does not exist|42703|PGRST/i.test(message);
+}
+
+function encodeCaseListCursor(row: CaseListRow, scope: CaseListScope) {
+  const sortValue = scope === "deleted" ? row.deleted_at : row.created_at;
+  if (!sortValue) {
+    return null;
+  }
+
+  return Buffer.from(JSON.stringify({ sortValue, id: row.id }), "utf8").toString("base64url");
+}
+
+function decodeCaseListCursor(value: string | null): CaseListCursor | null {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Partial<CaseListCursor>;
+    if (
+      typeof parsed.sortValue === "string" &&
+      parsed.sortValue.trim().length > 0 &&
+      typeof parsed.id === "string" &&
+      parsed.id.trim().length > 0
+    ) {
+      return {
+        sortValue: parsed.sortValue,
+        id: parsed.id,
+      };
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function normalizeCaseSearchQuery(value: string | null) {
+  return value?.replace(/\s+/g, " ").trim().slice(0, 120) ?? "";
+}
+
+function escapeIlikePattern(value: string) {
+  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
+}
+
+function escapePostgrestOrValue(value: string) {
+  return value.replace(/[\\,()]/g, (match) => `\\${match}`);
+}
 
 function isRecycleBinSchemaMissing(error: unknown) {
   if (!error || typeof error !== "object") {
@@ -185,6 +349,308 @@ function isFileEntry(entry: FormDataEntryValue): entry is File {
   return typeof entry !== "string";
 }
 
+function normalizeUploadIdentityValue(value: string) {
+  return value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function sha256Hex(value: Uint8Array | string) {
+  const bytes = new Uint8Array(typeof value === "string" ? new TextEncoder().encode(value) : value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes.buffer);
+  return Buffer.from(digest).toString("hex");
+}
+
+async function prepareUploadFiles(files: File[]): Promise<PreparedUploadFile[]> {
+  return Promise.all(
+    files.map(async (file) => {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      return {
+        originalName: file.name || "upload",
+        contentType: inferContentType(file),
+        bytes,
+        sizeBytes: file.size,
+        sha256: await sha256Hex(bytes),
+      };
+    })
+  );
+}
+
+function getUploadContentSignature(files: PreparedUploadFile[]) {
+  return files
+    .map((file) => `${file.sha256}:${file.sizeBytes}`)
+    .sort()
+    .join("|");
+}
+
+function getLegacyUploadSignature(files: Array<Pick<PreparedUploadFile, "originalName" | "sizeBytes">>) {
+  return files
+    .map((file) => `${normalizeUploadIdentityValue(file.originalName)}:${file.sizeBytes}`)
+    .sort()
+    .join("|");
+}
+
+function getUploadSizeSignature(files: Array<Pick<PreparedUploadFile, "sizeBytes">>) {
+  return files
+    .map((file) => String(file.sizeBytes))
+    .sort((a, b) => Number(a) - Number(b))
+    .join("|");
+}
+
+async function getUploadFingerprint(files: PreparedUploadFile[]) {
+  if (files.length === 0) return null;
+  return `upload-set-sha256-v1:${await sha256Hex(getUploadContentSignature(files))}`;
+}
+
+function getUploadDuplicateMeta(files: PreparedUploadFile[], uploadFingerprint: string | null) {
+  if (!uploadFingerprint) return {};
+
+  return {
+    uploadFingerprint,
+    uploadFingerprintVersion: "upload-set-sha256-v1",
+    uploadContentSignature: getUploadContentSignature(files),
+    uploadLegacySignature: getLegacyUploadSignature(files),
+    uploadFileFingerprints: files.map((file) => ({
+      name: file.originalName,
+      sizeBytes: file.sizeBytes,
+      mimeType: file.contentType,
+      sha256: file.sha256,
+    })),
+  };
+}
+
+function toRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function readStringMeta(value: unknown, key: string) {
+  const record = toRecord(value);
+  const raw = record[key];
+  return typeof raw === "string" && raw.trim().length > 0 ? raw : null;
+}
+
+function isDuplicateUploadConstraintError(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const record = error as Record<string, unknown>;
+  const code = typeof record.code === "string" ? record.code : "";
+  const message = [record.message, record.details, record.hint]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+
+  return (
+    code === "23505" &&
+    /packet_cases_owner_upload_fingerprint_unique_idx|uploadFingerprint|upload_fingerprint/i.test(message)
+  );
+}
+
+function mapDuplicateCaseResponse(row: DuplicateCaseCandidate): DuplicateCaseResponse {
+  return {
+    id: row.id,
+    displayName: row.display_name,
+    status: row.status,
+    createdAt: row.created_at,
+  };
+}
+
+function duplicateCaseMessage(row: DuplicateCaseCandidate) {
+  return `This packet is already saved as "${row.display_name}". Open the existing case instead of creating a duplicate.`;
+}
+
+async function fetchAllOwnerCaseCandidates(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  ownerUserId: string,
+  uploadCount: number
+) {
+  const rows: DuplicateCaseCandidate[] = [];
+  const pageSize = 1000;
+
+  for (let offset = 0; ; offset += pageSize) {
+    const { data, error } = await supabase
+      .from("packet_cases")
+      .select("id, display_name, status, created_at, upload_count, processing_meta")
+      .eq("owner_user_id", ownerUserId)
+      .eq("upload_count", uploadCount)
+      .order("created_at", { ascending: false })
+      .range(offset, offset + pageSize - 1);
+
+    if (error) {
+      throw error;
+    }
+
+    rows.push(...((data ?? []) as DuplicateCaseCandidate[]));
+    if (!data || data.length < pageSize) break;
+  }
+
+  return rows.filter((row) => !isCaseRecycled(row.processing_meta));
+}
+
+function chunk<T>(values: T[], size: number) {
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
+
+async function findDuplicateCaseByStoredFiles(params: {
+  supabase: ReturnType<typeof createSupabaseAdminClient>;
+  candidates: DuplicateCaseCandidate[];
+  contentSignature: string;
+  legacyUploadSignature: string;
+  sizeSignature: string;
+  fileCount: number;
+}) {
+  const candidateIds = params.candidates.map((candidate) => candidate.id);
+  if (candidateIds.length === 0) return null;
+
+  const filesByCaseId = new Map<string, StoredCaseFileIdentity[]>();
+  for (const ids of chunk(candidateIds, 100)) {
+    const { data, error } = await params.supabase
+      .from("packet_case_files")
+      .select("case_id, original_name, size_bytes, storage_bucket, storage_path")
+      .in("case_id", ids);
+
+    if (error) {
+      throw error;
+    }
+
+    for (const row of data ?? []) {
+      const current = filesByCaseId.get(row.case_id) ?? [];
+      current.push({
+        original_name: row.original_name,
+        size_bytes: row.size_bytes,
+        storage_bucket: row.storage_bucket,
+        storage_path: row.storage_path,
+      });
+      filesByCaseId.set(row.case_id, current);
+    }
+  }
+
+  const sameSizeCandidates: Array<{ candidate: DuplicateCaseCandidate; files: StoredCaseFileIdentity[] }> = [];
+  for (const candidate of params.candidates) {
+    const files = filesByCaseId.get(candidate.id) ?? [];
+    if (files.length !== params.fileCount) continue;
+
+    const sizeSignature = getUploadSizeSignature(
+      files.map((file) => ({
+        sizeBytes: file.size_bytes ?? 0,
+      }))
+    );
+    if (sizeSignature === params.sizeSignature) {
+      sameSizeCandidates.push({ candidate, files });
+    }
+
+    const signature = getLegacyUploadSignature(
+      files.map((file) => ({
+        originalName: file.original_name,
+        sizeBytes: file.size_bytes ?? 0,
+      }))
+    );
+    if (signature === params.legacyUploadSignature) {
+      return candidate;
+    }
+  }
+
+  for (const { candidate, files } of sameSizeCandidates) {
+    const contentSignature = await getStoredContentSignature(params.supabase, files);
+    if (contentSignature && contentSignature === params.contentSignature) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+async function getStoredContentSignature(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  files: StoredCaseFileIdentity[]
+) {
+  const signatures: string[] = [];
+
+  for (const file of files) {
+    if (!file.storage_path) {
+      return null;
+    }
+
+    const { data, error } = await supabase.storage
+      .from(file.storage_bucket || STORAGE_BUCKET)
+      .download(file.storage_path);
+    if (error || !data) {
+      return null;
+    }
+
+    const bytes = new Uint8Array(await data.arrayBuffer());
+    signatures.push(`${await sha256Hex(bytes)}:${file.size_bytes ?? bytes.byteLength}`);
+  }
+
+  return signatures.sort().join("|");
+}
+
+async function findDuplicateCaseForUpload(params: {
+  supabase: ReturnType<typeof createSupabaseAdminClient>;
+  ownerUserId: string;
+  files: PreparedUploadFile[];
+  uploadFingerprint: string | null;
+}) {
+  if (params.files.length === 0 || !params.uploadFingerprint) return null;
+
+  const candidates = await fetchAllOwnerCaseCandidates(
+    params.supabase,
+    params.ownerUserId,
+    params.files.length
+  );
+  const contentSignature = getUploadContentSignature(params.files);
+  const legacySignature = getLegacyUploadSignature(params.files);
+  const metadataMatch = candidates.find((candidate) => {
+    const fingerprint = readStringMeta(candidate.processing_meta, "uploadFingerprint");
+    if (fingerprint && fingerprint === params.uploadFingerprint) return true;
+
+    const storedContentSignature = readStringMeta(candidate.processing_meta, "uploadContentSignature");
+    return Boolean(storedContentSignature && storedContentSignature === contentSignature);
+  });
+
+  if (metadataMatch) {
+    return metadataMatch;
+  }
+
+  return findDuplicateCaseByStoredFiles({
+    supabase: params.supabase,
+    candidates,
+    contentSignature,
+    legacyUploadSignature: legacySignature,
+    sizeSignature: getUploadSizeSignature(params.files),
+    fileCount: params.files.length,
+  });
+}
+
+function duplicateCaseResponse(request: Request, duplicateCase: DuplicateCaseCandidate) {
+  return jsonWithCors(
+    request,
+    {
+      error: duplicateCaseMessage(duplicateCase),
+      duplicateCase: mapDuplicateCaseResponse(duplicateCase),
+    },
+    { status: 409 }
+  );
+}
+
+async function cleanupUploadedFiles(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  uploadedPaths: string[]
+) {
+  if (uploadedPaths.length === 0) return;
+
+  await supabase.storage.from(STORAGE_BUCKET).remove(uploadedPaths);
+  uploadedPaths.splice(0, uploadedPaths.length);
+}
+
 function sanitizeDocumentsForStorage(
   documents: CaseDoc[],
   fieldConfiguration: PacketFieldConfiguration
@@ -264,13 +730,21 @@ function mapDocumentRowForCaseSummary(row: {
           fieldConfiguration
         )
       : {};
+  const enrichedFields = sanitizeFieldsForDocType(
+    row.document_type,
+    enrichFieldsWithLineItemTaxRates(
+      extractedFields as Partial<Record<FieldKey, string>>,
+      storedLineItems
+    ),
+    fieldConfiguration
+  );
 
   return {
     id: row.client_document_id || row.id,
     type: row.document_type as CaseDoc["type"],
     title: row.title || row.document_type,
     pages: row.page_count || 1,
-    fields: extractedFields as CaseDoc["fields"],
+    fields: enrichedFields as CaseDoc["fields"],
     lineItems: storedLineItems,
     md: "",
     sourceHint: row.source_hint || row.source_file_name || undefined,
@@ -303,6 +777,10 @@ async function fetchCaseDocumentsForSummary(
     const current = documentsByCaseId.get(row.case_id) ?? [];
     current.push(mapDocumentRowForCaseSummary(row, fieldConfiguration));
     documentsByCaseId.set(row.case_id, current);
+  }
+
+  for (const [caseId, documents] of documentsByCaseId) {
+    documentsByCaseId.set(caseId, enrichDocumentsWithPacketGstTaxContext(documents));
   }
 
   return documentsByCaseId;
@@ -419,124 +897,244 @@ function mapCaseRow(
 }
 
 export async function GET(request: Request) {
+  const startedAt = nowMs();
+  const timing: CaseListTiming = {};
+
   try {
+    const authStartedAt = nowMs();
     const user = await requireRequestUser(request);
+    timing.auth = nowMs() - authStartedAt;
     if (!user) {
-      return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
+      timing.total = nowMs() - startedAt;
+      return attachCaseListTiming(
+        jsonWithCors(request, { error: "Unauthorized" }, { status: 401 }),
+        timing
+      );
     }
 
     const supabase = createSupabaseAdminClient();
-    const fieldConfiguration = await getPersistedPacketFieldConfiguration();
     const url = new URL(request.url);
-    const requestedLimit = Number(url.searchParams.get("limit") ?? "12");
+    const requestedLimit = Number(url.searchParams.get("limit") ?? String(DEFAULT_CASE_LIST_LIMIT));
+    const requestedPage = Number(url.searchParams.get("page"));
     const requestedScope = url.searchParams.get("scope");
+    const shouldDeriveSummaryFromDocuments = url.searchParams.get("derive") === "documents";
     const scope = requestedScope === "deleted" ? "deleted" : "active";
+    const cursor = decodeCaseListCursor(url.searchParams.get("cursor"));
+    const searchQuery = normalizeCaseSearchQuery(url.searchParams.get("q"));
     const limit =
       Number.isFinite(requestedLimit) && requestedLimit > 0
-        ? Math.min(Math.floor(requestedLimit), 200)
-        : 12;
+        ? Math.min(Math.floor(requestedLimit), MAX_CASE_LIST_LIMIT)
+        : DEFAULT_CASE_LIST_LIMIT;
+    const page =
+      Number.isFinite(requestedPage) && requestedPage > 0
+        ? Math.floor(requestedPage)
+        : null;
+    const usePageNumbers = page !== null && !cursor;
+    const rangeStart = usePageNumbers ? (page - 1) * limit : null;
+    const rangeEnd = rangeStart !== null ? rangeStart + limit - 1 : null;
 
-    let data:
-      | Array<{
-          id: string;
-          slug: string;
-          display_name: string;
-          buyer_name: string | null;
-          po_number: string | null;
-          invoice_number: string | null;
-          status: string;
-          risk_score: number;
-          upload_count: number;
-          document_count: number;
-          mismatch_count: number;
-          created_at: string;
-          processing_meta?: unknown;
-          deleted_at?: string | null;
-        }>
-      | null = null;
+    let data: CaseListRow[] | null = null;
+    let totalCount: number | null = null;
 
     try {
+      const queryStartedAt = nowMs();
       let query = supabase
         .from("packet_cases")
-        .select(
-          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
-        )
-        .eq("owner_user_id", user.id)
-        .limit(limit);
+        .select(LIST_COLUMNS, usePageNumbers ? { count: "exact" } : undefined)
+        .eq("owner_user_id", user.id);
 
-      query =
-        scope === "deleted"
-          ? query.not("deleted_at", "is", null).order("deleted_at", { ascending: false })
-          : query.is("deleted_at", null).order("created_at", { ascending: false });
+      if (scope === "deleted") {
+        query = query.not("deleted_at", "is", null);
+        if (cursor) {
+          query = query.or(`deleted_at.lt.${cursor.sortValue},and(deleted_at.eq.${cursor.sortValue},id.lt.${cursor.id})`);
+        }
+        query = query.order("deleted_at", { ascending: false }).order("id", { ascending: false });
+      } else {
+        query = query.is("deleted_at", null);
+        if (cursor) {
+          query = query.or(`created_at.lt.${cursor.sortValue},and(created_at.eq.${cursor.sortValue},id.lt.${cursor.id})`);
+        }
+        query = query.order("created_at", { ascending: false }).order("id", { ascending: false });
+      }
 
-      const result = await query;
+      if (searchQuery) {
+        query = query.ilike("search_text", `%${escapeIlikePattern(searchQuery.toLowerCase())}%`);
+      }
+
+      const result =
+        usePageNumbers && rangeStart !== null && rangeEnd !== null
+          ? await query.range(rangeStart, rangeEnd)
+          : await query.limit(limit + 1);
+      timing.caseQuery = nowMs() - queryStartedAt;
       if (result.error) {
         throw result.error;
       }
-      data = result.data;
+      totalCount = usePageNumbers ? (result.count ?? 0) : null;
+      data = result.data as CaseListRow[];
     } catch (error) {
-      if (!isRecycleBinSchemaMissing(error)) {
-        throw error;
+      if (searchQuery && isMissingSearchTextColumn(error)) {
+        const queryStartedAt = nowMs();
+        const searchPattern = `%${escapePostgrestOrValue(escapeIlikePattern(searchQuery))}%`;
+        let fallbackSearchQuery = supabase
+          .from("packet_cases")
+          .select(LIST_COLUMNS, usePageNumbers ? { count: "exact" } : undefined)
+          .eq("owner_user_id", user.id);
+
+        if (scope === "deleted") {
+          fallbackSearchQuery = fallbackSearchQuery.not("deleted_at", "is", null);
+          if (cursor) {
+            fallbackSearchQuery = fallbackSearchQuery.or(
+              `deleted_at.lt.${cursor.sortValue},and(deleted_at.eq.${cursor.sortValue},id.lt.${cursor.id})`
+            );
+          }
+          fallbackSearchQuery = fallbackSearchQuery
+            .order("deleted_at", { ascending: false })
+            .order("id", { ascending: false });
+        } else {
+          fallbackSearchQuery = fallbackSearchQuery.is("deleted_at", null);
+          if (cursor) {
+            fallbackSearchQuery = fallbackSearchQuery.or(
+              `created_at.lt.${cursor.sortValue},and(created_at.eq.${cursor.sortValue},id.lt.${cursor.id})`
+            );
+          }
+          fallbackSearchQuery = fallbackSearchQuery
+            .order("created_at", { ascending: false })
+            .order("id", { ascending: false });
+        }
+
+        fallbackSearchQuery = fallbackSearchQuery.or(
+          [
+            `display_name.ilike.${searchPattern}`,
+            `buyer_name.ilike.${searchPattern}`,
+            `po_number.ilike.${searchPattern}`,
+            `invoice_number.ilike.${searchPattern}`,
+            `slug.ilike.${searchPattern}`,
+          ].join(",")
+        );
+
+        const fallbackSearchResult =
+          usePageNumbers && rangeStart !== null && rangeEnd !== null
+            ? await fallbackSearchQuery.range(rangeStart, rangeEnd)
+            : await fallbackSearchQuery.limit(limit + 1);
+        timing.caseQuery = (timing.caseQuery ?? 0) + nowMs() - queryStartedAt;
+        if (fallbackSearchResult.error) {
+          throw fallbackSearchResult.error;
+        }
+        totalCount = usePageNumbers ? (fallbackSearchResult.count ?? 0) : null;
+        data = fallbackSearchResult.data as CaseListRow[];
+      } else {
+        if (!isRecycleBinSchemaMissing(error)) {
+          throw error;
+        }
+
+        const queryStartedAt = nowMs();
+        const fallbackLimit =
+          usePageNumbers && rangeEnd !== null
+            ? Math.min(rangeEnd + limit + 1, 1000)
+            : limit + 1;
+        const fallback = await supabase
+          .from("packet_cases")
+          .select(LIST_COLUMNS_WITHOUT_RECYCLE_BIN)
+          .eq("owner_user_id", user.id)
+          .order("created_at", { ascending: false })
+          .order("id", { ascending: false })
+          .limit(fallbackLimit);
+        timing.caseQuery = (timing.caseQuery ?? 0) + nowMs() - queryStartedAt;
+
+        if (fallback.error) {
+          throw fallback.error;
+        }
+
+        const rows = (fallback.data ?? []).map((row) => ({
+          ...row,
+          deleted_at: getRecycleBinDeletedAt(row.processing_meta),
+        }));
+
+        const filteredRows =
+          scope === "deleted"
+            ? rows
+                .filter((row) => isCaseRecycled(row.processing_meta))
+                .sort((a, b) => {
+                  const aTime = new Date(a.deleted_at ?? 0).getTime();
+                  const bTime = new Date(b.deleted_at ?? 0).getTime();
+                  return bTime - aTime;
+                })
+            : rows.filter((row) => !isCaseRecycled(row.processing_meta));
+
+        if (usePageNumbers && rangeStart !== null && rangeEnd !== null) {
+          data = filteredRows.slice(rangeStart, rangeEnd + 1);
+          const hasAnotherFetchedRow = filteredRows.length > rangeEnd + 1;
+          totalCount = hasAnotherFetchedRow ? rangeEnd + 2 : filteredRows.length;
+        } else {
+          data = filteredRows;
+          totalCount = null;
+        }
       }
-
-      const fallback = await supabase
-        .from("packet_cases")
-        .select(
-          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
-        )
-        .eq("owner_user_id", user.id)
-        .order("created_at", { ascending: false })
-        .limit(limit);
-
-      if (fallback.error) {
-        throw fallback.error;
-      }
-
-      const rows = (fallback.data ?? []).map((row) => ({
-        ...row,
-        deleted_at: getRecycleBinDeletedAt(row.processing_meta),
-      }));
-
-      data =
-        scope === "deleted"
-          ? rows
-              .filter((row) => isCaseRecycled(row.processing_meta))
-              .sort((a, b) => {
-                const aTime = new Date(a.deleted_at ?? 0).getTime();
-                const bTime = new Date(b.deleted_at ?? 0).getTime();
-                return bTime - aTime;
-              })
-          : rows.filter((row) => !isCaseRecycled(row.processing_meta));
     }
 
-    const documentsByCaseId = await fetchCaseDocumentsForSummary(
-      supabase,
-      (data ?? []).map((row) => row.id),
-      fieldConfiguration
-    );
-    const mismatchCountsByCaseId = await fetchCaseMismatchCountsForSummary(
-      supabase,
-      (data ?? []).map((row) => row.id),
-      documentsByCaseId,
-      fieldConfiguration
-    );
+    const rawRows = data ?? [];
+    const pageRows = usePageNumbers ? rawRows : rawRows.slice(0, limit);
+    const hasMore =
+      usePageNumbers && page !== null && totalCount !== null
+        ? page * limit < totalCount
+        : rawRows.length > limit;
+    const nextCursor = hasMore ? encodeCaseListCursor(pageRows[pageRows.length - 1], scope) : null;
+    const totalPages =
+      usePageNumbers && totalCount !== null ? Math.max(1, Math.ceil(totalCount / limit)) : null;
 
-    return jsonWithCors(request, {
-      cases: (data ?? []).map((row) =>
+    let fieldConfiguration: PacketFieldConfiguration | undefined;
+    let documentsByCaseId = new Map<string, CaseDoc[]>();
+    let mismatchCountsByCaseId = new Map<string, number>();
+
+    if (shouldDeriveSummaryFromDocuments && pageRows.length > 0) {
+      fieldConfiguration = await getPersistedPacketFieldConfiguration();
+      documentsByCaseId = await fetchCaseDocumentsForSummary(
+        supabase,
+        pageRows.map((row) => row.id),
+        fieldConfiguration
+      );
+      mismatchCountsByCaseId = await fetchCaseMismatchCountsForSummary(
+        supabase,
+        pageRows.map((row) => row.id),
+        documentsByCaseId,
+        fieldConfiguration
+      );
+    }
+
+    const serializeStartedAt = nowMs();
+    const body = {
+      cases: pageRows.map((row) =>
         mapCaseRow(
           row,
           documentsByCaseId.get(row.id) ?? [],
-          mismatchCountsByCaseId.get(row.id) ?? 0,
+          shouldDeriveSummaryFromDocuments
+            ? (mismatchCountsByCaseId.get(row.id) ?? 0)
+            : undefined,
           fieldConfiguration
         )
       ),
-    });
+      nextCursor,
+      hasMore,
+      page: page ?? undefined,
+      pageSize: usePageNumbers ? limit : undefined,
+      totalCount: totalCount ?? undefined,
+      totalPages: totalPages ?? undefined,
+    };
+    timing.serialize = nowMs() - serializeStartedAt;
+    timing.total = nowMs() - startedAt;
+    logSlowCaseListRequest({ scope, limit, hasSearch: Boolean(searchQuery), timing });
+
+    return attachCaseListTiming(jsonWithCors(request, body), timing);
   } catch (error) {
-    return jsonWithCors(request, 
-      {
-        error: serializeError(error),
-      },
-      { status: 500 }
+    timing.total = nowMs() - startedAt;
+    return attachCaseListTiming(
+      jsonWithCors(request,
+        {
+          error: serializeError(error),
+        },
+        { status: 500 }
+      ),
+      timing
     );
   }
 }
@@ -553,14 +1151,25 @@ export async function POST(request: Request) {
     }
 
     supabase = createSupabaseAdminClient();
-    const fieldConfiguration = await getPersistedPacketFieldConfiguration();
     const formData = await request.formData();
     const mode = typeof formData.get("mode") === "string" ? formData.get("mode") : null;
     const files = formData.getAll("files").filter(isFileEntry);
+    const preparedFiles = await prepareUploadFiles(files);
+    const uploadFingerprint = await getUploadFingerprint(preparedFiles);
+    const duplicateCase = await findDuplicateCaseForUpload({
+      supabase,
+      ownerUserId: user.id,
+      files: preparedFiles,
+      uploadFingerprint,
+    });
+    if (duplicateCase) {
+      return duplicateCaseResponse(request, duplicateCase);
+    }
+    const uploadDuplicateMeta = getUploadDuplicateMeta(preparedFiles, uploadFingerprint);
     const uploadGroups = parseUploadGroups(formData.get("uploadGroups"));
 
     if (mode === "draft") {
-      if (!files.length) {
+      if (!preparedFiles.length) {
         return jsonWithCors(request, 
           { error: "Upload at least one file to create a case." },
           { status: 400 }
@@ -568,17 +1177,15 @@ export async function POST(request: Request) {
       }
 
       caseId = crypto.randomUUID();
-      const firstFileName = uploadGroups[0]?.name ?? files[0]?.name ?? "New packet case";
+      const firstFileName = uploadGroups[0]?.name ?? preparedFiles[0]?.originalName ?? "New packet case";
       const displayName = formatDraftName(firstFileName);
       const slug = `${slugifyDraftName(displayName, "draft-case")}-${caseId.slice(0, 8)}`;
 
       const fileRows = [];
-      for (const file of files) {
-        const storagePath = `${caseId}/${Date.now()}-${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
-        const binary = new Uint8Array(await file.arrayBuffer());
-        const contentType = inferContentType(file);
-        const { error: uploadError } = await supabase.storage.from(STORAGE_BUCKET).upload(storagePath, binary, {
-          contentType,
+      for (const file of preparedFiles) {
+        const storagePath = `${caseId}/${Date.now()}-${crypto.randomUUID()}-${sanitizeFileName(file.originalName)}`;
+        const { error: uploadError } = await supabase.storage.from(STORAGE_BUCKET).upload(storagePath, file.bytes, {
+          contentType: file.contentType,
           upsert: false,
         });
 
@@ -589,11 +1196,11 @@ export async function POST(request: Request) {
         uploadedPaths.push(storagePath);
         fileRows.push({
           case_id: caseId,
-          original_name: file.name,
+          original_name: file.originalName,
           storage_bucket: STORAGE_BUCKET,
           storage_path: storagePath,
-          mime_type: contentType,
-          size_bytes: file.size,
+          mime_type: file.contentType,
+          size_bytes: file.sizeBytes,
         });
       }
 
@@ -607,7 +1214,7 @@ export async function POST(request: Request) {
         invoice_number: null,
         status: "draft",
         risk_score: 0,
-        upload_count: files.length,
+        upload_count: preparedFiles.length,
         document_count: 0,
         mismatch_count: 0,
         processing_meta: {
@@ -619,6 +1226,7 @@ export async function POST(request: Request) {
           missingDocumentGroups: [],
           paymentGap: 0,
           uploadGroups,
+          ...uploadDuplicateMeta,
         },
       };
 
@@ -631,6 +1239,18 @@ export async function POST(request: Request) {
         .single();
 
       if (caseError) {
+        if (isDuplicateUploadConstraintError(caseError)) {
+          await cleanupUploadedFiles(supabase, uploadedPaths);
+          const duplicate = await findDuplicateCaseForUpload({
+            supabase,
+            ownerUserId: user.id,
+            files: preparedFiles,
+            uploadFingerprint,
+          });
+          if (duplicate) {
+            return duplicateCaseResponse(request, duplicate);
+          }
+        }
         throw caseError;
       }
 
@@ -647,9 +1267,12 @@ export async function POST(request: Request) {
       );
     }
 
-    const documents = sanitizeDocumentsForStorage(
-      parseJsonField<CaseDoc[]>(formData.get("documents"), "documents"),
-      fieldConfiguration
+    const fieldConfiguration = await getPersistedPacketFieldConfiguration();
+    const documents = enrichDocumentsWithPacketGstTaxContext(
+      sanitizeDocumentsForStorage(
+        parseJsonField<CaseDoc[]>(formData.get("documents"), "documents"),
+        fieldConfiguration
+      )
     );
     const mismatches = sanitizeMismatchesForStorage(
       parseJsonField<Mismatch[]>(formData.get("mismatches"), "mismatches"),
@@ -669,12 +1292,10 @@ export async function POST(request: Request) {
     caseId = crypto.randomUUID();
 
     const fileRows = [];
-    for (const file of files) {
-      const storagePath = `${caseId}/${Date.now()}-${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
-      const binary = new Uint8Array(await file.arrayBuffer());
-      const contentType = inferContentType(file);
-      const { error: uploadError } = await supabase.storage.from(STORAGE_BUCKET).upload(storagePath, binary, {
-        contentType,
+    for (const file of preparedFiles) {
+      const storagePath = `${caseId}/${Date.now()}-${crypto.randomUUID()}-${sanitizeFileName(file.originalName)}`;
+      const { error: uploadError } = await supabase.storage.from(STORAGE_BUCKET).upload(storagePath, file.bytes, {
+        contentType: file.contentType,
         upsert: false,
       });
 
@@ -685,11 +1306,11 @@ export async function POST(request: Request) {
       uploadedPaths.push(storagePath);
       fileRows.push({
         case_id: caseId,
-        original_name: file.name,
+        original_name: file.originalName,
         storage_bucket: STORAGE_BUCKET,
         storage_path: storagePath,
-        mime_type: contentType,
-        size_bytes: file.size,
+        mime_type: file.contentType,
+        size_bytes: file.sizeBytes,
       });
     }
 
@@ -703,7 +1324,7 @@ export async function POST(request: Request) {
       invoice_number: summary.invoiceNumber || null,
       status: "completed",
       risk_score: summary.riskScore,
-      upload_count: files.length,
+      upload_count: preparedFiles.length,
       document_count: documents.length,
       mismatch_count: mismatches.length,
       processing_meta: {
@@ -714,6 +1335,7 @@ export async function POST(request: Request) {
         paymentGap: summary.paymentGap,
         comparisonOptions,
         uploadGroups,
+        ...uploadDuplicateMeta,
       },
     };
 
@@ -726,6 +1348,18 @@ export async function POST(request: Request) {
       .single();
 
     if (caseError) {
+      if (isDuplicateUploadConstraintError(caseError)) {
+        await cleanupUploadedFiles(supabase, uploadedPaths);
+        const duplicate = await findDuplicateCaseForUpload({
+          supabase,
+          ownerUserId: user.id,
+          files: preparedFiles,
+          uploadFingerprint,
+        });
+        if (duplicate) {
+          return duplicateCaseResponse(request, duplicate);
+        }
+      }
       throw caseError;
     }
 
@@ -777,7 +1411,7 @@ export async function POST(request: Request) {
     );
   } catch (error) {
     if (supabase && uploadedPaths.length > 0) {
-      await supabase.storage.from(STORAGE_BUCKET).remove(uploadedPaths);
+      await cleanupUploadedFiles(supabase, uploadedPaths);
     }
 
     if (supabase && caseId) {

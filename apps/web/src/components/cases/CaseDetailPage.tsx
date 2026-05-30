@@ -100,6 +100,10 @@ const LINE_ITEM_COLUMNS: Array<{
   { key: "unit", label: "Unit", className: "min-w-16" },
   { key: "rate", label: "Rate", className: "min-w-24 text-right" },
   { key: "taxableAmount", label: "Taxable", className: "min-w-28 text-right" },
+  { key: "taxRate", label: "GST %", className: "min-w-20 text-right" },
+  { key: "cgstRate", label: "CGST %", className: "min-w-20 text-right" },
+  { key: "sgstRate", label: "SGST %", className: "min-w-20 text-right" },
+  { key: "igstRate", label: "IGST %", className: "min-w-20 text-right" },
   { key: "taxAmount", label: "Tax", className: "min-w-24 text-right" },
   { key: "lineTotal", label: "Total", className: "min-w-28 text-right" },
 ];
@@ -177,12 +181,40 @@ function displayValue(value: unknown) {
   return String(value);
 }
 
+function parseDisplayNumber(value: unknown) {
+  const match = String(value ?? "").replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const parsed = Number(match[0]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatDisplayNumber(value: number) {
+  const rounded = Math.round(value * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function formatPercentDisplay(value: unknown) {
+  const parsed = parseDisplayNumber(value);
+  if (parsed === null) return "";
+  return `${formatDisplayNumber(parsed)}%`;
+}
+
 function getLineItemValue(item: CommercialLineItem, key: keyof CommercialLineItem) {
   if (key === "rate") {
     return item.netRate || item.rate || "";
   }
   if (key === "taxAmount") {
-    return item.taxAmount || item.igstAmount || item.cgstAmount || item.sgstAmount || "";
+    if (item.taxAmount) return item.taxAmount;
+    if (item.igstAmount) return item.igstAmount;
+    const cgstAmount = parseDisplayNumber(item.cgstAmount);
+    const sgstAmount = parseDisplayNumber(item.sgstAmount);
+    if (cgstAmount !== null && sgstAmount !== null) {
+      return formatDisplayNumber(cgstAmount + sgstAmount);
+    }
+    return item.cgstAmount || item.sgstAmount || "";
+  }
+  if (key === "taxRate" || key === "cgstRate" || key === "sgstRate" || key === "igstRate") {
+    return formatPercentDisplay(item[key]);
   }
   return item[key] ?? "";
 }

@@ -17,6 +17,7 @@
 /.next/
 /out/
 apps/*/.next/
+apps/*/.netlify/
 
 # production
 /build
@@ -26,6 +27,8 @@ apps/*/.next/
 *.pem
 *.zip
 backup/
+exports/
+tmp/
 
 # debug
 npm-debug.log*

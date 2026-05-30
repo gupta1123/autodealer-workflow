@@ -3,7 +3,8 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
-  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Clock,
   Eye,
   FileText,
@@ -27,7 +28,7 @@ import {
 } from "@/components/ui/table";
 import {
   deleteCaseForever,
-  fetchCasesByScope,
+  fetchCasePage,
   restoreCase,
   type SavedCaseRecord,
 } from "@/lib/case-persistence";
@@ -37,6 +38,15 @@ type PendingAction =
   | { type: "destroy"; item: SavedCaseRecord }
   | { type: "restore"; item: SavedCaseRecord }
   | null;
+
+const RECYCLE_BIN_PAGE_SIZE = 25;
+
+function getVisiblePages(currentPage: number, totalPages: number) {
+  const pages = new Set([1, totalPages, currentPage - 1, currentPage, currentPage + 1]);
+  return Array.from(pages)
+    .filter((page) => page >= 1 && page <= totalPages)
+    .sort((a, b) => a - b);
+}
 
 function formatDateTime(value: string | null) {
   if (!value) return "—";
@@ -138,20 +148,43 @@ export function RecycleBinPage() {
   const [status, setStatus] = useState<LoadState>("loading");
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalCount, setTotalCount] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
   const [pendingAction, setPendingAction] = useState<PendingAction>(null);
   const [isMutating, setIsMutating] = useState(false);
 
   useEffect(() => {
-    let active = true;
+    const timeout = window.setTimeout(() => {
+      setDebouncedQuery(query.trim());
+      setCurrentPage(1);
+    }, 250);
 
-    fetchCasesByScope("deleted", 100)
+    return () => window.clearTimeout(timeout);
+  }, [query]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    setStatus("loading");
+    setError(null);
+
+    fetchCasePage({
+      scope: "deleted",
+      limit: RECYCLE_BIN_PAGE_SIZE,
+      page: currentPage,
+      query: debouncedQuery,
+      signal: controller.signal,
+    })
       .then((payload) => {
-        if (!active) return;
         setCases(payload.cases);
+        setTotalCount(payload.totalCount ?? payload.cases.length);
+        setTotalPages(payload.totalPages ?? 1);
         setStatus("ready");
       })
       .catch((loadError) => {
-        if (!active) return;
+        if (controller.signal.aborted) return;
         setError(
           loadError instanceof Error ? loadError.message : "Failed to load recycle bin."
         );
@@ -159,23 +192,16 @@ export function RecycleBinPage() {
       });
 
     return () => {
-      active = false;
+      controller.abort();
     };
-  }, []);
+  }, [currentPage, debouncedQuery]);
 
-  const filteredCases = useMemo(() => {
-    if (!query.trim()) return cases;
-    const normalized = query.trim().toLowerCase();
-
-    return cases.filter((item) => {
-      return (
-      item.displayName.toLowerCase().includes(normalized) ||
-      item.slug.toLowerCase().includes(normalized) ||
-      (item.receiverName ?? "").toLowerCase().includes(normalized) ||
-      item.category.toLowerCase().includes(normalized)
-      );
-    });
-  }, [cases, query]);
+  const visiblePages = useMemo(
+    () => getVisiblePages(currentPage, totalPages),
+    [currentPage, totalPages]
+  );
+  const pageStart = totalCount === 0 ? 0 : (currentPage - 1) * RECYCLE_BIN_PAGE_SIZE + 1;
+  const pageEnd = Math.min(currentPage * RECYCLE_BIN_PAGE_SIZE, totalCount);
 
   async function handleConfirmAction() {
     if (!pendingAction) return;
@@ -193,6 +219,13 @@ export function RecycleBinPage() {
       setCases((current) =>
         current.filter((item) => item.id !== pendingAction.item.id)
       );
+      const nextTotalCount = Math.max(0, totalCount - 1);
+      const nextTotalPages = Math.max(1, Math.ceil(nextTotalCount / RECYCLE_BIN_PAGE_SIZE));
+      setTotalCount(nextTotalCount);
+      setTotalPages(nextTotalPages);
+      if (currentPage > nextTotalPages) {
+        setCurrentPage(nextTotalPages);
+      }
       setPendingAction(null);
     } catch (mutationError) {
       setError(
@@ -227,7 +260,7 @@ export function RecycleBinPage() {
                   {status === "loading" ? (
                     <Skeleton className="mt-1 h-3.5 w-60 bg-slate-100" />
                   ) : (
-                    `${filteredCases.length} items • Auto-deleted after 30 days`
+                    `${totalCount} items • Auto-deleted after 30 days`
                   )}
                 </div>
               </div>
@@ -272,7 +305,7 @@ export function RecycleBinPage() {
               </div>
             )}
 
-            {status === "ready" && cases.length === 0 && (
+            {status === "ready" && totalCount === 0 && !debouncedQuery && (
               <div className="flex flex-col items-center justify-center py-24 text-center px-4">
                 <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-full bg-[#f8fafc] border border-[#e2e8f0] shadow-sm">
                   <Trash2 className="h-8 w-8 text-[#cbd5e1]" />
@@ -284,12 +317,12 @@ export function RecycleBinPage() {
               </div>
             )}
 
-            {status === "ready" && cases.length > 0 && filteredCases.length === 0 && (
+            {status === "ready" && totalCount === 0 && debouncedQuery && (
               <div className="flex flex-col items-center justify-center py-24 text-center px-4">
                 <Search className="h-10 w-10 text-[#e2e8f0] mb-4" />
                 <h3 className="text-base font-bold text-[#0f172a]">No matches found</h3>
                 <p className="mt-1 text-sm font-medium text-[#64748b]">
-                  We couldn&apos;t find any deleted items matching &quot;{query}&quot;.
+                  We couldn&apos;t find any deleted items matching &quot;{debouncedQuery}&quot;.
                 </p>
                 <Button
                   variant="link"
@@ -301,10 +334,10 @@ export function RecycleBinPage() {
               </div>
             )}
 
-            {status === "ready" && filteredCases.length > 0 && (
+            {status === "ready" && cases.length > 0 && (
               <>
                 <div className="grid gap-3 px-4 pb-2 md:hidden">
-                  {filteredCases.map((item) => (
+                  {cases.map((item) => (
                     <div
                       key={item.id}
                       className="rounded-xl border border-[#e2e8f0] bg-white p-3.5 shadow-sm"
@@ -372,7 +405,7 @@ export function RecycleBinPage() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {filteredCases.map((item) => (
+                      {cases.map((item) => (
                         <TableRow
                           key={item.id}
                           className="group border-[#f1f5f9] transition-colors hover:bg-[#f8fafc] h-11"
@@ -445,17 +478,57 @@ export function RecycleBinPage() {
               </>
             )}
 
-            {/* Pagination Footer (Placeholder matching image) */}
-            {status === "ready" && filteredCases.length > 0 && (
-              <div className="px-6 md:px-8 pt-4 pb-2 flex items-center justify-between text-sm font-semibold text-[#94a3b8]">
-                <div>Page 1 of 1</div>
-                <div className="flex items-center gap-4">
-                  <button className="flex items-center opacity-50 cursor-not-allowed">
-                    <ChevronDown className="w-4 h-4 rotate-90 mr-1" /> Previous
-                  </button>
-                  <button className="flex items-center opacity-50 cursor-not-allowed">
-                    Next <ChevronDown className="w-4 h-4 -rotate-90 ml-1" />
-                  </button>
+            {status === "ready" && totalCount > 0 && (
+              <div className="flex flex-col gap-3 border-t border-[#f1f5f9] px-6 pb-2 pt-4 text-sm font-semibold text-[#94a3b8] md:flex-row md:items-center md:justify-between md:px-8">
+                <div>
+                  Showing {pageStart}-{pageEnd} of {totalCount}
+                </div>
+                <div className="flex items-center gap-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 border-[#e2e8f0] bg-white px-2 font-bold text-[#64748b] hover:bg-[#f8fafc]"
+                    disabled={currentPage <= 1}
+                    onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}
+                    aria-label="Previous page"
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  {visiblePages.map((page, index) => {
+                    const previousPage = visiblePages[index - 1];
+                    return (
+                      <div key={page} className="flex items-center gap-1">
+                        {previousPage && page - previousPage > 1 && (
+                          <span className="px-1 text-slate-300">...</span>
+                        )}
+                        <Button
+                          type="button"
+                          variant={page === currentPage ? "default" : "outline"}
+                          size="sm"
+                          className={
+                            page === currentPage
+                              ? "h-8 min-w-8 bg-[#0f172a] px-2 font-bold text-white hover:bg-[#1e293b]"
+                              : "h-8 min-w-8 border-[#e2e8f0] bg-white px-2 font-bold text-[#64748b] hover:bg-[#f8fafc]"
+                          }
+                          onClick={() => setCurrentPage(page)}
+                        >
+                          {page}
+                        </Button>
+                      </div>
+                    );
+                  })}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 border-[#e2e8f0] bg-white px-2 font-bold text-[#64748b] hover:bg-[#f8fafc]"
+                    disabled={currentPage >= totalPages}
+                    onClick={() => setCurrentPage((page) => Math.min(totalPages, page + 1))}
+                    aria-label="Next page"
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
                 </div>
               </div>
             )}

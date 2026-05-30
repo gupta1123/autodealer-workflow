@@ -538,6 +538,38 @@ export function resolveCaseDisplayName(params: {
   return resolveStoredCaseDisplayName(params);
 }
 
+function hasMeaningfulFieldValue(document: CaseDoc, field: FieldKey) {
+  return Boolean(normalizeValue(document.fields[field]));
+}
+
+function hasPurchaseOrderEvidence(document: CaseDoc) {
+  return hasMeaningfulFieldValue(document, "poNumber") || hasMeaningfulFieldValue(document, "referencePoNumber");
+}
+
+function hasEWayBillEvidence(document: CaseDoc) {
+  return hasMeaningfulFieldValue(document, "eWayBillNumber");
+}
+
+function isCorePacketGroupCovered(
+  group: { label: string; types: DocType[] },
+  documents: CaseDoc[],
+  presentTypes: Set<DocType>
+) {
+  if (group.types.some((type) => presentTypes.has(type))) {
+    return true;
+  }
+
+  if (group.label === "Purchase Order") {
+    return documents.some(hasPurchaseOrderEvidence);
+  }
+
+  if (group.label === "E-Way Bill") {
+    return documents.some(hasEWayBillEvidence);
+  }
+
+  return false;
+}
+
 export function summarizeCase(
   documents: CaseDoc[],
   mismatches: Mismatch[],
@@ -564,7 +596,7 @@ export function summarizeCase(
       .filter((type) => isDocTypeEnabled(type, fieldConfiguration))
   );
   const missingDocTypes = getEnabledCorePacketGroups(fieldConfiguration)
-    .filter((group) => !group.types.some((type) => presentTypes.has(type)))
+    .filter((group) => !isCorePacketGroupCovered(group, documents, presentTypes))
     .map((group) => group.label);
 
   const riskScore = Math.min(

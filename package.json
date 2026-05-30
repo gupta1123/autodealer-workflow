@@ -23,6 +23,7 @@
     "typecheck:web": "npm run typecheck --workspace @autodealer/web",
     "typecheck:api": "npm run typecheck --workspace @autodealer/api",
     "typecheck": "npm run typecheck:web && npm run typecheck:api",
+    "quality:packet-regressions": "node scripts/packet-quality-regressions.mjs",
     "worker": "npm run worker --workspace @autodealer/api",
     "worker:local": "npm run worker:local --workspace @autodealer/api"
   },

@@ -34,11 +34,6 @@ import {
   type MismatchDecision,
   type SavedCaseDetail,
 } from "@/lib/case-persistence";
-import {
-  DEFAULT_COMPARISON_FIELD_GROUPS,
-  fetchComparisonGroups,
-  type ComparisonFieldGroup,
-} from "@/lib/comparison-groups";
 
 type LoadState = "loading" | "ready" | "error";
 type MismatchRecord = SavedCaseDetail["mismatches"][number];
@@ -63,99 +58,11 @@ const LINE_ITEM_FIELD_LABELS: Record<string, string> = {
   "lineItems.amountMismatch": "Line item amount",
 };
 
-function getGroupForField(field: string, groups: ComparisonFieldGroup[]) {
-  return groups.find((group) => group.enabled && group.fields.includes(field)) ?? null;
-}
-
-const FIELD_GUIDANCE: Array<{
-  fields: string[];
-  why: string;
-  steps: string[];
-}> = [
-    {
-      fields: ["poNumber", "referencePoNumber"],
-      why: "These documents may be linked to different purchase orders.",
-      steps: [
-        "Confirm the approved PO number.",
-        "Correct the document that has the wrong PO reference.",
-        "Run analysis again after updating the file.",
-      ],
-    },
-    {
-      fields: ["invoiceNumber", "referenceInvoiceNumber", "receiptNumber"],
-      why: "The invoice or receipt reference may point to the wrong bill.",
-      steps: [
-        "Confirm the correct invoice number from the supplier invoice.",
-        "Correct the receipt or support document using the wrong invoice reference.",
-        "Run analysis again before accepting the case.",
-      ],
-    },
-    {
-      fields: ["totalAmount", "subtotal", "taxAmount", "paidAmount", "statementAmount", "currency"],
-      why: "The amount, tax, payment, or currency does not match across documents.",
-      steps: [
-        "Confirm the final bill amount and currency.",
-        "Check whether tax or payment proof is using a different value.",
-        "Correct the wrong document before approval.",
-      ],
-    },
-    {
-      fields: ["vehicleNumber", "registrationNumber", "lorryReceiptNumber", "fastagReference", "eWayBillNumber"],
-      why: "The vehicle or transport proof may not belong to the same shipment.",
-      steps: [
-        "Confirm the vehicle actually used for this delivery.",
-        "Check the invoice, e-way bill, LR, FASTag, and RC records.",
-        "Replace or correct the document with the wrong transport detail.",
-      ],
-    },
-    {
-      fields: ["grossWeight", "tareWeight", "netWeight", "itemQuantity", "unit"],
-      why: "The quantity or weighment proof does not match the billing document.",
-      steps: [
-        "Compare the invoice quantity with the delivery and weighment documents.",
-        "Confirm which value should be used for billing.",
-        "Correct the wrong file and re-run analysis.",
-      ],
-    },
-    {
-      fields: [
-        "vendorName",
-        "supplierGstin",
-        "buyerName",
-        "buyerGstin",
-        "ownerName",
-        "driverName",
-        "holderName",
-        "fatherName",
-        "panNumber",
-      ],
-      why: "One document may have the wrong party, GSTIN, or identity detail.",
-      steps: [
-        "Confirm the correct sender, receiver, GSTIN, or identity detail.",
-        "Check the source document where the value came from.",
-        "Correct the document that has the wrong party information.",
-      ],
-    },
-  ];
-
 function getFieldLabel(fieldName: string) {
   if (LINE_ITEM_FIELD_LABELS[fieldName]) {
     return LINE_ITEM_FIELD_LABELS[fieldName];
   }
   return getComparisonDisplayLabel(fieldName, FIELD_LABEL_LOOKUP[fieldName]);
-}
-
-function getGuidance(fieldName: string) {
-  return (
-    FIELD_GUIDANCE.find((item) => item.fields.includes(fieldName)) ?? {
-      why: "The same field has different values in different documents.",
-      steps: [
-        "Open the source documents shown above.",
-        "Confirm which value is correct.",
-        "Correct or replace the document with the wrong value.",
-      ],
-    }
-  );
 }
 
 function getValueCount(mismatch: MismatchRecord) {
@@ -247,197 +154,154 @@ function formatMismatchValue(fieldName: string, value: unknown, documentTitle: s
   return displayValue(value);
 }
 
-function getDocumentName(
-  documentLookup: Map<string, SavedCaseDetail["documents"][number]>,
-  docId: string | undefined,
-  fallback: string
-) {
-  if (!docId) return fallback;
-  const document = documentLookup.get(docId);
-  return document?.title || document?.sourceFileName || document?.sourceHint || fallback;
-}
+const BASE_CONTEXT_FIELDS = [
+  "poNumber",
+  "referencePoNumber",
+  "invoiceNumber",
+  "referenceInvoiceNumber",
+  "eWayBillNumber",
+  "lorryReceiptNumber",
+  "documentDate",
+];
 
-type GroupedMismatch = {
-  groupKey: string;
-  groupLabel: string;
-  fields: Array<{
-    fieldName: string;
-    fieldLabel: string;
-    values: Array<{ docId: string | undefined; value: unknown }>;
-    mismatch: MismatchRecord | null;
-  }>;
+const CONTEXT_FIELDS_BY_MISMATCH: Array<{ fields: string[]; context: string[] }> = [
+  {
+    fields: ["vendorName", "supplierGstin", "buyerName", "buyerGstin"],
+    context: ["vendorName", "supplierGstin", "buyerName", "buyerGstin"],
+  },
+  {
+    fields: ["vehicleNumber", "registrationNumber", "lorryReceiptNumber", "fastagReference", "eWayBillNumber"],
+    context: ["vehicleNumber", "registrationNumber", "lorryReceiptNumber", "eWayBillNumber", "fastagReference"],
+  },
+  {
+    fields: ["grossWeight", "tareWeight", "netWeight", "itemQuantity", "unit"],
+    context: ["weighmentNumber", "vehicleNumber", "grossWeight", "tareWeight", "netWeight", "itemQuantity", "unit"],
+  },
+  {
+    fields: ["subtotal", "taxAmount", "totalAmount", "paidAmount", "statementAmount", "currency"],
+    context: ["currency", "subtotal", "taxAmount", "totalAmount", "paidAmount", "statementAmount"],
+  },
+  {
+    fields: ["lineItems.unmatchedDocumentLine", "lineItems.unmatchedInvoiceLine", "lineItems.uninvoicedPoLine", "lineItems.quantityExceeded", "lineItems.quantityMismatch", "lineItems.rateMismatch", "lineItems.unitMismatch", "lineItems.hsnSacMismatch", "lineItems.amountMismatch"],
+    context: ["invoiceNumber", "referenceInvoiceNumber", "poNumber", "referencePoNumber", "eWayBillNumber", "itemQuantity", "unit", "subtotal", "taxAmount", "totalAmount"],
+  },
+];
+
+type DocumentContextRow = {
+  key: string;
+  label: string;
+  value: unknown;
+  emphasis?: boolean;
 };
 
-function buildGroupedMismatch(
-  activeMismatch: MismatchRecord,
-  visibleMismatches: MismatchRecord[],
-  documentLookup: Map<string, SavedCaseDetail["documents"][number]>,
-  comparisonGroups: ComparisonFieldGroup[]
-): GroupedMismatch | null {
-  const group = getGroupForField(activeMismatch.fieldName, comparisonGroups);
-  if (!group) return null;
+type MismatchEvidence = {
+  key: string;
+  docId?: string;
+  document?: SavedCaseDetail["documents"][number];
+  value: unknown;
+  contextRows: DocumentContextRow[];
+};
 
-  const groupMismatchByField = new Map(
-    visibleMismatches
-      .filter((mismatch) => group.fields.includes(mismatch.fieldName))
-      .map((mismatch) => [mismatch.fieldName, mismatch])
-  );
-
-  const result: GroupedMismatch = {
-    groupKey: group.groupKey,
-    groupLabel: group.label,
-    fields: group.fields.map((fieldName) => ({
-      fieldName,
-      fieldLabel: getFieldLabel(fieldName),
-      values: [],
-      mismatch: groupMismatchByField.get(fieldName) ?? null,
-    })),
-  };
-
-  const docIds = new Set<string>();
-  groupMismatchByField.forEach((mismatch) => {
-    (mismatch.values ?? []).forEach((v) => {
-      if (v.docId) docIds.add(v.docId);
-    });
-  });
-
-  result.fields.forEach((field) => {
-    field.values = Array.from(docIds).map((docId) => {
-      const doc = documentLookup.get(docId);
-      const extractedFields = doc?.extractedFields as Record<string, unknown> | undefined;
-      return { docId, value: extractedFields?.[field.fieldName] };
-    });
-  });
-
-  return result;
+function uniqueStrings(values: string[]) {
+  return Array.from(new Set(values.filter(Boolean)));
 }
 
-function GroupedMismatchTable({
-  activeMismatchId,
-  decisionStatus,
-  documentLookup,
-  grouped,
-  isCaseFinal,
-  onDecision,
-  onToggleSelected,
-  selectedMismatchIds,
-}: {
-  activeMismatchId: string | null;
-  decisionStatus: "idle" | "updating" | "error";
-  documentLookup: Map<string, SavedCaseDetail["documents"][number]>;
-  grouped: GroupedMismatch;
-  isCaseFinal: boolean;
-  onDecision: (mismatch: MismatchRecord, decision: MismatchDecision) => void;
-  onToggleSelected: (mismatchId: string) => void;
-  selectedMismatchIds: Set<string>;
-}) {
-  const docIds = grouped.fields[0]?.values.map((v) => v.docId) ?? [];
+function getContextFieldsForMismatch(fieldName: string) {
+  const configured = CONTEXT_FIELDS_BY_MISMATCH.find((entry) => entry.fields.includes(fieldName));
+  return uniqueStrings([fieldName, ...(configured?.context ?? []), ...BASE_CONTEXT_FIELDS]);
+}
 
-  return (
-    <div className="rounded-lg border border-slate-200 bg-white overflow-hidden">
-      <div className="px-4 py-3 bg-slate-50 border-b border-slate-200">
-        <h3 className="text-sm font-semibold text-slate-900">{grouped.groupLabel}</h3>
-      </div>
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead className="bg-slate-50 border-b border-slate-200">
-            <tr>
-              <th className="text-left px-4 py-2.5 text-xs font-medium text-slate-500 uppercase tracking-wider">Field</th>
-              {docIds.map((docId) => {
-                const doc = documentLookup.get(docId ?? "");
-                return (
-                  <th key={docId} className="text-left px-4 py-2.5 text-xs font-medium text-slate-500 uppercase tracking-wider">
-                    {doc?.title || doc?.sourceFileName || `Doc ${docId}`}
-                  </th>
-                );
-              })}
-              <th className="text-left px-4 py-2.5 text-xs font-medium text-slate-500 uppercase tracking-wider">Status</th>
-              <th className="text-right px-4 py-2.5 text-xs font-medium text-slate-500 uppercase tracking-wider">Action</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-100">
-            {grouped.fields.map((field) => {
-              const mismatch = field.mismatch;
-              const isActive = mismatch?.id === activeMismatchId;
-              const isPending = mismatch?.resolutionStatus === "pending";
-              const isSelected = mismatch ? selectedMismatchIds.has(mismatch.id) : false;
+function hasDisplayableValue(value: unknown) {
+  return value !== null && value !== undefined && String(value).trim().length > 0;
+}
 
-              return (
-                <tr key={field.fieldName} className={isActive ? "bg-amber-50" : "hover:bg-slate-50/50"}>
-                  <td className="px-4 py-2.5 font-medium text-slate-700 whitespace-nowrap">
-                    <div className="flex items-center gap-2">
-                      {isPending && !isCaseFinal ? (
-                        <input
-                          checked={isSelected}
-                          className="h-4 w-4 rounded border-slate-300 accent-emerald-600"
-                          onChange={() => onToggleSelected(mismatch.id)}
-                          type="checkbox"
-                        />
-                      ) : (
-                        <span className="h-4 w-4" />
-                      )}
-                      {field.fieldLabel}
-                    </div>
-                  </td>
-                  {field.values.map((val, idx) => (
-                    <td key={idx} className="px-4 py-2.5 text-slate-900">
-                      {val.value === null || val.value === undefined || val.value === "" ? (
-                        <span className="text-slate-400 italic">Missing</span>
-                      ) : (
-                        String(val.value)
-                      )}
-                    </td>
-                  ))}
-                  <td className="px-4 py-2.5">
-                    {mismatch ? (
-                      <Badge
-                        variant="outline"
-                        className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${getMismatchResolutionClassName(mismatch.resolutionStatus)}`}
-                      >
-                        {getMismatchResolutionLabel(mismatch.resolutionStatus)}
-                      </Badge>
-                    ) : (
-                      <Badge
-                        variant="outline"
-                        className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-700"
-                      >
-                        Match
-                      </Badge>
-                    )}
-                  </td>
-                  <td className="px-4 py-2.5">
-                    {isPending && !isCaseFinal ? (
-                      <div className="flex justify-end gap-1.5">
-                        <Button
-                          className="h-8 border-rose-200 px-2 text-xs text-rose-700 hover:bg-rose-50 hover:text-rose-800"
-                          disabled={decisionStatus === "updating"}
-                          onClick={() => onDecision(mismatch, "rejected")}
-                          size="sm"
-                          variant="outline"
-                        >
-                          Reject
-                        </Button>
-                        <Button
-                          className="h-8 bg-emerald-600 px-2 text-xs text-white hover:bg-emerald-700"
-                          disabled={decisionStatus === "updating"}
-                          onClick={() => onDecision(mismatch, "accepted")}
-                          size="sm"
-                        >
-                          Accept
-                        </Button>
-                      </div>
-                    ) : (
-                      <span className="block text-right text-xs text-slate-400">-</span>
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
+function getDocumentSourceLabel(document?: SavedCaseDetail["documents"][number]) {
+  if (!document) return "Document not found";
+  const sourceHint = document.sourceHint?.trim();
+  const sourceFileName = document.sourceFileName?.trim();
+  if (sourceHint && sourceFileName && sourceHint.includes(sourceFileName)) {
+    return sourceHint;
+  }
+
+  return [sourceHint, sourceFileName]
+    .filter((value): value is string => Boolean(value && value.trim()))
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .join(" · ") || "Uploaded document";
+}
+
+function getEvidenceDocumentRole(document?: SavedCaseDetail["documents"][number]) {
+  return document?.documentType || "Document";
+}
+
+function getFieldValueFromDocument(
+  document: SavedCaseDetail["documents"][number] | undefined,
+  fieldName: string
+) {
+  if (!document) return undefined;
+  return (document.extractedFields as Record<string, unknown> | undefined)?.[fieldName];
+}
+
+function buildDocumentContextRows(
+  document: SavedCaseDetail["documents"][number] | undefined,
+  fieldName: string,
+  mismatchValue: unknown
+) {
+  const rows: DocumentContextRow[] = [];
+  const primaryValue = getFieldValueFromDocument(document, fieldName);
+
+  if (isLineItemMismatchField(fieldName)) {
+    rows.push({
+      key: "issueDetail",
+      label: "Issue detail",
+      value: mismatchValue,
+      emphasis: true,
+    });
+  } else {
+    rows.push({
+      key: fieldName,
+      label: getFieldLabel(fieldName),
+      value: hasDisplayableValue(primaryValue) ? primaryValue : mismatchValue,
+      emphasis: true,
+    });
+  }
+
+  for (const contextField of getContextFieldsForMismatch(fieldName)) {
+    if (contextField === fieldName) continue;
+    const value = getFieldValueFromDocument(document, contextField);
+    if (!hasDisplayableValue(value)) continue;
+    rows.push({
+      key: contextField,
+      label: getFieldLabel(contextField),
+      value,
+    });
+  }
+
+  const lineItemCount = document?.lineItems?.length ?? 0;
+  if (isLineItemMismatchField(fieldName) && lineItemCount > 0) {
+    rows.push({
+      key: "lineItemCount",
+      label: "Extracted line items",
+      value: lineItemCount,
+    });
+  }
+
+  return rows.slice(0, 8);
+}
+
+function buildMismatchEvidence(
+  mismatch: MismatchRecord,
+  documentLookup: Map<string, SavedCaseDetail["documents"][number]>
+): MismatchEvidence[] {
+  return (mismatch.values ?? []).map((entry, index) => {
+    const document = entry.docId ? documentLookup.get(entry.docId) : undefined;
+    return {
+      key: `${mismatch.id}-${entry.docId ?? "missing"}-${index}`,
+      docId: entry.docId,
+      document,
+      value: entry.value,
+      contextRows: buildDocumentContextRows(document, mismatch.fieldName, entry.value),
+    };
+  });
 }
 
 function MismatchReviewSkeleton() {
@@ -526,22 +390,15 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
   const [activeMismatchId, setActiveMismatchId] = useState<string | null>(null);
   const [decisionStatus, setDecisionStatus] = useState<"idle" | "updating" | "error">("idle");
   const [decisionError, setDecisionError] = useState<string | null>(null);
-  const [comparisonGroups, setComparisonGroups] = useState<ComparisonFieldGroup[]>(
-    DEFAULT_COMPARISON_FIELD_GROUPS
-  );
   const [selectedMismatchIds, setSelectedMismatchIds] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     let active = true;
 
-    Promise.all([
-      fetchCaseDetail(caseId),
-      fetchComparisonGroups().catch(() => DEFAULT_COMPARISON_FIELD_GROUPS),
-    ])
-      .then(([payload, groups]) => {
+    fetchCaseDetail(caseId)
+      .then((payload) => {
         if (!active) return;
         setDetail(payload);
-        setComparisonGroups(groups);
         setStatus("ready");
       })
       .catch((loadError) => {
@@ -590,13 +447,11 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
     return visibleMismatches.find((mismatch) => mismatch.id === activeMismatchId) ?? null;
   }, [activeMismatchId, visibleMismatches]);
 
-  const groupedMismatch = useMemo(() => {
-    if (!activeMismatch || !documentLookup) return null;
-    return buildGroupedMismatch(activeMismatch, visibleMismatches, documentLookup, comparisonGroups);
-  }, [activeMismatch, comparisonGroups, documentLookup, visibleMismatches]);
-
   const activeFieldLabel = activeMismatch ? getFieldLabel(activeMismatch.fieldName) : "";
-  const activeGuidance = activeMismatch ? getGuidance(activeMismatch.fieldName) : null;
+  const activeEvidence = useMemo(
+    () => (activeMismatch ? buildMismatchEvidence(activeMismatch, documentLookup) : []),
+    [activeMismatch, documentLookup]
+  );
   const isCaseFinal = detail?.case.status === "accepted" || detail?.case.status === "rejected";
   const isActiveMismatchPending = activeMismatch?.resolutionStatus === "pending";
   const pendingMismatchCount = visibleMismatches.filter(
@@ -815,35 +670,55 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                     {visibleMismatches.map((mismatch) => {
                       const isActive = activeMismatchId === mismatch.id;
                       const fieldLabel = getFieldLabel(mismatch.fieldName);
+                      const isPending = mismatch.resolutionStatus === "pending";
+                      const isSelected = selectedMismatchIds.has(mismatch.id);
 
                       return (
-                        <button
+                        <div
                           key={mismatch.id}
-                          onClick={() => setActiveMismatchId(mismatch.id)}
                           className={`group relative flex items-center shrink-0 lg:w-full text-left transition-all ${isActive
                               ? "bg-amber-100 text-amber-900 lg:bg-amber-50/50 lg:text-slate-900 lg:border-l-[3px] lg:border-amber-500"
                               : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 lg:bg-transparent lg:border-0 lg:border-l-[3px] lg:border-transparent lg:hover:bg-slate-50"
                             } rounded-full lg:rounded-none px-4 py-2 lg:px-5 lg:py-3`}
                         >
-                          <div className="flex-1 min-w-0">
-                            <p className={`text-sm truncate ${isActive ? 'font-semibold' : 'font-medium'}`}>
-                              {fieldLabel}
-                            </p>
-                            <div className="mt-0.5 hidden items-center gap-2 lg:flex">
-                              <p className="text-xs text-slate-500 group-hover:text-slate-600">
-                                {getValueCount(mismatch)} value{getValueCount(mismatch) === 1 ? "" : "s"} found
-                              </p>
-                              <span
-                                className={`inline-flex rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${getMismatchResolutionClassName(mismatch.resolutionStatus)}`}
-                              >
-                                {getMismatchResolutionLabel(mismatch.resolutionStatus)}
-                              </span>
-                            </div>
-                          </div>
-                          {isActive && (
-                            <ChevronRight className="hidden lg:block h-4 w-4 text-amber-500 shrink-0 ml-3" />
+                          {isPending && !isCaseFinal && (
+                            <input
+                              aria-label={`Select ${fieldLabel}`}
+                              checked={isSelected}
+                              className="mr-2 h-4 w-4 shrink-0 rounded border-slate-300 accent-emerald-600"
+                              onChange={(event) => {
+                                event.stopPropagation();
+                                handleToggleSelectedMismatch(mismatch.id);
+                              }}
+                              onClick={(event) => event.stopPropagation()}
+                              type="checkbox"
+                            />
                           )}
-                        </button>
+                          <button
+                            className="flex min-w-0 flex-1 items-center text-left"
+                            onClick={() => setActiveMismatchId(mismatch.id)}
+                            type="button"
+                          >
+                            <div className="flex-1 min-w-0">
+                              <p className={`text-sm truncate ${isActive ? "font-semibold" : "font-medium"}`}>
+                                {fieldLabel}
+                              </p>
+                              <div className="mt-0.5 hidden items-center gap-2 lg:flex">
+                                <p className="text-xs text-slate-500 group-hover:text-slate-600">
+                                  {getValueCount(mismatch)} value{getValueCount(mismatch) === 1 ? "" : "s"} found
+                                </p>
+                                <span
+                                  className={`inline-flex rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${getMismatchResolutionClassName(mismatch.resolutionStatus)}`}
+                                >
+                                  {getMismatchResolutionLabel(mismatch.resolutionStatus)}
+                                </span>
+                              </div>
+                            </div>
+                            {isActive && (
+                              <ChevronRight className="hidden lg:block h-4 w-4 text-amber-500 shrink-0 ml-3" />
+                            )}
+                          </button>
+                        </div>
                       );
                     })}
                   </div>
@@ -854,7 +729,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
             {/* Main Detail Content */}
             <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
               <div className="flex-1 overflow-y-auto">
-                <div className="mx-auto max-w-3xl p-4 sm:p-6 lg:p-8">
+                <div className="mx-auto max-w-5xl p-4 sm:p-6 lg:p-8">
                   {visibleMismatches.length === 0 ? (
                     <div className="flex flex-col items-center justify-center rounded-2xl bg-white border border-slate-200 p-12 text-center shadow-sm mt-8">
                       <div className="h-16 w-16 rounded-full bg-emerald-100 flex items-center justify-center mb-4">
@@ -865,7 +740,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                         No value conflicts were found across the documents in this case.
                       </p>
                     </div>
-                  ) : activeMismatch && activeGuidance ? (
+                  ) : activeMismatch ? (
                     <div className="space-y-6">
 
                     {/* Header for Active Issue */}
@@ -886,47 +761,74 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                       </p>
                     </div>
 
-                    {/* Conflicting Values Grid or Grouped Table */}
-                    {groupedMismatch ? (
-                      <GroupedMismatchTable
-                        activeMismatchId={activeMismatch.id}
-                        decisionStatus={decisionStatus}
-                        documentLookup={documentLookup}
-                        grouped={groupedMismatch}
-                        isCaseFinal={isCaseFinal}
-                        onDecision={(mismatch, decision) => {
-                          void handleMismatchDecisionFor(mismatch, decision);
-                        }}
-                        onToggleSelected={handleToggleSelectedMismatch}
-                        selectedMismatchIds={selectedMismatchIds}
-                      />
-                    ) : (
-                      <div>
-                        <h3 className="mb-3 text-sm font-semibold text-slate-900 flex items-center gap-2">
+                    <section>
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-900">
                           <FileText className="h-4 w-4 text-slate-400" />
-                          Extracted Values
+                          Documents involved
                         </h3>
-                        <div className="grid gap-3 sm:grid-cols-2">
-                          {(activeMismatch.values ?? []).map((value, index) => {
-                            const title = getDocumentName(documentLookup, value.docId, `Document ${index + 1}`);
+                        <span className="text-xs font-medium text-slate-500">
+                          {activeEvidence.length} document{activeEvidence.length === 1 ? "" : "s"}
+                        </span>
+                      </div>
 
-                            return (
-                              <div
-                                key={`${activeMismatch.id}-${value.docId ?? index}`}
-                                className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm transition-all hover:shadow-md"
-                              >
-                                <div className="text-xs font-medium text-slate-500 mb-2 truncate" title={title}>
-                                  {title}
-                                </div>
-                                <div className="text-sm font-semibold text-slate-900 break-words">
-                                  {formatMismatchValue(activeMismatch.fieldName, value.value, title)}
+                      <div className="grid gap-4 lg:grid-cols-2">
+                        {activeEvidence.map((evidence) => {
+                          const sourceLabel = getDocumentSourceLabel(evidence.document);
+                          const documentRole = getEvidenceDocumentRole(evidence.document);
+
+                          return (
+                            <article
+                              key={evidence.key}
+                              className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm"
+                            >
+                              <div className="border-b border-slate-100 bg-slate-50 px-4 py-3">
+                                <div className="flex items-start justify-between gap-3">
+                                  <div className="min-w-0">
+                                    <h4 className="truncate text-sm font-semibold text-slate-900" title={sourceLabel}>
+                                      {sourceLabel}
+                                    </h4>
+                                  </div>
+                                  <Badge
+                                    variant="outline"
+                                    className="shrink-0 rounded-full border-slate-200 bg-white px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-slate-600"
+                                  >
+                                    {documentRole}
+                                  </Badge>
                                 </div>
                               </div>
-                            );
-                          })}
-                        </div>
+
+                              <div className="space-y-4 p-4">
+                                <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2.5">
+                                  <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-700">
+                                    Reported value
+                                  </p>
+                                  <div className="mt-1 break-words text-sm font-semibold text-slate-950">
+                                    {formatMismatchValue(activeMismatch.fieldName, evidence.value, documentRole)}
+                                  </div>
+                                </div>
+
+                                <dl className="divide-y divide-slate-100 rounded-md border border-slate-100">
+                                  {evidence.contextRows.map((row) => (
+                                    <div
+                                      key={row.key}
+                                      className={row.emphasis ? "grid gap-1 bg-slate-50 px-3 py-2.5" : "grid gap-1 px-3 py-2.5"}
+                                    >
+                                      <dt className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                        {row.label}
+                                      </dt>
+                                      <dd className="break-words text-sm font-medium text-slate-900">
+                                        {displayValue(row.value)}
+                                      </dd>
+                                    </div>
+                                  ))}
+                                </dl>
+                              </div>
+                            </article>
+                          );
+                        })}
                       </div>
-                    )}
+                    </section>
 
                     </div>
                   ) : (
@@ -939,7 +841,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
 
               {visibleMismatches.length > 0 && activeMismatch && (
                 <footer className="z-20 shrink-0 border-t border-slate-200 bg-white/95 px-4 py-3 shadow-[0_-8px_24px_rgba(15,23,42,0.08)] backdrop-blur sm:px-6 lg:px-8">
-                  <div className="mx-auto flex max-w-3xl flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="mx-auto flex max-w-5xl flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <div className="min-w-0">
 	                      <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500">
 	                        <span>

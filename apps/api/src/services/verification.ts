@@ -29,6 +29,16 @@ const EWAY_VALIDITY_RELATED_DOC_TYPES = new Set<CaseDoc["type"]>([
 ]);
 const COMMERCIAL_CHARGE_LINE_PATTERN =
   /\b(?:packing|p\s*&\s*f|p\s+and\s+f|freight|cartage|loading|unloading|handling|forwarding|insurance|transport(?:ation)?|courier|postage|delivery|other\s+charges?)\b/i;
+const BROAD_PURCHASE_LINE_PATTERN =
+  /\b(?:annexure|attached|consisting\s+of\s+following|part\s+delivery|system|equipment|heater|heating|assembly)\b/i;
+const PARTIAL_FULFILLMENT_DOC_TYPES = new Set<CaseDoc["type"]>([
+  "Invoice",
+  "Tax Invoice",
+  "Delivery Challan",
+  "Delivery Note",
+  "E-Way Bill",
+  "Unknown",
+]);
 const SAME_TYPE_ONLY_DESCRIPTIVE_FIELDS = new Set<FieldKey>([
   "driverName",
   "evidenceDescription",
@@ -860,6 +870,7 @@ const GENERIC_LINE_TOKENS = new Set([
 
 function normalizeLineToken(token: string) {
   if (token === "daneli" || token === "danieil") return "danieli";
+  if (token === "heater" || token === "heating") return "heat";
   return token;
 }
 
@@ -1258,6 +1269,22 @@ function getLineItemReferenceDoc(comparedDoc: CaseDoc, docsWithLineItems: CaseDo
   return getBestCandidateDoc(comparedDoc, candidateDocs, () => true);
 }
 
+function getBroadPurchaseLineReferenceDoc(
+  comparedDoc: CaseDoc,
+  docsWithLineItems: CaseDoc[],
+  comparedLine: CommercialLineItem
+) {
+  if (PURCHASE_DOC_TYPES.has(comparedDoc.type) || !PARTIAL_FULFILLMENT_DOC_TYPES.has(comparedDoc.type)) {
+    return null;
+  }
+
+  return getBestCandidateDoc(
+    comparedDoc,
+    docsWithLineItems.filter((doc) => doc.id !== comparedDoc.id),
+    (doc) => PURCHASE_DOC_TYPES.has(doc.type) && hasBroadPurchaseOrderCoverage(doc, comparedDoc, comparedLine, doc.lineItems ?? [])
+  );
+}
+
 function formatLineDocRole(doc: CaseDoc) {
   if (PURCHASE_DOC_TYPES.has(doc.type)) return "PO";
   if (INVOICE_DOC_TYPES.has(doc.type)) return "invoice";
@@ -1370,6 +1397,60 @@ function documentMentionsChargeAllowance(doc: CaseDoc) {
   return COMMERCIAL_CHARGE_LINE_PATTERN.test(`${fieldText} ${doc.md ?? ""}`);
 }
 
+function lineContext(line: CommercialLineItem) {
+  return [line.itemCode, line.description, line.rawText].filter(Boolean).join(" ");
+}
+
+function isBroadPurchaseOrderLine(line: CommercialLineItem) {
+  const context = lineContext(line);
+  return BROAD_PURCHASE_LINE_PATTERN.test(context) && !hasUsableItemCode(line.itemCode);
+}
+
+function isBroadPackageUnit(unit?: string) {
+  return ["lot", "set"].includes(normalizeUnit(unit));
+}
+
+function hasBroadPurchaseOrderCoverage(
+  referenceDoc: CaseDoc,
+  comparedDoc: CaseDoc,
+  comparedLine: CommercialLineItem,
+  referenceLines: CommercialLineItem[]
+) {
+  if (!PURCHASE_DOC_TYPES.has(referenceDoc.type) || !PARTIAL_FULFILLMENT_DOC_TYPES.has(comparedDoc.type)) {
+    return false;
+  }
+
+  const broadReferenceLines = referenceLines.filter(isBroadPurchaseOrderLine);
+  if (!broadReferenceLines.length) return false;
+
+  const comparedAmount = parseNumber(getComparableLineAmountValue(comparedLine));
+  const comparedQty = convertQuantityToBase(comparedLine.quantity, comparedLine.unit) ?? parseNumber(comparedLine.quantity);
+
+  return broadReferenceLines.some((referenceLine) => {
+    const referenceAmount = parseNumber(getComparableLineAmountValue(referenceLine));
+    const referenceQty = convertQuantityToBase(referenceLine.quantity, referenceLine.unit) ?? parseNumber(referenceLine.quantity);
+    const productOverlap = meaningfulTokenOverlap(comparedLine, referenceLine);
+    const amountWithinPo =
+      comparedAmount !== null &&
+      referenceAmount !== null &&
+      comparedAmount > 0 &&
+      comparedAmount <= referenceAmount * 1.01;
+    const amountCompatible =
+      comparedAmount === null ||
+      referenceAmount === null ||
+      comparedAmount <= referenceAmount * 1.01;
+    const quantityWithinPo =
+      comparedQty === null ||
+      referenceQty === null ||
+      (comparedAmount === null && isBroadPackageUnit(referenceLine.unit)) ||
+      comparedQty <= referenceQty * 1.01;
+
+    if (amountWithinPo && quantityWithinPo) return true;
+    if (productOverlap > 0 && amountCompatible && quantityWithinPo) return true;
+    return comparedAmount === null && quantityWithinPo;
+  });
+}
+
 function hasGroupedEWayBaseAnchor(comparedLine: CommercialLineItem, referenceLine: CommercialLineItem) {
   const comparedHsn = compactLineField(comparedLine.hsnSac);
   const referenceHsn = compactLineField(referenceLine.hsnSac);
@@ -1465,14 +1546,17 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
   for (const comparedDoc of docsWithLineItems) {
     if (comparedDoc.id === baselineDoc.id) continue;
 
-    const referenceDoc = getLineItemReferenceDoc(comparedDoc, docsWithLineItems);
-    if (!referenceDoc) continue;
-
-    const referenceLines = referenceDoc.lineItems ?? [];
-    const referenceRole = formatLineDocRole(referenceDoc);
     const comparedRole = formatLineDocRole(comparedDoc);
+    const defaultReferenceDoc = getLineItemReferenceDoc(comparedDoc, docsWithLineItems);
 
     for (const [index, comparedLine] of (comparedDoc.lineItems ?? []).entries()) {
+      const referenceDoc =
+        getBroadPurchaseLineReferenceDoc(comparedDoc, docsWithLineItems, comparedLine) ??
+        defaultReferenceDoc;
+      if (!referenceDoc) continue;
+
+      const referenceLines = referenceDoc.lineItems ?? [];
+      const referenceRole = formatLineDocRole(referenceDoc);
       const referenceLine =
         findBestReferenceLine(comparedLine, referenceLines) ??
         findGroupedEWayReferenceLine(referenceDoc, comparedDoc, comparedLine, referenceLines);
@@ -1480,6 +1564,7 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
         if (
           isLogisticsSummaryLine(comparedDoc, comparedLine) ||
           shouldIgnoreWeakFulfillmentLineMismatch(docs, referenceDoc, comparedDoc, comparedLine, referenceLines) ||
+          hasBroadPurchaseOrderCoverage(referenceDoc, comparedDoc, comparedLine, referenceLines) ||
           (PURCHASE_DOC_TYPES.has(referenceDoc.type) &&
             isCommercialChargeLine(comparedLine) &&
             documentMentionsChargeAllowance(referenceDoc))
@@ -1498,6 +1583,10 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
             `${comparedRole} line has no confident ${referenceRole} line match`
           )
         );
+        continue;
+      }
+
+      if (hasBroadPurchaseOrderCoverage(referenceDoc, comparedDoc, comparedLine, [referenceLine])) {
         continue;
       }
 

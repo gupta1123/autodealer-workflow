@@ -1,4 +1,5 @@
 import { CaseDetailPage } from "@/components/cases/CaseDetailPage";
+import { RuntimeFieldSettingsBootstrap } from "@/components/settings/RuntimeFieldSettingsBootstrap";
 
 export default async function SavedCaseDetailPage({
   params,
@@ -7,5 +8,10 @@ export default async function SavedCaseDetailPage({
 }) {
   const { id } = await params;
 
-  return <CaseDetailPage caseId={id} />;
+  return (
+    <>
+      <RuntimeFieldSettingsBootstrap />
+      <CaseDetailPage caseId={id} />
+    </>
+  );
 }

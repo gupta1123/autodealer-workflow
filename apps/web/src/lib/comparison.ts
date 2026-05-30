@@ -197,6 +197,56 @@ function normalizeInvoiceReferenceValue(value: string) {
   return withoutDocumentLabel || compact;
 }
 
+function getInvoiceSeriesParts(value: string | number | null | undefined, options: ComparisonOptions) {
+  const normalized = normalizeComparableValue(value, options, "invoiceNumber");
+  if (!normalized) return null;
+
+  const seriesMatch = normalized.match(/^([a-z]{1,12})(\d{6,})$/);
+  if (seriesMatch) {
+    return {
+      normalized,
+      series: seriesMatch[1],
+      body: seriesMatch[2],
+    };
+  }
+
+  if (/^\d{6,}$/.test(normalized)) {
+    return {
+      normalized,
+      series: null,
+      body: normalized,
+    };
+  }
+
+  return {
+    normalized,
+    series: null,
+    body: normalized,
+  };
+}
+
+function areInvoiceReferencesStructurallyEqual(
+  left: string | number | null | undefined,
+  right: string | number | null | undefined,
+  options: ComparisonOptions
+) {
+  const leftParts = getInvoiceSeriesParts(left, options);
+  const rightParts = getInvoiceSeriesParts(right, options);
+  if (!leftParts || !rightParts) return false;
+
+  if (leftParts.normalized === rightParts.normalized) return true;
+
+  if (leftParts.series && !rightParts.series) {
+    return leftParts.body === rightParts.normalized;
+  }
+
+  if (rightParts.series && !leftParts.series) {
+    return rightParts.body === leftParts.normalized;
+  }
+
+  return false;
+}
+
 function normalizeWeightToKg(value: string | number | null | undefined) {
   if (value === null || value === undefined) return null;
 
@@ -326,6 +376,13 @@ export function areComparableValuesEqual(
   }
 
   if (normalizedLeft === normalizedRight) return true;
+
+  if (
+    (fieldKey === "invoiceNumber" || fieldKey === "referenceInvoiceNumber") &&
+    areInvoiceReferencesStructurallyEqual(left, right, options)
+  ) {
+    return true;
+  }
 
   const splitIdentifierList = (value: string | number | null | undefined) =>
     String(value ?? "")

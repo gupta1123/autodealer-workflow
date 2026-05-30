@@ -50,6 +50,7 @@ const LINE_ITEM_KEYS: Array<keyof CommercialLineItem> = [
 type TextLineItemKey = Exclude<keyof CommercialLineItem, "sourcePage">;
 type TaxRateKey = "cgstRate" | "sgstRate" | "igstRate" | "taxRate";
 type TaxRateHint = Partial<Record<TaxRateKey, string>>;
+type TaxMode = "igst" | "split" | "unknown";
 
 const TEXT_LINE_ITEM_KEYS = LINE_ITEM_KEYS.filter(
   (key): key is TextLineItemKey => key !== "sourcePage"
@@ -70,11 +71,30 @@ const LINE_ITEM_SIGNATURE_KEYS: TextLineItemKey[] = [
 const LOOSE_LINE_ITEM_SIGNATURE_KEYS = LINE_ITEM_SIGNATURE_KEYS.filter(
   (key) => key !== "lineNumber" && key !== "referencePoLineNumber"
 );
+const DUPLICATE_COPY_LINE_ITEM_SIGNATURE_KEYS = LINE_ITEM_SIGNATURE_KEYS.filter(
+  (key) =>
+    key !== "lineNumber" &&
+    key !== "referencePoLineNumber" &&
+    key !== "taxableAmount" &&
+    key !== "lineTotal"
+);
 const TAX_RATE_KEYS: TaxRateKey[] = ["cgstRate", "sgstRate", "igstRate", "taxRate"];
 const DUPLICATE_COPY_PAGE_SIMILARITY_THRESHOLD = 0.88;
 const DUPLICATE_COPY_MIN_COMMON_TOKENS = 35;
 const INVOICE_COPY_DOC_TYPES = new Set<string>(["Invoice", "Tax Invoice"]);
 const INVOICE_DOC_TYPES = new Set<string>(["Invoice", "Tax Invoice"]);
+const HOME_GST_STATE_CODE = "27";
+const DEFAULT_GST_RATE = 18;
+const STANDARD_GST_RATES = [0, 0.25, 3, 5, 12, 18, 28];
+const PACKET_GST_PAIR_DOC_TYPES = new Set<string>([
+  "E-Way Bill",
+  "Tax Invoice",
+  "Invoice",
+  "Purchase Order",
+  "Amended Purchase Order",
+  "Delivery Challan",
+  "Delivery Note",
+]);
 const CHARGE_LINE_PATTERN =
   /\b(?:packing|p\s*&\s*f|p\s+and\s+f|freight|cartage|loading|unloading|handling|forwarding|insurance|transport(?:ation)?|courier|postage|delivery|other\s+charges?|round\s*off)\b/i;
 const EXPLICIT_TAX_LABEL_PATTERN = /\b(?:cgst|sgst|igst|gst|tax)\b/i;
@@ -252,6 +272,34 @@ function isHsnOnlyLineItem(item: CommercialLineItem) {
   return Boolean(item.hsnSac && !hasBusinessValue);
 }
 
+function removePlaceholderZeroLineAmounts(item: CommercialLineItem) {
+  const next = { ...item };
+  const hasPositiveMonetarySignal = [
+    next.rate,
+    next.netRate,
+    next.taxableAmount,
+    next.taxAmount,
+    next.cgstAmount,
+    next.sgstAmount,
+    next.igstAmount,
+  ].some((value) => {
+    const parsed = parseLineItemNumber(value);
+    return parsed !== null && Math.abs(parsed) > 0;
+  });
+
+  const lineTotal = parseLineItemNumber(next.lineTotal);
+  if (lineTotal !== null && Math.abs(lineTotal) === 0 && !hasPositiveMonetarySignal) {
+    delete next.lineTotal;
+  }
+
+  const taxableAmount = parseLineItemNumber(next.taxableAmount);
+  if (taxableAmount !== null && Math.abs(taxableAmount) === 0 && !hasPositiveMonetarySignal) {
+    delete next.taxableAmount;
+  }
+
+  return next;
+}
+
 export function sanitizeLineItems(value: unknown): CommercialLineItem[] {
   if (!Array.isArray(value)) return [];
 
@@ -278,7 +326,7 @@ export function sanitizeLineItems(value: unknown): CommercialLineItem[] {
       }
     }
 
-    const cleanedItem = cleanLineItem(item);
+    const cleanedItem = removePlaceholderZeroLineAmounts(cleanLineItem(item));
 
     if (isTaxSummaryOnlyLineItem(cleanedItem) || isHsnOnlyLineItem(cleanedItem)) {
       return [];
@@ -331,6 +379,20 @@ function normalizeRateValue(value: unknown) {
   const parsed = parseLineItemNumber(value);
   if (parsed === null || parsed < 0 || parsed > 50) return undefined;
   return formatLineItemNumber(parsed);
+}
+
+function normalizeKnownGstRate(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  let closest: number | null = null;
+  let closestDelta = Number.POSITIVE_INFINITY;
+  for (const rate of STANDARD_GST_RATES) {
+    const delta = Math.abs(rate - value);
+    if (delta < closestDelta) {
+      closest = rate;
+      closestDelta = delta;
+    }
+  }
+  return closestDelta <= 0.25 ? closest : null;
 }
 
 function normalizeSignatureValue(key: TextLineItemKey, value: unknown) {
@@ -467,12 +529,17 @@ function dedupeDuplicateCopyLineItems(
   const result: CommercialLineItem[] = [];
   const strictIndexBySignature = new Map<string, number>();
   const looseIndexBySignature = new Map<string, number>();
+  const duplicateCopyIndexBySignature = new Map<string, number>();
 
   for (const item of lineItems) {
     const strictSignature = buildLineItemSignature(item);
     const looseSignature = buildLineItemSignature(item, LOOSE_LINE_ITEM_SIGNATURE_KEYS);
+    const duplicateCopySignature = buildLineItemSignature(item, DUPLICATE_COPY_LINE_ITEM_SIGNATURE_KEYS);
     const sourcePage = item.sourcePage;
     const isFromDuplicateCopy = Boolean(sourcePage && duplicatePageNumbers.has(sourcePage));
+    const duplicateCopyMatchIndex = duplicateCopySignature
+      ? duplicateCopyIndexBySignature.get(duplicateCopySignature)
+      : undefined;
     const looseMatchIndex = looseSignature ? looseIndexBySignature.get(looseSignature) : undefined;
     const strictMatchIndex = strictSignature ? strictIndexBySignature.get(strictSignature) : undefined;
     const strictMatch = strictMatchIndex === undefined ? undefined : result[strictMatchIndex];
@@ -482,8 +549,10 @@ function dedupeDuplicateCopyLineItems(
           (sourcePage && strictMatch.sourcePage && sourcePage !== strictMatch.sourcePage))
     );
     const duplicateMatchIndex =
-      isFromDuplicateCopy && looseMatchIndex !== undefined
-        ? looseMatchIndex
+      isFromDuplicateCopy && duplicateCopyMatchIndex !== undefined
+        ? duplicateCopyMatchIndex
+        : isFromDuplicateCopy && looseMatchIndex !== undefined
+          ? looseMatchIndex
         : canUseStrictMatch
           ? strictMatchIndex
           : undefined;
@@ -497,6 +566,9 @@ function dedupeDuplicateCopyLineItems(
     if (strictSignature) strictIndexBySignature.set(strictSignature, nextIndex);
     if (looseSignature && !looseIndexBySignature.has(looseSignature)) {
       looseIndexBySignature.set(looseSignature, nextIndex);
+    }
+    if (duplicateCopySignature && !duplicateCopyIndexBySignature.has(duplicateCopySignature)) {
+      duplicateCopyIndexBySignature.set(duplicateCopySignature, nextIndex);
     }
   }
 
@@ -766,13 +838,17 @@ function extractColumnarTaxSummaryHints(
   return hints;
 }
 
-function extractTaxRateHintsFromVisibleText(visibleText: string, lineItems: CommercialLineItem[]) {
+function extractTaxRateHintsFromVisibleText(
+  visibleText: string,
+  lineItems: CommercialLineItem[],
+  documentFields: Partial<Record<FieldKey, string>> | undefined
+) {
   const hints = new Map<string, TaxRateHint>();
   const lines = visibleText
     .split(/\r?\n/)
     .map(cleanWhitespace)
     .filter(Boolean);
-  const taxMode = getDocumentTaxMode(visibleText);
+  const taxMode = getDocumentTaxMode(visibleText, documentFields);
 
   for (const line of lines) {
     const hsn = line.match(/\b\d{4,8}\b/)?.[0];
@@ -944,7 +1020,353 @@ function inferDocumentTaxRate(documentFields: Partial<Record<FieldKey, string>> 
   return isValidTaxRate("taxRate", rate) ? rate : null;
 }
 
-function getDocumentTaxMode(visibleText: string) {
+function getGstinStateCode(value: string | undefined) {
+  const normalized = value?.toUpperCase().replace(/[^0-9A-Z]/g, "") ?? "";
+  const match = normalized.match(/\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z]/);
+  return match?.[0].slice(0, 2) ?? null;
+}
+
+function inferTaxModeFromGstins(documentFields: Partial<Record<FieldKey, string>> | undefined): TaxMode {
+  const supplierState = getGstinStateCode(documentFields?.supplierGstin);
+  const buyerState = getGstinStateCode(documentFields?.buyerGstin);
+
+  if (supplierState && buyerState) {
+    return supplierState === buyerState ? "split" : "igst";
+  }
+
+  const knownState = buyerState ?? supplierState;
+  if (!knownState) return "unknown";
+  return knownState === HOME_GST_STATE_CODE ? "split" : "igst";
+}
+
+function normalizeGstinForTax(value: string | undefined) {
+  const normalized = value?.toUpperCase().replace(/[^0-9A-Z]/g, "") ?? "";
+  return /^\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z]$/.test(normalized) ? normalized : null;
+}
+
+function getPacketGstPairWeight(doc: CaseDoc) {
+  return PACKET_GST_PAIR_DOC_TYPES.has(doc.type) ? 3 : 1;
+}
+
+function selectUniqueTopGstin(counts: Map<string, number>) {
+  const ranked = [...counts.entries()].sort((left, right) => right[1] - left[1]);
+  const [top, second] = ranked;
+  if (!top || top[1] < 2 || (second && second[1] === top[1])) return null;
+  return top[0];
+}
+
+function inferPacketGstContext(documents: CaseDoc[]) {
+  const supplierCounts = new Map<string, number>();
+  const buyerCounts = new Map<string, number>();
+  const pairScores = new Map<string, { supplierGstin: string; buyerGstin: string; score: number }>();
+
+  for (const doc of documents) {
+    const supplierGstin = normalizeGstinForTax(doc.fields.supplierGstin);
+    const buyerGstin = normalizeGstinForTax(doc.fields.buyerGstin);
+
+    if (supplierGstin) {
+      supplierCounts.set(supplierGstin, (supplierCounts.get(supplierGstin) ?? 0) + 1);
+    }
+    if (buyerGstin) {
+      buyerCounts.set(buyerGstin, (buyerCounts.get(buyerGstin) ?? 0) + 1);
+    }
+
+    if (!supplierGstin || !buyerGstin || supplierGstin === buyerGstin) continue;
+    const key = `${supplierGstin}|${buyerGstin}`;
+    const current = pairScores.get(key) ?? { supplierGstin, buyerGstin, score: 0 };
+    current.score += getPacketGstPairWeight(doc);
+    pairScores.set(key, current);
+  }
+
+  const rankedPairs = [...pairScores.values()].sort((left, right) => right.score - left.score);
+  const topPair = rankedPairs[0];
+  const secondPair = rankedPairs[1];
+  if (topPair && topPair.score >= 3 && (!secondPair || secondPair.score < topPair.score)) {
+    return topPair;
+  }
+
+  const supplierGstin = selectUniqueTopGstin(supplierCounts);
+  const buyerGstin = selectUniqueTopGstin(buyerCounts);
+  if (supplierGstin && buyerGstin && supplierGstin !== buyerGstin) {
+    return { supplierGstin, buyerGstin, score: 2 };
+  }
+
+  return null;
+}
+
+function applyPacketGstContextToFields(
+  fields: Partial<Record<FieldKey, string>>,
+  context: { supplierGstin: string; buyerGstin: string } | null
+) {
+  if (!context) return fields;
+
+  const supplierGstin = normalizeGstinForTax(fields.supplierGstin);
+  const buyerGstin = normalizeGstinForTax(fields.buyerGstin);
+  const next = { ...fields };
+  let changed = false;
+
+  if (!supplierGstin && buyerGstin === context.buyerGstin) {
+    next.supplierGstin = context.supplierGstin;
+    changed = true;
+  }
+
+  if (!buyerGstin && supplierGstin === context.supplierGstin) {
+    next.buyerGstin = context.buyerGstin;
+    changed = true;
+  }
+
+  return changed ? next : fields;
+}
+
+function hasLineItemTaxSignal(item: CommercialLineItem) {
+  return Boolean(
+    item.taxRate ||
+      item.cgstRate ||
+      item.sgstRate ||
+      item.igstRate ||
+      item.taxAmount ||
+      item.cgstAmount ||
+      item.sgstAmount ||
+      item.igstAmount
+  );
+}
+
+function hasPacketTaxClassificationSignal(doc: CaseDoc) {
+  const fields = doc.fields;
+  return Boolean(
+    fields.taxRate ||
+      fields.cgstRate ||
+      fields.sgstRate ||
+      fields.igstRate ||
+      fields.taxAmount ||
+      (fields.subtotal && fields.totalAmount) ||
+      doc.lineItems?.some(hasLineItemTaxSignal)
+  );
+}
+
+export function enrichDocumentsWithPacketGstTaxContext(documents: CaseDoc[]) {
+  const context = inferPacketGstContext(documents);
+  if (!context) {
+    return documents.map((doc) => enrichDocumentWithTaxMode(doc));
+  }
+
+  return documents.map((doc) => enrichDocumentWithTaxMode(doc, context));
+}
+
+function enrichDocumentWithTaxMode(
+  doc: CaseDoc,
+  context?: { supplierGstin: string; buyerGstin: string } | null
+) {
+  const contextualFields = applyPacketGstContextToFields(doc.fields, context ?? null);
+  const shouldClassifyFromPacket =
+    Boolean(context) &&
+    inferTaxModeFromGstins(contextualFields) === "unknown" &&
+    hasPacketTaxClassificationSignal(doc);
+  const taxContextFields =
+    shouldClassifyFromPacket && context
+      ? { ...contextualFields, supplierGstin: context.supplierGstin, buyerGstin: context.buyerGstin }
+      : contextualFields;
+  const fields = enrichFieldsWithLineItemTaxRates(taxContextFields, doc.lineItems ?? []);
+  const taxMode = inferTaxModeFromGstins(fields);
+  if (shouldClassifyFromPacket) {
+    if (!contextualFields.supplierGstin) delete fields.supplierGstin;
+    if (!contextualFields.buyerGstin) delete fields.buyerGstin;
+  }
+  const documentTaxRate =
+    inferDocumentTaxRate(fields) ??
+    parseLineItemNumber(fields.taxRate);
+  const lineItems =
+    doc.lineItems?.map((item) => applyTaxModeToLineItem(item, documentTaxRate, taxMode)) ??
+    doc.lineItems;
+
+  if (fields === doc.fields && lineItems === doc.lineItems) {
+    return doc;
+  }
+
+  return { ...doc, fields, lineItems };
+}
+
+function selectDominantLineItemTaxRate(
+  lineItems: CommercialLineItem[],
+  key: TaxRateKey
+) {
+  const counts = new Map<string, { value: number; count: number }>();
+  for (const item of lineItems) {
+    const rate = parseLineItemNumber(item[key]);
+    if (rate === null || !isValidTaxRate(key, rate)) continue;
+    const formatted = formatLineItemNumber(rate);
+    const current = counts.get(formatted) ?? { value: rate, count: 0 };
+    current.count += 1;
+    counts.set(formatted, current);
+  }
+
+  return [...counts.values()].sort((left, right) => right.count - left.count || right.value - left.value)[0]?.value ?? null;
+}
+
+function getLineItemTotalTaxRate(item: CommercialLineItem) {
+  const taxRate = parseLineItemNumber(item.taxRate);
+  if (taxRate !== null && isValidTaxRate("taxRate", taxRate)) return taxRate;
+
+  const igstRate = parseLineItemNumber(item.igstRate);
+  if (igstRate !== null && isValidTaxRate("taxRate", igstRate)) return igstRate;
+
+  const cgstRate = parseLineItemNumber(item.cgstRate);
+  const sgstRate = parseLineItemNumber(item.sgstRate);
+  if (cgstRate !== null && sgstRate !== null) {
+    const totalRate = cgstRate + sgstRate;
+    return isValidTaxRate("taxRate", totalRate) ? totalRate : null;
+  }
+
+  const singleSplitRate = cgstRate ?? sgstRate;
+  return singleSplitRate !== null && isValidTaxRate("taxRate", singleSplitRate) ? singleSplitRate : null;
+}
+
+function getLineItemTotalTaxRateForMode(item: CommercialLineItem, taxMode: TaxMode) {
+  const taxRate = parseLineItemNumber(item.taxRate);
+  const igstRate = parseLineItemNumber(item.igstRate);
+  const cgstRate = parseLineItemNumber(item.cgstRate);
+  const sgstRate = parseLineItemNumber(item.sgstRate);
+  const singleSplitRate = cgstRate ?? sgstRate;
+  const taxRateLooksLikeSingleSplitComponent =
+    taxRate !== null &&
+    singleSplitRate !== null &&
+    Math.abs(taxRate - singleSplitRate) <= 0.25;
+
+  if (taxMode === "igst") {
+    if (igstRate !== null && isValidTaxRate("taxRate", igstRate)) return igstRate;
+    if (cgstRate !== null && sgstRate !== null) {
+      const totalRate = cgstRate + sgstRate;
+      return isValidTaxRate("taxRate", totalRate) ? totalRate : null;
+    }
+    if (taxRate !== null && isValidTaxRate("taxRate", taxRate) && !taxRateLooksLikeSingleSplitComponent) {
+      return taxRate;
+    }
+    return null;
+  }
+
+  if (taxMode === "split") {
+    if (cgstRate !== null && sgstRate !== null) {
+      const totalRate = cgstRate + sgstRate;
+      return isValidTaxRate("taxRate", totalRate) ? totalRate : null;
+    }
+    if (igstRate !== null && isValidTaxRate("taxRate", igstRate)) return igstRate;
+    if (taxRate !== null && isValidTaxRate("taxRate", taxRate) && !taxRateLooksLikeSingleSplitComponent) {
+      return taxRate;
+    }
+    return null;
+  }
+
+  if (taxRate !== null && isValidTaxRate("taxRate", taxRate)) return taxRate;
+  return getLineItemTotalTaxRate(item);
+}
+
+function selectDominantLineItemTotalTaxRateForMode(
+  lineItems: CommercialLineItem[],
+  taxMode: TaxMode
+) {
+  const counts = new Map<string, { value: number; count: number }>();
+  for (const item of lineItems) {
+    const rate = getLineItemTotalTaxRateForMode(item, taxMode);
+    if (rate === null) continue;
+    const formatted = formatLineItemNumber(rate);
+    const current = counts.get(formatted) ?? { value: rate, count: 0 };
+    current.count += 1;
+    counts.set(formatted, current);
+  }
+
+  return [...counts.values()].sort((left, right) => right.count - left.count || right.value - left.value)[0]?.value ?? null;
+}
+
+export function enrichFieldsWithLineItemTaxRates(
+  fields: Partial<Record<FieldKey, string>>,
+  lineItems: CommercialLineItem[]
+) {
+  const next = { ...fields };
+  let changed = false;
+  const taxMode = inferTaxModeFromGstins(next);
+  const documentTaxRate = inferDocumentTaxRate(fields);
+
+  const totalRates = lineItems
+    .map((item) => getLineItemTotalTaxRateForMode(item, taxMode))
+    .filter((value): value is number => value !== null);
+  const dominantTotalRate =
+    selectDominantLineItemTotalTaxRateForMode(lineItems, taxMode) ??
+    (totalRates.length
+      ? totalRates
+          .sort((left, right) => right - left)[0]
+      : null) ??
+    documentTaxRate;
+
+  if (!next.taxRate && dominantTotalRate !== null) {
+    next.taxRate = formatLineItemNumber(dominantTotalRate);
+    changed = true;
+  }
+
+  for (const key of ["cgstRate", "sgstRate", "igstRate"] satisfies TaxRateKey[]) {
+    const rate = selectDominantLineItemTaxRate(lineItems, key);
+    if (!next[key] && rate !== null) {
+      next[key] = formatLineItemNumber(rate);
+      changed = true;
+    }
+  }
+
+  const modeTaxRate =
+    taxMode === "unknown"
+      ? documentTaxRate ?? dominantTotalRate ?? parseLineItemNumber(next.taxRate)
+      : normalizeKnownGstRate(documentTaxRate) ??
+        normalizeKnownGstRate(dominantTotalRate) ??
+        normalizeKnownGstRate(parseLineItemNumber(next.taxRate)) ??
+        DEFAULT_GST_RATE;
+
+  if (modeTaxRate !== null && taxMode === "split") {
+    const formattedTaxRate = formatLineItemNumber(modeTaxRate);
+    const formattedHalfRate = formatLineItemNumber(modeTaxRate / 2);
+    if (next.taxRate !== formattedTaxRate) {
+      next.taxRate = formattedTaxRate;
+      changed = true;
+    }
+    if (next.cgstRate !== formattedHalfRate) {
+      next.cgstRate = formattedHalfRate;
+      changed = true;
+    }
+    if (next.sgstRate !== formattedHalfRate) {
+      next.sgstRate = formattedHalfRate;
+      changed = true;
+    }
+    if (next.igstRate) {
+      delete next.igstRate;
+      changed = true;
+    }
+  } else if (modeTaxRate !== null && taxMode === "igst") {
+    const formattedTaxRate = formatLineItemNumber(modeTaxRate);
+    if (next.taxRate !== formattedTaxRate) {
+      next.taxRate = formattedTaxRate;
+      changed = true;
+    }
+    if (next.igstRate !== formattedTaxRate) {
+      next.igstRate = formattedTaxRate;
+      changed = true;
+    }
+    if (next.cgstRate) {
+      delete next.cgstRate;
+      changed = true;
+    }
+    if (next.sgstRate) {
+      delete next.sgstRate;
+      changed = true;
+    }
+  }
+
+  return changed ? next : fields;
+}
+
+function getDocumentTaxMode(
+  visibleText: string,
+  documentFields: Partial<Record<FieldKey, string>> | undefined
+): TaxMode {
+  const gstinTaxMode = inferTaxModeFromGstins(documentFields);
+  if (gstinTaxMode !== "unknown") return gstinTaxMode;
+
   const hasIgst = /\bigst\b/i.test(visibleText);
   const hasCgst = /\bcgst\b/i.test(visibleText);
   const hasSgst = /\bsgst\b/i.test(visibleText);
@@ -952,6 +1374,65 @@ function getDocumentTaxMode(visibleText: string) {
   if (hasIgst && !hasCgst && !hasSgst) return "igst";
   if (hasCgst && hasSgst) return "split";
   return "unknown";
+}
+
+function applyTaxModeToLineItem(
+  item: CommercialLineItem,
+  documentTaxRate: number | null,
+  taxMode: TaxMode
+) {
+  if (taxMode === "unknown") return item;
+
+  const totalRate =
+    normalizeKnownGstRate(documentTaxRate) ??
+    normalizeKnownGstRate(getLineItemTotalTaxRateForMode(item, taxMode)) ??
+    DEFAULT_GST_RATE;
+  const next = { ...item };
+  setTaxRate(next, "taxRate", totalRate, { correctInconsistent: true });
+  const taxableAmount = parseLineItemNumber(next.taxableAmount);
+  const expectedTaxAmount =
+    taxableAmount !== null && taxableAmount > 0 ? taxableAmount * (totalRate / 100) : null;
+  const taxAmount = parseLineItemNumber(next.taxAmount);
+  const cgstAmount = parseLineItemNumber(next.cgstAmount);
+  const sgstAmount = parseLineItemNumber(next.sgstAmount);
+  const igstAmount = parseLineItemNumber(next.igstAmount);
+  const splitTotalAmount =
+    cgstAmount !== null && sgstAmount !== null ? cgstAmount + sgstAmount : null;
+  const singleSplitAmount = cgstAmount ?? sgstAmount;
+  const fullTaxAmount =
+    taxAmount ??
+    igstAmount ??
+    splitTotalAmount ??
+    (expectedTaxAmount !== null &&
+    singleSplitAmount !== null &&
+    amountsNearlyEqual(singleSplitAmount, expectedTaxAmount, Math.max(0.5, expectedTaxAmount * 0.002))
+      ? singleSplitAmount
+      : null);
+
+  if (taxMode === "split") {
+    setTaxRate(next, "cgstRate", totalRate / 2, { correctInconsistent: true });
+    setTaxRate(next, "sgstRate", totalRate / 2, { correctInconsistent: true });
+    if (fullTaxAmount !== null) {
+      const halfTaxAmount = formatLineItemNumber(fullTaxAmount / 2);
+      next.cgstAmount = halfTaxAmount;
+      next.sgstAmount = halfTaxAmount;
+      next.taxAmount = formatLineItemNumber(fullTaxAmount);
+    }
+    delete next.igstRate;
+    delete next.igstAmount;
+  } else if (taxMode === "igst") {
+    setTaxRate(next, "igstRate", totalRate, { correctInconsistent: true });
+    if (fullTaxAmount !== null) {
+      next.igstAmount = formatLineItemNumber(fullTaxAmount);
+      next.taxAmount = formatLineItemNumber(fullTaxAmount);
+    }
+    delete next.cgstRate;
+    delete next.sgstRate;
+    delete next.cgstAmount;
+    delete next.sgstAmount;
+  }
+
+  return next;
 }
 
 function fillDocumentTaxRates(
@@ -983,10 +1464,14 @@ function fillDocumentTaxRates(
   return next;
 }
 
-function fillVisibleTextTaxRates(lineItems: CommercialLineItem[], visibleText: string) {
+function fillVisibleTextTaxRates(
+  lineItems: CommercialLineItem[],
+  visibleText: string,
+  documentFields: Partial<Record<FieldKey, string>> | undefined
+) {
   if (!visibleText.trim()) return lineItems;
 
-  const hints = extractTaxRateHintsFromVisibleText(visibleText, lineItems);
+  const hints = extractTaxRateHintsFromVisibleText(visibleText, lineItems, documentFields);
   if (!hints.size) return lineItems;
 
   return lineItems.map((item) => {
@@ -1034,15 +1519,16 @@ export function normalizeExtractedCommercialLineItems(params: {
         params.documentFields
       )
     : deduped;
-  const withVisibleTextRates = fillVisibleTextTaxRates(withInvoiceAmounts, visibleText);
+  const withVisibleTextRates = fillVisibleTextTaxRates(withInvoiceAmounts, visibleText, params.documentFields);
   const documentTaxRate = INVOICE_DOC_TYPES.has(params.docType)
     ? inferDocumentTaxRate(params.documentFields)
     : null;
-  const taxMode = getDocumentTaxMode(visibleText);
+  const taxMode = getDocumentTaxMode(visibleText, params.documentFields);
 
   return withVisibleTextRates
     .map((item) => fillDocumentTaxRates(item, documentTaxRate, taxMode))
-    .map(fillComputedTaxRates);
+    .map(fillComputedTaxRates)
+    .map((item) => applyTaxModeToLineItem(item, documentTaxRate, taxMode));
 }
 
 export function readStoredLineItems(extractedFields: unknown) {

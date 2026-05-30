@@ -25,6 +25,7 @@ import {
 } from "@/lib/document-schema";
 import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
 import {
+  enrichDocumentsWithPacketGstTaxContext,
   isLineItemMismatchField,
   serializeFieldsWithLineItems,
 } from "@/lib/line-items";
@@ -436,10 +437,12 @@ export async function POST(
     if (documentDeleteError) throw documentDeleteError;
     if (mismatchDeleteError) throw mismatchDeleteError;
 
-    const documentsWithPersistedStructuredData = mergePersistedStructuredData(
-      documents,
-      existingDocuments ?? [],
-      fieldConfiguration
+    const documentsWithPersistedStructuredData = enrichDocumentsWithPacketGstTaxContext(
+      mergePersistedStructuredData(
+        documents,
+        existingDocuments ?? [],
+        fieldConfiguration
+      )
     );
 
     const documentRows = documentsWithPersistedStructuredData.map((document) => ({

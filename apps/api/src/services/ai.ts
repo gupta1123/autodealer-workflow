@@ -25,7 +25,7 @@ const INTERNAL_PO_REFERENCE_PATTERN = /\b[A-Z]{1,4}\/\d{2}-\d{2}\/[A-Z0-9][A-Z0-
 const IMAGE_HANDWRITTEN_EXTRACTION_INSTRUCTION =
   "Some packet documents are handwritten/manual or mixed printed and handwritten. Treat handwritten entries as first-class visible text, not as noise. Carefully inspect handwritten numbers, dates, party names, vehicle numbers, challan/receipt/permit/certificate numbers, financial amounts, weights, quantities, table cells, stamps, and signatures. Preserve readable handwriting in visibleText. Do not infer a handwritten value from other documents, file names, or nearby labels; if a value is only partly legible, omit the structured field and keep the uncertain transcription in visibleText. ";
 const AMOUNT_EXTRACTION_INSTRUCTION =
-  "Copy financial amounts exactly as printed, preserving digit count and decimal placement after removing separators. Do not add or drop zeros. Cross-check quantity x rate, taxable amount + tax amount, and subtotal + tax amount before returning totals; if arithmetic conflicts with a visually uncertain amount, prefer the arithmetically consistent value visible in the row/summary. ";
+  "Copy financial amounts exactly as printed, preserving digit count and decimal placement after removing separators. Do not add or drop zeros. Cross-check quantity x rate, taxable amount + tax amount, and subtotal + tax amount before returning totals; if arithmetic conflicts with a visually uncertain amount, prefer the arithmetically consistent value visible in the row/summary. Extract visible GST/tax percentage fields as taxRate, cgstRate, sgstRate, and igstRate; do not put tax percentages into taxAmount. Use GSTIN state codes for GST type: same-state or state code 27 means CGST+SGST split, while different-state/non-27 means IGST. ";
 
 type OpenRouterMessage = {
   role: "system" | "user" | "assistant";
@@ -207,6 +207,10 @@ const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   currency: ["currency"],
   subtotal: ["subtotal", "subTotal", "taxableAmount", "taxableValue", "taxableAmountRs", "totalTaxableAmount"],
   taxAmount: ["taxAmount", "tax", "gstAmount"],
+  taxRate: ["taxRate", "gstRate", "taxPercent", "taxPercentage", "gstPercent", "gstPercentage"],
+  cgstRate: ["cgstRate", "centralGstRate", "cgstPercent", "cgstPercentage"],
+  sgstRate: ["sgstRate", "stateGstRate", "sgstPercent", "sgstPercentage"],
+  igstRate: ["igstRate", "integratedGstRate", "igstPercent", "igstPercentage"],
   totalAmount: ["totalAmount", "grandTotal", "documentTotal"],
   paymentTerms: ["paymentTerms", "paymentTerm", "termsOfPayment", "paymentCondition"],
   deliveryTerms: ["deliveryTerms", "deliveryTerm", "deliveryPeriod", "deliverySchedule", "deliveryCondition"],
@@ -311,11 +315,11 @@ function normaliseDocType(raw?: string): DocType {
   if (value.includes("payment screenshot") || value.includes("payment proof") || value.includes("sms")) {
     return "Payment Screenshot";
   }
+  if (value.includes("delivery challan") || value.includes("challan")) return "Delivery Challan";
+  if (value.includes("delivery")) return "Delivery Note";
   if (value.includes("purchase order") || value === "po") return "Purchase Order";
   if (value.includes("invoice")) return "Invoice";
   if (value.includes("receipt")) return "Receipt";
-  if (value.includes("delivery challan") || value.includes("challan")) return "Delivery Challan";
-  if (value.includes("delivery")) return "Delivery Note";
   return "Unknown";
 }
 
@@ -331,7 +335,7 @@ function inferDocTypeFromFilename(fileName: string): DocType {
   if (lower.includes("tax") && lower.includes("invoice")) return "Tax Invoice";
   if (lower.includes("eway") || lower.includes("e-way")) return "E-Way Bill";
   if (lower.includes("weighment") || lower.includes("weight")) return "Weighment Slip";
-  if (lower.includes("lorry") || lower.includes("consignment") || lower.includes("challan") || lower.includes("lr")) {
+  if ((lower.includes("transport") && lower.includes("challan")) || lower.includes("lorry") || lower.includes("consignment") || lower.includes("lr")) {
     return "Lorry Receipt";
   }
   if (lower.includes("rc") || lower.includes("registration")) return "Vehicle Registration Certificate";
@@ -421,7 +425,7 @@ function getEWayBillExtractionInstruction(docType: DocType) {
   return (
     "For E-Way Bill documents, vendorName is the From party name in Address Details after the first GSTIN, and buyerName is the To party name after the second GSTIN. " +
     "Do not use Dispatch From or Ship To address text as party names; those belong in dispatchFrom and shipTo. " +
-    "Extract Generated Date as documentDate, Valid Upto/Valid Until as validityDate, Tot. Tax'ble Amt or Taxable Amount as subtotal, Total Inv. Amt as totalAmount, and CGST+SGST+IGST+Cess amounts or total minus taxable amount as taxAmount. " +
+    "Extract Generated Date as documentDate, Valid Upto/Valid Until as validityDate, Tot. Tax'ble Amt or Taxable Amount as subtotal, Total Inv. Amt as totalAmount, CGST+SGST+IGST+Cess amounts or total minus taxable amount as taxAmount, and derive taxRate from taxAmount/subtotal when the percentage is not printed. " +
     "Extract Transporter ID & Name into transporterName, Transporter Doc. No into lorryReceiptNumber, and the Part-B Vehicle/Trans number into vehicleNumber. " +
     "If Part-A shows Doc No, Document No, Invoice No, Tax Invoice No, or Delivery Challan No, extract that value as referenceInvoiceNumber unless it is the E-Way Bill No itself. "
   );
@@ -867,10 +871,24 @@ function normalizeEWayReferenceText(value: string) {
 
 function extractEWayBillReferenceInvoiceNumber(visibleText: string) {
   const text = visibleText.replace(/\s+/g, " ").trim();
-  const documentDetails = text.match(/\bDocument\s+Details\s*:?\s*(?:Tax\s+Invoice|Invoice|Delivery\s+Challan)?\s*[-:]?\s*([A-ZΑ-Ω0-9][A-ZΑ-Ω0-9\s/-]{1,40}?)(?:\s*[-–]\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\s+\bIRN\b|\s+\bAddress\s+Details\b|$)/i)?.[1];
+  const documentDetails = text.match(/\bDocument\s+Details\s*:?\s*([\s\S]{0,220}?)(?=\s+\b(?:IRN|RN|Address\s+Details|GSTIN|Goods\s+Details)\b|$)/i)?.[1];
   if (!documentDetails) return undefined;
-  const normalized = normalizeEWayReferenceText(documentDetails);
-  return normalized.length >= 2 && /\d/.test(normalized) ? normalized : undefined;
+
+  const seriesPrefix = normalizeEWayReferenceText(
+    documentDetails.match(/\b(?:Tax\s+Invoice|Invoice|Delivery\s+Challan)\s*[-:'"]+\s*([A-ZΑ-Ω]{1,8})(?=\s+(?:Transaction\s*type|Portal|Regular|\d)|\s*[-/]?\s*\d)/i)?.[1] ?? ""
+  );
+  const cleanedDetails = documentDetails
+    .replace(/\bTransaction\s*type\s*[:;]?\s*[A-Z]+\b/gi, " ")
+    .replace(/\bPortal\s*:?\s*\d+\b/gi, " ")
+    .replace(/\b(?:Tax\s+Invoice|Invoice|Delivery\s+Challan)\b/gi, " ");
+  const candidates = [...cleanedDetails.matchAll(/\b(?:[A-ZΑ-Ω]{1,8}\s*[-/]?\s*)?\d{2,}[A-ZΑ-Ω0-9]*(?:[/-]\d{1,4}){0,5}\b/gi)]
+    .map((match) => normalizeEWayReferenceText(match[0]))
+    .filter((candidate) => isEWayReferenceCandidate(candidate));
+  const withSeries = candidates.find((candidate) => /[A-ZΑ-Ω]/.test(candidate));
+  const numericOnly = candidates.find((candidate) => !/[A-ZΑ-Ω]/.test(candidate));
+
+  if (seriesPrefix && numericOnly) return `${seriesPrefix}-${numericOnly}`;
+  return withSeries ? formatEWaySeriesReference(withSeries) : numericOnly;
 }
 
 function cleanExistingEWayReferenceInvoiceNumber(value?: string) {
@@ -879,10 +897,57 @@ function cleanExistingEWayReferenceInvoiceNumber(value?: string) {
   return normalized.length >= 2 && /\d/.test(normalized) ? normalized : undefined;
 }
 
+function formatEWaySeriesReference(value: string) {
+  return value.replace(/^([A-ZΑ-Ω]{1,12})[-/]?(\d)/, "$1-$2");
+}
+
+function isEWayReferenceCandidate(value: string) {
+  const compact = value.replace(/[^A-Z0-9Α-Ω]/gi, "");
+  if (compact.length < 4 || !/\d/.test(compact)) return false;
+  return !/^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/i.test(value);
+}
+
+function compactEWayReference(value?: string) {
+  return value?.replace(/[^A-Z0-9Α-Ω]/gi, "").toUpperCase() ?? "";
+}
+
+function stripEWayReferenceSeries(value: string) {
+  return value.replace(/^[A-ZΑ-Ω]{1,12}(?=\d)/, "");
+}
+
+function chooseEWayReferenceInvoiceNumber(existing?: string, extracted?: string) {
+  const cleanedExisting = cleanExistingEWayReferenceInvoiceNumber(existing);
+  const cleanedExtracted = cleanExistingEWayReferenceInvoiceNumber(extracted);
+  if (!cleanedExisting) return cleanedExtracted;
+  if (!cleanedExtracted) return cleanedExisting;
+
+  const existingCompact = compactEWayReference(cleanedExisting);
+  const extractedCompact = compactEWayReference(cleanedExtracted);
+  if (existingCompact === extractedCompact) return cleanedExisting;
+
+  const existingHasSeries = /^[A-ZΑ-Ω]{1,12}\d{6,}$/.test(existingCompact);
+  const extractedHasSeries = /^[A-ZΑ-Ω]{1,12}\d{6,}$/.test(extractedCompact);
+  const existingBody = stripEWayReferenceSeries(existingCompact);
+  const extractedBody = stripEWayReferenceSeries(extractedCompact);
+
+  if (extractedHasSeries && !existingHasSeries && extractedBody === existingCompact) {
+    return cleanedExtracted;
+  }
+  if (existingHasSeries && !extractedHasSeries && existingBody === extractedCompact) {
+    return cleanedExisting;
+  }
+
+  return cleanedExisting;
+}
+
 const EWAY_DATE_PATTERN =
   "(?:\\d{4}[/-]\\d{1,2}[/-]\\d{1,2}|\\d{1,2}[/. -]\\d{1,2}[/. -]\\d{2,4}|\\d{1,2}-[A-Za-z]{3}-\\d{2,4})(?:\\s+\\d{1,2}:\\d{2}(?::\\d{2})?\\s*(?:AM|PM)?)?";
 const EWAY_VEHICLE_PATTERN = /\b[A-Z]{2}\s*\d{1,2}\s*[A-Z]{1,3}\s*\d{3,4}\b/gi;
 const EWAY_GSTIN_PATTERN = /\b\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z]\b/gi;
+const HOME_GST_STATE_CODE = "27";
+const DEFAULT_GST_RATE = 18;
+const STANDARD_GST_RATES = [0, 0.25, 3, 5, 12, 18, 28];
+type GstTaxMode = "igst" | "split" | "unknown";
 
 function cleanEWayDateValue(value?: string) {
   const raw = value?.match(new RegExp(EWAY_DATE_PATTERN, "i"))?.[0];
@@ -917,6 +982,81 @@ function formatEWayNumberForField(value: number) {
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, "");
 }
 
+function normalizeKnownGstRate(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  let closest: number | null = null;
+  let closestDelta = Number.POSITIVE_INFINITY;
+  for (const rate of STANDARD_GST_RATES) {
+    const delta = Math.abs(rate - value);
+    if (delta < closestDelta) {
+      closest = rate;
+      closestDelta = delta;
+    }
+  }
+  return closestDelta <= 0.25 ? closest : null;
+}
+
+function getGstinStateCode(value: string | undefined) {
+  const normalized = value?.toUpperCase().replace(/[^0-9A-Z]/g, "") ?? "";
+  const match = normalized.match(/\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z]/);
+  return match?.[0].slice(0, 2) ?? null;
+}
+
+function inferTaxModeFromGstins(fields: Partial<Record<FieldKey, string>>): GstTaxMode {
+  const supplierState = getGstinStateCode(fields.supplierGstin);
+  const buyerState = getGstinStateCode(fields.buyerGstin);
+
+  if (supplierState && buyerState) {
+    return supplierState === buyerState ? "split" : "igst";
+  }
+
+  const knownState = buyerState ?? supplierState;
+  if (!knownState) return "unknown";
+  return knownState === HOME_GST_STATE_CODE ? "split" : "igst";
+}
+
+function inferTopLevelTaxRate(fields: Partial<Record<FieldKey, string>>) {
+  let taxableBase = normalizeEWayAmount(fields.subtotal);
+  let taxAmount = normalizeEWayAmount(fields.taxAmount);
+  const totalAmount = normalizeEWayAmount(fields.totalAmount);
+
+  if ((taxAmount === null || taxAmount <= 0) && taxableBase !== null && totalAmount !== null && totalAmount > taxableBase) {
+    taxAmount = totalAmount - taxableBase;
+  }
+  if ((taxableBase === null || taxableBase <= 0) && taxAmount !== null && totalAmount !== null && totalAmount > taxAmount) {
+    taxableBase = totalAmount - taxAmount;
+  }
+  if (taxableBase === null || taxableBase <= 0 || taxAmount === null || taxAmount <= 0) {
+    return null;
+  }
+
+  const rate = Math.round((taxAmount / taxableBase) * 10000) / 100;
+  return rate >= 0 && rate <= 40 ? rate : null;
+}
+
+function applyGstinTaxMode(fields: Partial<Record<FieldKey, string>>) {
+  const taxMode = inferTaxModeFromGstins(fields);
+  if (taxMode === "unknown") return fields;
+
+  const totalRate =
+    normalizeKnownGstRate(inferTopLevelTaxRate(fields)) ??
+    normalizeKnownGstRate(normalizeEWayAmount(fields.taxRate)) ??
+    DEFAULT_GST_RATE;
+  const next = { ...fields, taxRate: formatEWayNumberForField(totalRate) };
+
+  if (taxMode === "split") {
+    next.cgstRate = formatEWayNumberForField(totalRate / 2);
+    next.sgstRate = formatEWayNumberForField(totalRate / 2);
+    delete next.igstRate;
+  } else {
+    next.igstRate = formatEWayNumberForField(totalRate);
+    delete next.cgstRate;
+    delete next.sgstRate;
+  }
+
+  return next;
+}
+
 function extractEWayAmounts(value: string) {
   return [...value.matchAll(/-?\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|-?\d+,\d{2}\b|-?\d+\.\d{1,2}\b/g)]
     .map((match) => normalizeEWayAmount(match[0]))
@@ -944,10 +1084,15 @@ function extractEWayCommercialAmounts(text: string, fields: Partial<Record<Field
     (total !== null && taxAmount !== null && total >= taxAmount
       ? Math.round((total - taxAmount) * 100) / 100
       : null);
+  const taxRate =
+    derivedSubtotal !== null && derivedSubtotal > 0 && taxAmount !== null
+      ? Math.round((taxAmount / derivedSubtotal) * 10000) / 100
+      : null;
 
   return {
     subtotal: derivedSubtotal === null ? undefined : formatEWayNumberForField(derivedSubtotal),
     taxAmount: taxAmount === null ? undefined : formatEWayNumberForField(taxAmount),
+    taxRate: taxRate === null || taxRate < 0 || taxRate > 40 ? undefined : formatEWayNumberForField(taxRate),
     totalAmount: total === null ? undefined : formatEWayNumberForField(total),
   } satisfies Partial<Record<FieldKey, string>>;
 }
@@ -1014,9 +1159,10 @@ function applyEWayBillAddressFallback(
   const text = visibleText.replace(/\s+/g, " ").trim();
   const addresses = extractEWayBillAddresses(visibleText);
   const parties = extractEWayBillPartyNames(visibleText, fields);
-  const referenceInvoiceNumber =
-    cleanExistingEWayReferenceInvoiceNumber(fields.referenceInvoiceNumber) ??
-    extractEWayBillReferenceInvoiceNumber(visibleText);
+  const referenceInvoiceNumber = chooseEWayReferenceInvoiceNumber(
+    fields.referenceInvoiceNumber,
+    extractEWayBillReferenceInvoiceNumber(visibleText)
+  );
   const amounts = extractEWayCommercialAmounts(text, fields);
   const transport = extractEWayTransportDetails(text);
   const transporterName = transport.transporterName ?? cleanEWayTransporterName(fields.transporterName);
@@ -1034,6 +1180,7 @@ function applyEWayBillAddressFallback(
     ...(!validityDate || validityDate === fields.validityDate ? {} : { validityDate }),
     ...(fields.subtotal || !amounts.subtotal ? {} : { subtotal: amounts.subtotal }),
     ...(fields.taxAmount || !amounts.taxAmount ? {} : { taxAmount: amounts.taxAmount }),
+    ...(fields.taxRate || !amounts.taxRate ? {} : { taxRate: amounts.taxRate }),
     ...(fields.totalAmount || !amounts.totalAmount ? {} : { totalAmount: amounts.totalAmount }),
     ...(!transporterName ? {} : { transporterName }),
     ...(fields.lorryReceiptNumber || !transport.lorryReceiptNumber ? {} : { lorryReceiptNumber: transport.lorryReceiptNumber }),
@@ -1252,7 +1399,8 @@ export async function classifyDocumentFromImage(image: string, fileName = ""): P
           role: "system",
           content:
             `Classify procurement packet pages. Return only JSON like {"documentType":"Purchase Order"} using one of: ${SUPPORTED_DOC_TYPES.join(", ")}. ` +
-            "Some pages may be handwritten/manual or mixed printed and handwritten; classify by the document layout and purpose, not only by machine-readable printed text.",
+            "Some pages may be handwritten/manual or mixed printed and handwritten; classify by the document layout and purpose, not only by machine-readable printed text. " +
+            "If the page is headed Delivery Challan or shows Challan No/Challan Date, classify it as Delivery Challan even when it references a PO No; PO No on logistics documents is only a reference.",
         },
         {
           role: "user",
@@ -1371,7 +1519,8 @@ export async function extractDataFromImages(params: {
     const visibleTextPages = extracted.map((page) => page.visibleText).filter(Boolean);
     const visibleText = visibleTextPages.join("\n");
     const mappedFields = mapFields(combinedFields, documentType);
-    const fields = applyPoNumberLabelGuard(
+  const fields = applyGstinTaxMode(
+    applyPoNumberLabelGuard(
       applyInvoicePoReferenceFallback(
         applyPhotoEvidenceVehicleVisibilityCopy(
           applyFastagDetailsFallback(
@@ -1389,7 +1538,8 @@ export async function extractDataFromImages(params: {
         visibleText
       ),
       visibleText
-    );
+    )
+  );
 
     const caseDoc: CaseDoc = {
       id: `${fileName}-${Date.now()}`,

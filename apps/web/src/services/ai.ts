@@ -7,6 +7,7 @@ import {
   omitIgnoredFields,
 } from "@/lib/document-schema";
 import {
+  enrichDocumentsWithPacketGstTaxContext,
   isCommercialDocType,
   normalizeExtractedCommercialLineItems,
   sanitizeLineItems,
@@ -32,7 +33,14 @@ const INTERNAL_PO_REFERENCE_PATTERN = /\b[A-Z]{1,4}\/\d{2}-\d{2}\/[A-Z0-9][A-Z0-
 const IMAGE_HANDWRITTEN_EXTRACTION_INSTRUCTION =
   "Some packet documents are handwritten/manual or mixed printed and handwritten. Treat handwritten entries as first-class visible text, not as noise. Carefully inspect handwritten numbers, dates, party names, vehicle numbers, challan/receipt/permit/certificate numbers, financial amounts, weights, quantities, table cells, stamps, and signatures. Preserve readable handwriting in visibleText. Do not infer a handwritten value from other documents, file names, or nearby labels; if a value is only partly legible, omit the structured field and keep the uncertain transcription in visibleText. ";
 const AMOUNT_EXTRACTION_INSTRUCTION =
-  "Copy financial amounts exactly as printed, preserving digit count and decimal placement after removing separators. Do not add or drop zeros. Cross-check quantity x rate, taxable amount + tax amount, and subtotal + tax amount before returning totals; if arithmetic conflicts with a visually uncertain amount, prefer the arithmetically consistent value visible in the row/summary. ";
+  "Copy financial amounts exactly as printed, preserving digit count and decimal placement after removing separators. Do not add or drop zeros. Cross-check quantity x rate, taxable amount + tax amount, and subtotal + tax amount before returning totals; if arithmetic conflicts with a visually uncertain amount, prefer the arithmetically consistent value visible in the row/summary. Extract visible GST/tax percentage fields as taxRate, cgstRate, sgstRate, and igstRate; do not put tax percentages into taxAmount. Use GSTIN state codes for GST type: same-state or state code 27 means CGST+SGST split, while different-state/non-27 means IGST. ";
+const CONSIGNEE_EXTRACTION_INSTRUCTION =
+  "If a party is labelled Consignee, Ship To, or Recipient, map it to buyerName/buyerGstin only when that party is Kalika or Kalika Steel Alloys. If the consignee/ship-to/recipient is any other party, do not use that value as buyerName or buyerGstin; keep it only in visibleText or address fields when applicable. ";
+const CONSIGNEE_NAME_ALIASES = new Set(["consigneeName", "consignee", "shipToName", "recipientName"]);
+const CONSIGNEE_GSTIN_ALIASES = new Set(["consigneeGstin", "shipToGstin", "recipientGstin"]);
+const INTERNAL_CONSIGNEE_GSTINS = new Set(["27AACCK1502A1ZD"]);
+const CONSIGNEE_CONTEXT_PATTERN = /\b(?:consignee|ship\s*to|ship-to|recipient)\b/i;
+const DIRECT_BUYER_CONTEXT_PATTERN = /\b(?:buyer|bill\s*to|bill-to|customer|purchaser)\b/i;
 
 type OpenRouterMessage = {
   role: "system" | "user" | "assistant";
@@ -212,6 +220,10 @@ const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   currency: ["currency"],
   subtotal: ["subtotal", "subTotal", "taxableAmount", "taxableValue", "taxableAmountRs", "totalTaxableAmount"],
   taxAmount: ["taxAmount", "tax", "gstAmount"],
+  taxRate: ["taxRate", "gstRate", "taxPercent", "taxPercentage", "gstPercent", "gstPercentage"],
+  cgstRate: ["cgstRate", "centralGstRate", "cgstPercent", "cgstPercentage"],
+  sgstRate: ["sgstRate", "stateGstRate", "sgstPercent", "sgstPercentage"],
+  igstRate: ["igstRate", "integratedGstRate", "igstPercent", "igstPercentage"],
   totalAmount: ["totalAmount", "grandTotal", "documentTotal"],
   paymentTerms: ["paymentTerms", "paymentTerm", "termsOfPayment", "paymentCondition"],
   deliveryTerms: ["deliveryTerms", "deliveryTerm", "deliveryPeriod", "deliverySchedule", "deliveryCondition"],
@@ -316,12 +328,12 @@ function normaliseDocType(raw?: string): DocType {
   if (value.includes("payment screenshot") || value.includes("payment proof") || value.includes("sms")) {
     return "Payment Screenshot";
   }
+  if (value.includes("delivery challan") || value.includes("challan")) return "Delivery Challan";
+  if (value.includes("delivery")) return "Delivery Note";
   if (value.includes("purchase order") || value === "po") return "Purchase Order";
   if (value.includes("amended") && value.includes("po")) return "Purchase Order";
   if (value.includes("invoice")) return "Tax Invoice";
   if (value.includes("receipt")) return "Receipt";
-  if (value.includes("delivery challan") || value.includes("challan")) return "Delivery Challan";
-  if (value.includes("delivery")) return "Delivery Note";
   return "Unknown";
 }
 
@@ -337,7 +349,7 @@ function inferDocTypeFromFilename(fileName: string): DocType {
   if (lower.includes("tax") && lower.includes("invoice")) return "Tax Invoice";
   if (lower.includes("eway") || lower.includes("e-way")) return "E-Way Bill";
   if (lower.includes("weighment") || lower.includes("weight")) return "Weighment Slip";
-  if (lower.includes("lorry") || lower.includes("consignment") || lower.includes("challan") || lower.includes("lr")) {
+  if ((lower.includes("transport") && lower.includes("challan")) || lower.includes("lorry") || lower.includes("consignment") || lower.includes("lr")) {
     return "Lorry Receipt";
   }
   if (lower.includes("rc") || lower.includes("registration")) return "Vehicle Registration Certificate";
@@ -385,6 +397,7 @@ function getLineItemExtractionInstruction(docType: DocType) {
     "Do not extract HSN/SAC-wise tax summary rows as lineItems. Rows that only contain HSN/SAC, taxable value, and tax amount are summary rows, not product/service lines. " +
     "When invoice GST rates appear only in an HSN/SAC tax summary, map the visible CGST, SGST, IGST, or GST rates from that summary onto the matching product/service lineItems by HSN/SAC and taxable amount. " +
     "For invoice rows, taxableAmount is the row amount before GST; when the row shows only quantity, rate, and amount, use that amount as taxableAmount and lineTotal. Do not treat packing, freight, P&F, or other charge percentages as GST rates unless the row or tax summary explicitly labels CGST, SGST, IGST, GST, or tax. " +
+    "Only set taxableAmount or lineTotal when a monetary amount/value column is visible. Do not use quantity totals such as TOTAL 1.000 as monetary amounts, and omit amount fields instead of writing 0 when the document does not show an amount. " +
     "For product/service rows, keep item name only in description, keep product/model/specification identifiers in itemCode, and keep HSN/SAC only in hsnSac. Never copy HSN/SAC codes, GST labels, quantities, units, rates, tax rates, taxable amounts, tax amounts, or totals into description or itemCode. "
   );
 }
@@ -446,7 +459,7 @@ function getEWayBillExtractionInstruction(docType: DocType) {
   return (
     "For E-Way Bill documents, vendorName is the From party name in Address Details after the first GSTIN, and buyerName is the To party name after the second GSTIN. " +
     "Do not use Dispatch From or Ship To address text as party names; those belong in dispatchFrom and shipTo. " +
-    "Extract Generated Date as documentDate, Valid Upto/Valid Until as validityDate, Tot. Tax'ble Amt or Taxable Amount as subtotal, Total Inv. Amt as totalAmount, and CGST+SGST+IGST+Cess amounts or total minus taxable amount as taxAmount. " +
+    "Extract Generated Date as documentDate, Valid Upto/Valid Until as validityDate, Tot. Tax'ble Amt or Taxable Amount as subtotal, Total Inv. Amt as totalAmount, CGST+SGST+IGST+Cess amounts or total minus taxable amount as taxAmount, and derive taxRate from taxAmount/subtotal when the percentage is not printed. " +
     "Extract Transporter ID & Name into transporterName, Transporter Doc. No into lorryReceiptNumber, and the Part-B Vehicle/Trans number into vehicleNumber. " +
     "If Part-A shows Doc No, Document No, Invoice No, Tax Invoice No, or Delivery Challan No, extract that value as referenceInvoiceNumber unless it is the E-Way Bill No itself. "
   );
@@ -528,6 +541,88 @@ function getValueContexts(visibleText: string, value: string) {
   });
 
   return [...contexts];
+}
+
+function normalizeCompanySignal(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((token) => {
+      if (["kaliko", "xarika", "xarixa"].includes(token)) return "kalika";
+      return token;
+    })
+    .join(" ");
+}
+
+function isInternalConsigneeName(value?: string) {
+  return Boolean(value && normalizeCompanySignal(value).split(/\s+/).includes("kalika"));
+}
+
+function normalizeGstinSignal(value?: string) {
+  return value?.toUpperCase().replace(/[^A-Z0-9]/g, "") ?? "";
+}
+
+function isInternalConsigneeGstin(value?: string) {
+  const normalized = normalizeGstinSignal(value);
+  return Boolean(normalized && INTERNAL_CONSIGNEE_GSTINS.has(normalized));
+}
+
+function shouldAcceptMappedAlias(fieldKey: FieldKey, alias: string, value: string) {
+  if (fieldKey === "buyerName" && CONSIGNEE_NAME_ALIASES.has(alias)) {
+    return isInternalConsigneeName(value);
+  }
+
+  if (fieldKey === "buyerGstin" && CONSIGNEE_GSTIN_ALIASES.has(alias)) {
+    return isInternalConsigneeGstin(value);
+  }
+
+  return true;
+}
+
+function isConsigneeOnlyContext(visibleText: string, value: string) {
+  const contexts = getValueContexts(visibleText, value);
+  if (!contexts.length) return false;
+
+  return contexts.some((context) => {
+    if (!CONSIGNEE_CONTEXT_PATTERN.test(context)) return false;
+    return !DIRECT_BUYER_CONTEXT_PATTERN.test(context);
+  });
+}
+
+function applyConsigneeBuyerGuard(
+  fields: Partial<Record<FieldKey, string>>,
+  visibleText: string
+) {
+  if (!visibleText.trim()) return fields;
+
+  const next = { ...fields };
+  let changed = false;
+  let droppedConsigneeBuyerName = false;
+
+  if (
+    next.buyerName &&
+    !isInternalConsigneeName(next.buyerName) &&
+    isConsigneeOnlyContext(visibleText, next.buyerName)
+  ) {
+    delete next.buyerName;
+    droppedConsigneeBuyerName = true;
+    changed = true;
+  }
+
+  if (
+    next.buyerGstin &&
+    !isInternalConsigneeGstin(next.buyerGstin) &&
+    (droppedConsigneeBuyerName || isConsigneeOnlyContext(visibleText, next.buyerGstin))
+  ) {
+    delete next.buyerGstin;
+    changed = true;
+  }
+
+  return changed ? next : fields;
 }
 
 function isIndentNumberMasqueradingAsPo(value: string, visibleText: string) {
@@ -676,7 +771,7 @@ function mapFields(
     for (const alias of aliases) {
       const value = fields[alias];
       const normalizedValue = normalizeFieldValue(value);
-      if (normalizedValue) {
+      if (normalizedValue && shouldAcceptMappedAlias(fieldKey, alias, normalizedValue)) {
         result[fieldKey] = normalizedValue;
         break;
       }
@@ -892,16 +987,73 @@ function normalizeEWayReferenceText(value: string) {
 
 function extractEWayBillReferenceInvoiceNumber(visibleText: string) {
   const text = visibleText.replace(/\s+/g, " ").trim();
-  const documentDetails = text.match(/\bDocument\s+Details\s*:?\s*(?:Tax\s+Invoice|Invoice|Delivery\s+Challan)?\s*[-:]?\s*([A-ZΑ-Ω0-9][A-ZΑ-Ω0-9\s/-]{1,40}?)(?:\s*[-–]\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\s+\bIRN\b|\s+\bAddress\s+Details\b|$)/i)?.[1];
+  const documentDetails = text.match(/\bDocument\s+Details\s*:?\s*([\s\S]{0,220}?)(?=\s+\b(?:IRN|RN|Address\s+Details|GSTIN|Goods\s+Details)\b|$)/i)?.[1];
   if (!documentDetails) return undefined;
-  const normalized = normalizeEWayReferenceText(documentDetails);
-  return normalized.length >= 2 && /\d/.test(normalized) ? normalized : undefined;
+
+  const seriesPrefix = normalizeEWayReferenceText(
+    documentDetails.match(/\b(?:Tax\s+Invoice|Invoice|Delivery\s+Challan)\s*[-:'"]+\s*([A-ZΑ-Ω]{1,8})(?=\s+(?:Transaction\s*type|Portal|Regular|\d)|\s*[-/]?\s*\d)/i)?.[1] ?? ""
+  );
+  const cleanedDetails = documentDetails
+    .replace(/\bTransaction\s*type\s*[:;]?\s*[A-Z]+\b/gi, " ")
+    .replace(/\bPortal\s*:?\s*\d+\b/gi, " ")
+    .replace(/\b(?:Tax\s+Invoice|Invoice|Delivery\s+Challan)\b/gi, " ");
+  const candidates = [...cleanedDetails.matchAll(/\b(?:[A-ZΑ-Ω]{1,8}\s*[-/]?\s*)?\d{2,}[A-ZΑ-Ω0-9]*(?:[/-]\d{1,4}){0,5}\b/gi)]
+    .map((match) => normalizeEWayReferenceText(match[0]))
+    .filter((candidate) => isEWayReferenceCandidate(candidate));
+  const withSeries = candidates.find((candidate) => /[A-ZΑ-Ω]/.test(candidate));
+  const numericOnly = candidates.find((candidate) => !/[A-ZΑ-Ω]/.test(candidate));
+
+  if (seriesPrefix && numericOnly) return `${seriesPrefix}-${numericOnly}`;
+  return withSeries ? formatEWaySeriesReference(withSeries) : numericOnly;
 }
 
 function cleanExistingEWayReferenceInvoiceNumber(value?: string) {
   if (!value) return undefined;
   const normalized = normalizeEWayReferenceText(value);
   return normalized.length >= 2 && /\d/.test(normalized) ? normalized : undefined;
+}
+
+function formatEWaySeriesReference(value: string) {
+  return value.replace(/^([A-ZΑ-Ω]{1,12})[-/]?(\d)/, "$1-$2");
+}
+
+function isEWayReferenceCandidate(value: string) {
+  const compact = value.replace(/[^A-Z0-9Α-Ω]/gi, "");
+  if (compact.length < 4 || !/\d/.test(compact)) return false;
+  return !/^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$/i.test(value);
+}
+
+function compactEWayReference(value?: string) {
+  return value?.replace(/[^A-Z0-9Α-Ω]/gi, "").toUpperCase() ?? "";
+}
+
+function stripEWayReferenceSeries(value: string) {
+  return value.replace(/^[A-ZΑ-Ω]{1,12}(?=\d)/, "");
+}
+
+function chooseEWayReferenceInvoiceNumber(existing?: string, extracted?: string) {
+  const cleanedExisting = cleanExistingEWayReferenceInvoiceNumber(existing);
+  const cleanedExtracted = cleanExistingEWayReferenceInvoiceNumber(extracted);
+  if (!cleanedExisting) return cleanedExtracted;
+  if (!cleanedExtracted) return cleanedExisting;
+
+  const existingCompact = compactEWayReference(cleanedExisting);
+  const extractedCompact = compactEWayReference(cleanedExtracted);
+  if (existingCompact === extractedCompact) return cleanedExisting;
+
+  const existingHasSeries = /^[A-ZΑ-Ω]{1,12}\d{6,}$/.test(existingCompact);
+  const extractedHasSeries = /^[A-ZΑ-Ω]{1,12}\d{6,}$/.test(extractedCompact);
+  const existingBody = stripEWayReferenceSeries(existingCompact);
+  const extractedBody = stripEWayReferenceSeries(extractedCompact);
+
+  if (extractedHasSeries && !existingHasSeries && extractedBody === existingCompact) {
+    return cleanedExtracted;
+  }
+  if (existingHasSeries && !extractedHasSeries && existingBody === extractedCompact) {
+    return cleanedExisting;
+  }
+
+  return cleanedExisting;
 }
 
 const EWAY_DATE_PATTERN =
@@ -969,10 +1121,15 @@ function extractEWayCommercialAmounts(text: string, fields: Partial<Record<Field
     (total !== null && taxAmount !== null && total >= taxAmount
       ? Math.round((total - taxAmount) * 100) / 100
       : null);
+  const taxRate =
+    derivedSubtotal !== null && derivedSubtotal > 0 && taxAmount !== null
+      ? Math.round((taxAmount / derivedSubtotal) * 10000) / 100
+      : null;
 
   return {
     subtotal: derivedSubtotal === null ? undefined : formatEWayNumberForField(derivedSubtotal),
     taxAmount: taxAmount === null ? undefined : formatEWayNumberForField(taxAmount),
+    taxRate: taxRate === null || taxRate < 0 || taxRate > 40 ? undefined : formatEWayNumberForField(taxRate),
     totalAmount: total === null ? undefined : formatEWayNumberForField(total),
   } satisfies Partial<Record<FieldKey, string>>;
 }
@@ -1039,9 +1196,10 @@ function applyEWayBillAddressFallback(
   const text = visibleText.replace(/\s+/g, " ").trim();
   const addresses = extractEWayBillAddresses(visibleText);
   const parties = extractEWayBillPartyNames(visibleText, fields);
-  const referenceInvoiceNumber =
-    cleanExistingEWayReferenceInvoiceNumber(fields.referenceInvoiceNumber) ??
-    extractEWayBillReferenceInvoiceNumber(visibleText);
+  const referenceInvoiceNumber = chooseEWayReferenceInvoiceNumber(
+    fields.referenceInvoiceNumber,
+    extractEWayBillReferenceInvoiceNumber(visibleText)
+  );
   const amounts = extractEWayCommercialAmounts(text, fields);
   const transport = extractEWayTransportDetails(text);
   const transporterName = transport.transporterName ?? cleanEWayTransporterName(fields.transporterName);
@@ -1059,6 +1217,7 @@ function applyEWayBillAddressFallback(
     ...(!validityDate || validityDate === fields.validityDate ? {} : { validityDate }),
     ...(fields.subtotal || !amounts.subtotal ? {} : { subtotal: amounts.subtotal }),
     ...(fields.taxAmount || !amounts.taxAmount ? {} : { taxAmount: amounts.taxAmount }),
+    ...(fields.taxRate || !amounts.taxRate ? {} : { taxRate: amounts.taxRate }),
     ...(fields.totalAmount || !amounts.totalAmount ? {} : { totalAmount: amounts.totalAmount }),
     ...(!transporterName ? {} : { transporterName }),
     ...(fields.lorryReceiptNumber || !transport.lorryReceiptNumber ? {} : { lorryReceiptNumber: transport.lorryReceiptNumber }),
@@ -1749,6 +1908,195 @@ function getLineItemTaxRate(item: CommercialLineItem) {
   return cgstRate ?? sgstRate;
 }
 
+type TaxRateFieldKey = "taxRate" | "cgstRate" | "sgstRate" | "igstRate";
+type GstTaxMode = "igst" | "split" | "unknown";
+
+const HOME_GST_STATE_CODE = "27";
+const DEFAULT_GST_RATE = 18;
+const STANDARD_GST_RATES = [0, 0.25, 3, 5, 12, 18, 28];
+
+function inferTaxRateFromAmounts(fields: Partial<Record<FieldKey, string>>) {
+  let taxableBase = parseLooseNumber(fields.subtotal);
+  let taxAmount = parseLooseNumber(fields.taxAmount);
+  const totalAmount = parseLooseNumber(fields.totalAmount);
+
+  if ((taxAmount === null || taxAmount <= 0) && taxableBase !== null && totalAmount !== null && totalAmount > taxableBase) {
+    taxAmount = totalAmount - taxableBase;
+  }
+
+  if ((taxableBase === null || taxableBase <= 0) && taxAmount !== null && totalAmount !== null && totalAmount > taxAmount) {
+    taxableBase = totalAmount - taxAmount;
+  }
+
+  if (taxableBase === null || taxableBase <= 0 || taxAmount === null || taxAmount <= 0) return null;
+  return normalizeTaxRateValue((taxAmount / taxableBase) * 100);
+}
+
+function normalizeKnownGstRate(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  let closest: number | null = null;
+  let closestDelta = Number.POSITIVE_INFINITY;
+  for (const rate of STANDARD_GST_RATES) {
+    const delta = Math.abs(rate - value);
+    if (delta < closestDelta) {
+      closest = rate;
+      closestDelta = delta;
+    }
+  }
+  return closestDelta <= 0.25 ? closest : null;
+}
+
+function getDominantLineItemSpecificTaxRate(
+  lineItems: CommercialLineItem[] | undefined,
+  field: TaxRateFieldKey
+) {
+  const rates = (lineItems ?? [])
+    .map((item) => parseTaxRateField(item[field]))
+    .filter((value): value is number => value !== null);
+  return selectDominantTaxRate(rates);
+}
+
+function getGstinStateCode(value: string | undefined) {
+  const normalized = value?.toUpperCase().replace(/[^0-9A-Z]/g, "") ?? "";
+  const match = normalized.match(/\d{2}[A-Z]{5}\d{4}[A-Z][0-9A-Z]Z[0-9A-Z]/);
+  return match?.[0].slice(0, 2) ?? null;
+}
+
+function inferTaxModeFromGstins(fields: Partial<Record<FieldKey, string>>): GstTaxMode {
+  const supplierState = getGstinStateCode(fields.supplierGstin);
+  const buyerState = getGstinStateCode(fields.buyerGstin);
+
+  if (supplierState && buyerState) {
+    return supplierState === buyerState ? "split" : "igst";
+  }
+
+  const knownState = buyerState ?? supplierState;
+  if (!knownState) return "unknown";
+  return knownState === HOME_GST_STATE_CODE ? "split" : "igst";
+}
+
+function getLineItemTaxRateForMode(item: CommercialLineItem, taxMode: GstTaxMode) {
+  const taxRate = parseTaxRateField(item.taxRate);
+  const igstRate = parseTaxRateField(item.igstRate);
+  const cgstRate = parseTaxRateField(item.cgstRate);
+  const sgstRate = parseTaxRateField(item.sgstRate);
+  const singleSplitRate = cgstRate ?? sgstRate;
+  const taxRateLooksLikeSingleSplitComponent =
+    taxRate !== null &&
+    singleSplitRate !== null &&
+    Math.abs(taxRate - singleSplitRate) <= 0.25;
+
+  if (taxMode === "igst") {
+    if (igstRate !== null) return igstRate;
+    if (cgstRate !== null && sgstRate !== null) return normalizeTaxRateValue(cgstRate + sgstRate);
+    if (taxRate !== null && !taxRateLooksLikeSingleSplitComponent) return taxRate;
+    return null;
+  }
+
+  if (taxMode === "split") {
+    if (cgstRate !== null && sgstRate !== null) return normalizeTaxRateValue(cgstRate + sgstRate);
+    if (igstRate !== null) return igstRate;
+    if (taxRate !== null && !taxRateLooksLikeSingleSplitComponent) return taxRate;
+    return null;
+  }
+
+  if (taxRate !== null) return taxRate;
+  return getLineItemTaxRate(item);
+}
+
+function getDominantLineItemTaxRateForMode(
+  lineItems: CommercialLineItem[] | undefined,
+  taxMode: GstTaxMode
+) {
+  const rates = (lineItems ?? [])
+    .map((item) => getLineItemTaxRateForMode(item, taxMode))
+    .filter((value): value is number => value !== null);
+  return selectDominantTaxRate(rates);
+}
+
+function setDocumentTaxRateField(
+  fields: Partial<Record<FieldKey, string>>,
+  key: TaxRateFieldKey,
+  rate: number
+) {
+  const formatted = formatNumberForField(rate);
+  if (fields[key] === formatted) return false;
+  fields[key] = formatted;
+  return true;
+}
+
+function enrichDocumentTaxRateFields(doc: CaseDoc) {
+  const fields = { ...doc.fields };
+  let changed = false;
+  const taxMode = inferTaxModeFromGstins(fields);
+  const lineRates = (doc.lineItems ?? [])
+    .map((item) => getLineItemTaxRateForMode(item, taxMode))
+    .filter((value): value is number => value !== null);
+  const amountDerivedRate = inferTaxRateFromAmounts(fields);
+  const totalRate =
+    amountDerivedRate ??
+    parseTaxRateField(fields.taxRate) ??
+    getDominantLineItemTaxRateForMode(doc.lineItems, taxMode) ??
+    selectDominantTaxRate(lineRates) ??
+    null;
+
+  if (taxMode !== "unknown") {
+    const resolvedTotalRate =
+      normalizeKnownGstRate(amountDerivedRate) ??
+      normalizeKnownGstRate(parseTaxRateField(fields.taxRate)) ??
+      normalizeKnownGstRate(getDominantLineItemTaxRateForMode(doc.lineItems, taxMode)) ??
+      normalizeKnownGstRate(selectDominantTaxRate(lineRates)) ??
+      normalizeKnownGstRate(totalRate) ??
+      DEFAULT_GST_RATE;
+    changed = setDocumentTaxRateField(fields, "taxRate", resolvedTotalRate) || changed;
+
+    if (taxMode === "split") {
+      changed = setDocumentTaxRateField(fields, "cgstRate", resolvedTotalRate / 2) || changed;
+      changed = setDocumentTaxRateField(fields, "sgstRate", resolvedTotalRate / 2) || changed;
+      if (fields.igstRate) {
+        delete fields.igstRate;
+        changed = true;
+      }
+    } else {
+      changed = setDocumentTaxRateField(fields, "igstRate", resolvedTotalRate) || changed;
+      if (fields.cgstRate) {
+        delete fields.cgstRate;
+        changed = true;
+      }
+      if (fields.sgstRate) {
+        delete fields.sgstRate;
+        changed = true;
+      }
+    }
+
+    return changed ? { ...doc, fields } : doc;
+  }
+
+  if (totalRate !== null && !fields.taxRate) {
+    fields.taxRate = formatNumberForField(totalRate);
+    changed = true;
+  }
+
+  const cgstRate = parseTaxRateField(fields.cgstRate) ?? getDominantLineItemSpecificTaxRate(doc.lineItems, "cgstRate");
+  const sgstRate = parseTaxRateField(fields.sgstRate) ?? getDominantLineItemSpecificTaxRate(doc.lineItems, "sgstRate");
+  const igstRate = parseTaxRateField(fields.igstRate) ?? getDominantLineItemSpecificTaxRate(doc.lineItems, "igstRate");
+
+  if (cgstRate !== null && !fields.cgstRate) {
+    fields.cgstRate = formatNumberForField(cgstRate);
+    changed = true;
+  }
+  if (sgstRate !== null && !fields.sgstRate) {
+    fields.sgstRate = formatNumberForField(sgstRate);
+    changed = true;
+  }
+  if (igstRate !== null && !fields.igstRate) {
+    fields.igstRate = formatNumberForField(igstRate);
+    changed = true;
+  }
+
+  return changed ? { ...doc, fields } : doc;
+}
+
 function parseVisibleTaxRate(value: string) {
   const normalized = value.startsWith(".") ? `0${value}` : value;
   return normalizeTaxRateValue(Number(normalized));
@@ -1921,7 +2269,16 @@ function correctCommercialTotals(doc: CaseDoc) {
 }
 
 function enrichCommercialAmounts(documents: CaseDoc[]) {
-  return documents.map(correctCommercialTotals);
+  return enrichDocumentsWithPacketGstTaxContext(
+    documents.map((doc) => enrichDocumentTaxRateFields(correctCommercialTotals(doc)))
+  );
+}
+
+function applyConsigneeBuyerGuardToDocuments(documents: CaseDoc[]) {
+  return documents.map((doc) => {
+    const fields = applyConsigneeBuyerGuard(doc.fields, doc.md ?? "");
+    return areFieldRecordsEqual(doc.fields, fields) ? doc : { ...doc, fields };
+  });
 }
 
 export function enrichProcessedDocuments(documents: CaseDoc[]) {
@@ -1932,7 +2289,8 @@ export function enrichProcessedDocuments(documents: CaseDoc[]) {
   const withInvoiceEWay = enrichInvoiceEWayBillNumbers(withEWayCore);
   const withParties = enrichEWayBillParties(withInvoiceEWay);
   const withVehicles = enrichWeighmentVehicleNumbers(withParties);
-  return normalizeIdentifierDisplayFields(enrichCommercialAmounts(withVehicles));
+  const withConsigneeGuard = applyConsigneeBuyerGuardToDocuments(withVehicles);
+  return normalizeIdentifierDisplayFields(enrichCommercialAmounts(withConsigneeGuard));
 }
 
 function toText(value: unknown): string {
@@ -1951,6 +2309,25 @@ function toText(value: unknown): string {
   }
   if (value === null || value === undefined) return "";
   return String(value).trim();
+}
+
+function formatLineItemRateLabel(label: string, value?: string) {
+  const trimmed = value?.trim();
+  if (!trimmed) return "";
+  return `${label} ${trimmed.endsWith("%") ? trimmed : `${trimmed}%`}`;
+}
+
+function getLineItemTaxAmount(item: CommercialLineItem) {
+  if (item.taxAmount) return item.taxAmount;
+  if (item.igstAmount) return item.igstAmount;
+
+  const cgstAmount = parseLooseNumber(item.cgstAmount);
+  const sgstAmount = parseLooseNumber(item.sgstAmount);
+  if (cgstAmount !== null && sgstAmount !== null) {
+    return formatNumberForField(cgstAmount + sgstAmount);
+  }
+
+  return item.cgstAmount ?? item.sgstAmount ?? "";
 }
 
 function buildMarkdown(doc: CaseDoc, visibleTextPages: string[] = []): string {
@@ -1973,12 +2350,19 @@ function buildMarkdown(doc: CaseDoc, visibleTextPages: string[] = []): string {
     lines.push("## Line Items", "");
     doc.lineItems.forEach((item, index) => {
       const label = item.lineNumber ? `Line ${item.lineNumber}` : `Line ${index + 1}`;
+      const taxAmount = getLineItemTaxAmount(item);
       const parts = [
         item.itemCode,
         item.description,
         item.hsnSac ? `HSN ${item.hsnSac}` : "",
         item.quantity && item.unit ? `${item.quantity} ${item.unit}` : item.quantity,
         item.rate ? `rate ${item.rate}` : "",
+        item.taxableAmount ? `taxable ${item.taxableAmount}` : "",
+        formatLineItemRateLabel("GST", item.taxRate),
+        formatLineItemRateLabel("CGST", item.cgstRate),
+        formatLineItemRateLabel("SGST", item.sgstRate),
+        formatLineItemRateLabel("IGST", item.igstRate),
+        taxAmount ? `tax ${taxAmount}` : "",
         item.lineTotal ? `total ${item.lineTotal}` : "",
       ].filter(Boolean);
       lines.push(`- **${label}**: ${parts.join(" | ") || item.rawText || "Extracted row"}`);
@@ -2051,7 +2435,8 @@ export async function classifyDocumentFromImage(image: string, fileName = ""): P
           role: "system",
           content:
             `Classify procurement packet pages. Return only JSON like {"documentType":"Purchase Order"} using one of: ${SUPPORTED_DOC_TYPES.join(", ")}. ` +
-            "Some pages may be handwritten/manual or mixed printed and handwritten; classify by the document layout and purpose, not only by machine-readable printed text.",
+            "Some pages may be handwritten/manual or mixed printed and handwritten; classify by the document layout and purpose, not only by machine-readable printed text. " +
+            "If the page is headed Delivery Challan or shows Challan No/Challan Date, classify it as Delivery Challan even when it references a PO No; PO No on logistics documents is only a reference.",
         },
         {
           role: "user",
@@ -2115,6 +2500,7 @@ export async function extractDataFromImages(params: {
               "visibleText must be a raw OCR-style transcription of the important visible text on the page, preserving line breaks where useful. " +
               IMAGE_HANDWRITTEN_EXTRACTION_INSTRUCTION +
               AMOUNT_EXTRACTION_INSTRUCTION +
+              CONSIGNEE_EXTRACTION_INSTRUCTION +
               lineItemInstruction +
               photoEvidenceVehicleInstruction +
               poNumberExtractionInstruction +
@@ -2123,7 +2509,7 @@ export async function extractDataFromImages(params: {
               eWayBillExtractionInstruction +
               "For stamp/signature presence fields, return only Yes, No, or Unclear. Use Yes only when the mark is visibly present, No only when the relevant area is visible and clearly absent, otherwise Unclear. " +
               "For FASTag Toll Proof documents, extract statement reference, customer ID/name, statement period/date, vehicle number, tag account number, trip count, opening/credit/debit/closing balances, recharge/payment amount, toll plaza, and a compact toll transaction summary using the canonical FASTag keys. " +
-              "For party roles on seller-issued documents, vendorName is the issuing supplier/seller/consignor and buyerName is the receiving buyer, bill-to party, ship-to party, consignee, customer, or purchaser. " +
+              "For party roles on seller-issued documents, vendorName is the issuing supplier/seller/consignor and buyerName is the receiving buyer, bill-to party, customer, or purchaser. Only use ship-to/consignee/recipient as buyerName when that party is Kalika. " +
               "For Purchase Order documents, vendorName is the supplier/vendor receiving the order and buyerName is the purchaser issuing the order. Never swap these roles. " +
               "Omit any field that is not visible or not applicable to this document type. If structured fields are hard to identify, still return visibleText. Do not hallucinate.",
             },
@@ -2138,7 +2524,7 @@ export async function extractDataFromImages(params: {
                   `Extract only clearly visible ${documentType}-specific fields from this allowed schema: ${allowedFieldKeysText}. ` +
                   "Also transcribe the visible text into visibleText even if the structured fields object is empty. " +
                   "Treat printed and handwritten entries equally when they are readable. " +
-                  "If both supplier and receiver are visible, map seller-issued documents as seller/consignor to vendorName and receiving buyer/bill-to/ship-to/consignee to buyerName. For purchase orders, map the supplier/vendor receiving the order to vendorName. " +
+                  "If both supplier and receiver are visible, map seller-issued documents as seller/consignor to vendorName and receiving buyer/bill-to/customer/purchaser to buyerName. Only use ship-to/consignee/recipient as buyerName when that party is Kalika. For purchase orders, map the supplier/vendor receiving the order to vendorName. " +
                   "Preserve exact document numbers, vehicle ids, GSTINs, weights, dates, and financial totals.",
               },
               { type: "image_url", image_url: { url: image } },
@@ -2186,7 +2572,10 @@ export async function extractDataFromImages(params: {
         applyPhotoEvidenceVehicleVisibilityCopy(
           applyFastagDetailsFallback(
             applyEWayBillAddressFallback(
-              applyPurchaseOrderDateFallback(mappedFields, documentType, visibleText),
+              applyConsigneeBuyerGuard(
+                applyPurchaseOrderDateFallback(mappedFields, documentType, visibleText),
+                visibleText
+              ),
               documentType,
               visibleText
             ),

@@ -21,34 +21,94 @@ export type DocTypeSettingRow = {
 };
 
 const DEFAULT_ORG_ID = "default";
+const FIELD_SETTINGS_CACHE_TTL_MS = 60_000;
+
+type FieldSettingsPayload = {
+  fieldSettings: FieldSettingRow[];
+  docTypeSettings: DocTypeSettingRow[];
+};
+
+const fieldSettingsCache = new Map<string, { value: FieldSettingsPayload; expiresAt: number }>();
+const pendingFieldSettingsReads = new Map<string, Promise<FieldSettingsPayload | null>>();
+
+function getCachedFieldSettings(orgId: string) {
+  const cached = fieldSettingsCache.get(orgId);
+  if (!cached) {
+    return null;
+  }
+
+  if (cached.expiresAt <= Date.now()) {
+    fieldSettingsCache.delete(orgId);
+    return null;
+  }
+
+  return cached.value;
+}
+
+function cacheFieldSettings(orgId: string, value: FieldSettingsPayload) {
+  fieldSettingsCache.set(orgId, {
+    value,
+    expiresAt: Date.now() + FIELD_SETTINGS_CACHE_TTL_MS,
+  });
+}
+
+function clearFieldSettingsCache(orgId: string = DEFAULT_ORG_ID) {
+  fieldSettingsCache.delete(orgId);
+}
 
 export async function getFieldSettings(orgId: string = DEFAULT_ORG_ID) {
+  const cached = getCachedFieldSettings(orgId);
+  if (cached) {
+    return cached;
+  }
+
+  const pending = pendingFieldSettingsReads.get(orgId);
+  if (pending) {
+    return pending;
+  }
+
+  const readPromise = readFieldSettings(orgId).finally(() => {
+    pendingFieldSettingsReads.delete(orgId);
+  });
+  pendingFieldSettingsReads.set(orgId, readPromise);
+  return readPromise;
+}
+
+async function readFieldSettings(orgId: string): Promise<FieldSettingsPayload | null> {
   const supabase = createSupabaseAdminClient();
-  
-  const { data: fieldSettings, error: fieldError } = await supabase
-    .from("field_settings")
-    .select("*")
-    .eq("organization_id", orgId);
+
+  const [fieldResult, docTypeResult] = await Promise.all([
+    supabase
+      .from("field_settings")
+      .select("*")
+      .eq("organization_id", orgId),
+    supabase
+      .from("doc_type_settings")
+      .select("*")
+      .eq("organization_id", orgId),
+  ]);
+
+  const { data: fieldSettings, error: fieldError } = fieldResult;
 
   if (fieldError) {
     console.error("Error fetching field settings:", fieldError);
     return null;
   }
 
-  const { data: docTypeSettings, error: docError } = await supabase
-    .from("doc_type_settings")
-    .select("*")
-    .eq("organization_id", orgId);
+  const { data: docTypeSettings, error: docError } = docTypeResult;
 
   if (docError) {
     console.error("Error fetching doc type settings:", docError);
     return null;
   }
 
-  return {
+  const payload = {
     fieldSettings: fieldSettings as FieldSettingRow[],
     docTypeSettings: docTypeSettings as DocTypeSettingRow[],
   };
+
+  cacheFieldSettings(orgId, payload);
+  return payload;
 }
 
 export async function getPersistedPacketFieldConfiguration(
@@ -91,6 +151,7 @@ export async function saveFieldSettings(
     return false;
   }
 
+  clearFieldSettingsCache(orgId);
   return true;
 }
 
@@ -118,6 +179,7 @@ export async function saveDocTypeSettings(
     return false;
   }
 
+  clearFieldSettingsCache(orgId);
   return true;
 }
 
@@ -128,6 +190,7 @@ export async function initializeDefaultSettings() {
     [],
     { onConflict: "organization_id,doc_type,field_key" }
   );
-  
+
+  clearFieldSettingsCache();
   return !error;
 }

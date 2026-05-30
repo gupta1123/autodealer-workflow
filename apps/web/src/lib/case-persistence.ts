@@ -27,6 +27,13 @@ export type SavedCaseRecord = {
   deletedAt: string | null;
 };
 
+export type DuplicateCaseReference = {
+  id: string;
+  displayName: string;
+  status: string;
+  createdAt: string;
+};
+
 export type SavedCaseFile = {
   id: string;
   originalName: string;
@@ -97,6 +104,11 @@ type CreateCaseResponse = {
   case: SavedCaseRecord;
 };
 
+type CreateCaseApiResponse = {
+  case?: SavedCaseRecord;
+  duplicateCase?: DuplicateCaseReference;
+};
+
 type EnqueueCaseAnalysisResponse = CreateCaseResponse & {
   job?: SavedAnalysisJob | null;
 };
@@ -108,6 +120,12 @@ type CaseAnalysisStatusResponse = {
 
 type RecentCasesResponse = {
   cases: SavedCaseRecord[];
+  nextCursor?: string | null;
+  hasMore?: boolean;
+  page?: number;
+  pageSize?: number;
+  totalCount?: number;
+  totalPages?: number;
 };
 
 type CaseDetailResponse = SavedCaseDetail;
@@ -118,6 +136,15 @@ type CaseFileSignedUrlResponse = {
 export type CaseListScope = "active" | "deleted";
 export type CaseDecision = "accepted" | "rejected";
 export type MismatchDecision = "accepted" | "rejected";
+
+export type FetchCasesOptions = {
+  scope: CaseListScope;
+  limit?: number;
+  cursor?: string | null;
+  page?: number | null;
+  query?: string;
+  signal?: AbortSignal;
+};
 
 type UpdateCaseMismatchDecisionResponse = {
   caseStatus: string;
@@ -143,13 +170,26 @@ const AUTH_SESSION_ERROR =
 class ApiRequestError extends Error {
   status?: number;
   isAuthError: boolean;
+  duplicateCase?: DuplicateCaseReference;
 
-  constructor(message: string, options?: { status?: number; isAuthError?: boolean }) {
+  constructor(
+    message: string,
+    options?: {
+      status?: number;
+      isAuthError?: boolean;
+      duplicateCase?: DuplicateCaseReference;
+    }
+  ) {
     super(message);
     this.name = "ApiRequestError";
     this.status = options?.status;
     this.isAuthError = Boolean(options?.isAuthError);
+    this.duplicateCase = options?.duplicateCase;
   }
+}
+
+export function getDuplicateCaseFromError(error: unknown) {
+  return error instanceof ApiRequestError ? (error.duplicateCase ?? null) : null;
 }
 
 function appendUploadsToFormData(formData: FormData, uploads: QueuedUpload[]) {
@@ -286,6 +326,30 @@ function extractApiError(
   return fallback;
 }
 
+function readDuplicateCase(payload: unknown): DuplicateCaseReference | undefined {
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+
+  const duplicateCase = (payload as { duplicateCase?: unknown }).duplicateCase;
+  if (!duplicateCase || typeof duplicateCase !== "object") {
+    return undefined;
+  }
+
+  const record = duplicateCase as Partial<DuplicateCaseReference>;
+  return typeof record.id === "string" &&
+    typeof record.displayName === "string" &&
+    typeof record.status === "string" &&
+    typeof record.createdAt === "string"
+    ? {
+        id: record.id,
+        displayName: record.displayName,
+        status: record.status,
+        createdAt: record.createdAt,
+      }
+    : undefined;
+}
+
 function toApiRequestError(
   payload: unknown,
   fallback: string,
@@ -293,6 +357,7 @@ function toApiRequestError(
 ) {
   const isAuthError = isAuthErrorPayload(payload, options?.status);
   const message = extractApiError(payload, fallback, options);
+  const duplicateCase = readDuplicateCase(payload);
 
   if (isAuthError) {
     redirectToLogin(message);
@@ -301,6 +366,7 @@ function toApiRequestError(
   return new ApiRequestError(message, {
     status: options?.status,
     isAuthError,
+    duplicateCase,
   });
 }
 
@@ -324,7 +390,7 @@ export async function persistProcessedCase(params: {
     body: formData,
   });
 
-  const { payload, rawText } = await readApiResponse<CreateCaseResponse>(response);
+  const { payload, rawText } = await readApiResponse<CreateCaseApiResponse>(response);
 
   if (!response.ok || !payload.case) {
     throw toApiRequestError(payload, "Failed to save processed case to Supabase.", {
@@ -349,7 +415,7 @@ export async function createDraftCase(params: {
     body: formData,
   });
 
-  const { payload, rawText } = await readApiResponse<CreateCaseResponse>(response);
+  const { payload, rawText } = await readApiResponse<CreateCaseApiResponse>(response);
 
   if (!response.ok || !payload.case) {
     throw toApiRequestError(payload, "Failed to create draft case.", {
@@ -477,35 +543,39 @@ export async function fetchCaseAnalysisStatus(
 }
 
 export async function fetchRecentCases(limit = 12): Promise<RecentCasesResponse> {
-  const query = new URLSearchParams();
-  query.set("limit", String(limit));
-  query.set("scope", "active");
-
-  const response = await performApiFetch(`/api/cases?${query.toString()}`, {
-    cache: "no-store",
-  });
-  const { payload, rawText } = await readApiResponse<RecentCasesResponse>(response);
-
-  if (!response.ok || !Array.isArray(payload.cases)) {
-    throw toApiRequestError(payload, "Failed to load saved cases.", {
-      status: response.status,
-      rawText,
-    });
-  }
-
-  return { cases: payload.cases };
+  return fetchCasePage({ scope: "active", limit });
 }
 
 export async function fetchCasesByScope(
   scope: CaseListScope,
   limit = 100
 ): Promise<RecentCasesResponse> {
+  return fetchCasePage({ scope, limit });
+}
+
+export async function fetchCasePage({
+  scope,
+  limit = 25,
+  cursor,
+  page,
+  query: searchQuery,
+  signal,
+}: FetchCasesOptions): Promise<RecentCasesResponse> {
   const query = new URLSearchParams();
   query.set("limit", String(limit));
   query.set("scope", scope);
+  if (cursor) {
+    query.set("cursor", cursor);
+  } else if (page && page > 0) {
+    query.set("page", String(Math.floor(page)));
+  }
+  if (searchQuery?.trim()) {
+    query.set("q", searchQuery.trim());
+  }
 
   const response = await performApiFetch(`/api/cases?${query.toString()}`, {
     cache: "no-store",
+    signal,
   });
   const { payload, rawText } = await readApiResponse<RecentCasesResponse>(response);
 
@@ -516,7 +586,15 @@ export async function fetchCasesByScope(
     });
   }
 
-  return { cases: payload.cases };
+  return {
+    cases: payload.cases,
+    nextCursor: payload.nextCursor ?? null,
+    hasMore: Boolean(payload.hasMore),
+    page: payload.page,
+    pageSize: payload.pageSize,
+    totalCount: payload.totalCount,
+    totalPages: payload.totalPages,
+  };
 }
 
 async function mutateCase(

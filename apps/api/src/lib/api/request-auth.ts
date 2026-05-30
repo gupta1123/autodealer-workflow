@@ -1,6 +1,15 @@
-import { createClient, type User } from "@supabase/supabase-js";
+import { createClient } from "@supabase/supabase-js";
 
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+
+type RequestUser = { id: string };
+
+const AUTH_CACHE_TTL_MS = 60_000;
+const AUTH_EXPIRY_SAFETY_MS = 15_000;
+
+let tokenValidationClient: ReturnType<typeof createClient> | null = null;
+const bearerUserCache = new Map<string, { user: RequestUser; expiresAt: number }>();
+const pendingBearerValidations = new Map<string, Promise<RequestUser | null>>();
 
 function requireEnv(name: string, value?: string) {
   if (!value) {
@@ -10,7 +19,11 @@ function requireEnv(name: string, value?: string) {
 }
 
 function createTokenValidationClient() {
-  return createClient(
+  if (tokenValidationClient) {
+    return tokenValidationClient;
+  }
+
+  tokenValidationClient = createClient(
     requireEnv("NEXT_PUBLIC_SUPABASE_URL", process.env.NEXT_PUBLIC_SUPABASE_URL),
     requireEnv(
       "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
@@ -23,6 +36,62 @@ function createTokenValidationClient() {
       },
     }
   );
+
+  return tokenValidationClient;
+}
+
+function getTokenCacheExpiry(expClaim: unknown) {
+  const maxExpiry = Date.now() + AUTH_CACHE_TTL_MS;
+
+  if (typeof expClaim !== "number" || !Number.isFinite(expClaim)) {
+    return maxExpiry;
+  }
+
+  return Math.min(maxExpiry, expClaim * 1000 - AUTH_EXPIRY_SAFETY_MS);
+}
+
+async function validateBearerToken(token: string): Promise<RequestUser | null> {
+  const supabase = createTokenValidationClient();
+  const { data, error } = await supabase.auth.getClaims(token);
+
+  if (error || !data || typeof data.claims.sub !== "string" || !data.claims.sub) {
+    return null;
+  }
+
+  const user = { id: data.claims.sub };
+  const expiresAt = getTokenCacheExpiry(data.claims.exp);
+  if (expiresAt > Date.now()) {
+    bearerUserCache.set(token, { user, expiresAt });
+  }
+
+  return user;
+}
+
+function getCachedBearerUser(token: string) {
+  const cached = bearerUserCache.get(token);
+  if (!cached) {
+    return null;
+  }
+
+  if (cached.expiresAt <= Date.now()) {
+    bearerUserCache.delete(token);
+    return null;
+  }
+
+  return cached.user;
+}
+
+function getBearerValidation(token: string) {
+  const pending = pendingBearerValidations.get(token);
+  if (pending) {
+    return pending;
+  }
+
+  const validation = validateBearerToken(token).finally(() => {
+    pendingBearerValidations.delete(token);
+  });
+  pendingBearerValidations.set(token, validation);
+  return validation;
 }
 
 function getBearerToken(request: Request) {
@@ -35,30 +104,30 @@ function getBearerToken(request: Request) {
   return match?.[1] ?? null;
 }
 
-async function resolveUserFromBearer(request: Request): Promise<User | null> {
+async function resolveUserFromBearer(request: Request): Promise<RequestUser | null> {
   const token = getBearerToken(request);
   if (!token) {
     return null;
   }
 
-  const supabase = createTokenValidationClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser(token);
+  const cachedUser = getCachedBearerUser(token);
+  if (cachedUser) {
+    return cachedUser;
+  }
 
-  return user ?? null;
+  return getBearerValidation(token);
 }
 
-async function resolveUserFromCookies() {
+async function resolveUserFromCookies(): Promise<RequestUser | null> {
   const supabase = await createSupabaseServerClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
 
-  return user ?? null;
+  return user ? { id: user.id } : null;
 }
 
-export async function requireRequestUser(request: Request) {
+export async function requireRequestUser(request: Request): Promise<RequestUser | null> {
   const bearerUser = await resolveUserFromBearer(request);
   if (bearerUser) {
     return bearerUser;

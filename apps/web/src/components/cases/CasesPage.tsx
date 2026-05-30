@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   Search,
   FolderOpen,
@@ -12,6 +13,8 @@ import {
   List,
   Upload,
   Trash2,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
@@ -27,13 +30,32 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import {
-  fetchCasesByScope,
+  fetchCasePage,
   recycleCase,
   type SavedCaseRecord,
 } from "@/lib/case-persistence";
 
 type LoadState = "loading" | "ready" | "error";
 type ViewMode = "grid" | "table";
+type CachedCaseList = {
+  cases: SavedCaseRecord[];
+  totalCount: number;
+  totalPages: number;
+};
+
+const CASE_LIST_PAGE_SIZE = 25;
+const caseListCache = new Map<string, CachedCaseList>();
+
+function getCaseListCacheKey(query: string, page: number) {
+  return `active:${query.trim().toLowerCase()}:page:${page}`;
+}
+
+function getVisiblePages(currentPage: number, totalPages: number) {
+  const pages = new Set([1, totalPages, currentPage - 1, currentPage, currentPage + 1]);
+  return Array.from(pages)
+    .filter((page) => page >= 1 && page <= totalPages)
+    .sort((a, b) => a - b);
+}
 
 function formatDateTime(value: string) {
   return new Date(value).toLocaleString("en-US", {
@@ -179,50 +201,90 @@ function CasesLoadingSkeleton({ viewMode }: { viewMode: ViewMode }) {
 }
 
 export function CasesPage() {
+  const router = useRouter();
   const [cases, setCases] = useState<SavedCaseRecord[]>([]);
   const [status, setStatus] = useState<LoadState>("loading");
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalCount, setTotalCount] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
   const [viewMode, setViewMode] = useState<ViewMode>("table");
   const [pendingCase, setPendingCase] = useState<SavedCaseRecord | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const isMobileView = useIsMobileView();
+  const cacheKey = useMemo(
+    () => getCaseListCacheKey(debouncedSearchQuery, currentPage),
+    [currentPage, debouncedSearchQuery]
+  );
 
   useEffect(() => {
-    let active = true;
+    const timeout = window.setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery.trim());
+      setCurrentPage(1);
+    }, 250);
 
-    fetchCasesByScope("active", 100)
+    return () => window.clearTimeout(timeout);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    const cached = caseListCache.get(cacheKey);
+    if (cached) {
+      setCases(cached.cases);
+      setTotalCount(cached.totalCount);
+      setTotalPages(cached.totalPages);
+      setStatus("ready");
+      setError(null);
+      return;
+    }
+
+    const controller = new AbortController();
+
+    setCases([]);
+    setTotalCount(0);
+    setTotalPages(1);
+    setStatus("loading");
+    setError(null);
+
+    fetchCasePage({
+      scope: "active",
+      limit: CASE_LIST_PAGE_SIZE,
+      page: currentPage,
+      query: debouncedSearchQuery,
+      signal: controller.signal,
+    })
       .then((payload) => {
-        if (!active) return;
+        const nextTotalCount = payload.totalCount ?? payload.cases.length;
+        const nextTotalPages = payload.totalPages ?? 1;
         setCases(payload.cases);
+        setTotalCount(nextTotalCount);
+        setTotalPages(nextTotalPages);
         setStatus("ready");
+        caseListCache.set(cacheKey, {
+          cases: payload.cases,
+          totalCount: nextTotalCount,
+          totalPages: nextTotalPages,
+        });
       })
       .catch((loadError) => {
-        if (!active) return;
+        if (controller.signal.aborted) return;
         setError(loadError instanceof Error ? loadError.message : "Failed to load cases.");
         setStatus("error");
       });
 
     return () => {
-      active = false;
+      controller.abort();
     };
-  }, []);
+  }, [cacheKey, currentPage, debouncedSearchQuery]);
 
   const totalDocs = useMemo(() => cases.reduce((acc, curr) => acc + curr.documentCount, 0), [cases]);
-
-  // Client-side filtering logic
-  const filteredCases = useMemo(() => {
-    if (!searchQuery.trim()) return cases;
-    const query = searchQuery.toLowerCase();
-
-    return cases.filter((c) =>
-      c.displayName.toLowerCase().includes(query) ||
-      (c.receiverName && c.receiverName.toLowerCase().includes(query)) ||
-      c.category.toLowerCase().includes(query) ||
-      (c.poNumber && c.poNumber.toLowerCase().includes(query)) ||
-      c.slug.toLowerCase().includes(query)
-    );
-  }, [cases, searchQuery]);
+  const visiblePages = useMemo(
+    () => getVisiblePages(currentPage, totalPages),
+    [currentPage, totalPages]
+  );
+  const pageStart = totalCount === 0 ? 0 : (currentPage - 1) * CASE_LIST_PAGE_SIZE + 1;
+  const pageEnd = Math.min(currentPage * CASE_LIST_PAGE_SIZE, totalCount);
 
   const effectiveViewMode: ViewMode = isMobileView ? "grid" : viewMode;
 
@@ -233,7 +295,22 @@ export function CasesPage() {
       setIsDeleting(true);
       setError(null);
       await recycleCase(pendingCase.id);
-      setCases((current) => current.filter((item) => item.id !== pendingCase.id));
+      const nextTotalCount = Math.max(0, totalCount - 1);
+      const nextTotalPages = Math.max(1, Math.ceil(nextTotalCount / CASE_LIST_PAGE_SIZE));
+      setCases((current) => {
+        const nextCases = current.filter((item) => item.id !== pendingCase.id);
+        caseListCache.set(cacheKey, {
+          cases: nextCases,
+          totalCount: nextTotalCount,
+          totalPages: nextTotalPages,
+        });
+        return nextCases;
+      });
+      setTotalCount(nextTotalCount);
+      setTotalPages(nextTotalPages);
+      if (currentPage > nextTotalPages) {
+        setCurrentPage(nextTotalPages);
+      }
       setPendingCase(null);
     } catch (mutationError) {
       setError(
@@ -302,7 +379,7 @@ export function CasesPage() {
                 {status === "loading" ? (
                   <Skeleton className="h-3.5 w-36 bg-[#e5ddd0]" />
                 ) : (
-                  `${cases.length} folders • ${totalDocs} documents`
+                  `${totalCount} folders • ${totalDocs} documents on this page`
                 )}
               </div>
 
@@ -336,7 +413,9 @@ export function CasesPage() {
               {status === "loading" ? (
                 <Skeleton className="h-3.5 w-32 bg-slate-100" />
               ) : (
-                <span className="text-slate-400">({filteredCases.length} in current view)</span>
+                <span className="text-slate-400">
+                  ({pageStart}-{pageEnd} of {totalCount})
+                </span>
               )}
             </div>
           </div>
@@ -365,24 +444,32 @@ export function CasesPage() {
                 <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-full bg-slate-50 border border-slate-100 shadow-sm">
                   <Database className="h-8 w-8 text-slate-300" />
                 </div>
-                <h3 className="text-lg font-bold text-slate-900">Directory is empty</h3>
+                <h3 className="text-lg font-bold text-slate-900">
+                  {debouncedSearchQuery ? "No matching cases" : "Directory is empty"}
+                </h3>
                 <p className="mt-2 text-sm font-medium text-slate-500 max-w-sm">
-                  No cases have been processed yet. Upload your first packet to see it here.
+                  {debouncedSearchQuery
+                    ? "Try a different case name, receiver, PO, invoice, or slug."
+                    : "No cases have been processed yet. Upload your first packet to see it here."}
                 </p>
-                <Button asChild className="mt-6 rounded-lg font-bold bg-[#1a1a1a] hover:bg-[#2d2d2d] text-white">
-                  <Link href="/workspace">Start Upload</Link>
-                </Button>
+                {!debouncedSearchQuery && (
+                  <Button asChild className="mt-6 rounded-lg font-bold bg-[#1a1a1a] hover:bg-[#2d2d2d] text-white">
+                    <Link href="/workspace">Start Upload</Link>
+                  </Button>
+                )}
               </div>
             )}
 
-            {status === "ready" && filteredCases.length > 0 && (
+            {status === "ready" && cases.length > 0 && (
               effectiveViewMode === "grid" ? (
                 <div className="grid grid-cols-1 gap-3 px-4 sm:grid-cols-2 md:px-6 lg:grid-cols-3 xl:grid-cols-4">
-                  {filteredCases.map((item) => (
+                  {cases.map((item) => (
                     <Link
                       key={item.id}
                       href={`/cases/${item.id}`}
                       className="group flex flex-col rounded-xl border border-[#e5ddd0] bg-white p-3.5 shadow-sm transition-all hover:-translate-y-px hover:border-[#d4c9b8] hover:shadow-md"
+                      onFocus={() => router.prefetch(`/cases/${item.id}`)}
+                      onMouseEnter={() => router.prefetch(`/cases/${item.id}`)}
                     >
                       <div className="flex items-start justify-between gap-2">
                         <div className="flex min-w-0 items-start gap-2.5">
@@ -441,13 +528,18 @@ export function CasesPage() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {filteredCases.map((item) => (
+                    {cases.map((item) => (
                       <TableRow
                         key={item.id}
                         className="group cursor-pointer border-slate-100/60 transition-colors hover:bg-slate-50/80 h-11"
                       >
                         <TableCell className="py-2 pl-4 md:pl-6">
-                          <Link href={`/cases/${item.id}`} className="flex items-center gap-2.5 outline-none">
+                          <Link
+                            href={`/cases/${item.id}`}
+                            className="flex items-center gap-2.5 outline-none"
+                            onFocus={() => router.prefetch(`/cases/${item.id}`)}
+                            onMouseEnter={() => router.prefetch(`/cases/${item.id}`)}
+                          >
                             <div className="w-7 h-7 rounded-md bg-[#f0ece6] border border-[#e5ddd0] text-[#5a5046] flex items-center justify-center shrink-0">
                               <Folder className="w-3.5 h-3.5 fill-[#e5ddd0]" />
                             </div>
@@ -486,7 +578,12 @@ export function CasesPage() {
 
                         <TableCell className="pr-4 md:pr-6 py-2 text-right">
                           <div className="flex items-center justify-end gap-3 opacity-0 group-hover:opacity-100 transition-opacity">
-                            <Link href={`/cases/${item.id}`} className="text-[13px] font-bold text-[#1a1a1a] hover:text-[#5a5046] transition-colors">
+                            <Link
+                              href={`/cases/${item.id}`}
+                              className="text-[13px] font-bold text-[#1a1a1a] hover:text-[#5a5046] transition-colors"
+                              onFocus={() => router.prefetch(`/cases/${item.id}`)}
+                              onMouseEnter={() => router.prefetch(`/cases/${item.id}`)}
+                            >
                               Open
                             </Link>
                             <button
@@ -504,6 +601,61 @@ export function CasesPage() {
                   </TableBody>
                 </Table>
               )
+            )}
+
+            {status === "ready" && totalCount > 0 && (
+              <div className="flex flex-col gap-3 border-t border-slate-100 px-4 py-4 text-sm font-semibold text-slate-500 md:flex-row md:items-center md:justify-between md:px-8">
+                <div>
+                  Showing {pageStart}-{pageEnd} of {totalCount}
+                </div>
+                <div className="flex items-center gap-1">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 border-[#d4c9b8] bg-white px-2 font-bold text-[#5a5046] hover:bg-[#faf8f4]"
+                    disabled={currentPage <= 1}
+                    onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}
+                    aria-label="Previous page"
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  {visiblePages.map((page, index) => {
+                    const previousPage = visiblePages[index - 1];
+                    return (
+                      <div key={page} className="flex items-center gap-1">
+                        {previousPage && page - previousPage > 1 && (
+                          <span className="px-1 text-slate-300">...</span>
+                        )}
+                        <Button
+                          type="button"
+                          variant={page === currentPage ? "default" : "outline"}
+                          size="sm"
+                          className={
+                            page === currentPage
+                              ? "h-8 min-w-8 bg-[#1a1a1a] px-2 font-bold text-white hover:bg-[#2d2d2d]"
+                              : "h-8 min-w-8 border-[#d4c9b8] bg-white px-2 font-bold text-[#5a5046] hover:bg-[#faf8f4]"
+                          }
+                          onClick={() => setCurrentPage(page)}
+                        >
+                          {page}
+                        </Button>
+                      </div>
+                    );
+                  })}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 border-[#d4c9b8] bg-white px-2 font-bold text-[#5a5046] hover:bg-[#faf8f4]"
+                    disabled={currentPage >= totalPages}
+                    onClick={() => setCurrentPage((page) => Math.min(totalPages, page + 1))}
+                    aria-label="Next page"
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
             )}
           </div>
         </div>

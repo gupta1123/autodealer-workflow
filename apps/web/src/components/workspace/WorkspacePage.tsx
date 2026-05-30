@@ -63,6 +63,7 @@ import {
   appendCaseFiles,
   createDraftCase,
   enqueueCaseAnalysis,
+  getDuplicateCaseFromError,
   updateCaseDecision,
   type CaseDecision,
 } from "@/lib/case-persistence";
@@ -996,6 +997,14 @@ export function WorkspacePage() {
       setCaseDraftCreated(true);
       setDraftCaseStatus("saved");
     } catch (createError) {
+      const duplicateCase = getDuplicateCaseFromError(createError);
+      if (duplicateCase) {
+        setDraftCaseError(null);
+        setDraftCaseStatus("saved");
+        router.replace(`/cases/${duplicateCase.id}`);
+        return;
+      }
+
       setDraftCaseError(createError instanceof Error ? createError.message : "Failed to create case.");
       setDraftCaseStatus("error");
     }
@@ -1055,6 +1064,14 @@ export function WorkspacePage() {
       setDraftCaseStatus("saved");
       router.replace(`/cases/${caseRecord.id}`);
     } catch (smartSplitError) {
+      const duplicateCase = getDuplicateCaseFromError(smartSplitError);
+      if (duplicateCase) {
+        setDraftCaseError(null);
+        setDraftCaseStatus("saved");
+        router.replace(`/cases/${duplicateCase.id}`);
+        return;
+      }
+
       setDraftCaseError(
         smartSplitError instanceof Error
           ? smartSplitError.message
