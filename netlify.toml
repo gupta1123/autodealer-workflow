@@ -2,6 +2,10 @@
 command = "npm run build:web"
 publish = "apps/web/.next"
 
+[build.environment]
+NODE_VERSION = "24"
+NPM_VERSION = "11"
+
 [[plugins]]
 package = "./netlify/plugins/api-proxy"
 
