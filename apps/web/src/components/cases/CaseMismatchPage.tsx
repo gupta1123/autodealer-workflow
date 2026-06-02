@@ -57,6 +57,7 @@ const LINE_ITEM_FIELD_LABELS: Record<string, string> = {
   "lineItems.hsnSacMismatch": "Line item HSN/SAC",
   "lineItems.amountMismatch": "Line item amount",
 };
+const TERMS_COMPLIANCE_FIELD = "termsAndConditions";
 
 function getFieldLabel(fieldName: string) {
   if (LINE_ITEM_FIELD_LABELS[fieldName]) {
@@ -116,6 +117,8 @@ function getIssueDescription(fieldName: string) {
       return "The invoice quantity is greater than the matching PO quantity.";
     case "lineItems.quantityMismatch":
       return "The matched line quantity differs between the documents.";
+    case TERMS_COMPLIANCE_FIELD:
+      return "A visible terms and conditions clause was assessed against the packet and needs correction or review.";
     case "taxAmount":
       return "The invoice tax amount and PO tax amount do not match.";
     case "totalAmount":
@@ -180,6 +183,25 @@ const CONTEXT_FIELDS_BY_MISMATCH: Array<{ fields: string[]; context: string[] }>
   {
     fields: ["subtotal", "taxAmount", "totalAmount", "paidAmount", "statementAmount", "currency"],
     context: ["currency", "subtotal", "taxAmount", "totalAmount", "paidAmount", "statementAmount"],
+  },
+  {
+    fields: [TERMS_COMPLIANCE_FIELD],
+    context: [
+      "termsAndConditions",
+      "paymentTerms",
+      "deliveryTerms",
+      "freightTerms",
+      "packingForwardingTerms",
+      "priceBasis",
+      "taxTerms",
+      "inspectionTerms",
+      "warrantyTerms",
+      "hasAuthorizedSignature",
+      "hasVendorStamp",
+      "hasStoreStamp",
+      "hasStoreSignature",
+      "hasGateStamp",
+    ],
   },
   {
     fields: ["lineItems.unmatchedDocumentLine", "lineItems.unmatchedInvoiceLine", "lineItems.uninvoicedPoLine", "lineItems.quantityExceeded", "lineItems.quantityMismatch", "lineItems.rateMismatch", "lineItems.unitMismatch", "lineItems.hsnSacMismatch", "lineItems.amountMismatch"],
@@ -249,10 +271,10 @@ function buildDocumentContextRows(
   const rows: DocumentContextRow[] = [];
   const primaryValue = getFieldValueFromDocument(document, fieldName);
 
-  if (isLineItemMismatchField(fieldName)) {
+  if (isLineItemMismatchField(fieldName) || fieldName === TERMS_COMPLIANCE_FIELD) {
     rows.push({
       key: "issueDetail",
-      label: "Issue detail",
+      label: fieldName === TERMS_COMPLIANCE_FIELD ? "Terms assessment" : "Issue detail",
       value: mismatchValue,
       emphasis: true,
     });
@@ -416,6 +438,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
     () =>
       detail?.mismatches.filter(
         (mismatch) =>
+          mismatch.fieldName === TERMS_COMPLIANCE_FIELD ||
           isLineItemMismatchField(mismatch.fieldName) ||
           (shouldConsiderFieldKey(mismatch.fieldName) && isPrimaryComparisonField(mismatch.fieldName))
       ) ?? [],

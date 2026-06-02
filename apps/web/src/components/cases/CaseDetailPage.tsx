@@ -86,6 +86,7 @@ const FIELD_LABEL_LOOKUP = ACTIVE_FIELD_DEFINITIONS.reduce(
   },
   {} as Record<string, string>
 );
+const TERMS_COMPLIANCE_FIELD = "termsAndConditions";
 
 const LINE_ITEM_COLUMNS: Array<{
   key: keyof CommercialLineItem;
@@ -560,6 +561,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     () =>
       detail?.mismatches.filter(
         (mismatch) =>
+          mismatch.fieldName === TERMS_COMPLIANCE_FIELD ||
           isLineItemMismatchField(mismatch.fieldName) ||
           (shouldConsiderFieldKey(mismatch.fieldName) && isPrimaryComparisonField(mismatch.fieldName))
       ) ?? [],

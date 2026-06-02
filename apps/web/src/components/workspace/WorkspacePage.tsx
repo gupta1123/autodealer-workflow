@@ -66,6 +66,7 @@ import {
   getDuplicateCaseFromError,
   updateCaseDecision,
   type CaseDecision,
+  type DuplicateCaseReference,
 } from "@/lib/case-persistence";
 import {
   CAMERA_SCAN_SOURCE,
@@ -458,6 +459,15 @@ function caseStatusClassName(status?: string) {
   return "border-slate-200 bg-slate-50 text-slate-600";
 }
 
+function formatDuplicateCaseDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+}
+
 export function WorkspacePage() {
   const router = useRouter();
   const {
@@ -479,6 +489,7 @@ export function WorkspacePage() {
   const [activeDocId, setActiveDocId] = useState<string | null>(null);
   const [activeMismatchId, setActiveMismatchId] = useState<string | null>(null);
   const [duplicateUploadConflicts, setDuplicateUploadConflicts] = useState<DuplicateUploadConflict[]>([]);
+  const [duplicateCaseNotice, setDuplicateCaseNotice] = useState<DuplicateCaseReference | null>(null);
   const [caseDraftCreated, setCaseDraftCreated] = useState(false);
   const [draftCaseStatus, setDraftCaseStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [draftCaseError, setDraftCaseError] = useState<string | null>(null);
@@ -623,6 +634,7 @@ export function WorkspacePage() {
       setDuplicateUploadConflicts(result.conflicts);
     }
     if (result?.acceptedUploads.length) {
+      setDuplicateCaseNotice(null);
       void persistDraftUploads(result.acceptedUploads);
     }
   };
@@ -636,6 +648,7 @@ export function WorkspacePage() {
     });
 
     if (result?.acceptedUploads.length) {
+      setDuplicateCaseNotice(null);
       void persistDraftUploads(result.acceptedUploads);
     }
   };
@@ -770,6 +783,7 @@ export function WorkspacePage() {
       strategy
     );
     if (result?.acceptedUploads.length) {
+      setDuplicateCaseNotice(null);
       void persistDraftUploads(result.acceptedUploads, strategy);
     }
     setDuplicateUploadConflicts([]);
@@ -970,6 +984,7 @@ export function WorkspacePage() {
   const resetWorkspace = () => {
     setCaseDraftCreated(false);
     setDuplicateUploadConflicts([]);
+    setDuplicateCaseNotice(null);
     setImagePreviewUploadId(null);
     setDraftCaseStatus("idle");
     setDraftCaseError(null);
@@ -1000,8 +1015,8 @@ export function WorkspacePage() {
       const duplicateCase = getDuplicateCaseFromError(createError);
       if (duplicateCase) {
         setDraftCaseError(null);
-        setDraftCaseStatus("saved");
-        router.replace(`/cases/${duplicateCase.id}`);
+        setDraftCaseStatus("idle");
+        setDuplicateCaseNotice(duplicateCase);
         return;
       }
 
@@ -1067,8 +1082,8 @@ export function WorkspacePage() {
       const duplicateCase = getDuplicateCaseFromError(smartSplitError);
       if (duplicateCase) {
         setDraftCaseError(null);
-        setDraftCaseStatus("saved");
-        router.replace(`/cases/${duplicateCase.id}`);
+        setDraftCaseStatus("idle");
+        setDuplicateCaseNotice(duplicateCase);
         return;
       }
 
@@ -1080,6 +1095,42 @@ export function WorkspacePage() {
       setDraftCaseStatus("error");
     }
   };
+
+  const duplicateCaseNoticePanel = duplicateCaseNotice ? (
+    <div className="mt-6 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-left shadow-sm">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <div className="flex min-w-0 gap-3">
+          <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-amber-200 bg-white text-amber-700">
+            <TriangleAlert className="h-5 w-5" />
+          </div>
+          <div className="min-w-0">
+            <div className="text-sm font-extrabold text-amber-900">Existing case found</div>
+            <p className="mt-1 text-sm font-medium leading-relaxed text-amber-800">
+              This upload already exists as <span className="font-bold">{duplicateCaseNotice.displayName}</span>.
+              Created {formatDuplicateCaseDate(duplicateCaseNotice.createdAt)}.
+            </p>
+          </div>
+        </div>
+        <div className="flex shrink-0 gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            className="rounded-xl border-amber-200 bg-white text-amber-900 hover:bg-amber-100"
+            onClick={resetWorkspace}
+          >
+            Clear upload
+          </Button>
+          <Button
+            type="button"
+            className="rounded-xl bg-amber-900 text-white hover:bg-amber-950"
+            onClick={() => router.replace(`/cases/${duplicateCaseNotice.id}`)}
+          >
+            Open existing case
+          </Button>
+        </div>
+      </div>
+    </div>
+  ) : null;
 
   const queuedUploadRail = hasUploads ? (
     <div className="w-full max-w-3xl space-y-3 text-left">
@@ -1348,6 +1399,7 @@ export function WorkspacePage() {
               {draftCaseError}
             </div>
           )}
+          {duplicateCaseNoticePanel}
 
           {hasUploads && (
             <motion.div
@@ -1432,6 +1484,7 @@ export function WorkspacePage() {
                   {draftCaseError}
                 </div>
               )}
+              {duplicateCaseNoticePanel}
             </div>
 
             <div className="w-full max-w-3xl rounded-[2rem] border border-[#e5ddd0] bg-white p-6 shadow-sm">

@@ -138,6 +138,21 @@ function normalizeMatchKey(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+const INTERNAL_PARTY_NAME_HINTS = [
+  "kalika",
+  "kalika steel",
+  "kalika steels",
+  "kalika steel alloys",
+  "kalika steel alloys pvt ltd",
+  "kalika steel alloys private limited",
+].map(normalizeMatchKey);
+
+function isInternalPartyName(value?: string | null) {
+  const key = normalizeMatchKey(normalizeValue(value));
+  if (!key) return false;
+  return INTERNAL_PARTY_NAME_HINTS.some((hint) => hint && key.includes(hint));
+}
+
 function currencyishToNumber(value?: string) {
   if (!value) return undefined;
   const number = Number(value.replace(/[₹,\s]/g, ""));
@@ -272,18 +287,46 @@ function getVendorCounterpartyWeight(document: CaseDoc) {
 }
 
 function derivePreferredCounterpartyName(documents: CaseDoc[]) {
-  const buyerCandidate = rankWeightedDocumentValues(
+  const buyerCandidates = rankWeightedDocumentValues(
     documents,
     (document) => firstDocumentPartyValue(document, ["buyerName"]),
     getBuyerCounterpartyWeight
-  )[0];
+  );
 
-  const vendorCandidate = rankWeightedDocumentValues(
+  const vendorCandidates = rankWeightedDocumentValues(
     documents,
     (document) => firstDocumentPartyValue(document, ["vendorName"]),
     getVendorCounterpartyWeight
-  )[0];
+  );
 
+  const externalBuyerCandidate = buyerCandidates.find((candidate) => !isInternalPartyName(candidate.value));
+  const externalVendorCandidate = vendorCandidates.find((candidate) => !isInternalPartyName(candidate.value));
+
+  if (
+    externalBuyerCandidate &&
+    externalVendorCandidate &&
+    normalizeMatchKey(externalBuyerCandidate.value) !== normalizeMatchKey(externalVendorCandidate.value)
+  ) {
+    const buyerStrength = externalBuyerCandidate.score + externalBuyerCandidate.count;
+    const vendorStrength = externalVendorCandidate.score + externalVendorCandidate.count;
+
+    if (buyerStrength !== vendorStrength) {
+      return buyerStrength > vendorStrength ? externalBuyerCandidate.value : externalVendorCandidate.value;
+    }
+
+    return externalVendorCandidate.value;
+  }
+
+  if (externalVendorCandidate) {
+    return externalVendorCandidate.value;
+  }
+
+  if (externalBuyerCandidate) {
+    return externalBuyerCandidate.value;
+  }
+
+  const buyerCandidate = buyerCandidates[0];
+  const vendorCandidate = vendorCandidates[0];
   if (
     buyerCandidate &&
     vendorCandidate &&
@@ -531,7 +574,15 @@ export function resolveCaseDisplayName(params: {
   status?: string | null;
 }) {
   const storedDisplayName = normalizeValue(params.storedDisplayName);
-  if (params.status !== "draft" && storedDisplayName && !isGeneratedCaptureDisplayName(storedDisplayName)) {
+  const receiverName = normalizeValue(params.receiverName);
+  const storedLooksInternal = isInternalPartyName(storedDisplayName);
+  const receiverLooksExternal = Boolean(receiverName && !isInternalPartyName(receiverName));
+  if (
+    params.status !== "draft" &&
+    storedDisplayName &&
+    !isGeneratedCaptureDisplayName(storedDisplayName) &&
+    !(storedLooksInternal && receiverLooksExternal)
+  ) {
     return storedDisplayName;
   }
 

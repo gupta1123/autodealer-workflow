@@ -30,6 +30,7 @@ import {
   stripStoredLineItems,
 } from "@/lib/line-items";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
+import { assessCaseTermsCompliance } from "@/lib/processing/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { readUploadGroupMeta } from "@/lib/upload-groups";
 import type { CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
@@ -41,6 +42,7 @@ const LIST_COLUMNS =
   "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at";
 const LIST_COLUMNS_WITHOUT_RECYCLE_BIN =
   "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta";
+const TERMS_COMPLIANCE_FIELD = "termsAndConditions";
 
 type CaseListScope = "active" | "deleted";
 type CaseListCursor = {
@@ -684,6 +686,10 @@ function sanitizeMismatchesForStorage(
   fieldConfiguration: PacketFieldConfiguration
 ): Mismatch[] {
   return mismatches.filter((mismatch) => {
+    if (mismatch.field === TERMS_COMPLIANCE_FIELD) {
+      return true;
+    }
+
     if (
       (!isLineItemMismatchField(mismatch.field) &&
         (!shouldConsiderFieldKey(mismatch.field, undefined, fieldConfiguration) ||
@@ -808,6 +814,11 @@ async function fetchCaseMismatchCountsForSummary(
   }
 
   for (const row of data ?? []) {
+    if (row.field_name === TERMS_COMPLIANCE_FIELD) {
+      mismatchCountsByCaseId.set(row.case_id, (mismatchCountsByCaseId.get(row.case_id) ?? 0) + 1);
+      continue;
+    }
+
     if (
       !shouldConsiderFieldKey(row.field_name, undefined, fieldConfiguration) ||
       !isPrimaryComparisonField(row.field_name)
@@ -1274,7 +1285,7 @@ export async function POST(request: Request) {
         fieldConfiguration
       )
     );
-    const mismatches = sanitizeMismatchesForStorage(
+    const baseMismatches = sanitizeMismatchesForStorage(
       parseJsonField<Mismatch[]>(formData.get("mismatches"), "mismatches"),
       documents,
       fieldConfiguration
@@ -1287,6 +1298,8 @@ export async function POST(request: Request) {
       );
     }
 
+    const termsMismatches = await assessCaseTermsCompliance(documents);
+    const mismatches = [...baseMismatches, ...termsMismatches];
     const summary = summarizeCase(documents, mismatches, fieldConfiguration);
     const displayName = await resolveCaseDisplayNameWithAI(documents, summary);
     caseId = crypto.randomUUID();

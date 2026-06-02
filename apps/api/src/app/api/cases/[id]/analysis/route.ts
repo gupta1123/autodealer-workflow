@@ -31,10 +31,13 @@ import {
 } from "@/lib/line-items";
 import { mergePersistedStructuredData } from "@/lib/persisted-structured-data";
 import { getLatestProcessingJob, mapProcessingJob } from "@/lib/processing/jobs";
+import { assessCaseTermsCompliance } from "@/lib/processing/pipeline";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import type { CaseAnalysisMode, CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
+
+const TERMS_COMPLIANCE_FIELD = "termsAndConditions";
 
 function isRecycleBinSchemaMissing(error: unknown) {
   if (!error || typeof error !== "object") {
@@ -137,6 +140,10 @@ function sanitizeMismatchesForStorage(
   fieldConfiguration: PacketFieldConfiguration
 ): Mismatch[] {
   return mismatches.filter((mismatch) => {
+    if (mismatch.field === TERMS_COMPLIANCE_FIELD) {
+      return true;
+    }
+
     if (
       (!isLineItemMismatchField(mismatch.field) &&
         (!shouldConsiderFieldKey(mismatch.field, undefined, fieldConfiguration) ||
@@ -401,7 +408,7 @@ export async function POST(
     }
 
     const documents = sanitizeDocumentsForStorage(rawDocuments, fieldConfiguration);
-    const mismatches = sanitizeMismatchesForStorage(
+    const baseMismatches = sanitizeMismatchesForStorage(
       rawMismatches ?? [],
       documents,
       fieldConfiguration
@@ -444,6 +451,8 @@ export async function POST(
         fieldConfiguration
       )
     );
+    const termsMismatches = await assessCaseTermsCompliance(documentsWithPersistedStructuredData);
+    const mismatches = [...baseMismatches, ...termsMismatches];
 
     const documentRows = documentsWithPersistedStructuredData.map((document) => ({
       case_id: id,

@@ -564,6 +564,10 @@ const PO_TERMS_FIELD_KEYS: FieldKey[] = [
   "inspectionTerms",
   "warrantyTerms",
 ];
+const TERMS_FIELD_KEYS: FieldKey[] = [...PO_TERMS_FIELD_KEYS, "termsAndConditions"];
+const TERMS_COMPLIANCE_FIELD: FieldKey = "termsAndConditions";
+const TERMS_COMPLIANCE_MISMATCH_PREFIX = "terms-compliance";
+const TERMS_COMPLIANCE_STATUSES = new Set(["not_fulfilled", "unknown"]);
 
 const PO_TERM_LABELS: Array<{ field: FieldKey; label: string; pattern: RegExp }> = [
   { field: "paymentTerms", label: "Payment", pattern: /^(?:payment\s+terms?|terms?\s+of\s+payment|payment)$/i },
@@ -727,6 +731,231 @@ function applyPurchaseOrderTermsFallback(
     },
     { ...fields } as Partial<Record<FieldKey, string>>
   );
+}
+
+type TermsComplianceAssessment = {
+  sourceDocId?: unknown;
+  sourceClause?: unknown;
+  obligation?: unknown;
+  category?: unknown;
+  status?: unknown;
+  evidenceDocIds?: unknown;
+  evidence?: unknown;
+  reason?: unknown;
+  severity?: unknown;
+};
+
+function compactPromptText(value: string, maxLength: number) {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxLength) return compact;
+  return `${compact.slice(0, maxLength - 20).trim()} ... [truncated]`;
+}
+
+function getTermsFieldSummary(doc: CaseDoc) {
+  return TERMS_FIELD_KEYS
+    .map((field) => {
+      const value = doc.fields[field];
+      return value && String(value).trim() ? `${FIELD_LABELS[field]}: ${String(value).trim()}` : null;
+    })
+    .filter((value): value is string => Boolean(value));
+}
+
+function fieldSummaryForTermsAssessment(doc: CaseDoc) {
+  return Object.entries(doc.fields)
+    .filter(([, value]) => value !== undefined && value !== null && String(value).trim().length > 0)
+    .slice(0, 80)
+    .map(([key, value]) => `${FIELD_LABELS[key as FieldKey] ?? key}: ${String(value).trim()}`)
+    .join("; ");
+}
+
+function lineItemSummaryForTermsAssessment(doc: CaseDoc) {
+  if (!doc.lineItems?.length) return "";
+  return doc.lineItems
+    .slice(0, 20)
+    .map((item, index) =>
+      [
+        item.lineNumber || `line ${index + 1}`,
+        item.itemCode,
+        item.description,
+        item.quantity && item.unit ? `${item.quantity} ${item.unit}` : item.quantity,
+        item.rate ? `rate ${item.rate}` : "",
+        item.taxableAmount ? `taxable ${item.taxableAmount}` : "",
+        item.lineTotal ? `total ${item.lineTotal}` : "",
+      ]
+        .filter(Boolean)
+        .join(" | ")
+    )
+    .join("\n");
+}
+
+function buildTermsAssessmentPrompt(documents: CaseDoc[]) {
+  return documents
+    .map((doc) => {
+      const termsFields = getTermsFieldSummary(doc);
+      return [
+        `DOC_ID: ${doc.id}`,
+        `TYPE: ${doc.type}`,
+        `TITLE: ${doc.title}`,
+        `SOURCE: ${doc.sourceFileName ?? doc.sourceHint ?? "uploaded"}`,
+        termsFields.length ? `EXTRACTED_TERMS:\n${termsFields.join("\n")}` : "",
+        `FIELDS: ${fieldSummaryForTermsAssessment(doc) || "No extracted fields"}`,
+        lineItemSummaryForTermsAssessment(doc) ? `LINE_ITEMS:\n${lineItemSummaryForTermsAssessment(doc)}` : "",
+        `VISIBLE_TEXT:\n${compactPromptText(doc.md ?? "", termsFields.length ? 5000 : 3500)}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+    })
+    .join("\n\n---\n\n")
+    .slice(0, 52000);
+}
+
+function normalizeTermsStatus(value: unknown) {
+  const normalized = String(value ?? "").toLowerCase().replace(/[^a-z_]/g, "");
+  if (normalized === "notfulfilled" || normalized === "failed" || normalized === "breach") return "not_fulfilled";
+  if (normalized === "fulfilled" || normalized === "satisfied" || normalized === "ok") return "fulfilled";
+  if (normalized === "notapplicable" || normalized === "na") return "not_applicable";
+  if (normalized === "unknown" || normalized === "needsreview" || normalized === "insufficientevidence") return "unknown";
+  return "";
+}
+
+function normalizeStringList(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry ?? "").trim()).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value
+      .split(/[,;\n]/)
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function stableMismatchPart(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48) || "terms";
+}
+
+function normalizeTermsSeverity(value: unknown) {
+  const normalized = String(value ?? "").toLowerCase().replace(/[^a-z]/g, "");
+  if (normalized === "critical") return "high";
+  if (normalized === "high" || normalized === "medium" || normalized === "low") return normalized;
+  return "";
+}
+
+function isMaterialUnknownTermsIssue(assessment: TermsComplianceAssessment) {
+  const severity = normalizeTermsSeverity(assessment.severity);
+  return severity === "high" || severity === "medium";
+}
+
+function buildTermsComplianceMismatch(
+  assessment: TermsComplianceAssessment,
+  documentsById: Map<string, CaseDoc>,
+  index: number
+): Mismatch | null {
+  const sourceDocId = String(assessment.sourceDocId ?? "").trim();
+  const sourceDoc = documentsById.get(sourceDocId);
+  if (!sourceDoc) return null;
+
+  const status = normalizeTermsStatus(assessment.status);
+  if (!TERMS_COMPLIANCE_STATUSES.has(status)) return null;
+  if (status === "unknown" && !isMaterialUnknownTermsIssue(assessment)) return null;
+
+  const sourceClause = compactPromptText(String(assessment.sourceClause ?? "").trim(), 700);
+  const obligation = compactPromptText(String(assessment.obligation ?? "").trim(), 500);
+  if (!sourceClause || !obligation) return null;
+
+  const reason = compactPromptText(String(assessment.reason ?? "").trim(), 700);
+  const evidence = compactPromptText(String(assessment.evidence ?? "").trim(), 700);
+  const category = compactPromptText(String(assessment.category ?? "Terms compliance").trim(), 80);
+  const evidenceDocIds = normalizeStringList(assessment.evidenceDocIds).filter((docId) => documentsById.has(docId));
+  const valueDocIds = [sourceDocId, ...evidenceDocIds].filter((docId, docIndex, ids) => ids.indexOf(docId) === docIndex);
+  const statusLabel = status === "not_fulfilled" ? "Not fulfilled" : "Needs review";
+  const issueValue = [
+    `${statusLabel}: ${obligation}`,
+    `Clause: ${sourceClause}`,
+    reason ? `Reason: ${reason}` : "",
+    evidence ? `Evidence: ${evidence}` : "",
+  ].filter(Boolean).join("\n");
+
+  return {
+    id: `${TERMS_COMPLIANCE_MISMATCH_PREFIX}-${stableMismatchPart(sourceDocId)}-${index}-${stableMismatchPart(obligation)}`,
+    field: TERMS_COMPLIANCE_FIELD,
+    values: valueDocIds.map((docId) => ({
+      docId,
+      value: docId === sourceDocId ? issueValue : `Evidence reviewed for clause: ${obligation}`,
+    })),
+    analysis:
+      status === "not_fulfilled"
+        ? `A terms and conditions obligation is not fulfilled. Source: ${sourceDoc.title}. Category: ${category}. ${reason || evidence || obligation}`
+        : `A terms and conditions obligation needs manual review because the packet does not contain enough clear evidence. Source: ${sourceDoc.title}. Category: ${category}. ${reason || obligation}`,
+    fixPlan:
+      `1. Review the source clause: ${sourceClause}\n` +
+      `2. Add or correct the packet evidence needed to satisfy: ${obligation}\n` +
+      "3. Re-run analysis so the terms compliance issue can be cleared.",
+  };
+}
+
+export async function assessCaseTermsCompliance(documents: CaseDoc[]): Promise<Mismatch[]> {
+  const assessableDocuments = documents.filter(
+    (doc) =>
+      doc.md?.trim() ||
+      Object.values(doc.fields).some((value) => value !== undefined && value !== null && String(value).trim()) ||
+      Boolean(doc.lineItems?.length)
+  );
+  if (!assessableDocuments.length) return [];
+
+  const documentsById = new Map(assessableDocuments.map((doc) => [doc.id, doc]));
+  const packetContext = buildTermsAssessmentPrompt(assessableDocuments);
+  if (!packetContext.trim()) return [];
+
+  let raw = "";
+  try {
+    raw = await callOpenRouter(
+      [
+        {
+          role: "system",
+          content:
+            "You assess procurement packet terms and conditions compliance. Return only JSON with key obligations. " +
+            "Terms can appear in any document type, not only purchase orders. Use only explicit visible clauses and packet evidence. " +
+            "First identify whether the packet contains any explicit terms, conditions, commercial clauses, special instructions, or document requirements. If not, return {\"obligations\":[]}. " +
+            "Do not compare wording between documents. Convert each explicit clause into a checkable obligation only when it can be assessed from the uploaded packet. " +
+            "Statuses must be one of fulfilled, not_fulfilled, unknown, not_applicable. " +
+            "Use not_fulfilled only when packet evidence clearly violates or misses a required obligation. Use unknown when the obligation is material but evidence is insufficient. " +
+            "Use not_applicable for generic legal boilerplate, jurisdiction, future warranty/interest clauses, or clauses not testable from current packet evidence. " +
+            "For conditional clauses like 'if applicable', do not mark not_fulfilled unless applicability is clear from the packet. " +
+            "Set severity to high, medium, low, or none. Use high/medium only for obligations that can block packet approval. " +
+            "Each obligation object must include sourceDocId, sourceClause, obligation, category, status, evidenceDocIds, evidence, reason, severity.",
+        },
+        {
+          role: "user",
+          content:
+            "Assess this packet. Return JSON like {\"obligations\":[...]} and keep only concise evidence from the packet.\n\n" +
+            packetContext,
+        },
+      ],
+      {
+        expectJson: true,
+        model: getQualityExtractionModel(),
+        reasoning: getQualityExtractionReasoning(),
+      }
+    );
+  } catch (error) {
+    console.warn("Failed to assess terms compliance", error);
+    return [];
+  }
+
+  const parsed = safeJsonParse<{ obligations?: unknown }>(raw, {});
+  const obligations = Array.isArray(parsed.obligations) ? parsed.obligations : [];
+  return obligations
+    .map((entry, index) =>
+      buildTermsComplianceMismatch(entry as TermsComplianceAssessment, documentsById, index + 1)
+    )
+    .filter((mismatch): mismatch is Mismatch => Boolean(mismatch))
+    .slice(0, 10);
 }
 
 function mapFields(fields: Record<string, unknown>, docType?: DocType): Partial<Record<FieldKey, string>> {
@@ -4248,14 +4477,13 @@ export async function processStoredCaseFiles(params: {
     progress: 80,
     stage: `Comparing ${enrichedDocuments.length} extracted documents across ${verificationResult.verificationGroups.length} packet group${verificationResult.verificationGroups.length === 1 ? "" : "s"}`,
   });
-  const mismatches = verificationResult.mismatches;
 
   await params.onProgress?.({ progress: 92, stage: "Finalizing case summary" });
-  const summary = summarizeCase(enrichedDocuments, mismatches, fieldConfiguration);
+  const summary = summarizeCase(enrichedDocuments, verificationResult.mismatches, fieldConfiguration);
 
   return {
     documents: enrichedDocuments,
-    mismatches,
+    mismatches: verificationResult.mismatches,
     summary,
     comparisonOptions,
     analysisMode,

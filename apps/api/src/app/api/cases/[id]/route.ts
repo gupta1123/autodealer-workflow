@@ -37,6 +37,7 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import type { CaseDoc, FieldKey } from "@/types/pipeline";
 
 const STORAGE_BUCKET = "packet-files";
+const TERMS_COMPLIANCE_FIELD = "termsAndConditions";
 const DOCUMENT_DISPLAY_ORDER = [
   "Weighment Slip",
   "FASTag Toll Proof",
@@ -511,6 +512,10 @@ export async function GET(
       };
     });
     const filteredMismatches = mismatches.filter((mismatch) => {
+      if (mismatch.fieldName === TERMS_COMPLIANCE_FIELD) {
+        return true;
+      }
+
       if (
         !isLineItemMismatchField(mismatch.fieldName) &&
         (!shouldConsiderFieldKey(mismatch.fieldName, undefined, fieldConfiguration) ||

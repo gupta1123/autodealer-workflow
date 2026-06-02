@@ -4,7 +4,12 @@ import { summarizeCase } from "@/lib/case-summary";
 import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
 import { serializeFieldsWithLineItems } from "@/lib/line-items";
 import { mergePersistedStructuredData } from "@/lib/persisted-structured-data";
-import { enrichProcessedDocuments, processStoredCaseFiles, verifyProcessedDocuments } from "@/lib/processing/pipeline";
+import {
+  assessCaseTermsCompliance,
+  enrichProcessedDocuments,
+  processStoredCaseFiles,
+  verifyProcessedDocuments,
+} from "@/lib/processing/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import type { CaseAnalysisMode } from "@/types/pipeline";
 
@@ -130,7 +135,12 @@ export async function POST(
         fieldConfiguration
       )
     );
-    const verified = verifyProcessedDocuments(documents, processed.comparisonOptions);
+    const baseVerified = verifyProcessedDocuments(documents, processed.comparisonOptions);
+    const termsMismatches = await assessCaseTermsCompliance(documents);
+    const verified = {
+      ...baseVerified,
+      mismatches: [...baseVerified.mismatches, ...termsMismatches],
+    };
     const summary = summarizeCase(documents, verified.mismatches, fieldConfiguration);
     const displayName = await resolveCaseDisplayNameWithAI(documents, summary);
 
