@@ -205,7 +205,8 @@ const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   validityDate: ["validityDate", "validUpto", "validUntil", "permitValidityDate", "licenseValidityDate", "licenceValidityDate", "registrationValidityDate"],
   dateOfBirth: ["dateOfBirth", "dob", "birthDate"],
   currency: ["currency"],
-  subtotal: ["subtotal", "subTotal", "taxableAmount", "taxableValue", "taxableAmountRs", "totalTaxableAmount"],
+  subtotal: ["subtotal", "subTotal"],
+  totalTaxableAmount: ["totalTaxableAmount", "totalTaxableAmt", "taxableAmount", "taxableValue", "taxableAmountRs"],
   taxAmount: ["taxAmount", "tax", "gstAmount"],
   taxRate: ["taxRate", "gstRate", "taxPercent", "taxPercentage", "gstPercent", "gstPercentage"],
   cgstRate: ["cgstRate", "centralGstRate", "cgstPercent", "cgstPercentage"],
@@ -425,7 +426,7 @@ function getEWayBillExtractionInstruction(docType: DocType) {
   return (
     "For E-Way Bill documents, vendorName is the From party name in Address Details after the first GSTIN, and buyerName is the To party name after the second GSTIN. " +
     "Do not use Dispatch From or Ship To address text as party names; those belong in dispatchFrom and shipTo. " +
-    "Extract Generated Date as documentDate, Valid Upto/Valid Until as validityDate, Tot. Tax'ble Amt or Taxable Amount as subtotal, Total Inv. Amt as totalAmount, CGST+SGST+IGST+Cess amounts or total minus taxable amount as taxAmount, and derive taxRate from taxAmount/subtotal when the percentage is not printed. " +
+    "Extract Generated Date as documentDate, Valid Upto/Valid Until as validityDate, Tot. Tax'ble Amt or Taxable Amount as totalTaxableAmount and subtotal, Total Inv. Amt as totalAmount, CGST+SGST+IGST+Cess amounts or total minus taxable amount as taxAmount, and derive taxRate from taxAmount/subtotal when the percentage is not printed. " +
     "Extract Transporter ID & Name into transporterName, Transporter Doc. No into lorryReceiptNumber, and the Part-B Vehicle/Trans number into vehicleNumber. " +
     "If Part-A shows Doc No, Document No, Invoice No, Tax Invoice No, or Delivery Challan No, extract that value as referenceInvoiceNumber unless it is the E-Way Bill No itself. "
   );
@@ -661,6 +662,12 @@ function mapFields(
       }
     }
   });
+  if (!result.subtotal && result.totalTaxableAmount) {
+    result.subtotal = result.totalTaxableAmount;
+  }
+  if (docType === "E-Way Bill" && !result.totalTaxableAmount && result.subtotal) {
+    result.totalTaxableAmount = result.subtotal;
+  }
   return result;
 }
 

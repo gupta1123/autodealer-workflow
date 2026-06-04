@@ -29,7 +29,7 @@ export function getFieldCategory(fieldKey: FieldKey): string {
   if (["licenseNumber", "registrationNumber", "chassisNumber", "engineNumber", "vehicleClass", "fuelType", "ownerName", "driverName", "holderName", "fatherName", "panNumber"].includes(fieldKey)) {
     return "identity";
   }
-  if (["totalAmount", "subtotal", "taxAmount", "paidAmount", "statementAmount", "freightAmount", "advanceAmount", "toPayAmount", "currency", "openingBalance", "creditAmount", "debitAmount", "closingBalance"].includes(fieldKey)) {
+  if (["totalAmount", "subtotal", "totalTaxableAmount", "taxAmount", "paidAmount", "statementAmount", "freightAmount", "advanceAmount", "toPayAmount", "currency", "openingBalance", "creditAmount", "debitAmount", "closingBalance"].includes(fieldKey)) {
     return "financial";
   }
   if (["vehicleNumber", "lorryReceiptNumber", "eWayBillNumber", "weighmentNumber", "weighbridgeName", "fastagReference", "tollPlaza", "tollTransactionSummary", "tripCount", "transporterName"].includes(fieldKey)) {

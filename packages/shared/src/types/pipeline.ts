@@ -29,6 +29,7 @@ export type FieldKey =
   | "dateOfBirth"
   | "currency"
   | "subtotal"
+  | "totalTaxableAmount"
   | "taxAmount"
   | "totalAmount"
   | "paymentTerms"

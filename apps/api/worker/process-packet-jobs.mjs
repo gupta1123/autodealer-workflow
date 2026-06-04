@@ -77,6 +77,12 @@ async function runJob(job) {
     },
   });
 
+  if (response.status === 409) {
+    const payload = await response.text().catch(() => "");
+    console.warn(`[worker] job ${job.id} skipped: ${payload || "not runnable"}`);
+    return;
+  }
+
   if (!response.ok) {
     const payload = await response.text().catch(() => "");
     throw new Error(payload || `Internal processing failed (${response.status})`);

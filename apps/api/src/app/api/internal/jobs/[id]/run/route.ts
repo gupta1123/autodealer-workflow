@@ -12,8 +12,17 @@ import {
 } from "@/lib/processing/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import type { CaseAnalysisMode } from "@/types/pipeline";
+import { randomUUID } from "crypto";
 
 const WORKER_SECRET = process.env.WORKER_SECRET || "";
+const STALE_JOB_RUN_MESSAGE = "This processing run was superseded by another worker run.";
+
+class StaleJobRunError extends Error {
+  constructor(message = STALE_JOB_RUN_MESSAGE) {
+    super(message);
+    this.name = "StaleJobRunError";
+  }
+}
 
 function unauthorized(request: Request) {
   return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
@@ -25,6 +34,17 @@ function toMessage(error: unknown) {
 
 function readAnalysisMode(value: unknown): CaseAnalysisMode {
   return value === "smart_split" ? "smart_split" : "standard";
+}
+
+function readRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function asNumber(value: unknown) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 export async function POST(
@@ -53,6 +73,14 @@ export async function POST(
     return jsonWithCors(request, { error: "Job is not in a runnable state." }, { status: 409 });
   }
 
+  const runId = randomUUID();
+  const jobResult = readRecord(job.result);
+  const lockedBy = typeof job.locked_by === "string" && job.locked_by.trim() ? job.locked_by : null;
+  const attemptCount = asNumber(job.attempt_count);
+  if (!lockedBy) {
+    return jsonWithCors(request, { error: "Job has no worker lock." }, { status: 409 });
+  }
+
   const { data: caseRow, error: caseError } = await supabase
     .from("packet_cases")
     .select("id, upload_count, processing_meta")
@@ -63,26 +91,124 @@ export async function POST(
     return jsonWithCors(request, { error: toMessage(caseError) }, { status: 500 });
   }
 
-  const updateJob = async (fields: Record<string, unknown>, options?: { onlyWhenRunning?: boolean }) => {
-    let query = supabase.from("packet_processing_jobs").update(fields).eq("id", id);
-    if (options?.onlyWhenRunning) {
-      query = query.eq("status", "running");
-    }
-    const { error } = await query;
+  const assertCurrentRun = async () => {
+    const { data: currentJob, error } = await supabase
+      .from("packet_processing_jobs")
+      .select("status, locked_by, attempt_count, result")
+      .eq("id", id)
+      .single();
+
     if (error) {
       throw error;
     }
+
+    const currentResult = readRecord(currentJob.result);
+    if (
+      currentJob.status !== "running" ||
+      currentJob.locked_by !== lockedBy ||
+      asNumber(currentJob.attempt_count) !== attemptCount ||
+      currentResult.activeRunId !== runId
+    ) {
+      throw new StaleJobRunError();
+    }
+  };
+
+  const updateCurrentJob = async (fields: Record<string, unknown>) => {
+    const { data, error } = await supabase
+      .from("packet_processing_jobs")
+      .update(fields)
+      .eq("id", id)
+      .eq("status", "running")
+      .eq("locked_by", lockedBy)
+      .eq("attempt_count", attemptCount)
+      .select("id")
+      .maybeSingle();
+
+    if (error) {
+      throw error;
+    }
+    if (!data) {
+      throw new StaleJobRunError();
+    }
+  };
+
+  const deleteDuplicateAnalysisRows = async (caseId: string) => {
+    const [{ data: documentRows, error: documentError }, { data: mismatchRows, error: mismatchError }] =
+      await Promise.all([
+        supabase
+          .from("packet_documents")
+          .select("id, client_document_id, source_file_name, source_hint, document_type, title, created_at")
+          .eq("case_id", caseId)
+          .order("created_at", { ascending: false }),
+        supabase
+          .from("packet_mismatches")
+          .select("id, client_mismatch_id, field_name, values_json, created_at")
+          .eq("case_id", caseId)
+          .order("created_at", { ascending: false }),
+      ]);
+
+    if (documentError) throw documentError;
+    if (mismatchError) throw mismatchError;
+
+    const documentSeen = new Set<string>();
+    const duplicateDocumentIds: string[] = [];
+    for (const row of documentRows ?? []) {
+      const key = [
+        row.client_document_id || "",
+        row.source_file_name || "",
+        row.source_hint || "",
+        row.document_type || "",
+        row.title || "",
+      ].join("::");
+      if (documentSeen.has(key)) {
+        duplicateDocumentIds.push(row.id);
+      } else {
+        documentSeen.add(key);
+      }
+    }
+
+    const mismatchSeen = new Set<string>();
+    const duplicateMismatchIds: string[] = [];
+    for (const row of mismatchRows ?? []) {
+      const key = [
+        row.client_mismatch_id || "",
+        row.field_name || "",
+        JSON.stringify(row.values_json ?? []),
+      ].join("::");
+      if (mismatchSeen.has(key)) {
+        duplicateMismatchIds.push(row.id);
+      } else {
+        mismatchSeen.add(key);
+      }
+    }
+
+    await Promise.all([
+      duplicateDocumentIds.length
+        ? supabase.from("packet_documents").delete().in("id", duplicateDocumentIds)
+        : Promise.resolve({ error: null }),
+      duplicateMismatchIds.length
+        ? supabase.from("packet_mismatches").delete().in("id", duplicateMismatchIds)
+        : Promise.resolve({ error: null }),
+    ]).then((results) => {
+      for (const result of results) {
+        if (result.error) throw result.error;
+      }
+    });
   };
 
   try {
-    await updateJob({
+    await updateCurrentJob({
       stage: "Preparing files",
       progress: 2,
       error: null,
       locked_at: now,
+      result: {
+        ...jobResult,
+        activeRunId: runId,
+        activeRunStartedAt: now,
+      },
     });
 
-    const jobResult = job.result && typeof job.result === "object" ? (job.result as Record<string, unknown>) : {};
     const analysisMode = readAnalysisMode(jobResult.analysisMode);
     const comparisonOptions = jobResult.comparisonOptions;
     const fieldConfiguration = await getPersistedPacketFieldConfiguration();
@@ -92,18 +218,22 @@ export async function POST(
       analysisMode,
       comparisonOptions,
       onProgress: async ({ progress, stage }) => {
-        await updateJob({
+        await updateCurrentJob({
           progress,
           stage,
           error: null,
-        }, { onlyWhenRunning: true });
+        });
       },
     });
 
-    await updateJob({
+    await assertCurrentRun();
+
+    await updateCurrentJob({
       stage: "Saving extracted results",
       progress: 96,
     });
+
+    await assertCurrentRun();
 
     const [
       { data: existingDocuments, error: existingDocumentsError },
@@ -177,6 +307,9 @@ export async function POST(
       }
     }
 
+    await deleteDuplicateAnalysisRows(job.case_id);
+    await assertCurrentRun();
+
     const existingMeta =
       caseRow.processing_meta && typeof caseRow.processing_meta === "object"
         ? (caseRow.processing_meta as Record<string, unknown>)
@@ -216,7 +349,7 @@ export async function POST(
       throw updateCaseError;
     }
 
-    await updateJob({
+    await updateCurrentJob({
       status: "succeeded",
       progress: 100,
       stage: "Completed",
@@ -234,6 +367,10 @@ export async function POST(
     return jsonWithCors(request, { ok: true });
   } catch (error) {
     const message = toMessage(error);
+    if (error instanceof StaleJobRunError) {
+      return jsonWithCors(request, { ok: false, stale: true, error: message }, { status: 409 });
+    }
+
     const shouldRetry = job.attempt_count < job.max_attempts;
     const nextRunAt = new Date(
       Date.now() + Math.min(60_000 * Math.pow(2, Math.max(0, job.attempt_count - 1)), 15 * 60_000)

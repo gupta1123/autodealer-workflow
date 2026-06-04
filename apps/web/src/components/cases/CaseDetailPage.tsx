@@ -246,7 +246,12 @@ function getOrderedDocumentEntries(
   extractedFields: Record<string, unknown>
 ) {
   const visibleEntries = Object.entries(extractedFields).filter(
-    ([key, value]) => !isNonRequiredDocumentField(documentType, key) && value !== null && value !== undefined && value !== ""
+    ([key, value]) =>
+      !isNonRequiredDocumentField(documentType, key) &&
+      !(documentType === "E-Way Bill" && key === "subtotal" && extractedFields.totalTaxableAmount) &&
+      value !== null &&
+      value !== undefined &&
+      value !== ""
   );
   const relevantDefinitions = getFieldDefinitionsForDocType(documentType);
   const relevantKeys = relevantDefinitions.map(({ key }) => key);
@@ -257,7 +262,12 @@ function getOrderedDocumentEntries(
 
   return getFieldDefinitionsByKeys([...relevantKeys, ...remainingKeys]).flatMap(({ key }) => {
     const value = extractedFields[key];
-    if (value === null || value === undefined || value === "") {
+    if (
+      value === null ||
+      value === undefined ||
+      value === "" ||
+      (documentType === "E-Way Bill" && key === "subtotal" && extractedFields.totalTaxableAmount)
+    ) {
       return [];
     }
     return [[key, value] as [string, unknown]];

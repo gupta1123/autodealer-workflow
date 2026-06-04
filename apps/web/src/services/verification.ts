@@ -1058,6 +1058,49 @@ function isLogisticsSummaryLine(doc: CaseDoc, line: CommercialLineItem) {
   );
 }
 
+function hasCommercialLineSignal(line: CommercialLineItem) {
+  return Boolean(
+    line.hsnSac ||
+      line.rate ||
+      line.netRate ||
+      line.taxableAmount ||
+      line.lineTotal ||
+      line.taxRate ||
+      line.cgstRate ||
+      line.sgstRate ||
+      line.igstRate ||
+      line.taxAmount
+  );
+}
+
+function isLogisticsOnlyFulfillmentDocument(doc: CaseDoc) {
+  if (!FULFILLMENT_LINE_DOC_TYPES.has(doc.type)) return false;
+
+  const text = [
+    doc.title,
+    doc.sourceFileName,
+    doc.sourceHint,
+    ...Object.values(doc.fields ?? {}),
+    doc.md,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const hasLogisticsSignal =
+    /\b(?:lorry\s*receipt|lr\s*(?:no|number)|transporter|transport|lorry|freight|to\s*pay|route|consignor|consignee|vehicle|driver)\b/i.test(
+      text
+    );
+  const hasDocumentCommercialSignal = Boolean(
+    doc.fields.subtotal ||
+      doc.fields.totalTaxableAmount ||
+      doc.fields.taxAmount ||
+      doc.fields.totalAmount ||
+      doc.fields.hsnSac
+  );
+  const hasLineCommercialSignal = (doc.lineItems ?? []).some(hasCommercialLineSignal);
+
+  return hasLogisticsSignal && !hasDocumentCommercialSignal && !hasLineCommercialSignal;
+}
+
 function getCountLikeQuantity(quantity?: string | number | null, unit?: string) {
   const parsed = parseNumber(quantity);
   if (parsed === null) return null;
@@ -1097,6 +1140,7 @@ function fulfillmentQuantityReconcilesWithReference(docs: CaseDoc[], referenceDo
 
   for (const doc of docs) {
     if (!FULFILLMENT_LINE_DOC_TYPES.has(doc.type)) continue;
+    if (isLogisticsOnlyFulfillmentDocument(doc)) continue;
     const quantity = getFulfillmentDocumentQuantity(doc);
     if (quantity === null) continue;
     fulfillmentQuantity += quantity;
@@ -1278,7 +1322,10 @@ function findGroupedEWayReferenceLine(
 
 function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" | "fixPlan">[] {
   const docsWithLineItems = docs.filter(
-    (doc) => doc.lineItems?.length && COMMERCIAL_LINE_ITEM_COMPARISON_DOC_TYPES.has(doc.type)
+    (doc) =>
+      doc.lineItems?.length &&
+      COMMERCIAL_LINE_ITEM_COMPARISON_DOC_TYPES.has(doc.type) &&
+      !isLogisticsOnlyFulfillmentDocument(doc)
   );
   const mismatches: Omit<Mismatch, "analysis" | "fixPlan">[] = [];
 

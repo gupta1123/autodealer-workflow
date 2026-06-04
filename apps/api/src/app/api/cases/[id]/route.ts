@@ -127,8 +127,16 @@ function enrichReadableEWayBillTaxableAmount(
   documentType: string,
   fields: Record<string, unknown>
 ) {
-  if (documentType !== "E-Way Bill" || fields.subtotal) {
+  if (documentType !== "E-Way Bill") {
     return fields;
+  }
+
+  if (fields.subtotal || fields.totalTaxableAmount) {
+    return {
+      ...fields,
+      ...(fields.subtotal ? {} : { subtotal: fields.totalTaxableAmount }),
+      ...(fields.totalTaxableAmount ? {} : { totalTaxableAmount: fields.subtotal }),
+    };
   }
 
   const totalAmount = parseCommercialAmount(fields.totalAmount);
@@ -140,6 +148,7 @@ function enrichReadableEWayBillTaxableAmount(
   return {
     ...fields,
     subtotal: formatCommercialAmount(totalAmount - taxAmount),
+    totalTaxableAmount: formatCommercialAmount(totalAmount - taxAmount),
   };
 }
 
