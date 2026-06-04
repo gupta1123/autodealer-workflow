@@ -12,6 +12,15 @@ import type { ComparisonOptions } from "@/types/pipeline";
 const PRESENCE_CHECK_FIELDS = new Set<FieldKey>();
 const PURCHASE_DOC_TYPES = new Set(["Purchase Order", "Amended Purchase Order"]);
 const INVOICE_DOC_TYPES = new Set(["Invoice", "Tax Invoice"]);
+const COMMERCIAL_LINE_ITEM_COMPARISON_DOC_TYPES = new Set<CaseDoc["type"]>([
+  "Purchase Order",
+  "Amended Purchase Order",
+  "Invoice",
+  "Tax Invoice",
+  "Delivery Challan",
+  "Delivery Note",
+  "E-Way Bill",
+]);
 const LOGISTICS_SUMMARY_LINE_DOC_TYPES = new Set(["Lorry Receipt", "Weighment Slip", "Transport Permit"]);
 const FULFILLMENT_LINE_DOC_TYPES = new Set<CaseDoc["type"]>(["Delivery Challan", "Delivery Note"]);
 const WEIGHT_FIELDS = new Set<FieldKey>(["grossWeight", "tareWeight", "netWeight"]);
@@ -1530,7 +1539,9 @@ function findGroupedEWayReferenceLine(
 }
 
 function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" | "fixPlan">[] {
-  const docsWithLineItems = docs.filter((doc) => doc.lineItems?.length);
+  const docsWithLineItems = docs.filter(
+    (doc) => doc.lineItems?.length && COMMERCIAL_LINE_ITEM_COMPARISON_DOC_TYPES.has(doc.type)
+  );
   const mismatches: Omit<Mismatch, "analysis" | "fixPlan">[] = [];
 
   if (docsWithLineItems.length < 2) {

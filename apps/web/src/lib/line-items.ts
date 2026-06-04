@@ -10,9 +10,6 @@ const COMMERCIAL_DOC_TYPES = new Set<DocType>([
   "Delivery Note",
   "Delivery Challan",
   "E-Way Bill",
-  "Lorry Receipt",
-  "Weighment Slip",
-  "Material Test Certificate",
 ]);
 
 const HSN_SAC_CODE_PATTERN = /\b\d{4,8}\b/;
@@ -1503,8 +1500,12 @@ export function normalizeExtractedCommercialLineItems(params: {
   visibleTextPages?: string[];
   documentFields?: Partial<Record<FieldKey, string>>;
 }) {
-  if (!isCommercialDocType(params.docType) || params.lineItems.length === 0) {
-    return params.lineItems;
+  if (params.lineItems.length === 0) {
+    return [];
+  }
+
+  if (!isCommercialDocType(params.docType)) {
+    return [];
   }
 
   const visibleTextPages = params.visibleTextPages ?? [];

@@ -35,11 +35,8 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
-  areComparableValuesEqual,
-  getComparableFieldValue,
   getComparisonModeLabel,
   isPrimaryComparisonField,
-  pickCanonicalComparableValue,
   readComparisonOptions,
 } from "@/lib/comparison";
 import {
@@ -64,8 +61,6 @@ import type {
   CaseAnalysisMode,
   CommercialLineItem,
   ComparisonOptions,
-  DocType,
-  FieldKey,
   PipelineStageProgress,
   QueuedUpload,
 } from "@/types/pipeline";
@@ -73,6 +68,20 @@ import type {
 type LoadState = "loading" | "ready" | "error";
 type ActiveTab = "preview" | "data";
 type DataViewMode = "fields" | "lineItems";
+const PURCHASE_ORDER_DOCUMENT_TYPES = new Set(["Purchase Order", "Amended Purchase Order"]);
+const TERMS_CHECKLIST_DEFINITIONS = [
+  { key: "paymentTerms", label: "Payment", keywords: ["payment", "advance", "proforma"] },
+  { key: "deliveryTerms", label: "Delivery", keywords: ["delivery", "dispatch", "delivered", "schedule"] },
+  { key: "freightTerms", label: "Freight", keywords: ["freight", "transport", "godown"] },
+  { key: "packingForwardingTerms", label: "Packing / Forwarding", keywords: ["packing", "forwarding", "p&f"] },
+  { key: "priceBasis", label: "Price Basis", keywords: ["price", "late", "fee", "basis"] },
+  { key: "taxTerms", label: "Tax / GST", keywords: ["tax", "gst", "eway", "e-way"] },
+  { key: "inspectionTerms", label: "Inspection / Quality", keywords: ["inspection", "test", "certificate", "quality"] },
+  { key: "warrantyTerms", label: "Warranty", keywords: ["warranty", "guarantee"] },
+  { key: "termsAndConditions", label: "Other Terms", keywords: ["terms", "conditions", "clause"] },
+] as const;
+const TERMS_FIELD_KEYS = TERMS_CHECKLIST_DEFINITIONS.map((item) => item.key);
+const TERMS_FIELD_KEY_SET = new Set<string>(TERMS_FIELD_KEYS);
 
 const DETAIL_TABS: { id: ActiveTab; label: string; icon: LucideIcon }[] = [
   { id: "preview", label: "Original", icon: Eye },
@@ -87,6 +96,101 @@ const FIELD_LABEL_LOOKUP = ACTIVE_FIELD_DEFINITIONS.reduce(
   {} as Record<string, string>
 );
 const TERMS_COMPLIANCE_FIELD = "termsAndConditions";
+
+function getDocumentFieldLabel(documentType: string | undefined, key: string) {
+  if (documentType === "E-Way Bill" && key === "subtotal") {
+    return "Total Taxable Amount";
+  }
+
+  return FIELD_LABEL_LOOKUP[key] || key;
+}
+
+function hasExtractedTerms(document: SavedCaseDetail["documents"][number] | null) {
+  if (!document || !PURCHASE_ORDER_DOCUMENT_TYPES.has(document.documentType)) {
+    return false;
+  }
+
+  return TERMS_FIELD_KEYS.some((key) => {
+    const value = document.extractedFields[key];
+    return value !== null && value !== undefined && String(value).trim().length > 0;
+  });
+}
+
+function getTermValue(value: unknown) {
+  return value === null || value === undefined ? "" : String(value).trim();
+}
+
+function isNonRequiredDocumentField(documentType: string, key: string) {
+  return PURCHASE_ORDER_DOCUMENT_TYPES.has(documentType) && key === "hasVendorStamp";
+}
+
+function getTermsIssueText(mismatch: SavedCaseDetail["mismatches"][number]) {
+  return [
+    mismatch.analysis ?? "",
+    mismatch.fixPlan ?? "",
+    ...mismatch.values.map((entry) => String(entry.value ?? "")),
+  ]
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function termsIssueMatchesDocument(
+  mismatch: SavedCaseDetail["mismatches"][number],
+  document: SavedCaseDetail["documents"][number] | null
+) {
+  if (!document || mismatch.fieldName !== TERMS_COMPLIANCE_FIELD) return false;
+  const documentIds = new Set(
+    [document.id, document.clientDocumentId, document.sourceHint, document.title]
+      .filter((value): value is string => Boolean(value))
+  );
+  return mismatch.values.some((entry) => entry.docId && documentIds.has(entry.docId));
+}
+
+function termsIssueMatchesDefinition(
+  mismatch: SavedCaseDetail["mismatches"][number],
+  definition: (typeof TERMS_CHECKLIST_DEFINITIONS)[number],
+  value: string
+) {
+  const issueText = getTermsIssueText(mismatch).toLowerCase();
+  if (definition.key === "termsAndConditions") return false;
+  if (definition.keywords.some((keyword) => issueText.includes(keyword))) return true;
+
+  const usefulWords = value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((word) => word.length >= 5)
+    .slice(0, 8);
+  if (usefulWords.length < 2) return false;
+
+  return usefulWords.filter((word) => issueText.includes(word)).length >= 2;
+}
+
+function getTermsIssueStatus(mismatch: SavedCaseDetail["mismatches"][number]) {
+  const text = getTermsIssueText(mismatch).toLowerCase();
+  if (text.includes("not fulfilled")) {
+    return {
+      label: "Not fulfilled",
+      className: "border-rose-200 bg-rose-50 text-rose-700",
+      icon: ShieldAlert,
+    };
+  }
+
+  return {
+    label: "Needs review",
+    className: "border-amber-200 bg-amber-50 text-amber-700",
+    icon: TriangleAlert,
+  };
+}
+
+function getClearTermsStatus() {
+  return {
+    label: "No issue flagged",
+    className: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    icon: CheckCircle2,
+  };
+}
 
 const LINE_ITEM_COLUMNS: Array<{
   key: keyof CommercialLineItem;
@@ -142,7 +246,7 @@ function getOrderedDocumentEntries(
   extractedFields: Record<string, unknown>
 ) {
   const visibleEntries = Object.entries(extractedFields).filter(
-    ([, value]) => value !== null && value !== undefined && value !== ""
+    ([key, value]) => !isNonRequiredDocumentField(documentType, key) && value !== null && value !== undefined && value !== ""
   );
   const relevantDefinitions = getFieldDefinitionsForDocType(documentType);
   const relevantKeys = relevantDefinitions.map(({ key }) => key);
@@ -653,6 +757,52 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     if (!activeDocument) return [];
     return getOrderedDocumentEntries(activeDocument.documentType, activeDocument.extractedFields);
   }, [activeDocument]);
+  const activeTermsIssues = useMemo(() => {
+    if (!detail) return [];
+    return detail.mismatches.filter((mismatch) =>
+      termsIssueMatchesDocument(mismatch, activeDocument)
+    );
+  }, [activeDocument, detail]);
+  const activeTermsChecklistRows = useMemo(() => {
+    if (!activeDocument || !PURCHASE_ORDER_DOCUMENT_TYPES.has(activeDocument.documentType)) {
+      return [];
+    }
+
+    return TERMS_CHECKLIST_DEFINITIONS.flatMap((definition) => {
+      const value = getTermValue(activeDocument.extractedFields[definition.key]);
+      if (!value) return [];
+
+      const issue = activeTermsIssues.find((mismatch) =>
+        termsIssueMatchesDefinition(mismatch, definition, value)
+      );
+
+      return [
+        {
+          key: definition.key,
+          label: definition.label,
+          value,
+          issue,
+          status: issue ? getTermsIssueStatus(issue) : getClearTermsStatus(),
+        },
+      ];
+    });
+  }, [activeDocument, activeTermsIssues]);
+  const unmatchedTermsIssues = useMemo(
+    () =>
+      activeTermsIssues.filter(
+        (issue) => !activeTermsChecklistRows.some((row) => row.issue?.id === issue.id)
+      ),
+    [activeTermsChecklistRows, activeTermsIssues]
+  );
+  const activeDocumentFieldEntries = useMemo(() => {
+    if (activeTermsChecklistRows.length === 0) {
+      return activeDocumentEntries;
+    }
+
+    return activeDocumentEntries.filter(([key]) => !TERMS_FIELD_KEY_SET.has(key));
+  }, [activeDocumentEntries, activeTermsChecklistRows.length]);
+  const activeFieldDataCount =
+    activeDocumentFieldEntries.length + activeTermsChecklistRows.length + unmatchedTermsIssues.length;
   const activeDocumentLineItems = useMemo(
     () => activeDocument?.lineItems ?? [],
     [activeDocument]
@@ -663,8 +813,12 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   );
 
   useEffect(() => {
-    setActiveDataView(activeDocumentLineItems.length > 0 ? "lineItems" : "fields");
-  }, [activeDocumentId, activeDocumentLineItems.length]);
+    setActiveDataView(
+      hasExtractedTerms(activeDocument) || activeDocumentLineItems.length === 0
+        ? "fields"
+        : "lineItems"
+    );
+  }, [activeDocument, activeDocumentId, activeDocumentLineItems.length]);
 
   const activeDocumentFiles = useMemo(() => {
     if (!detail || !activeDocument) return [];
@@ -800,26 +954,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       ),
     [detail]
   );
-
-  const fieldCanonicalValues = useMemo(() => {
-    if (!detail) return {} as Record<string, string>;
-    const result: Record<string, string> = {};
-    const comparableDocuments = detail.documents.map((document) => ({
-      type: document.documentType as DocType,
-      fields: document.extractedFields as Partial<Record<FieldKey, string>>,
-    }));
-
-    ACTIVE_FIELD_DEFINITIONS.forEach(({ key }) => {
-      const values = comparableDocuments
-        .map((document) => getComparableFieldValue(document, key))
-        .filter(
-          (value): value is string =>
-            value !== undefined && value !== null && String(value).trim().length > 0
-        );
-      result[key] = pickCanonicalComparableValue(values, comparisonOptions);
-    });
-    return result;
-  }, [comparisonOptions, detail]);
 
   async function handleAnalyzeDraftCase(
     comparisonOptions: ComparisonOptions,
@@ -1608,7 +1742,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 {activeTab === 'data' && (
                   <div className="absolute inset-0 overflow-y-auto">
                     <div className="p-4 sm:p-8 max-w-5xl mx-auto pb-8 space-y-6">
-                      {(activeDocumentEntries.length > 0 || activeDocumentLineItems.length > 0) && (
+                      {(activeFieldDataCount > 0 || activeDocumentLineItems.length > 0) && (
                         <div className="flex flex-col gap-3 rounded-xl border border-slate-100 bg-white p-3 shadow-sm sm:flex-row sm:items-center sm:justify-between">
                           <div>
                             <div className="text-xs font-bold uppercase tracking-wider text-slate-400">
@@ -1628,7 +1762,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                               }`}
                               onClick={() => setActiveDataView("fields")}
                             >
-                              Fields ({activeDocumentEntries.length})
+                              Fields ({activeFieldDataCount})
                             </button>
                             <button
                               type="button"
@@ -1646,35 +1780,126 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                         </div>
                       )}
 
-                      {activeDocumentEntries.length === 0 && activeDocumentLineItems.length === 0 ? (
+                      {activeFieldDataCount === 0 && activeDocumentLineItems.length === 0 ? (
                         <div className="py-12 text-center text-sm font-medium text-slate-500">
                           No specific fields extracted for this document type.
                         </div>
-                      ) : activeDataView === "fields" && activeDocumentEntries.length > 0 ? (
-                        <div className="flex flex-col text-sm border border-slate-100 rounded-xl overflow-hidden shadow-sm">
-                          {activeDocumentEntries.map(([key, value], index) => {
-                            const currentValue = typeof value === "string" ? value : displayValue(value);
-                            const canonical = fieldCanonicalValues[key];
-                            const ok = !canonical || areComparableValuesEqual(currentValue, canonical, comparisonOptions);
-
-                            return (
-                              <div key={key} className={`flex flex-col sm:flex-row sm:items-start p-3 sm:p-5 ${index !== activeDocumentEntries.length - 1 ? 'border-b border-slate-100' : ''} hover:bg-slate-50/50 transition-colors bg-white`}>
-                                <div className="w-full sm:w-1/3 mb-1 sm:mb-0 pr-4">
-                                  <div className="font-semibold text-slate-500 text-xs sm:text-sm uppercase sm:normal-case tracking-wider sm:tracking-normal flex items-center gap-2">
-                                    {FIELD_LABEL_LOOKUP[key] || key}
-                                    {!ok && (
-                                      <span className="px-1.5 py-0.5 rounded text-[9px] sm:text-[10px] font-bold bg-rose-100 text-rose-700 uppercase tracking-wider shrink-0">
-                                        Conflict
-                                      </span>
-                                    )}
+                      ) : activeDataView === "fields" && activeFieldDataCount > 0 ? (
+                        <div className="space-y-4">
+                          {(activeTermsChecklistRows.length > 0 || unmatchedTermsIssues.length > 0) && (
+                            <div className="overflow-hidden rounded-xl border border-slate-100 bg-white shadow-sm">
+                              <div className="flex flex-col gap-3 border-b border-slate-100 px-4 py-4 sm:flex-row sm:items-start sm:justify-between sm:px-5">
+                                <div>
+                                  <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                                    Terms & Conditions Compliance Checklist
+                                  </div>
+                                  <div className="mt-1 text-sm font-medium text-slate-700">
+                                    {activeTermsChecklistRows.length} clause{activeTermsChecklistRows.length === 1 ? "" : "s"} extracted from this document.
                                   </div>
                                 </div>
-                                <div className="w-full sm:w-2/3 text-slate-900 font-medium sm:text-sm text-base break-words">
-                                  {currentValue || <span className="text-slate-300 font-normal italic">Not detected</span>}
+                                <div
+                                  className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-bold ${
+                                    activeTermsIssues.length > 0
+                                      ? "border-amber-200 bg-amber-50 text-amber-700"
+                                      : "border-emerald-200 bg-emerald-50 text-emerald-700"
+                                  }`}
+                                >
+                                  {activeTermsIssues.length > 0 ? (
+                                    <TriangleAlert className="h-3.5 w-3.5" />
+                                  ) : (
+                                    <CheckCircle2 className="h-3.5 w-3.5" />
+                                  )}
+                                  {activeTermsIssues.length > 0
+                                    ? `${activeTermsIssues.length} issue${activeTermsIssues.length === 1 ? "" : "s"} flagged`
+                                    : "No issue flagged"}
                                 </div>
                               </div>
-                            )
-                          })}
+
+                              <div className="divide-y divide-slate-100">
+                                {activeTermsChecklistRows.map((row) => {
+                                  const StatusIcon = row.status.icon;
+
+                                  return (
+                                    <div
+                                      key={row.key}
+                                      className="grid gap-3 px-4 py-4 sm:grid-cols-[10rem_minmax(0,1fr)_auto] sm:px-5"
+                                    >
+                                      <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                                        {row.label}
+                                      </div>
+                                      <div className="min-w-0">
+                                        <div className="whitespace-pre-wrap break-words text-sm font-medium leading-relaxed text-slate-900">
+                                          {row.value}
+                                        </div>
+                                        {row.issue?.analysis ? (
+                                          <div className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs font-medium leading-relaxed text-amber-800">
+                                            {row.issue.analysis}
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                      <div
+                                        className={`inline-flex h-fit w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-bold ${row.status.className}`}
+                                      >
+                                        <StatusIcon className="h-3.5 w-3.5" />
+                                        {row.status.label}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+
+                                {unmatchedTermsIssues.map((issue) => {
+                                  const status = getTermsIssueStatus(issue);
+                                  const StatusIcon = status.icon;
+                                  const issueText =
+                                    issue.analysis ||
+                                    issue.fixPlan ||
+                                    getTermsIssueText(issue) ||
+                                    "Terms issue requires review.";
+
+                                  return (
+                                    <div
+                                      key={issue.id}
+                                      className="grid gap-3 px-4 py-4 sm:grid-cols-[10rem_minmax(0,1fr)_auto] sm:px-5"
+                                    >
+                                      <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                                        Review Item
+                                      </div>
+                                      <div className="min-w-0 whitespace-pre-wrap break-words text-sm font-medium leading-relaxed text-slate-900">
+                                        {issueText}
+                                      </div>
+                                      <div
+                                        className={`inline-flex h-fit w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-bold ${status.className}`}
+                                      >
+                                        <StatusIcon className="h-3.5 w-3.5" />
+                                        {status.label}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+
+                          {activeDocumentFieldEntries.length > 0 ? (
+                            <div className="flex flex-col overflow-hidden rounded-xl border border-slate-100 text-sm shadow-sm">
+                              {activeDocumentFieldEntries.map(([key, value], index) => {
+                                const currentValue = typeof value === "string" ? value : displayValue(value);
+
+                                return (
+                                  <div key={key} className={`flex flex-col bg-white p-3 transition-colors hover:bg-slate-50/50 sm:flex-row sm:items-start sm:p-5 ${index !== activeDocumentFieldEntries.length - 1 ? 'border-b border-slate-100' : ''}`}>
+                                    <div className="mb-1 w-full pr-4 sm:mb-0 sm:w-1/3">
+                                      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-slate-500 sm:text-sm sm:normal-case sm:tracking-normal">
+                                        {getDocumentFieldLabel(activeDocument?.documentType, key)}
+                                      </div>
+                                    </div>
+                                    <div className="w-full break-words text-base font-medium text-slate-900 sm:w-2/3 sm:text-sm">
+                                      {currentValue || <span className="font-normal italic text-slate-300">Not detected</span>}
+                                    </div>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          ) : null}
                         </div>
                       ) : activeDataView === "fields" ? (
                         <div className="rounded-xl border border-dashed border-slate-200 bg-white p-8 text-center text-sm font-medium text-slate-500">

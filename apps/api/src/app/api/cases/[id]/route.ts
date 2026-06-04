@@ -101,11 +101,46 @@ function sanitizeExtractedFields(
     return {};
   }
 
-  return sanitizeFieldsForDocType(
+  const sanitized = sanitizeFieldsForDocType(
     documentType,
     stripStoredLineItems(fields as Record<string, unknown>),
     fieldConfiguration
   );
+  return enrichReadableEWayBillTaxableAmount(documentType, sanitized);
+}
+
+function parseCommercialAmount(value: unknown) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "string") return null;
+
+  const compact = value.replace(/[₹$€£,\s]/g, "");
+  const parsed = Number(compact);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatCommercialAmount(value: number) {
+  const rounded = Math.round(value * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function enrichReadableEWayBillTaxableAmount(
+  documentType: string,
+  fields: Record<string, unknown>
+) {
+  if (documentType !== "E-Way Bill" || fields.subtotal) {
+    return fields;
+  }
+
+  const totalAmount = parseCommercialAmount(fields.totalAmount);
+  const taxAmount = parseCommercialAmount(fields.taxAmount);
+  if (totalAmount === null || taxAmount === null || taxAmount < 0 || totalAmount <= taxAmount) {
+    return fields;
+  }
+
+  return {
+    ...fields,
+    subtotal: formatCommercialAmount(totalAmount - taxAmount),
+  };
 }
 
 function mapDocumentRowForCaseSummary(row: {

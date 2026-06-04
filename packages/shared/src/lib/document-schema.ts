@@ -334,7 +334,6 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
     'warrantyTerms',
     'termsAndConditions',
     'hasAuthorizedSignature',
-    'hasVendorStamp',
   ],
   'Amended Purchase Order': [
     'vendorName',
@@ -363,7 +362,6 @@ export const DOC_TYPE_EXTRACTION_FIELDS: Record<DocType, FieldKey[]> = {
     'warrantyTerms',
     'termsAndConditions',
     'hasAuthorizedSignature',
-    'hasVendorStamp',
   ],
   Invoice: [
     'vendorName',

@@ -41,6 +41,9 @@ const CONSIGNEE_GSTIN_ALIASES = new Set(["consigneeGstin", "shipToGstin", "recip
 const INTERNAL_CONSIGNEE_GSTINS = new Set(["27AACCK1502A1ZD"]);
 const CONSIGNEE_CONTEXT_PATTERN = /\b(?:consignee|ship\s*to|ship-to|recipient)\b/i;
 const DIRECT_BUYER_CONTEXT_PATTERN = /\b(?:buyer|bill\s*to|bill-to|customer|purchaser)\b/i;
+const STORE_EVIDENCE_DOC_TYPES = new Set<DocType>(["Invoice", "Tax Invoice", "Delivery Challan", "Delivery Note"]);
+const STAMP_SIGNATURE_EXTRACTION_INSTRUCTION =
+  "For stamp/signature presence fields, return only Yes, No, or Unclear. Use Yes only when the mark is visibly present, No only when the relevant area is visible and clearly absent, otherwise Unclear. For invoice/delivery receiving evidence, a buyer or receiver stamp block such as Kalika, SMS Division, Store, Gate, or Security with Date and Name & Sign lines means hasStoreStamp=Yes; if handwritten marks or signatures appear on those Name & Sign lines, hasStoreSignature=Yes. Do not confuse the supplier Authorized Signatory with store signature. ";
 
 type OpenRouterMessage = {
   role: "system" | "user" | "assistant";
@@ -393,7 +396,7 @@ function getLineItemExtractionInstruction(docType: DocType) {
     "Each line item may contain lineNumber, itemCode, description, hsnSac, quantity, unit, rate, discountPercent, netRate, taxableAmount, cgstRate, cgstAmount, sgstRate, sgstAmount, igstRate, igstAmount, taxRate, taxAmount, lineTotal, referencePoLineNumber, rawText, and sourcePage. " +
     "When the prompt text or rendered images contain multiple pages, set sourcePage to the visible page number where the row appears. " +
     "When the item description cell contains a generic item name plus a product/model/specification code, split it: put the generic item name in description and put the remaining product/model/specification text in itemCode. For example, extract \"Guide Roller 5374 ERG150\" as description \"Guide Roller\" and itemCode \"5374 ERG150\". " +
-    "Preserve one entry per visible PO, invoice, delivery, e-way bill, LR, weighment, or material table row; do not merge different rows or sum unlike units. Use rawText for the original row text when OCR is uncertain. " +
+    "Preserve one entry per visible PO, invoice, delivery challan/note, or e-way bill goods row; do not merge different rows or sum unlike units. Use rawText for the original row text when OCR is uncertain. " +
     "Do not extract HSN/SAC-wise tax summary rows as lineItems. Rows that only contain HSN/SAC, taxable value, and tax amount are summary rows, not product/service lines. " +
     "When invoice GST rates appear only in an HSN/SAC tax summary, map the visible CGST, SGST, IGST, or GST rates from that summary onto the matching product/service lineItems by HSN/SAC and taxable amount. " +
     "For invoice rows, taxableAmount is the row amount before GST; when the row shows only quantity, rate, and amount, use that amount as taxableAmount and lineTotal. Do not treat packing, freight, P&F, or other charge percentages as GST rates unless the row or tax summary explicitly labels CGST, SGST, IGST, GST, or tax. " +
@@ -449,7 +452,18 @@ function getWeighmentSlipExtractionInstruction(docType: DocType) {
   return (
     "For Weighment Slip documents, prioritize vehicleNumber/lorry number, grossWeight, tareWeight, netWeight, weighmentNumber, weighbridgeName, and authorized signature presence. " +
     "Lorry No or Vehicle No on a weighment slip is the vehicleNumber, not lorryReceiptNumber. Do not use RST No, receipt number, ticket number, tare/gross/net weight, date, or charges as vehicleNumber. " +
+    "Do not return weighment rows or weight tables as lineItems; keep gross, tare, and net weights in fields only. " +
     "Read Indian vehicle numbers carefully from the image; distinguish letters from similar-looking digits, especially G/9, L/1, O/0, S/5, T/7, D/G, and C/G. "
+  );
+}
+
+function getLorryReceiptExtractionInstruction(docType: DocType) {
+  if (docType !== "Lorry Receipt") return "";
+  return (
+    "For Lorry Receipt documents, prioritize lorryReceiptNumber, vehicleNumber, routeFrom, routeTo, transporterName, netWeight, and authorized signature presence. " +
+    "Lorry No is the vehicleNumber. G.C. Note, LR No, Consignment No, or Transporter Doc No is lorryReceiptNumber. " +
+    "Do not return package, freight, weight, amount, total, to-pay, or to-be-billed rows as lineItems; keep logistics quantities and weights in fields only. " +
+    "Read Indian vehicle numbers carefully from the image; distinguish letters from similar-looking digits, especially G/9, J/S, O/0, S/5, T/7, D/G, and C/G. "
   );
 }
 
@@ -691,6 +705,71 @@ function applyPurchaseOrderDateFallback(
 
   const documentDate = extractPurchaseOrderDocumentDate(visibleText);
   return documentDate ? { ...fields, documentDate } : fields;
+}
+
+function removeNonRequiredPurchaseOrderPresenceFields(
+  fields: Partial<Record<FieldKey, string>>,
+  docType: DocType
+) {
+  if (!isPurchaseOrderDocType(docType) || !fields.hasVendorStamp) return fields;
+
+  const next = { ...fields };
+  delete next.hasVendorStamp;
+  return next;
+}
+
+function normalizeEvidenceText(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function hasReceivingStoreStampEvidence(visibleText: string) {
+  const normalized = normalizeEvidenceText(visibleText);
+  const hasInternalReceiver =
+    normalized.includes("kalika") &&
+    (normalized.includes("sms division") ||
+      normalized.includes("s m s division") ||
+      normalized.includes("steels") ||
+      normalized.includes("steel alloys"));
+  const hasReceivingStampLanguage =
+    /\b(?:store|stores|warehouse|receiv(?:ed|ing)|gate|security)\b[\s\S]{0,100}\b(?:stamp|seal|division)\b/i.test(
+      visibleText
+    ) ||
+    /\b(?:stamp|seal)\b[\s\S]{0,100}\b(?:store|stores|warehouse|receiv(?:ed|ing)|gate|security)\b/i.test(
+      visibleText
+    );
+  const hasNameSignBlock = /\b(?:name\s*&\s*sign|name\s+and\s+sign|name\s*\/\s*sign)\b/i.test(visibleText);
+
+  return hasReceivingStampLanguage || (hasInternalReceiver && hasNameSignBlock);
+}
+
+function hasReceivingStoreSignatureEvidence(visibleText: string) {
+  if (!hasReceivingStoreStampEvidence(visibleText)) return false;
+  return /\b(?:name\s*&\s*sign|name\s+and\s+sign|name\s*\/\s*sign|signature|signed|signatory)\b/i.test(visibleText);
+}
+
+function applyVisibleStoreEvidenceFallback(
+  fields: Partial<Record<FieldKey, string>>,
+  docType: DocType,
+  visibleText: string
+) {
+  if (!STORE_EVIDENCE_DOC_TYPES.has(docType) || !visibleText.trim()) return fields;
+
+  const hasStoreStamp = hasReceivingStoreStampEvidence(visibleText);
+  const hasStoreSignature = hasReceivingStoreSignatureEvidence(visibleText);
+  if (!hasStoreStamp && !hasStoreSignature) return fields;
+
+  const next = { ...fields };
+  if (hasStoreStamp && next.hasStoreStamp !== "Yes") {
+    next.hasStoreStamp = "Yes";
+  }
+  if (hasStoreSignature && next.hasStoreSignature !== "Yes") {
+    next.hasStoreSignature = "Yes";
+  }
+  return next;
 }
 
 function cleanPoReferenceCandidate(value: string) {
@@ -1497,9 +1576,12 @@ function enrichEWayBillCoreFields(documents: CaseDoc[]) {
 
 function enrichPurchaseOrderCoreFields(documents: CaseDoc[]) {
   return documents.map((doc) => {
-    if (!isPurchaseOrderDocType(doc.type) || !doc.md?.trim()) return doc;
+    if (!isPurchaseOrderDocType(doc.type)) return doc;
 
-    const fields = applyPurchaseOrderDateFallback(doc.fields, doc.type, doc.md);
+    const fields = removeNonRequiredPurchaseOrderPresenceFields(
+      applyPurchaseOrderDateFallback(doc.fields, doc.type, doc.md ?? ""),
+      doc.type
+    );
     return areFieldRecordsEqual(doc.fields, fields) ? doc : { ...doc, fields };
   });
 }
@@ -2475,6 +2557,7 @@ export async function extractDataFromImages(params: {
   const poNumberExtractionInstruction = getPoNumberExtractionInstruction(documentType);
   const deliveryQuantityExtractionInstruction = getDeliveryQuantityExtractionInstruction(documentType);
   const weighmentSlipExtractionInstruction = getWeighmentSlipExtractionInstruction(documentType);
+  const lorryReceiptExtractionInstruction = getLorryReceiptExtractionInstruction(documentType);
   const eWayBillExtractionInstruction = getEWayBillExtractionInstruction(documentType);
 
   if (!pageImages.length || pageImages.some((image) => !image.startsWith("data:image/"))) {
@@ -2506,8 +2589,9 @@ export async function extractDataFromImages(params: {
               poNumberExtractionInstruction +
               deliveryQuantityExtractionInstruction +
               weighmentSlipExtractionInstruction +
+              lorryReceiptExtractionInstruction +
               eWayBillExtractionInstruction +
-              "For stamp/signature presence fields, return only Yes, No, or Unclear. Use Yes only when the mark is visibly present, No only when the relevant area is visible and clearly absent, otherwise Unclear. " +
+              STAMP_SIGNATURE_EXTRACTION_INSTRUCTION +
               "For FASTag Toll Proof documents, extract statement reference, customer ID/name, statement period/date, vehicle number, tag account number, trip count, opening/credit/debit/closing balances, recharge/payment amount, toll plaza, and a compact toll transaction summary using the canonical FASTag keys. " +
               "For party roles on seller-issued documents, vendorName is the issuing supplier/seller/consignor and buyerName is the receiving buyer, bill-to party, customer, or purchaser. Only use ship-to/consignee/recipient as buyerName when that party is Kalika. " +
               "For Purchase Order documents, vendorName is the supplier/vendor receiving the order and buyerName is the purchaser issuing the order. Never swap these roles. " +
@@ -2568,21 +2652,25 @@ export async function extractDataFromImages(params: {
       documentFields: mappedFields,
     });
     const fields = applyPoNumberLabelGuard(
-      applyInvoicePoReferenceFallback(
-        applyPhotoEvidenceVehicleVisibilityCopy(
-          applyFastagDetailsFallback(
-            applyEWayBillAddressFallback(
-              applyConsigneeBuyerGuard(
-                applyPurchaseOrderDateFallback(mappedFields, documentType, visibleText),
+      applyVisibleStoreEvidenceFallback(
+        applyInvoicePoReferenceFallback(
+          applyPhotoEvidenceVehicleVisibilityCopy(
+            applyFastagDetailsFallback(
+              applyEWayBillAddressFallback(
+                applyConsigneeBuyerGuard(
+                  applyPurchaseOrderDateFallback(mappedFields, documentType, visibleText),
+                  visibleText
+                ),
+                documentType,
                 visibleText
               ),
               documentType,
               visibleText
             ),
-            documentType,
-            visibleText
+            documentType
           ),
-          documentType
+          documentType,
+          visibleText
         ),
         documentType,
         visibleText
