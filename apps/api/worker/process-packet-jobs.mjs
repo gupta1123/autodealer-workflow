@@ -12,6 +12,7 @@ const RAW_APP_BASE_URL =
 const APP_BASE_URL = RAW_APP_BASE_URL?.replace(/\/+$/, "");
 const HEROKU_ROUTER_TIMEOUT_GRACE_MS = Number(process.env.HEROKU_ROUTER_TIMEOUT_GRACE_MS ?? 29_000);
 const WORKER_STALE_RUNNING_JOB_MS = Number(process.env.WORKER_STALE_RUNNING_JOB_MS ?? 20 * 60_000);
+const WORKER_STALE_RUNNING_JOB_INTERVAL = `${Math.max(1, Math.round(WORKER_STALE_RUNNING_JOB_MS / 60_000))} minutes`;
 const WORKER_IN_FLIGHT_WAIT_MS = Number(process.env.WORKER_IN_FLIGHT_WAIT_MS ?? 2 * 60_000);
 const WORKER_IN_FLIGHT_POLL_MS = Number(process.env.WORKER_IN_FLIGHT_POLL_MS ?? 5_000);
 
@@ -44,6 +45,18 @@ class JobMayStillBeRunningError extends Error {
 
 function isTerminalJobStatus(status) {
   return ["succeeded", "failed", "cancelled"].includes(status);
+}
+
+function formatError(error) {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object") {
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+  return String(error ?? "Unknown error");
 }
 
 async function getJob(jobId) {
@@ -169,6 +182,7 @@ async function claimNextJob() {
 
   const { data, error } = await supabase.rpc("claim_packet_processing_job", {
     worker_name: WORKER_NAME,
+    stale_after: WORKER_STALE_RUNNING_JOB_INTERVAL,
   });
 
   if (error) {
@@ -253,7 +267,7 @@ async function main() {
         await requeueJob(job.id, message);
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
+      const message = formatError(error);
       console.error(`[worker] polling failed: ${message}`);
       await sleep(WORKER_POLL_INTERVAL_MS);
     }

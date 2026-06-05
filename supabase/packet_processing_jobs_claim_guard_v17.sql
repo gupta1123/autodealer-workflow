@@ -1,3 +1,6 @@
+drop function if exists public.claim_packet_processing_job(text);
+drop function if exists public.claim_packet_processing_job(text, interval);
+
 create or replace function public.claim_packet_processing_job(
   worker_name text default 'worker',
   stale_after interval default interval '20 minutes'
