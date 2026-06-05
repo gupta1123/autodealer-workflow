@@ -1,4 +1,5 @@
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENROUTER_MODEL =
   process.env.OPENROUTER_MODEL ||
   process.env.NEXT_PUBLIC_OPENROUTER_MODEL ||
@@ -7,6 +8,19 @@ const OPENROUTER_QUALITY_MODEL =
   process.env.OPENROUTER_QUALITY_MODEL ||
   process.env.GEMINI_THINKING_MODEL ||
   "google/gemini-2.5-flash";
+const OPENROUTER_REVIEW_MODEL =
+  process.env.OPENROUTER_REVIEW_MODEL ||
+  process.env.OPENROUTER_EXTRACTION_REVIEW_MODEL ||
+  "openai/gpt-5.5";
+const OPENAI_REVIEW_MODEL =
+  process.env.OPENAI_REVIEW_MODEL ||
+  process.env.EXTRACTION_REVIEW_MODEL ||
+  "gpt-5.5";
+const OPENROUTER_REVIEW_REASONING_EFFORT =
+  process.env.OPENROUTER_REVIEW_REASONING_EFFORT ||
+  process.env.OPENAI_REVIEW_REASONING_EFFORT ||
+  process.env.EXTRACTION_REVIEW_REASONING_EFFORT ||
+  "medium";
 const OPENROUTER_QUALITY_REASONING_TOKENS = Number(process.env.OPENROUTER_QUALITY_REASONING_TOKENS ?? 2000);
 const MAX_RETRIES = Number(process.env.OPENROUTER_MAX_RETRIES ?? 2);
 const RETRY_BASE_MS = Number(process.env.OPENROUTER_RETRY_BASE_MS ?? 1200);
@@ -79,11 +93,11 @@ export async function callOpenRouter(
       });
 
       const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
+      if (!response.ok || payload?.error) {
         const errorText =
           payload?.error?.message ||
           payload?.message ||
-          `OpenRouter request failed (${response.status})`;
+          (response.ok ? "OpenRouter returned an error payload" : `OpenRouter request failed (${response.status})`);
         lastError = errorText;
 
         if (!isRetryableStatus(response.status) || isHardQuotaError(errorText) || attempt === MAX_RETRIES) {
@@ -118,6 +132,14 @@ export function getQualityExtractionModel() {
   return OPENROUTER_QUALITY_MODEL;
 }
 
+export function getExtractionReviewModel() {
+  return OPENAI_API_KEY ? OPENAI_REVIEW_MODEL : OPENROUTER_REVIEW_MODEL;
+}
+
+export function getExtractionReviewProvider() {
+  return OPENAI_API_KEY ? "openai" : "openrouter";
+}
+
 export function getQualityExtractionReasoning() {
   if (!Number.isFinite(OPENROUTER_QUALITY_REASONING_TOKENS) || OPENROUTER_QUALITY_REASONING_TOKENS <= 0) {
     return undefined;
@@ -127,4 +149,83 @@ export function getQualityExtractionReasoning() {
     max_tokens: OPENROUTER_QUALITY_REASONING_TOKENS,
     exclude: true,
   } satisfies OpenRouterReasoningOptions;
+}
+
+export function getExtractionReviewReasoning() {
+  if (!["low", "medium", "high"].includes(OPENROUTER_REVIEW_REASONING_EFFORT)) {
+    return { effort: "medium", exclude: true } satisfies OpenRouterReasoningOptions;
+  }
+
+  return {
+    effort: OPENROUTER_REVIEW_REASONING_EFFORT as "low" | "medium" | "high",
+    exclude: true,
+  } satisfies OpenRouterReasoningOptions;
+}
+
+function getExtractionReviewReasoningEffort() {
+  return getExtractionReviewReasoning().effort ?? "medium";
+}
+
+export async function callExtractionReviewModel(messages: OpenRouterMessage[]) {
+  if (!OPENAI_API_KEY) {
+    return callOpenRouter(messages, {
+      expectJson: true,
+      model: OPENROUTER_REVIEW_MODEL,
+      reasoning: getExtractionReviewReasoning(),
+    });
+  }
+
+  let attempt = 0;
+  let lastError = "OpenAI extraction review request failed";
+
+  while (attempt <= MAX_RETRIES) {
+    try {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: OPENAI_REVIEW_MODEL,
+          messages,
+          response_format: { type: "json_object" },
+          reasoning_effort: getExtractionReviewReasoningEffort(),
+        }),
+      });
+
+      const payload = await response.json().catch(() => ({}));
+      if (payload?.error || !response.ok) {
+        const errorText =
+          payload?.error?.message ||
+          payload?.message ||
+          `OpenAI extraction review request failed (${response.status})`;
+        lastError = errorText;
+
+        if (!isRetryableStatus(response.status) || isHardQuotaError(errorText) || attempt === MAX_RETRIES) {
+          throw new Error(errorText);
+        }
+
+        const delayMs = RETRY_BASE_MS * Math.pow(2, attempt);
+        await sleep(delayMs);
+        attempt += 1;
+        continue;
+      }
+
+      const message = payload?.choices?.[0]?.message?.content;
+      return Array.isArray(message)
+        ? message.map((part: OpenRouterContentPart) => part?.text || "").join("\n")
+        : String(message || "");
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error ?? "Unknown error");
+      if (attempt === MAX_RETRIES) {
+        throw new Error(lastError);
+      }
+      const delayMs = RETRY_BASE_MS * Math.pow(2, attempt);
+      await sleep(delayMs);
+      attempt += 1;
+    }
+  }
+
+  throw new Error(lastError);
 }

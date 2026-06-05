@@ -34,7 +34,14 @@ import type {
   Mismatch,
 } from "@/types/pipeline";
 
-import { callOpenRouter, getQualityExtractionModel, getQualityExtractionReasoning } from "./openrouter";
+import {
+  callExtractionReviewModel,
+  callOpenRouter,
+  getExtractionReviewProvider,
+  getExtractionReviewModel,
+  getQualityExtractionModel,
+  getQualityExtractionReasoning,
+} from "./openrouter";
 
 const STORAGE_BUCKET = "packet-files";
 const execFileAsync = promisify(execFile);
@@ -1102,6 +1109,383 @@ export async function assessCaseTermsComplianceDetailed(documents: CaseDoc[]): P
 export async function assessCaseTermsCompliance(documents: CaseDoc[]): Promise<Mismatch[]> {
   const result = await assessCaseTermsComplianceDetailed(documents);
   return result.mismatches;
+}
+
+type ExtractionReviewCorrection = {
+  docId?: unknown;
+  documentType?: unknown;
+  fields?: unknown;
+  unsetFields?: unknown;
+  quarantineFields?: unknown;
+  lineItems?: unknown;
+  reason?: unknown;
+};
+
+type ExtractionReviewPayload = {
+  corrections?: unknown;
+  notes?: unknown;
+};
+
+export type ExtractionReviewSummary = {
+  enabled: boolean;
+  reviewedAt?: string;
+  model?: string;
+  provider?: string;
+  correctionCount: number;
+  corrections: Array<{
+    docId: string;
+    title: string;
+    reason?: string;
+    changedFields: string[];
+    unsetFields: string[];
+    quarantinedFields: string[];
+    documentType?: string;
+    lineItemsReplaced?: boolean;
+  }>;
+  warnings: string[];
+  error?: string;
+};
+
+function isKnownDocType(value: unknown): value is DocType {
+  return typeof value === "string" && SUPPORTED_DOC_TYPES.includes(value as DocType);
+}
+
+function isKnownFieldKey(value: unknown): value is FieldKey {
+  return typeof value === "string" && ALL_ALLOWED_FIELD_KEYS.includes(value as FieldKey);
+}
+
+function normalizeStringArray(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry) => String(entry ?? "").trim()).filter(Boolean);
+}
+
+function normalizeReviewFieldList(value: unknown) {
+  return normalizeStringArray(value).filter(isKnownFieldKey);
+}
+
+function normalizeReviewQuarantineFields(value: unknown): Array<{ field: FieldKey; reason?: string }> {
+  if (!Array.isArray(value)) return [];
+
+  return value.flatMap((entry) => {
+    if (isKnownFieldKey(entry)) return [{ field: entry }];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const record = entry as Record<string, unknown>;
+    const field = record.field;
+    if (!isKnownFieldKey(field)) return [];
+    const reason = String(record.reason ?? "").trim();
+    return [{ field, ...(reason ? { reason } : {}) }];
+  });
+}
+
+function getVisibleTextFromMarkdown(markdown: string | undefined) {
+  const raw = String(markdown ?? "");
+  const marker = "## Visible Text";
+  const markerIndex = raw.indexOf(marker);
+  if (markerIndex >= 0) {
+    return raw.slice(markerIndex + marker.length).replace(/^#+\s+Page\s+\d+\s*$/gim, "").trim();
+  }
+  return raw.trim();
+}
+
+function buildExtractionReviewPrompt(documents: CaseDoc[]) {
+  return documents.map((doc, index) => ({
+    index: index + 1,
+    docId: doc.id,
+    documentType: doc.type,
+    title: doc.title,
+    sourceFileName: doc.sourceFileName,
+    sourceHint: doc.sourceHint,
+    fields: doc.fields,
+    lineItems: (doc.lineItems ?? []).slice(0, 40),
+    qualityIssues: doc.qualityIssues ?? [],
+    visibleText: compactPromptText(getVisibleTextFromMarkdown(doc.md), 6500),
+  }));
+}
+
+function rebuildReviewedMarkdown(doc: CaseDoc, originalMarkdown: string | undefined) {
+  const visibleText = getVisibleTextFromMarkdown(originalMarkdown);
+  return buildMarkdown(doc, visibleText ? [visibleText] : []);
+}
+
+function appendReviewQualityIssue(
+  issues: ExtractionQualityIssue[],
+  field: FieldKey,
+  originalValue: string,
+  action: ExtractionQualityIssue["action"],
+  reason: string
+) {
+  const alreadyPresent = issues.some(
+    (issue) =>
+      issue.field === field &&
+      issue.originalValue === originalValue &&
+      issue.action === action &&
+      issue.reason === reason
+  );
+  if (!alreadyPresent) {
+    issues.push({ field, originalValue, action, reason });
+  }
+}
+
+function applyExtractionReviewCorrections(
+  documents: CaseDoc[],
+  payload: ExtractionReviewPayload
+): { documents: CaseDoc[]; summary: ExtractionReviewSummary } {
+  const warnings: string[] = [];
+  const rawCorrections = Array.isArray(payload.corrections) ? payload.corrections : [];
+  const documentsById = new Map(documents.map((doc) => [doc.id, doc]));
+  const correctedById = new Map<string, CaseDoc>();
+  const applied: ExtractionReviewSummary["corrections"] = [];
+
+  for (const rawCorrection of rawCorrections.slice(0, 80)) {
+    if (!rawCorrection || typeof rawCorrection !== "object" || Array.isArray(rawCorrection)) {
+      warnings.push("Ignored malformed extraction review correction.");
+      continue;
+    }
+
+    const correction = rawCorrection as ExtractionReviewCorrection;
+    const docId = String(correction.docId ?? "").trim();
+    const originalDoc = correctedById.get(docId) ?? documentsById.get(docId);
+    if (!docId || !originalDoc) {
+      warnings.push(`Ignored extraction review correction for unknown document id: ${docId || "<missing>"}.`);
+      continue;
+    }
+
+    let nextDoc: CaseDoc = { ...originalDoc, fields: { ...originalDoc.fields }, qualityIssues: [...(originalDoc.qualityIssues ?? [])] };
+    const changedFields: string[] = [];
+    const unsetFields: string[] = [];
+    const quarantinedFields: string[] = [];
+    let documentType: string | undefined;
+    let lineItemsReplaced = false;
+    const reason = compactPromptText(String(correction.reason ?? "").trim(), 500);
+
+    if (correction.documentType !== undefined) {
+      if (isKnownDocType(correction.documentType) && correction.documentType !== nextDoc.type) {
+        nextDoc = {
+          ...nextDoc,
+          type: correction.documentType,
+          title: `${formatDocType(correction.documentType)} — ${nextDoc.sourceHint ?? nextDoc.sourceFileName ?? nextDoc.title}`,
+        };
+        documentType = correction.documentType;
+      } else if (correction.documentType && !isKnownDocType(correction.documentType)) {
+        warnings.push(`Ignored invalid documentType from extraction review for ${docId}: ${String(correction.documentType)}.`);
+      }
+    }
+
+    const allowedFields = new Set(getAllowedFieldKeysForDocType(nextDoc.type));
+    if (correction.fields && typeof correction.fields === "object" && !Array.isArray(correction.fields)) {
+      for (const [rawKey, rawValue] of Object.entries(correction.fields as Record<string, unknown>)) {
+        if (!isKnownFieldKey(rawKey)) {
+          warnings.push(`Ignored invalid field key from extraction review for ${docId}: ${rawKey}.`);
+          continue;
+        }
+        if (!allowedFields.has(rawKey)) {
+          warnings.push(`Ignored field ${rawKey} for ${docId} because it is not allowed on ${nextDoc.type}.`);
+          continue;
+        }
+
+        if (rawValue === null) {
+          const originalValue = nextDoc.fields[rawKey];
+          if (originalValue) {
+            delete nextDoc.fields[rawKey];
+            unsetFields.push(rawKey);
+            appendReviewQualityIssue(
+              nextDoc.qualityIssues ?? [],
+              rawKey,
+              originalValue,
+              "quarantined",
+              reason || "Second-pass extraction review removed this unsupported value."
+            );
+          }
+          continue;
+        }
+
+        const value = normalizeFieldValue(rawValue);
+        if (!value) continue;
+        const oldValue = nextDoc.fields[rawKey];
+        if (oldValue !== value) {
+          nextDoc.fields[rawKey] = value;
+          changedFields.push(rawKey);
+          appendReviewQualityIssue(
+            nextDoc.qualityIssues ?? [],
+            rawKey,
+            oldValue ?? "<missing>",
+            "corrected",
+            reason || "Second-pass extraction review corrected this value from packet evidence."
+          );
+        }
+      }
+    }
+
+    for (const field of normalizeReviewFieldList(correction.unsetFields)) {
+      if (!allowedFields.has(field)) continue;
+      const originalValue = nextDoc.fields[field];
+      if (!originalValue) continue;
+      delete nextDoc.fields[field];
+      unsetFields.push(field);
+      appendReviewQualityIssue(
+        nextDoc.qualityIssues ?? [],
+        field,
+        originalValue,
+        "quarantined",
+        reason || "Second-pass extraction review removed this value as unsupported by packet evidence."
+      );
+    }
+
+    for (const entry of normalizeReviewQuarantineFields(correction.quarantineFields)) {
+      if (!allowedFields.has(entry.field)) continue;
+      const originalValue = nextDoc.fields[entry.field];
+      if (!originalValue) continue;
+      delete nextDoc.fields[entry.field];
+      quarantinedFields.push(entry.field);
+      appendReviewQualityIssue(
+        nextDoc.qualityIssues ?? [],
+        entry.field,
+        originalValue,
+        "quarantined",
+        entry.reason || reason || "Second-pass extraction review quarantined this uncertain value."
+      );
+    }
+
+    if (Array.isArray(correction.lineItems)) {
+      const visibleText = getVisibleTextFromMarkdown(nextDoc.md);
+      nextDoc.lineItems = normalizeExtractedCommercialLineItems({
+        docType: nextDoc.type,
+        lineItems: sanitizeLineItems(correction.lineItems),
+        visibleTextPages: visibleText ? [visibleText] : [],
+        documentFields: nextDoc.fields,
+      });
+      lineItemsReplaced = true;
+    }
+
+    if (
+      documentType ||
+      changedFields.length ||
+      unsetFields.length ||
+      quarantinedFields.length ||
+      lineItemsReplaced
+    ) {
+      nextDoc.fields = omitIgnoredFields(nextDoc.fields) as Partial<Record<FieldKey, string>>;
+      nextDoc.md = rebuildReviewedMarkdown(nextDoc, originalDoc.md);
+      correctedById.set(docId, nextDoc);
+      applied.push({
+        docId,
+        title: nextDoc.title,
+        ...(reason ? { reason } : {}),
+        changedFields,
+        unsetFields,
+        quarantinedFields,
+        ...(documentType ? { documentType } : {}),
+        ...(lineItemsReplaced ? { lineItemsReplaced } : {}),
+      });
+    }
+  }
+
+  return {
+    documents: documents.map((doc) => correctedById.get(doc.id) ?? doc),
+    summary: {
+      enabled: true,
+      reviewedAt: new Date().toISOString(),
+      model: getExtractionReviewModel(),
+      provider: getExtractionReviewProvider(),
+      correctionCount: applied.length,
+      corrections: applied,
+      warnings: [
+        ...warnings,
+        ...normalizeStringArray(payload.notes).map((note) => compactPromptText(note, 400)),
+      ].filter(Boolean),
+    },
+  };
+}
+
+export async function reviewAndCorrectExtractedDocuments(documents: CaseDoc[]): Promise<{
+  documents: CaseDoc[];
+  review: ExtractionReviewSummary;
+}> {
+  if (process.env.PACKET_EXTRACTION_REVIEW_ENABLED === "false") {
+    return {
+      documents,
+      review: {
+        enabled: false,
+        correctionCount: 0,
+        corrections: [],
+        warnings: ["Second-pass extraction review is disabled by PACKET_EXTRACTION_REVIEW_ENABLED=false."],
+      },
+    };
+  }
+
+  const assessableDocuments = documents.filter((doc) => doc.md?.trim() || Object.keys(doc.fields).length || doc.lineItems?.length);
+  if (!assessableDocuments.length) {
+    return {
+      documents,
+      review: {
+        enabled: true,
+        reviewedAt: new Date().toISOString(),
+        model: getExtractionReviewModel(),
+        provider: getExtractionReviewProvider(),
+        correctionCount: 0,
+        corrections: [],
+        warnings: ["Second-pass extraction review skipped because there were no extracted documents to review."],
+      },
+    };
+  }
+
+  let raw = "";
+  try {
+    raw = await callExtractionReviewModel(
+      [
+        {
+          role: "system",
+          content:
+            "You are a strict procurement packet extraction reviewer. Return only JSON. " +
+            "Review all extracted documents against their visibleText and correct only values that are explicitly supported by visible packet evidence. " +
+            "Do not invent data from file names, nearby documents, expectations, or arithmetic alone. " +
+            "You may correct documentType, fields, lineItems, and quarantine unsupported fields. " +
+            "E-Way Bill numbers must be exactly 12 digits. If an extracted eWayBillNumber is not 12 digits, remove it. " +
+            "Do not automatically move an invalid e-way value into referenceInvoiceNumber unless the visible page explicitly labels it as Doc No, Document No, Invoice No, Tax Invoice No, or Delivery Challan No for that same document. " +
+            "If a page is a PASS OUT DOCUMENT, delivery summary, logistics summary, or contains multiple delivery refs such as EM5032/EM5033, avoid creating a strong invoice reference unless the label and line amounts clearly support that exact invoice. " +
+            "For consignee/ship-to/recipient, buyerName/buyerGstin may be Kalika only; non-Kalika consignee values must not become buyer fields. " +
+            "For GST, preserve visible tax percentages separately from tax amounts. Same Maharashtra/Kalika state code 27 means CGST+SGST split unless the document explicitly shows IGST. " +
+            "Return JSON shape: {\"corrections\":[{\"docId\":\"...\",\"documentType\":\"Invoice\",\"fields\":{\"fieldKey\":\"value or null\"},\"unsetFields\":[\"fieldKey\"],\"quarantineFields\":[{\"field\":\"fieldKey\",\"reason\":\"...\"}],\"lineItems\":[...],\"reason\":\"concise evidence\"}],\"notes\":[\"...\"]}. " +
+            "Use null in fields or quarantineFields to remove unsupported values. Use empty corrections when extraction is already strong.",
+        },
+        {
+          role: "user",
+          content:
+            "Review this completed first-pass extraction before mismatch generation. " +
+            "Only return corrections that are clearly supported by visibleText.\n\n" +
+            JSON.stringify({
+              allowedDocumentTypes: SUPPORTED_DOC_TYPES,
+              allowedFieldKeys: ALL_ALLOWED_FIELD_KEYS,
+              documents: buildExtractionReviewPrompt(assessableDocuments),
+            }),
+        },
+      ]
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
+    console.warn("Second-pass extraction review failed; continuing with first-pass extraction.", message);
+    return {
+      documents,
+      review: {
+        enabled: true,
+        reviewedAt: new Date().toISOString(),
+        model: getExtractionReviewModel(),
+        provider: getExtractionReviewProvider(),
+        correctionCount: 0,
+        corrections: [],
+        warnings: [],
+        error: message,
+      },
+    };
+  }
+
+  const payload = safeJsonParse<ExtractionReviewPayload>(raw, {});
+  const applied = applyExtractionReviewCorrections(assessableDocuments, payload);
+  const correctedById = new Map(applied.documents.map((doc) => [doc.id, doc]));
+  return {
+    documents: documents.map((doc) => correctedById.get(doc.id) ?? doc),
+    review: applied.summary,
+  };
 }
 
 function mapFields(fields: Record<string, unknown>, docType?: DocType): Partial<Record<FieldKey, string>> {

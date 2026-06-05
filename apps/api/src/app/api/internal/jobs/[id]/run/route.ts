@@ -8,6 +8,7 @@ import {
   assessCaseTermsComplianceDetailed,
   enrichProcessedDocuments,
   processStoredCaseFiles,
+  reviewAndCorrectExtractedDocuments,
   verifyProcessedDocuments,
 } from "@/lib/processing/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -229,8 +230,8 @@ export async function POST(
     await assertCurrentRun();
 
     await updateCurrentJob({
-      stage: "Saving extracted results",
-      progress: 96,
+      stage: "Preparing extracted results",
+      progress: 93,
     });
 
     await assertCurrentRun();
@@ -258,13 +259,28 @@ export async function POST(
     if (documentDeleteError) throw documentDeleteError;
     if (mismatchDeleteError) throw mismatchDeleteError;
 
-    const documents = enrichProcessedDocuments(
+    let documents = enrichProcessedDocuments(
       mergePersistedStructuredData(
         processed.documents,
         existingDocuments ?? [],
         fieldConfiguration
       )
     );
+    await updateCurrentJob({
+      stage: "Reviewing extraction accuracy",
+      progress: 94,
+    });
+    await assertCurrentRun();
+
+    const extractionReview = await reviewAndCorrectExtractedDocuments(documents);
+    documents = enrichProcessedDocuments(extractionReview.documents);
+
+    await updateCurrentJob({
+      stage: "Saving reviewed results",
+      progress: 96,
+    });
+    await assertCurrentRun();
+
     const baseVerified = verifyProcessedDocuments(documents, processed.comparisonOptions);
     const termsCompliance = await assessCaseTermsComplianceDetailed(documents);
     const verified = {
@@ -341,6 +357,7 @@ export async function POST(
           comparisonOptions: processed.comparisonOptions,
           verificationGroups: verified.verificationGroups,
           termsComplianceChecklist: termsCompliance.checklist,
+          extractionReview: extractionReview.review,
           lastProcessingError: null,
         },
       })
@@ -361,6 +378,7 @@ export async function POST(
         documentCount: documents.length,
         mismatchCount: verified.mismatches.length,
         verificationGroupCount: verified.verificationGroups.length,
+        extractionReview: extractionReview.review,
       },
       finished_at: new Date().toISOString(),
     });
