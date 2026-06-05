@@ -39,6 +39,7 @@ import {
   callOpenRouter,
   getExtractionReviewProvider,
   getExtractionReviewModel,
+  getExtractionReviewReasoningEffort,
   getQualityExtractionModel,
   getQualityExtractionReasoning,
 } from "./openrouter";
@@ -1131,6 +1132,7 @@ export type ExtractionReviewSummary = {
   reviewedAt?: string;
   model?: string;
   provider?: string;
+  reasoningEffort?: string;
   correctionCount: number;
   corrections: Array<{
     docId: string;
@@ -1387,6 +1389,7 @@ function applyExtractionReviewCorrections(
       reviewedAt: new Date().toISOString(),
       model: getExtractionReviewModel(),
       provider: getExtractionReviewProvider(),
+      reasoningEffort: getExtractionReviewReasoningEffort(),
       correctionCount: applied.length,
       corrections: applied,
       warnings: [
@@ -1422,6 +1425,7 @@ export async function reviewAndCorrectExtractedDocuments(documents: CaseDoc[]): 
         reviewedAt: new Date().toISOString(),
         model: getExtractionReviewModel(),
         provider: getExtractionReviewProvider(),
+        reasoningEffort: getExtractionReviewReasoningEffort(),
         correctionCount: 0,
         corrections: [],
         warnings: ["Second-pass extraction review skipped because there were no extracted documents to review."],
@@ -1471,6 +1475,7 @@ export async function reviewAndCorrectExtractedDocuments(documents: CaseDoc[]): 
         reviewedAt: new Date().toISOString(),
         model: getExtractionReviewModel(),
         provider: getExtractionReviewProvider(),
+        reasoningEffort: getExtractionReviewReasoningEffort(),
         correctionCount: 0,
         corrections: [],
         warnings: [],

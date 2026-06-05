@@ -162,7 +162,7 @@ export function getExtractionReviewReasoning() {
   } satisfies OpenRouterReasoningOptions;
 }
 
-function getExtractionReviewReasoningEffort() {
+export function getExtractionReviewReasoningEffort() {
   return getExtractionReviewReasoning().effort ?? "medium";
 }
 
