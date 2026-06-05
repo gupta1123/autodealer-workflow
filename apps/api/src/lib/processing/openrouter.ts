@@ -16,6 +16,14 @@ const OPENAI_REVIEW_MODEL =
   process.env.OPENAI_REVIEW_MODEL ||
   process.env.EXTRACTION_REVIEW_MODEL ||
   "gpt-5.5";
+const EXTRACTION_REVIEW_PROVIDER = (
+  process.env.EXTRACTION_REVIEW_PROVIDER ||
+  process.env.OPENROUTER_REVIEW_PROVIDER ||
+  process.env.OPENAI_REVIEW_PROVIDER ||
+  ""
+)
+  .trim()
+  .toLowerCase();
 const OPENROUTER_REVIEW_REASONING_EFFORT =
   process.env.OPENROUTER_REVIEW_REASONING_EFFORT ||
   process.env.OPENAI_REVIEW_REASONING_EFFORT ||
@@ -89,6 +97,7 @@ export async function callOpenRouter(
           messages,
           temperature: 0,
           ...(options?.reasoning ? { reasoning: options.reasoning } : {}),
+          ...(options?.expectJson ? { response_format: { type: "json_object" } } : {}),
         }),
       });
 
@@ -132,12 +141,20 @@ export function getQualityExtractionModel() {
   return OPENROUTER_QUALITY_MODEL;
 }
 
+function getConfiguredExtractionReviewProvider() {
+  if (EXTRACTION_REVIEW_PROVIDER === "openai" || EXTRACTION_REVIEW_PROVIDER === "openrouter") {
+    return EXTRACTION_REVIEW_PROVIDER;
+  }
+
+  return OPENROUTER_API_KEY ? "openrouter" : "openai";
+}
+
 export function getExtractionReviewModel() {
-  return OPENAI_API_KEY ? OPENAI_REVIEW_MODEL : OPENROUTER_REVIEW_MODEL;
+  return getConfiguredExtractionReviewProvider() === "openrouter" ? OPENROUTER_REVIEW_MODEL : OPENAI_REVIEW_MODEL;
 }
 
 export function getExtractionReviewProvider() {
-  return OPENAI_API_KEY ? "openai" : "openrouter";
+  return getConfiguredExtractionReviewProvider();
 }
 
 export function getQualityExtractionReasoning() {
@@ -167,7 +184,7 @@ export function getExtractionReviewReasoningEffort() {
 }
 
 export async function callExtractionReviewModel(messages: OpenRouterMessage[]) {
-  if (!OPENAI_API_KEY) {
+  if (getConfiguredExtractionReviewProvider() === "openrouter") {
     return callOpenRouter(messages, {
       expectJson: true,
       model: OPENROUTER_REVIEW_MODEL,
