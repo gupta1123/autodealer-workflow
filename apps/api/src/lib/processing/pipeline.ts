@@ -5,6 +5,8 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
+import sharp from "sharp";
+
 import { summarizeCase } from "@/lib/case-summary";
 import { DEFAULT_COMPARISON_OPTIONS, normalizeComparableValue, readComparisonOptions } from "@/lib/comparison";
 import {
@@ -31,6 +33,9 @@ const execFileAsync = promisify(execFile);
 const PDF_RENDER_DPI = Number(process.env.PACKET_PDF_RENDER_DPI ?? 160);
 const PDF_RENDER_MAX_PAGES = Number(process.env.PACKET_PDF_RENDER_MAX_PAGES ?? 8);
 const PDF_SMART_SPLIT_MAX_PAGES = Number(process.env.PACKET_PDF_SMART_SPLIT_MAX_PAGES ?? 20);
+const PROVIDER_IMAGE_HARD_LIMIT_BYTES = Number(process.env.PACKET_PROVIDER_IMAGE_HARD_LIMIT_BYTES ?? 20 * 1024 * 1024);
+const PROVIDER_IMAGE_TARGET_BYTES = Number(process.env.PACKET_PROVIDER_IMAGE_TARGET_BYTES ?? 8 * 1024 * 1024);
+const PROVIDER_IMAGE_MAX_DIMENSION = Number(process.env.PACKET_PROVIDER_IMAGE_MAX_DIMENSION ?? 3200);
 const PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY = "Vehicle number is not clearly visible in this image.";
 const PO_NUMBER_FIELD_KEYS: FieldKey[] = ["poNumber", "referencePoNumber"];
 const INDENT_LABEL_PATTERN = /\b(?:indent|ind\.?\s*no|indent\s*(?:no|number|form|ref|reference)?)\b/i;
@@ -3473,6 +3478,104 @@ function bufferToDataUrl(data: Uint8Array, mimeType: string) {
   return `data:${mimeType};base64,${Buffer.from(data).toString("base64")}`;
 }
 
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** index;
+  return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
+}
+
+function normalizeImageMimeType(mimeType: string) {
+  const lower = mimeType.toLowerCase();
+  if (lower === "image/jpg") return "image/jpeg";
+  if (lower.startsWith("image/")) return lower;
+  return "image/jpeg";
+}
+
+function isProviderSafeImageMimeType(mimeType: string) {
+  return ["image/jpeg", "image/png", "image/webp"].includes(normalizeImageMimeType(mimeType));
+}
+
+async function compressImageForProvider(input: Buffer, label: string) {
+  const dimensionSteps = [
+    PROVIDER_IMAGE_MAX_DIMENSION,
+    2800,
+    2400,
+    2000,
+    1600,
+    1200,
+  ].filter((value, index, values) => Number.isFinite(value) && value > 0 && values.indexOf(value) === index);
+  const qualitySteps = [86, 80, 74, 68, 62, 56];
+  let smallest: Buffer | null = null;
+  let lastError: unknown = null;
+
+  for (const dimension of dimensionSteps) {
+    for (const quality of qualitySteps) {
+      try {
+        const output = await sharp(input, { failOn: "none" })
+          .rotate()
+          .resize({
+            width: dimension,
+            height: dimension,
+            fit: "inside",
+            withoutEnlargement: true,
+          })
+          .jpeg({
+            quality,
+            progressive: true,
+            force: true,
+          })
+          .toBuffer();
+
+        if (!smallest || output.byteLength < smallest.byteLength) {
+          smallest = output;
+        }
+        if (output.byteLength <= PROVIDER_IMAGE_TARGET_BYTES) {
+          return { bytes: output, mimeType: "image/jpeg" };
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+  }
+
+  if (smallest && smallest.byteLength <= PROVIDER_IMAGE_HARD_LIMIT_BYTES) {
+    return { bytes: smallest, mimeType: "image/jpeg" };
+  }
+
+  const reason = lastError instanceof Error ? lastError.message : "compression did not reach a safe size";
+  throw new Error(
+    `Unable to prepare "${label}" for analysis. Image remains above the ${formatBytes(PROVIDER_IMAGE_HARD_LIMIT_BYTES)} provider limit after compression (${reason}).`
+  );
+}
+
+async function imageBytesToProviderDataUrl(data: Uint8Array, mimeType: string, label: string) {
+  const normalizedMimeType = normalizeImageMimeType(mimeType);
+  const input = Buffer.from(data);
+  if (input.byteLength <= PROVIDER_IMAGE_TARGET_BYTES && isProviderSafeImageMimeType(normalizedMimeType)) {
+    return bufferToDataUrl(input, normalizedMimeType);
+  }
+
+  try {
+    const compressed = await compressImageForProvider(input, label);
+    if (compressed.bytes.byteLength < input.byteLength || input.byteLength > PROVIDER_IMAGE_HARD_LIMIT_BYTES) {
+      console.info(
+        `[packet-processing] compressed image for provider: ${label} ${formatBytes(input.byteLength)} -> ${formatBytes(compressed.bytes.byteLength)}`
+      );
+    }
+    return bufferToDataUrl(compressed.bytes, compressed.mimeType);
+  } catch (error) {
+    if (input.byteLength <= PROVIDER_IMAGE_HARD_LIMIT_BYTES && isProviderSafeImageMimeType(normalizedMimeType)) {
+      console.warn(
+        `[packet-processing] image compression failed for ${label}; using original ${formatBytes(input.byteLength)} image. ${error instanceof Error ? error.message : String(error ?? "")}`
+      );
+      return bufferToDataUrl(input, normalizedMimeType);
+    }
+    throw error;
+  }
+}
+
 function hasMeaningfulTextPages(textPages: string[]) {
   return textPages.some((page) => page.replace(/\s+/g, "").length > 20);
 }
@@ -3482,7 +3585,7 @@ function renderedPageNumber(fileName: string) {
   return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
 }
 
-async function renderPdfToImagePages(data: Uint8Array, options?: { maxPages?: number }) {
+async function renderPdfToImagePages(data: Uint8Array, options?: { maxPages?: number; sourceName?: string }) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "packet-pdf-"));
   const inputPath = path.join(tmpDir, "input.pdf");
   const outputPrefix = path.join(tmpDir, "page");
@@ -3502,14 +3605,18 @@ async function renderPdfToImagePages(data: Uint8Array, options?: { maxPages?: nu
       outputPrefix,
     ]);
 
-    return fs
+    const pageFileNames = fs
       .readdirSync(tmpDir)
       .filter((fileName) => fileName.startsWith("page-") && fileName.endsWith(".png"))
-      .sort((left, right) => renderedPageNumber(left) - renderedPageNumber(right))
-      .map((fileName) => {
-        const bytes = fs.readFileSync(path.join(tmpDir, fileName));
-        return `data:image/png;base64,${bytes.toString("base64")}`;
-      });
+      .sort((left, right) => renderedPageNumber(left) - renderedPageNumber(right));
+
+    const pageImages: string[] = [];
+    for (const fileName of pageFileNames) {
+      const bytes = fs.readFileSync(path.join(tmpDir, fileName));
+      pageImages.push(await imageBytesToProviderDataUrl(bytes, "image/png", `${options?.sourceName ?? "PDF"} ${fileName}`));
+    }
+
+    return pageImages;
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -4309,7 +4416,7 @@ async function retryWeakPdfTextExtractionFromImages(params: {
     return params.document;
   }
 
-  const pageImages = await renderPdfToImagePages(params.bytes);
+  const pageImages = await renderPdfToImagePages(params.bytes, { sourceName: params.fileName });
   if (!pageImages.length) {
     return params.document;
   }
@@ -4440,7 +4547,7 @@ export async function processStoredCaseFiles(params: {
         progress: fileProgress(0.35),
         stage: `Extracting file ${index + 1} of ${files.length}: ${file.original_name}`,
       });
-      const image = bufferToDataUrl(bytes, mimeType);
+      const image = await imageBytesToProviderDataUrl(bytes, mimeType, file.original_name);
       const documentType = await classifyDocumentFromImage(image, file.original_name);
       let document = await extractDataFromImagePages({
         fileName: file.original_name,
@@ -4464,7 +4571,10 @@ export async function processStoredCaseFiles(params: {
 
         let pageImages: string[] = [];
         try {
-          pageImages = await renderPdfToImagePages(bytes, { maxPages: PDF_SMART_SPLIT_MAX_PAGES });
+          pageImages = await renderPdfToImagePages(bytes, {
+            maxPages: PDF_SMART_SPLIT_MAX_PAGES,
+            sourceName: file.original_name,
+          });
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error ?? "Unknown error");
           if (!hasMeaningfulTextPages(textPages)) {
@@ -4527,7 +4637,7 @@ export async function processStoredCaseFiles(params: {
 
         let pageImages: string[] = [];
         try {
-          pageImages = await renderPdfToImagePages(bytes);
+          pageImages = await renderPdfToImagePages(bytes, { sourceName: file.original_name });
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error ?? "Unknown error");
           throw new Error(
