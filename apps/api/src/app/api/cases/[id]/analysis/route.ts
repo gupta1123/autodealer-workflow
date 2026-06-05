@@ -31,7 +31,7 @@ import {
 } from "@/lib/line-items";
 import { mergePersistedStructuredData } from "@/lib/persisted-structured-data";
 import { getLatestProcessingJob, mapProcessingJob } from "@/lib/processing/jobs";
-import { assessCaseTermsCompliance } from "@/lib/processing/pipeline";
+import { assessCaseTermsComplianceDetailed } from "@/lib/processing/pipeline";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
@@ -451,8 +451,8 @@ export async function POST(
         fieldConfiguration
       )
     );
-    const termsMismatches = await assessCaseTermsCompliance(documentsWithPersistedStructuredData);
-    const mismatches = [...baseMismatches, ...termsMismatches];
+    const termsCompliance = await assessCaseTermsComplianceDetailed(documentsWithPersistedStructuredData);
+    const mismatches = [...baseMismatches, ...termsCompliance.mismatches];
 
     const documentRows = documentsWithPersistedStructuredData.map((document) => ({
       case_id: id,
@@ -517,6 +517,7 @@ export async function POST(
         missingDocumentGroups: summary.missingDocTypes,
         paymentGap: summary.paymentGap,
         comparisonOptions,
+        termsComplianceChecklist: termsCompliance.checklist,
       },
     };
 

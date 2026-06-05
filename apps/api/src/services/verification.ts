@@ -97,6 +97,8 @@ const LINE_ITEM_REFERENCE_PRIORITY: Partial<Record<CaseDoc["type"], number>> = {
 const GROUP_REFERENCE_FIELDS: FieldKey[] = [
   "poNumber",
   "invoiceNumber",
+  "referenceInvoiceNumber",
+  "deliveryNoteNumber",
   "eWayBillNumber",
   "lorryReceiptNumber",
   "weighmentNumber",
@@ -555,9 +557,13 @@ function isUsefulInvoiceReference(value: string | null) {
   return value.length >= 4 || /[a-z]/i.test(value);
 }
 
+function isValidEWayBillReference(value: string | null) {
+  return Boolean(value && /^\d{12}$/.test(value));
+}
+
 function isUsefulVehicleReference(value: string | null) {
   if (!value) return false;
-  return value.length >= 7 && value.length <= 12 && /[a-z]/i.test(value) && /\d/.test(value);
+  return /^[a-z]{2}\d{1,2}[a-z]{1,3}\d{3,4}$/i.test(value);
 }
 
 function getVehicleReference(doc: CaseDoc, comparisonOptions: ComparisonOptions) {
@@ -578,18 +584,32 @@ function getPacketReferenceKeys(doc: CaseDoc, comparisonOptions: ComparisonOptio
   );
   if (isUsefulInvoiceReference(invoiceNumber)) {
     keys.push(`invoice:${invoiceNumber}`);
+    keys.push(`document:${invoiceNumber}`);
     if (vendorIdentity) keys.push(`invoice-party:${invoiceNumber}:${vendorIdentity}`);
   }
 
   const eWayBillNumber = normalizeGroupValue(doc.fields.eWayBillNumber, comparisonOptions, "eWayBillNumber");
-  if (eWayBillNumber) keys.push(`eway:${eWayBillNumber}`);
+  if (isValidEWayBillReference(eWayBillNumber)) keys.push(`eway:${eWayBillNumber}`);
+
+  const deliveryNoteNumber = normalizeGroupValue(
+    doc.fields.deliveryNoteNumber,
+    comparisonOptions,
+    "deliveryNoteNumber"
+  );
+  if (isUsefulInvoiceReference(deliveryNoteNumber)) {
+    keys.push(`delivery:${deliveryNoteNumber}`);
+    keys.push(`document:${deliveryNoteNumber}`);
+  }
 
   const lorryReceiptNumber = normalizeGroupValue(
     doc.fields.lorryReceiptNumber,
     comparisonOptions,
     "lorryReceiptNumber"
   );
-  if (lorryReceiptNumber) keys.push(`lr:${lorryReceiptNumber}`);
+  if (lorryReceiptNumber) {
+    keys.push(`lr:${lorryReceiptNumber}`);
+    keys.push(`document:${lorryReceiptNumber}`);
+  }
 
   const weighmentNumber = normalizeGroupValue(doc.fields.weighmentNumber, comparisonOptions, "weighmentNumber");
   if (weighmentNumber && vendorIdentity) keys.push(`weighment-party:${weighmentNumber}:${vendorIdentity}`);
@@ -610,9 +630,9 @@ function getPacketReferenceKeys(doc: CaseDoc, comparisonOptions: ComparisonOptio
   return [...new Set(keys)];
 }
 
-function shareReferenceKey(left: CaseDoc, right: CaseDoc, comparisonOptions: ComparisonOptions) {
+function getSharedReferenceKeys(left: CaseDoc, right: CaseDoc, comparisonOptions: ComparisonOptions) {
   const leftKeys = new Set(getPacketReferenceKeys(left, comparisonOptions));
-  return getPacketReferenceKeys(right, comparisonOptions).some((key) => leftKeys.has(key));
+  return getPacketReferenceKeys(right, comparisonOptions).filter((key) => leftKeys.has(key));
 }
 
 function shareCommercialIdentity(left: CaseDoc, right: CaseDoc, comparisonOptions: ComparisonOptions) {
@@ -643,14 +663,91 @@ function shareCommercialIdentity(left: CaseDoc, right: CaseDoc, comparisonOption
   );
 }
 
+function isStrongDocumentReferenceKey(key: string) {
+  return (
+    key.startsWith("po:") ||
+    key.startsWith("invoice:") ||
+    key.startsWith("invoice-party:") ||
+    key.startsWith("document:") ||
+    key.startsWith("delivery:") ||
+    key.startsWith("eway:") ||
+    key.startsWith("lr:")
+  );
+}
+
+function isWeakLogisticsReferenceKey(key: string) {
+  return (
+    key.startsWith("vehicle:") ||
+    key.startsWith("fastag:") ||
+    key.startsWith("transaction:") ||
+    key.startsWith("weighment-party:")
+  );
+}
+
+function getStrongDocumentReferenceKeys(doc: CaseDoc, comparisonOptions: ComparisonOptions) {
+  return getPacketReferenceKeys(doc, comparisonOptions).filter(isStrongDocumentReferenceKey);
+}
+
+function hasCommercialComparisonSignal(doc: CaseDoc) {
+  return Boolean(
+    doc.fields.subtotal ||
+      doc.fields.totalTaxableAmount ||
+      doc.fields.taxAmount ||
+      doc.fields.totalAmount ||
+      (doc.lineItems?.length ?? 0) > 0 ||
+      COMMERCIAL_LINE_ITEM_COMPARISON_DOC_TYPES.has(doc.type)
+  );
+}
+
+function hasSharedStrongDocumentReference(
+  left: CaseDoc,
+  right: CaseDoc,
+  comparisonOptions: ComparisonOptions
+) {
+  const leftKeys = new Set(getStrongDocumentReferenceKeys(left, comparisonOptions));
+  return getStrongDocumentReferenceKeys(right, comparisonOptions).some((key) => leftKeys.has(key));
+}
+
 function shouldGroupBySourceFile(
   left: CaseDoc,
   right: CaseDoc,
   sourceDocs: CaseDoc[],
   comparisonOptions: ComparisonOptions
 ) {
-  if (shareReferenceKey(left, right, comparisonOptions) || shareCommercialIdentity(left, right, comparisonOptions)) {
+  const leftStrongRefs = getStrongDocumentReferenceKeys(left, comparisonOptions);
+  const rightStrongRefs = getStrongDocumentReferenceKeys(right, comparisonOptions);
+  if (leftStrongRefs.length > 0 && rightStrongRefs.length > 0) {
+    return hasSharedStrongDocumentReference(left, right, comparisonOptions);
+  }
+
+  if (shareCommercialIdentity(left, right, comparisonOptions)) {
     return true;
+  }
+
+  const sharedReferenceKeys = getSharedReferenceKeys(left, right, comparisonOptions);
+  if (sharedReferenceKeys.some(isStrongDocumentReferenceKey)) {
+    return true;
+  }
+
+  const hasOnlyWeakLogisticsReference =
+    sharedReferenceKeys.length > 0 && sharedReferenceKeys.every(isWeakLogisticsReferenceKey);
+  const commercialSourceDocCount = sourceDocs.filter((doc) =>
+    COMMERCIAL_LINE_ITEM_COMPARISON_DOC_TYPES.has(doc.type)
+  ).length;
+  if (
+    hasOnlyWeakLogisticsReference &&
+    commercialSourceDocCount > 1 &&
+    (hasCommercialComparisonSignal(left) || hasCommercialComparisonSignal(right))
+  ) {
+    return false;
+  }
+
+  if (sharedReferenceKeys.length > 0) {
+    return true;
+  }
+
+  if (hasCommercialComparisonSignal(left) && hasCommercialComparisonSignal(right)) {
+    return false;
   }
 
   const invoiceCount = sourceDocs.filter((doc) => INVOICE_DOC_TYPES.has(doc.type)).length;
@@ -719,9 +816,11 @@ export function groupDocumentsForVerification(
 
   const byReference = new Map<string, number[]>();
   docs.forEach((doc, index) => {
-    getPacketReferenceKeys(doc, comparisonOptions).forEach((key) => {
-      byReference.set(key, [...(byReference.get(key) ?? []), index]);
-    });
+    getPacketReferenceKeys(doc, comparisonOptions)
+      .filter(isStrongDocumentReferenceKey)
+      .forEach((key) => {
+        byReference.set(key, [...(byReference.get(key) ?? []), index]);
+      });
   });
 
   byReference.forEach((indices) => {
@@ -1278,6 +1377,14 @@ function getLineItemReferenceDoc(comparedDoc: CaseDoc, docsWithLineItems: CaseDo
   return getBestCandidateDoc(comparedDoc, candidateDocs, () => true);
 }
 
+function shouldSkipUnanchoredEWayInvoiceLineComparison(referenceDoc: CaseDoc, comparedDoc: CaseDoc) {
+  return (
+    comparedDoc.type === "E-Way Bill" &&
+    INVOICE_DOC_TYPES.has(referenceDoc.type) &&
+    !hasSharedLineItemReference(comparedDoc, referenceDoc)
+  );
+}
+
 function getBroadPurchaseLineReferenceDoc(
   comparedDoc: CaseDoc,
   docsWithLineItems: CaseDoc[],
@@ -1612,6 +1719,7 @@ function verifyCommercialLineItems(docs: CaseDoc[]): Omit<Mismatch, "analysis" |
         getBroadPurchaseLineReferenceDoc(comparedDoc, docsWithLineItems, comparedLine) ??
         defaultReferenceDoc;
       if (!referenceDoc) continue;
+      if (shouldSkipUnanchoredEWayInvoiceLineComparison(referenceDoc, comparedDoc)) continue;
 
       const referenceLines = referenceDoc.lineItems ?? [];
       const referenceRole = formatLineDocRole(referenceDoc);

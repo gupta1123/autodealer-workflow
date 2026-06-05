@@ -5,7 +5,7 @@ import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-servi
 import { serializeFieldsWithLineItems } from "@/lib/line-items";
 import { mergePersistedStructuredData } from "@/lib/persisted-structured-data";
 import {
-  assessCaseTermsCompliance,
+  assessCaseTermsComplianceDetailed,
   enrichProcessedDocuments,
   processStoredCaseFiles,
   verifyProcessedDocuments,
@@ -266,10 +266,10 @@ export async function POST(
       )
     );
     const baseVerified = verifyProcessedDocuments(documents, processed.comparisonOptions);
-    const termsMismatches = await assessCaseTermsCompliance(documents);
+    const termsCompliance = await assessCaseTermsComplianceDetailed(documents);
     const verified = {
       ...baseVerified,
-      mismatches: [...baseVerified.mismatches, ...termsMismatches],
+      mismatches: [...baseVerified.mismatches, ...termsCompliance.mismatches],
     };
     const summary = summarizeCase(documents, verified.mismatches, fieldConfiguration);
     const displayName = await resolveCaseDisplayNameWithAI(documents, summary);
@@ -340,6 +340,7 @@ export async function POST(
           analysisMode,
           comparisonOptions: processed.comparisonOptions,
           verificationGroups: verified.verificationGroups,
+          termsComplianceChecklist: termsCompliance.checklist,
           lastProcessingError: null,
         },
       })

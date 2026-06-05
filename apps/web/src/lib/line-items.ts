@@ -1,6 +1,7 @@
 import type { CaseDoc, CommercialLineItem, DocType, FieldKey } from "@/types/pipeline";
 
 export const LINE_ITEMS_FIELD_KEY = "__lineItems";
+export const EXTRACTION_QUALITY_FIELD_KEY = "__extractionQuality";
 
 const COMMERCIAL_DOC_TYPES = new Set<DocType>([
   "Purchase Order",
@@ -1540,12 +1541,15 @@ export function readStoredLineItems(extractedFields: unknown) {
   return sanitizeLineItems((extractedFields as Record<string, unknown>)[LINE_ITEMS_FIELD_KEY]);
 }
 
-export function serializeFieldsWithLineItems(document: Pick<CaseDoc, "fields" | "lineItems">) {
+export function serializeFieldsWithLineItems(document: Pick<CaseDoc, "fields" | "lineItems" | "qualityIssues">) {
   const fields: Record<string, unknown> = { ...(document.fields ?? {}) };
   const lineItems = sanitizeLineItems(document.lineItems);
 
   if (lineItems.length > 0) {
     fields[LINE_ITEMS_FIELD_KEY] = lineItems;
+  }
+  if (document.qualityIssues?.length) {
+    fields[EXTRACTION_QUALITY_FIELD_KEY] = document.qualityIssues;
   }
 
   return fields;
@@ -1554,5 +1558,6 @@ export function serializeFieldsWithLineItems(document: Pick<CaseDoc, "fields" | 
 export function stripStoredLineItems(fields: Record<string, unknown>) {
   const rest = { ...fields };
   delete rest[LINE_ITEMS_FIELD_KEY];
+  delete rest[EXTRACTION_QUALITY_FIELD_KEY];
   return rest as Partial<Record<FieldKey, string>>;
 }

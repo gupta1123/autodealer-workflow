@@ -97,6 +97,54 @@ const FIELD_LABEL_LOOKUP = ACTIVE_FIELD_DEFINITIONS.reduce(
 );
 const TERMS_COMPLIANCE_FIELD = "termsAndConditions";
 
+type TermsComplianceChecklistItem = {
+  sourceDocId: string;
+  sourceClause: string;
+  obligation: string;
+  category: string;
+  status: "fulfilled" | "not_fulfilled" | "unknown" | "not_applicable";
+  evidenceDocIds: string[];
+  evidence: string;
+  reason: string;
+  severity: "high" | "medium" | "low" | "none";
+};
+
+function readTermsComplianceChecklist(processingMeta: unknown): TermsComplianceChecklistItem[] {
+  if (!processingMeta || typeof processingMeta !== "object" || Array.isArray(processingMeta)) {
+    return [];
+  }
+
+  const raw = (processingMeta as Record<string, unknown>).termsComplianceChecklist;
+  if (!Array.isArray(raw)) return [];
+
+  return raw.flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const record = entry as Record<string, unknown>;
+    const sourceDocId = String(record.sourceDocId ?? "").trim();
+    const sourceClause = String(record.sourceClause ?? "").trim();
+    const obligation = String(record.obligation ?? "").trim();
+    const status = String(record.status ?? "").trim() as TermsComplianceChecklistItem["status"];
+    if (!sourceDocId || !sourceClause || !obligation) return [];
+    if (!["fulfilled", "not_fulfilled", "unknown", "not_applicable"].includes(status)) return [];
+
+    return [
+      {
+        sourceDocId,
+        sourceClause,
+        obligation,
+        category: String(record.category ?? "Terms compliance").trim() || "Terms compliance",
+        status,
+        evidenceDocIds: Array.isArray(record.evidenceDocIds)
+          ? record.evidenceDocIds.map((value) => String(value ?? "").trim()).filter(Boolean)
+          : [],
+        evidence: String(record.evidence ?? "").trim(),
+        reason: String(record.reason ?? "").trim(),
+        severity: String(record.severity ?? "none").trim() as TermsComplianceChecklistItem["severity"],
+      },
+    ];
+  });
+}
+
 function getDocumentFieldLabel(documentType: string | undefined, key: string) {
   if (documentType === "E-Way Bill" && key === "subtotal") {
     return "Total Taxable Amount";
@@ -187,6 +235,38 @@ function getTermsIssueStatus(mismatch: SavedCaseDetail["mismatches"][number]) {
 function getClearTermsStatus() {
   return {
     label: "No issue flagged",
+    className: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    icon: CheckCircle2,
+  };
+}
+
+function getChecklistStatus(status: TermsComplianceChecklistItem["status"]) {
+  if (status === "not_fulfilled") {
+    return {
+      label: "Not fulfilled",
+      className: "border-rose-200 bg-rose-50 text-rose-700",
+      icon: ShieldAlert,
+    };
+  }
+
+  if (status === "unknown") {
+    return {
+      label: "Needs review",
+      className: "border-amber-200 bg-amber-50 text-amber-700",
+      icon: TriangleAlert,
+    };
+  }
+
+  if (status === "not_applicable") {
+    return {
+      label: "Not applicable",
+      className: "border-slate-200 bg-slate-50 text-slate-600",
+      icon: Check,
+    };
+  }
+
+  return {
+    label: "Fulfilled",
     className: "border-emerald-200 bg-emerald-50 text-emerald-700",
     icon: CheckCircle2,
   };
@@ -773,9 +853,30 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       termsIssueMatchesDocument(mismatch, activeDocument)
     );
   }, [activeDocument, detail]);
+  const caseTermsChecklist = useMemo(
+    () => readTermsComplianceChecklist(detail?.case.processingMeta),
+    [detail?.case.processingMeta]
+  );
   const activeTermsChecklistRows = useMemo(() => {
     if (!activeDocument || !PURCHASE_ORDER_DOCUMENT_TYPES.has(activeDocument.documentType)) {
       return [];
+    }
+
+    const documentIds = new Set(
+      [activeDocument.id, activeDocument.clientDocumentId, activeDocument.sourceHint, activeDocument.title]
+        .filter((value): value is string => Boolean(value))
+    );
+    const assessedRows = caseTermsChecklist.filter((item) => documentIds.has(item.sourceDocId));
+    if (assessedRows.length > 0) {
+      return assessedRows.map((item, index) => ({
+        key: `assessed-${item.sourceDocId}-${index}`,
+        label: item.category || "Terms",
+        value: item.sourceClause,
+        detail: item.obligation,
+        evidence: item.evidence || item.reason,
+        issue: activeTermsIssues.find((mismatch) => getTermsIssueText(mismatch).includes(item.obligation)),
+        status: getChecklistStatus(item.status),
+      }));
     }
 
     return TERMS_CHECKLIST_DEFINITIONS.flatMap((definition) => {
@@ -791,12 +892,14 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           key: definition.key,
           label: definition.label,
           value,
+          detail: "",
+          evidence: "",
           issue,
           status: issue ? getTermsIssueStatus(issue) : getClearTermsStatus(),
         },
       ];
     });
-  }, [activeDocument, activeTermsIssues]);
+  }, [activeDocument, activeTermsIssues, caseTermsChecklist]);
   const unmatchedTermsIssues = useMemo(
     () =>
       activeTermsIssues.filter(
@@ -1841,6 +1944,16 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                                         <div className="whitespace-pre-wrap break-words text-sm font-medium leading-relaxed text-slate-900">
                                           {row.value}
                                         </div>
+                                        {row.detail ? (
+                                          <div className="mt-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                            {row.detail}
+                                          </div>
+                                        ) : null}
+                                        {row.evidence ? (
+                                          <div className="mt-2 rounded-lg bg-slate-50 px-3 py-2 text-xs font-medium leading-relaxed text-slate-700">
+                                            {row.evidence}
+                                          </div>
+                                        ) : null}
                                         {row.issue?.analysis ? (
                                           <div className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs font-medium leading-relaxed text-amber-800">
                                             {row.issue.analysis}

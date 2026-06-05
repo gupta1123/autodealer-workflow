@@ -24,7 +24,15 @@ import {
 } from "@/lib/line-items";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { verifyGroupedCaseDocuments } from "@/services/verification";
-import type { CaseAnalysisMode, CaseDoc, CommercialLineItem, DocType, FieldKey, Mismatch } from "@/types/pipeline";
+import type {
+  CaseAnalysisMode,
+  CaseDoc,
+  CommercialLineItem,
+  DocType,
+  ExtractionQualityIssue,
+  FieldKey,
+  Mismatch,
+} from "@/types/pipeline";
 
 import { callOpenRouter, getQualityExtractionModel, getQualityExtractionReasoning } from "./openrouter";
 
@@ -827,6 +835,18 @@ type TermsComplianceAssessment = {
   severity?: unknown;
 };
 
+export type TermsComplianceChecklistItem = {
+  sourceDocId: string;
+  sourceClause: string;
+  obligation: string;
+  category: string;
+  status: "fulfilled" | "not_fulfilled" | "unknown" | "not_applicable";
+  evidenceDocIds: string[];
+  evidence: string;
+  reason: string;
+  severity: "high" | "medium" | "low" | "none";
+};
+
 function compactPromptText(value: string, maxLength: number) {
   const compact = value.replace(/\s+/g, " ").trim();
   if (compact.length <= maxLength) return compact;
@@ -981,18 +1001,51 @@ function buildTermsComplianceMismatch(
   };
 }
 
-export async function assessCaseTermsCompliance(documents: CaseDoc[]): Promise<Mismatch[]> {
+function buildTermsComplianceChecklistItem(
+  assessment: TermsComplianceAssessment,
+  documentsById: Map<string, CaseDoc>
+): TermsComplianceChecklistItem | null {
+  const sourceDocId = String(assessment.sourceDocId ?? "").trim();
+  if (!documentsById.has(sourceDocId)) return null;
+
+  const status = normalizeTermsStatus(assessment.status);
+  if (!status) return null;
+
+  const sourceClause = compactPromptText(String(assessment.sourceClause ?? "").trim(), 700);
+  const obligation = compactPromptText(String(assessment.obligation ?? "").trim(), 500);
+  if (!sourceClause || !obligation) return null;
+
+  const severity = normalizeTermsSeverity(assessment.severity) || "none";
+  const evidenceDocIds = normalizeStringList(assessment.evidenceDocIds).filter((docId) => documentsById.has(docId));
+
+  return {
+    sourceDocId,
+    sourceClause,
+    obligation,
+    category: compactPromptText(String(assessment.category ?? "Terms compliance").trim(), 80),
+    status: status as TermsComplianceChecklistItem["status"],
+    evidenceDocIds,
+    evidence: compactPromptText(String(assessment.evidence ?? "").trim(), 700),
+    reason: compactPromptText(String(assessment.reason ?? "").trim(), 700),
+    severity: severity as TermsComplianceChecklistItem["severity"],
+  };
+}
+
+export async function assessCaseTermsComplianceDetailed(documents: CaseDoc[]): Promise<{
+  mismatches: Mismatch[];
+  checklist: TermsComplianceChecklistItem[];
+}> {
   const assessableDocuments = documents.filter(
     (doc) =>
       doc.md?.trim() ||
       Object.values(doc.fields).some((value) => value !== undefined && value !== null && String(value).trim()) ||
       Boolean(doc.lineItems?.length)
   );
-  if (!assessableDocuments.length) return [];
+  if (!assessableDocuments.length) return { mismatches: [], checklist: [] };
 
   const documentsById = new Map(assessableDocuments.map((doc) => [doc.id, doc]));
   const packetContext = buildTermsAssessmentPrompt(assessableDocuments);
-  if (!packetContext.trim()) return [];
+  if (!packetContext.trim()) return { mismatches: [], checklist: [] };
 
   let raw = "";
   try {
@@ -1027,17 +1080,28 @@ export async function assessCaseTermsCompliance(documents: CaseDoc[]): Promise<M
     );
   } catch (error) {
     console.warn("Failed to assess terms compliance", error);
-    return [];
+    return { mismatches: [], checklist: [] };
   }
 
   const parsed = safeJsonParse<{ obligations?: unknown }>(raw, {});
   const obligations = Array.isArray(parsed.obligations) ? parsed.obligations : [];
-  return obligations
+  const checklist = obligations
+    .map((entry) => buildTermsComplianceChecklistItem(entry as TermsComplianceAssessment, documentsById))
+    .filter((entry): entry is TermsComplianceChecklistItem => Boolean(entry))
+    .slice(0, 30);
+  const mismatches = obligations
     .map((entry, index) =>
       buildTermsComplianceMismatch(entry as TermsComplianceAssessment, documentsById, index + 1)
     )
     .filter((mismatch): mismatch is Mismatch => Boolean(mismatch))
     .slice(0, 10);
+
+  return { mismatches, checklist };
+}
+
+export async function assessCaseTermsCompliance(documents: CaseDoc[]): Promise<Mismatch[]> {
+  const result = await assessCaseTermsComplianceDetailed(documents);
+  return result.mismatches;
 }
 
 function mapFields(fields: Record<string, unknown>, docType?: DocType): Partial<Record<FieldKey, string>> {
@@ -2205,6 +2269,15 @@ function normalizeVehicleNumberForDisplay(value: string | undefined) {
     : value;
 }
 
+function isValidIndianVehicleNumber(value: string | undefined) {
+  const normalized = normalizePacketValue(value, "vehicleNumber");
+  return Boolean(normalized && /^[a-z]{2}\d{1,2}[a-z]{1,3}\d{3,4}$/i.test(normalized));
+}
+
+function isNumericOnlyIdentifier(value: string | undefined) {
+  return Boolean(value && /^\d{5,14}$/.test(value.replace(/\D/g, "")) && !/[a-z]/i.test(value));
+}
+
 function vehicleCore(value: string | undefined) {
   const normalized = normalizeVehicleNumberForDisplay(value);
   if (!normalized) return null;
@@ -2452,6 +2525,104 @@ function normalizeEWayBillNumberForDisplay(value: string | undefined) {
 function getValidEWayBillNumber(value: string | undefined) {
   const digits = value?.replace(/\D/g, "");
   return digits && digits.length === 12 ? digits : undefined;
+}
+
+function normalizeInvoiceLikeReference(value: string | undefined) {
+  const compact = value?.toUpperCase().replace(/[^A-Z0-9/-]/g, "") ?? "";
+  return compact && /[A-Z]/.test(compact) && /\d/.test(compact) && compact.length >= 5 ? compact : undefined;
+}
+
+function addQualityIssue(
+  issues: ExtractionQualityIssue[],
+  field: FieldKey,
+  originalValue: string,
+  action: ExtractionQualityIssue["action"],
+  reason: string,
+  targetField?: FieldKey
+) {
+  issues.push({
+    field,
+    originalValue,
+    action,
+    ...(targetField ? { targetField } : {}),
+    reason,
+  });
+}
+
+function applyIdentifierQualityGuard(doc: CaseDoc): CaseDoc {
+  const fields = { ...doc.fields };
+  const qualityIssues = [...(doc.qualityIssues ?? [])];
+  let changed = false;
+
+  if (fields.vehicleNumber && !isValidIndianVehicleNumber(fields.vehicleNumber)) {
+    const originalValue = fields.vehicleNumber;
+    if (doc.type === "Weighment Slip" && isNumericOnlyIdentifier(originalValue) && !fields.weighmentNumber) {
+      fields.weighmentNumber = originalValue.replace(/\D/g, "");
+      addQualityIssue(
+        qualityIssues,
+        "vehicleNumber",
+        originalValue,
+        "moved",
+        "Numeric-only lorry/weighment value is not a valid Indian vehicle registration.",
+        "weighmentNumber"
+      );
+    } else {
+      addQualityIssue(
+        qualityIssues,
+        "vehicleNumber",
+        originalValue,
+        "quarantined",
+        "Value is not a valid Indian vehicle registration and was excluded from packet comparison."
+      );
+    }
+    delete fields.vehicleNumber;
+    changed = true;
+  }
+
+  if (fields.registrationNumber && !isValidIndianVehicleNumber(fields.registrationNumber)) {
+    const originalValue = fields.registrationNumber;
+    addQualityIssue(
+      qualityIssues,
+      "registrationNumber",
+      originalValue,
+      "quarantined",
+      "Registration value is not a valid Indian vehicle registration and was excluded from packet comparison."
+    );
+    delete fields.registrationNumber;
+    changed = true;
+  }
+
+  if (fields.eWayBillNumber && !getValidEWayBillNumber(fields.eWayBillNumber)) {
+    const originalValue = fields.eWayBillNumber;
+    const invoiceLikeReference = normalizeInvoiceLikeReference(originalValue);
+    if (doc.type === "E-Way Bill" && invoiceLikeReference && !fields.referenceInvoiceNumber) {
+      fields.referenceInvoiceNumber = invoiceLikeReference;
+      addQualityIssue(
+        qualityIssues,
+        "eWayBillNumber",
+        originalValue,
+        "moved",
+        "E-Way Bill number must be 12 digits; this value looks like a document or invoice reference.",
+        "referenceInvoiceNumber"
+      );
+    } else {
+      addQualityIssue(
+        qualityIssues,
+        "eWayBillNumber",
+        originalValue,
+        "quarantined",
+        "E-Way Bill number must be 12 digits and was excluded from packet comparison."
+      );
+    }
+    delete fields.eWayBillNumber;
+    changed = true;
+  }
+
+  return changed ? { ...doc, fields, qualityIssues } : doc;
+}
+
+function applyIdentifierQualityGuards(documents: CaseDoc[]) {
+  return documents.map(applyIdentifierQualityGuard);
 }
 
 function visibleTextSupportsEWayBillNumber(doc: CaseDoc, eWayBillNumber: string) {
@@ -3171,11 +3342,12 @@ export function enrichProcessedDocuments(documents: CaseDoc[]) {
   const withGstin = enrichGstinConsensusValues(withFastag);
   const withPoCore = enrichPurchaseOrderCoreFields(withGstin);
   const withEWayCore = enrichEWayBillCoreFields(withPoCore);
-  const withInvoiceEWay = enrichInvoiceEWayBillNumbers(withEWayCore);
+  const withIdentifierQuality = applyIdentifierQualityGuards(withEWayCore);
+  const withInvoiceEWay = enrichInvoiceEWayBillNumbers(withIdentifierQuality);
   const withParties = enrichEWayBillParties(withInvoiceEWay);
   const withVehicles = enrichCorroboratedVehicleNumbers(enrichWeighmentVehicleNumbers(withParties));
   const withConsigneeGuard = applyConsigneeBuyerGuardToDocuments(withVehicles);
-  return normalizeIdentifierDisplayFields(enrichCommercialAmounts(withConsigneeGuard));
+  return applyIdentifierQualityGuards(normalizeIdentifierDisplayFields(enrichCommercialAmounts(withConsigneeGuard)));
 }
 
 function buildProcessedVerificationResult(
@@ -4312,7 +4484,11 @@ async function extractDataFromImagePages(params: {
           applyFastagDetailsFallback(
             applyEWayBillAddressFallback(
               applyConsigneeBuyerGuard(
-                applyPurchaseOrderDateFallback(mappedFields, params.documentType, visibleText),
+                applyPurchaseOrderTermsFallback(
+                  applyPurchaseOrderDateFallback(mappedFields, params.documentType, visibleText),
+                  params.documentType,
+                  visibleText
+                ),
                 visibleText
               ),
               params.documentType,
@@ -4405,7 +4581,11 @@ async function extractDataFromTextPages(params: {
           applyFastagDetailsFallback(
             applyEWayBillAddressFallback(
               applyConsigneeBuyerGuard(
-                applyPurchaseOrderDateFallback(mappedFields, params.documentType, visibleText),
+                applyPurchaseOrderTermsFallback(
+                  applyPurchaseOrderDateFallback(mappedFields, params.documentType, visibleText),
+                  params.documentType,
+                  visibleText
+                ),
                 visibleText
               ),
               params.documentType,

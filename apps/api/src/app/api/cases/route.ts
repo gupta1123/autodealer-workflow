@@ -30,7 +30,7 @@ import {
   stripStoredLineItems,
 } from "@/lib/line-items";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
-import { assessCaseTermsCompliance } from "@/lib/processing/pipeline";
+import { assessCaseTermsComplianceDetailed } from "@/lib/processing/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { readUploadGroupMeta } from "@/lib/upload-groups";
 import type { CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
@@ -1298,8 +1298,8 @@ export async function POST(request: Request) {
       );
     }
 
-    const termsMismatches = await assessCaseTermsCompliance(documents);
-    const mismatches = [...baseMismatches, ...termsMismatches];
+    const termsCompliance = await assessCaseTermsComplianceDetailed(documents);
+    const mismatches = [...baseMismatches, ...termsCompliance.mismatches];
     const summary = summarizeCase(documents, mismatches, fieldConfiguration);
     const displayName = await resolveCaseDisplayNameWithAI(documents, summary);
     caseId = crypto.randomUUID();
@@ -1347,6 +1347,7 @@ export async function POST(request: Request) {
         missingDocumentGroups: summary.missingDocTypes,
         paymentGap: summary.paymentGap,
         comparisonOptions,
+        termsComplianceChecklist: termsCompliance.checklist,
         uploadGroups,
         ...uploadDuplicateMeta,
       },

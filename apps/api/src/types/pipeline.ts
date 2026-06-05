@@ -130,9 +130,18 @@ export interface CaseDoc {
   pages: number;
   fields: Partial<Record<FieldKey, string>>;
   lineItems?: CommercialLineItem[];
+  qualityIssues?: ExtractionQualityIssue[];
   md: string;
   sourceFileName?: string;
   sourceHint?: string;
+}
+
+export interface ExtractionQualityIssue {
+  field: FieldKey;
+  originalValue: string;
+  action: "quarantined" | "moved" | "corrected";
+  targetField?: FieldKey;
+  reason: string;
 }
 
 export interface CommercialLineItem {
