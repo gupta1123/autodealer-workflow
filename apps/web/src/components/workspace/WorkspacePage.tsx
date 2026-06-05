@@ -135,6 +135,7 @@ const DUMMY_DOCS: CaseDoc[] = SAMPLE_DOCS;
 const ALL_FIELDS = ACTIVE_FIELD_DEFINITIONS;
 const DOCUMENT_UPLOAD_ACCEPT = "application/pdf,image/*";
 const IMAGE_UPLOAD_ACCEPT = "image/*";
+const SUPPORTED_UPLOAD_EXTENSION_PATTERN = /\.(pdf|jpe?g|png|webp|heic|heif)$/i;
 
 const FIELD_LABEL_LOOKUP: Record<string, string> = ACTIVE_FIELD_DEFINITIONS.reduce(
   (acc, { key, label }) => {
@@ -506,6 +507,7 @@ export function WorkspacePage() {
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
   const [cameraPageFiles, setCameraPageFiles] = useState<File[]>([]);
   const [imagePreviewUploadId, setImagePreviewUploadId] = useState<string | null>(null);
+  const [isUploadDragActive, setIsUploadDragActive] = useState(false);
 
   const cameraSessionRef = useRef(createCameraSessionStamp());
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -670,6 +672,55 @@ export function WorkspacePage() {
     const files = Array.from(event.currentTarget.files ?? []);
     if (event.currentTarget.value) event.currentTarget.value = "";
     await handleQueueFiles(files);
+  };
+
+  const isSupportedDroppedFile = (file: File) =>
+    file.type === "application/pdf" ||
+    file.type.startsWith("image/") ||
+    SUPPORTED_UPLOAD_EXTENSION_PATTERN.test(file.name);
+
+  const getSupportedDroppedFiles = (dataTransfer: DataTransfer) =>
+    Array.from(dataTransfer.files ?? []).filter(isSupportedDroppedFile);
+
+  const handleUploadDragEnter = (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (Array.from(event.dataTransfer.types).includes("Files")) {
+      event.dataTransfer.dropEffect = "copy";
+      setIsUploadDragActive(true);
+    }
+  };
+
+  const handleUploadDragOver = (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (Array.from(event.dataTransfer.types).includes("Files")) {
+      event.dataTransfer.dropEffect = "copy";
+      setIsUploadDragActive(true);
+    }
+  };
+
+  const handleUploadDragLeave = (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const nextTarget = event.relatedTarget;
+    if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+      setIsUploadDragActive(false);
+    }
+  };
+
+  const handleUploadDrop = async (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsUploadDragActive(false);
+
+    const files = getSupportedDroppedFiles(event.dataTransfer);
+    if (files.length) {
+      await handleQueueFiles(files);
+    }
   };
 
   const handleCameraFallbackInputChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -1331,20 +1382,43 @@ export function WorkspacePage() {
         {/* Centered Upload Card */}
         <div className="flex flex-1 items-center justify-center">
         <div className="w-full max-w-2xl">
-          <div className="w-full rounded-[2rem] border-2 border-dashed border-[#e5ddd0] bg-white px-5 py-7 text-center shadow-sm transition-all hover:border-[#d4c9b8] hover:shadow-md sm:px-8 sm:py-8">
-            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-[1.25rem] border border-[#e5ddd0] bg-[#f0ece6] text-[#1a1a1a] shadow-sm">
+          <div
+            className={`w-full rounded-[2rem] border-2 border-dashed px-5 py-7 text-center shadow-sm transition-all sm:px-8 sm:py-8 ${
+              isUploadDragActive
+                ? "border-[#22c55e] bg-[#f0fdf4] shadow-lg shadow-emerald-100 ring-4 ring-emerald-100"
+                : "border-[#e5ddd0] bg-white hover:border-[#d4c9b8] hover:shadow-md"
+            }`}
+            onDragEnter={handleUploadDragEnter}
+            onDragOver={handleUploadDragOver}
+            onDragLeave={handleUploadDragLeave}
+            onDrop={handleUploadDrop}
+          >
+            <div
+              className={`mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-[1.25rem] border shadow-sm ${
+                isUploadDragActive
+                  ? "border-[#bbf7d0] bg-white text-[#15803d]"
+                  : "border-[#e5ddd0] bg-[#f0ece6] text-[#1a1a1a]"
+              }`}
+            >
               <UploadCloud className="h-7 w-7" />
             </div>
 
-            <h2 className="text-2xl font-extrabold text-[#1a1a1a] sm:text-3xl">Upload case packet</h2>
-            <p className="mt-2 text-base font-medium text-[#5a5046]">
-              or{" "}
-              <label className="cursor-pointer font-bold text-[#15803d] hover:text-[#166534] hover:underline">
-                click to browse
-                <input type="file" multiple accept={DOCUMENT_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
-              </label>
-              {" "}PDFs and images
-            </p>
+            <h2 className="text-2xl font-extrabold text-[#1a1a1a] sm:text-3xl">
+              {isUploadDragActive ? "Drop files to add them" : "Upload case packet"}
+            </h2>
+            {isUploadDragActive ? (
+              <p className="mt-2 text-base font-semibold text-[#15803d]">
+                Release to upload PDFs and images for this case.
+              </p>
+            ) : (
+              <p className="mt-2 text-base font-medium text-[#5a5046]">
+                Drag and drop PDFs/images here, or{" "}
+                <label className="cursor-pointer font-bold text-[#15803d] hover:text-[#166534] hover:underline">
+                  click to browse
+                  <input type="file" multiple accept={DOCUMENT_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
+                </label>
+              </p>
+            )}
 
             {/* Pills */}
             <div className="mx-auto mt-5 flex max-w-2xl flex-wrap justify-center gap-2">

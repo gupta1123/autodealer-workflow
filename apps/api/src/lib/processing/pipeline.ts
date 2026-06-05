@@ -3725,6 +3725,10 @@ type PdfDocumentGroup = {
   pageStart: number;
   pageEnd: number;
   confidence?: number;
+  documentNumber?: string;
+  primaryPartyName?: string;
+  vehicleNumber?: string;
+  splitReason?: string;
 };
 
 function pageRangeLabel(group: PdfDocumentGroup) {
@@ -3736,6 +3740,37 @@ function pageRangeLabel(group: PdfDocumentGroup) {
 function normalizePageNumber(value: unknown) {
   const numberValue = Number(value);
   return Number.isFinite(numberValue) ? Math.round(numberValue) : NaN;
+}
+
+function normalizePdfGroupIdentity(value: unknown) {
+  return toText(value)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, " ")
+    .trim();
+}
+
+function readPdfGroupIdentityValue(record: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const normalized = normalizePdfGroupIdentity(record[key]);
+    if (normalized) return normalized;
+  }
+  return undefined;
+}
+
+function hasConflictingPdfGroupIdentity(left?: string, right?: string) {
+  return Boolean(left && right && left !== right);
+}
+
+function shouldMergeAdjacentPdfGroups(previous: PdfDocumentGroup, current: PdfDocumentGroup) {
+  if (previous.documentType !== current.documentType || previous.pageEnd + 1 !== current.pageStart) {
+    return false;
+  }
+
+  return !(
+    hasConflictingPdfGroupIdentity(previous.documentNumber, current.documentNumber) ||
+    hasConflictingPdfGroupIdentity(previous.primaryPartyName, current.primaryPartyName) ||
+    hasConflictingPdfGroupIdentity(previous.vehicleNumber, current.vehicleNumber)
+  );
 }
 
 function normalizePdfDocumentGroups(
@@ -3758,6 +3793,25 @@ function normalizePdfDocumentGroups(
         documentType: normaliseDocType(String(record.documentType ?? record.type ?? record.docType ?? "")),
         pageStart: Math.max(1, Math.min(pageCount, pageStart)),
         pageEnd: Math.max(1, Math.min(pageCount, pageEnd)),
+        documentNumber: readPdfGroupIdentityValue(record, [
+          "documentNumber",
+          "invoiceNumber",
+          "poNumber",
+          "ewayBillNumber",
+          "challanNumber",
+          "billNumber",
+          "number",
+        ]),
+        primaryPartyName: readPdfGroupIdentityValue(record, [
+          "primaryPartyName",
+          "partyName",
+          "buyerName",
+          "vendorName",
+          "supplierName",
+          "customerName",
+        ]),
+        vehicleNumber: readPdfGroupIdentityValue(record, ["vehicleNumber", "lorryNumber", "truckNumber"]),
+        splitReason: toText(record.splitReason ?? record.reason) || undefined,
       };
 
       if (typeof record.confidence === "number") {
@@ -3784,7 +3838,14 @@ function normalizePdfDocumentGroups(
 
   const seen = new Set<string>();
   const normalized = parsedGroups.filter((group) => {
-    const key = `${group.documentType}:${group.pageStart}:${group.pageEnd}`;
+    const key = [
+      group.documentType,
+      group.pageStart,
+      group.pageEnd,
+      group.documentNumber ?? "",
+      group.primaryPartyName ?? "",
+      group.vehicleNumber ?? "",
+    ].join(":");
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -3833,16 +3894,16 @@ function compactConsecutivePdfGroups(groups: PdfDocumentGroup[]) {
 
   for (const group of sorted) {
     const previous = compacted[compacted.length - 1];
-    if (
-      previous &&
-      previous.documentType === group.documentType &&
-      previous.pageEnd + 1 === group.pageStart
-    ) {
+    if (previous && shouldMergeAdjacentPdfGroups(previous, group)) {
       previous.pageEnd = group.pageEnd;
       previous.confidence =
         typeof previous.confidence === "number" && typeof group.confidence === "number"
           ? Math.min(previous.confidence, group.confidence)
           : previous.confidence ?? group.confidence;
+      previous.documentNumber = previous.documentNumber ?? group.documentNumber;
+      previous.primaryPartyName = previous.primaryPartyName ?? group.primaryPartyName;
+      previous.vehicleNumber = previous.vehicleNumber ?? group.vehicleNumber;
+      previous.splitReason = previous.splitReason ?? group.splitReason;
       continue;
     }
 
@@ -3861,9 +3922,11 @@ async function splitPdfPagesIndividually(params: {
   const pageGroups: PdfDocumentGroup[] = [];
   const systemPrompt =
     `Classify one page from a procurement packet PDF. Return only JSON with a top-level "documents" array. ` +
-    `Each item must contain documentType and confidence. Use only these documentType values: ${SUPPORTED_DOC_TYPES.join(", ")}. ` +
+    `Each item must contain documentType and confidence. Also include documentNumber, primaryPartyName, vehicleNumber, and splitReason when visible. ` +
+    `Use only these documentType values: ${SUPPORTED_DOC_TYPES.join(", ")}. ` +
     `Use the rendered page image as the source of truth when available; use text only as supporting context. ` +
     `If this one page visibly contains multiple separate documents or cards, return multiple records. ` +
+    `If a page contains a separate invoice, identify that invoice by visible invoice number and party/customer/supplier name. ` +
     `Do not infer document type from the file name when the page image/text shows a different document. ` +
     `A page headed Delivery Challan or showing Challan No/Challan Date is Delivery Challan even if it contains PO No as a reference.`;
 
@@ -3970,8 +4033,11 @@ async function splitPdfIntoDocumentGroups(params: {
   const hasText = hasMeaningfulTextPages(params.textPages);
   const systemPrompt =
     `You split uploaded procurement packet PDFs into separate documents. Return only JSON with a top-level "documents" array. ` +
-    `Each item must contain documentType, pageStart, pageEnd, and confidence. Use only these documentType values: ${SUPPORTED_DOC_TYPES.join(", ")}. ` +
+    `Each item must contain documentType, pageStart, pageEnd, and confidence. Also include documentNumber, primaryPartyName, vehicleNumber, and splitReason when visible. ` +
+    `Use only these documentType values: ${SUPPORTED_DOC_TYPES.join(", ")}. ` +
     `Group consecutive pages belonging to the same physical/logical document. Do not merge different document types just because they are in one PDF. ` +
+    `Do not merge separate documents just because they have the same documentType. Split same-type documents when invoice number, bill number, PO number, party/customer/supplier name, GSTIN, vehicle number, page numbering, letterhead, total section, or document heading resets or changes. ` +
+    `A single uploaded PDF can contain two or more invoices for the same vehicle but different parties; emit each invoice as its own Invoice document with its own page range and party identity. ` +
     `If one scanned page visibly contains multiple separate cards/documents, output multiple records with the same pageStart and pageEnd. ` +
     `For example, one page may contain Vehicle Registration Certificate, Driving Licence, and PAN Card together; emit three records all pointing to that page. ` +
     `Do not invent PAN Card or Driving Licence records on later pages just because they appeared on an earlier multi-document scan. ` +
