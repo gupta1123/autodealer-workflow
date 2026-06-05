@@ -83,7 +83,13 @@ function normalizeMaxTokens(value: number) {
 
 export async function callOpenRouter(
   messages: OpenRouterMessage[],
-  options?: { expectJson?: boolean; model?: string; reasoning?: OpenRouterReasoningOptions; maxTokens?: number }
+  options?: {
+    expectJson?: boolean;
+    jsonMode?: boolean;
+    model?: string;
+    reasoning?: OpenRouterReasoningOptions;
+    maxTokens?: number;
+  }
 ) {
   if (!OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY is not configured.");
@@ -108,7 +114,7 @@ export async function callOpenRouter(
           messages,
           temperature: 0,
           ...(options?.reasoning ? { reasoning: options.reasoning } : {}),
-          ...(options?.expectJson ? { response_format: { type: "json_object" } } : {}),
+          ...(options?.jsonMode ? { response_format: { type: "json_object" } } : {}),
           ...(maxTokens ? { max_tokens: maxTokens } : {}),
         }),
       });
@@ -199,6 +205,7 @@ export async function callExtractionReviewModel(messages: OpenRouterMessage[]) {
   if (getConfiguredExtractionReviewProvider() === "openrouter") {
     return callOpenRouter(messages, {
       expectJson: true,
+      jsonMode: true,
       model: OPENROUTER_REVIEW_MODEL,
       reasoning: getExtractionReviewReasoning(),
       maxTokens: normalizeMaxTokens(OPENROUTER_REVIEW_MAX_OUTPUT_TOKENS),
