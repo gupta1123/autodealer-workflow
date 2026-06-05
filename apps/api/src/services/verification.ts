@@ -675,6 +675,17 @@ function isStrongDocumentReferenceKey(key: string) {
   );
 }
 
+function isFulfillmentDocumentReferenceKey(key: string) {
+  return (
+    key.startsWith("invoice:") ||
+    key.startsWith("invoice-party:") ||
+    key.startsWith("document:") ||
+    key.startsWith("delivery:") ||
+    key.startsWith("eway:") ||
+    key.startsWith("lr:")
+  );
+}
+
 function isWeakLogisticsReferenceKey(key: string) {
   return (
     key.startsWith("vehicle:") ||
@@ -686,6 +697,10 @@ function isWeakLogisticsReferenceKey(key: string) {
 
 function getStrongDocumentReferenceKeys(doc: CaseDoc, comparisonOptions: ComparisonOptions) {
   return getPacketReferenceKeys(doc, comparisonOptions).filter(isStrongDocumentReferenceKey);
+}
+
+function getFulfillmentDocumentReferenceKeys(doc: CaseDoc, comparisonOptions: ComparisonOptions) {
+  return getPacketReferenceKeys(doc, comparisonOptions).filter(isFulfillmentDocumentReferenceKey);
 }
 
 function hasCommercialComparisonSignal(doc: CaseDoc) {
@@ -708,6 +723,53 @@ function hasSharedStrongDocumentReference(
   return getStrongDocumentReferenceKeys(right, comparisonOptions).some((key) => leftKeys.has(key));
 }
 
+function hasSharedFulfillmentDocumentReference(
+  left: CaseDoc,
+  right: CaseDoc,
+  comparisonOptions: ComparisonOptions
+) {
+  const leftKeys = new Set(getFulfillmentDocumentReferenceKeys(left, comparisonOptions));
+  return getFulfillmentDocumentReferenceKeys(right, comparisonOptions).some((key) => leftKeys.has(key));
+}
+
+function sourceHasMultipleFulfillmentReferenceComponents(
+  sourceDocs: CaseDoc[],
+  comparisonOptions: ComparisonOptions
+) {
+  const anchoredCommercialDocs = sourceDocs.filter(
+    (doc) => hasCommercialComparisonSignal(doc) && getFulfillmentDocumentReferenceKeys(doc, comparisonOptions).length > 0
+  );
+  if (anchoredCommercialDocs.length <= 1) return false;
+
+  const parent = anchoredCommercialDocs.map((_, index) => index);
+  const find = (index: number): number => {
+    if (parent[index] !== index) parent[index] = find(parent[index]);
+    return parent[index];
+  };
+  const union = (left: number, right: number) => {
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot !== rightRoot) parent[rightRoot] = leftRoot;
+  };
+
+  for (let left = 0; left < anchoredCommercialDocs.length; left += 1) {
+    for (let right = left + 1; right < anchoredCommercialDocs.length; right += 1) {
+      if (
+        hasSharedFulfillmentDocumentReference(
+          anchoredCommercialDocs[left],
+          anchoredCommercialDocs[right],
+          comparisonOptions
+        ) ||
+        shareCommercialIdentity(anchoredCommercialDocs[left], anchoredCommercialDocs[right], comparisonOptions)
+      ) {
+        union(left, right);
+      }
+    }
+  }
+
+  return new Set(anchoredCommercialDocs.map((_, index) => find(index))).size > 1;
+}
+
 function shouldGroupBySourceFile(
   left: CaseDoc,
   right: CaseDoc,
@@ -727,6 +789,10 @@ function shouldGroupBySourceFile(
   const sharedReferenceKeys = getSharedReferenceKeys(left, right, comparisonOptions);
   if (sharedReferenceKeys.some(isStrongDocumentReferenceKey)) {
     return true;
+  }
+
+  if (sourceHasMultipleFulfillmentReferenceComponents(sourceDocs, comparisonOptions)) {
+    return false;
   }
 
   const hasOnlyWeakLogisticsReference =
