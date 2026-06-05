@@ -30,6 +30,8 @@ const OPENROUTER_REVIEW_REASONING_EFFORT =
   process.env.EXTRACTION_REVIEW_REASONING_EFFORT ||
   "medium";
 const OPENROUTER_QUALITY_REASONING_TOKENS = Number(process.env.OPENROUTER_QUALITY_REASONING_TOKENS ?? 2000);
+const OPENROUTER_MAX_OUTPUT_TOKENS = Number(process.env.OPENROUTER_MAX_OUTPUT_TOKENS ?? 8192);
+const OPENROUTER_REVIEW_MAX_OUTPUT_TOKENS = Number(process.env.OPENROUTER_REVIEW_MAX_OUTPUT_TOKENS ?? 4096);
 const MAX_RETRIES = Number(process.env.OPENROUTER_MAX_RETRIES ?? 2);
 const RETRY_BASE_MS = Number(process.env.OPENROUTER_RETRY_BASE_MS ?? 1200);
 
@@ -71,14 +73,23 @@ function isRetryableStatus(status: number) {
   return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
+function normalizeMaxTokens(value: number) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return undefined;
+  }
+
+  return Math.floor(value);
+}
+
 export async function callOpenRouter(
   messages: OpenRouterMessage[],
-  options?: { expectJson?: boolean; model?: string; reasoning?: OpenRouterReasoningOptions }
+  options?: { expectJson?: boolean; model?: string; reasoning?: OpenRouterReasoningOptions; maxTokens?: number }
 ) {
   if (!OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY is not configured.");
   }
 
+  const maxTokens = normalizeMaxTokens(options?.maxTokens ?? OPENROUTER_MAX_OUTPUT_TOKENS);
   let attempt = 0;
   let lastError = "OpenRouter request failed";
 
@@ -98,6 +109,7 @@ export async function callOpenRouter(
           temperature: 0,
           ...(options?.reasoning ? { reasoning: options.reasoning } : {}),
           ...(options?.expectJson ? { response_format: { type: "json_object" } } : {}),
+          ...(maxTokens ? { max_tokens: maxTokens } : {}),
         }),
       });
 
@@ -189,6 +201,7 @@ export async function callExtractionReviewModel(messages: OpenRouterMessage[]) {
       expectJson: true,
       model: OPENROUTER_REVIEW_MODEL,
       reasoning: getExtractionReviewReasoning(),
+      maxTokens: normalizeMaxTokens(OPENROUTER_REVIEW_MAX_OUTPUT_TOKENS),
     });
   }
 
