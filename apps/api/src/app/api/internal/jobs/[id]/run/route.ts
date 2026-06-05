@@ -12,6 +12,7 @@ import {
   verifyProcessedDocuments,
 } from "@/lib/processing/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { TERMS_COMPLIANCE_MISMATCH_MODE } from "@/lib/terms-compliance";
 import type { CaseAnalysisMode } from "@/types/pipeline";
 import { randomUUID } from "crypto";
 
@@ -357,6 +358,7 @@ export async function POST(
           comparisonOptions: processed.comparisonOptions,
           verificationGroups: verified.verificationGroups,
           termsComplianceChecklist: termsCompliance.checklist,
+          termsComplianceMismatchMode: TERMS_COMPLIANCE_MISMATCH_MODE,
           extractionReview: extractionReview.review,
           lastProcessingError: null,
         },

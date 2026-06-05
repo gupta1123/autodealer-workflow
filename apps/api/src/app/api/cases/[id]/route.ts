@@ -1,7 +1,6 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
-  getCaseStatusForMismatchResolutions,
   getMismatchResolutionStatusForCaseDecision,
   isMismatchResolutionSchemaMissing,
   type MismatchResolutionStatus,
@@ -34,10 +33,14 @@ import {
   stripStoredLineItems,
 } from "@/lib/line-items";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import {
+  getLegacyHiddenTermsReviewCount,
+  isActionableStoredTermsComplianceMismatch,
+  TERMS_COMPLIANCE_FIELD,
+} from "@/lib/terms-compliance";
 import type { CaseDoc, FieldKey } from "@/types/pipeline";
 
 const STORAGE_BUCKET = "packet-files";
-const TERMS_COMPLIANCE_FIELD = "termsAndConditions";
 const DOCUMENT_DISPLAY_ORDER = [
   "Weighment Slip",
   "FASTag Toll Proof",
@@ -380,6 +383,15 @@ function mapCaseRow(
     category,
     status: row.status,
   });
+  const legacyHiddenTermsReviewCount =
+    mismatchCountOverride === undefined ? getLegacyHiddenTermsReviewCount(row.processing_meta) : 0;
+  const mismatchCount = Math.max(
+    0,
+    (mismatchCountOverride ?? row.mismatch_count) - legacyHiddenTermsReviewCount
+  );
+  const riskScore = derivedSummary
+    ? Math.min(100, derivedSummary.riskScore + mismatchCount * 10)
+    : Math.max(0, row.risk_score - legacyHiddenTermsReviewCount * 10);
 
   return {
     id: row.id,
@@ -391,10 +403,10 @@ function mapCaseRow(
     poNumber: row.po_number,
     invoiceNumber: row.invoice_number,
     status: row.status,
-    riskScore: row.risk_score,
+    riskScore,
     uploadCount: row.upload_count,
     documentCount: row.document_count,
-    mismatchCount: mismatchCountOverride ?? row.mismatch_count,
+    mismatchCount,
     createdAt: row.created_at,
     deletedAt: row.deleted_at ?? getRecycleBinDeletedAt(row.processing_meta),
     processingMeta: row.processing_meta ?? {},
@@ -557,7 +569,7 @@ export async function GET(
     });
     const filteredMismatches = mismatches.filter((mismatch) => {
       if (mismatch.fieldName === TERMS_COMPLIANCE_FIELD) {
-        return true;
+        return isActionableStoredTermsComplianceMismatch(mismatch);
       }
 
       if (

@@ -32,6 +32,13 @@ import {
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { assessCaseTermsComplianceDetailed } from "@/lib/processing/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import {
+  getLegacyHiddenTermsReviewCount,
+  isActionableStoredTermsComplianceMismatch,
+  isActionableTermsComplianceMismatch,
+  TERMS_COMPLIANCE_FIELD,
+  TERMS_COMPLIANCE_MISMATCH_MODE,
+} from "@/lib/terms-compliance";
 import { readUploadGroupMeta } from "@/lib/upload-groups";
 import type { CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
 
@@ -42,8 +49,6 @@ const LIST_COLUMNS =
   "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at";
 const LIST_COLUMNS_WITHOUT_RECYCLE_BIN =
   "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta";
-const TERMS_COMPLIANCE_FIELD = "termsAndConditions";
-
 type CaseListScope = "active" | "deleted";
 type CaseListCursor = {
   sortValue: string;
@@ -687,7 +692,7 @@ function sanitizeMismatchesForStorage(
 ): Mismatch[] {
   return mismatches.filter((mismatch) => {
     if (mismatch.field === TERMS_COMPLIANCE_FIELD) {
-      return true;
+      return isActionableTermsComplianceMismatch(mismatch);
     }
 
     if (
@@ -806,7 +811,7 @@ async function fetchCaseMismatchCountsForSummary(
 
   const { data, error } = await supabase
     .from("packet_mismatches")
-    .select("case_id, field_name")
+    .select("case_id, field_name, values_json, analysis, fix_plan")
     .in("case_id", caseIds);
 
   if (error) {
@@ -815,7 +820,9 @@ async function fetchCaseMismatchCountsForSummary(
 
   for (const row of data ?? []) {
     if (row.field_name === TERMS_COMPLIANCE_FIELD) {
-      mismatchCountsByCaseId.set(row.case_id, (mismatchCountsByCaseId.get(row.case_id) ?? 0) + 1);
+      if (isActionableStoredTermsComplianceMismatch(row)) {
+        mismatchCountsByCaseId.set(row.case_id, (mismatchCountsByCaseId.get(row.case_id) ?? 0) + 1);
+      }
       continue;
     }
 
@@ -887,6 +894,15 @@ function mapCaseRow(
     category,
     status: row.status,
   });
+  const legacyHiddenTermsReviewCount =
+    mismatchCountOverride === undefined ? getLegacyHiddenTermsReviewCount(row.processing_meta) : 0;
+  const mismatchCount = Math.max(
+    0,
+    (mismatchCountOverride ?? row.mismatch_count) - legacyHiddenTermsReviewCount
+  );
+  const riskScore = derivedSummary
+    ? Math.min(100, derivedSummary.riskScore + mismatchCount * 10)
+    : Math.max(0, row.risk_score - legacyHiddenTermsReviewCount * 10);
 
   return {
     id: row.id,
@@ -898,10 +914,10 @@ function mapCaseRow(
     poNumber: row.po_number,
     invoiceNumber: row.invoice_number,
     status: row.status,
-    riskScore: row.risk_score,
+    riskScore,
     uploadCount: row.upload_count,
     documentCount: row.document_count,
-    mismatchCount: mismatchCountOverride ?? row.mismatch_count,
+    mismatchCount,
     createdAt: row.created_at,
     deletedAt: row.deleted_at ?? getRecycleBinDeletedAt(row.processing_meta),
   };
@@ -1348,6 +1364,7 @@ export async function POST(request: Request) {
         paymentGap: summary.paymentGap,
         comparisonOptions,
         termsComplianceChecklist: termsCompliance.checklist,
+        termsComplianceMismatchMode: TERMS_COMPLIANCE_MISMATCH_MODE,
         uploadGroups,
         ...uploadDuplicateMeta,
       },

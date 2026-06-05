@@ -34,10 +34,12 @@ import { getLatestProcessingJob, mapProcessingJob } from "@/lib/processing/jobs"
 import { assessCaseTermsComplianceDetailed } from "@/lib/processing/pipeline";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
-import { createSupabaseServerClient } from "@/lib/supabase/server";
+import {
+  isActionableTermsComplianceMismatch,
+  TERMS_COMPLIANCE_FIELD,
+  TERMS_COMPLIANCE_MISMATCH_MODE,
+} from "@/lib/terms-compliance";
 import type { CaseAnalysisMode, CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
-
-const TERMS_COMPLIANCE_FIELD = "termsAndConditions";
 
 function isRecycleBinSchemaMissing(error: unknown) {
   if (!error || typeof error !== "object") {
@@ -78,13 +80,6 @@ function serializeError(error: unknown) {
   }
 
   return combined;
-}
-
-function parseJsonField<T>(value: FormDataEntryValue | null, fieldName: string): T {
-  if (typeof value !== "string") {
-    throw new Error(`Missing ${fieldName} payload.`);
-  }
-  return JSON.parse(value) as T;
 }
 
 function parseOptionalJsonField<T>(value: FormDataEntryValue | null): T | null {
@@ -141,7 +136,7 @@ function sanitizeMismatchesForStorage(
 ): Mismatch[] {
   return mismatches.filter((mismatch) => {
     if (mismatch.field === TERMS_COMPLIANCE_FIELD) {
-      return true;
+      return isActionableTermsComplianceMismatch(mismatch);
     }
 
     if (
@@ -518,6 +513,7 @@ export async function POST(
         paymentGap: summary.paymentGap,
         comparisonOptions,
         termsComplianceChecklist: termsCompliance.checklist,
+        termsComplianceMismatchMode: TERMS_COMPLIANCE_MISMATCH_MODE,
       },
     };
 

@@ -23,6 +23,7 @@ import {
   sanitizeLineItems,
 } from "@/lib/line-items";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { isActionableTermsComplianceStatus, TERMS_COMPLIANCE_FIELD } from "@/lib/terms-compliance";
 import { verifyGroupedCaseDocuments } from "@/services/verification";
 import type {
   CaseAnalysisMode,
@@ -598,9 +599,7 @@ const PO_TERMS_FIELD_KEYS: FieldKey[] = [
   "warrantyTerms",
 ];
 const TERMS_FIELD_KEYS: FieldKey[] = [...PO_TERMS_FIELD_KEYS, "termsAndConditions"];
-const TERMS_COMPLIANCE_FIELD: FieldKey = "termsAndConditions";
 const TERMS_COMPLIANCE_MISMATCH_PREFIX = "terms-compliance";
-const TERMS_COMPLIANCE_STATUSES = new Set(["not_fulfilled", "unknown"]);
 
 const PO_TERM_LABELS: Array<{ field: FieldKey; label: string; pattern: RegExp }> = [
   { field: "paymentTerms", label: "Payment", pattern: /^(?:payment\s+terms?|terms?\s+of\s+payment|payment)$/i },
@@ -956,11 +955,6 @@ function normalizeTermsSeverity(value: unknown) {
   return "";
 }
 
-function isMaterialUnknownTermsIssue(assessment: TermsComplianceAssessment) {
-  const severity = normalizeTermsSeverity(assessment.severity);
-  return severity === "high" || severity === "medium";
-}
-
 function buildTermsComplianceMismatch(
   assessment: TermsComplianceAssessment,
   documentsById: Map<string, CaseDoc>,
@@ -971,8 +965,7 @@ function buildTermsComplianceMismatch(
   if (!sourceDoc) return null;
 
   const status = normalizeTermsStatus(assessment.status);
-  if (!TERMS_COMPLIANCE_STATUSES.has(status)) return null;
-  if (status === "unknown" && !isMaterialUnknownTermsIssue(assessment)) return null;
+  if (!isActionableTermsComplianceStatus(status)) return null;
 
   const sourceClause = compactPromptText(String(assessment.sourceClause ?? "").trim(), 700);
   const obligation = compactPromptText(String(assessment.obligation ?? "").trim(), 500);
@@ -1070,6 +1063,7 @@ export async function assessCaseTermsComplianceDetailed(documents: CaseDoc[]): P
             "Use not_fulfilled only when packet evidence clearly violates or misses a required obligation. Use unknown when the obligation is material but evidence is insufficient. " +
             "Use not_applicable for generic legal boilerplate, jurisdiction, future warranty/interest clauses, or clauses not testable from current packet evidence. " +
             "For conditional clauses like 'if applicable', do not mark not_fulfilled unless applicability is clear from the packet. " +
+            "Unknown means manual review only; it must stay in the checklist and must not be treated as a mismatch or rejection. " +
             "Set severity to high, medium, low, or none. Use high/medium only for obligations that can block packet approval. " +
             "Each obligation object must include sourceDocId, sourceClause, obligation, category, status, evidenceDocIds, evidence, reason, severity.",
         },
