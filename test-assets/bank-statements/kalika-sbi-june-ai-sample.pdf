@@ -1,0 +1,93 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 1379 >>
+stream
+BT
+/F1 10 Tf
+42 790 Td
+13 TL
+(STATE BANK OF INDIA ACCOUNT STATEMENT) Tj
+T*
+(Bank Name: State Bank of India) Tj
+T*
+(Customer Name: Kalika Steel Alloys Pvt Ltd) Tj
+T*
+(A/C No: 409876543210) Tj
+T*
+(IFSC: SBIN0000456) Tj
+T*
+(Statement Period: 01/06/2026 to 05/06/2026) Tj
+T*
+() Tj
+T*
+(Transaction 1) Tj
+T*
+(Txn Date: 01/06/2026 | Value Date: 01/06/2026 | Ref No: SBI-RTGS-01) Tj
+T*
+(Narration: RTGS PAYMENT TO TRANSPORT VENDOR) Tj
+T*
+(Withdrawal: 45000.00 | Deposit: | Balance: 64382.00) Tj
+T*
+(Transaction 2) Tj
+T*
+(Txn Date: 02/06/2026 | Value Date: 02/06/2026 | Ref No: SBI-NEFT-02) Tj
+T*
+(Narration: NEFT RECEIPT FROM ACME RETAIL PRIVATE LIMITED) Tj
+T*
+(Withdrawal: | Deposit: 73500.00 | Balance: 137882.00) Tj
+T*
+(Transaction 3) Tj
+T*
+(Txn Date: 03/06/2026 | Value Date: 03/06/2026 | Ref No: SBI-CASH-03) Tj
+T*
+(Narration: CASH DEPOSIT BRANCH SATARA) Tj
+T*
+(Withdrawal: | Deposit: 25000.00 | Balance: 162882.00) Tj
+T*
+(Transaction 4) Tj
+T*
+(Txn Date: 04/06/2026 | Value Date: 04/06/2026 | Ref No: CHQ-889001) Tj
+T*
+(Narration: CHEQUE PAYMENT TO QUALIMECH ENGINEERS) Tj
+T*
+(Withdrawal: 32000.00 | Deposit: | Balance: 130882.00) Tj
+T*
+(Transaction 5) Tj
+T*
+(Txn Date: 05/06/2026 | Value Date: 05/06/2026 | Ref No: SBI-CHG-05) Tj
+T*
+(Narration: SMS ALERT CHARGES GST) Tj
+T*
+(Withdrawal: 29.50 | Deposit: | Balance: 130852.50) Tj
+T*
+() Tj
+T*
+(Closing Balance: INR 1,30,852.50) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000001672 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1742
+%%EOF

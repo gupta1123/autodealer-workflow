@@ -1,0 +1,77 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 919 >>
+stream
+BT
+/F1 10 Tf
+42 790 Td
+13 TL
+(HDFC BANK STATEMENT) Tj
+T*
+(Bank Name: HDFC Bank) Tj
+T*
+(Account Holder Name: Kalika Steel Alloys Pvt Ltd) Tj
+T*
+(Account Number: 50100234567890) Tj
+T*
+(IFSC Code: HDFC0001234) Tj
+T*
+(Statement Period: 01/06/2026 to 03/06/2026) Tj
+T*
+() Tj
+T*
+(Transaction 1) Tj
+T*
+(Date: 01/06/2026 | Value Date: 01/06/2026 | Reference: 12345) Tj
+T*
+(Description: NEFT RECEIPT FROM BHARAT STEELS UTR 12345) Tj
+T*
+(Debit: | Credit: 50000.00 | Balance: 50000.00) Tj
+T*
+(Transaction 2) Tj
+T*
+(Date: 02/06/2026 | Value Date: 02/06/2026 | Reference: 9988) Tj
+T*
+(Description: UPI PAYMENT TO OFFICE SUPPLIES REF 9988) Tj
+T*
+(Debit: 2500.00 | Credit: | Balance: 47500.00) Tj
+T*
+(Transaction 3) Tj
+T*
+(Date: 03/06/2026 | Value Date: 03/06/2026 | Reference: HDFC-CHG-01) Tj
+T*
+(Description: BANK CHARGES GST) Tj
+T*
+(Debit: 118.00 | Credit: | Balance: 47382.00) Tj
+T*
+() Tj
+T*
+(Closing Balance: INR 47,382.00) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000001211 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1281
+%%EOF
