@@ -1,4 +1,12 @@
+import { execFile } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+
 import { createClient } from "@supabase/supabase-js";
+import sharp from "sharp";
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -15,6 +23,47 @@ const WORKER_STALE_RUNNING_JOB_MS = Number(process.env.WORKER_STALE_RUNNING_JOB_
 const WORKER_STALE_RUNNING_JOB_INTERVAL = `${Math.max(1, Math.round(WORKER_STALE_RUNNING_JOB_MS / 60_000))} minutes`;
 const WORKER_IN_FLIGHT_WAIT_MS = Number(process.env.WORKER_IN_FLIGHT_WAIT_MS ?? 2 * 60_000);
 const WORKER_IN_FLIGHT_POLL_MS = Number(process.env.WORKER_IN_FLIGHT_POLL_MS ?? 5_000);
+const BANK_STATEMENT_AI_MAX_PAGES = Number(process.env.BANK_STATEMENT_AI_MAX_PAGES ?? 8);
+const BANK_STATEMENT_PDF_RENDER_DPI = Number(process.env.BANK_STATEMENT_PDF_RENDER_DPI ?? 170);
+const BANK_STATEMENT_PROVIDER_IMAGE_TARGET_BYTES = Number(
+  process.env.BANK_STATEMENT_PROVIDER_IMAGE_TARGET_BYTES ?? 8 * 1024 * 1024
+);
+const BANK_STATEMENT_PROVIDER_IMAGE_HARD_LIMIT_BYTES = Number(
+  process.env.BANK_STATEMENT_PROVIDER_IMAGE_HARD_LIMIT_BYTES ?? 20 * 1024 * 1024
+);
+const BANK_STATEMENT_PROVIDER_IMAGE_MAX_DIMENSION = Number(
+  process.env.BANK_STATEMENT_PROVIDER_IMAGE_MAX_DIMENSION ?? 3200
+);
+const BANK_STATEMENT_BUCKET = "bank-statement-files";
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+const OPENROUTER_MODEL =
+  process.env.OPENROUTER_QUALITY_MODEL ||
+  process.env.GEMINI_THINKING_MODEL ||
+  "google/gemini-2.5-flash";
+const OPENROUTER_MAX_RETRIES = Number(process.env.OPENROUTER_MAX_RETRIES ?? 2);
+const OPENROUTER_RETRY_BASE_MS = Number(process.env.OPENROUTER_RETRY_BASE_MS ?? 1200);
+const OPENROUTER_MAX_OUTPUT_TOKENS = Number(process.env.OPENROUTER_MAX_OUTPUT_TOKENS ?? 8192);
+const OPENROUTER_QUALITY_REASONING_TOKENS = Number(process.env.OPENROUTER_QUALITY_REASONING_TOKENS ?? 2000);
+const execFileAsync = promisify(execFile);
+const WORKER_IDLE_LOG_INTERVAL_MS = Number(process.env.WORKER_IDLE_LOG_INTERVAL_MS ?? 30_000);
+
+function resolvePdfJsWorkerSrc() {
+  const candidates = [
+    path.resolve(process.cwd(), "node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs"),
+    path.resolve(process.cwd(), "../node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs"),
+    path.resolve(process.cwd(), "../../node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs"),
+    path.resolve(process.cwd(), "../../../node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs"),
+  ];
+
+  const existingPath = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!existingPath) {
+    throw new Error("Unable to locate pdfjs-dist worker file in node_modules.");
+  }
+
+  return pathToFileURL(existingPath).href;
+}
+
+const PDFJS_WORKER_SRC = resolvePdfJsWorkerSrc();
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("Supabase environment variables are missing for the worker.");
@@ -57,6 +106,856 @@ function formatError(error) {
     }
   }
   return String(error ?? "Unknown error");
+}
+
+function normalizeImageMimeType(mimeType) {
+  const lower = String(mimeType || "").toLowerCase();
+  if (lower === "image/jpg") return "image/jpeg";
+  if (lower.startsWith("image/")) return lower;
+  return "image/jpeg";
+}
+
+function isProviderSafeImageMimeType(mimeType) {
+  return ["image/jpeg", "image/png", "image/webp"].includes(normalizeImageMimeType(mimeType));
+}
+
+function bufferToDataUrl(buffer, mimeType) {
+  return `data:${mimeType};base64,${buffer.toString("base64")}`;
+}
+
+function renderedPageNumber(fileName) {
+  const match = fileName.match(/-(\d+)\.png$/);
+  return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+}
+
+function textLineKey(y) {
+  return String(Math.round(Number(y || 0) / 2) * 2);
+}
+
+function reconstructPdfTextLines(items) {
+  const lines = new Map();
+  for (const item of items) {
+    const text = String(item?.str ?? "").trim();
+    const transform = Array.isArray(item?.transform) ? item.transform : [];
+    if (!text || transform.length < 6) continue;
+    const x = Number(transform[4] ?? 0);
+    const y = Number(transform[5] ?? 0);
+    const key = textLineKey(y);
+    const entries = lines.get(key) ?? [];
+    entries.push({ x, text });
+    lines.set(key, entries);
+  }
+
+  return [...lines.entries()]
+    .sort((left, right) => Number(right[0]) - Number(left[0]))
+    .map(([, entries]) =>
+      entries
+        .sort((left, right) => left.x - right.x)
+        .map((entry) => entry.text)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim()
+    )
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function extractBankStatementPdfTextPages(data) {
+  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  if ("GlobalWorkerOptions" in pdfjsLib) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_SRC;
+  }
+
+  const pdf = await pdfjsLib.getDocument({
+    data,
+    disableWorker: true,
+    useSystemFonts: true,
+    verbosity: pdfjsLib.VerbosityLevel?.ERRORS,
+  }).promise;
+  const pageCount = Math.min(pdf.numPages, BANK_STATEMENT_AI_MAX_PAGES);
+  const pages = [];
+
+  for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber);
+    const textContent = await page.getTextContent();
+    pages.push(reconstructPdfTextLines(textContent.items));
+  }
+
+  return pages;
+}
+
+function hasUsableBankStatementText(pages) {
+  const combined = pages.join("\n").replace(/\s+/g, " ").trim();
+  if (combined.length < 300) return false;
+  return /\b(?:date|value date|description|narration|particulars)\b/i.test(combined) &&
+    /\b(?:balance|deposit|withdrawal|debit|credit)\b/i.test(combined);
+}
+
+function formatBankStatementTextForAi(pages) {
+  return pages
+    .map((page, index) => `Page ${index + 1}\n${page || "[No text extracted]"}`)
+    .join("\n\n---\n\n")
+    .slice(0, 80_000);
+}
+
+function parseDate(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const iso = raw.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  if (iso) {
+    const [, year, month, day] = iso;
+    return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
+  }
+  const indian = raw.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})/);
+  if (indian) {
+    const [, day, month, yearRaw] = indian;
+    const year = yearRaw.length === 2 ? `20${yearRaw}` : yearRaw;
+    return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
+}
+
+function parseAmount(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  const negative = /^\(.*\)$/.test(raw) || /^-/.test(raw);
+  const cleaned = raw.replace(/[(),₹$€£\s]/g, "").replace(/^-/, "");
+  if (!cleaned || !/^\d+(\.\d+)?$/.test(cleaned)) return null;
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? (negative ? -parsed : parsed) : null;
+}
+
+function textCell(value) {
+  return String(value ?? "").trim();
+}
+
+function normalizeName(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function titleCaseName(value) {
+  return value
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => (part.length <= 3 ? part.toUpperCase() : `${part[0]?.toUpperCase() ?? ""}${part.slice(1)}`))
+    .join(" ");
+}
+
+function extractCounterpartyName(description) {
+  const raw = String(description ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return null;
+  const patterns = [
+    /\b(?:neft|rtgs|imps)\s+(?:receipt\s+)?from\s+(.+?)(?:\s+(?:utr|ref|reference|a\/c|ac|account|ifsc|on)\b|$)/i,
+    /\b(?:neft|rtgs|imps)\s+(?:payment\s+)?to\s+(.+?)(?:\s+(?:utr|ref|reference|a\/c|ac|account|ifsc|on)\b|$)/i,
+    /\b(?:neft|rtgs|imps)\s+(.+?)(?:\s+(?:utr|ref|reference|a\/c|ac|account|ifsc|on)\b|$)/i,
+    /\bupi\s+(?:payment\s+)?to\s+(.+?)(?:\s+(?:upi|ref|reference|txn|transaction|on)\b|$)/i,
+    /\bupi\s+(?:receipt\s+)?from\s+(.+?)(?:\s+(?:upi|ref|reference|txn|transaction|on)\b|$)/i,
+    /\bupi\s+(.+?)(?:\s+(?:upi|ref|reference|txn|transaction|on)\b|$)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    const candidate = match?.[1]
+      ?.replace(/[^a-zA-Z0-9 .&'-]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (candidate && normalizeName(candidate).length >= 3) return titleCaseName(candidate);
+  }
+  return null;
+}
+
+function detectTransactionType(description) {
+  const text = String(description || "").toLowerCase();
+  if (/\bupi\b/.test(text)) return "upi";
+  if (/\bneft\b/.test(text)) return "neft";
+  if (/\brtgs\b/.test(text)) return "rtgs";
+  if (/\bimps\b/.test(text)) return "imps";
+  if (/\bcheque|chq\b/.test(text)) return "cheque";
+  if (/\bcash\b/.test(text)) return "cash";
+  if (/\bcharge|charges|fee|gst\b/.test(text)) return "bank_charge";
+  if (/\binterest\b/.test(text)) return "interest";
+  return "unknown";
+}
+
+function detectCategory(description, debitAmount, creditAmount) {
+  const text = String(description || "").toLowerCase();
+  if (/\bcharge|charges|fee|gst\b/.test(text)) return "bank_charges";
+  if (/\btax|tds|gst\b/.test(text)) return "tax";
+  if (/\bsalary|wages\b/.test(text)) return "salary";
+  if (/\bloan|emi\b/.test(text)) return "loan_or_emi";
+  if (/\bself|own account|internal transfer|transfer to own\b/.test(text)) return "internal_transfer";
+  if ((creditAmount ?? 0) > 0) return "receipt";
+  if ((debitAmount ?? 0) > 0) return "payment";
+  return "unknown";
+}
+
+function safeJsonParse(raw, fallback) {
+  try {
+    const trimmed = String(raw || "").trim();
+    const start = trimmed.indexOf("{");
+    const end = trimmed.lastIndexOf("}");
+    const jsonString = start >= 0 && end > start ? trimmed.slice(start, end + 1) : trimmed;
+    return JSON.parse(jsonString);
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeIfscCode(value) {
+  const normalized = String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+  return normalized.slice(0, 16);
+}
+
+function normalizeAccountNumber(value) {
+  return String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+}
+
+function maskAccountNumber(value) {
+  const normalized = normalizeAccountNumber(value);
+  if (!normalized) return "";
+  if (normalized.length <= 4) return normalized;
+  return `${"*".repeat(Math.max(0, normalized.length - 4))}${normalized.slice(-4)}`;
+}
+
+async function imageBytesToProviderDataUrl(data, mimeType, label) {
+  const normalizedMimeType = normalizeImageMimeType(mimeType);
+  const input = Buffer.from(data);
+  if (input.byteLength <= BANK_STATEMENT_PROVIDER_IMAGE_TARGET_BYTES && isProviderSafeImageMimeType(normalizedMimeType)) {
+    return bufferToDataUrl(input, normalizedMimeType);
+  }
+
+  let smallest = null;
+  let lastError = null;
+  for (const dimension of [BANK_STATEMENT_PROVIDER_IMAGE_MAX_DIMENSION, 2800, 2400, 2000, 1600, 1200]) {
+    for (const quality of [86, 80, 74, 68, 62, 56]) {
+      try {
+        const output = await sharp(input, { failOn: "none" })
+          .rotate()
+          .resize({ width: dimension, height: dimension, fit: "inside", withoutEnlargement: true })
+          .jpeg({ quality, progressive: true, force: true })
+          .toBuffer();
+        if (!smallest || output.byteLength < smallest.byteLength) smallest = output;
+        if (output.byteLength <= BANK_STATEMENT_PROVIDER_IMAGE_TARGET_BYTES) {
+          return bufferToDataUrl(output, "image/jpeg");
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+  }
+
+  if (smallest && smallest.byteLength <= BANK_STATEMENT_PROVIDER_IMAGE_HARD_LIMIT_BYTES) {
+    return bufferToDataUrl(smallest, "image/jpeg");
+  }
+  if (input.byteLength <= BANK_STATEMENT_PROVIDER_IMAGE_HARD_LIMIT_BYTES && isProviderSafeImageMimeType(normalizedMimeType)) {
+    return bufferToDataUrl(input, normalizedMimeType);
+  }
+
+  const reason = lastError instanceof Error ? lastError.message : "image remained above provider limit";
+  throw new Error(`Unable to prepare "${label}" for bank statement extraction: ${reason}`);
+}
+
+async function renderBankStatementPdfToImages(data, sourceName) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bank-statement-pdf-"));
+  const inputPath = path.join(tmpDir, "input.pdf");
+  const outputPrefix = path.join(tmpDir, "page");
+
+  try {
+    fs.writeFileSync(inputPath, Buffer.from(data));
+    await execFileAsync("pdftoppm", [
+      "-r",
+      String(BANK_STATEMENT_PDF_RENDER_DPI),
+      "-png",
+      "-f",
+      "1",
+      "-l",
+      String(BANK_STATEMENT_AI_MAX_PAGES),
+      inputPath,
+      outputPrefix,
+    ]);
+
+    const pageFileNames = fs
+      .readdirSync(tmpDir)
+      .filter((fileName) => fileName.startsWith("page-") && fileName.endsWith(".png"))
+      .sort((left, right) => renderedPageNumber(left) - renderedPageNumber(right));
+
+    const images = [];
+    for (const fileName of pageFileNames) {
+      const bytes = fs.readFileSync(path.join(tmpDir, fileName));
+      images.push(await imageBytesToProviderDataUrl(bytes, "image/png", `${sourceName} ${fileName}`));
+    }
+    return images;
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+function normalizeAiTransaction(value, rowNumber) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value;
+  const transactionDate = parseDate(row.transactionDate ?? row.date ?? row.txnDate ?? row.postingDate);
+  const description = textCell(row.description ?? row.narration ?? row.particulars ?? row.remarks);
+  if (!transactionDate || !description) return null;
+
+  const debitAmount = parseAmount(row.debitAmount ?? row.debit ?? row.withdrawal ?? row.paidOut);
+  const creditAmount = parseAmount(row.creditAmount ?? row.credit ?? row.deposit ?? row.paidIn);
+  const balanceAmount = parseAmount(row.balanceAmount ?? row.balance ?? row.runningBalance ?? row.closingBalance);
+  const transactionType = textCell(row.transactionType) || detectTransactionType(description);
+  const category = textCell(row.category) || detectCategory(description, debitAmount, creditAmount);
+  const counterpartyName = textCell(row.counterpartyName) || extractCounterpartyName(description);
+
+  return {
+    row_index: rowNumber,
+    transaction_date: transactionDate,
+    value_date: parseDate(row.valueDate) ?? transactionDate,
+    description,
+    reference_number: textCell(row.referenceNumber ?? row.reference ?? row.utr ?? row.chequeNumber) || null,
+    debit_amount: debitAmount,
+    credit_amount: creditAmount,
+    balance_amount: balanceAmount,
+    transaction_type: transactionType,
+    category,
+    counterparty_name: counterpartyName,
+    suggested_ledger_name: textCell(row.suggestedLedgerName) || null,
+    suggestion_confidence:
+      typeof row.suggestionConfidence === "number" && Number.isFinite(row.suggestionConfidence)
+        ? Math.max(0, Math.min(1, row.suggestionConfidence))
+        : null,
+    suggestion_reason: textCell(row.suggestionReason) || null,
+    confirmed_ledger_name: textCell(row.confirmedLedgerName) || null,
+    additional_charges: transactionType === "bank_charge" ? [{ type: "bank_charge", amount: debitAmount }] : [],
+    confidence:
+      typeof row.confidence === "number" && Number.isFinite(row.confidence)
+        ? Math.max(0, Math.min(1, row.confidence))
+        : 0.78,
+    raw_payload: { rowNumber, source: "openrouter_bank_statement_v1", row },
+  };
+}
+
+function normalizeAiBankStatement(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      account: { bankName: null, accountNumber: null, accountHolderName: null, ifscCode: null },
+      statementPeriodStart: null,
+      statementPeriodEnd: null,
+      transactions: [],
+    };
+  }
+  const parsed = value;
+  const account = parsed.account && typeof parsed.account === "object" && !Array.isArray(parsed.account)
+    ? parsed.account
+    : parsed;
+  const transactions = Array.isArray(parsed.transactions)
+    ? parsed.transactions.flatMap((row, index) => {
+        const transaction = normalizeAiTransaction(row, index + 1);
+        return transaction ? [transaction] : [];
+      })
+    : [];
+
+  return {
+    account: {
+      bankName: textCell(account.bankName ?? parsed.bankName) || null,
+      accountNumber: textCell(account.accountNumber ?? parsed.accountNumber) || null,
+      accountHolderName: textCell(account.accountHolderName ?? account.accountName ?? parsed.accountHolderName) || null,
+      ifscCode: normalizeIfscCode(textCell(account.ifscCode ?? parsed.ifscCode)) || null,
+    },
+    statementPeriodStart: parseDate(parsed.statementPeriodStart) ?? parseDate(parsed.periodStart),
+    statementPeriodEnd: parseDate(parsed.statementPeriodEnd) ?? parseDate(parsed.periodEnd),
+    transactions,
+  };
+}
+
+function isRetryableStatus(status) {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function isHardQuotaError(message) {
+  const lower = String(message || "").toLowerCase();
+  return (
+    lower.includes("limit: 0") ||
+    lower.includes("quota exceeded") ||
+    lower.includes("billing") ||
+    lower.includes("insufficient credits")
+  );
+}
+
+async function callOpenRouterForBankStatement(messages) {
+  if (!OPENROUTER_API_KEY) {
+    throw new Error("OPENROUTER_API_KEY is not configured.");
+  }
+
+  let attempt = 0;
+  let lastError = "OpenRouter request failed";
+  while (attempt <= OPENROUTER_MAX_RETRIES) {
+    try {
+      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": process.env.APP_BASE_URL || "http://localhost:3001",
+          "X-Title": "Autodealer Workflow Bank Statement Worker",
+        },
+        body: JSON.stringify({
+          model: OPENROUTER_MODEL,
+          messages,
+          temperature: 0,
+          reasoning:
+            Number.isFinite(OPENROUTER_QUALITY_REASONING_TOKENS) && OPENROUTER_QUALITY_REASONING_TOKENS > 0
+              ? { max_tokens: OPENROUTER_QUALITY_REASONING_TOKENS, exclude: true }
+              : undefined,
+          response_format: { type: "json_object" },
+          max_tokens:
+            Number.isFinite(OPENROUTER_MAX_OUTPUT_TOKENS) && OPENROUTER_MAX_OUTPUT_TOKENS > 0
+              ? Math.floor(OPENROUTER_MAX_OUTPUT_TOKENS)
+              : undefined,
+        }),
+      });
+
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload?.error) {
+        const errorText =
+          payload?.error?.message ||
+          payload?.message ||
+          (response.ok ? "OpenRouter returned an error payload" : `OpenRouter request failed (${response.status})`);
+        lastError = errorText;
+        if (!isRetryableStatus(response.status) || isHardQuotaError(errorText) || attempt === OPENROUTER_MAX_RETRIES) {
+          throw new Error(errorText);
+        }
+        await sleep(OPENROUTER_RETRY_BASE_MS * Math.pow(2, attempt));
+        attempt += 1;
+        continue;
+      }
+
+      const message = payload?.choices?.[0]?.message?.content;
+      return Array.isArray(message) ? message.map((part) => part?.text || "").join("\n") : String(message || "");
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error ?? "Unknown error");
+      if (attempt === OPENROUTER_MAX_RETRIES) {
+        throw new Error(lastError);
+      }
+      await sleep(OPENROUTER_RETRY_BASE_MS * Math.pow(2, attempt));
+      attempt += 1;
+    }
+  }
+
+  throw new Error(lastError);
+}
+
+async function extractBankStatementFromImages(fileName, images) {
+  if (images.length === 0) {
+    return {
+      account: { bankName: null, accountNumber: null, accountHolderName: null, ifscCode: null },
+      statementPeriodStart: null,
+      statementPeriodEnd: null,
+      transactions: [],
+    };
+  }
+
+  const raw = await callOpenRouterForBankStatement([
+    {
+      role: "system",
+      content:
+        "Extract bank statement account details and transaction rows. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
+        "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
+        "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
+        "Use numbers for amounts, with debit and credit as positive values in their own columns. Do not invent rows. Preserve narration text exactly enough for audit matching. " +
+        "If a page contains only summary information and no ledger rows, extract account/period only and leave transactions empty.",
+    },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: `Extract bank statement data from ${fileName}.` },
+        ...images.map((image) => ({ type: "image_url", image_url: { url: image } })),
+      ],
+    },
+  ]);
+
+  return normalizeAiBankStatement(safeJsonParse(raw, {}));
+}
+
+async function extractBankStatementFromPdfFile(fileName, mimeType, bytes) {
+  const fileData = Buffer.from(bytes).toString("base64");
+  const raw = await callOpenRouterForBankStatement([
+    {
+      role: "user",
+      content: [
+        {
+          type: "file",
+          file: {
+            filename: fileName,
+            file_data: `data:${mimeType || "application/pdf"};base64,${fileData}`,
+          },
+        },
+        {
+          type: "text",
+          text:
+            "Extract bank statement account details and transaction rows from the attached PDF. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
+            "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
+            "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
+            "Use numbers for amounts, with debit and credit as positive values in their own columns. Preserve multi-line narration text in the description. " +
+            "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
+            "Do not treat BALANCE FORWARD, page footers, insurance notices, reward-points sections, summary totals, or opening/closing balance-only lines as transactions. " +
+            "Do not invent rows or amounts. If the PDF contains only summary information and no ledger rows, extract account/period only and leave transactions empty.",
+        },
+      ],
+    },
+  ]);
+
+  return normalizeAiBankStatement(safeJsonParse(raw, {}));
+}
+
+async function extractBankStatementFromText(fileName, pages) {
+  const raw = await callOpenRouterForBankStatement([
+    {
+      role: "system",
+      content:
+        "Extract bank statement account details and transaction rows from PDF text. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
+        "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
+        "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
+        "Use numbers for amounts, with debit and credit as positive values in their own columns. Preserve multi-line narration text in the description. " +
+        "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
+        "Do not treat BALANCE FORWARD, page footers, insurance notices, reward-points sections, summary totals, or opening/closing balance-only lines as transactions. " +
+        "Do not invent rows or amounts. If the text is only summary information and no ledger rows are present, extract account/period only and leave transactions empty.",
+    },
+    {
+      role: "user",
+      content: `Extract bank statement data from ${fileName} using this text:\n\n${formatBankStatementTextForAi(pages)}`,
+    },
+  ]);
+
+  return normalizeAiBankStatement(safeJsonParse(raw, {}));
+}
+
+function mergeBankStatementResults(results) {
+  const merged = normalizeAiBankStatement({});
+  for (const result of results) {
+    if (!result) continue;
+    merged.account = {
+      bankName: merged.account.bankName || result.account.bankName || null,
+      accountNumber: merged.account.accountNumber || result.account.accountNumber || null,
+      accountHolderName: merged.account.accountHolderName || result.account.accountHolderName || null,
+      ifscCode: merged.account.ifscCode || result.account.ifscCode || null,
+    };
+    merged.statementPeriodStart = merged.statementPeriodStart || result.statementPeriodStart || null;
+    merged.statementPeriodEnd = merged.statementPeriodEnd || result.statementPeriodEnd || null;
+    merged.transactions.push(...result.transactions);
+  }
+  return merged;
+}
+
+async function extractBankStatementFromTextPages(fileName, pages) {
+  const results = [];
+
+  for (let index = 0; index < pages.length; index += 1) {
+    const pageText = String(pages[index] || "").trim();
+    if (!pageText || !/\d{1,2}\s+[A-Za-z]{3}\s+\d{2}/.test(pageText)) {
+      continue;
+    }
+
+    const raw = await callOpenRouterForBankStatement([
+      {
+        role: "system",
+        content:
+          "Extract bank statement rows from one page of PDF text. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
+          "Dates must be ISO YYYY-MM-DD. Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
+          "Use positive numbers for debit and credit in their own columns. The columns are Date, Value Date, Description, Cheque, Deposit, Withdrawal, Balance. " +
+          "If a transaction line has amounts and narration but no printed date, use the most recent transaction date/value date visible above it on the same page. " +
+          "Attach continuation narration lines to the previous transaction. Ignore BALANCE FORWARD, TOTAL, reward-points sections, page footers, and bank notices. Do not invent rows.",
+      },
+      {
+        role: "user",
+        content: `Extract only page ${index + 1} from ${fileName}:\n\n${pageText}`,
+      },
+    ]);
+
+    const parsed = normalizeAiBankStatement(safeJsonParse(raw, {}));
+    if (parsed.transactions.length > 0 || parsed.account.accountNumber) {
+      results.push(parsed);
+    } else {
+      console.warn(`[worker] PDF text page ${index + 1} produced no bank rows for ${fileName}`);
+    }
+  }
+
+  return mergeBankStatementResults(results);
+}
+
+async function updateBankJob(jobId, fields) {
+  const { error } = await supabase
+    .from("bank_statement_extraction_jobs")
+    .update(fields)
+    .eq("id", jobId);
+  if (error) throw error;
+}
+
+async function claimNextBankStatementJob() {
+  const { data, error } = await supabase.rpc("claim_bank_statement_extraction_job", {
+    worker_name: WORKER_NAME,
+    stale_after: WORKER_STALE_RUNNING_JOB_INTERVAL,
+  });
+
+  if (error) {
+    const message = error instanceof Error ? error.message : String(error?.message ?? error ?? "");
+    if (message.includes("claim_bank_statement_extraction_job")) {
+      return null;
+    }
+    throw error;
+  }
+
+  const claimedJob = Array.isArray(data) ? data[0] : data;
+  return claimedJob?.id ? claimedJob : null;
+}
+
+async function getBankJob(jobId) {
+  const { data, error } = await supabase
+    .from("bank_statement_extraction_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .maybeSingle();
+  if (error) throw error;
+  return data ?? null;
+}
+
+async function requeueBankJob(jobId, errorMessage) {
+  const job = await getBankJob(jobId);
+  if (!job || isTerminalJobStatus(job.status)) return;
+  if (Number(job.attempt_count ?? 0) >= Number(job.max_attempts ?? 3)) {
+    await updateBankJob(jobId, {
+      status: "failed",
+      progress: 100,
+      stage: "Failed",
+      error: errorMessage,
+      locked_at: null,
+      locked_by: null,
+      finished_at: new Date().toISOString(),
+    });
+    await supabase
+      .from("bank_statement_imports")
+      .update({
+        status: "failed",
+        processing_meta: {
+          jobStatus: "failed",
+          extractionError: errorMessage,
+          failedAt: new Date().toISOString(),
+        },
+      })
+      .eq("id", job.import_id)
+      .eq("owner_user_id", job.owner_user_id);
+    return;
+  }
+  await updateBankJob(jobId, {
+    status: "queued",
+    progress: 0,
+    stage: "Queued after worker failure",
+    error: errorMessage,
+    locked_at: null,
+    locked_by: null,
+    next_run_at: new Date(Date.now() + WORKER_POLL_INTERVAL_MS).toISOString(),
+  });
+}
+
+async function runBankStatementJob(job) {
+  const { data: importRow, error: importError } = await supabase
+    .from("bank_statement_imports")
+    .select("*")
+    .eq("id", job.import_id)
+    .eq("owner_user_id", job.owner_user_id)
+    .maybeSingle();
+
+  if (importError) throw importError;
+  if (!importRow) {
+    await updateBankJob(job.id, {
+      status: "cancelled",
+      progress: 100,
+      stage: "Cancelled",
+      error: "Bank statement import was deleted.",
+      locked_at: null,
+      locked_by: null,
+      finished_at: new Date().toISOString(),
+    });
+    return;
+  }
+
+  await updateBankJob(job.id, { progress: 15, stage: "Downloading statement" });
+  const { data: storedFile, error: downloadError } = await supabase.storage
+    .from(importRow.storage_bucket || BANK_STATEMENT_BUCKET)
+    .download(importRow.storage_path);
+  if (downloadError) throw downloadError;
+
+  const mimeType = importRow.mime_type || "";
+  const fileName = importRow.original_file_name || "bank-statement";
+  const bytes = new Uint8Array(await storedFile.arrayBuffer());
+  if (bytes.byteLength === 0) {
+    throw new Error(`Downloaded bank statement file "${fileName}" is empty.`);
+  }
+  await updateBankJob(job.id, { progress: 30, stage: "Preparing pages for AI" });
+  const isPdf = mimeType.includes("pdf") || /\.pdf$/i.test(fileName);
+  const isImage = mimeType.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(fileName);
+  let parsed = null;
+  let extractionSource = "none";
+
+  let textPages = null;
+
+  if (isPdf) {
+    try {
+      textPages = await extractBankStatementPdfTextPages(bytes);
+    } catch (error) {
+      console.warn(
+        `[worker] PDF text extraction skipped for ${fileName}: ${error instanceof Error ? error.message : String(error ?? "")}`
+      );
+    }
+  }
+
+  if (isPdf && textPages && hasUsableBankStatementText(textPages)) {
+    try {
+      await updateBankJob(job.id, { progress: 55, stage: "Running page-by-page AI extraction from PDF text" });
+      parsed = await extractBankStatementFromTextPages(fileName, textPages);
+      extractionSource = "pdf_text_page_ai";
+      console.log(`[worker] page-by-page PDF text AI returned ${parsed.transactions.length} row(s) for ${fileName}`);
+    } catch (error) {
+      console.warn(
+        `[worker] page-by-page PDF text AI extraction skipped for ${fileName}: ${error instanceof Error ? error.message : String(error ?? "")}`
+      );
+    }
+  }
+
+  if (isPdf && (!parsed || parsed.transactions.length === 0) && !hasUsableBankStatementText(textPages ?? [])) {
+    try {
+      await updateBankJob(job.id, { progress: 50, stage: "Running AI extraction from PDF file" });
+      parsed = await extractBankStatementFromPdfFile(fileName, mimeType || "application/pdf", bytes);
+      extractionSource = "pdf_file_ai";
+      console.log(`[worker] PDF file AI returned ${parsed.transactions.length} row(s) for ${fileName}`);
+    } catch (error) {
+      console.warn(
+        `[worker] PDF file AI extraction skipped for ${fileName}: ${error instanceof Error ? error.message : String(error ?? "")}`
+      );
+    }
+  }
+
+  if (!parsed || parsed.transactions.length === 0) {
+    await updateBankJob(job.id, {
+      progress: 45,
+      stage: isPdf ? "Preparing page images for AI fallback" : "Preparing image for AI",
+    });
+    try {
+      const images = isPdf
+        ? await renderBankStatementPdfToImages(bytes, fileName)
+        : isImage
+          ? [await imageBytesToProviderDataUrl(bytes, mimeType || "image/jpeg", fileName)]
+          : [];
+
+      await updateBankJob(job.id, { progress: 55, stage: "Running AI extraction from images" });
+      parsed = await extractBankStatementFromImages(fileName, images);
+      extractionSource = "image_ai";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
+      console.warn(`[worker] image AI fallback skipped for ${fileName}: ${message}`);
+      if (!parsed) {
+        parsed = normalizeAiBankStatement({});
+      }
+      extractionSource = extractionSource === "none" ? "image_ai_failed" : `${extractionSource}_image_fallback_failed`;
+    }
+  }
+
+  const account = {
+    bankName: importRow.extracted_bank_name || parsed.account.bankName || null,
+    accountNumber: importRow.extracted_account_number || parsed.account.accountNumber || null,
+    accountHolderName: importRow.extracted_account_holder_name || parsed.account.accountHolderName || null,
+    ifscCode: importRow.extracted_ifsc_code || parsed.account.ifscCode || null,
+  };
+  const normalizedAccountNumber = normalizeAccountNumber(account.accountNumber);
+  const { data: candidateRows, error: candidateError } = normalizedAccountNumber
+    ? await supabase
+        .from("bank_accounts")
+        .select("id")
+        .eq("owner_user_id", job.owner_user_id)
+        .eq("account_number_normalized", normalizedAccountNumber)
+        .limit(5)
+    : { data: [], error: null };
+  if (candidateError) throw candidateError;
+  const candidateCount = (candidateRows ?? []).length;
+  const selectedAccountId = candidateCount === 1 ? candidateRows[0].id : null;
+  const finalStatus =
+    parsed.transactions.length === 0
+      ? "manual_review_required"
+      : candidateCount > 1
+        ? "needs_account_selection"
+        : "ready_to_review";
+
+  await updateBankJob(job.id, { progress: 75, stage: "Saving preview rows" });
+  await supabase
+    .from("bank_statement_import_preview_transactions")
+    .delete()
+    .eq("import_id", job.import_id)
+    .eq("owner_user_id", job.owner_user_id);
+
+  const rows = parsed.transactions.map((transaction, index) => ({
+    import_id: job.import_id,
+    owner_user_id: job.owner_user_id,
+    ...transaction,
+    row_index: index + 1,
+  }));
+  if (rows.length > 0) {
+    const { error: previewInsertError } = await supabase
+      .from("bank_statement_import_preview_transactions")
+      .insert(rows);
+    if (previewInsertError) throw previewInsertError;
+  }
+
+  const processingMeta =
+    importRow.processing_meta && typeof importRow.processing_meta === "object" && !Array.isArray(importRow.processing_meta)
+      ? importRow.processing_meta
+      : {};
+  const { error: importUpdateError } = await supabase
+    .from("bank_statement_imports")
+    .update({
+      bank_account_id: selectedAccountId,
+      statement_period_start: parsed.statementPeriodStart,
+      statement_period_end: parsed.statementPeriodEnd,
+      extracted_bank_name: account.bankName,
+      extracted_account_number: account.accountNumber,
+      extracted_account_holder_name: account.accountHolderName,
+      extracted_ifsc_code: account.ifscCode,
+      status: finalStatus,
+      processing_meta: {
+        ...processingMeta,
+        parser: "openrouter_bank_statement_v1",
+        extractionSource,
+        jobStatus: "completed",
+        extractionError: null,
+        normalizedAccountNumber,
+        maskedAccountNumber: maskAccountNumber(account.accountNumber),
+        ifscCode: account.ifscCode,
+        previewTransactionCount: rows.length,
+        completedAt: new Date().toISOString(),
+      },
+    })
+    .eq("id", job.import_id)
+    .eq("owner_user_id", job.owner_user_id);
+  if (importUpdateError) throw importUpdateError;
+
+  await updateBankJob(job.id, {
+    status: "succeeded",
+    progress: 100,
+    stage: "Completed",
+    error: null,
+    result: {
+      importId: job.import_id,
+      transactionCount: rows.length,
+      status: finalStatus,
+    },
+    locked_at: null,
+    locked_by: null,
+    finished_at: new Date().toISOString(),
+  });
 }
 
 async function getJob(jobId) {
@@ -243,16 +1142,46 @@ async function waitForInFlightRun(jobId) {
 }
 
 async function main() {
+  console.log(
+    `[worker] started name=${WORKER_NAME} appBase=${APP_BASE_URL} pollMs=${WORKER_POLL_INTERVAL_MS} bankPdfMode=pdf_file_ai`
+  );
+  let lastIdleLogAt = 0;
+
   while (true) {
     try {
+      const bankJob = await claimNextBankStatementJob();
+      if (bankJob) {
+        try {
+          console.log(
+            `[worker] claimed bank statement job ${bankJob.id} import=${bankJob.import_id ?? "<unknown>"} attempt=${bankJob.attempt_count ?? "?"}/${bankJob.max_attempts ?? "?"}`
+          );
+          await runBankStatementJob(bankJob);
+          console.log(`[worker] completed bank statement job ${bankJob.id}`);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
+          console.error(`[worker] bank statement extraction failed for job ${bankJob.id}: ${message}`);
+          await requeueBankJob(bankJob.id, message);
+        }
+        continue;
+      }
+
       const job = await claimNextJob();
       if (!job) {
+        const now = Date.now();
+        if (now - lastIdleLogAt >= WORKER_IDLE_LOG_INTERVAL_MS) {
+          console.log("[worker] idle: no queued bank statement or packet jobs claimed");
+          lastIdleLogAt = now;
+        }
         await sleep(WORKER_POLL_INTERVAL_MS);
         continue;
       }
 
       try {
+        console.log(
+          `[worker] claimed packet job ${job.id} case=${job.case_id ?? "<unknown>"} attempt=${job.attempt_count ?? "?"}/${job.max_attempts ?? "?"}`
+        );
         await runJob(job);
+        console.log(`[worker] completed packet job ${job.id}`);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
         if (error instanceof JobMayStillBeRunningError) {

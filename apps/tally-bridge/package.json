@@ -1,0 +1,12 @@
+{
+  "name": "@autodealer/tally-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "pair": "node src/bridge.mjs pair",
+    "start": "node src/bridge.mjs start",
+    "test": "node src/bridge.mjs test",
+    "sync": "node src/bridge.mjs sync-masters"
+  }
+}
