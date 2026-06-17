@@ -66,6 +66,12 @@ export type ParsedBankStatement = {
 export type BankStatementExtractionResult = ParsedBankStatement & {
   extractionSource: "csv_text_v1" | "openrouter_bank_statement_v1" | "manual_review_required_v1";
   extractionError?: string | null;
+  extractionDiagnostics?: {
+    rawAiTransactionCount?: number;
+    normalizedAiTransactionCount?: number;
+    rejectedAiTransactionCount?: number;
+    fallbackParser?: string | null;
+  };
 };
 
 export type BankAccountRow = {
@@ -180,6 +186,29 @@ export function parseDate(value: unknown) {
     return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
   }
 
+  const monthName = raw.match(/^(\d{1,2})[\s-]+([a-zA-Z]{3,9})[\s,-]+(\d{2,4})/);
+  if (monthName) {
+    const [, day, monthRaw, yearRaw] = monthName;
+    const monthIndex = [
+      "jan",
+      "feb",
+      "mar",
+      "apr",
+      "may",
+      "jun",
+      "jul",
+      "aug",
+      "sep",
+      "oct",
+      "nov",
+      "dec",
+    ].findIndex((month) => monthRaw.toLowerCase().startsWith(month));
+    if (monthIndex >= 0) {
+      const year = yearRaw.length === 2 ? `20${yearRaw}` : yearRaw;
+      return `${year}-${String(monthIndex + 1).padStart(2, "0")}-${day.padStart(2, "0")}`;
+    }
+  }
+
   const parsed = new Date(raw);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString().slice(0, 10);
@@ -275,9 +304,19 @@ function splitSignedAmount(row: Record<string, string>) {
 function safeJsonParse<T>(raw: string, fallback: T): T {
   try {
     const trimmed = raw.trim();
-    const start = trimmed.indexOf("{");
-    const end = trimmed.lastIndexOf("}");
-    const jsonString = start >= 0 && end > start ? trimmed.slice(start, end + 1) : trimmed;
+    const objectStart = trimmed.indexOf("{");
+    const objectEnd = trimmed.lastIndexOf("}");
+    const arrayStart = trimmed.indexOf("[");
+    const arrayEnd = trimmed.lastIndexOf("]");
+    const useArray =
+      arrayStart >= 0 &&
+      arrayEnd > arrayStart &&
+      (objectStart < 0 || arrayStart < objectStart);
+    const jsonString = useArray
+      ? trimmed.slice(arrayStart, arrayEnd + 1)
+      : objectStart >= 0 && objectEnd > objectStart
+        ? trimmed.slice(objectStart, objectEnd + 1)
+        : trimmed;
     return JSON.parse(jsonString) as T;
   } catch {
     return fallback;
@@ -352,6 +391,169 @@ function parseCsvTransactions(text: string): ParsedBankTransaction[] {
   });
 }
 
+function extractLabeledValue(text: string, labels: string[]) {
+  const escapedLabels = labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const pattern = new RegExp(`(?:^|\\|)\\s*(?:${escapedLabels})\\s*:\\s*([^|\\n\\r]*)`, "i");
+  return text.match(pattern)?.[1]?.trim() ?? "";
+}
+
+function parseLabeledTransactionBlocks(text: string): ParsedBankTransaction[] {
+  const blocks = text
+    .split(/\bTransaction\s+\d+\b/i)
+    .slice(1)
+    .map((block) => block.trim())
+    .filter(Boolean);
+
+  return blocks.flatMap((block, index) => {
+    const transactionDate = parseDate(extractLabeledValue(block, ["Date", "Txn Date", "Transaction Date", "Posting Date"]));
+    const description = textCell(extractLabeledValue(block, ["Description", "Narration", "Particulars", "Remarks"]));
+    if (!transactionDate || !description) return [];
+
+    const debitAmount = parseAmount(extractLabeledValue(block, ["Debit", "Withdrawal", "Withdrawals", "Paid Out", "Dr"]));
+    const creditAmount = parseAmount(extractLabeledValue(block, ["Credit", "Deposit", "Deposits", "Paid In", "Cr"]));
+    const balanceAmount = parseAmount(extractLabeledValue(block, ["Balance", "Running Balance", "Closing Balance"]));
+    const transactionType = detectTransactionType(description);
+    const category = detectCategory(description, debitAmount, creditAmount);
+    const counterpartyName = extractCounterpartyName(description);
+
+    return [
+      {
+        transactionDate,
+        valueDate: parseDate(extractLabeledValue(block, ["Value Date"])) ?? transactionDate,
+        description,
+        referenceNumber: textCell(
+          extractLabeledValue(block, ["Reference", "Ref", "Ref No", "UTR", "Cheque No", "Instrument No"])
+        ) || null,
+        debitAmount,
+        creditAmount,
+        balanceAmount,
+        transactionType,
+        category,
+        counterpartyName,
+        additionalCharges: transactionType === "bank_charge" ? [{ type: "bank_charge", amount: debitAmount }] : [],
+        confidence: 0.82,
+        rawPayload: { rowNumber: index + 1, source: "labeled_text_block_v1", block },
+      },
+    ];
+  });
+}
+
+function normalizeStatementLineDescription(value: string) {
+  return value
+    .replace(/\s+/g, " ")
+    .replace(/\bPage\s+\d+\s+of\s+\d+\b.*$/i, "")
+    .trim();
+}
+
+function parseFixedWidthPdfTransactions(text: string): ParsedBankTransaction[] {
+  const rawLines = text.split(/\r?\n/);
+  const headerLine = rawLines.find((line) => /\bDeposit\b/i.test(line) && /\bWithdrawal\b/i.test(line) && /\bBalance\b/i.test(line));
+  const depositColumn = headerLine?.search(/\bDeposit\b/i) ?? -1;
+  const withdrawalColumn = headerLine?.search(/\bWithdrawal\b/i) ?? -1;
+  const amountPattern = /\b\d{1,3}(?:,\d{3})*\.\d{2}\b|\b\d+\.\d{2}\b/g;
+  const transactions: ParsedBankTransaction[] = [];
+  let currentTransaction: ParsedBankTransaction | null = null;
+  let currentDate: string | null = null;
+  let currentValueDate: string | null = null;
+
+  function finishCurrent() {
+    if (!currentTransaction) return;
+    currentTransaction.description = normalizeStatementLineDescription(currentTransaction.description);
+    if (
+      currentTransaction.description &&
+      !/\bbalance\s+forward\b/i.test(currentTransaction.description) &&
+      !/\btotal\b/i.test(currentTransaction.description)
+    ) {
+      transactions.push(currentTransaction);
+    }
+    currentTransaction = null;
+  }
+
+  for (const rawLine of rawLines) {
+    if (!rawLine.trim()) continue;
+    if (/\b(?:Date|Value\s+Date|Description|Cheque|Deposit|Withdrawal|Balance)\b/i.test(rawLine) && !/\d{1,3}(?:,\d{3})*\.\d{2}/.test(rawLine)) {
+      continue;
+    }
+    if (/\b(?:reward points statement|scheme|opening balance|points accrued|points redeemed|closing balance)\b/i.test(rawLine)) {
+      finishCurrent();
+      continue;
+    }
+    if (/^\s*Page\s+\d+\s+of\s+\d+\b/i.test(rawLine)) {
+      finishCurrent();
+      continue;
+    }
+
+    let line = rawLine;
+    const dated = line.match(/^\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4})(?:\s+(\d{1,2}\s+[A-Za-z]{3}\s+\d{2,4}))?\s*(.*)$/);
+    if (dated) {
+      const parsedDate = parseDate(dated[1]);
+      const parsedValueDate = parseDate(dated[2]) ?? parsedDate;
+      if (parsedDate) currentDate = parsedDate;
+      if (parsedValueDate) currentValueDate = parsedValueDate;
+      line = dated[3] ?? "";
+    }
+
+    const amountMatches = [...line.matchAll(amountPattern)].map((match) => ({
+      value: match[0],
+      index: match.index ?? 0,
+    }));
+    const hasRunningBalance = amountMatches.length >= 2;
+    if (hasRunningBalance && currentDate) {
+      finishCurrent();
+      const balanceMatch = amountMatches[amountMatches.length - 1];
+      const amountMatch = amountMatches[amountMatches.length - 2];
+      const amount = parseAmount(amountMatch.value);
+      const balanceAmount = parseAmount(balanceMatch.value);
+      if (amount === null) continue;
+
+      const description = normalizeStatementLineDescription(line.slice(0, amountMatch.index));
+      const isCredit =
+        depositColumn >= 0 &&
+        withdrawalColumn >= 0 &&
+        amountMatch.index < withdrawalColumn - 2;
+      const debitAmount = isCredit ? null : amount;
+      const creditAmount = isCredit ? amount : null;
+      const transactionType = detectTransactionType(description);
+      const category = detectCategory(description, debitAmount, creditAmount);
+
+      currentTransaction = {
+        transactionDate: currentDate,
+        valueDate: currentValueDate ?? currentDate,
+        description,
+        referenceNumber: null,
+        debitAmount,
+        creditAmount,
+        balanceAmount,
+        transactionType,
+        category,
+        counterpartyName: extractCounterpartyName(description),
+        additionalCharges: transactionType === "bank_charge" ? [{ type: "bank_charge", amount: debitAmount }] : [],
+        confidence: 0.7,
+        rawPayload: {
+          source: "fixed_width_pdf_text_v1",
+          line: rawLine,
+        },
+      };
+      continue;
+    }
+
+    const continuation = normalizeStatementLineDescription(line);
+    if (currentTransaction && continuation && !/\bBank deposits are covered\b/i.test(continuation)) {
+      currentTransaction.description = `${currentTransaction.description} ${continuation}`;
+      currentTransaction.transactionType = detectTransactionType(currentTransaction.description);
+      currentTransaction.category = detectCategory(
+        currentTransaction.description,
+        currentTransaction.debitAmount ?? null,
+        currentTransaction.creditAmount ?? null
+      );
+      currentTransaction.counterpartyName = extractCounterpartyName(currentTransaction.description);
+    }
+  }
+
+  finishCurrent();
+  return transactions;
+}
+
 function extractFirst(text: string, patterns: RegExp[]) {
   for (const pattern of patterns) {
     const match = text.match(pattern);
@@ -360,12 +562,29 @@ function extractFirst(text: string, patterns: RegExp[]) {
   return "";
 }
 
+function extractAccountNumber(text: string) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    const match = line.match(/\b(?:account\s*(?:no\.?|number)|a\/c\s*(?:no\.?|number)?)\s*[:\-]?\s*([A-Z0-9X* -]{6,32})\b/i);
+    const candidate = normalizeAccountNumber(match?.[1]);
+    if (candidate) return candidate;
+  }
+
+  const compact = text.replace(/\s+/g, " ").trim();
+  const labeled = extractFirst(compact, [
+    /account\s*(?:no\.?|number)\s*[:\-]?\s*([A-Z0-9X* -]{6,32})(?=\s+(?:account\s+type|branch|currency|customer|ifsc|micr|nominee|statement|phone)\b|$)/i,
+    /a\/c\s*(?:no\.?|number)?\s*[:\-]?\s*([A-Z0-9X* -]{6,32})(?=\s+(?:account\s+type|branch|currency|customer|ifsc|micr|nominee|statement|phone)\b|$)/i,
+  ]);
+  return normalizeAccountNumber(labeled) || "";
+}
+
 export function parseBankStatementText(text: string) {
   const compact = text.replace(/\s+/g, " ").trim();
-  const accountNumber = extractFirst(compact, [
-    /account\s*(?:no|number)\s*[:\-]?\s*([A-Z0-9X* -]{6,32})/i,
-    /a\/c\s*(?:no|number)?\s*[:\-]?\s*([A-Z0-9X* -]{6,32})/i,
-  ]);
+  const accountNumber = extractAccountNumber(text);
   const accountHolderName = extractFirst(compact, [
     /account\s*(?:holder|name)\s*[:\-]?\s*([A-Z][A-Z0-9 .&'-]{2,80})/i,
     /customer\s*name\s*[:\-]?\s*([A-Z][A-Z0-9 .&'-]{2,80})/i,
@@ -389,7 +608,9 @@ export function parseBankStatementText(text: string) {
     },
     statementPeriodStart: parseDate(period?.[1]) ?? null,
     statementPeriodEnd: parseDate(period?.[2]) ?? null,
-    transactions: parseCsvTransactions(text),
+    transactions: parseCsvTransactions(text)
+      .concat(parseLabeledTransactionBlocks(text))
+      .concat(parseFixedWidthPdfTransactions(text)),
   };
 }
 
@@ -495,25 +716,166 @@ async function renderBankStatementPdfToImages(data: Uint8Array, sourceName: stri
   }
 }
 
+async function extractBankStatementPdfText(data: Uint8Array) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bank-statement-pdf-text-"));
+  const inputPath = path.join(tmpDir, "input.pdf");
+
+  try {
+    fs.writeFileSync(inputPath, Buffer.from(data));
+    const { stdout } = await execFileAsync("pdftotext", ["-layout", inputPath, "-"], {
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    return stdout.trim();
+  } catch {
+    return "";
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+function readLooseField(row: Record<string, unknown>, aliases: string[]) {
+  const aliasSet = new Set(aliases.map(normalizeHeader));
+  for (const [key, value] of Object.entries(row)) {
+    if (aliasSet.has(normalizeHeader(key))) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function readLooseText(row: Record<string, unknown>, aliases: string[]) {
+  return textCell(readLooseField(row, aliases));
+}
+
+function readLooseAmount(row: Record<string, unknown>, aliases: string[]) {
+  return parseAmount(readLooseField(row, aliases));
+}
+
+function readLooseDate(row: Record<string, unknown>, aliases: string[]) {
+  return parseDate(readLooseField(row, aliases));
+}
+
+function splitLooseSignedAmount(row: Record<string, unknown>) {
+  const amount = readLooseAmount(row, [
+    "amount",
+    "transactionAmount",
+    "transaction amount",
+    "txn amount",
+    "value",
+  ]);
+  if (amount === null) return { debitAmount: null, creditAmount: null };
+
+  const marker = readLooseText(row, [
+    "dr cr",
+    "dr/cr",
+    "debit credit",
+    "debit/credit",
+    "transaction type",
+    "type",
+    "amount type",
+  ]).toLowerCase();
+  if (/\bdr\b|debit|withdrawal|paid\s*out/.test(marker)) {
+    return { debitAmount: Math.abs(amount), creditAmount: null };
+  }
+  if (/\bcr\b|credit|deposit|paid\s*in/.test(marker)) {
+    return { debitAmount: null, creditAmount: Math.abs(amount) };
+  }
+  if (amount < 0) return { debitAmount: Math.abs(amount), creditAmount: null };
+  return { debitAmount: null, creditAmount: amount };
+}
+
 function normalizeAiTransaction(value: unknown, rowNumber: number): ParsedBankTransaction | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
-  const transactionDate = parseDate(row.transactionDate ?? row.date ?? row.txnDate ?? row.postingDate);
-  const description = textCell(row.description ?? row.narration ?? row.particulars ?? row.remarks);
-  if (!transactionDate || !description) return null;
+  const transactionDate = readLooseDate(row, [
+    "transactionDate",
+    "transaction date",
+    "date",
+    "txnDate",
+    "txn date",
+    "postingDate",
+    "posting date",
+    "post date",
+  ]);
+  const description =
+    readLooseText(row, [
+      "description",
+      "narration",
+      "particulars",
+      "remarks",
+      "details",
+      "transactionDetails",
+      "transaction details",
+      "transactionDescription",
+      "transaction description",
+      "rawLine",
+      "raw line",
+    ]) || `Transaction ${rowNumber}`;
+  const splitAmount = splitLooseSignedAmount(row);
+  const debitAmount =
+    readLooseAmount(row, [
+      "debitAmount",
+      "debit amount",
+      "debit",
+      "withdrawal",
+      "withdrawals",
+      "withdrawalAmount",
+      "withdrawal amount",
+      "paidOut",
+      "paid out",
+      "amountDebited",
+      "amount debited",
+      "dr",
+    ]) ?? splitAmount.debitAmount;
+  const creditAmount =
+    readLooseAmount(row, [
+      "creditAmount",
+      "credit amount",
+      "credit",
+      "deposit",
+      "deposits",
+      "depositAmount",
+      "deposit amount",
+      "paidIn",
+      "paid in",
+      "amountCredited",
+      "amount credited",
+      "cr",
+    ]) ?? splitAmount.creditAmount;
+  const balanceAmount = readLooseAmount(row, [
+    "balanceAmount",
+    "balance amount",
+    "balance",
+    "runningBalance",
+    "running balance",
+    "closingBalance",
+    "closing balance",
+  ]);
+  const hasAmount = debitAmount !== null || creditAmount !== null || balanceAmount !== null;
+  if (!transactionDate || !hasAmount) return null;
 
-  const debitAmount = parseAmount(row.debitAmount ?? row.debit ?? row.withdrawal ?? row.paidOut);
-  const creditAmount = parseAmount(row.creditAmount ?? row.credit ?? row.deposit ?? row.paidIn);
-  const balanceAmount = parseAmount(row.balanceAmount ?? row.balance ?? row.runningBalance ?? row.closingBalance);
-  const transactionType = textCell(row.transactionType) || detectTransactionType(description);
-  const category = textCell(row.category) || detectCategory(description, debitAmount, creditAmount);
-  const counterpartyName = textCell(row.counterpartyName) || extractCounterpartyName(description);
+  const transactionType = readLooseText(row, ["transactionType", "transaction type", "type"]) || detectTransactionType(description);
+  const category = readLooseText(row, ["category"]) || detectCategory(description, debitAmount, creditAmount);
+  const counterpartyName = readLooseText(row, ["counterpartyName", "counterparty name", "counterparty", "party"]) || extractCounterpartyName(description);
 
   return {
     transactionDate,
-    valueDate: parseDate(row.valueDate) ?? transactionDate,
+    valueDate: readLooseDate(row, ["valueDate", "value date"]) ?? transactionDate,
     description,
-    referenceNumber: textCell(row.referenceNumber ?? row.reference ?? row.utr ?? row.chequeNumber) || null,
+    referenceNumber:
+      readLooseText(row, [
+        "referenceNumber",
+        "reference number",
+        "reference",
+        "ref",
+        "utr",
+        "chequeNumber",
+        "cheque number",
+        "chequeNo",
+        "cheque no",
+        "instrumentNo",
+        "instrument no",
+      ]) || null,
     debitAmount,
     creditAmount,
     balanceAmount,
@@ -529,29 +891,68 @@ function normalizeAiTransaction(value: unknown, rowNumber: number): ParsedBankTr
   };
 }
 
-function normalizeAiBankStatement(value: unknown): ParsedBankStatement {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return emptyParsedBankStatement();
+function collectAiTransactions(parsed: Record<string, unknown>) {
+  for (const key of ["transactions", "transactionRows", "transaction rows", "rows", "entries", "statementRows"]) {
+    const value = readLooseField(parsed, [key]);
+    if (Array.isArray(value)) return value;
+  }
+  const table = readLooseField(parsed, ["table", "statementTable", "statement table"]);
+  if (table && typeof table === "object" && !Array.isArray(table)) {
+    const rows = readLooseField(table as Record<string, unknown>, ["rows", "transactions", "entries"]);
+    if (Array.isArray(rows)) return rows;
+  }
+  return [];
+}
+
+function normalizeAiBankStatement(value: unknown): ParsedBankStatement & {
+  diagnostics: NonNullable<BankStatementExtractionResult["extractionDiagnostics"]>;
+} {
+  if (Array.isArray(value)) {
+    const transactions = value.flatMap((row, index) => {
+      const transaction = normalizeAiTransaction(row, index + 1);
+      return transaction ? [transaction] : [];
+    });
+    return {
+      ...emptyParsedBankStatement(),
+      transactions,
+      diagnostics: {
+        rawAiTransactionCount: value.length,
+        normalizedAiTransactionCount: transactions.length,
+        rejectedAiTransactionCount: Math.max(0, value.length - transactions.length),
+      },
+    };
+  }
+  if (!value || typeof value !== "object") {
+    return { ...emptyParsedBankStatement(), diagnostics: { rawAiTransactionCount: 0, normalizedAiTransactionCount: 0, rejectedAiTransactionCount: 0 } };
+  }
   const parsed = value as Record<string, unknown>;
   const account = parsed.account && typeof parsed.account === "object" && !Array.isArray(parsed.account)
     ? (parsed.account as Record<string, unknown>)
     : parsed;
-  const transactions = Array.isArray(parsed.transactions)
-    ? parsed.transactions.flatMap((row, index) => {
+  const rawTransactions = collectAiTransactions(parsed);
+  const transactions = rawTransactions.flatMap((row, index) => {
         const transaction = normalizeAiTransaction(row, index + 1);
         return transaction ? [transaction] : [];
-      })
-    : [];
+      });
 
   return {
     account: {
-      bankName: textCell(account.bankName ?? parsed.bankName) || null,
-      accountNumber: textCell(account.accountNumber ?? parsed.accountNumber) || null,
-      accountHolderName: textCell(account.accountHolderName ?? account.accountName ?? parsed.accountHolderName) || null,
-      ifscCode: normalizeIfscCode(textCell(account.ifscCode ?? parsed.ifscCode)) || null,
+      bankName: readLooseText(account, ["bankName", "bank name", "bank"]) || readLooseText(parsed, ["bankName", "bank name", "bank"]) || null,
+      accountNumber: readLooseText(account, ["accountNumber", "account number", "accountNo", "account no", "account no."]) || readLooseText(parsed, ["accountNumber", "account number", "accountNo", "account no", "account no."]) || null,
+      accountHolderName:
+        readLooseText(account, ["accountHolderName", "account holder name", "accountName", "account name", "customerName", "customer name", "holder"]) ||
+        readLooseText(parsed, ["accountHolderName", "account holder name", "accountName", "account name", "customerName", "customer name", "holder"]) ||
+        null,
+      ifscCode: normalizeIfscCode(readLooseText(account, ["ifscCode", "ifsc code", "ifsc"]) || readLooseText(parsed, ["ifscCode", "ifsc code", "ifsc"])) || null,
     },
-    statementPeriodStart: parseDate(parsed.statementPeriodStart) ?? parseDate(parsed.periodStart),
-    statementPeriodEnd: parseDate(parsed.statementPeriodEnd) ?? parseDate(parsed.periodEnd),
+    statementPeriodStart: readLooseDate(parsed, ["statementPeriodStart", "statement period start", "periodStart", "period start", "fromDate", "from date"]),
+    statementPeriodEnd: readLooseDate(parsed, ["statementPeriodEnd", "statement period end", "periodEnd", "period end", "toDate", "to date"]),
     transactions,
+    diagnostics: {
+      rawAiTransactionCount: rawTransactions.length,
+      normalizedAiTransactionCount: transactions.length,
+      rejectedAiTransactionCount: Math.max(0, rawTransactions.length - transactions.length),
+    },
   };
 }
 
@@ -559,8 +960,20 @@ async function extractBankStatementFromImages(params: {
   fileName: string;
   images: string[];
   textHint?: string;
-}): Promise<ParsedBankStatement> {
-  if (params.images.length === 0) return emptyParsedBankStatement();
+  repairMode?: boolean;
+}): Promise<ParsedBankStatement & {
+  diagnostics: NonNullable<BankStatementExtractionResult["extractionDiagnostics"]>;
+}> {
+  if (params.images.length === 0) {
+    return {
+      ...emptyParsedBankStatement(),
+      diagnostics: {
+        rawAiTransactionCount: 0,
+        normalizedAiTransactionCount: 0,
+        rejectedAiTransactionCount: 0,
+      },
+    };
+  }
 
   const raw = await callOpenRouter(
     [
@@ -569,9 +982,12 @@ async function extractBankStatementFromImages(params: {
         content:
           "Extract bank statement account details and transaction rows. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
           "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
-          "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
+          "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, confidence, and rawLine. " +
           "Use numbers for amounts, with debit and credit as positive values in their own columns. Do not invent rows. Preserve narration text exactly enough for audit matching. " +
-          "If a page contains only summary information and no ledger rows, extract account/period only and leave transactions empty.",
+          "Merge wrapped narration lines into the preceding transaction row. Ignore balance-forward, subtotal, total, reward-points, and footer rows. If a page contains only summary information and no ledger rows, extract account/period only and leave transactions empty. " +
+          (params.repairMode
+            ? "Repair mode: a previous pass found no usable rows. Treat the visible fixed-width or tabular bank statement as authoritative and extract every ledger transaction row you can see."
+            : ""),
       },
       {
         role: "user",
@@ -613,14 +1029,76 @@ export async function extractBankStatementFile(params: {
     return { ...parsed, extractionSource: "csv_text_v1", extractionError: null };
   }
 
+  const isPdf = mimeType.includes("pdf") || /\.pdf$/i.test(params.fileName);
+  const isImage = mimeType.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(params.fileName);
+
   try {
-    const images = mimeType.includes("pdf") || /\.pdf$/i.test(params.fileName)
+    const textHint = isPdf
+      ? await extractBankStatementPdfText(params.bytes)
+      : "";
+
+    const images = isPdf
       ? await renderBankStatementPdfToImages(params.bytes, params.fileName)
-      : mimeType.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(params.fileName)
+      : isImage
         ? [await imageBytesToProviderDataUrl(params.bytes, mimeType || "image/jpeg", params.fileName)]
         : [];
-    const parsed = await extractBankStatementFromImages({ fileName: params.fileName, images });
-    return { ...parsed, extractionSource: "openrouter_bank_statement_v1", extractionError: null };
+    let aiParsed = await extractBankStatementFromImages({ fileName: params.fileName, images, textHint });
+    if (aiParsed.transactions.length === 0 && images.length > 0) {
+      try {
+        const repaired = await extractBankStatementFromImages({
+          fileName: params.fileName,
+          images,
+          textHint,
+          repairMode: true,
+        });
+        aiParsed = {
+          ...repaired,
+          diagnostics: {
+            ...repaired.diagnostics,
+            rawAiTransactionCount:
+              repaired.diagnostics.rawAiTransactionCount ?? aiParsed.diagnostics.rawAiTransactionCount,
+            normalizedAiTransactionCount: repaired.transactions.length,
+            rejectedAiTransactionCount: repaired.diagnostics.rejectedAiTransactionCount,
+          },
+        };
+      } catch {
+        // Keep the first AI result and continue to the PDF text fallback.
+      }
+    }
+    if (aiParsed.transactions.length > 0) {
+      return {
+        ...aiParsed,
+        extractionSource: "openrouter_bank_statement_v1",
+        extractionError: null,
+        extractionDiagnostics: aiParsed.diagnostics,
+      };
+    }
+
+    const textParsed = textHint ? parseBankStatementText(textHint) : emptyParsedBankStatement();
+    return {
+      ...(textParsed.transactions.length > 0
+        ? {
+            ...textParsed,
+            account: {
+              bankName: aiParsed.account.bankName || textParsed.account.bankName,
+              accountNumber: aiParsed.account.accountNumber || textParsed.account.accountNumber,
+              accountHolderName: aiParsed.account.accountHolderName || textParsed.account.accountHolderName,
+              ifscCode: aiParsed.account.ifscCode || textParsed.account.ifscCode,
+            },
+            statementPeriodStart: aiParsed.statementPeriodStart || textParsed.statementPeriodStart,
+            statementPeriodEnd: aiParsed.statementPeriodEnd || textParsed.statementPeriodEnd,
+          }
+        : aiParsed),
+      extractionSource: textParsed.transactions.length > 0 ? "csv_text_v1" : "openrouter_bank_statement_v1",
+      extractionError:
+        textParsed.transactions.length > 0
+          ? "AI returned no normalized rows; imported rows from PDF text fallback."
+          : "AI returned no normalized transaction rows.",
+      extractionDiagnostics: {
+        ...aiParsed.diagnostics,
+        fallbackParser: textParsed.transactions.length > 0 ? "pdf_text_v1" : null,
+      },
+    };
   } catch (error) {
     return {
       ...emptyParsedBankStatement(),
