@@ -624,6 +624,23 @@ function emptyParsedBankStatement(): ParsedBankStatement {
   };
 }
 
+function mergeBankStatementMetadata(
+  primary: ParsedBankStatement,
+  fallback: ParsedBankStatement
+): ParsedBankStatement {
+  return {
+    ...primary,
+    account: {
+      bankName: primary.account.bankName || fallback.account.bankName,
+      accountNumber: primary.account.accountNumber || fallback.account.accountNumber,
+      accountHolderName: primary.account.accountHolderName || fallback.account.accountHolderName,
+      ifscCode: primary.account.ifscCode || fallback.account.ifscCode,
+    },
+    statementPeriodStart: primary.statementPeriodStart || fallback.statementPeriodStart,
+    statementPeriodEnd: primary.statementPeriodEnd || fallback.statementPeriodEnd,
+  };
+}
+
 function normalizeImageMimeType(mimeType: string) {
   const lower = mimeType.toLowerCase();
   if (lower === "image/jpg") return "image/jpeg";
@@ -1037,6 +1054,7 @@ export async function extractBankStatementFile(params: {
     const textHint = isPdf
       ? await extractBankStatementPdfText(params.bytes)
       : "";
+    const textParsed = textHint ? parseBankStatementText(textHint) : emptyParsedBankStatement();
 
     const images = isPdf
       ? await renderBankStatementPdfToImages(params.bytes, params.fileName)
@@ -1067,28 +1085,29 @@ export async function extractBankStatementFile(params: {
       }
     }
     if (aiParsed.transactions.length > 0) {
+      const mergedParsed = mergeBankStatementMetadata(aiParsed, textParsed);
       return {
-        ...aiParsed,
+        ...mergedParsed,
         extractionSource: "openrouter_bank_statement_v1",
         extractionError: null,
-        extractionDiagnostics: aiParsed.diagnostics,
+        extractionDiagnostics: {
+          ...aiParsed.diagnostics,
+          fallbackParser:
+            textParsed.account.accountNumber ||
+            textParsed.account.bankName ||
+            textParsed.account.accountHolderName ||
+            textParsed.account.ifscCode ||
+            textParsed.statementPeriodStart ||
+            textParsed.statementPeriodEnd
+              ? "pdf_text_metadata_v1"
+              : null,
+        },
       };
     }
 
-    const textParsed = textHint ? parseBankStatementText(textHint) : emptyParsedBankStatement();
     return {
       ...(textParsed.transactions.length > 0
-        ? {
-            ...textParsed,
-            account: {
-              bankName: aiParsed.account.bankName || textParsed.account.bankName,
-              accountNumber: aiParsed.account.accountNumber || textParsed.account.accountNumber,
-              accountHolderName: aiParsed.account.accountHolderName || textParsed.account.accountHolderName,
-              ifscCode: aiParsed.account.ifscCode || textParsed.account.ifscCode,
-            },
-            statementPeriodStart: aiParsed.statementPeriodStart || textParsed.statementPeriodStart,
-            statementPeriodEnd: aiParsed.statementPeriodEnd || textParsed.statementPeriodEnd,
-          }
+        ? mergeBankStatementMetadata(textParsed, aiParsed)
         : aiParsed),
       extractionSource: textParsed.transactions.length > 0 ? "csv_text_v1" : "openrouter_bank_statement_v1",
       extractionError:
