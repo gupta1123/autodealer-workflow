@@ -34,6 +34,7 @@ const OPENROUTER_MAX_OUTPUT_TOKENS = Number(process.env.OPENROUTER_MAX_OUTPUT_TO
 const OPENROUTER_REVIEW_MAX_OUTPUT_TOKENS = Number(process.env.OPENROUTER_REVIEW_MAX_OUTPUT_TOKENS ?? 4096);
 const MAX_RETRIES = Number(process.env.OPENROUTER_MAX_RETRIES ?? 2);
 const RETRY_BASE_MS = Number(process.env.OPENROUTER_RETRY_BASE_MS ?? 1200);
+const OPENROUTER_TIMEOUT_MS = Number(process.env.OPENROUTER_TIMEOUT_MS ?? 60_000);
 
 export type OpenRouterMessage = {
   role: "system" | "user" | "assistant";
@@ -81,6 +82,10 @@ function normalizeMaxTokens(value: number) {
   return Math.floor(value);
 }
 
+function timeoutMessage(model: string, timeoutMs: number) {
+  return `OpenRouter request timed out after ${Math.round(timeoutMs / 1000)}s for model ${model}.`;
+}
+
 export async function callOpenRouter(
   messages: OpenRouterMessage[],
   options?: {
@@ -89,6 +94,7 @@ export async function callOpenRouter(
     model?: string;
     reasoning?: OpenRouterReasoningOptions;
     maxTokens?: number;
+    timeoutMs?: number;
   }
 ) {
   if (!OPENROUTER_API_KEY) {
@@ -96,13 +102,20 @@ export async function callOpenRouter(
   }
 
   const maxTokens = normalizeMaxTokens(options?.maxTokens ?? OPENROUTER_MAX_OUTPUT_TOKENS);
+  const model = options?.model || OPENROUTER_MODEL;
+  const timeoutMs = Number.isFinite(options?.timeoutMs) && Number(options?.timeoutMs) > 0
+    ? Number(options?.timeoutMs)
+    : OPENROUTER_TIMEOUT_MS;
   let attempt = 0;
   let lastError = "OpenRouter request failed";
 
   while (attempt <= MAX_RETRIES) {
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => abortController.abort(), timeoutMs);
     try {
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
+        signal: abortController.signal,
         headers: {
           Authorization: `Bearer ${OPENROUTER_API_KEY}`,
           "Content-Type": "application/json",
@@ -110,7 +123,7 @@ export async function callOpenRouter(
           "X-Title": "Autodealer Workflow Backend",
         },
         body: JSON.stringify({
-          model: options?.model || OPENROUTER_MODEL,
+          model,
           messages,
           temperature: 0,
           ...(options?.reasoning ? { reasoning: options.reasoning } : {}),
@@ -118,6 +131,7 @@ export async function callOpenRouter(
           ...(maxTokens ? { max_tokens: maxTokens } : {}),
         }),
       });
+      clearTimeout(timeoutId);
 
       const payload = await response.json().catch(() => ({}));
       if (!response.ok || payload?.error) {
@@ -142,7 +156,13 @@ export async function callOpenRouter(
         ? message.map((part: OpenRouterContentPart) => part?.text || "").join("\n")
         : String(message || "");
     } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error ?? "Unknown error");
+      clearTimeout(timeoutId);
+      lastError =
+        error instanceof Error && error.name === "AbortError"
+          ? timeoutMessage(model, timeoutMs)
+          : error instanceof Error
+            ? error.message
+            : String(error ?? "Unknown error");
       if (attempt === MAX_RETRIES) {
         throw new Error(lastError);
       }

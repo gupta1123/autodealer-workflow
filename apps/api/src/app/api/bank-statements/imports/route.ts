@@ -211,6 +211,7 @@ export async function POST(request: Request) {
         source: "bank_statement_upload",
         parser: parsed.extractionSource,
         extractionError: parsed.extractionError ?? null,
+        extractionDiagnostics: parsed.extractionDiagnostics ?? null,
         normalizedAccountNumber: normalizeAccountNumber(account.accountNumber),
         maskedAccountNumber: maskAccountNumber(account.accountNumber),
         ifscCode: account.ifscCode,
@@ -242,6 +243,7 @@ export async function POST(request: Request) {
       requiresManualExtraction: parsed.extractionSource === "manual_review_required_v1" || parsed.transactions.length === 0,
       extractionSource: parsed.extractionSource,
       extractionError: parsed.extractionError ?? null,
+      extractionDiagnostics: parsed.extractionDiagnostics ?? null,
     });
   } catch (error) {
     console.error("Error in POST /api/bank-statements/imports:", error);
