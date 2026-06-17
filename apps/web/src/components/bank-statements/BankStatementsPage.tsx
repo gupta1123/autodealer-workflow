@@ -123,6 +123,14 @@ type PreviewResponse = {
   candidates: BankAccount[];
   transactions: PreviewTransaction[];
   requiresManualExtraction: boolean;
+  extractionSource?: string | null;
+  extractionError?: string | null;
+  extractionDiagnostics?: {
+    rawAiTransactionCount?: number;
+    normalizedAiTransactionCount?: number;
+    rejectedAiTransactionCount?: number;
+    fallbackParser?: string | null;
+  } | null;
   processing?: boolean;
   job?: {
     id: string;
@@ -161,20 +169,7 @@ type QueueTransaction = {
   selectedLedgerName: string;
   saveMapping: boolean;
   needsLedgerConfirmation: boolean;
-  createLedgerName: string;
-  createLedgerParentName: string;
-  creatingLedger: boolean;
 };
-
-const LEDGER_PARENT_OPTIONS = [
-  "Indirect Expenses",
-  "Indirect Incomes",
-  "Duties & Taxes",
-  "Sundry Creditors",
-  "Sundry Debtors",
-  "Current Assets",
-  "Current Liabilities",
-];
 
 const EMPTY_ACCOUNT: DraftAccount = {
   bankName: "",
@@ -253,6 +248,13 @@ function parseNumber(value: string) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function maskAccountNumber(value: string) {
+  const normalized = value.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+  if (!normalized) return "";
+  if (normalized.length <= 4) return normalized;
+  return `${"*".repeat(Math.max(0, normalized.length - 4))}${normalized.slice(-4)}`;
+}
+
 function formatAmount(value: string | number | null | undefined) {
   const parsed = Number(value ?? 0);
   if (!Number.isFinite(parsed) || parsed === 0) return "";
@@ -260,14 +262,6 @@ function formatAmount(value: string | number | null | undefined) {
     maximumFractionDigits: 2,
     minimumFractionDigits: 0,
   }).format(parsed);
-}
-
-function defaultLedgerParent(transaction: Pick<QueueTransaction, "description" | "category">) {
-  const text = `${transaction.category} ${transaction.description}`.toLowerCase();
-  if (/\binterest\b/.test(text)) return "Indirect Incomes";
-  if (/\bcharge|charges|fee\b/.test(text)) return "Indirect Expenses";
-  if (/\btax|gst|tds\b/.test(text)) return "Duties & Taxes";
-  return "Sundry Creditors";
 }
 
 function defaultCreateLedgerName(transaction: Pick<QueueTransaction, "suggestedLedgerName" | "counterpartyName" | "category">) {
@@ -342,15 +336,6 @@ export function BankStatementsPage() {
     () => queueTransactions.filter((transaction) => !(transaction.selectedLedgerName || "").trim()).length,
     [queueTransactions]
   );
-  const createReadyRows = useMemo(
-    () =>
-      queueTransactions.filter((transaction) => {
-        const name = transaction.createLedgerName || defaultCreateLedgerName(transaction);
-        return !(transaction.selectedLedgerName || "").trim() && name.trim();
-      }).length,
-    [queueTransactions]
-  );
-
   function ledgerExists(name?: string | null) {
     if (!name) return false;
     return ledgerMasters.some((ledger) => ledger.name === name);
@@ -403,6 +388,8 @@ export function BankStatementsPage() {
       setBankLedgerName(nextTallyLedgerName);
     }
     setSelectedAccountId(singleCandidate ? singleCandidate.id : null);
+    setTallyAccountId("");
+    setQueueTransactions([]);
     setTransactions(
       payload.transactions.length
         ? payload.transactions.map(normalizeDraftTransaction)
@@ -536,12 +523,6 @@ export function BankStatementsPage() {
           ...transaction,
           selectedLedgerName: transaction.confirmedLedgerName || transaction.suggestedLedgerName || "",
           saveMapping: true,
-          createLedgerName:
-            transaction.suggestedLedgerName ||
-            transaction.counterpartyName ||
-            (transaction.category === "bank_charges" ? "Bank Charges" : ""),
-          createLedgerParentName: defaultLedgerParent(transaction),
-          creatingLedger: false,
         }))
       );
     }
@@ -651,12 +632,17 @@ export function BankStatementsPage() {
 
       const payload = (await response.json()) as PreviewResponse;
       applyPreviewPayload(payload);
+      const extractionIssue = payload.extractionError
+        ? payload.extractionError
+        : payload.extractionDiagnostics?.rawAiTransactionCount
+          ? `AI found ${payload.extractionDiagnostics.rawAiTransactionCount} row(s), but ${payload.extractionDiagnostics.normalizedAiTransactionCount ?? 0} passed validation.`
+          : "No transaction rows were extracted.";
       setBanner({
         tone: payload.processing || payload.requiresManualExtraction ? "info" : "success",
         text: payload.processing
           ? "AI extraction queued. The review panel will update when it is ready."
           : payload.requiresManualExtraction
-          ? "File stored. Add or verify transaction rows before confirming."
+          ? `File stored. ${extractionIssue} Add or verify transaction rows before confirming.`
           : "Statement extracted. Review the account and transactions.",
       });
     } catch (error) {
@@ -681,79 +667,6 @@ export function BankStatementsPage() {
     setTransactions((current) =>
       current.length <= 1 ? [createEmptyTransaction()] : current.filter((item) => item.id !== id)
     );
-  }
-
-  async function handleCreateLedger(transaction: QueueTransaction) {
-    if (!tallyConnectionId) {
-      setBanner({ tone: "error", text: "Select a Tally connection before creating a ledger." });
-      return;
-    }
-    const ledgerName = (transaction.createLedgerName || defaultCreateLedgerName(transaction)).trim();
-    const parentName = (transaction.createLedgerParentName || defaultLedgerParent(transaction)).trim();
-
-    if (!ledgerName || !parentName) {
-      setBanner({ tone: "error", text: "Ledger name and parent group are required." });
-      return;
-    }
-
-    try {
-      setQueueTransactions((current) =>
-        current.map((item) => (item.id === transaction.id ? { ...item, creatingLedger: true } : item))
-      );
-      const response = await apiFetch(`/api/tally/connections/${tallyConnectionId}/commands`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          commandType: "create_ledger",
-          payload: {
-            name: ledgerName,
-            parentName,
-          },
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(await readError(response));
-      }
-
-      setBanner({
-        tone: "success",
-        text: `Ledger create queued for ${ledgerName}. After the bridge logs success, queue the voucher.`,
-      });
-      setLedgerMasters((current) =>
-        current.some((ledger) => ledger.name === ledgerName)
-          ? current
-          : [
-              ...current,
-              {
-                key: `pending:${ledgerName}`,
-                name: ledgerName,
-                type: "ledger",
-              },
-            ]
-      );
-      setQueueTransactions((current) =>
-        current.map((item) =>
-          item.id === transaction.id
-            ? {
-                ...item,
-                createLedgerName: ledgerName,
-                createLedgerParentName: parentName,
-                selectedLedgerName: ledgerName,
-              }
-            : item
-        )
-      );
-    } catch (error) {
-      setBanner({
-        tone: "error",
-        text: error instanceof Error ? error.message : "Could not queue ledger creation.",
-      });
-    } finally {
-      setQueueTransactions((current) =>
-        current.map((item) => (item.id === transaction.id ? { ...item, creatingLedger: false } : item))
-      );
-    }
   }
 
   async function handleSyncLedgerMasters() {
@@ -1220,7 +1133,11 @@ export function BankStatementsPage() {
                     <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
                       <div className="mb-3 flex items-center gap-2 text-sm font-black text-amber-900">
                         <AlertTriangle className="h-4 w-4" />
-                        Multiple matching accounts
+                        Multiple accounts match this statement
+                      </div>
+                      <div className="mb-3 text-xs font-semibold leading-5 text-amber-900">
+                        The extracted name/account details match more than one saved bank account. Select the
+                        correct account before confirming.
                       </div>
                       <div className="grid gap-2 md:grid-cols-2">
                         {preview.candidates.map((candidate) => (
@@ -1269,7 +1186,9 @@ export function BankStatementsPage() {
 
                   {!preview.processing && preview.candidates.length === 0 && (
                     <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm font-semibold text-blue-800">
-                      New bank account will be created after confirmation. Enter the account number on the left first.
+                      No saved account matched this statement. Confirm Import will automatically create{" "}
+                      {account.accountHolderName || "this bank account"}
+                      {account.accountNumber ? ` · ${maskAccountNumber(account.accountNumber)}` : ""}.
                     </div>
                   )}
 
@@ -1562,7 +1481,7 @@ export function BankStatementsPage() {
                 </div>
 
                 {queueTransactions.length > 0 && (
-                  <div className="grid grid-cols-3 gap-2 rounded-lg border border-[#eee5da] bg-[#fbf7f1] p-2 text-center">
+                  <div className="grid grid-cols-2 gap-2 rounded-lg border border-[#eee5da] bg-[#fbf7f1] p-2 text-center">
                     <div>
                       <div className="text-lg font-black text-[#2b241d]">{queueTransactions.length}</div>
                       <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#9a8d7f]">Rows</div>
@@ -1573,10 +1492,6 @@ export function BankStatementsPage() {
                       </div>
                       <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#9a8d7f]">Matched</div>
                     </div>
-                    <div>
-                      <div className="text-lg font-black text-amber-700">{createReadyRows}</div>
-                      <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#9a8d7f]">Can create</div>
-                    </div>
                   </div>
                 )}
 
@@ -1584,10 +1499,10 @@ export function BankStatementsPage() {
                   <div className="flex items-center justify-between border-b border-[#eee5da] bg-[#fbf7f1] px-4 py-3">
                     <div>
                       <div className="text-xs font-black uppercase tracking-[0.16em] text-[#6f6256]">
-                        Ledger Matches
+                        Tally Ledger Matches
                       </div>
                       <div className="mt-0.5 text-[11px] font-semibold text-[#9a8d7f]">
-                        Pick an existing ledger or create the suggested one.
+                        Map each bank transaction to an existing or new Tally ledger.
                       </div>
                     </div>
                     <Badge className="border-[#d6c8b8] bg-white text-[#6f4e2f]" variant="outline">
@@ -1598,7 +1513,9 @@ export function BankStatementsPage() {
                   <div className="max-h-[540px] space-y-3 overflow-auto bg-[#fffdf9] p-3">
                     {queueTransactions.length === 0 ? (
                       <div className="rounded-lg border border-dashed border-[#d6c8b8] px-4 py-8 text-center text-sm font-semibold text-[#8a7f72]">
-                        {loadingQueueRows
+                        {preview
+                          ? "Confirm the current statement to load its ledger matches."
+                          : loadingQueueRows
                           ? "Loading pending transactions..."
                           : tallyAccountId
                             ? "No pending or failed transactions loaded for this account."
@@ -1709,78 +1626,6 @@ export function BankStatementsPage() {
                                   ))}
                               </select>
                             </label>
-
-                            {!selectedLedger && (
-                              <div className="mt-3 rounded-md border border-[#ead8bd] bg-[#fff8ed] p-3">
-                                <div className="flex items-start justify-between gap-3">
-                                  <div>
-                                    <div className="text-[10px] font-black uppercase tracking-[0.14em] text-[#9a6b2f]">
-                                      Create suggested ledger
-                                    </div>
-                                    <div className="mt-1 text-sm font-black text-[#2b241d]">
-                                      {transaction.createLedgerName || suggestedName || "No name suggested"}
-                                    </div>
-                                    <div className="mt-1 text-[11px] font-semibold text-[#8a7f72]">
-                                      Parent: {transaction.createLedgerParentName || defaultLedgerParent(transaction)}
-                                    </div>
-                                  </div>
-                                  <Button
-                                    type="button"
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() => handleCreateLedger(transaction)}
-                                    disabled={transaction.creatingLedger || !suggestedName}
-                                  >
-                                    {transaction.creatingLedger ? (
-                                      <Loader2 className="h-4 w-4 animate-spin" />
-                                    ) : (
-                                      <Plus className="h-4 w-4" />
-                                    )}
-                                    Create
-                                  </Button>
-                                </div>
-
-                                <details className="mt-3">
-                                  <summary className="cursor-pointer text-xs font-bold text-[#7c5f3f]">
-                                    Change name or group
-                                  </summary>
-                                  <div className="mt-2 space-y-2">
-                                    <Input
-                                      value={transaction.createLedgerName || ""}
-                                      onChange={(event) =>
-                                        setQueueTransactions((current) =>
-                                          current.map((item) =>
-                                            item.id === transaction.id
-                                              ? { ...item, createLedgerName: event.target.value }
-                                              : item
-                                          )
-                                        )
-                                      }
-                                      placeholder={suggestedName || "New ledger name"}
-                                    />
-                                    <select
-                                      value={transaction.createLedgerParentName || defaultLedgerParent(transaction)}
-                                      onChange={(event) =>
-                                        setQueueTransactions((current) =>
-                                          current.map((item) =>
-                                            item.id === transaction.id
-                                              ? { ...item, createLedgerParentName: event.target.value }
-                                              : item
-                                          )
-                                        )
-                                      }
-                                      className="h-10 w-full rounded-md border border-[#d8cbbb] bg-white px-3 text-sm font-medium outline-none focus:border-[#7c5f3f]"
-                                    >
-                                      {LEDGER_PARENT_OPTIONS.map((parentName) => (
-                                        <option key={parentName} value={parentName}>
-                                          {parentName}
-                                        </option>
-                                      ))}
-                                    </select>
-                                  </div>
-                                </details>
-                              </div>
-                            )}
 
                             <label className="mt-3 flex items-center gap-2 text-xs font-semibold text-[#7c6f62]">
                               <input
