@@ -198,24 +198,70 @@ export async function POST(
       }
     } else {
       const account = body.account ?? {};
+      const initialAccountNumber = account.accountNumber || importRow.extracted_account_number || "";
+      let syncedLedgerBankDetails: {
+        bankName?: string | null;
+        accountNumber?: string | null;
+        accountHolderName?: string | null;
+        ifscCode?: string | null;
+      } = {};
+
+      if (!normalizeAccountNumber(initialAccountNumber) && requestedTallyLedgerName) {
+        const { data: ledgerMaster, error: ledgerMasterError } = await supabase
+          .from("tally_masters")
+          .select("raw_payload")
+          .eq("owner_user_id", user.id)
+          .eq("master_type", "ledger")
+          .eq("is_active", true)
+          .eq("tally_name", requestedTallyLedgerName)
+          .order("last_synced_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (ledgerMasterError) throw ledgerMasterError;
+
+        const rawPayload =
+          ledgerMaster?.raw_payload &&
+          typeof ledgerMaster.raw_payload === "object" &&
+          !Array.isArray(ledgerMaster.raw_payload)
+            ? (ledgerMaster.raw_payload as Record<string, unknown>)
+            : {};
+
+        syncedLedgerBankDetails = {
+          bankName: toText(rawPayload.bankName) || null,
+          accountNumber: toText(rawPayload.bankAccountNumber) || null,
+          accountHolderName: toText(rawPayload.accountHolderName) || null,
+          ifscCode: toText(rawPayload.ifscCode) || null,
+        };
+      }
+
       const accountNumber =
-        account.accountNumber || importRow.extracted_account_number || "";
+        initialAccountNumber || syncedLedgerBankDetails.accountNumber || "";
       const normalizedAccountNumber = normalizeAccountNumber(accountNumber);
       if (!normalizedAccountNumber) {
         return jsonWithCors(
           request,
-          { error: "Account number is required when creating a new bank account." },
+          {
+            error:
+              "Account number is required when creating a new bank account. Sync Tally bank ledger details or enter the account number manually.",
+          },
           { status: 400 }
         );
       }
 
       const insertPayload = {
         owner_user_id: user.id,
-        bank_name: account.bankName || importRow.extracted_bank_name || null,
+        bank_name: account.bankName || importRow.extracted_bank_name || syncedLedgerBankDetails.bankName || null,
         account_number_normalized: normalizedAccountNumber,
         account_number_masked: maskAccountNumber(accountNumber),
-        account_holder_name: account.accountHolderName || importRow.extracted_account_holder_name || null,
-        ifsc_code: normalizeIfscCode(account.ifscCode || importRow.extracted_ifsc_code || null) || null,
+        account_holder_name:
+          account.accountHolderName ||
+          importRow.extracted_account_holder_name ||
+          syncedLedgerBankDetails.accountHolderName ||
+          null,
+        ifsc_code:
+          normalizeIfscCode(account.ifscCode || importRow.extracted_ifsc_code || syncedLedgerBankDetails.ifscCode || null) ||
+          null,
         tally_ledger_name: requestedTallyLedgerName,
       };
 
