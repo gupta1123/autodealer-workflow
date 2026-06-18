@@ -22,6 +22,8 @@ type QueuePayload = {
   transactions?: Array<{
     transactionId?: string;
     counterpartyLedgerName?: string;
+    createLedgerName?: string;
+    createLedgerParentName?: string;
     saveMapping?: boolean;
   }>;
 };
@@ -68,6 +70,10 @@ type PostingLogRow = {
 type ExistingCommandRow = {
   id: string;
   status: string;
+};
+
+type ExistingCreateLedgerCommandRow = {
+  payload: unknown;
 };
 
 type TransactionStatusSummaryRow = {
@@ -155,6 +161,14 @@ function buildVoucherReference(transaction: BankTransactionRow, bankCode: string
   return `${getVoucherReferencePrefix(transaction)}-${bankCode}-${suffix}`;
 }
 
+function defaultLedgerParent(transaction: Pick<BankTransactionRow, "description" | "category">) {
+  const text = `${transaction.category} ${transaction.description}`.toLowerCase();
+  if (/\binterest\b/.test(text)) return "Indirect Incomes";
+  if (/\bcharge|charges|fee\b/.test(text)) return "Indirect Expenses";
+  if (/\btax|gst|tds\b/.test(text)) return "Duties & Taxes";
+  return "Sundry Creditors";
+}
+
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
@@ -176,6 +190,16 @@ export async function POST(request: Request) {
         const transactionId = toText(transaction?.transactionId, 80);
         const ledgerName = toText(transaction?.counterpartyLedgerName, 500);
         return transactionId && ledgerName ? [[transactionId, ledgerName] as const] : [];
+      })
+    );
+    const createLedgerByTransactionId = new Map(
+      (Array.isArray(body.transactions) ? body.transactions : []).flatMap((transaction) => {
+        const transactionId = toText(transaction?.transactionId, 80);
+        const ledgerName = toText(transaction?.createLedgerName, 500);
+        const parentName = toText(transaction?.createLedgerParentName, 240);
+        return transactionId && ledgerName
+          ? [[transactionId, { name: ledgerName, parentName }] as const]
+          : [];
       })
     );
     const saveMappingTransactionIds = new Set(
@@ -363,6 +387,24 @@ export async function POST(request: Request) {
 
     if (ledgerError) throw ledgerError;
 
+    const { data: activeCreateRows, error: activeCreateError } = await supabase
+      .from("tally_bridge_commands")
+      .select("payload")
+      .eq("connection_id", connectionId)
+      .eq("owner_user_id", user.id)
+      .eq("command_type", "create_ledger")
+      .in("status", ["queued", "claimed"]);
+
+    if (activeCreateError) throw activeCreateError;
+
+    const activeCreateLedgerNames = new Set(
+      ((activeCreateRows ?? []) as unknown as ExistingCreateLedgerCommandRow[]).flatMap((row) => {
+        const payload = row.payload && typeof row.payload === "object" ? row.payload as Record<string, unknown> : {};
+        const name = toText(payload.name, 500);
+        return name ? [normalizeName(name)] : [];
+      })
+    );
+
     const syncedLedgerNames = new Set(
       ((ledgerRows ?? []) as unknown as TallyLedgerRow[]).map((ledger) => normalizeName(ledger.tally_name))
     );
@@ -407,6 +449,92 @@ export async function POST(request: Request) {
         return { transaction, suggestion, counterpartyLedgerName };
       })
     );
+
+    const createLedgerRequests = new Map<string, { name: string; parentName: string }>();
+    let alreadyQueuedLedgerCreates = 0;
+
+    for (const { transaction } of commandInputs) {
+      if (blockedFingerprints.has(transaction.fingerprint)) continue;
+      const createLedger = createLedgerByTransactionId.get(transaction.id);
+      if (!createLedger?.name) continue;
+      if (selectedLedgerByTransactionId.has(transaction.id)) continue;
+
+      const account = accountsById.get(transaction.bank_account_id);
+      const amount = getTransactionAmount(transaction);
+      const bankLedgerName = toText(body.bankLedgerName, 500) || account?.tally_ledger_name || "";
+      if (!account || !isValidTransactionDate(transaction.transaction_date) || !bankLedgerName || amount <= 0) {
+        continue;
+      }
+      if (ledgerExists(createLedger.name)) continue;
+
+      const normalizedCreateName = normalizeName(createLedger.name);
+      if (activeCreateLedgerNames.has(normalizedCreateName)) {
+        alreadyQueuedLedgerCreates += 1;
+        continue;
+      }
+
+      createLedgerRequests.set(normalizedCreateName, {
+        name: createLedger.name,
+        parentName: createLedger.parentName || defaultLedgerParent(transaction),
+      });
+    }
+
+    if (createLedgerRequests.size > 0) {
+      const ledgerCreateCommands = Array.from(createLedgerRequests.values()).map((ledger) => ({
+        connection_id: connectionId,
+        owner_user_id: user.id,
+        command_type: "create_ledger",
+        status: "queued",
+        priority: 30,
+        payload: {
+          name: ledger.name,
+          parentName: ledger.parentName,
+          companyName: connection.last_company_name,
+          source: "bank_statement_queue",
+        },
+      }));
+
+      const { data: createdLedgerCommands, error: ledgerCreateError } = await supabase
+        .from("tally_bridge_commands")
+        .insert(ledgerCreateCommands)
+        .select("*");
+
+      if (ledgerCreateError) throw ledgerCreateError;
+
+      await supabase.from("tally_connection_events").insert({
+        connection_id: connectionId,
+        owner_user_id: user.id,
+        event_type: "command_queued",
+        message: "Missing bank statement ledgers queued for bridge creation.",
+        payload: {
+          commandType: "create_ledger",
+          queuedCount: ledgerCreateCommands.length,
+          ledgerNames: ledgerCreateCommands.map((command) => command.payload.name),
+        },
+      });
+
+      return jsonWithCors(request, {
+        queuedCount: 0,
+        ledgerCreateQueuedCount: ledgerCreateCommands.length,
+        ledgerCreateAlreadyQueuedCount: alreadyQueuedLedgerCreates,
+        needsLedgerSyncBeforeVouchers: true,
+        commands: createdLedgerCommands ?? [],
+        message:
+          "Missing ledgers were queued for creation. Keep the bridge running, sync ledgers after they are created, then queue vouchers again.",
+      });
+    }
+
+    if (alreadyQueuedLedgerCreates > 0) {
+      return jsonWithCors(request, {
+        queuedCount: 0,
+        ledgerCreateQueuedCount: 0,
+        ledgerCreateAlreadyQueuedCount: alreadyQueuedLedgerCreates,
+        needsLedgerSyncBeforeVouchers: true,
+        commands: [],
+        message:
+          "Missing ledgers are already queued for creation. Keep the bridge running, sync ledgers after they are created, then queue vouchers again.",
+      });
+    }
 
     const commands = commandInputs.flatMap(({ transaction, suggestion, counterpartyLedgerName }) => {
       if (blockedFingerprints.has(transaction.fingerprint)) {
