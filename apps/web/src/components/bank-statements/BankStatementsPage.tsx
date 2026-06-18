@@ -169,6 +169,9 @@ type QueueTransaction = {
   selectedLedgerName: string;
   saveMapping: boolean;
   needsLedgerConfirmation: boolean;
+  createLedgerName: string;
+  createLedgerParentName: string;
+  creatingLedger: boolean;
 };
 
 const EMPTY_ACCOUNT: DraftAccount = {
@@ -262,6 +265,14 @@ function formatAmount(value: string | number | null | undefined) {
     maximumFractionDigits: 2,
     minimumFractionDigits: 0,
   }).format(parsed);
+}
+
+function defaultLedgerParent(transaction: Pick<QueueTransaction, "description" | "category">) {
+  const text = `${transaction.category} ${transaction.description}`.toLowerCase();
+  if (/\binterest\b/.test(text)) return "Indirect Incomes";
+  if (/\bcharge|charges|fee\b/.test(text)) return "Indirect Expenses";
+  if (/\btax|gst|tds\b/.test(text)) return "Duties & Taxes";
+  return "Sundry Creditors";
 }
 
 function defaultCreateLedgerName(transaction: Pick<QueueTransaction, "suggestedLedgerName" | "counterpartyName" | "category">) {
@@ -523,6 +534,12 @@ export function BankStatementsPage() {
           ...transaction,
           selectedLedgerName: transaction.confirmedLedgerName || transaction.suggestedLedgerName || "",
           saveMapping: true,
+          createLedgerName:
+            transaction.suggestedLedgerName ||
+            transaction.counterpartyName ||
+            (transaction.category === "bank_charges" ? "Bank Charges" : ""),
+          createLedgerParentName: defaultLedgerParent(transaction),
+          creatingLedger: false,
         }))
       );
     }
