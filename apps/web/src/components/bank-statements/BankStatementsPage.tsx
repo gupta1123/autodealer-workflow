@@ -918,8 +918,12 @@ export function BankStatementsPage() {
       setBanner({ tone: "error", text: "No pending or failed transactions are available for this account." });
       return;
     }
-    const unresolvedRows = queueTransactions.filter((transaction) => !transaction.selectedLedgerName.trim());
-    if (unresolvedRows.length > 0) {
+    const ambiguousRows = queueTransactions.filter((transaction) => {
+      if (transaction.selectedLedgerName.trim()) return false;
+      const createLedgerName = (transaction.createLedgerName || defaultCreateLedgerName(transaction)).trim();
+      return !createLedgerName;
+    });
+    if (ambiguousRows.length > 0) {
       setBanner({ tone: "error", text: "Select a counterparty ledger for every queued transaction." });
       return;
     }
@@ -938,6 +942,14 @@ export function BankStatementsPage() {
           transactions: queueTransactions.map((transaction) => ({
             transactionId: transaction.id,
             counterpartyLedgerName: transaction.selectedLedgerName,
+            createLedgerName:
+              transaction.selectedLedgerName.trim()
+                ? ""
+                : (transaction.createLedgerName || defaultCreateLedgerName(transaction)).trim(),
+            createLedgerParentName:
+              transaction.selectedLedgerName.trim()
+                ? ""
+                : (transaction.createLedgerParentName || defaultLedgerParent(transaction)).trim(),
             saveMapping: transaction.saveMapping,
           })),
         }),
@@ -947,7 +959,31 @@ export function BankStatementsPage() {
         throw new Error(await readError(response));
       }
 
-      const payload = (await response.json()) as { queuedCount?: number };
+      const payload = (await response.json()) as {
+        queuedCount?: number;
+        ledgerCreateQueuedCount?: number;
+        ledgerCreateAlreadyQueuedCount?: number;
+        needsLedgerSyncBeforeVouchers?: boolean;
+        message?: string;
+      };
+      if (payload.needsLedgerSyncBeforeVouchers) {
+        const createCount = payload.ledgerCreateQueuedCount ?? 0;
+        const alreadyQueuedCount = payload.ledgerCreateAlreadyQueuedCount ?? 0;
+        setBanner({
+          tone: "info",
+          text:
+            payload.message ||
+            `${createCount + alreadyQueuedCount} missing ledger(s) queued for creation. Keep the bridge running, sync ledgers, then queue vouchers again.`,
+        });
+        setQueueTransactions((current) =>
+          current.map((transaction) => {
+            if (transaction.selectedLedgerName.trim()) return transaction;
+            const createLedgerName = (transaction.createLedgerName || defaultCreateLedgerName(transaction)).trim();
+            return createLedgerName ? { ...transaction, selectedLedgerName: createLedgerName } : transaction;
+          })
+        );
+        return;
+      }
       setBanner({
         tone: "success",
         text: `${payload.queuedCount ?? 0} bank voucher commands queued for the Tally bridge.`,
