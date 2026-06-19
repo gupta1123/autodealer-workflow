@@ -3,28 +3,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
-  Banknote,
+  ArrowRight,
   CheckCircle2,
-  FileUp,
   Landmark,
   Loader2,
-  Plus,
   RefreshCw,
-  Trash2,
+  Search,
+  UploadCloud,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { apiFetch } from "@/lib/api-client";
 
 type BankAccount = {
@@ -37,8 +27,6 @@ type BankAccount = {
   tallyLedgerName: string | null;
   lastImportedTransactionAt: string | null;
   lastTallyPostedTransactionAt: string | null;
-  createdAt: string;
-  updatedAt: string;
 };
 
 type BankStatementImport = {
@@ -59,11 +47,9 @@ type TallyConnection = {
 
 type TallyCommand = {
   id: string;
-  commandType: string;
   status: string;
   result: Record<string, unknown> | null;
   error: string | null;
-  completedAt: string | null;
 };
 
 type DraftAccount = {
@@ -72,24 +58,6 @@ type DraftAccount = {
   accountHolderName: string;
   ifscCode: string;
   tallyLedgerName: string;
-};
-
-type DraftTransaction = {
-  id: string;
-  transactionDate: string;
-  valueDate: string;
-  description: string;
-  referenceNumber: string;
-  debitAmount: string;
-  creditAmount: string;
-  balanceAmount: string;
-  transactionType: string;
-  category: string;
-  counterpartyName: string;
-  suggestedLedgerName: string;
-  suggestionConfidence: number | null;
-  suggestionReason: string;
-  confirmedLedgerName: string;
 };
 
 type PreviewTransaction = {
@@ -108,6 +76,46 @@ type PreviewTransaction = {
   suggestionConfidence?: number | null;
   suggestionReason?: string | null;
   confirmedLedgerName?: string | null;
+  rawPayload?: {
+    aiLedgerRecommendation?: LedgerRecommendation | null;
+  } | null;
+};
+
+type LedgerRecommendationAction =
+  | "use_existing_ledger"
+  | "create_new_ledger"
+  | "use_standard_ledger"
+  | "use_suspense"
+  | "needs_review";
+
+type LedgerRecommendation = {
+  action: LedgerRecommendationAction;
+  ledgerName: string | null;
+  ledgerGroup: string | null;
+  confidence: number;
+  requiresUserConfirmation: boolean;
+  reason: string | null;
+};
+
+type ReviewTransaction = {
+  id: string;
+  transactionDate: string;
+  valueDate: string;
+  description: string;
+  referenceNumber: string;
+  debitAmount: string;
+  creditAmount: string;
+  balanceAmount: string;
+  transactionType: string;
+  category: string;
+  counterpartyName: string;
+  suggestedLedgerName: string;
+  suggestionConfidence: number | null;
+  suggestionReason: string;
+  selectedLedgerName: string;
+  ledgerAction: LedgerRecommendationAction;
+  ledgerGroup: string;
+  requiresUserConfirmation: boolean;
 };
 
 type PreviewResponse = {
@@ -123,22 +131,12 @@ type PreviewResponse = {
   candidates: BankAccount[];
   transactions: PreviewTransaction[];
   requiresManualExtraction: boolean;
-  extractionSource?: string | null;
   extractionError?: string | null;
   extractionDiagnostics?: {
     rawAiTransactionCount?: number;
     normalizedAiTransactionCount?: number;
-    rejectedAiTransactionCount?: number;
-    fallbackParser?: string | null;
   } | null;
-  processing?: boolean;
-  job?: {
-    id: string;
-    status: string;
-    progress: number;
-    stage: string | null;
-    error: string | null;
-  } | null;
+  ledgerRecommendationError?: string | null;
 };
 
 type TallyMaster = {
@@ -149,7 +147,6 @@ type TallyMaster = {
   bankName?: string | null;
   bankAccountNumber?: string | null;
   ifscCode?: string | null;
-  branchName?: string | null;
   accountHolderName?: string | null;
 };
 
@@ -160,18 +157,8 @@ type QueueTransaction = {
   referenceNumber: string | null;
   debitAmount: string | number | null;
   creditAmount: string | number | null;
-  category: string;
-  counterpartyName: string | null;
   suggestedLedgerName: string | null;
-  suggestionConfidence: number | null;
-  suggestionReason: string | null;
   confirmedLedgerName: string | null;
-  selectedLedgerName: string;
-  saveMapping: boolean;
-  needsLedgerConfirmation: boolean;
-  createLedgerName: string;
-  createLedgerParentName: string;
-  creatingLedger: boolean;
 };
 
 const EMPTY_ACCOUNT: DraftAccount = {
@@ -182,31 +169,41 @@ const EMPTY_ACCOUNT: DraftAccount = {
   tallyLedgerName: "",
 };
 
-function createEmptyTransaction(): DraftTransaction {
-  return {
-    id: crypto.randomUUID(),
-    transactionDate: new Date().toISOString().slice(0, 10),
-    valueDate: "",
-    description: "",
-    referenceNumber: "",
-    debitAmount: "",
-    creditAmount: "",
-    balanceAmount: "",
-    transactionType: "unknown",
-    category: "unknown",
-    counterpartyName: "",
-    suggestedLedgerName: "",
-    suggestionConfidence: null,
-    suggestionReason: "",
-    confirmedLedgerName: "",
-  };
+function normalizeName(value?: string | null) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
 }
 
-function normalizeDraftTransaction(transaction: PreviewTransaction): DraftTransaction {
+function findLedgerByNormalizedName(ledgerMasters: TallyMaster[], ledgerName?: string | null) {
+  const normalizedLedgerName = normalizeName(ledgerName);
+  if (!normalizedLedgerName) return null;
+
+  return (
+    ledgerMasters.find((ledger) => normalizeName(ledger.name) === normalizedLedgerName) ?? null
+  );
+}
+
+function readRecommendation(transaction: PreviewTransaction): LedgerRecommendation | null {
+  return transaction.rawPayload?.aiLedgerRecommendation ?? null;
+}
+
+function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMasters: TallyMaster[]): ReviewTransaction {
+  const recommendation = readRecommendation(transaction);
+  const suggestedLedgerName = transaction.suggestedLedgerName || "";
+  const action = recommendation?.action ?? "needs_review";
+  const recommendedLedgerName = recommendation?.ledgerName || suggestedLedgerName;
+  const matchedLedger = findLedgerByNormalizedName(ledgerMasters, recommendedLedgerName);
+  const selectedLedgerName =
+    transaction.confirmedLedgerName ||
+    matchedLedger?.name ||
+    (action === "create_new_ledger" || action === "use_suspense" ? recommendedLedgerName : "") ||
+    "";
+
   return {
     id: transaction.id || crypto.randomUUID(),
     transactionDate: transaction.transactionDate || "",
-    valueDate: transaction.valueDate || "",
+    valueDate: transaction.valueDate || transaction.transactionDate || "",
     description: transaction.description || "",
     referenceNumber: transaction.referenceNumber || "",
     debitAmount:
@@ -224,24 +221,18 @@ function normalizeDraftTransaction(transaction: PreviewTransaction): DraftTransa
     transactionType: transaction.transactionType || "unknown",
     category: transaction.category || "unknown",
     counterpartyName: transaction.counterpartyName || "",
-    suggestedLedgerName: transaction.suggestedLedgerName || "",
-    suggestionConfidence: transaction.suggestionConfidence ?? null,
-    suggestionReason: transaction.suggestionReason || "",
-    confirmedLedgerName: transaction.confirmedLedgerName || "",
+    suggestedLedgerName: recommendedLedgerName,
+    suggestionConfidence: recommendation?.confidence ?? transaction.suggestionConfidence ?? null,
+    suggestionReason: recommendation?.reason || transaction.suggestionReason || "",
+    selectedLedgerName,
+    ledgerAction: action,
+    ledgerGroup: recommendation?.ledgerGroup || "",
+    requiresUserConfirmation: recommendation?.requiresUserConfirmation ?? false,
   };
 }
 
-function transactionIsValid(transaction: DraftTransaction) {
+function transactionIsValid(transaction: ReviewTransaction) {
   return Boolean(transaction.transactionDate && transaction.description.trim());
-}
-
-function formatDate(value: string | null) {
-  if (!value) return "Never";
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  }).format(new Date(value));
 }
 
 function parseNumber(value: string) {
@@ -249,13 +240,6 @@ function parseNumber(value: string) {
   if (!trimmed) return null;
   const parsed = Number(trimmed.replace(/,/g, ""));
   return Number.isFinite(parsed) ? parsed : null;
-}
-
-function maskAccountNumber(value: string) {
-  const normalized = value.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
-  if (!normalized) return "";
-  if (normalized.length <= 4) return normalized;
-  return `${"*".repeat(Math.max(0, normalized.length - 4))}${normalized.slice(-4)}`;
 }
 
 function formatAmount(value: string | number | null | undefined) {
@@ -267,20 +251,11 @@ function formatAmount(value: string | number | null | undefined) {
   }).format(parsed);
 }
 
-function defaultLedgerParent(transaction: Pick<QueueTransaction, "description" | "category">) {
-  const text = `${transaction.category} ${transaction.description}`.toLowerCase();
-  if (/\binterest\b/.test(text)) return "Indirect Incomes";
-  if (/\bcharge|charges|fee\b/.test(text)) return "Indirect Expenses";
-  if (/\btax|gst|tds\b/.test(text)) return "Duties & Taxes";
-  return "Sundry Creditors";
-}
-
-function defaultCreateLedgerName(transaction: Pick<QueueTransaction, "suggestedLedgerName" | "counterpartyName" | "category">) {
-  if (transaction.suggestedLedgerName?.trim()) return transaction.suggestedLedgerName.trim();
-  if (transaction.counterpartyName?.trim()) return transaction.counterpartyName.trim();
-  if (transaction.category === "bank_charges") return "Bank Charges";
-  if (transaction.category === "receipt") return "Interest Income";
-  return "";
+function maskAccountNumber(value: string) {
+  const normalized = value.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+  if (!normalized) return "";
+  if (normalized.length <= 4) return normalized;
+  return `${"*".repeat(Math.max(0, normalized.length - 4))}${normalized.slice(-4)}`;
 }
 
 function isBankLedgerMaster(ledger: TallyMaster) {
@@ -289,6 +264,145 @@ function isBankLedgerMaster(ledger: TallyMaster) {
     /\bbank\b/.test(text) ||
     /\b(hdfc|icici|sbi|axis|kotak|idfc|indusind|canara|yes bank|federal|standard chartered|bank of baroda|bank of india)\b/.test(text)
   );
+}
+
+function getLedgerChoices(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
+  const names = new Set<string>();
+  const suggested = transaction.suggestedLedgerName.trim();
+  if (suggested) names.add(suggested);
+
+  const searchTerms = [
+    transaction.counterpartyName,
+    transaction.suggestedLedgerName,
+    transaction.category,
+  ].map(normalizeName).filter(Boolean);
+
+  for (const ledger of ledgerMasters) {
+    const normalizedLedger = normalizeName(ledger.name);
+    if (
+      searchTerms.some(
+        (term) =>
+          term.length >= 4 &&
+          (normalizedLedger.includes(term) || term.includes(normalizedLedger))
+      )
+    ) {
+      names.add(ledger.name);
+    }
+    if (names.size >= 4) break;
+  }
+
+  const suspense = ledgerMasters.find((ledger) => normalizeName(ledger.name) === "suspense");
+  if (suspense) names.add(suspense.name);
+
+  for (const ledger of ledgerMasters) {
+    names.add(ledger.name);
+  }
+
+  return Array.from(names).filter(Boolean);
+}
+
+function LedgerSearchSelect({
+  value,
+  options,
+  placeholder,
+  onChange,
+}: {
+  value: string;
+  options: string[];
+  placeholder: string;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const uniqueOptions = useMemo(() => Array.from(new Set(options.filter(Boolean))), [options]);
+  const filteredOptions = useMemo(() => {
+    const normalizedQuery = normalizeName(query);
+    const matches = normalizedQuery
+      ? uniqueOptions.filter((option) => normalizeName(option).includes(normalizedQuery))
+      : uniqueOptions;
+
+    return matches.slice(0, 60);
+  }, [query, uniqueOptions]);
+
+  return (
+    <div className="relative">
+      <div className="relative">
+        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9a8d7f]" />
+        <input
+          className="h-10 w-full rounded-md border border-[#d8cbbb] bg-white px-3 pl-9 text-sm font-medium text-[#2b241d] outline-none transition placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
+          onBlur={() => window.setTimeout(() => setOpen(false), 120)}
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setOpen(true);
+          }}
+          onFocus={() => setOpen(true)}
+          placeholder={placeholder}
+          value={open ? query : value}
+        />
+      </div>
+
+      {open ? (
+        <div className="absolute z-30 mt-2 max-h-72 w-full overflow-auto rounded-xl border border-[#d8cbbb] bg-white p-1 shadow-xl">
+          {filteredOptions.length > 0 ? (
+            filteredOptions.map((option) => (
+              <button
+                className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold transition hover:bg-[#fbf4ea] ${
+                  option === value ? "bg-[#f6efe6] text-[#4b3828]" : "text-[#2b241d]"
+                }`}
+                key={option}
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  onChange(option);
+                  setQuery("");
+                  setOpen(false);
+                }}
+                type="button"
+              >
+                <span className="truncate">{option}</span>
+                {option === value ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" /> : null}
+              </button>
+            ))
+          ) : (
+            <div className="px-3 py-4 text-sm font-semibold text-[#8a7f72]">
+              No matching ledger found.
+            </div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function getLedgerActionLabel(transaction: ReviewTransaction) {
+  if (transaction.ledgerAction === "create_new_ledger") return "Create new";
+  if (transaction.ledgerAction === "use_suspense") return "Suspense";
+  if (transaction.ledgerAction === "use_standard_ledger") return "Standard";
+  if (transaction.ledgerAction === "use_existing_ledger") return "Matched";
+  return transaction.selectedLedgerName ? "Selected" : "Needs review";
+}
+
+function getLedgerActionTone(transaction: ReviewTransaction) {
+  if (!transaction.selectedLedgerName.trim()) return "warning";
+  if (transaction.ledgerAction === "create_new_ledger" || transaction.ledgerAction === "use_suspense") {
+    return "warning";
+  }
+  return "success";
+}
+
+function transactionQueueKey(transaction: {
+  transactionDate: string;
+  description: string;
+  referenceNumber?: string | null;
+  debitAmount?: string | number | null;
+  creditAmount?: string | number | null;
+}) {
+  return [
+    transaction.transactionDate,
+    transaction.referenceNumber || "",
+    transaction.description,
+    String(transaction.debitAmount ?? ""),
+    String(transaction.creditAmount ?? ""),
+  ].join("|");
 }
 
 async function readError(response: Response) {
@@ -309,27 +423,22 @@ function wait(ms: number) {
 export function BankStatementsPage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [file, setFile] = useState<File | null>(null);
+  const [dragActive, setDragActive] = useState(false);
   const [account, setAccount] = useState<DraftAccount>(EMPTY_ACCOUNT);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [recentImports, setRecentImports] = useState<BankStatementImport[]>([]);
   const [accounts, setAccounts] = useState<BankAccount[]>([]);
   const [connections, setConnections] = useState<TallyConnection[]>([]);
-  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
+  const [selectedAccountId, setSelectedAccountId] = useState<string>("");
   const [tallyConnectionId, setTallyConnectionId] = useState("");
-  const [tallyAccountId, setTallyAccountId] = useState("");
   const [bankLedgerName, setBankLedgerName] = useState("");
   const [ledgerMasters, setLedgerMasters] = useState<TallyMaster[]>([]);
-  const [queueTransactions, setQueueTransactions] = useState<QueueTransaction[]>([]);
-  const [transactions, setTransactions] = useState<DraftTransaction[]>([createEmptyTransaction()]);
+  const [transactions, setTransactions] = useState<ReviewTransaction[]>([]);
+  const [editingLedgerIds, setEditingLedgerIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
-  const [confirming, setConfirming] = useState(false);
-  const [queueing, setQueueing] = useState(false);
+  const [sending, setSending] = useState(false);
   const [syncingMasters, setSyncingMasters] = useState(false);
-  const [loadingQueueRows, setLoadingQueueRows] = useState(false);
-  const [queueRowsRefreshKey, setQueueRowsRefreshKey] = useState(0);
-  const [banner, setBanner] = useState<{ tone: "success" | "error" | "info"; text: string } | null>(
-    null
-  );
+  const [banner, setBanner] = useState<{ tone: "success" | "error" | "info"; text: string } | null>(null);
 
   const validTransactions = useMemo(
     () => transactions.filter(transactionIsValid),
@@ -339,74 +448,29 @@ export function BankStatementsPage() {
     () => preview?.candidates.find((candidate) => candidate.id === selectedAccountId) ?? null,
     [preview?.candidates, selectedAccountId]
   );
+  const selectedConnection = useMemo(
+    () => connections.find((connection) => connection.id === tallyConnectionId) ?? null,
+    [connections, tallyConnectionId]
+  );
   const bankLedgerOptions = useMemo(() => {
     const bankLedgers = ledgerMasters.filter(isBankLedgerMaster);
     return bankLedgers.length > 0 ? bankLedgers : ledgerMasters;
   }, [ledgerMasters]);
-  const unresolvedQueueRows = useMemo(
-    () => queueTransactions.filter((transaction) => !(transaction.selectedLedgerName || "").trim()).length,
-    [queueTransactions]
+  const missingLedgerCount = useMemo(
+    () => transactions.filter((transaction) => !transaction.selectedLedgerName.trim()).length,
+    [transactions]
   );
-  function ledgerExists(name?: string | null) {
-    if (!name) return false;
-    return ledgerMasters.some((ledger) => ledger.name === name);
-  }
-
-  function applyTallyBankLedgerSelection(ledgerName: string) {
-    const ledger = ledgerMasters.find((item) => item.name === ledgerName);
-    const mappedAccount = accounts.find((item) => item.tallyLedgerName === ledgerName);
-    const ledgerAccountNumber =
-      mappedAccount?.accountNumber?.trim() || ledger?.bankAccountNumber?.trim() || "";
-
-    setAccount((current) => ({
-      ...current,
-      tallyLedgerName: ledgerName,
-      bankName: mappedAccount?.bankName || ledger?.bankName || ledger?.name || current.bankName,
-      accountNumber: ledgerAccountNumber || current.accountNumber,
-      accountHolderName:
-        mappedAccount?.accountHolderName ||
-        ledger?.accountHolderName ||
-        ledger?.name ||
-        current.accountHolderName,
-      ifscCode: mappedAccount?.ifscCode || ledger?.ifscCode || current.ifscCode,
-    }));
-    setBankLedgerName(ledgerName);
-    if (ledgerName && !ledgerAccountNumber) {
-      setBanner({
-        tone: "info",
-        text:
-          "Selected Tally ledger has no synced account number yet. Update the Windows bridge, run Sync again, or add the account number manually.",
-      });
-    }
-  }
-
-  const applyPreviewPayload = useCallback((payload: PreviewResponse, fallbackAccount = account) => {
-    const singleCandidate = payload.candidates.length === 1 ? payload.candidates[0] : null;
-    const nextTallyLedgerName =
-      singleCandidate?.tallyLedgerName ||
-      payload.account.tallyLedgerName ||
-      fallbackAccount.tallyLedgerName;
-
-    setPreview(payload);
-    setAccount({
-      bankName: payload.account.bankName ?? fallbackAccount.bankName,
-      accountNumber: payload.account.accountNumber ?? fallbackAccount.accountNumber,
-      accountHolderName: payload.account.accountHolderName ?? fallbackAccount.accountHolderName,
-      ifscCode: payload.account.ifscCode ?? fallbackAccount.ifscCode,
-      tallyLedgerName: nextTallyLedgerName,
-    });
-    if (nextTallyLedgerName) {
-      setBankLedgerName(nextTallyLedgerName);
-    }
-    setSelectedAccountId(singleCandidate ? singleCandidate.id : null);
-    setTallyAccountId("");
-    setQueueTransactions([]);
-    setTransactions(
-      payload.transactions.length
-        ? payload.transactions.map(normalizeDraftTransaction)
-        : [createEmptyTransaction()]
-    );
-  }, [account]);
+  const matchedLedgerCount = transactions.filter(
+    (transaction) =>
+      transaction.selectedLedgerName.trim() &&
+      (transaction.ledgerAction === "use_existing_ledger" || transaction.ledgerAction === "use_standard_ledger")
+  ).length;
+  const createLedgerCount = transactions.filter(
+    (transaction) => transaction.ledgerAction === "create_new_ledger"
+  ).length;
+  const accountMatchLabel = selectedAccount
+    ? `${selectedAccount.accountHolderName || "Saved account"} · ${selectedAccount.accountNumberMasked}`
+    : `${account.accountHolderName || "New account"}${account.accountNumber ? ` · ${maskAccountNumber(account.accountNumber)}` : ""}`;
 
   const loadLedgerMasters = useCallback(async (connectionId: string) => {
     if (!connectionId) {
@@ -415,7 +479,7 @@ export function BankStatementsPage() {
     }
 
     const response = await apiFetch(
-      `/api/tally/connections/${connectionId}/masters?type=ledger&limit=500`,
+      `/api/tally/connections/${connectionId}/masters?type=ledger&limit=800`,
       { cache: "no-store" }
     );
     if (!response.ok) {
@@ -449,9 +513,10 @@ export function BankStatementsPage() {
     let cancelled = false;
 
     async function loadSummary() {
-      const [importsResponse, accountsResponse] = await Promise.all([
+      const [importsResponse, accountsResponse, connectionsResponse] = await Promise.all([
         apiFetch("/api/bank-statements/imports", { cache: "no-store" }),
         apiFetch("/api/bank-statements/accounts", { cache: "no-store" }),
+        apiFetch("/api/tally/connections", { cache: "no-store" }),
       ]);
 
       if (cancelled) return;
@@ -464,9 +529,7 @@ export function BankStatementsPage() {
         const payload = (await accountsResponse.json()) as { accounts?: BankAccount[] };
         setAccounts(payload.accounts ?? []);
       }
-
-      const connectionsResponse = await apiFetch("/api/tally/connections", { cache: "no-store" });
-      if (!cancelled && connectionsResponse.ok) {
+      if (connectionsResponse.ok) {
         const payload = (await connectionsResponse.json()) as { connections?: TallyConnection[] };
         const loadedConnections = payload.connections ?? [];
         setConnections(loadedConnections);
@@ -476,7 +539,7 @@ export function BankStatementsPage() {
 
     loadSummary().catch(() => {
       if (!cancelled) {
-        setBanner({ tone: "error", text: "Could not load bank statement summary." });
+        setBanner({ tone: "error", text: "Could not load bank statement details." });
       }
     });
 
@@ -488,11 +551,7 @@ export function BankStatementsPage() {
   useEffect(() => {
     let cancelled = false;
 
-    async function loadLedgers() {
-      await loadLedgerMasters(tallyConnectionId);
-    }
-
-    loadLedgers().catch(() => {
+    loadLedgerMasters(tallyConnectionId).catch(() => {
       if (!cancelled) setLedgerMasters([]);
     });
 
@@ -502,131 +561,85 @@ export function BankStatementsPage() {
   }, [loadLedgerMasters, tallyConnectionId]);
 
   useEffect(() => {
-    let cancelled = false;
+    if (ledgerMasters.length === 0) return;
 
-    async function loadQueueRows() {
-      if (!tallyAccountId) {
-        setQueueTransactions([]);
-        return;
-      }
-
-      setLoadingQueueRows(true);
-      const params = new URLSearchParams({
-        accountId: tallyAccountId,
-        status: "queueable",
-      });
-      if (tallyConnectionId) params.set("connectionId", tallyConnectionId);
-
-      const response = await apiFetch(`/api/bank-statements/transactions?${params.toString()}`, {
-        cache: "no-store",
-      });
-      if (cancelled) return;
-
-      if (!response.ok) {
-        setQueueTransactions([]);
-        setBanner({ tone: "error", text: `Could not load pending ledger matches. ${await readError(response)}` });
-        return;
-      }
-
-      const payload = (await response.json()) as { transactions?: QueueTransaction[] };
-      setQueueTransactions(
-        (payload.transactions ?? []).map((transaction) => ({
-          ...transaction,
-          selectedLedgerName: transaction.confirmedLedgerName || transaction.suggestedLedgerName || "",
-          saveMapping: true,
-          createLedgerName:
-            transaction.suggestedLedgerName ||
-            transaction.counterpartyName ||
-            (transaction.category === "bank_charges" ? "Bank Charges" : ""),
-          createLedgerParentName: defaultLedgerParent(transaction),
-          creatingLedger: false,
-        }))
-      );
-    }
-
-    loadQueueRows()
-      .catch((error) => {
-        if (!cancelled) {
-          setQueueTransactions([]);
-          setBanner({
-            tone: "error",
-            text:
-              error instanceof Error
-                ? `Could not load pending ledger matches. ${error.message}`
-                : "Could not load pending ledger matches.",
-          });
+    setTransactions((current) =>
+      current.map((transaction) => {
+        if (transaction.selectedLedgerName.trim() || !transaction.suggestedLedgerName.trim()) {
+          return transaction;
         }
+
+        const matchedLedger = findLedgerByNormalizedName(ledgerMasters, transaction.suggestedLedgerName);
+        return matchedLedger ? { ...transaction, selectedLedgerName: matchedLedger.name } : transaction;
       })
-      .finally(() => {
-        if (!cancelled) setLoadingQueueRows(false);
-      });
+    );
+  }, [ledgerMasters]);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [tallyAccountId, tallyConnectionId, queueRowsRefreshKey]);
+  function updateTransaction(id: string, field: keyof ReviewTransaction, value: string) {
+    setTransactions((current) =>
+      current.map((transaction) =>
+        transaction.id === id
+          ? {
+              ...transaction,
+              [field]: value,
+              ...(field === "selectedLedgerName"
+                ? {
+                    ledgerAction:
+                      normalizeName(value) === "suspense" ? "use_suspense" : "use_existing_ledger",
+                    ledgerGroup: "",
+                    requiresUserConfirmation: false,
+                  }
+                : {}),
+            }
+          : transaction
+      )
+    );
+  }
 
-  useEffect(() => {
-    if (!preview?.processing || !preview.import.id) return;
+  function applyTallyBankLedgerSelection(ledgerName: string) {
+    const ledger = ledgerMasters.find((item) => item.name === ledgerName);
+    const mappedAccount = accounts.find((item) => item.tallyLedgerName === ledgerName);
+    const ledgerAccountNumber =
+      mappedAccount?.accountNumber?.trim() || ledger?.bankAccountNumber?.trim() || "";
 
-    const importId = preview.import.id;
-    let cancelled = false;
-    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    setAccount((current) => ({
+      ...current,
+      tallyLedgerName: ledgerName,
+      bankName: mappedAccount?.bankName || ledger?.bankName || ledger?.name || current.bankName,
+      accountNumber: ledgerAccountNumber || current.accountNumber,
+      accountHolderName:
+        mappedAccount?.accountHolderName ||
+        ledger?.accountHolderName ||
+        ledger?.name ||
+        current.accountHolderName,
+      ifscCode: mappedAccount?.ifscCode || ledger?.ifscCode || current.ifscCode,
+    }));
+    setBankLedgerName(ledgerName);
+  }
 
-    async function pollImport() {
-      try {
-        const response = await apiFetch(`/api/bank-statements/imports/${importId}`, {
-          cache: "no-store",
-        });
-        if (cancelled) return;
-        if (!response.ok) {
-          setBanner({ tone: "error", text: `Could not refresh bank statement extraction. ${await readError(response)}` });
-          return;
-        }
+  function applyPreviewPayload(payload: PreviewResponse, fallbackAccount = account) {
+    const singleCandidate = payload.candidates.length === 1 ? payload.candidates[0] : null;
+    const nextTallyLedgerName =
+      singleCandidate?.tallyLedgerName ||
+      payload.account.tallyLedgerName ||
+      fallbackAccount.tallyLedgerName;
 
-        const payload = (await response.json()) as PreviewResponse;
-        applyPreviewPayload(payload);
+    setPreview(payload);
+    setAccount({
+      bankName: payload.account.bankName ?? fallbackAccount.bankName,
+      accountNumber: payload.account.accountNumber ?? fallbackAccount.accountNumber,
+      accountHolderName: payload.account.accountHolderName ?? fallbackAccount.accountHolderName,
+      ifscCode: payload.account.ifscCode ?? fallbackAccount.ifscCode,
+      tallyLedgerName: nextTallyLedgerName,
+    });
+    setSelectedAccountId(singleCandidate?.id || "");
+    setBankLedgerName(nextTallyLedgerName || "");
+    setTransactions(payload.transactions.map((transaction) => normalizeReviewTransaction(transaction, ledgerMasters)));
+    setEditingLedgerIds(new Set());
+  }
 
-        if (payload.processing) {
-          setBanner({
-            tone: "info",
-            text: payload.job?.stage
-              ? `AI extraction in progress: ${payload.job.stage}`
-              : "AI extraction in progress.",
-          });
-          timeoutId = setTimeout(pollImport, 2500);
-          return;
-        }
-
-        setBanner({
-          tone: payload.requiresManualExtraction ? "info" : "success",
-          text: payload.requiresManualExtraction
-            ? payload.job?.error || "AI extraction finished without usable rows. Add or verify rows manually."
-            : "Statement extracted. Review the account and transactions.",
-        });
-      } catch (error) {
-        if (!cancelled) {
-          setBanner({
-            tone: "error",
-            text:
-              error instanceof Error
-                ? `Could not refresh bank statement extraction. ${error.message}`
-                : "Could not refresh bank statement extraction.",
-          });
-        }
-      }
-    }
-
-    timeoutId = setTimeout(pollImport, 1500);
-
-    return () => {
-      cancelled = true;
-      if (timeoutId) clearTimeout(timeoutId);
-    };
-  }, [applyPreviewPayload, preview?.processing, preview?.import.id]);
-
-  async function handlePreview() {
-    if (!file) {
+  async function analyzeFile(nextFile = file) {
+    if (!nextFile) {
       setBanner({ tone: "error", text: "Select a bank statement file." });
       return;
     }
@@ -634,9 +647,13 @@ export function BankStatementsPage() {
     try {
       setLoading(true);
       setBanner(null);
+      setFile(nextFile);
       const formData = new FormData();
-      formData.set("file", file);
+      formData.set("file", nextFile);
       formData.set("account", JSON.stringify(account));
+      if (tallyConnectionId) {
+        formData.set("connectionId", tallyConnectionId);
+      }
 
       const response = await apiFetch("/api/bank-statements/imports", {
         method: "POST",
@@ -649,41 +666,28 @@ export function BankStatementsPage() {
 
       const payload = (await response.json()) as PreviewResponse;
       applyPreviewPayload(payload);
+
       const extractionIssue = payload.extractionError
         ? payload.extractionError
         : payload.extractionDiagnostics?.rawAiTransactionCount
           ? `AI found ${payload.extractionDiagnostics.rawAiTransactionCount} row(s), but ${payload.extractionDiagnostics.normalizedAiTransactionCount ?? 0} passed validation.`
           : "No transaction rows were extracted.";
       setBanner({
-        tone: payload.processing || payload.requiresManualExtraction ? "info" : "success",
-        text: payload.processing
-          ? "AI extraction queued. The review panel will update when it is ready."
-          : payload.requiresManualExtraction
-          ? `File stored. ${extractionIssue} Add or verify transaction rows before confirming.`
-          : "Statement extracted. Review the account and transactions.",
+        tone: payload.requiresManualExtraction || payload.ledgerRecommendationError ? "info" : "success",
+        text: payload.requiresManualExtraction
+          ? `File stored. ${extractionIssue} Please verify rows before sending.`
+          : payload.ledgerRecommendationError
+            ? `Statement analyzed, but ledger recommendations need review: ${payload.ledgerRecommendationError}`
+            : "Statement analyzed. Review the rows, then send to Tally.",
       });
     } catch (error) {
       setBanner({
         tone: "error",
-        text: error instanceof Error ? error.message : "Bank statement preview failed.",
+        text: error instanceof Error ? error.message : "Bank statement analysis failed.",
       });
     } finally {
       setLoading(false);
     }
-  }
-
-  function updateTransaction(id: string, field: keyof DraftTransaction, value: string) {
-    setTransactions((current) =>
-      current.map((transaction) =>
-        transaction.id === id ? { ...transaction, [field]: value } : transaction
-      )
-    );
-  }
-
-  function removeTransaction(id: string) {
-    setTransactions((current) =>
-      current.length <= 1 ? [createEmptyTransaction()] : current.filter((item) => item.id !== id)
-    );
   }
 
   async function handleSyncLedgerMasters() {
@@ -719,13 +723,13 @@ export function BankStatementsPage() {
       }
       setBanner({
         tone: "info",
-        text: "Tally ledger sync is running. Keep the bridge open while ledgers are refreshed.",
+        text: "Tally ledger sync is running. Keep the connector open.",
       });
       const completedCommand = await waitForCommand(connection.id, command.id);
       if (!completedCommand) {
         setBanner({
           tone: "info",
-          text: "Tally ledger sync is still pending. Keep the bridge running and try the dropdown again shortly.",
+          text: "Tally ledger sync is still pending. Keep the connector running and try again shortly.",
         });
         return;
       }
@@ -733,47 +737,49 @@ export function BankStatementsPage() {
         throw new Error(completedCommand.error || `Tally ledger sync ${completedCommand.status}.`);
       }
 
-      await loadLedgerMasters(connection.id).catch(() => undefined);
-      const totals = completedCommand.result?.totals;
-      const syncedLedgers =
-        totals && typeof totals === "object" && "ledger" in totals
-          ? Number((totals as Record<string, unknown>).ledger ?? 0)
-          : ledgerMasters.length;
-      setBanner({
-        tone: "success",
-        text: `Tally ledger sync completed. ${Number.isFinite(syncedLedgers) ? syncedLedgers : 0} ledger(s) synced.`,
-      });
+      await loadLedgerMasters(connection.id);
+      setBanner({ tone: "success", text: "Tally ledgers refreshed." });
     } catch (error) {
       setBanner({
         tone: "error",
-        text: error instanceof Error ? error.message : "Could not queue Tally ledger sync.",
+        text: error instanceof Error ? error.message : "Could not sync Tally ledgers.",
       });
     } finally {
       setSyncingMasters(false);
     }
   }
 
-  async function handleConfirm() {
+  async function sendToTally() {
     if (!preview) return;
-    if (preview.candidates.length > 1 && !selectedAccountId) {
-      setBanner({ tone: "error", text: "Select the matching account before confirming." });
+    if (!tallyConnectionId) {
+      setBanner({ tone: "error", text: "Select a Tally connection." });
+      return;
+    }
+    if (!bankLedgerName.trim()) {
+      setBanner({ tone: "error", text: "Select the Tally bank ledger." });
       return;
     }
     if (validTransactions.length === 0) {
-      setBanner({ tone: "error", text: "Add at least one valid transaction." });
+      setBanner({ tone: "error", text: "No valid rows are available to send." });
+      return;
+    }
+    if (missingLedgerCount > 0) {
+      setBanner({ tone: "error", text: "Select a ledger for every row before sending to Tally." });
       return;
     }
 
     try {
-      setConfirming(true);
+      setSending(true);
       setBanner(null);
-
-      const response = await apiFetch(`/api/bank-statements/imports/${preview.import.id}/confirm`, {
+      const confirmResponse = await apiFetch(`/api/bank-statements/imports/${preview.import.id}/confirm`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          accountId: selectedAccountId,
-          account,
+          accountId: selectedAccountId || null,
+          account: {
+            ...account,
+            tallyLedgerName: bankLedgerName,
+          },
           transactions: validTransactions.map((transaction) => ({
             transactionDate: transaction.transactionDate,
             valueDate: transaction.valueDate || transaction.transactionDate,
@@ -788,144 +794,108 @@ export function BankStatementsPage() {
             suggestedLedgerName: transaction.suggestedLedgerName || null,
             suggestionConfidence: transaction.suggestionConfidence,
             suggestionReason: transaction.suggestionReason || null,
-            confirmedLedgerName: transaction.confirmedLedgerName || null,
+            confirmedLedgerName: transaction.selectedLedgerName || null,
           })),
         }),
       });
 
-      if (!response.ok) {
-        throw new Error(await readError(response));
+      if (!confirmResponse.ok) {
+        throw new Error(await readError(confirmResponse));
       }
 
-      const payload = (await response.json()) as {
+      const confirmPayload = (await confirmResponse.json()) as {
         account: BankAccount;
         import: BankStatementImport;
         importedTransactionCount: number;
         duplicateTransactionCount: number;
       };
 
-      setAccounts((current) => {
-        const remaining = current.filter((item) => item.id !== payload.account.id);
-        return [payload.account, ...remaining];
-      });
-      setRecentImports((current) => [payload.import, ...current.filter((item) => item.id !== payload.import.id)]);
-      setTallyAccountId(payload.account.id);
-      setBankLedgerName(payload.account.tallyLedgerName || "");
-      setQueueTransactions([]);
-      setQueueRowsRefreshKey((current) => current + 1);
-      setPreview(null);
-      setSelectedAccountId(null);
-      setTransactions([createEmptyTransaction()]);
-      setFile(null);
-      setBanner({
-        tone: "success",
-        text: `${payload.importedTransactionCount} transactions imported, ${payload.duplicateTransactionCount} duplicates skipped.`,
-      });
-    } catch (error) {
-      setBanner({
-        tone: "error",
-        text: error instanceof Error ? error.message : "Could not confirm bank statement.",
-      });
-    } finally {
-      setConfirming(false);
-    }
-  }
+      const transactionsResponse = await apiFetch(
+        `/api/bank-statements/transactions?${new URLSearchParams({
+          accountId: confirmPayload.account.id,
+          status: "queueable",
+          connectionId: tallyConnectionId,
+        }).toString()}`,
+        { cache: "no-store" }
+      );
+      if (!transactionsResponse.ok) {
+        throw new Error(await readError(transactionsResponse));
+      }
 
-  async function handleQueueTally() {
-    if (preview) {
-      setBanner({ tone: "error", text: "Confirm the bank statement import before queueing vouchers to Tally." });
-      return;
-    }
-    if (!tallyConnectionId || !tallyAccountId) {
-      setBanner({ tone: "error", text: "Select a Tally connection and bank account." });
-      return;
-    }
-    if (!bankLedgerName.trim()) {
-      setBanner({ tone: "error", text: "Select the Tally bank ledger." });
-      return;
-    }
-    if (queueTransactions.length === 0) {
-      setBanner({ tone: "error", text: "No pending or failed transactions are available for this account." });
-      return;
-    }
-    const ambiguousRows = queueTransactions.filter((transaction) => {
-      if (transaction.selectedLedgerName.trim()) return false;
-      const createLedgerName = (transaction.createLedgerName || defaultCreateLedgerName(transaction)).trim();
-      return !createLedgerName;
-    });
-    if (ambiguousRows.length > 0) {
-      setBanner({ tone: "error", text: "Select a counterparty ledger for every queued transaction." });
-      return;
-    }
+      const queuePayload = (await transactionsResponse.json()) as { transactions?: QueueTransaction[] };
+      const queueRows = queuePayload.transactions ?? [];
+      const reviewedTransactionsByKey = new Map(
+        validTransactions.map((transaction) => [transactionQueueKey(transaction), transaction])
+      );
+      if (queueRows.length === 0) {
+        setAccounts((current) => [confirmPayload.account, ...current.filter((item) => item.id !== confirmPayload.account.id)]);
+        setRecentImports((current) => [confirmPayload.import, ...current.filter((item) => item.id !== confirmPayload.import.id)]);
+        setPreview(null);
+        setTransactions([]);
+        setFile(null);
+        setBanner({
+          tone: "success",
+          text: `${confirmPayload.importedTransactionCount} transactions imported. No new rows needed Tally posting.`,
+        });
+        return;
+      }
 
-    try {
-      setQueueing(true);
-      setBanner(null);
-      const response = await apiFetch("/api/bank-statements/tally/queue", {
+      const queueResponse = await apiFetch("/api/bank-statements/tally/queue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           connectionId: tallyConnectionId,
-          accountId: tallyAccountId,
-          transactionIds: queueTransactions.map((transaction) => transaction.id),
+          accountId: confirmPayload.account.id,
+          transactionIds: queueRows.map((transaction) => transaction.id),
           bankLedgerName,
-          transactions: queueTransactions.map((transaction) => ({
+          transactions: queueRows.map((transaction) => ({
             transactionId: transaction.id,
-            counterpartyLedgerName: transaction.selectedLedgerName,
-            createLedgerName:
-              transaction.selectedLedgerName.trim()
-                ? ""
-                : (transaction.createLedgerName || defaultCreateLedgerName(transaction)).trim(),
-            createLedgerParentName:
-              transaction.selectedLedgerName.trim()
-                ? ""
-                : (transaction.createLedgerParentName || defaultLedgerParent(transaction)).trim(),
-            saveMapping: transaction.saveMapping,
+            ...(() => {
+              const reviewedTransaction = reviewedTransactionsByKey.get(transactionQueueKey(transaction));
+              if (reviewedTransaction?.ledgerAction === "create_new_ledger") {
+                return {
+                  counterpartyLedgerName: "",
+                  createLedgerName: reviewedTransaction.selectedLedgerName,
+                  createLedgerParentName: reviewedTransaction.ledgerGroup || "Sundry Creditors",
+                };
+              }
+              return {
+                counterpartyLedgerName:
+                  reviewedTransaction?.selectedLedgerName ||
+                  transaction.confirmedLedgerName ||
+                  transaction.suggestedLedgerName ||
+                  "Suspense",
+                createLedgerName: "",
+                createLedgerParentName: "",
+              };
+            })(),
+            saveMapping: true,
           })),
         }),
       });
 
-      if (!response.ok) {
-        throw new Error(await readError(response));
+      if (!queueResponse.ok) {
+        throw new Error(await readError(queueResponse));
       }
 
-      const payload = (await response.json()) as {
-        queuedCount?: number;
-        ledgerCreateQueuedCount?: number;
-        ledgerCreateAlreadyQueuedCount?: number;
-        needsLedgerSyncBeforeVouchers?: boolean;
-        message?: string;
-      };
-      if (payload.needsLedgerSyncBeforeVouchers) {
-        const createCount = payload.ledgerCreateQueuedCount ?? 0;
-        const alreadyQueuedCount = payload.ledgerCreateAlreadyQueuedCount ?? 0;
-        setBanner({
-          tone: "info",
-          text:
-            payload.message ||
-            `${createCount + alreadyQueuedCount} missing ledger(s) queued for creation. Keep the bridge running, sync ledgers, then queue vouchers again.`,
-        });
-        setQueueTransactions((current) =>
-          current.map((transaction) => {
-            if (transaction.selectedLedgerName.trim()) return transaction;
-            const createLedgerName = (transaction.createLedgerName || defaultCreateLedgerName(transaction)).trim();
-            return createLedgerName ? { ...transaction, selectedLedgerName: createLedgerName } : transaction;
-          })
-        );
-        return;
-      }
+      const queuedPayload = (await queueResponse.json()) as { queuedCount?: number };
+      setAccounts((current) => [confirmPayload.account, ...current.filter((item) => item.id !== confirmPayload.account.id)]);
+      setRecentImports((current) => [confirmPayload.import, ...current.filter((item) => item.id !== confirmPayload.import.id)]);
+      setPreview(null);
+      setTransactions([]);
+      setFile(null);
+      setSelectedAccountId("");
       setBanner({
         tone: "success",
-        text: `${payload.queuedCount ?? 0} bank voucher commands queued for the Tally bridge.`,
+        text: `${confirmPayload.importedTransactionCount} transactions imported. ${queuedPayload.queuedCount ?? 0} voucher(s) queued for Tally.`,
       });
-      setQueueTransactions([]);
     } catch (error) {
       setBanner({
         tone: "error",
-        text: error instanceof Error ? error.message : "Could not queue Tally vouchers.",
+        text: error instanceof Error ? error.message : "Could not send bank statement to Tally.",
       });
     } finally {
-      setQueueing(false);
+      setSending(false);
     }
   }
 
@@ -942,7 +912,7 @@ export function BankStatementsPage() {
                 Bank Statements
               </h1>
               <p className="mt-1 max-w-2xl text-sm font-medium text-[#7c6f62]">
-                Import account transactions, resolve account matches, and queue confirmed rows for Tally posting.
+                Upload a statement, check the rows, and send them to Tally.
               </p>
             </div>
             <div className="grid grid-cols-2 gap-3 sm:flex">
@@ -980,20 +950,8 @@ export function BankStatementsPage() {
             </div>
           )}
 
-          <section className="grid gap-6 xl:grid-cols-[420px_1fr]">
-            <div className="rounded-2xl border border-[#e3d6c6] bg-white p-5 shadow-sm">
-              <div className="mb-5 flex items-center justify-between">
-                <div>
-                  <h2 className="text-sm font-black uppercase tracking-[0.16em] text-[#6f6256]">
-                    Upload
-                  </h2>
-                  <p className="mt-1 text-xs font-medium text-[#9a8d7f]">
-                    CSV/text parses rows automatically. PDF/image files are stored for review.
-                  </p>
-                </div>
-                <FileUp className="h-5 w-5 text-[#8a7f72]" />
-              </div>
-
+          {!preview ? (
+            <section className="rounded-2xl border border-[#e3d6c6] bg-white p-5 shadow-sm">
               <input
                 ref={fileInputRef}
                 type="file"
@@ -1002,719 +960,397 @@ export function BankStatementsPage() {
                 onClick={(event) => {
                   event.currentTarget.value = "";
                 }}
-                onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+                onChange={(event) => {
+                  const nextFile = event.target.files?.[0] ?? null;
+                  if (nextFile) void analyzeFile(nextFile);
+                }}
               />
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
-                className="flex min-h-32 w-full cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-[#d6c8b8] bg-[#fdfaf6] px-4 py-6 text-center transition hover:border-[#9c7a52] hover:bg-[#fbf4ea]"
+                onDragEnter={(event) => {
+                  event.preventDefault();
+                  setDragActive(true);
+                }}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  setDragActive(true);
+                }}
+                onDragLeave={(event) => {
+                  event.preventDefault();
+                  setDragActive(false);
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  setDragActive(false);
+                  const nextFile = event.dataTransfer.files?.[0] ?? null;
+                  if (nextFile) void analyzeFile(nextFile);
+                }}
+                className={`flex min-h-[420px] w-full flex-col items-center justify-center rounded-2xl border border-dashed px-6 py-10 text-center transition ${
+                  dragActive
+                    ? "border-[#7c5f3f] bg-[#fbf4ea]"
+                    : "border-[#d6c8b8] bg-[#fdfaf6] hover:border-[#9c7a52] hover:bg-[#fbf4ea]"
+                }`}
               >
-                <Banknote className="mb-2 h-7 w-7 text-[#7c5f3f]" />
-                <span className="text-sm font-bold text-[#2b241d]">
-                  {file ? file.name : "Select statement file"}
-                </span>
-                <span className="mt-1 text-xs font-medium text-[#8a7f72]">
-                  PDF, image, CSV, or text
-                </span>
+                <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-[#4b3828] text-white shadow-sm">
+                  {loading ? <Loader2 className="h-7 w-7 animate-spin" /> : <UploadCloud className="h-7 w-7" />}
+                </div>
+                <div className="text-xl font-black text-[#2b241d]">
+                  {loading ? "Analyzing statement..." : "Drop bank statement here"}
+                </div>
+                <div className="mt-2 max-w-md text-sm font-medium leading-6 text-[#8a7f72]">
+                  Click to upload or drag a PDF, image, CSV, or text file.
+                </div>
+                {file ? (
+                  <div className="mt-5 rounded-full border border-[#e3d6c6] bg-white px-4 py-2 text-sm font-bold text-[#6f4e2f]">
+                    {file.name}
+                  </div>
+                ) : null}
               </button>
-
-              <div className="mt-5 space-y-3">
-                <label className="block space-y-1.5">
-                  <span className="flex items-center justify-between gap-3">
-                    <span className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
-                      Tally bank ledger
-                    </span>
-                    <button
-                      type="button"
-                      onClick={handleSyncLedgerMasters}
-                      disabled={!tallyConnectionId || syncingMasters}
-                      className="inline-flex h-7 items-center gap-1 rounded-md border border-[#d8cbbb] bg-white px-2 text-[11px] font-bold text-[#6f4e2f] hover:bg-[#fbf7f1] disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {syncingMasters ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            </section>
+          ) : (
+            <section className="space-y-4">
+              <div className="rounded-2xl border border-[#e3d6c6] bg-white p-5 shadow-sm">
+                <div className="grid gap-3 lg:grid-cols-3">
+                  <div className="rounded-xl border border-[#eee5da] bg-[#fdfaf6] p-4">
+                    <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
+                      Tally
+                    </div>
+                    <div className="mt-2 flex items-center gap-2">
+                      {selectedConnection?.status === "company_loaded" || selectedConnection?.status === "tally_reachable" ? (
+                        <CheckCircle2 className="h-4 w-4 text-emerald-700" />
                       ) : (
-                        <RefreshCw className="h-3.5 w-3.5" />
+                        <AlertTriangle className="h-4 w-4 text-amber-700" />
                       )}
-                      {syncingMasters ? "Syncing" : "Sync"}
-                    </button>
-                  </span>
-                  <select
-                    value={account.tallyLedgerName}
-                    onChange={(event) => {
-                      applyTallyBankLedgerSelection(event.target.value);
-                    }}
-                    className="h-10 w-full rounded-md border border-[#d8cbbb] bg-white px-3 text-sm font-medium outline-none focus:border-[#7c5f3f]"
-                  >
-                    <option value="">
-                      {tallyConnectionId
-                        ? bankLedgerOptions.length > 0
-                          ? "Select Tally bank ledger"
-                          : "No synced Tally ledgers yet"
-                        : "Select Tally connection first"}
-                    </option>
-                    {bankLedgerOptions.map((ledger) => (
-                      <option key={ledger.key} value={ledger.name}>
-                        {ledger.name}
-                        {ledger.parent ? ` · ${ledger.parent}` : ""}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <Input
-                  value={account.bankName}
-                  onChange={(event) => setAccount((current) => ({ ...current, bankName: event.target.value }))}
-                  placeholder="Bank name"
-                />
-                <Input
-                  value={account.accountNumber}
-                  onChange={(event) =>
-                    setAccount((current) => ({ ...current, accountNumber: event.target.value }))
-                  }
-                  placeholder="Account number"
-                />
-                <Input
-                  value={account.accountHolderName}
-                  onChange={(event) =>
-                    setAccount((current) => ({ ...current, accountHolderName: event.target.value }))
-                  }
-                  placeholder="Account holder name"
-                />
-                <Input
-                  value={account.ifscCode}
-                  onChange={(event) =>
-                    setAccount((current) => ({ ...current, ifscCode: event.target.value.toUpperCase() }))
-                  }
-                  placeholder="IFSC code"
-                />
+                      <div className="text-sm font-black text-[#2b241d]">
+                        {selectedConnection ? selectedConnection.displayName : "No connection selected"}
+                      </div>
+                    </div>
+                    <div className="mt-1 text-xs font-semibold text-[#8a7f72]">
+                      {selectedConnection?.status?.replaceAll("_", " ") || "Select connection"}
+                    </div>
+                    {connections.length > 1 ? (
+                      <select
+                        value={tallyConnectionId}
+                        onChange={(event) => setTallyConnectionId(event.target.value)}
+                        className="mt-3 h-9 w-full rounded-md border border-[#d8cbbb] bg-white px-3 text-sm font-medium outline-none focus:border-[#7c5f3f]"
+                      >
+                        <option value="">Select Tally connection</option>
+                        {connections.map((connection) => (
+                          <option key={connection.id} value={connection.id}>
+                            {connection.displayName}
+                          </option>
+                        ))}
+                      </select>
+                    ) : null}
+                  </div>
+
+                  <div className="rounded-xl border border-[#eee5da] bg-[#fdfaf6] p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
+                        Bank ledger
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleSyncLedgerMasters}
+                        disabled={!tallyConnectionId || syncingMasters}
+                        className="inline-flex h-7 items-center gap-1 rounded-md border border-[#d8cbbb] bg-white px-2 text-[11px] font-bold text-[#6f4e2f] hover:bg-[#fbf7f1] disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {syncingMasters ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-3.5 w-3.5" />
+                        )}
+                        Sync
+                      </button>
+                    </div>
+                    {bankLedgerName ? (
+                      <div className="mt-2 flex items-center gap-2">
+                        <CheckCircle2 className="h-4 w-4 text-emerald-700" />
+                        <div className="text-sm font-black text-[#2b241d]">{bankLedgerName}</div>
+                      </div>
+                    ) : (
+                      <div className="mt-3">
+                        <LedgerSearchSelect
+                          onChange={applyTallyBankLedgerSelection}
+                          options={bankLedgerOptions.map((ledger) => ledger.name)}
+                          placeholder="Search bank ledger"
+                          value={bankLedgerName}
+                        />
+                      </div>
+                    )}
+                    {bankLedgerName ? (
+                      <button
+                        type="button"
+                        onClick={() => setBankLedgerName("")}
+                        className="mt-2 text-xs font-bold text-[#6f4e2f] underline-offset-2 hover:underline"
+                      >
+                        Change
+                      </button>
+                    ) : null}
+                  </div>
+
+                  <div className="rounded-xl border border-[#eee5da] bg-[#fdfaf6] p-4">
+                    <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
+                      Bank account
+                    </div>
+                    <div className="mt-2 flex items-center gap-2">
+                      <CheckCircle2 className="h-4 w-4 text-emerald-700" />
+                      <div className="text-sm font-black text-[#2b241d]">{accountMatchLabel}</div>
+                    </div>
+                    {preview.candidates.length > 1 ? (
+                      <select
+                        value={selectedAccountId || "new"}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setSelectedAccountId(value === "new" ? "" : value);
+                          const candidate = preview.candidates.find((item) => item.id === value);
+                          if (candidate) {
+                            setAccount({
+                              bankName: candidate.bankName || account.bankName,
+                              accountNumber: candidate.accountNumber || account.accountNumber,
+                              accountHolderName: candidate.accountHolderName || account.accountHolderName,
+                              ifscCode: candidate.ifscCode || account.ifscCode,
+                              tallyLedgerName: candidate.tallyLedgerName || account.tallyLedgerName,
+                            });
+                            if (candidate.tallyLedgerName) setBankLedgerName(candidate.tallyLedgerName);
+                          }
+                        }}
+                        className="mt-3 h-9 w-full rounded-md border border-[#d8cbbb] bg-white px-3 text-sm font-medium outline-none focus:border-[#7c5f3f]"
+                      >
+                        <option value="new">Use extracted account</option>
+                        {preview.candidates.map((candidate) => (
+                          <option key={candidate.id} value={candidate.id}>
+                            {candidate.accountHolderName || "Saved account"} · {candidate.accountNumberMasked}
+                          </option>
+                        ))}
+                      </select>
+                    ) : null}
+                  </div>
+                </div>
               </div>
 
-              <Button
-                className="mt-5 w-full bg-[#4b3828] text-white hover:bg-[#38291d]"
-                onClick={handlePreview}
-                disabled={loading}
-              >
-                {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                Preview Import
-              </Button>
-            </div>
-
-            <div className="rounded-2xl border border-[#e3d6c6] bg-white shadow-sm">
-              <div className="border-b border-[#eee5da] px-5 py-4">
-                <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+              <div className="rounded-2xl border border-[#e3d6c6] bg-white shadow-sm">
+                <div className="flex flex-col gap-3 border-b border-[#eee5da] px-5 py-4 md:flex-row md:items-center md:justify-between">
                   <div>
                     <h2 className="text-sm font-black uppercase tracking-[0.16em] text-[#6f6256]">
-                      Review
+                      Review statement
                     </h2>
                     <p className="mt-1 text-xs font-medium text-[#9a8d7f]">
-                      Confirmed transactions are stored locally and marked pending for Tally.
+                      Most rows are ready automatically. Only review rows marked Needs ledger.
                     </p>
                   </div>
-                  {preview && (
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Badge className="border-[#d6c8b8] bg-[#f6efe6] text-[#6f4e2f]" variant="outline">
-                        {preview.import.status.replaceAll("_", " ")}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge className="border-[#d6c8b8] bg-[#f6efe6] text-[#6f4e2f]" variant="outline">
+                      {validTransactions.length} rows
+                    </Badge>
+                    <Badge className="border-emerald-200 bg-emerald-50 text-emerald-800" variant="outline">
+                      {matchedLedgerCount} matched
+                    </Badge>
+                    {createLedgerCount > 0 ? (
+                      <Badge className="border-amber-200 bg-amber-50 text-amber-800" variant="outline">
+                        {createLedgerCount} create new
                       </Badge>
-                      <Button
-                        className="bg-[#4b3828] text-white hover:bg-[#38291d]"
-                        size="sm"
-                        onClick={handleConfirm}
-                        disabled={confirming || Boolean(preview.processing)}
-                      >
-                        {confirming ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-                        Confirm Import
-                      </Button>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {!preview ? (
-                <div className="flex min-h-[440px] flex-col items-center justify-center px-6 text-center">
-                  <Landmark className="mb-3 h-10 w-10 text-[#d6c8b8]" />
-                  <div className="text-sm font-bold text-[#3b332b]">No statement in review</div>
-                  <div className="mt-1 max-w-sm text-xs font-medium text-[#8a7f72]">
-                    Upload a file to review account matching and transaction rows.
-                  </div>
-                </div>
-              ) : (
-                <div className="space-y-5 p-5">
-                  <div className="grid gap-3 lg:grid-cols-5">
-                    <div className="rounded-xl border border-[#eee5da] bg-[#fdfaf6] p-4">
-                      <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
-                        Bank
-                      </div>
-                      <div className="mt-1 text-sm font-black">{account.bankName || "Not set"}</div>
-                    </div>
-                    <div className="rounded-xl border border-[#eee5da] bg-[#fdfaf6] p-4">
-                      <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
-                        Account
-                      </div>
-                      <div className="mt-1 text-sm font-black">
-                        {preview.account.accountNumberMasked || account.accountNumber || "Not set"}
-                      </div>
-                    </div>
-                    <div className="rounded-xl border border-[#eee5da] bg-[#fdfaf6] p-4">
-                      <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
-                        Holder
-                      </div>
-                      <div className="mt-1 text-sm font-black">{account.accountHolderName || "Not set"}</div>
-                    </div>
-                    <div className="rounded-xl border border-[#eee5da] bg-[#fdfaf6] p-4">
-                      <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
-                        IFSC
-                      </div>
-                      <div className="mt-1 text-sm font-black">{account.ifscCode || "Not set"}</div>
-                    </div>
-                    <div className="rounded-xl border border-[#eee5da] bg-[#fdfaf6] p-4">
-                      <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
-                        Tally Ledger
-                      </div>
-                      <div className="mt-1 text-sm font-black">{account.tallyLedgerName || "Not mapped"}</div>
-                    </div>
-                  </div>
-
-                  {preview.processing && (
-                    <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-4 text-sm font-semibold text-blue-800">
-                      <div className="flex items-center gap-2">
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                        {preview.job?.stage || "AI extraction in progress"}
-                      </div>
-                    </div>
-                  )}
-
-                  {!preview.processing && preview.candidates.length > 1 && (
-                    <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
-                      <div className="mb-3 flex items-center gap-2 text-sm font-black text-amber-900">
-                        <AlertTriangle className="h-4 w-4" />
-                        Multiple accounts match this statement
-                      </div>
-                      <div className="mb-3 text-xs font-semibold leading-5 text-amber-900">
-                        The extracted name/account details match more than one saved bank account. Select the
-                        correct account before confirming.
-                      </div>
-                      <div className="grid gap-2 md:grid-cols-2">
-                        {preview.candidates.map((candidate) => (
-                          <button
-                            key={candidate.id}
-                            type="button"
-                            onClick={() => {
-                              setSelectedAccountId(candidate.id);
-                              setAccount((current) => ({
-                                ...current,
-                                tallyLedgerName: candidate.tallyLedgerName || current.tallyLedgerName,
-                              }));
-                              if (candidate.tallyLedgerName) setBankLedgerName(candidate.tallyLedgerName);
-                            }}
-                            className={`rounded-xl border p-3 text-left transition ${
-                              selectedAccountId === candidate.id
-                                ? "border-[#5f452d] bg-white shadow-sm"
-                                : "border-amber-200 bg-[#fffaf0] hover:border-[#9c7a52]"
-                            }`}
-                          >
-                            <div className="text-sm font-black text-[#2b241d]">
-                              {candidate.accountHolderName || "Unnamed account"}
-                            </div>
-                            <div className="mt-1 text-xs font-semibold text-[#7c6f62]">
-                              {candidate.bankName || "Bank"} · {candidate.accountNumberMasked}
-                            </div>
-                            <div className="mt-2 text-[11px] font-semibold text-[#9a8d7f]">
-                              Last import: {formatDate(candidate.lastImportedTransactionAt)}
-                            </div>
-                            <div className="mt-1 text-[11px] font-semibold text-[#9a8d7f]">
-                              Tally ledger: {candidate.tallyLedgerName || "Not mapped"}
-                            </div>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {!preview.processing && preview.candidates.length === 1 && selectedAccount && (
-                    <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-semibold text-emerald-800">
-                      Matched existing account: {selectedAccount.accountHolderName || "Unnamed account"} ·{" "}
-                      {selectedAccount.accountNumberMasked}
-                      {selectedAccount.tallyLedgerName ? ` · ${selectedAccount.tallyLedgerName}` : ""}
-                    </div>
-                  )}
-
-                  {!preview.processing && preview.candidates.length === 0 && (
-                    <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm font-semibold text-blue-800">
-                      No saved account matched this statement. Confirm Import will automatically create{" "}
-                      {account.accountHolderName || "this bank account"}
-                      {account.accountNumber ? ` · ${maskAccountNumber(account.accountNumber)}` : ""}.
-                    </div>
-                  )}
-
-                  {!preview.processing && (
-                    <div className="overflow-hidden rounded-xl border border-[#eee5da]">
-                      <div className="flex items-center justify-between border-b border-[#eee5da] bg-[#fbf7f1] px-4 py-3">
-                        <div className="text-xs font-black uppercase tracking-[0.16em] text-[#6f6256]">
-                          Transactions
-                        </div>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => setTransactions((current) => [...current, createEmptyTransaction()])}
-                        >
-                          <Plus className="h-4 w-4" />
-                          Row
-                        </Button>
-                      </div>
-                      <div className="overflow-x-auto">
-                        <Table>
-                        <TableHeader>
-                          <TableRow>
-                            <TableHead className="min-w-36">Date</TableHead>
-                            <TableHead className="min-w-56">Description</TableHead>
-                            <TableHead className="min-w-32">Reference</TableHead>
-                            <TableHead className="min-w-28">Debit</TableHead>
-                            <TableHead className="min-w-28">Credit</TableHead>
-                            <TableHead className="min-w-28">Balance</TableHead>
-                            <TableHead className="min-w-32">Type</TableHead>
-                            <TableHead className="min-w-32">Category</TableHead>
-                            <TableHead className="min-w-40">Counterparty</TableHead>
-                            <TableHead className="w-12" />
-                          </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          {transactions.map((transaction) => (
-                            <TableRow key={transaction.id}>
-                              <TableCell>
-                                <Input
-                                  type="date"
-                                  value={transaction.transactionDate}
-                                  onChange={(event) =>
-                                    updateTransaction(transaction.id, "transactionDate", event.target.value)
-                                  }
-                                />
-                              </TableCell>
-                              <TableCell>
-                                <Input
-                                  value={transaction.description}
-                                  onChange={(event) =>
-                                    updateTransaction(transaction.id, "description", event.target.value)
-                                  }
-                                  placeholder="Narration"
-                                />
-                              </TableCell>
-                              <TableCell>
-                                <Input
-                                  value={transaction.referenceNumber}
-                                  onChange={(event) =>
-                                    updateTransaction(transaction.id, "referenceNumber", event.target.value)
-                                  }
-                                  placeholder="UTR / ref"
-                                />
-                              </TableCell>
-                              <TableCell>
-                                <Input
-                                  inputMode="decimal"
-                                  value={transaction.debitAmount}
-                                  onChange={(event) =>
-                                    updateTransaction(transaction.id, "debitAmount", event.target.value)
-                                  }
-                                  placeholder="0.00"
-                                />
-                              </TableCell>
-                              <TableCell>
-                                <Input
-                                  inputMode="decimal"
-                                  value={transaction.creditAmount}
-                                  onChange={(event) =>
-                                    updateTransaction(transaction.id, "creditAmount", event.target.value)
-                                  }
-                                  placeholder="0.00"
-                                />
-                              </TableCell>
-                              <TableCell>
-                                <Input
-                                  inputMode="decimal"
-                                  value={transaction.balanceAmount}
-                                  onChange={(event) =>
-                                    updateTransaction(transaction.id, "balanceAmount", event.target.value)
-                                  }
-                                  placeholder="0.00"
-                                />
-                              </TableCell>
-                              <TableCell>
-                                <Input
-                                  value={transaction.transactionType}
-                                  onChange={(event) =>
-                                    updateTransaction(transaction.id, "transactionType", event.target.value)
-                                  }
-                                  placeholder="neft"
-                                />
-                              </TableCell>
-                              <TableCell>
-                                <Input
-                                  value={transaction.category}
-                                  onChange={(event) =>
-                                    updateTransaction(transaction.id, "category", event.target.value)
-                                  }
-                                  placeholder="payment"
-                                />
-                              </TableCell>
-                              <TableCell>
-                                <Input
-                                  value={transaction.counterpartyName}
-                                  onChange={(event) =>
-                                    updateTransaction(transaction.id, "counterpartyName", event.target.value)
-                                  }
-                                  placeholder="Detected party"
-                                />
-                              </TableCell>
-                              <TableCell>
-                                <button
-                                  type="button"
-                                  onClick={() => removeTransaction(transaction.id)}
-                                  className="flex h-8 w-8 items-center justify-center rounded-md text-[#9a8d7f] hover:bg-rose-50 hover:text-rose-700"
-                                  aria-label="Remove transaction"
-                                >
-                                  <Trash2 className="h-4 w-4" />
-                                </button>
-                              </TableCell>
-                            </TableRow>
-                          ))}
-                        </TableBody>
-                        </Table>
-                      </div>
-                    </div>
-                  )}
-
-                  {!preview.processing && (
-                    <div className="flex flex-col gap-3 border-t border-[#eee5da] pt-5 sm:flex-row sm:items-center sm:justify-between">
-                      <div className="text-sm font-semibold text-[#7c6f62]">
-                        {validTransactions.length} valid rows ready for import
-                      </div>
-                      <Button
-                        className="bg-[#4b3828] text-white hover:bg-[#38291d]"
-                        onClick={handleConfirm}
-                        disabled={confirming}
-                      >
-                        {confirming ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-                        Confirm Import
-                      </Button>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </section>
-
-          <section className="grid gap-6 lg:grid-cols-[1fr_420px]">
-            <div className="rounded-2xl border border-[#e3d6c6] bg-white p-5 shadow-sm">
-              <div className="mb-4 flex items-center justify-between">
-                <div>
-                  <h2 className="text-sm font-black uppercase tracking-[0.16em] text-[#6f6256]">
-                    Bank Accounts
-                  </h2>
-                  <p className="mt-1 text-xs font-medium text-[#9a8d7f]">
-                    Latest import and Tally posting timestamps stay separate.
-                  </p>
-                </div>
-                <Landmark className="h-5 w-5 text-[#8a7f72]" />
-              </div>
-              <div className="overflow-hidden rounded-xl border border-[#eee5da]">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Account</TableHead>
-                      <TableHead>Bank</TableHead>
-                      <TableHead>Tally Ledger</TableHead>
-                      <TableHead>Last Import</TableHead>
-                      <TableHead>Last Tally Post</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {accounts.length === 0 ? (
-                      <TableRow>
-                        <TableCell colSpan={5} className="py-8 text-center text-sm font-medium text-[#8a7f72]">
-                          No bank accounts yet.
-                        </TableCell>
-                      </TableRow>
-                    ) : (
-                      accounts.map((item) => (
-                        <TableRow key={item.id}>
-                          <TableCell>
-                            <div className="font-bold">{item.accountHolderName || "Unnamed account"}</div>
-                            <div className="text-xs font-medium text-[#8a7f72]">{item.accountNumberMasked}</div>
-                          </TableCell>
-                          <TableCell>{item.bankName || "Not set"}</TableCell>
-                          <TableCell>{item.tallyLedgerName || "Not mapped"}</TableCell>
-                          <TableCell>{formatDate(item.lastImportedTransactionAt)}</TableCell>
-                          <TableCell>{formatDate(item.lastTallyPostedTransactionAt)}</TableCell>
-                        </TableRow>
-                      ))
-                    )}
-                  </TableBody>
-                </Table>
-              </div>
-            </div>
-
-            <div className="rounded-2xl border border-[#dfd0bd] bg-white shadow-sm">
-              <div className="border-b border-[#eee5da] px-5 py-4">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <h2 className="text-sm font-black uppercase tracking-[0.16em] text-[#5f4d3d]">
-                      Queue To Tally
-                    </h2>
-                    <p className="mt-1 text-xs font-medium leading-5 text-[#8a7f72]">
-                      Confirm ledgers first; only matched rows are posted.
-                    </p>
-                  </div>
-                  <Badge className="border-[#d6c8b8] bg-[#fbf7f1] text-[#6f4e2f]" variant="outline">
-                    {queueTransactions.length ? `${queueTransactions.length - unresolvedQueueRows}/${queueTransactions.length} ready` : "No rows"}
-                  </Badge>
-                </div>
-              </div>
-
-              <div className="space-y-4 p-5">
-                <div className="grid gap-3">
-                  <label className="space-y-1.5">
-                    <span className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
-                      Tally connection
-                    </span>
-                    <select
-                      value={tallyConnectionId}
-                      onChange={(event) => setTallyConnectionId(event.target.value)}
-                      className="h-10 w-full rounded-md border border-[#d8cbbb] bg-white px-3 text-sm font-medium outline-none focus:border-[#7c5f3f]"
+                    ) : null}
+                    <Badge
+                      className={
+                        missingLedgerCount === 0
+                          ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                          : "border-amber-200 bg-amber-50 text-amber-800"
+                      }
+                      variant="outline"
                     >
-                      <option value="">Select Tally connection</option>
-                      {connections.map((connection) => (
-                        <option key={connection.id} value={connection.id}>
-                          {connection.displayName} · {connection.status}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-
-                  <label className="space-y-1.5">
-                    <span className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
-                      Imported bank account
-                    </span>
-                    <select
-                      value={tallyAccountId}
-                      onChange={(event) => {
-                        const nextAccount = accounts.find((item) => item.id === event.target.value);
-                        setTallyAccountId(event.target.value);
-                        setBankLedgerName(nextAccount?.tallyLedgerName || "");
-                      }}
-                      className="h-10 w-full rounded-md border border-[#d8cbbb] bg-white px-3 text-sm font-medium outline-none focus:border-[#7c5f3f]"
-                    >
-                      <option value="">Select bank account</option>
-                      {accounts.map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.accountHolderName || "Unnamed account"} · {item.accountNumberMasked}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-
-                  <label className="space-y-1.5">
-                    <span className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
-                      Tally bank ledger
-                    </span>
-                    <select
-                      value={bankLedgerName}
-                      onChange={(event) => setBankLedgerName(event.target.value)}
-                      className="h-10 w-full rounded-md border border-[#d8cbbb] bg-white px-3 text-sm font-medium outline-none focus:border-[#7c5f3f]"
-                    >
-                      <option value="">Select Tally bank ledger</option>
-                      {bankLedgerName && !ledgerMasters.some((ledger) => ledger.name === bankLedgerName) && (
-                        <option value={bankLedgerName}>{bankLedgerName} · not synced</option>
-                      )}
-                      {bankLedgerOptions.map((ledger) => (
-                        <option key={ledger.key} value={ledger.name}>
-                          {ledger.name}
-                          {ledger.parent ? ` · ${ledger.parent}` : ""}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                </div>
-
-                {queueTransactions.length > 0 && (
-                  <div className="grid grid-cols-2 gap-2 rounded-lg border border-[#eee5da] bg-[#fbf7f1] p-2 text-center">
-                    <div>
-                      <div className="text-lg font-black text-[#2b241d]">{queueTransactions.length}</div>
-                      <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#9a8d7f]">Rows</div>
-                    </div>
-                    <div>
-                      <div className="text-lg font-black text-emerald-700">
-                        {queueTransactions.length - unresolvedQueueRows}
-                      </div>
-                      <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#9a8d7f]">Matched</div>
-                    </div>
-                  </div>
-                )}
-
-                <div className="overflow-hidden rounded-xl border border-[#eee5da]">
-                  <div className="flex items-center justify-between border-b border-[#eee5da] bg-[#fbf7f1] px-4 py-3">
-                    <div>
-                      <div className="text-xs font-black uppercase tracking-[0.16em] text-[#6f6256]">
-                        Tally Ledger Matches
-                      </div>
-                      <div className="mt-0.5 text-[11px] font-semibold text-[#9a8d7f]">
-                        Map each bank transaction to an existing or new Tally ledger.
-                      </div>
-                    </div>
-                    <Badge className="border-[#d6c8b8] bg-white text-[#6f4e2f]" variant="outline">
-                      {loadingQueueRows ? "Loading" : `${queueTransactions.length} rows`}
+                      {missingLedgerCount === 0 ? "Ready" : `${missingLedgerCount} need ledger`}
                     </Badge>
                   </div>
+                </div>
 
-                  <div className="max-h-[540px] space-y-3 overflow-auto bg-[#fffdf9] p-3">
-                    {queueTransactions.length === 0 ? (
-                      <div className="rounded-lg border border-dashed border-[#d6c8b8] px-4 py-8 text-center text-sm font-semibold text-[#8a7f72]">
-                        {preview
-                          ? "Confirm the current statement to load its ledger matches."
-                          : loadingQueueRows
-                          ? "Loading pending transactions..."
-                          : tallyAccountId
-                            ? "No pending or failed transactions loaded for this account."
-                            : "Select an account with pending transactions."}
-                      </div>
-                    ) : (
-                      queueTransactions.map((transaction, index) => {
-                        const suggestedName = defaultCreateLedgerName(transaction);
-                        const suggestedExists = ledgerExists(transaction.suggestedLedgerName);
-                        const selectedLedger = transaction.selectedLedgerName || "";
-                        const debit = formatAmount(transaction.debitAmount);
-                        const credit = formatAmount(transaction.creditAmount);
+                <div className="grid gap-3 border-b border-[#eee5da] bg-[#fdfaf6] p-4 md:grid-cols-4">
+                  <div>
+                    <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
+                      Bank
+                    </div>
+                    <div className="mt-1 rounded-md border border-[#e3d6c6] bg-white px-3 py-2 text-sm font-bold text-[#2b241d]">
+                      {account.bankName || "Not found"}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
+                      Account
+                    </div>
+                    <div className="mt-1 rounded-md border border-[#e3d6c6] bg-white px-3 py-2 text-sm font-bold text-[#2b241d]">
+                      {account.accountNumber || "Not found"}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
+                      Holder
+                    </div>
+                    <div className="mt-1 rounded-md border border-[#e3d6c6] bg-white px-3 py-2 text-sm font-bold text-[#2b241d]">
+                      {account.accountHolderName || "Not found"}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
+                      IFSC
+                    </div>
+                    <div className="mt-1 rounded-md border border-[#e3d6c6] bg-white px-3 py-2 text-sm font-bold text-[#2b241d]">
+                      {account.ifscCode || "Not found"}
+                    </div>
+                  </div>
+                </div>
 
-                        return (
-                          <div
-                            key={transaction.id}
-                            className={`rounded-lg border p-3 shadow-sm ${
-                              selectedLedger
-                                ? "border-emerald-200 bg-emerald-50/50"
-                                : "border-amber-200 bg-white"
-                            }`}
-                          >
-                            <div className="flex items-start justify-between gap-3">
-                              <div className="min-w-0">
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <span className="rounded-md bg-[#f0e7da] px-2 py-1 text-[11px] font-black text-[#6f4e2f]">
-                                    {index + 1}
-                                  </span>
-                                  <span className="text-xs font-bold text-[#7c6f62]">
-                                    {formatDate(transaction.transactionDate)}
-                                  </span>
-                                  {(debit || credit) && (
-                                    <span className="text-xs font-black text-[#2b241d]">
-                                      {debit ? `Dr ${debit}` : `Cr ${credit}`}
-                                    </span>
-                                  )}
-                                </div>
-                                <div className="mt-2 text-sm font-black leading-5 text-[#2b241d]">
-                                  {transaction.description}
-                                </div>
-                                <div className="mt-1 text-xs font-semibold text-[#8a7f72]">
-                                  {transaction.counterpartyName || transaction.category}
-                                </div>
-                              </div>
-                              {selectedLedger ? (
-                                <CheckCircle2 className="mt-1 h-5 w-5 shrink-0 text-emerald-700" />
-                              ) : (
-                                <AlertTriangle className="mt-1 h-5 w-5 shrink-0 text-amber-700" />
-                              )}
+                <div className="divide-y divide-[#eee5da]">
+                  {transactions.length === 0 ? (
+                    <div className="px-6 py-10 text-center text-sm font-semibold text-[#8a7f72]">
+                      No rows were extracted. Upload another file or add rows after extraction support improves.
+                    </div>
+                  ) : (
+                    transactions.map((transaction, index) => {
+                      const debit = formatAmount(transaction.debitAmount);
+                      const credit = formatAmount(transaction.creditAmount);
+                      const choices = getLedgerChoices(transaction, ledgerMasters);
+
+                      const isEditingLedger = editingLedgerIds.has(transaction.id);
+                      const needsLedger = !transaction.selectedLedgerName.trim();
+                      const actionTone = getLedgerActionTone(transaction);
+                      const showLedgerSelect = needsLedger || isEditingLedger || transaction.ledgerAction === "needs_review";
+
+                      return (
+                        <div key={transaction.id} className="grid gap-4 px-4 py-4 lg:grid-cols-[64px_1.8fr_150px_300px]">
+                          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[#f0e7da] text-sm font-black text-[#6f4e2f]">
+                            {index + 1}
+                          </div>
+
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-sm font-black text-[#2b241d]">{transaction.transactionDate || "No date"}</span>
+                              <span className="text-xs font-semibold text-[#8a7f72]">
+                                {transaction.referenceNumber || transaction.transactionType || "No reference"}
+                              </span>
                             </div>
+                            <div className="mt-2 truncate text-sm font-bold text-[#2b241d]" title={transaction.description}>
+                              {transaction.description || "No narration"}
+                            </div>
+                            <div className="mt-1 text-xs font-semibold text-[#8a7f72]">
+                              {transaction.counterpartyName || transaction.category || "Counterparty not found"}
+                            </div>
+                          </div>
 
-                            <div className="mt-3 rounded-md border border-[#eee5da] bg-white px-3 py-2">
+                          <div className="rounded-lg border border-[#eee5da] bg-[#fdfaf6] px-3 py-2">
+                            <div className="text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
+                              Amount
+                            </div>
+                            <div className="mt-1 text-sm font-black text-[#2b241d]">
+                              {debit ? `Dr ${debit}` : credit ? `Cr ${credit}` : "0"}
+                            </div>
+                          </div>
+
+                          <div className="space-y-2">
+                            <div
+                              className={`rounded-lg border px-3 py-2 ${
+                                actionTone === "warning"
+                                  ? "border-amber-200 bg-amber-50"
+                                  : "border-emerald-200 bg-emerald-50"
+                              }`}
+                            >
                               <div className="flex items-start justify-between gap-2">
-                                <div>
+                                <div className="min-w-0">
                                   <div className="text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
-                                    Suggested
+                                    Tally ledger
                                   </div>
-                                  <div className="mt-1 text-sm font-bold text-[#2b241d]">
-                                    {transaction.suggestedLedgerName || suggestedName || "Needs selection"}
+                                  <div className="mt-1 truncate text-sm font-black text-[#2b241d]">
+                                    {transaction.selectedLedgerName ||
+                                      transaction.suggestedLedgerName ||
+                                      transaction.counterpartyName ||
+                                      "Choose ledger"}
                                   </div>
                                 </div>
                                 <Badge
                                   className={
-                                    suggestedExists
-                                      ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-                                      : "border-amber-200 bg-amber-50 text-amber-800"
+                                    actionTone === "warning"
+                                      ? "border-amber-200 bg-white text-amber-800"
+                                      : "border-emerald-200 bg-white text-emerald-800"
                                   }
                                   variant="outline"
                                 >
-                                  {suggestedExists ? "Exists" : "Missing"}
+                                  {getLedgerActionLabel(transaction)}
                                 </Badge>
                               </div>
-                              <div className="mt-1 text-[11px] font-medium text-[#8a7f72]">
-                                {transaction.suggestionReason ||
-                                  (transaction.needsLedgerConfirmation ? "Confirm before queueing" : "Ready")}
-                              </div>
+                              {transaction.ledgerAction === "create_new_ledger" && transaction.ledgerGroup ? (
+                                <div className="mt-1 text-[11px] font-semibold text-[#8a7f72]">
+                                  Group: {transaction.ledgerGroup}
+                                </div>
+                              ) : null}
+                              {transaction.suggestionReason ? (
+                                <div className="mt-1 text-[11px] font-medium text-[#8a7f72]">
+                                  {transaction.suggestionReason}
+                                </div>
+                              ) : null}
                             </div>
-
-                            <label className="mt-3 block space-y-1.5">
-                              <span className="text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
-                                Existing ledger
-                              </span>
-                              <select
-                                value={selectedLedger}
-                                onChange={(event) =>
-                                  setQueueTransactions((current) =>
-                                    current.map((item) =>
-                                      item.id === transaction.id
-                                        ? { ...item, selectedLedgerName: event.target.value }
-                                        : item
-                                    )
-                                  )
-                                }
-                                className="h-10 w-full rounded-md border border-[#d8cbbb] bg-white px-3 text-sm font-medium outline-none focus:border-[#7c5f3f]"
-                              >
-                                <option value="">Select existing ledger</option>
-                                {transaction.suggestedLedgerName && suggestedExists && (
-                                  <option value={transaction.suggestedLedgerName}>
-                                    {transaction.suggestedLedgerName}
-                                  </option>
-                                )}
-                                {ledgerMasters
-                                  .filter((ledger) => ledger.name !== transaction.suggestedLedgerName)
-                                  .map((ledger) => (
-                                    <option key={ledger.key} value={ledger.name}>
-                                      {ledger.name}
-                                    </option>
-                                  ))}
-                              </select>
-                            </label>
-
-                            <label className="mt-3 flex items-center gap-2 text-xs font-semibold text-[#7c6f62]">
-                              <input
-                                type="checkbox"
-                                checked={transaction.saveMapping}
-                                onChange={(event) =>
-                                  setQueueTransactions((current) =>
-                                    current.map((item) =>
-                                      item.id === transaction.id
-                                        ? { ...item, saveMapping: event.target.checked }
-                                        : item
-                                    )
-                                  )
-                                }
-                                className="h-4 w-4 accent-[#4b3828]"
+                            {showLedgerSelect ? (
+                              <LedgerSearchSelect
+                                onChange={(value) => {
+                                  updateTransaction(transaction.id, "selectedLedgerName", value);
+                                  setEditingLedgerIds((current) => {
+                                    const next = new Set(current);
+                                    next.delete(transaction.id);
+                                    return next;
+                                  });
+                                }}
+                                options={choices}
+                                placeholder="Search ledger"
+                                value={transaction.selectedLedgerName}
                               />
-                              Save this narration-to-ledger mapping
-                            </label>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setEditingLedgerIds((current) => new Set(current).add(transaction.id))
+                                }
+                                className="text-left text-xs font-bold text-[#6f4e2f] underline-offset-2 hover:underline"
+                              >
+                                Change ledger
+                              </button>
+                            )}
                           </div>
-                        );
-                      })
-                    )}
-                  </div>
+                        </div>
+                      );
+                    })
+                  )}
                 </div>
 
-                <Button
-                  className="w-full bg-[#4b3828] text-white hover:bg-[#38291d]"
-                  onClick={handleQueueTally}
-                  disabled={queueing || queueTransactions.length === 0}
-                >
-                  {queueing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                  Queue Pending Vouchers
-                </Button>
+                <div className="flex flex-col gap-3 border-t border-[#eee5da] bg-[#fbf7f1] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="text-sm font-semibold text-[#7c6f62]">
+                    {validTransactions.length} row(s) ready after review.
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      className="border-[#d8cbbb] bg-white text-[#2b241d] hover:bg-[#f7efe5]"
+                      onClick={() => {
+                        setPreview(null);
+                        setTransactions([]);
+                        setFile(null);
+                        setBanner(null);
+                      }}
+                      type="button"
+                      variant="outline"
+                    >
+                      Upload Another
+                    </Button>
+                    <Button
+                      className="bg-[#4b3828] text-white hover:bg-[#38291d]"
+                      onClick={sendToTally}
+                      disabled={sending || validTransactions.length === 0}
+                    >
+                      {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+                      Send To Tally
+                    </Button>
+                  </div>
+                </div>
               </div>
-            </div>
-          </section>
+            </section>
+          )}
         </div>
       </div>
     </AppShell>
