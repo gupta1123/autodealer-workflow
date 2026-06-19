@@ -52,6 +52,22 @@ export type ParsedBankTransaction = {
   rawPayload?: Record<string, unknown>;
 };
 
+export type BankTransactionLedgerRecommendationAction =
+  | "use_existing_ledger"
+  | "create_new_ledger"
+  | "use_standard_ledger"
+  | "use_suspense"
+  | "needs_review";
+
+export type BankTransactionLedgerRecommendation = {
+  action: BankTransactionLedgerRecommendationAction;
+  ledgerName: string | null;
+  ledgerGroup: string | null;
+  confidence: number;
+  requiresUserConfirmation: boolean;
+  reason: string | null;
+};
+
 export type ParsedBankStatement = {
   account: {
     bankName: string | null;
@@ -322,6 +338,196 @@ function safeJsonParse<T>(raw: string, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function compactPromptJson(value: unknown) {
+  return JSON.stringify(value, null, 2);
+}
+
+function clampConfidence(value: unknown) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.min(1, parsed));
+}
+
+function readAiRecommendationAction(value: unknown): BankTransactionLedgerRecommendationAction {
+  const normalized = String(value ?? "").trim();
+  if (
+    normalized === "use_existing_ledger" ||
+    normalized === "create_new_ledger" ||
+    normalized === "use_standard_ledger" ||
+    normalized === "use_suspense" ||
+    normalized === "needs_review"
+  ) {
+    return normalized;
+  }
+  return "needs_review";
+}
+
+function titleCaseLedgerName(value: string) {
+  return titleCaseName(value.replace(/\s+/g, " ").trim());
+}
+
+function normalizeLedgerKey(value?: string | null) {
+  return normalizeName(value).replace(/[^a-z0-9]/g, "");
+}
+
+function findProvidedLedger(ledgerNames: string[], value?: string | null) {
+  const normalized = normalizeLedgerKey(value);
+  if (!normalized) return null;
+  return ledgerNames.find((ledgerName) => normalizeLedgerKey(ledgerName) === normalized) ?? null;
+}
+
+function normalizeLedgerRecommendation(
+  value: unknown,
+  transaction: ParsedBankTransaction,
+  ledgerNames: string[]
+): BankTransactionLedgerRecommendation {
+  const row = value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+  let action = readAiRecommendationAction(row.recommendedAction ?? row.action);
+  const rawLedgerName = readLooseText(row, ["recommendedLedgerName", "ledgerName", "targetLedgerName"]);
+  const rawLedgerGroup = readLooseText(row, ["recommendedLedgerGroup", "ledgerGroup", "parentGroup"]);
+  const reason = readLooseText(row, ["reason", "explanation"]) || null;
+  const confidence = clampConfidence(row.confidence);
+  const existingLedger = findProvidedLedger(ledgerNames, rawLedgerName);
+  const suspenseLedger = findProvidedLedger(ledgerNames, "Suspense");
+
+  if (action === "use_existing_ledger" || action === "use_standard_ledger") {
+    if (existingLedger) {
+      return {
+        action,
+        ledgerName: existingLedger,
+        ledgerGroup: null,
+        confidence: Math.max(confidence, 0.75),
+        requiresUserConfirmation: confidence < 0.85,
+        reason,
+      };
+    }
+    action = "needs_review";
+  }
+
+  if (action === "use_suspense") {
+    return {
+      action: suspenseLedger ? "use_suspense" : "needs_review",
+      ledgerName: suspenseLedger,
+      ledgerGroup: null,
+      confidence,
+      requiresUserConfirmation: true,
+      reason: reason || (suspenseLedger ? "AI recommended suspense for an unclear transaction." : "Suspense ledger is not synced."),
+    };
+  }
+
+  if (action === "create_new_ledger") {
+    const fallbackName = transaction.counterpartyName || rawLedgerName || extractCounterpartyName(transaction.description);
+    const ledgerName = titleCaseLedgerName(rawLedgerName || fallbackName || "");
+    const debit = Number(transaction.debitAmount ?? 0) || 0;
+    const credit = Number(transaction.creditAmount ?? 0) || 0;
+    const fallbackGroup = credit > 0 && debit <= 0 ? "Sundry Debtors" : "Sundry Creditors";
+
+    if (ledgerName) {
+      return {
+        action: "create_new_ledger",
+        ledgerName,
+        ledgerGroup: rawLedgerGroup || fallbackGroup,
+        confidence,
+        requiresUserConfirmation: true,
+        reason,
+      };
+    }
+  }
+
+  return {
+    action: "needs_review",
+    ledgerName: rawLedgerName || transaction.counterpartyName || null,
+    ledgerGroup: rawLedgerGroup || null,
+    confidence,
+    requiresUserConfirmation: true,
+    reason: reason || "AI could not safely choose an accounting action.",
+  };
+}
+
+export async function classifyBankTransactionsForTallyWithAI(params: {
+  account: ParsedBankStatement["account"];
+  transactions: ParsedBankTransaction[];
+  tallyLedgerNames: string[];
+  businessName?: string | null;
+}) {
+  if (params.transactions.length === 0) return params.transactions;
+
+  const ledgerNames = Array.from(new Set(params.tallyLedgerNames.filter(Boolean))).slice(0, 1000);
+  const raw = await callOpenRouter(
+    [
+      {
+        role: "system",
+        content:
+          "You are classifying Indian business bank statement transactions for Tally Prime accounting. Return only valid JSON. " +
+          "Do not invent existing ledgers. You may use an existing ledger only if it appears in the provided tallyLedgerNames list, matching case-insensitively. " +
+          "For a receipt from a named customer/business party with no existing ledger, recommend create_new_ledger under Sundry Debtors. " +
+          "For a payment to a named vendor/business party with no existing ledger, recommend create_new_ledger under Sundry Creditors. " +
+          "For bank charges, fees, GST on bank charges, interest, cash withdrawal/deposit, tax, TDS, GST, salary, or other standard categories, prefer an existing standard ledger from tallyLedgerNames when present. " +
+          "Do not create a party ledger for bank charges, tax, GST, TDS, interest, cash, salary, or internal bank transfers. " +
+          "Use use_suspense only when the transaction is genuinely unclear and a Suspense ledger exists. Use needs_review when the data is insufficient or risky. " +
+          "Creating a new ledger, using suspense, or any confidence below 0.85 must set requiresUserConfirmation true. " +
+          "Allowed recommendedAction values: use_existing_ledger, create_new_ledger, use_standard_ledger, use_suspense, needs_review. " +
+          "Allowed create_new_ledger groups: Sundry Debtors, Sundry Creditors, Indirect Expenses, Indirect Incomes, Duties & Taxes, Cash-in-Hand. " +
+          "Return JSON shape: {\"recommendations\":[{\"index\":0,\"counterpartyName\":\"...\",\"transactionNature\":\"customer_receipt|vendor_payment|bank_charge|interest|tax|cash|transfer|unknown\",\"recommendedAction\":\"...\",\"recommendedLedgerName\":\"...\",\"recommendedLedgerGroup\":\"...\",\"confidence\":0.0,\"requiresUserConfirmation\":true,\"reason\":\"short reason\"}]}.",
+      },
+      {
+        role: "user",
+        content:
+          "Classify these transactions for Tally posting.\n" +
+          compactPromptJson({
+            businessName: params.businessName ?? params.account.accountHolderName ?? null,
+            statementAccount: params.account,
+            tallyLedgerNames: ledgerNames,
+            transactions: params.transactions.map((transaction, index) => ({
+              index,
+              transactionDate: transaction.transactionDate,
+              description: transaction.description,
+              referenceNumber: transaction.referenceNumber,
+              debitAmount: transaction.debitAmount,
+              creditAmount: transaction.creditAmount,
+              transactionType: transaction.transactionType,
+              category: transaction.category,
+              counterpartyName: transaction.counterpartyName,
+            })),
+          }),
+      },
+    ],
+    {
+      expectJson: true,
+      jsonMode: true,
+      model: getQualityExtractionModel(),
+      reasoning: getQualityExtractionReasoning(),
+      maxTokens: 8192,
+    }
+  );
+
+  const parsed = safeJsonParse<{ recommendations?: unknown }>(raw, {});
+  const recommendations = Array.isArray(parsed.recommendations) ? parsed.recommendations : [];
+  const byIndex = new Map<number, unknown>();
+  for (const recommendation of recommendations) {
+    if (!recommendation || typeof recommendation !== "object" || Array.isArray(recommendation)) continue;
+    const index = Number((recommendation as Record<string, unknown>).index);
+    if (Number.isInteger(index)) byIndex.set(index, recommendation);
+  }
+
+  return params.transactions.map((transaction, index) => {
+    const recommendation = normalizeLedgerRecommendation(byIndex.get(index), transaction, ledgerNames);
+    return {
+      ...transaction,
+      counterpartyName: transaction.counterpartyName || extractCounterpartyName(transaction.description),
+      suggestedLedgerName: recommendation.ledgerName,
+      suggestionConfidence: recommendation.confidence,
+      suggestionReason: recommendation.reason,
+      rawPayload: {
+        ...(transaction.rawPayload ?? {}),
+        aiLedgerRecommendation: recommendation,
+      },
+    };
+  });
 }
 
 function readColumn(row: Record<string, string>, aliases: string[]) {

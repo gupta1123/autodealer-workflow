@@ -58,6 +58,20 @@ function readConfig() {
   return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
 }
 
+function formatCliError(error) {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+
+  const cause = error.cause;
+  if (cause instanceof Error) {
+    const code = typeof cause.code === "string" ? ` (${cause.code})` : "";
+    return `${error.message}: ${cause.message}${code}`;
+  }
+
+  return error.message;
+}
+
 function writeConfig(config) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
   fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
@@ -1756,6 +1770,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error instanceof Error ? error.message : error);
+  console.error(formatCliError(error));
   process.exit(1);
 });

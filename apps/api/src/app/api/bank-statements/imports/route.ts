@@ -3,6 +3,7 @@ import { requireRequestUser } from "@/lib/api/request-auth";
 import {
   BANK_STATEMENT_BUCKET,
   buildStoragePath,
+  classifyBankTransactionsForTallyWithAI,
   extractBankStatementFile,
   findBankAccountCandidates,
   maskAccountNumber,
@@ -42,15 +43,6 @@ function serializeImport(row: Record<string, unknown>) {
     duplicateTransactionCount: Number(row.duplicate_transaction_count ?? 0),
     createdAt: String(row.created_at ?? ""),
   };
-}
-
-function shouldExtractAsync(fileName: string, mimeType?: string | null) {
-  const type = mimeType ?? "";
-  return (
-    type.includes("pdf") ||
-    type.startsWith("image/") ||
-    /\.(pdf|png|jpe?g|webp)$/i.test(fileName || "")
-  );
 }
 
 export function OPTIONS(request: Request) {
@@ -97,6 +89,9 @@ export async function POST(request: Request) {
     }
 
     const manualAccount = readJsonField<BankAccountInput>(formData.get("account"), {});
+    const connectionId = typeof formData.get("connectionId") === "string"
+      ? String(formData.get("connectionId")).trim()
+      : "";
     const bytes = new Uint8Array(await file.arrayBuffer());
     const storagePath = buildStoragePath(user.id, file.name || "bank-statement");
     const supabase = createSupabaseAdminClient();
@@ -107,75 +102,7 @@ export async function POST(request: Request) {
     });
     if (upload.error) throw upload.error;
 
-    if (shouldExtractAsync(file.name || "bank-statement", file.type || null)) {
-      const account = {
-        bankName: manualAccount.bankName || null,
-        accountNumber: manualAccount.accountNumber || null,
-        accountHolderName: manualAccount.accountHolderName || null,
-        ifscCode: manualAccount.ifscCode || null,
-        tallyLedgerName: manualAccount.tallyLedgerName || null,
-      };
-      const { data: createdImport, error: insertError } = await supabase
-        .from("bank_statement_imports")
-        .insert({
-          owner_user_id: user.id,
-          bank_account_id: null,
-          original_file_name: file.name || "bank-statement",
-          storage_bucket: BANK_STATEMENT_BUCKET,
-          storage_path: storagePath,
-          mime_type: file.type || null,
-          size_bytes: file.size,
-          extracted_bank_name: account.bankName,
-          extracted_account_number: account.accountNumber,
-          extracted_account_holder_name: account.accountHolderName,
-          extracted_ifsc_code: account.ifscCode,
-          status: "processing",
-          processing_meta: {
-            source: "bank_statement_upload",
-            parser: "openrouter_bank_statement_v1",
-            jobStatus: "queued",
-            normalizedAccountNumber: normalizeAccountNumber(account.accountNumber),
-            maskedAccountNumber: maskAccountNumber(account.accountNumber),
-            ifscCode: account.ifscCode,
-            tallyLedgerName: account.tallyLedgerName,
-            previewTransactionCount: 0,
-          },
-        })
-        .select("*")
-        .single();
-
-      if (insertError) throw insertError;
-
-      const { error: jobError } = await supabase.from("bank_statement_extraction_jobs").insert({
-        import_id: createdImport.id,
-        owner_user_id: user.id,
-        status: "queued",
-        progress: 0,
-        stage: "Queued for AI extraction",
-      });
-
-      if (jobError) throw jobError;
-
-      return jsonWithCors(request, {
-        import: serializeImport(createdImport as Record<string, unknown>),
-        account: {
-          bankName: account.bankName,
-          accountNumber: account.accountNumber,
-          accountNumberMasked: maskAccountNumber(account.accountNumber),
-          accountHolderName: account.accountHolderName,
-          ifscCode: account.ifscCode,
-          tallyLedgerName: account.tallyLedgerName,
-        },
-        candidates: [],
-        transactions: [],
-        requiresManualExtraction: false,
-        extractionSource: "openrouter_bank_statement_v1",
-        extractionError: null,
-        processing: true,
-      });
-    }
-
-    const parsed = await extractBankStatementFile({
+    let parsed = await extractBankStatementFile({
       bytes,
       fileName: file.name || "bank-statement",
       mimeType: file.type || null,
@@ -186,11 +113,41 @@ export async function POST(request: Request) {
       accountNumber: manualAccount.accountNumber || parsed.account.accountNumber || null,
       accountHolderName: manualAccount.accountHolderName || parsed.account.accountHolderName || null,
       ifscCode: manualAccount.ifscCode || parsed.account.ifscCode || null,
-      tallyLedgerName: manualAccount.tallyLedgerName || null,
     };
     const candidates = await findBankAccountCandidates(supabase, user.id, account);
     const status = resolveImportStatus(candidates.length);
     const selectedAccountId = candidates.length === 1 ? candidates[0].id : null;
+
+    let ledgerRecommendationError: string | null = null;
+    if (connectionId && parsed.transactions.length > 0) {
+      try {
+        const { data: ledgerRows, error: ledgerError } = await supabase
+          .from("tally_masters")
+          .select("tally_name")
+          .eq("owner_user_id", user.id)
+          .eq("connection_id", connectionId)
+          .eq("master_type", "ledger")
+          .eq("is_active", true)
+          .limit(1000);
+
+        if (ledgerError) throw ledgerError;
+
+        parsed = {
+          ...parsed,
+          transactions: await classifyBankTransactionsForTallyWithAI({
+            account,
+            transactions: parsed.transactions,
+            tallyLedgerNames: ((ledgerRows ?? []) as Array<{ tally_name?: string | null }>)
+              .map((row) => row.tally_name)
+              .filter((value): value is string => Boolean(value)),
+            businessName: account.accountHolderName,
+          }),
+        };
+      } catch (error) {
+        ledgerRecommendationError =
+          error instanceof Error ? error.message : "AI ledger recommendation failed.";
+      }
+    }
 
     const insertPayload = {
       owner_user_id: user.id,
@@ -212,10 +169,10 @@ export async function POST(request: Request) {
         parser: parsed.extractionSource,
         extractionError: parsed.extractionError ?? null,
         extractionDiagnostics: parsed.extractionDiagnostics ?? null,
+        ledgerRecommendationError,
         normalizedAccountNumber: normalizeAccountNumber(account.accountNumber),
         maskedAccountNumber: maskAccountNumber(account.accountNumber),
         ifscCode: account.ifscCode,
-        tallyLedgerName: account.tallyLedgerName,
         previewTransactionCount: parsed.transactions.length,
       },
     };
@@ -236,7 +193,6 @@ export async function POST(request: Request) {
         accountNumberMasked: maskAccountNumber(account.accountNumber),
         accountHolderName: account.accountHolderName,
         ifscCode: account.ifscCode,
-        tallyLedgerName: account.tallyLedgerName,
       },
       candidates: candidates.map(serializeAccount),
       transactions: parsed.transactions,
@@ -244,6 +200,7 @@ export async function POST(request: Request) {
       extractionSource: parsed.extractionSource,
       extractionError: parsed.extractionError ?? null,
       extractionDiagnostics: parsed.extractionDiagnostics ?? null,
+      ledgerRecommendationError,
     });
   } catch (error) {
     console.error("Error in POST /api/bank-statements/imports:", error);
