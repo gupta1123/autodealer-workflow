@@ -52,37 +52,6 @@ function readRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
-function titleCaseLedgerName(value: string) {
-  return value
-    .toLowerCase()
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((part) => (part.length <= 3 ? part.toUpperCase() : `${part[0]?.toUpperCase() ?? ""}${part.slice(1)}`))
-    .join(" ")
-    .slice(0, 120);
-}
-
-function fallbackLedgerName(transaction: ParsedBankTransaction, suggestedCounterparty?: string | null) {
-  const counterparty = String(transaction.counterpartyName || suggestedCounterparty || "").trim();
-  if (counterparty) return titleCaseLedgerName(counterparty);
-
-  const text = `${transaction.category ?? ""} ${transaction.transactionType ?? ""} ${transaction.description}`.toLowerCase();
-  if (/\bbank[_\s-]*charges\b|\bcharge|charges|fee\b/.test(text)) return "Bank Charges";
-  if (/\binterest\b/.test(text)) return "Interest Income";
-  if (/\batm\b|\bcash\b/.test(text)) return "Cash";
-
-  return null;
-}
-
-function fallbackLedgerGroup(transaction: ParsedBankTransaction, ledgerName: string) {
-  const text = `${ledgerName} ${transaction.category ?? ""} ${transaction.transactionType ?? ""} ${transaction.description}`.toLowerCase();
-  if (/\bbank[_\s-]*charges\b|\bcharge|charges|fee\b/.test(text)) return "Indirect Expenses";
-  if (/\binterest\b/.test(text)) return "Indirect Incomes";
-  if (/\bcash\b|\batm\b/.test(text)) return "Cash-in-Hand";
-  if ((transaction.creditAmount ?? 0) > 0) return "Sundry Debtors";
-  return "Sundry Creditors";
-}
-
 async function enrichTransactionsWithLedgerRecommendations(input: {
   ownerUserId: string;
   connectionId: string;
@@ -106,22 +75,20 @@ async function enrichTransactionsWithLedgerRecommendations(input: {
       });
       const ledgerName =
         suggestion.ledgerName ||
-        fallbackLedgerName(transaction, suggestion.counterpartyName) ||
+        transaction.confirmedLedgerName ||
         transaction.suggestedLedgerName ||
-        null;
+        "Suspense";
       const action = suggestion.ledgerName
         ? suggestion.mappingSource === "category"
           ? "use_standard_ledger"
           : suggestion.mappingSource === "close_match"
             ? "needs_review"
             : "use_existing_ledger"
-        : ledgerName
-          ? "create_new_ledger"
-          : "needs_review";
+        : "use_suspense";
       const reason =
         suggestion.reason ||
-        (action === "create_new_ledger"
-          ? "No matching Tally ledger was found. A new ledger will be created unless changed."
+        (action === "use_suspense"
+          ? "No matching Tally ledger was found. This row will go to Suspense unless changed."
           : null);
 
       return {
@@ -135,7 +102,7 @@ async function enrichTransactionsWithLedgerRecommendations(input: {
           aiLedgerRecommendation: {
             action,
             ledgerName,
-            ledgerGroup: action === "create_new_ledger" && ledgerName ? fallbackLedgerGroup(transaction, ledgerName) : null,
+            ledgerGroup: null,
             confidence: suggestion.ledgerName ? suggestion.confidence : ledgerName ? 0.6 : 0,
             requiresUserConfirmation: suggestion.mappingSource === "close_match",
             reason,

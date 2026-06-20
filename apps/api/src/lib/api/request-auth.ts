@@ -51,8 +51,15 @@ function getTokenCacheExpiry(expClaim: unknown) {
 }
 
 async function validateBearerToken(token: string): Promise<RequestUser | null> {
+  if (token.split(".").length !== 3) {
+    return null;
+  }
+
   const supabase = createTokenValidationClient();
-  const { data, error } = await supabase.auth.getClaims(token);
+  const { data, error } = await supabase.auth.getClaims(token).catch(() => ({
+    data: null,
+    error: new Error("Bearer token validation failed"),
+  }));
 
   if (error || !data || typeof data.claims.sub !== "string" || !data.claims.sub) {
     return null;

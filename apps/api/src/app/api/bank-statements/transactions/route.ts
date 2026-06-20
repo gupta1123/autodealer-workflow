@@ -8,6 +8,7 @@ export const runtime = "nodejs";
 type BankTransactionRow = {
   id: string;
   bank_account_id: string;
+  statement_import_id: string | null;
   transaction_date: string;
   value_date: string | null;
   description: string;
@@ -71,6 +72,7 @@ export async function GET(request: Request) {
 
     const url = new URL(request.url);
     const accountId = url.searchParams.get("accountId")?.trim();
+    const importId = url.searchParams.get("importId")?.trim();
     const connectionId = url.searchParams.get("connectionId")?.trim() || null;
     const status = url.searchParams.get("status")?.trim() || "pending";
 
@@ -98,6 +100,10 @@ export async function GET(request: Request) {
       .eq("bank_account_id", accountId)
       .order("transaction_date", { ascending: true })
       .limit(200);
+
+    if (importId) {
+      builder = builder.eq("statement_import_id", importId);
+    }
 
     if (status === "queueable") {
       builder = builder.in("tally_status", ["pending", "failed"]);

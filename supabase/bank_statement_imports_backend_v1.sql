@@ -21,6 +21,7 @@ create table if not exists public.bank_accounts (
   tally_master_id uuid references public.tally_masters(id) on delete set null,
   tally_ledger_name text,
   last_imported_transaction_at timestamptz,
+  last_imported_transaction_marker jsonb not null default '{}'::jsonb,
   last_tally_posted_transaction_at timestamptz,
   created_at timestamptz not null default timezone('utc', now()),
   updated_at timestamptz not null default timezone('utc', now()),

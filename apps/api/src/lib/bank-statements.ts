@@ -100,6 +100,7 @@ export type BankAccountRow = {
   ifsc_code: string | null;
   tally_ledger_name: string | null;
   last_imported_transaction_at: string | null;
+  last_imported_transaction_marker: Record<string, unknown> | null;
   last_tally_posted_transaction_at: string | null;
   created_at: string;
   updated_at: string;
@@ -239,7 +240,7 @@ function normalizeHeader(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function splitCsvLine(line: string) {
+function splitCsvLine(line: string, delimiter = ",") {
   const cells: string[] = [];
   let current = "";
   let quoted = false;
@@ -256,7 +257,7 @@ function splitCsvLine(line: string) {
       quoted = !quoted;
       continue;
     }
-    if (char === "," && !quoted) {
+    if (char === delimiter && !quoted) {
       cells.push(current.trim());
       current = "";
       continue;
@@ -266,6 +267,10 @@ function splitCsvLine(line: string) {
 
   cells.push(current.trim());
   return cells;
+}
+
+function splitDelimitedLine(line: string) {
+  return splitCsvLine(line, line.includes("|") ? "|" : ",");
 }
 
 function detectTransactionType(description: string) {
@@ -545,7 +550,7 @@ function parseCsvTransactions(text: string): ParsedBankTransaction[] {
     .map((line) => line.trim())
     .filter(Boolean);
   const headerIndex = lines.findIndex((line) => {
-    const normalized = splitCsvLine(line).map(normalizeHeader);
+    const normalized = splitDelimitedLine(line).map(normalizeHeader);
     return (
       normalized.some((value) => ["date", "transactiondate", "txndate", "postingdate", "valuedate"].includes(value)) &&
       normalized.some((value) => ["description", "narration", "particulars", "remarks"].includes(value))
@@ -554,9 +559,9 @@ function parseCsvTransactions(text: string): ParsedBankTransaction[] {
 
   if (headerIndex < 0) return [];
 
-  const headers = splitCsvLine(lines[headerIndex]);
+  const headers = splitDelimitedLine(lines[headerIndex]);
   return lines.slice(headerIndex + 1).flatMap((line, index) => {
-    const cells = splitCsvLine(line);
+    const cells = splitDelimitedLine(line);
     const row = Object.fromEntries(headers.map((header, cellIndex) => [header, cells[cellIndex] ?? ""]));
     const transactionDate = parseDate(
       readColumn(row, ["transactionDate", "date", "txn date", "posting date"])
@@ -805,6 +810,12 @@ export function parseBankStatementText(text: string) {
     /\b([A-Z]{4}0[A-Z0-9]{6})\b/i,
   ]);
   const period = compact.match(/(?:statement\s*)?period\s*[:\-]?\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\s*(?:to|-)\s*(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})/i);
+  const tableTransactions = parseCsvTransactions(text);
+  const labeledTransactions = tableTransactions.length > 0 ? [] : parseLabeledTransactionBlocks(text);
+  const fixedWidthTransactions =
+    tableTransactions.length > 0 || labeledTransactions.length > 0
+      ? []
+      : parseFixedWidthPdfTransactions(text);
 
   return {
     account: {
@@ -815,9 +826,7 @@ export function parseBankStatementText(text: string) {
     },
     statementPeriodStart: parseDate(period?.[1]) ?? null,
     statementPeriodEnd: parseDate(period?.[2]) ?? null,
-    transactions: parseCsvTransactions(text)
-      .concat(parseLabeledTransactionBlocks(text))
-      .concat(parseFixedWidthPdfTransactions(text)),
+    transactions: tableTransactions.concat(labeledTransactions).concat(fixedWidthTransactions),
   };
 }
 

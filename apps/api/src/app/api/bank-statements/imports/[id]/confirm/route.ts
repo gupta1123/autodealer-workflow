@@ -43,6 +43,43 @@ type PostedLogRow = {
   tally_posted_at: string | null;
 };
 
+type TransactionCheckpointMarker = {
+  transactionDate: string;
+  valueDate: string | null;
+  description: string;
+  referenceNumber: string | null;
+  debitAmount: number | null;
+  creditAmount: number | null;
+  balanceAmount: number | null;
+  transactionType: string;
+  category: string;
+  counterpartyName: string | null;
+  fingerprint: string;
+};
+
+type DraftTransactionRow = {
+  transaction_date: string;
+  value_date: string | null;
+  description: string;
+  reference_number: string | null;
+  debit_amount: number | null | undefined;
+  credit_amount: number | null | undefined;
+  balance_amount: number | null | undefined;
+  transaction_type: string;
+  category: string;
+  counterparty_name: string | null;
+  suggested_ledger_name?: string | null;
+  suggestion_confidence?: number | null;
+  suggestion_reason?: string | null;
+  confirmed_ledger_name?: string | null;
+  ledger_mapping_source?: string | null;
+  additional_charges?: Array<Record<string, unknown>>;
+  confidence?: number | null;
+  raw_payload?: Record<string, unknown>;
+  fingerprint: string;
+  tally_status?: string;
+};
+
 function serializeImport(row: Record<string, unknown>) {
   return {
     id: String(row.id),
@@ -117,6 +154,136 @@ function checkpointDate(value: unknown) {
   return match?.[1] ?? null;
 }
 
+function normalizeCheckpointText(value?: string | null) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeCheckpointAmount(value: number | string | null | undefined) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Number(parsed.toFixed(2)) : null;
+}
+
+function checkpointAmountsMatch(
+  left: number | string | null | undefined,
+  right: number | string | null | undefined
+) {
+  const normalizedLeft = normalizeCheckpointAmount(left);
+  const normalizedRight = normalizeCheckpointAmount(right);
+  if (normalizedLeft === null || normalizedRight === null) return normalizedLeft === normalizedRight;
+  return Math.abs(normalizedLeft - normalizedRight) < 0.005;
+}
+
+function readTransactionCheckpointMarker(value: unknown): TransactionCheckpointMarker | null {
+  let row = value;
+  if (typeof value === "string") {
+    try {
+      row = JSON.parse(value || "{}");
+    } catch {
+      return null;
+    }
+  }
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const marker = row as Partial<TransactionCheckpointMarker>;
+  if (!marker.transactionDate || typeof marker.transactionDate !== "string") return null;
+  return {
+    transactionDate: marker.transactionDate,
+    valueDate: typeof marker.valueDate === "string" ? marker.valueDate : null,
+    description: typeof marker.description === "string" ? marker.description : "",
+    referenceNumber: typeof marker.referenceNumber === "string" ? marker.referenceNumber : null,
+    debitAmount: normalizeCheckpointAmount(marker.debitAmount),
+    creditAmount: normalizeCheckpointAmount(marker.creditAmount),
+    balanceAmount: normalizeCheckpointAmount(marker.balanceAmount),
+    transactionType: typeof marker.transactionType === "string" ? marker.transactionType : "unknown",
+    category: typeof marker.category === "string" ? marker.category : "unknown",
+    counterpartyName: typeof marker.counterpartyName === "string" ? marker.counterpartyName : null,
+    fingerprint: typeof marker.fingerprint === "string" ? marker.fingerprint : "",
+  };
+}
+
+function buildTransactionCheckpointMarker(row: DraftTransactionRow): TransactionCheckpointMarker {
+  return {
+    transactionDate: row.transaction_date,
+    valueDate: row.value_date,
+    description: row.description,
+    referenceNumber: row.reference_number,
+    debitAmount: normalizeCheckpointAmount(row.debit_amount),
+    creditAmount: normalizeCheckpointAmount(row.credit_amount),
+    balanceAmount: normalizeCheckpointAmount(row.balance_amount),
+    transactionType: row.transaction_type,
+    category: row.category,
+    counterpartyName: row.counterparty_name,
+    fingerprint: row.fingerprint,
+  };
+}
+
+function transactionMatchesCheckpoint(row: DraftTransactionRow, marker: TransactionCheckpointMarker) {
+  if (marker.fingerprint && row.fingerprint === marker.fingerprint) return true;
+  if (row.transaction_date !== marker.transactionDate) return false;
+  if (!checkpointAmountsMatch(row.debit_amount, marker.debitAmount)) return false;
+  if (!checkpointAmountsMatch(row.credit_amount, marker.creditAmount)) return false;
+  if (!checkpointAmountsMatch(row.balance_amount, marker.balanceAmount)) return false;
+  if (normalizeCheckpointText(row.description) !== normalizeCheckpointText(marker.description)) return false;
+  if (marker.referenceNumber && normalizeCheckpointText(row.reference_number) !== normalizeCheckpointText(marker.referenceNumber)) {
+    return false;
+  }
+  return true;
+}
+
+function rowsAfterImportCheckpoint(
+  rows: DraftTransactionRow[],
+  marker: TransactionCheckpointMarker | null,
+  legacyCheckpointDate: string | null
+) {
+  const markerDate = marker?.transactionDate || legacyCheckpointDate;
+  if (!markerDate) {
+    return {
+      markerFound: null as boolean | null,
+      rows,
+      skippedCount: 0,
+    };
+  }
+
+  const sameDateRowExists = rows.some((row) => row.transaction_date === markerDate);
+  if (!sameDateRowExists) {
+    const nextRows = rows.filter((row) => row.transaction_date > markerDate);
+    return {
+      markerFound: null as boolean | null,
+      rows: nextRows,
+      skippedCount: rows.length - nextRows.length,
+    };
+  }
+
+  const markerIndex = marker ? rows.findIndex((row) => transactionMatchesCheckpoint(row, marker)) : -1;
+  if (markerIndex >= 0) {
+    const nextRows = rows.filter(
+      (row, index) => row.transaction_date > markerDate || (row.transaction_date === markerDate && index > markerIndex)
+    );
+    return {
+      markerFound: true,
+      rows: nextRows,
+      skippedCount: rows.length - nextRows.length,
+    };
+  }
+
+  const nextRows = rows.filter((row) => row.transaction_date > markerDate);
+  return {
+    markerFound: false,
+    rows: nextRows,
+    skippedCount: rows.length - nextRows.length,
+  };
+}
+
+function latestTransactionRow(rows: DraftTransactionRow[]) {
+  return rows.reduce<DraftTransactionRow | null>((latest, row) => {
+    if (!latest) return row;
+    return row.transaction_date >= latest.transaction_date ? row : latest;
+  }, null);
+}
+
 function getTransactionAmount(row: {
   debit_amount?: number | string | null;
   credit_amount?: number | string | null;
@@ -176,7 +343,10 @@ export async function POST(
       return jsonWithCors(request, { error: "Bank statement import was not found." }, { status: 404 });
     }
 
-    let accountId = body.accountId || importRow.bank_account_id || null;
+    const accountIdWasProvided = Object.prototype.hasOwnProperty.call(body, "accountId");
+    let accountId = accountIdWasProvided
+      ? body.accountId || null
+      : importRow.bank_account_id || null;
     let accountRow = null;
 
     if (accountId) {
@@ -272,9 +442,15 @@ export async function POST(
     );
     const rows = Array.from(rowsByFingerprint.values());
     const lastImportedTransactionDate = checkpointDate(accountRow.last_imported_transaction_at);
-    const rowsAfterCheckpoint = lastImportedTransactionDate
-      ? rows.filter((row) => row.transaction_date > lastImportedTransactionDate)
-      : rows;
+    const lastImportedTransactionMarker = readTransactionCheckpointMarker(
+      accountRow.last_imported_transaction_marker
+    );
+    const checkpointResult = rowsAfterImportCheckpoint(
+      rows,
+      lastImportedTransactionMarker,
+      lastImportedTransactionDate
+    );
+    const rowsAfterCheckpoint = checkpointResult.rows;
 
     const { data: existingPostedRows, error: existingPostedError } = await supabase
       .from("bank_transactions")
@@ -398,9 +574,14 @@ export async function POST(
       if (insertError) throw insertError;
     }
 
-    const latestAcceptedDate = latestRowTransactionDate(rowsAfterCheckpoint);
+    const latestAcceptedRow = latestTransactionRow(rowsAfterCheckpoint);
+    const latestAcceptedDate = latestAcceptedRow?.transaction_date ?? latestRowTransactionDate(rowsAfterCheckpoint);
+    const latestAcceptedMarker = latestAcceptedRow ? buildTransactionCheckpointMarker(latestAcceptedRow) : null;
     const accountUpdate = latestAcceptedDate
-      ? { last_imported_transaction_at: `${latestAcceptedDate}T00:00:00.000Z` }
+      ? {
+          last_imported_transaction_at: `${latestAcceptedDate}T00:00:00.000Z`,
+          last_imported_transaction_marker: latestAcceptedMarker,
+        }
       : {};
 
     const accountUpdatePromise = latestAcceptedDate
@@ -435,7 +616,9 @@ export async function POST(
               confirmedAt: new Date().toISOString(),
               confirmedTransactionCount: transactions.length,
               importedAfterTransactionDate: lastImportedTransactionDate,
-              skippedByCheckpointCount: rows.length - rowsAfterCheckpoint.length,
+              importedAfterTransactionMarker: lastImportedTransactionMarker,
+              checkpointMarkerFound: checkpointResult.markerFound,
+              skippedByCheckpointCount: checkpointResult.skippedCount,
               existingTransactionCount: existingFingerprints.size,
               appendCompletedAt: new Date().toISOString(),
               alreadyPostedTransactionCount: postedByFingerprint.size,
@@ -483,7 +666,7 @@ export async function POST(
       import: serializeImport(updatedImport as Record<string, unknown>),
       importedTransactionCount: rowsToInsert.length,
       duplicateTransactionCount: transactions.length - rowsToInsert.length,
-      skippedByCheckpointCount: rows.length - rowsAfterCheckpoint.length,
+      skippedByCheckpointCount: checkpointResult.skippedCount,
       existingTransactionCount: existingFingerprints.size,
       alreadyPostedTransactionCount: postedByFingerprint.size,
     });

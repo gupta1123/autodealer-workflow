@@ -2,12 +2,16 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { createPortal } from "react-dom";
 import {
   AlertTriangle,
   ArrowRight,
+  CalendarDays,
   CheckCircle2,
+  Filter,
   Landmark,
   Loader2,
+  Pencil,
   RefreshCw,
   Search,
   UploadCloud,
@@ -177,6 +181,8 @@ type QueueTransaction = {
 };
 
 type MessageTone = "success" | "error" | "info";
+type ReviewStatusFilter = "all" | "matched" | "needs_review" | "suspense";
+type ReviewDirectionFilter = "all" | "debit" | "credit";
 
 type ToastMessage = {
   id: string;
@@ -363,6 +369,8 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
   const suggestedLedgerName = transaction.suggestedLedgerName || "";
   const action = recommendation?.action ?? "needs_review";
   const recommendedLedgerName = recommendation?.ledgerName || suggestedLedgerName || fallbackReviewLedgerName(transaction);
+  const suspenseLedger = findLedgerByNormalizedName(ledgerMasters, "Suspense");
+  const suspenseName = suspenseLedger?.name || "Suspense";
   const matchedLedger = findLedgerByNormalizedName(ledgerMasters, recommendedLedgerName);
   const shouldReviewRecommendedLedger = Boolean(matchedLedger && recommendation?.requiresUserConfirmation);
   const closeLedgerMatch = shouldReviewRecommendedLedger && matchedLedger
@@ -378,25 +386,19 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
       recommendation?.requiresUserConfirmation);
   const hasExistingLedgerRecommendation =
     action === "use_existing_ledger" || action === "use_standard_ledger";
-  const shouldCreateLedger =
-    !matchedLedger &&
-    !shouldReviewCloseMatch &&
-    Boolean(recommendedLedgerName.trim()) &&
-    action !== "use_suspense" &&
-    !hasExistingLedgerRecommendation;
   const reviewSuggestedLedgerName = shouldReviewCloseMatch
     ? closeLedgerMatch?.ledger.name || recommendedLedgerName
     : recommendedLedgerName;
   const selectedLedgerName =
     transaction.confirmedLedgerName ||
     (shouldReviewCloseMatch ? "" : matchedLedger?.name) ||
-    (hasExistingLedgerRecommendation || shouldCreateLedger || action === "use_suspense"
+    (hasExistingLedgerRecommendation || action === "use_suspense"
       ? recommendedLedgerName
-      : "") ||
+      : suspenseName) ||
     "";
   const ledgerAction: LedgerRecommendationAction = shouldReviewCloseMatch
     ? "needs_review"
-    : action === "use_suspense"
+    : action === "use_suspense" || (!matchedLedger && !hasExistingLedgerRecommendation)
     ? "use_suspense"
     : matchedLedger
     ? action === "use_standard_ledger"
@@ -404,9 +406,7 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
       : "use_existing_ledger"
     : hasExistingLedgerRecommendation
       ? action
-    : shouldCreateLedger
-      ? "create_new_ledger"
-      : action;
+      : "use_suspense";
 
   return {
     id: transaction.id || crypto.randomUUID(),
@@ -432,11 +432,13 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     suggestedLedgerName: reviewSuggestedLedgerName,
     suggestionConfidence: recommendation?.confidence ?? transaction.suggestionConfidence ?? null,
     suggestionReason: shouldReviewCloseMatch
-      ? `Possible existing ledger: ${closeLedgerMatch?.ledger.name}. Review before creating a new ledger.`
-      : recommendation?.reason || transaction.suggestionReason || "",
+      ? `Possible existing ledger: ${closeLedgerMatch?.ledger.name}. Review before using Suspense.`
+      : ledgerAction === "use_suspense" && !matchedLedger
+        ? "No matching Tally ledger was found. This row will go to Suspense unless changed."
+        : recommendation?.reason || transaction.suggestionReason || "",
     selectedLedgerName,
     ledgerAction,
-    ledgerGroup: recommendation?.ledgerGroup || "Sundry Creditors",
+    ledgerGroup: recommendation?.ledgerGroup || "",
     requiresUserConfirmation: shouldReviewCloseMatch || (matchedLedger ? false : recommendation?.requiresUserConfirmation ?? false),
   };
 }
@@ -515,15 +517,6 @@ function getTransactionPartyTitle(transaction: ReviewTransaction) {
   return transaction.description || "Unknown transaction";
 }
 
-function getTransactionMetaItems(transaction: ReviewTransaction) {
-  return [
-    transaction.transactionDate,
-    getTransactionDirection(transaction),
-    getTransactionMode(transaction),
-    getTransactionReference(transaction),
-  ].filter(Boolean);
-}
-
 function maskAccountNumber(value: string) {
   const normalized = value.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
   if (!normalized) return "";
@@ -537,15 +530,6 @@ function isBankLedgerMaster(ledger: TallyMaster) {
     /\bbank\b/.test(text) ||
     /\b(hdfc|icici|sbi|axis|kotak|idfc|indusind|canara|yes bank|federal|standard chartered|bank of baroda|bank of india)\b/.test(text)
   );
-}
-
-function titleCaseLedgerName(value: string) {
-  return value
-    .toLowerCase()
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((part) => (part.length <= 3 ? part.toUpperCase() : `${part[0]?.toUpperCase() ?? ""}${part.slice(1)}`))
-    .join(" ");
 }
 
 function getLedgerCandidateName(transaction: ReviewTransaction) {
@@ -639,8 +623,6 @@ function uniqueLedgerOptions(options: LedgerPickerOption[]) {
 }
 
 function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]): LedgerPickerGroup[] {
-  const candidateName = getLedgerCandidateName(transaction);
-  const candidateLedgerGroup = transaction.ledgerGroup || "Sundry Creditors";
   const suspenseLedger = ledgerMasters.find((ledger) => normalizeName(ledger.name) === "suspense");
   const suspenseName = suspenseLedger?.name || "Suspense";
   const currentLedger = findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
@@ -695,17 +677,6 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
         badge: "Fallback",
       },
     ]);
-  } else if (transaction.ledgerAction === "create_new_ledger" && candidateName) {
-    addGroup("Recommended", [
-      {
-        name: candidateName,
-        action: "create_new_ledger",
-        ledgerGroup: candidateLedgerGroup,
-        label: `Create new ledger: ${candidateName}`,
-        helper: `Group: ${candidateLedgerGroup}`,
-        badge: "Create new",
-      },
-    ]);
   }
 
   if (transaction.ledgerAction === "needs_review" || closeMatches.length > 0) {
@@ -733,42 +704,6 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
     ]);
   }
 
-  if (transaction.ledgerAction === "needs_review") {
-    if (candidateName) {
-      addGroup("Create new", [
-        {
-          name: titleCaseLedgerName(candidateName),
-          action: "create_new_ledger",
-          ledgerGroup: candidateLedgerGroup,
-          label: `Create new ledger: ${titleCaseLedgerName(candidateName)}`,
-          helper: `Group: ${candidateLedgerGroup}`,
-          badge: "Create new",
-        },
-      ]);
-    }
-  } else if (transaction.ledgerAction !== "create_new_ledger" && candidateName && !findLedgerByNormalizedName(ledgerMasters, candidateName)) {
-    addGroup("Create new", [
-      {
-        name: titleCaseLedgerName(candidateName),
-        action: "create_new_ledger",
-        ledgerGroup: candidateLedgerGroup,
-        label: `Create new ledger: ${titleCaseLedgerName(candidateName)}`,
-        helper: `Group: ${candidateLedgerGroup}`,
-        badge: "Create new",
-      },
-    ]);
-  }
-
-  addGroup("Safe fallback", [
-    {
-      name: suspenseName,
-      action: "use_suspense",
-      label: "Put in Suspense",
-      helper: "Use when the correct ledger is unclear.",
-      badge: "Fallback",
-    },
-  ]);
-
   addGroup(
     "Common ledgers",
     commonLedgers.map((name) => ({
@@ -782,7 +717,7 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
   );
 
   addGroup(
-    "All Tally ledgers",
+    "Search Tally ledgers",
     ledgerMasters.map((ledger) => ({
       name: ledger.name,
       action: "use_existing_ledger",
@@ -790,6 +725,16 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
       helper: ledger.parent ? `Group: ${ledger.parent}` : "Existing Tally ledger.",
     }))
   );
+
+  addGroup("Safe fallback", [
+    {
+      name: suspenseName,
+      action: "use_suspense",
+      label: "Put in Suspense",
+      helper: "Use when the correct ledger is unclear.",
+      badge: "Fallback",
+    },
+  ]);
 
   return groups;
 }
@@ -867,9 +812,6 @@ function LedgerSearchSelect({
 }
 
 function getLedgerPickerDisplayValue(transaction: ReviewTransaction) {
-  if (transaction.ledgerAction === "create_new_ledger" && transaction.selectedLedgerName) {
-    return `Create new: ${transaction.selectedLedgerName}`;
-  }
   if (transaction.ledgerAction === "use_suspense") return "Put in Suspense";
   if (transaction.ledgerAction === "use_standard_ledger" && transaction.selectedLedgerName) {
     return `Standard: ${transaction.selectedLedgerName}`;
@@ -878,6 +820,10 @@ function getLedgerPickerDisplayValue(transaction: ReviewTransaction) {
     return `Use existing: ${transaction.selectedLedgerName}`;
   }
   return transaction.selectedLedgerName;
+}
+
+function isSuspenseLedgerName(value: string) {
+  return normalizeName(value) === "suspense";
 }
 
 function LedgerReviewSelect({
@@ -891,7 +837,13 @@ function LedgerReviewSelect({
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
-  const [openAbove, setOpenAbove] = useState(false);
+  const [popoverPosition, setPopoverPosition] = useState<{
+    bottom?: number;
+    left: number;
+    maxHeight: number;
+    top?: number;
+    width: number;
+  } | null>(null);
   const [query, setQuery] = useState("");
   const groups = useMemo(
     () => buildLedgerPickerGroups(transaction, ledgerMasters),
@@ -914,14 +866,6 @@ function LedgerReviewSelect({
       }))
       .filter((group) => group.options.length > 0);
   }, [groups, normalizedQuery, query]);
-  const queryCloseMatch = findBestCloseLedgerMatch(ledgerMasters, query, 0.84);
-  const queryCanCreate =
-    query.trim().length >= 3 &&
-    !findLedgerByNormalizedName(ledgerMasters, query) &&
-    !queryCloseMatch &&
-    !groups.some((group) =>
-      group.options.some((option) => normalizeName(option.name) === normalizeName(query))
-    );
   const displayValue = open ? query : getLedgerPickerDisplayValue(transaction);
 
   function selectOption(option: LedgerSelection) {
@@ -932,9 +876,93 @@ function LedgerReviewSelect({
 
   function openMenu() {
     const rect = rootRef.current?.getBoundingClientRect();
-    setOpenAbove(Boolean(rect && window.innerHeight - rect.bottom < 360));
+    if (rect) {
+      const gutter = 16;
+      const width = Math.min(480, window.innerWidth - gutter * 2);
+      const left = Math.min(
+        Math.max(gutter, rect.right - width),
+        Math.max(gutter, window.innerWidth - width - gutter)
+      );
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const spaceAbove = rect.top;
+      const shouldOpenAbove = spaceBelow < 360 && spaceAbove > spaceBelow;
+      const availableHeight = Math.max(220, shouldOpenAbove ? spaceAbove - gutter * 2 : spaceBelow - gutter * 2);
+      setPopoverPosition({
+        bottom: shouldOpenAbove ? window.innerHeight - rect.top + 8 : undefined,
+        left,
+        maxHeight: Math.min(420, availableHeight),
+        top: shouldOpenAbove ? undefined : rect.bottom + 8,
+        width,
+      });
+    }
     setOpen(true);
   }
+
+  const popover = open && popoverPosition ? (
+    <div
+      className="fixed z-[1000] overflow-auto rounded-xl border border-[#d8cbbb] bg-white p-1 shadow-2xl"
+      style={{
+        bottom: popoverPosition.bottom,
+        left: popoverPosition.left,
+        maxHeight: popoverPosition.maxHeight,
+        top: popoverPosition.top,
+        width: popoverPosition.width,
+      }}
+    >
+      {filteredGroups.length > 0 ? (
+        filteredGroups.map((group) => (
+          <div className="mb-1 last:mb-0" key={group.label}>
+            <div className="px-3 pb-1 pt-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
+              {group.label}
+            </div>
+            {group.options.map((option) => {
+              const selected =
+                normalizeName(option.name) === normalizeName(transaction.selectedLedgerName) &&
+                option.action === transaction.ledgerAction;
+              return (
+                <button
+                  className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold transition hover:bg-[#fbf4ea] ${
+                    selected ? "bg-[#f6efe6] text-[#4b3828]" : "text-[#2b241d]"
+                  }`}
+                  key={option.key}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    selectOption(option);
+                  }}
+                  type="button"
+                >
+                  <span className="min-w-0">
+                    <span className="block whitespace-normal break-words">{option.label}</span>
+                    {option.helper ? (
+                      <span className="mt-0.5 block whitespace-normal break-words text-[11px] font-medium leading-4 text-[#8a7f72]">
+                        {option.helper}
+                      </span>
+                    ) : null}
+                  </span>
+                  <span className="flex shrink-0 items-center gap-2">
+                    {option.badge ? (
+                      <Badge className="border-[#d8cbbb] bg-white text-[#6f4e2f]" variant="outline">
+                        {option.badge}
+                      </Badge>
+                    ) : null}
+                    {selected ? <CheckCircle2 className="h-4 w-4 text-emerald-700" /> : null}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        ))
+      ) : ledgerMasters.length === 0 ? (
+        <div className="px-3 py-4 text-sm font-semibold text-[#8a7f72]">
+          Tally ledgers are not loaded. Use Sync above, then search again.
+        </div>
+      ) : (
+        <div className="px-3 py-4 text-sm font-semibold text-[#8a7f72]">
+          No matching ledger found.
+        </div>
+      )}
+    </div>
+  ) : null;
 
   return (
     <div className="relative" ref={rootRef}>
@@ -953,108 +981,47 @@ function LedgerReviewSelect({
         />
       </div>
 
-      {open ? (
-        <div
-          className={`absolute z-[80] max-h-[min(20rem,calc(100vh-8rem))] w-full overflow-auto rounded-xl border border-[#d8cbbb] bg-white p-1 shadow-xl ${
-            openAbove ? "bottom-full mb-2" : "mt-2"
-          }`}
-        >
-          {queryCanCreate ? (
-            <div className="mb-1">
-              <div className="px-3 pb-1 pt-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
-                Create new
-              </div>
-              <button
-                className="flex w-full items-center justify-between gap-3 rounded-lg bg-amber-50 px-3 py-2 text-left text-sm font-semibold text-[#2b241d] transition hover:bg-amber-100"
-                onMouseDown={(event) => {
-                  event.preventDefault();
-                  selectOption({
-                    name: titleCaseLedgerName(query.trim()),
-                    action: "create_new_ledger",
-                    ledgerGroup: "Sundry Creditors",
-                  });
-                }}
-                type="button"
-              >
-                <span className="min-w-0">
-                  <span className="block truncate">Create new ledger: {titleCaseLedgerName(query.trim())}</span>
-                  <span className="mt-0.5 block text-[11px] font-medium text-[#8a7f72]">Group: Sundry Creditors</span>
-                </span>
-                <Badge className="shrink-0 border-amber-200 bg-white text-amber-800" variant="outline">
-                  Create new
-                </Badge>
-              </button>
-            </div>
-          ) : null}
-
-          {filteredGroups.length > 0 ? (
-            filteredGroups.map((group) => (
-              <div className="mb-1 last:mb-0" key={group.label}>
-                <div className="px-3 pb-1 pt-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
-                  {group.label}
-                </div>
-                {group.options.map((option) => {
-                  const selected =
-                    normalizeName(option.name) === normalizeName(transaction.selectedLedgerName) &&
-                    option.action === transaction.ledgerAction;
-                  return (
-                    <button
-                      className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold transition hover:bg-[#fbf4ea] ${
-                        selected ? "bg-[#f6efe6] text-[#4b3828]" : "text-[#2b241d]"
-                      }`}
-                      key={option.key}
-                      onMouseDown={(event) => {
-                        event.preventDefault();
-                        selectOption(option);
-                      }}
-                      type="button"
-                    >
-                      <span className="min-w-0">
-                        <span className="block truncate">{option.label}</span>
-                        {option.helper ? (
-                          <span className="mt-0.5 block truncate text-[11px] font-medium text-[#8a7f72]">
-                            {option.helper}
-                          </span>
-                        ) : null}
-                      </span>
-                      <span className="flex shrink-0 items-center gap-2">
-                        {option.badge ? (
-                          <Badge className="border-[#d8cbbb] bg-white text-[#6f4e2f]" variant="outline">
-                            {option.badge}
-                          </Badge>
-                        ) : null}
-                        {selected ? <CheckCircle2 className="h-4 w-4 text-emerald-700" /> : null}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            ))
-          ) : !queryCanCreate ? (
-            <div className="px-3 py-4 text-sm font-semibold text-[#8a7f72]">
-              No matching ledger found.
-            </div>
-          ) : null}
-        </div>
-      ) : null}
+      {popover ? createPortal(popover, document.body) : null}
     </div>
   );
 }
 
-function getLedgerActionLabel(transaction: ReviewTransaction) {
-  if (transaction.ledgerAction === "create_new_ledger") return "Create new";
-  if (transaction.ledgerAction === "use_suspense") return "Suspense";
-  if (transaction.ledgerAction === "use_standard_ledger") return "Standard";
-  if (transaction.ledgerAction === "use_existing_ledger") return "Matched";
-  return transaction.selectedLedgerName ? "Selected" : "Needs review";
+function getReviewStatus(transaction: ReviewTransaction): ReviewStatusFilter {
+  if (transaction.ledgerAction === "use_suspense" || isSuspenseLedgerName(transaction.selectedLedgerName)) {
+    return "suspense";
+  }
+  if (
+    transaction.selectedLedgerName.trim() &&
+    (transaction.ledgerAction === "use_existing_ledger" || transaction.ledgerAction === "use_standard_ledger")
+  ) {
+    return "matched";
+  }
+  return "needs_review";
 }
 
-function getLedgerActionTone(transaction: ReviewTransaction) {
-  if (!transaction.selectedLedgerName.trim()) return "warning";
-  if (transaction.ledgerAction === "create_new_ledger" || transaction.ledgerAction === "use_suspense") {
-    return "warning";
-  }
-  return "success";
+function getReviewStatusLabel(transaction: ReviewTransaction) {
+  const status = getReviewStatus(transaction);
+  if (status === "matched") return "Matched";
+  if (status === "suspense") return "In Suspense";
+  return "Needs review";
+}
+
+function getReviewStatusClass(transaction: ReviewTransaction) {
+  const status = getReviewStatus(transaction);
+  if (status === "matched") return "border-emerald-200 bg-emerald-50 text-emerald-800";
+  if (status === "suspense") return "border-amber-200 bg-amber-50 text-amber-800";
+  return "border-amber-200 bg-amber-50 text-amber-800";
+}
+
+function formatShortDate(value: string) {
+  const date = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return value || "-";
+  return date.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function getLedgerGroupLabel(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
+  const ledger = findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
+  return ledger?.parent || transaction.ledgerGroup || "-";
 }
 
 function transactionQueueKey(transaction: {
@@ -1137,6 +1104,13 @@ export function BankStatementsPage() {
   const [refreshingConnections, setRefreshingConnections] = useState(false);
   const [banner, setBanner] = useState<{ tone: MessageTone; text: string } | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const [reviewFiltersOpen, setReviewFiltersOpen] = useState(false);
+  const [reviewSearch, setReviewSearch] = useState("");
+  const [reviewStatusFilter, setReviewStatusFilter] = useState<ReviewStatusFilter>("all");
+  const [reviewDirectionFilter, setReviewDirectionFilter] = useState<ReviewDirectionFilter>("all");
+  const [reviewDateFrom, setReviewDateFrom] = useState("");
+  const [reviewDateTo, setReviewDateTo] = useState("");
+  const [rowsPerPage, setRowsPerPage] = useState(50);
 
   const validTransactions = useMemo(
     () => transactions.filter(transactionIsValid),
@@ -1163,11 +1137,64 @@ export function BankStatementsPage() {
   const matchedLedgerCount = transactions.filter(
     (transaction) =>
       transaction.selectedLedgerName.trim() &&
+      !isSuspenseLedgerName(transaction.selectedLedgerName) &&
       (transaction.ledgerAction === "use_existing_ledger" || transaction.ledgerAction === "use_standard_ledger")
   ).length;
-  const createLedgerCount = transactions.filter(
-    (transaction) => transaction.ledgerAction === "create_new_ledger"
+  const suspenseLedgerCount = transactions.filter(
+    (transaction) => transaction.ledgerAction === "use_suspense" || isSuspenseLedgerName(transaction.selectedLedgerName)
   ).length;
+  const needsReviewCount = transactions.filter(
+    (transaction) => getReviewStatus(transaction) === "needs_review"
+  ).length;
+  const filteredTransactions = useMemo(() => {
+    const normalizedSearch = normalizeName(reviewSearch);
+    return transactions.filter((transaction) => {
+      if (reviewStatusFilter !== "all" && getReviewStatus(transaction) !== reviewStatusFilter) {
+        return false;
+      }
+      if (reviewDirectionFilter === "debit" && (parseNumber(transaction.debitAmount) ?? 0) <= 0) {
+        return false;
+      }
+      if (reviewDirectionFilter === "credit" && (parseNumber(transaction.creditAmount) ?? 0) <= 0) {
+        return false;
+      }
+      if (reviewDateFrom && transaction.transactionDate < reviewDateFrom) {
+        return false;
+      }
+      if (reviewDateTo && transaction.transactionDate > reviewDateTo) {
+        return false;
+      }
+
+      if (!normalizedSearch) return true;
+
+      const searchable = [
+        transaction.transactionDate,
+        transaction.description,
+        transaction.referenceNumber,
+        transaction.transactionType,
+        transaction.category,
+        transaction.counterpartyName,
+        transaction.suggestedLedgerName,
+        transaction.selectedLedgerName,
+        transaction.ledgerGroup,
+        transaction.debitAmount,
+        transaction.creditAmount,
+        getTransactionPartyTitle(transaction),
+      ].join(" ");
+      return normalizeName(searchable).includes(normalizedSearch);
+    });
+  }, [reviewDateFrom, reviewDateTo, reviewDirectionFilter, reviewSearch, reviewStatusFilter, transactions]);
+  const visibleReviewTransactions = useMemo(
+    () => filteredTransactions.slice(0, rowsPerPage),
+    [filteredTransactions, rowsPerPage]
+  );
+  const activeReviewFilterCount = [
+    reviewSearch.trim(),
+    reviewStatusFilter !== "all" ? reviewStatusFilter : "",
+    reviewDirectionFilter !== "all" ? reviewDirectionFilter : "",
+    reviewDateFrom,
+    reviewDateTo,
+  ].filter(Boolean).length;
 
   const loadTallyConnections = useCallback(async () => {
     const response = await apiFetch("/api/tally/connections", { cache: "no-store" });
@@ -1315,10 +1342,7 @@ export function BankStatementsPage() {
               ...transaction,
               selectedLedgerName: selection.name,
               ledgerAction: selection.action,
-              ledgerGroup:
-                selection.action === "create_new_ledger"
-                  ? selection.ledgerGroup || transaction.ledgerGroup || "Sundry Creditors"
-                  : selection.ledgerGroup || "",
+              ledgerGroup: selection.ledgerGroup || "",
               requiresUserConfirmation: false,
             }
           : transaction
@@ -1605,6 +1629,7 @@ export function BankStatementsPage() {
       const transactionsResponse = await apiFetch(
         `/api/bank-statements/transactions?${new URLSearchParams({
           accountId: confirmPayload.account.id,
+          importId: confirmPayload.import.id,
           status: "queueable",
           connectionId: tallyConnectionId,
         }).toString()}`,
@@ -1644,13 +1669,6 @@ export function BankStatementsPage() {
             transactionId: transaction.id,
             ...(() => {
               const reviewedTransaction = reviewedTransactionsByKey.get(transactionQueueKey(transaction));
-              if (reviewedTransaction?.ledgerAction === "create_new_ledger") {
-                return {
-                  counterpartyLedgerName: "",
-                  createLedgerName: reviewedTransaction.selectedLedgerName,
-                  createLedgerParentName: reviewedTransaction.ledgerGroup || "Sundry Creditors",
-                };
-              }
               return {
                 counterpartyLedgerName:
                   reviewedTransaction?.selectedLedgerName ||
@@ -1671,29 +1689,6 @@ export function BankStatementsPage() {
       }
 
       const queuedPayload = (await queueResponse.json()) as { queuedCount?: number; commands?: TallyCommand[] };
-      const createLedgerCommands = (queuedPayload.commands ?? []).filter(
-        (command) => (command.commandType || command.command_type) === "create_ledger"
-      );
-      if (createLedgerCommands.length > 0) {
-        setBanner({
-          tone: "info",
-          text: "Creating new Tally ledgers. Keep the connector open.",
-        });
-        const completedCreateCommands = await Promise.all(
-          createLedgerCommands.map((command) => waitForCommand(tallyConnectionId, command.id))
-        );
-        const failedCreateCommand = completedCreateCommands.find(
-          (command) => command && command.status !== "succeeded"
-        );
-        if (failedCreateCommand) {
-          throw new Error(failedCreateCommand.error || "A Tally ledger could not be created.");
-        }
-        if (completedCreateCommands.every(Boolean)) {
-          await loadLedgerMasters(tallyConnectionId);
-        } else {
-          showToast("info", "Ledger creation is still running. Refresh Tally ledgers before uploading the next statement.");
-        }
-      }
       setAccounts((current) => [confirmPayload.account, ...current.filter((item) => item.id !== confirmPayload.account.id)]);
       setRecentImports((current) => [confirmPayload.import, ...current.filter((item) => item.id !== confirmPayload.import.id)]);
       setPreview(null);
@@ -1744,7 +1739,7 @@ export function BankStatementsPage() {
           </div>
         ))}
       </div>
-      <div className={`min-h-screen bg-[#f7f4ee] px-4 py-6 text-[#1a1a1a] sm:px-8 sm:py-8 ${preview ? "pb-28" : ""}`}>
+      <div className={`min-h-screen bg-[#f7f4ee] px-4 py-6 text-[#1a1a1a] sm:px-8 sm:py-8 ${preview ? "pb-40" : ""}`}>
         <div className="mx-auto flex max-w-7xl flex-col gap-6">
           <header className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
             <div className="flex items-start gap-3">
@@ -1980,194 +1975,313 @@ export function BankStatementsPage() {
                 </div>
               </div>
 
-              <div className="rounded-2xl border border-[#e3d6c6] bg-white shadow-sm">
-                <div className="flex flex-col gap-3 border-b border-[#eee5da] px-5 py-4 lg:flex-row lg:items-start lg:justify-between">
-                  <div className="min-w-0">
-                    <h2 className="text-sm font-black uppercase tracking-[0.16em] text-[#6f6256]">
-                      Review statement
-                    </h2>
-                    <p className="mt-1 text-xs font-medium text-[#9a8d7f]">
-                      Most rows are ready automatically. Only review rows marked Needs ledger.
-                    </p>
-                    <div className="mt-3 flex flex-wrap gap-1.5">
-                      {[
-                        account.bankName ? `Bank: ${account.bankName}` : "Bank not found",
-                        account.accountNumber ? `Account: ${maskAccountNumber(account.accountNumber)}` : "Account not found",
-                        account.accountHolderName ? `Holder: ${account.accountHolderName}` : "Holder not found",
-                        account.ifscCode ? `IFSC: ${account.ifscCode}` : "IFSC not found",
-                      ].map((item) => (
-                        <span
-                          className="max-w-full truncate rounded-md border border-[#e6dccf] bg-[#fbf7f1] px-2 py-1 text-[11px] font-bold text-[#6f6256]"
-                          key={item}
-                        >
-                          {item}
+              <div className="overflow-hidden rounded-2xl border border-[#e3d6c6] bg-white shadow-sm">
+                <div className="border-b border-[#eee5da] px-4 py-3">
+                  <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                    <button
+                      className={`inline-flex h-9 w-fit items-center gap-2 rounded-md border px-3 text-xs font-black transition ${
+                        reviewFiltersOpen || activeReviewFilterCount > 0
+                          ? "border-[#7c5f3f] bg-[#fbf4ea] text-[#4b3828]"
+                          : "border-[#e3d6c6] bg-[#fbf7f1] text-[#4b3828] hover:bg-[#f6efe6]"
+                      }`}
+                      onClick={() => setReviewFiltersOpen((current) => !current)}
+                      type="button"
+                    >
+                      <Filter className="h-3.5 w-3.5" />
+                      Filters
+                      {activeReviewFilterCount > 0 ? (
+                        <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-[#4b3828] px-1.5 text-[10px] text-white">
+                          {activeReviewFilterCount}
                         </span>
-                      ))}
+                      ) : null}
+                    </button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge className="border-[#d6c8b8] bg-[#f6efe6] text-[#6f4e2f]" variant="outline">
+                        {transactions.length} total
+                      </Badge>
+                      <Badge className="border-emerald-200 bg-emerald-50 text-emerald-800" variant="outline">
+                        {matchedLedgerCount} matched
+                      </Badge>
+                      {needsReviewCount > 0 ? (
+                        <Badge className="border-amber-200 bg-amber-50 text-amber-800" variant="outline">
+                          {needsReviewCount} needs review
+                        </Badge>
+                      ) : null}
+                      {suspenseLedgerCount > 0 ? (
+                        <Badge className="border-amber-200 bg-amber-50 text-amber-800" variant="outline">
+                          {suspenseLedgerCount} in suspense
+                        </Badge>
+                      ) : null}
+                      <Badge
+                        className={
+                          missingLedgerCount === 0
+                            ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                            : "border-amber-200 bg-amber-50 text-amber-800"
+                        }
+                        variant="outline"
+                      >
+                        {missingLedgerCount === 0 ? "Ready" : `${missingLedgerCount} need ledger`}
+                      </Badge>
                     </div>
                   </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Badge className="border-[#d6c8b8] bg-[#f6efe6] text-[#6f4e2f]" variant="outline">
-                      {validTransactions.length} rows
-                    </Badge>
-                    <Badge className="border-emerald-200 bg-emerald-50 text-emerald-800" variant="outline">
-                      {matchedLedgerCount} matched
-                    </Badge>
-                    {createLedgerCount > 0 ? (
-                      <Badge className="border-amber-200 bg-amber-50 text-amber-800" variant="outline">
-                        {createLedgerCount} create new
-                      </Badge>
-                    ) : null}
-                    <Badge
-                      className={
-                        missingLedgerCount === 0
-                          ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-                          : "border-amber-200 bg-amber-50 text-amber-800"
-                      }
-                      variant="outline"
-                    >
-                      {missingLedgerCount === 0 ? "Ready" : `${missingLedgerCount} need ledger`}
-                    </Badge>
-                  </div>
+                  {reviewFiltersOpen ? (
+                    <div className="mt-3 rounded-xl border border-[#e3d6c6] bg-[#fdfaf6] p-3">
+                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.4fr_0.8fr_0.8fr_0.8fr_0.8fr_auto] xl:items-end">
+                        <label className="block">
+                          <span className="text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
+                            Search
+                          </span>
+                          <div className="relative mt-1">
+                            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9a8d7f]" />
+                            <input
+                              className="h-9 w-full rounded-md border border-[#e3d6c6] bg-white px-3 pl-9 text-xs font-semibold text-[#2b241d] outline-none placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
+                              onChange={(event) => setReviewSearch(event.target.value)}
+                              placeholder="Narration, amount, ledger, reference..."
+                              value={reviewSearch}
+                            />
+                          </div>
+                        </label>
+                        <label className="block">
+                          <span className="text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
+                            Status
+                          </span>
+                          <select
+                            className="mt-1 h-9 w-full rounded-md border border-[#e3d6c6] bg-white px-3 text-xs font-bold text-[#4b3828] outline-none focus:border-[#7c5f3f]"
+                            onChange={(event) => setReviewStatusFilter(event.target.value as ReviewStatusFilter)}
+                            value={reviewStatusFilter}
+                          >
+                            <option value="all">All rows</option>
+                            <option value="matched">Matched</option>
+                            <option value="needs_review">Needs review</option>
+                            <option value="suspense">Suspense</option>
+                          </select>
+                        </label>
+                        <label className="block">
+                          <span className="text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
+                            Type
+                          </span>
+                          <select
+                            className="mt-1 h-9 w-full rounded-md border border-[#e3d6c6] bg-white px-3 text-xs font-bold text-[#4b3828] outline-none focus:border-[#7c5f3f]"
+                            onChange={(event) => setReviewDirectionFilter(event.target.value as ReviewDirectionFilter)}
+                            value={reviewDirectionFilter}
+                          >
+                            <option value="all">Debit and credit</option>
+                            <option value="debit">Debit only</option>
+                            <option value="credit">Credit only</option>
+                          </select>
+                        </label>
+                        <label className="block">
+                          <span className="text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
+                            From date
+                          </span>
+                          <div className="relative mt-1">
+                            <CalendarDays className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#9a8d7f]" />
+                            <input
+                              className="h-9 w-full rounded-md border border-[#e3d6c6] bg-white px-3 pl-9 text-xs font-bold text-[#4b3828] outline-none focus:border-[#7c5f3f]"
+                              onChange={(event) => setReviewDateFrom(event.target.value)}
+                              type="date"
+                              value={reviewDateFrom}
+                            />
+                          </div>
+                        </label>
+                        <label className="block">
+                          <span className="text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
+                            To date
+                          </span>
+                          <div className="relative mt-1">
+                            <CalendarDays className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#9a8d7f]" />
+                            <input
+                              className="h-9 w-full rounded-md border border-[#e3d6c6] bg-white px-3 pl-9 text-xs font-bold text-[#4b3828] outline-none focus:border-[#7c5f3f]"
+                              onChange={(event) => setReviewDateTo(event.target.value)}
+                              type="date"
+                              value={reviewDateTo}
+                            />
+                          </div>
+                        </label>
+                        <button
+                          className="h-9 rounded-md border border-[#e3d6c6] bg-white px-3 text-xs font-bold text-[#7c5f3f] hover:bg-[#fbf4ea]"
+                          onClick={() => {
+                            setReviewSearch("");
+                            setReviewStatusFilter("all");
+                            setReviewDirectionFilter("all");
+                            setReviewDateFrom("");
+                            setReviewDateTo("");
+                          }}
+                          type="button"
+                        >
+                          Reset
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
 
-                <div className="divide-y divide-[#eee5da]">
-                  {transactions.length === 0 ? (
-                    <div className="px-6 py-10 text-center text-sm font-semibold text-[#8a7f72]">
-                      No rows were extracted. Upload another file or add rows after extraction support improves.
-                    </div>
-                  ) : (
-                    transactions.map((transaction, index) => {
-                      const debit = formatAmount(transaction.debitAmount);
-                      const credit = formatAmount(transaction.creditAmount);
-                      const partyTitle = getTransactionPartyTitle(transaction);
-                      const metaItems = getTransactionMetaItems(transaction);
-                      const isEditingLedger = editingLedgerIds.has(transaction.id);
-                      const needsLedger = !transaction.selectedLedgerName.trim();
-                      const actionTone = getLedgerActionTone(transaction);
-                      const showLedgerSelect = needsLedger || isEditingLedger || transaction.ledgerAction === "needs_review";
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[1120px] border-collapse text-left">
+                    <thead>
+                      <tr className="border-b border-[#eee5da] bg-[#fbf7f1] text-[10px] font-black uppercase tracking-[0.14em] text-[#8a7f72]">
+                        <th className="w-32 px-3 py-3">Date</th>
+                        <th className="px-3 py-3">Narration</th>
+                        <th className="w-24 px-3 py-3">Type</th>
+                        <th className="w-32 px-3 py-3">Ref / UTR</th>
+                        <th className="w-36 px-3 py-3 text-right">Withdrawal (Dr)</th>
+                        <th className="w-36 px-3 py-3 text-right">Deposit (Cr)</th>
+                        <th className="w-72 px-3 py-3">Tally ledger</th>
+                        <th className="w-32 px-3 py-3">Status</th>
+                        <th className="w-20 px-3 py-3 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#eee5da]">
+                      {transactions.length === 0 ? (
+                        <tr>
+                          <td colSpan={9} className="px-6 py-12 text-center text-sm font-semibold text-[#8a7f72]">
+                            No rows were extracted. Upload another file or add rows after extraction support improves.
+                          </td>
+                        </tr>
+                      ) : visibleReviewTransactions.length === 0 ? (
+                        <tr>
+                          <td colSpan={9} className="px-6 py-12 text-center text-sm font-semibold text-[#8a7f72]">
+                            No rows match the current filters.
+                          </td>
+                        </tr>
+                      ) : (
+                        visibleReviewTransactions.map((transaction) => {
+                          const debit = formatAmount(transaction.debitAmount);
+                          const credit = formatAmount(transaction.creditAmount);
+                          const partyTitle = getTransactionPartyTitle(transaction);
+                          const direction = getTransactionDirection(transaction);
+                          const mode = getTransactionMode(transaction);
+                          const reference = getTransactionReference(transaction);
+                          const isEditingLedger = editingLedgerIds.has(transaction.id);
+                          const showLedgerSelect = isEditingLedger;
 
-                      return (
-                        <div key={transaction.id} className="grid gap-4 px-4 py-4 lg:grid-cols-[64px_1.8fr_150px_300px]">
-                          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[#f0e7da] text-sm font-black text-[#6f4e2f]">
-                            {index + 1}
-                          </div>
-
-                          <div className="min-w-0">
-                            <div className="truncate text-base font-black text-[#2b241d]" title={partyTitle}>
-                              {partyTitle}
-                            </div>
-                            <div className="mt-2 flex flex-wrap gap-1.5">
-                              {metaItems.length > 0 ? (
-                                metaItems.map((item) => (
-                                  <span
-                                    className="rounded-md border border-[#e6dccf] bg-[#fbf7f1] px-2 py-1 text-[11px] font-bold text-[#6f6256]"
-                                    key={item}
-                                  >
-                                    {item}
-                                  </span>
-                                ))
-                              ) : (
-                                <span className="rounded-md border border-[#e6dccf] bg-[#fbf7f1] px-2 py-1 text-[11px] font-bold text-[#8a7f72]">
-                                  Details not found
-                                </span>
-                              )}
-                            </div>
-                            <div
-                              className="mt-2 line-clamp-2 text-xs font-semibold leading-5 text-[#8a7f72]"
-                              title={transaction.description}
-                            >
-                              <span className="font-black uppercase tracking-[0.12em] text-[#b0a294]">
-                                Narration
-                              </span>{" "}
-                              {transaction.description || "Not found"}
-                            </div>
-                          </div>
-
-                          <div className="rounded-lg border border-[#eee5da] bg-[#fdfaf6] px-3 py-2">
-                            <div className="text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
-                              Amount
-                            </div>
-                            <div className="mt-1 text-sm font-black text-[#2b241d]">
-                              {debit ? `Dr ${debit}` : credit ? `Cr ${credit}` : "0"}
-                            </div>
-                          </div>
-
-                          <div className="space-y-2">
-                            <div
-                              className={`rounded-lg border px-3 py-2 ${
-                                actionTone === "warning"
-                                  ? "border-amber-200 bg-amber-50"
-                                  : "border-emerald-200 bg-emerald-50"
-                              }`}
-                            >
-                              <div className="flex items-start justify-between gap-2">
-                                <div className="min-w-0">
-                                  <div className="text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
-                                    Tally ledger
-                                  </div>
-                                  <div className="mt-1 truncate text-sm font-black text-[#2b241d]">
-                                    {transaction.selectedLedgerName ||
-                                      transaction.suggestedLedgerName ||
-                                      transaction.counterpartyName ||
-                                      "Choose ledger"}
-                                  </div>
+                          return (
+                            <tr key={transaction.id} className="align-middle text-sm text-[#2b241d] hover:bg-[#fffaf4]">
+                              <td className="px-3 py-3 text-xs font-semibold text-[#4b4036]">
+                                {formatShortDate(transaction.transactionDate)}
+                              </td>
+                              <td className="max-w-[360px] px-3 py-3">
+                                <div className="truncate text-sm font-black text-[#2b241d]" title={partyTitle}>
+                                  {partyTitle}
                                 </div>
+                                <div className="mt-1 truncate text-xs font-semibold text-[#8a7f72]" title={transaction.description}>
+                                  {transaction.description || "Narration not found"}
+                                </div>
+                              </td>
+                              <td className="px-3 py-3">
                                 <Badge
                                   className={
-                                    actionTone === "warning"
-                                      ? "border-amber-200 bg-white text-amber-800"
-                                      : "border-emerald-200 bg-white text-emerald-800"
+                                    direction === "Credit"
+                                      ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                                      : "border-red-200 bg-red-50 text-red-700"
                                   }
                                   variant="outline"
                                 >
-                                  {getLedgerActionLabel(transaction)}
+                                  {direction}
                                 </Badge>
-                              </div>
-                              {transaction.ledgerAction === "create_new_ledger" && transaction.ledgerGroup ? (
-                                <div className="mt-1 text-[11px] font-semibold text-[#8a7f72]">
-                                  Group: {transaction.ledgerGroup}
+                              </td>
+                              <td className="max-w-[150px] px-3 py-3">
+                                <div className="truncate text-xs font-black text-[#4b4036]" title={mode}>
+                                  {mode || "-"}
                                 </div>
-                              ) : null}
-                              {transaction.suggestionReason ? (
-                                <div className="mt-1 text-[11px] font-medium text-[#8a7f72]">
-                                  {transaction.suggestionReason}
+                                <div className="mt-1 truncate text-xs font-semibold text-[#8a7f72]" title={reference}>
+                                  {reference || "-"}
                                 </div>
-                              ) : null}
-                            </div>
-                            {showLedgerSelect ? (
-                              <LedgerReviewSelect
-                                ledgerMasters={ledgerMasters}
-                                onChange={(selection) => {
-                                  updateLedgerSelection(transaction.id, selection);
-                                  setEditingLedgerIds((current) => {
-                                    const next = new Set(current);
-                                    next.delete(transaction.id);
-                                    return next;
-                                  });
-                                }}
-                                transaction={transaction}
-                              />
-                            ) : (
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setEditingLedgerIds((current) => new Set(current).add(transaction.id))
-                                }
-                                className="text-left text-xs font-bold text-[#6f4e2f] underline-offset-2 hover:underline"
-                              >
-                                Change ledger
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
+                              </td>
+                              <td className="px-3 py-3 text-right text-xs font-black text-red-600">
+                                {debit || "-"}
+                              </td>
+                              <td className="px-3 py-3 text-right text-xs font-black text-emerald-700">
+                                {credit || "-"}
+                              </td>
+                              <td className="px-3 py-3">
+                                {showLedgerSelect ? (
+                                  <LedgerReviewSelect
+                                    ledgerMasters={ledgerMasters}
+                                    onChange={(selection) => {
+                                      updateLedgerSelection(transaction.id, selection);
+                                      setEditingLedgerIds((current) => {
+                                        const next = new Set(current);
+                                        next.delete(transaction.id);
+                                        return next;
+                                      });
+                                    }}
+                                    transaction={transaction}
+                                  />
+                                ) : (
+                                  <div className="block max-w-full text-left">
+                                    <span className="block truncate text-sm font-black text-[#2b241d]" title={transaction.selectedLedgerName}>
+                                      {transaction.selectedLedgerName}
+                                    </span>
+                                    <span className="mt-1 block truncate text-xs font-semibold text-[#8a7f72]">
+                                      {getLedgerGroupLabel(transaction, ledgerMasters)}
+                                    </span>
+                                  </div>
+                                )}
+                              </td>
+                              <td className="px-3 py-3">
+                                <Badge className={getReviewStatusClass(transaction)} variant="outline">
+                                  {getReviewStatusLabel(transaction)}
+                                </Badge>
+                              </td>
+                              <td className="px-3 py-3">
+                                <div className="flex justify-end gap-1">
+                                  <button
+                                    className={`inline-flex h-8 w-8 items-center justify-center rounded-md transition ${
+                                      isEditingLedger
+                                        ? "bg-[#4b3828] text-white hover:bg-[#38291d]"
+                                        : "text-[#6f6256] hover:bg-[#f6efe6]"
+                                    }`}
+                                    onClick={() =>
+                                      setEditingLedgerIds((current) => {
+                                        const next = new Set(current);
+                                        if (next.has(transaction.id)) {
+                                          next.delete(transaction.id);
+                                        } else {
+                                          next.add(transaction.id);
+                                        }
+                                        return next;
+                                      })
+                                    }
+                                    title={isEditingLedger ? "Close ledger selection" : "Change ledger"}
+                                    type="button"
+                                  >
+                                    {isEditingLedger ? <X className="h-4 w-4" /> : <Pencil className="h-4 w-4" />}
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
                 </div>
 
+                <div className="flex flex-col gap-3 border-t border-[#eee5da] px-4 py-3 text-xs font-semibold text-[#6f6256] sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex items-center gap-2">
+                    <span>Rows per page</span>
+                    <select
+                      className="h-8 rounded-md border border-[#e3d6c6] bg-white px-2 text-xs font-bold text-[#4b3828] outline-none"
+                      onChange={(event) => setRowsPerPage(Number(event.target.value))}
+                      value={rowsPerPage}
+                    >
+                      {[25, 50, 100, 200].map((value) => (
+                        <option key={value} value={value}>
+                          {value}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    Showing {visibleReviewTransactions.length === 0 ? 0 : 1}-
+                    {visibleReviewTransactions.length} of {filteredTransactions.length}
+                  </div>
+                </div>
               </div>
 
-              <div className="sticky bottom-0 z-40 flex flex-col gap-3 rounded-t-2xl border border-[#d8cbbb] bg-[#fbf7f1]/95 px-5 py-4 shadow-[0_-8px_24px_rgba(74,56,40,0.10)] backdrop-blur sm:flex-row sm:items-center sm:justify-between">
+              <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-[#d8cbbb] bg-[#fbf7f1]/95 px-4 py-3 shadow-[0_-8px_24px_rgba(74,56,40,0.10)] backdrop-blur sm:left-[224px] sm:px-8">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="text-sm font-semibold text-[#5f5348]">
                   {validTransactions.length} row(s) ready after review.
                 </div>
@@ -2193,6 +2307,7 @@ export function BankStatementsPage() {
                     {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
                     Send To Tally
                   </Button>
+                </div>
                 </div>
               </div>
             </section>
