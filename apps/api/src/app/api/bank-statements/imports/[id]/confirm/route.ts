@@ -104,11 +104,17 @@ function toTransaction(value: unknown): ParsedBankTransaction | null {
   };
 }
 
-function latestTransactionDate(transactions: ParsedBankTransaction[]) {
-  return transactions
-    .map((transaction) => transaction.transactionDate)
+function latestRowTransactionDate(rows: Array<{ transaction_date: string }>) {
+  return rows
+    .map((row) => row.transaction_date)
     .sort()
     .at(-1);
+}
+
+function checkpointDate(value: unknown) {
+  const raw = typeof value === "string" ? value : "";
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  return match?.[1] ?? null;
 }
 
 function getTransactionAmount(row: {
@@ -172,7 +178,6 @@ export async function POST(
 
     let accountId = body.accountId || importRow.bank_account_id || null;
     let accountRow = null;
-    const requestedTallyLedgerName = toText(body.account?.tallyLedgerName) || null;
 
     if (accountId) {
       const { data, error } = await supabase
@@ -185,84 +190,26 @@ export async function POST(
         return jsonWithCors(request, { error: "Selected bank account was not found." }, { status: 404 });
       }
       accountRow = data;
-      if (requestedTallyLedgerName && data.tally_ledger_name !== requestedTallyLedgerName) {
-        const { data: updated, error: updateError } = await supabase
-          .from("bank_accounts")
-          .update({ tally_ledger_name: requestedTallyLedgerName })
-          .eq("id", accountId)
-          .eq("owner_user_id", user.id)
-          .select("*")
-          .single();
-        if (updateError) throw updateError;
-        accountRow = updated;
-      }
     } else {
       const account = body.account ?? {};
-      const initialAccountNumber = account.accountNumber || importRow.extracted_account_number || "";
-      let syncedLedgerBankDetails: {
-        bankName?: string | null;
-        accountNumber?: string | null;
-        accountHolderName?: string | null;
-        ifscCode?: string | null;
-      } = {};
-
-      if (!normalizeAccountNumber(initialAccountNumber) && requestedTallyLedgerName) {
-        const { data: ledgerMaster, error: ledgerMasterError } = await supabase
-          .from("tally_masters")
-          .select("raw_payload")
-          .eq("owner_user_id", user.id)
-          .eq("master_type", "ledger")
-          .eq("is_active", true)
-          .eq("tally_name", requestedTallyLedgerName)
-          .order("last_synced_at", { ascending: false })
-          .limit(1)
-          .maybeSingle();
-
-        if (ledgerMasterError) throw ledgerMasterError;
-
-        const rawPayload =
-          ledgerMaster?.raw_payload &&
-          typeof ledgerMaster.raw_payload === "object" &&
-          !Array.isArray(ledgerMaster.raw_payload)
-            ? (ledgerMaster.raw_payload as Record<string, unknown>)
-            : {};
-
-        syncedLedgerBankDetails = {
-          bankName: toText(rawPayload.bankName) || null,
-          accountNumber: toText(rawPayload.bankAccountNumber) || null,
-          accountHolderName: toText(rawPayload.accountHolderName) || null,
-          ifscCode: toText(rawPayload.ifscCode) || null,
-        };
-      }
-
       const accountNumber =
-        initialAccountNumber || syncedLedgerBankDetails.accountNumber || "";
+        account.accountNumber || importRow.extracted_account_number || "";
       const normalizedAccountNumber = normalizeAccountNumber(accountNumber);
       if (!normalizedAccountNumber) {
         return jsonWithCors(
           request,
-          {
-            error:
-              "Account number is required when creating a new bank account. Sync Tally bank ledger details or enter the account number manually.",
-          },
+          { error: "Account number is required when creating a new bank account." },
           { status: 400 }
         );
       }
 
       const insertPayload = {
         owner_user_id: user.id,
-        bank_name: account.bankName || importRow.extracted_bank_name || syncedLedgerBankDetails.bankName || null,
+        bank_name: account.bankName || importRow.extracted_bank_name || null,
         account_number_normalized: normalizedAccountNumber,
         account_number_masked: maskAccountNumber(accountNumber),
-        account_holder_name:
-          account.accountHolderName ||
-          importRow.extracted_account_holder_name ||
-          syncedLedgerBankDetails.accountHolderName ||
-          null,
-        ifsc_code:
-          normalizeIfscCode(account.ifscCode || importRow.extracted_ifsc_code || syncedLedgerBankDetails.ifscCode || null) ||
-          null,
-        tally_ledger_name: requestedTallyLedgerName,
+        account_holder_name: account.accountHolderName || importRow.extracted_account_holder_name || null,
+        ifsc_code: normalizeIfscCode(account.ifscCode || importRow.extracted_ifsc_code || null) || null,
       };
 
       const { data, error } = await supabase
@@ -282,17 +229,6 @@ export async function POST(
         accountRow = existing;
       } else {
         accountRow = data;
-      }
-      if (requestedTallyLedgerName && accountRow.tally_ledger_name !== requestedTallyLedgerName) {
-        const { data: updated, error: updateError } = await supabase
-          .from("bank_accounts")
-          .update({ tally_ledger_name: requestedTallyLedgerName })
-          .eq("id", accountRow.id)
-          .eq("owner_user_id", user.id)
-          .select("*")
-          .single();
-        if (updateError) throw updateError;
-        accountRow = updated;
       }
       accountId = accountRow.id;
     }
@@ -335,6 +271,10 @@ export async function POST(
       })
     );
     const rows = Array.from(rowsByFingerprint.values());
+    const lastImportedTransactionDate = checkpointDate(accountRow.last_imported_transaction_at);
+    const rowsAfterCheckpoint = lastImportedTransactionDate
+      ? rows.filter((row) => row.transaction_date > lastImportedTransactionDate)
+      : rows;
 
     const { data: existingPostedRows, error: existingPostedError } = await supabase
       .from("bank_transactions")
@@ -379,60 +319,51 @@ export async function POST(
       if (postedLogError) throw postedLogError;
     }
 
-    const fingerprints = rows.map((row) => row.fingerprint);
-    const { data: postedLogData, error: postedLogReadError } = await supabase
-      .from("bank_transaction_posting_log")
-      .select("fingerprint, tally_voucher_id, tally_posted_at")
-      .eq("owner_user_id", user.id)
-      .eq("bank_account_id", accountId)
-      .eq("status", "posted")
-      .in("fingerprint", fingerprints);
+    const fingerprints = rowsAfterCheckpoint.map((row) => row.fingerprint);
+    const { data: postedLogData, error: postedLogReadError } = fingerprints.length
+      ? await supabase
+          .from("bank_transaction_posting_log")
+          .select("fingerprint, tally_voucher_id, tally_posted_at")
+          .eq("owner_user_id", user.id)
+          .eq("bank_account_id", accountId)
+          .eq("status", "posted")
+          .in("fingerprint", fingerprints)
+      : { data: [], error: null };
 
     if (postedLogReadError) throw postedLogReadError;
 
+    const { data: existingTransactionData, error: existingTransactionReadError } = fingerprints.length
+      ? await supabase
+          .from("bank_transactions")
+          .select("fingerprint")
+          .eq("owner_user_id", user.id)
+          .eq("bank_account_id", accountId)
+          .in("fingerprint", fingerprints)
+      : { data: [], error: null };
+
+    if (existingTransactionReadError) throw existingTransactionReadError;
+
+    const existingFingerprints = new Set(
+      ((existingTransactionData ?? []) as Array<{ fingerprint: string | null }>).flatMap((row) =>
+        row.fingerprint ? [row.fingerprint] : []
+      )
+    );
     const postedByFingerprint = new Map(
       ((postedLogData ?? []) as unknown as PostedLogRow[]).map((row) => [row.fingerprint, row])
     );
-    const snapshotRows = rows.map((row) => {
+    const snapshotRows = rowsAfterCheckpoint.flatMap((row) => {
+      if (existingFingerprints.has(row.fingerprint)) return [];
       const postedLog = postedByFingerprint.get(row.fingerprint);
-      if (!postedLog) return row;
-      return {
-        ...row,
-        tally_status: "posted",
-        tally_posted_at: postedLog.tally_posted_at,
-        tally_voucher_id: postedLog.tally_voucher_id,
-      };
+      if (!postedLog) return [row];
+      return [
+        {
+          ...row,
+          tally_status: "posted",
+          tally_posted_at: postedLog.tally_posted_at,
+          tally_voucher_id: postedLog.tally_voucher_id,
+        },
+      ];
     });
-
-    await supabase
-      .from("tally_bridge_commands")
-      .update({
-        status: "canceled",
-        error: "Canceled because a newer bank statement snapshot was confirmed.",
-        completed_at: new Date().toISOString(),
-      })
-      .eq("owner_user_id", user.id)
-      .eq("command_type", "post_bank_voucher")
-      .eq("status", "queued")
-      .contains("payload", { bankAccountId: accountId });
-
-    await supabase
-      .from("bank_transaction_posting_log")
-      .update({
-        status: "canceled",
-        error: "Canceled because a newer bank statement snapshot was confirmed.",
-      })
-      .eq("owner_user_id", user.id)
-      .eq("bank_account_id", accountId)
-      .eq("status", "queued");
-
-    const { error: deleteSnapshotError } = await supabase
-      .from("bank_transactions")
-      .delete()
-      .eq("owner_user_id", user.id)
-      .eq("bank_account_id", accountId);
-
-    if (deleteSnapshotError) throw deleteSnapshotError;
 
     const rowsToInsert = snapshotRows.map((row) => ({
       owner_user_id: user.id,
@@ -467,25 +398,29 @@ export async function POST(
       if (insertError) throw insertError;
     }
 
-    const latestDate = latestTransactionDate(transactions);
-    const accountUpdate = latestDate
-      ? {
-          last_imported_transaction_at: `${latestDate}T00:00:00.000Z`,
-          ...(requestedTallyLedgerName ? { tally_ledger_name: requestedTallyLedgerName } : {}),
-        }
-      : requestedTallyLedgerName
-        ? { tally_ledger_name: requestedTallyLedgerName }
-        : {};
+    const latestAcceptedDate = latestRowTransactionDate(rowsAfterCheckpoint);
+    const accountUpdate = latestAcceptedDate
+      ? { last_imported_transaction_at: `${latestAcceptedDate}T00:00:00.000Z` }
+      : {};
 
-    const [{ data: updatedAccount, error: accountUpdateError }, { data: updatedImport, error: importUpdateError }] =
-      await Promise.all([
-        supabase
+    const accountUpdatePromise = latestAcceptedDate
+      ? supabase
           .from("bank_accounts")
           .update(accountUpdate)
           .eq("id", accountId)
           .eq("owner_user_id", user.id)
           .select("*")
-          .single(),
+          .single()
+      : supabase
+          .from("bank_accounts")
+          .select("*")
+          .eq("id", accountId)
+          .eq("owner_user_id", user.id)
+          .single();
+
+    const [{ data: updatedAccount, error: accountUpdateError }, { data: updatedImport, error: importUpdateError }] =
+      await Promise.all([
+        accountUpdatePromise,
         supabase
           .from("bank_statement_imports")
           .update({
@@ -499,7 +434,10 @@ export async function POST(
                 : {}),
               confirmedAt: new Date().toISOString(),
               confirmedTransactionCount: transactions.length,
-              snapshotReplacedAt: new Date().toISOString(),
+              importedAfterTransactionDate: lastImportedTransactionDate,
+              skippedByCheckpointCount: rows.length - rowsAfterCheckpoint.length,
+              existingTransactionCount: existingFingerprints.size,
+              appendCompletedAt: new Date().toISOString(),
               alreadyPostedTransactionCount: postedByFingerprint.size,
             },
           })
@@ -511,18 +449,6 @@ export async function POST(
 
     if (accountUpdateError) throw accountUpdateError;
     if (importUpdateError) throw importUpdateError;
-
-    await supabase
-      .from("bank_statement_import_preview_transactions")
-      .delete()
-      .eq("import_id", id)
-      .eq("owner_user_id", user.id);
-
-    await supabase
-      .from("bank_statement_extraction_jobs")
-      .delete()
-      .eq("import_id", id)
-      .eq("owner_user_id", user.id);
 
     const { data: olderImports, error: olderImportsError } = await supabase
       .from("bank_statement_imports")
@@ -557,6 +483,8 @@ export async function POST(
       import: serializeImport(updatedImport as Record<string, unknown>),
       importedTransactionCount: rowsToInsert.length,
       duplicateTransactionCount: transactions.length - rowsToInsert.length,
+      skippedByCheckpointCount: rows.length - rowsAfterCheckpoint.length,
+      existingTransactionCount: existingFingerprints.size,
       alreadyPostedTransactionCount: postedByFingerprint.size,
     });
   } catch (error) {

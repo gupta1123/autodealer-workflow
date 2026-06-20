@@ -94,6 +94,21 @@ type MappingRow = {
   notes: string;
 };
 
+type TransactionLedgerSelection = {
+  counterpartyLedgerName: string;
+  createLedgerName: string;
+  createLedgerParentName: string;
+};
+
+type TallyCommandInsert = {
+  connection_id: string;
+  owner_user_id: string;
+  command_type: "create_ledger" | "post_bank_voucher";
+  status: "queued";
+  priority: number;
+  payload: Record<string, unknown>;
+};
+
 function toText(value: unknown, maxLength = 500) {
   if (value === null || value === undefined) return "";
   return String(value).trim().slice(0, maxLength);
@@ -173,21 +188,24 @@ export async function POST(request: Request) {
     const requestedTransactionIds = Array.isArray(body.transactionIds)
       ? body.transactionIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
       : [];
-    const selectedLedgerByTransactionId = new Map(
+    const ledgerSelectionByTransactionId = new Map<string, TransactionLedgerSelection>(
       (Array.isArray(body.transactions) ? body.transactions : []).flatMap((transaction) => {
         const transactionId = toText(transaction?.transactionId, 80);
-        const ledgerName = toText(transaction?.counterpartyLedgerName, 500);
-        return transactionId && ledgerName ? [[transactionId, ledgerName] as const] : [];
-      })
-    );
-    const createLedgerByTransactionId = new Map(
-      (Array.isArray(body.transactions) ? body.transactions : []).flatMap((transaction) => {
-        const transactionId = toText(transaction?.transactionId, 80);
-        const ledgerName = toText(transaction?.createLedgerName, 500);
-        const parentName = toText(transaction?.createLedgerParentName, 500) || "Sundry Creditors";
-        return transactionId && ledgerName
-          ? [[transactionId, { ledgerName, parentName }] as const]
-          : [];
+        const counterpartyLedgerName = toText(transaction?.counterpartyLedgerName, 500);
+        const createLedgerName = toText(transaction?.createLedgerName, 500);
+        const createLedgerParentName = toText(transaction?.createLedgerParentName, 240);
+        if (!transactionId || (!counterpartyLedgerName && !createLedgerName)) return [];
+
+        return [
+          [
+            transactionId,
+            {
+              counterpartyLedgerName,
+              createLedgerName,
+              createLedgerParentName,
+            },
+          ] as const,
+        ];
       })
     );
     const saveMappingTransactionIds = new Set(
@@ -360,6 +378,8 @@ export async function POST(request: Request) {
       missingBankLedger: 0,
       missingCounterpartyLedger: 0,
       ledgerNotSynced: 0,
+      bankLedgerNotSynced: 0,
+      counterpartyLedgerNotSynced: 0,
       invalidDate: 0,
       invalidAmount: 0,
     };
@@ -371,7 +391,7 @@ export async function POST(request: Request) {
       .eq("connection_id", connectionId)
       .eq("master_type", "ledger")
       .eq("is_active", true)
-      .limit(1000);
+      .limit(5000);
 
     if (ledgerError) throw ledgerError;
 
@@ -389,9 +409,13 @@ export async function POST(request: Request) {
       return syncedLedgerNames.has(normalizeName(ledgerName));
     }
 
-    function isPartyLedger(ledgerName: string) {
-      const parent = normalizeName(ledgerParentByName.get(normalizeName(ledgerName)));
+    function isPartyParent(parentName: string) {
+      const parent = normalizeName(parentName);
       return parent.includes("sundry debtor") || parent.includes("sundry creditor");
+    }
+
+    function isPartyLedger(ledgerName: string) {
+      return isPartyParent(ledgerParentByName.get(normalizeName(ledgerName)) || "");
     }
 
     const commandInputs = await Promise.all(
@@ -407,76 +431,106 @@ export async function POST(request: Request) {
             counterpartyName: transaction.counterparty_name,
           },
         });
-        const selectedLedger = selectedLedgerByTransactionId.get(transaction.id);
-        const createLedger = createLedgerByTransactionId.get(transaction.id);
+        const selectedLedger = ledgerSelectionByTransactionId.get(transaction.id);
+        const createLedgerName = selectedLedger?.createLedgerName || "";
         const legacyFallback = requestedTransactionIds.length === 1 ? toText(body.counterpartyLedgerName, 500) : "";
         const counterpartyLedgerName =
-          selectedLedger ||
-          createLedger?.ledgerName ||
+          createLedgerName ||
+          selectedLedger?.counterpartyLedgerName ||
           transaction.confirmed_ledger_name ||
           (Number(transaction.suggestion_confidence ?? 0) >= 0.85 ? transaction.suggested_ledger_name || "" : "") ||
           (suggestion.confidence >= 0.85 ? suggestion.ledgerName || "" : "") ||
           legacyFallback;
 
-        return { transaction, suggestion, counterpartyLedgerName, createLedger };
+        return {
+          transaction,
+          suggestion,
+          counterpartyLedgerName,
+          createLedgerName,
+          createLedgerParentName: selectedLedger?.createLedgerParentName || "Sundry Creditors",
+        };
       })
     );
 
-    const voucherCommands = commandInputs.flatMap(({ transaction, suggestion, counterpartyLedgerName, createLedger }) => {
-      if (blockedFingerprints.has(transaction.fingerprint)) {
-        skipped.alreadyPostedOrActive += 1;
-        return [];
-      }
-      const account = accountsById.get(transaction.bank_account_id);
-      const amount = getTransactionAmount(transaction);
-      const bankLedgerName = toText(body.bankLedgerName, 500) || account?.tally_ledger_name || "";
-      if (!account) {
-        skipped.missingAccount += 1;
-        return [];
-      }
-      if (!isValidTransactionDate(transaction.transaction_date)) {
-        skipped.invalidDate = (skipped.invalidDate ?? 0) + 1;
-        return [];
-      }
-      if (!bankLedgerName) {
-        skipped.missingBankLedger += 1;
-        return [];
-      }
-      if (!counterpartyLedgerName) {
-        skipped.missingCounterpartyLedger += 1;
-        return [];
-      }
-      const counterpartyWillBeCreated =
-        Boolean(createLedger?.ledgerName) &&
-        normalizeName(createLedger?.ledgerName) === normalizeName(counterpartyLedgerName);
-      if (!ledgerExists(bankLedgerName) || (!ledgerExists(counterpartyLedgerName) && !counterpartyWillBeCreated)) {
-        skipped.ledgerNotSynced += 1;
-        return [];
-      }
-      if (amount <= 0) {
-        skipped.invalidAmount += 1;
-        return [];
-      }
-      const originalVoucherType = getVoucherType(transaction);
-      const counterpartyIsPartyLedger = isPartyLedger(counterpartyLedgerName);
-      const usesTallyFallbackLedger =
-        !counterpartyIsPartyLedger &&
-        (originalVoucherType === "Payment" || originalVoucherType === "Receipt") &&
-        ledgerExists(NON_PARTY_TALLY_FALLBACK_LEDGER);
-      const tallyCounterpartyLedgerName = usesTallyFallbackLedger
-        ? NON_PARTY_TALLY_FALLBACK_LEDGER
-        : counterpartyLedgerName;
-      const statementImport = transaction.statement_import_id
-        ? importsById.get(transaction.statement_import_id)
-        : null;
-      const referenceBankCode = getVoucherReferenceBankCode(
-        statementImport?.extracted_bank_name || account.bank_name
-      );
-      const referenceNumber =
-        transaction.reference_number || buildVoucherReference(transaction, referenceBankCode);
+    const queuedCreateLedgerKeys = new Set<string>();
+    const commands: TallyCommandInsert[] = commandInputs.flatMap(
+      ({ transaction, suggestion, counterpartyLedgerName, createLedgerName, createLedgerParentName }) => {
+        if (blockedFingerprints.has(transaction.fingerprint)) {
+          skipped.alreadyPostedOrActive += 1;
+          return [];
+        }
+        const account = accountsById.get(transaction.bank_account_id);
+        const amount = getTransactionAmount(transaction);
+        const bankLedgerName = toText(body.bankLedgerName, 500) || account?.tally_ledger_name || "";
+        if (!account) {
+          skipped.missingAccount += 1;
+          return [];
+        }
+        if (!isValidTransactionDate(transaction.transaction_date)) {
+          skipped.invalidDate = (skipped.invalidDate ?? 0) + 1;
+          return [];
+        }
+        if (!bankLedgerName) {
+          skipped.missingBankLedger += 1;
+          return [];
+        }
+        if (!counterpartyLedgerName) {
+          skipped.missingCounterpartyLedger += 1;
+          return [];
+        }
+        const shouldCreateCounterpartyLedger = Boolean(createLedgerName) && !ledgerExists(createLedgerName);
+        const bankLedgerIsSynced = ledgerExists(bankLedgerName);
+        const counterpartyLedgerIsReady = shouldCreateCounterpartyLedger || ledgerExists(counterpartyLedgerName);
+        if (!bankLedgerIsSynced || !counterpartyLedgerIsReady) {
+          if (!bankLedgerIsSynced) skipped.bankLedgerNotSynced += 1;
+          if (!counterpartyLedgerIsReady) skipped.counterpartyLedgerNotSynced += 1;
+          skipped.ledgerNotSynced += 1;
+          return [];
+        }
+        if (amount <= 0) {
+          skipped.invalidAmount += 1;
+          return [];
+        }
+        const originalVoucherType = getVoucherType(transaction);
+        const counterpartyIsPartyLedger = shouldCreateCounterpartyLedger
+          ? isPartyParent(createLedgerParentName)
+          : isPartyLedger(counterpartyLedgerName);
+        const usesTallyFallbackLedger =
+          !counterpartyIsPartyLedger &&
+          (originalVoucherType === "Payment" || originalVoucherType === "Receipt") &&
+          ledgerExists(NON_PARTY_TALLY_FALLBACK_LEDGER);
+        const tallyCounterpartyLedgerName = usesTallyFallbackLedger
+          ? NON_PARTY_TALLY_FALLBACK_LEDGER
+          : counterpartyLedgerName;
+        const statementImport = transaction.statement_import_id
+          ? importsById.get(transaction.statement_import_id)
+          : null;
+        const referenceBankCode = getVoucherReferenceBankCode(
+          statementImport?.extracted_bank_name || account.bank_name
+        );
+        const referenceNumber =
+          transaction.reference_number || buildVoucherReference(transaction, referenceBankCode);
 
-      return [
-        {
+        const nextCommands: TallyCommandInsert[] = [];
+        const createLedgerKey = normalizeName(createLedgerName);
+        if (shouldCreateCounterpartyLedger && createLedgerKey && !queuedCreateLedgerKeys.has(createLedgerKey)) {
+          queuedCreateLedgerKeys.add(createLedgerKey);
+          nextCommands.push({
+            connection_id: connectionId,
+            owner_user_id: user.id,
+            command_type: "create_ledger",
+            status: "queued",
+            priority: 30,
+            payload: {
+              name: createLedgerName,
+              parentName: createLedgerParentName,
+              companyName: connection.last_company_name,
+              source: "bank_statement_queue",
+            },
+          });
+        }
+
+        nextCommands.push({
           connection_id: connectionId,
           owner_user_id: user.id,
           command_type: "post_bank_voucher",
@@ -503,37 +557,15 @@ export async function POST(request: Request) {
             counterpartyName: transaction.counterparty_name || suggestion.counterpartyName,
             accountNumberMasked: account.account_number_masked,
           },
-        },
-      ];
-    });
-    const createLedgerCommands = Array.from(
-      new Map(
-        commandInputs.flatMap(({ createLedger }) => {
-          if (!createLedger?.ledgerName) return [];
-          if (ledgerExists(createLedger.ledgerName)) return [];
-          return [
-            [
-              normalizeName(createLedger.ledgerName),
-              {
-                connection_id: connectionId,
-                owner_user_id: user.id,
-                command_type: "create_ledger",
-                status: "queued",
-                priority: 30,
-                payload: {
-                  name: createLedger.ledgerName,
-                  parentName: createLedger.parentName,
-                  companyName: connection.last_company_name,
-                },
-              },
-            ] as const,
-          ];
-        })
-      ).values()
-    );
-    const commands = [...createLedgerCommands, ...voucherCommands];
+        });
 
-    if (commands.length === 0) {
+        return nextCommands;
+      }
+    );
+
+    const voucherCommands = commands.filter((command) => command.command_type === "post_bank_voucher");
+
+    if (voucherCommands.length === 0) {
       return jsonWithCors(
         request,
         {
@@ -721,7 +753,7 @@ export async function POST(request: Request) {
       payload: {
         commandType: "post_bank_voucher",
         queuedCount: voucherCommands.length,
-        ledgerCreateQueuedCount: createLedgerCommands.length,
+        commandCount: commands.length,
         transactionIds: queuedTransactionIds,
         savedMappingCount: uniqueMappingRows.length,
       },
@@ -729,7 +761,7 @@ export async function POST(request: Request) {
 
     return jsonWithCors(request, {
       queuedCount: voucherCommands.length,
-      ledgerCreateQueuedCount: createLedgerCommands.length,
+      commandCount: commands.length,
       commands: createdCommands ?? [],
     });
   } catch (error) {

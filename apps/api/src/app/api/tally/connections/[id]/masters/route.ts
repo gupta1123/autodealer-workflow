@@ -31,7 +31,7 @@ export async function GET(
     const url = new URL(request.url);
     const type = parseMasterType(url.searchParams.get("type"));
     const query = url.searchParams.get("q")?.trim() ?? "";
-    const limit = Math.min(Number(url.searchParams.get("limit") || 100), 500);
+    const limit = Math.min(Number(url.searchParams.get("limit") || 100), 5000);
 
     const supabase = createSupabaseAdminClient();
     const { data: connection, error: connectionError } = await supabase

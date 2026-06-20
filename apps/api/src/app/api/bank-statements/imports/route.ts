@@ -1,9 +1,9 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { suggestBankLedgerForTransaction } from "@/lib/bank-statement-ledger-matching";
 import {
   BANK_STATEMENT_BUCKET,
   buildStoragePath,
-  classifyBankTransactionsForTallyWithAI,
   extractBankStatementFile,
   findBankAccountCandidates,
   maskAccountNumber,
@@ -11,6 +11,7 @@ import {
   resolveImportStatus,
   serializeAccount,
   type BankAccountInput,
+  type ParsedBankTransaction,
 } from "@/lib/bank-statements";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
@@ -43,6 +44,284 @@ function serializeImport(row: Record<string, unknown>) {
     duplicateTransactionCount: Number(row.duplicate_transaction_count ?? 0),
     createdAt: String(row.created_at ?? ""),
   };
+}
+
+function readRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function titleCaseLedgerName(value: string) {
+  return value
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => (part.length <= 3 ? part.toUpperCase() : `${part[0]?.toUpperCase() ?? ""}${part.slice(1)}`))
+    .join(" ")
+    .slice(0, 120);
+}
+
+function fallbackLedgerName(transaction: ParsedBankTransaction, suggestedCounterparty?: string | null) {
+  const counterparty = String(transaction.counterpartyName || suggestedCounterparty || "").trim();
+  if (counterparty) return titleCaseLedgerName(counterparty);
+
+  const text = `${transaction.category ?? ""} ${transaction.transactionType ?? ""} ${transaction.description}`.toLowerCase();
+  if (/\bbank[_\s-]*charges\b|\bcharge|charges|fee\b/.test(text)) return "Bank Charges";
+  if (/\binterest\b/.test(text)) return "Interest Income";
+  if (/\batm\b|\bcash\b/.test(text)) return "Cash";
+
+  return null;
+}
+
+function fallbackLedgerGroup(transaction: ParsedBankTransaction, ledgerName: string) {
+  const text = `${ledgerName} ${transaction.category ?? ""} ${transaction.transactionType ?? ""} ${transaction.description}`.toLowerCase();
+  if (/\bbank[_\s-]*charges\b|\bcharge|charges|fee\b/.test(text)) return "Indirect Expenses";
+  if (/\binterest\b/.test(text)) return "Indirect Incomes";
+  if (/\bcash\b|\batm\b/.test(text)) return "Cash-in-Hand";
+  if ((transaction.creditAmount ?? 0) > 0) return "Sundry Debtors";
+  return "Sundry Creditors";
+}
+
+async function enrichTransactionsWithLedgerRecommendations(input: {
+  ownerUserId: string;
+  connectionId: string;
+  accountId: string;
+  transactions: ParsedBankTransaction[];
+}) {
+  if (!input.connectionId) {
+    return input.transactions;
+  }
+
+  const supabase = createSupabaseAdminClient();
+
+  return Promise.all(
+    input.transactions.map(async (transaction) => {
+      const suggestion = await suggestBankLedgerForTransaction({
+        supabase,
+        ownerUserId: input.ownerUserId,
+        connectionId: input.connectionId,
+        accountId: input.accountId,
+        transaction,
+      });
+      const ledgerName =
+        suggestion.ledgerName ||
+        fallbackLedgerName(transaction, suggestion.counterpartyName) ||
+        transaction.suggestedLedgerName ||
+        null;
+      const action = suggestion.ledgerName
+        ? suggestion.mappingSource === "category"
+          ? "use_standard_ledger"
+          : suggestion.mappingSource === "close_match"
+            ? "needs_review"
+            : "use_existing_ledger"
+        : ledgerName
+          ? "create_new_ledger"
+          : "needs_review";
+      const reason =
+        suggestion.reason ||
+        (action === "create_new_ledger"
+          ? "No matching Tally ledger was found. A new ledger will be created unless changed."
+          : null);
+
+      return {
+        ...transaction,
+        counterpartyName: transaction.counterpartyName || suggestion.counterpartyName || null,
+        suggestedLedgerName: ledgerName,
+        suggestionConfidence: suggestion.ledgerName ? suggestion.confidence : ledgerName ? 0.6 : 0,
+        suggestionReason: reason,
+        rawPayload: {
+          ...(transaction.rawPayload ?? {}),
+          aiLedgerRecommendation: {
+            action,
+            ledgerName,
+            ledgerGroup: action === "create_new_ledger" && ledgerName ? fallbackLedgerGroup(transaction, ledgerName) : null,
+            confidence: suggestion.ledgerName ? suggestion.confidence : ledgerName ? 0.6 : 0,
+            requiresUserConfirmation: suggestion.mappingSource === "close_match",
+            reason,
+          },
+        },
+      };
+    })
+  );
+}
+
+function serializePreviewFromMeta(row: Record<string, unknown>) {
+  const meta = readRecord(row.processing_meta);
+  const preview = readRecord(meta.preview);
+  const analysis = readRecord(meta.analysis);
+
+  return {
+    import: serializeImport(row),
+    account: readRecord(preview.account),
+    candidates: Array.isArray(preview.candidates) ? preview.candidates : [],
+    transactions: Array.isArray(preview.transactions) ? preview.transactions : [],
+    requiresManualExtraction: Boolean(preview.requiresManualExtraction),
+    extractionSource: preview.extractionSource ?? null,
+    extractionError: preview.extractionError ?? null,
+    extractionDiagnostics: preview.extractionDiagnostics ?? null,
+    processing: analysis.status === "processing" || analysis.status === "queued",
+    job: {
+      id: String(row.id),
+      status: String(analysis.status ?? "completed"),
+      progress: Number(analysis.progress ?? 100),
+      stage: typeof analysis.stage === "string" ? analysis.stage : null,
+      error: typeof analysis.error === "string" ? analysis.error : null,
+    },
+  };
+}
+
+async function processBankStatementImport(importId: string, ownerUserId: string) {
+  const supabase = createSupabaseAdminClient();
+
+  async function updateAnalysis(next: Record<string, unknown>) {
+    const { data: current } = await supabase
+      .from("bank_statement_imports")
+      .select("processing_meta")
+      .eq("id", importId)
+      .eq("owner_user_id", ownerUserId)
+      .maybeSingle();
+    const currentMeta = readRecord(current?.processing_meta);
+    const currentAnalysis = readRecord(currentMeta.analysis);
+
+    await supabase
+      .from("bank_statement_imports")
+      .update({
+        processing_meta: {
+          ...currentMeta,
+          analysis: {
+            ...currentAnalysis,
+            ...next,
+            updatedAt: new Date().toISOString(),
+          },
+        },
+      })
+      .eq("id", importId)
+      .eq("owner_user_id", ownerUserId);
+  }
+
+  try {
+    await updateAnalysis({ status: "processing", progress: 10, stage: "Reading uploaded statement" });
+
+    const { data: importRow, error: importError } = await supabase
+      .from("bank_statement_imports")
+      .select("*")
+      .eq("id", importId)
+      .eq("owner_user_id", ownerUserId)
+      .maybeSingle();
+    if (importError) throw importError;
+    if (!importRow) throw new Error("Bank statement import not found.");
+
+    const meta = readRecord(importRow.processing_meta);
+    const analysis = readRecord(meta.analysis);
+    const manualAccount = readRecord(analysis.manualAccount) as BankAccountInput;
+    const connectionId = typeof analysis.connectionId === "string" ? analysis.connectionId : "";
+
+    const { data: fileData, error: downloadError } = await supabase.storage
+      .from(String(importRow.storage_bucket || BANK_STATEMENT_BUCKET))
+      .download(String(importRow.storage_path));
+    if (downloadError) throw downloadError;
+    if (!fileData) throw new Error("Uploaded bank statement file could not be read.");
+
+    await updateAnalysis({ status: "processing", progress: 30, stage: "Extracting transactions" });
+    const parsed = await extractBankStatementFile({
+      bytes: new Uint8Array(await fileData.arrayBuffer()),
+      fileName: String(importRow.original_file_name || "bank-statement"),
+      mimeType: typeof importRow.mime_type === "string" ? importRow.mime_type : null,
+    });
+
+    await updateAnalysis({ status: "processing", progress: 75, stage: "Matching bank account" });
+    const account = {
+      bankName: manualAccount.bankName || parsed.account.bankName || null,
+      accountNumber: manualAccount.accountNumber || parsed.account.accountNumber || null,
+      accountHolderName: manualAccount.accountHolderName || parsed.account.accountHolderName || null,
+      ifscCode: manualAccount.ifscCode || parsed.account.ifscCode || null,
+    };
+    const candidates = await findBankAccountCandidates(supabase, ownerUserId, account);
+    const status = resolveImportStatus(candidates.length);
+    const selectedAccountId = candidates.length === 1 ? candidates[0].id : null;
+    const recommendationAccountId =
+      selectedAccountId ||
+      normalizeAccountNumber(account.accountNumber) ||
+      String(importRow.id);
+    const transactions = await enrichTransactionsWithLedgerRecommendations({
+      ownerUserId,
+      connectionId,
+      accountId: recommendationAccountId,
+      transactions: parsed.transactions,
+    });
+
+    const preview = {
+      account: {
+        bankName: account.bankName,
+        accountNumber: account.accountNumber,
+        accountNumberMasked: maskAccountNumber(account.accountNumber),
+        accountHolderName: account.accountHolderName,
+        ifscCode: account.ifscCode,
+      },
+      candidates: candidates.map(serializeAccount),
+      transactions,
+      requiresManualExtraction:
+        parsed.extractionSource === "manual_review_required_v1" || transactions.length === 0,
+      extractionSource: parsed.extractionSource,
+      extractionError: parsed.extractionError ?? null,
+      extractionDiagnostics: parsed.extractionDiagnostics ?? null,
+    };
+
+    const nextMeta = {
+      ...meta,
+      preview,
+      analysis: {
+        ...analysis,
+        status: "completed",
+        progress: 100,
+        stage: "Statement analyzed",
+        error: null,
+        connectionId,
+        completedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      parser: parsed.extractionSource,
+      extractionError: parsed.extractionError ?? null,
+      extractionDiagnostics: parsed.extractionDiagnostics ?? null,
+      normalizedAccountNumber: normalizeAccountNumber(account.accountNumber),
+      maskedAccountNumber: maskAccountNumber(account.accountNumber),
+      ifscCode: account.ifscCode,
+      previewTransactionCount: transactions.length,
+    };
+
+    const { error: updateError } = await supabase
+      .from("bank_statement_imports")
+      .update({
+        bank_account_id: selectedAccountId,
+        statement_period_start: parsed.statementPeriodStart,
+        statement_period_end: parsed.statementPeriodEnd,
+        extracted_bank_name: account.bankName,
+        extracted_account_number: account.accountNumber,
+        extracted_account_holder_name: account.accountHolderName,
+        extracted_ifsc_code: account.ifscCode,
+        status,
+        processing_meta: nextMeta,
+      })
+      .eq("id", importId)
+      .eq("owner_user_id", ownerUserId);
+    if (updateError) throw updateError;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Bank statement analysis failed.";
+    await updateAnalysis({
+      status: "failed",
+      progress: 100,
+      stage: "Analysis failed",
+      error: message,
+      failedAt: new Date().toISOString(),
+    });
+    await supabase
+      .from("bank_statement_imports")
+      .update({ status: "failed" })
+      .eq("id", importId)
+      .eq("owner_user_id", ownerUserId);
+    console.error("Bank statement background analysis failed:", error);
+  }
 }
 
 export function OPTIONS(request: Request) {
@@ -102,78 +381,27 @@ export async function POST(request: Request) {
     });
     if (upload.error) throw upload.error;
 
-    let parsed = await extractBankStatementFile({
-      bytes,
-      fileName: file.name || "bank-statement",
-      mimeType: file.type || null,
-    });
-
-    const account = {
-      bankName: manualAccount.bankName || parsed.account.bankName || null,
-      accountNumber: manualAccount.accountNumber || parsed.account.accountNumber || null,
-      accountHolderName: manualAccount.accountHolderName || parsed.account.accountHolderName || null,
-      ifscCode: manualAccount.ifscCode || parsed.account.ifscCode || null,
-    };
-    const candidates = await findBankAccountCandidates(supabase, user.id, account);
-    const status = resolveImportStatus(candidates.length);
-    const selectedAccountId = candidates.length === 1 ? candidates[0].id : null;
-
-    let ledgerRecommendationError: string | null = null;
-    if (connectionId && parsed.transactions.length > 0) {
-      try {
-        const { data: ledgerRows, error: ledgerError } = await supabase
-          .from("tally_masters")
-          .select("tally_name")
-          .eq("owner_user_id", user.id)
-          .eq("connection_id", connectionId)
-          .eq("master_type", "ledger")
-          .eq("is_active", true)
-          .limit(1000);
-
-        if (ledgerError) throw ledgerError;
-
-        parsed = {
-          ...parsed,
-          transactions: await classifyBankTransactionsForTallyWithAI({
-            account,
-            transactions: parsed.transactions,
-            tallyLedgerNames: ((ledgerRows ?? []) as Array<{ tally_name?: string | null }>)
-              .map((row) => row.tally_name)
-              .filter((value): value is string => Boolean(value)),
-            businessName: account.accountHolderName,
-          }),
-        };
-      } catch (error) {
-        ledgerRecommendationError =
-          error instanceof Error ? error.message : "AI ledger recommendation failed.";
-      }
-    }
-
     const insertPayload = {
       owner_user_id: user.id,
-      bank_account_id: selectedAccountId,
+      bank_account_id: null,
       original_file_name: file.name || "bank-statement",
       storage_bucket: BANK_STATEMENT_BUCKET,
       storage_path: storagePath,
       mime_type: file.type || null,
       size_bytes: file.size,
-      statement_period_start: parsed.statementPeriodStart,
-      statement_period_end: parsed.statementPeriodEnd,
-      extracted_bank_name: account.bankName,
-      extracted_account_number: account.accountNumber,
-      extracted_account_holder_name: account.accountHolderName,
-      extracted_ifsc_code: account.ifscCode,
-      status,
+      status: "extracted",
       processing_meta: {
         source: "bank_statement_upload",
-        parser: parsed.extractionSource,
-        extractionError: parsed.extractionError ?? null,
-        extractionDiagnostics: parsed.extractionDiagnostics ?? null,
-        ledgerRecommendationError,
-        normalizedAccountNumber: normalizeAccountNumber(account.accountNumber),
-        maskedAccountNumber: maskAccountNumber(account.accountNumber),
-        ifscCode: account.ifscCode,
-        previewTransactionCount: parsed.transactions.length,
+        analysis: {
+          status: "queued",
+          progress: 5,
+          stage: "Statement uploaded",
+          error: null,
+          connectionId,
+          manualAccount,
+          startedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
       },
     };
 
@@ -185,23 +413,9 @@ export async function POST(request: Request) {
 
     if (insertError) throw insertError;
 
-    return jsonWithCors(request, {
-      import: serializeImport(createdImport as Record<string, unknown>),
-      account: {
-        bankName: account.bankName,
-        accountNumber: account.accountNumber,
-        accountNumberMasked: maskAccountNumber(account.accountNumber),
-        accountHolderName: account.accountHolderName,
-        ifscCode: account.ifscCode,
-      },
-      candidates: candidates.map(serializeAccount),
-      transactions: parsed.transactions,
-      requiresManualExtraction: parsed.extractionSource === "manual_review_required_v1" || parsed.transactions.length === 0,
-      extractionSource: parsed.extractionSource,
-      extractionError: parsed.extractionError ?? null,
-      extractionDiagnostics: parsed.extractionDiagnostics ?? null,
-      ledgerRecommendationError,
-    });
+    void processBankStatementImport(String(createdImport.id), user.id);
+
+    return jsonWithCors(request, serializePreviewFromMeta(createdImport as Record<string, unknown>));
   } catch (error) {
     console.error("Error in POST /api/bank-statements/imports:", error);
     return jsonWithCors(
