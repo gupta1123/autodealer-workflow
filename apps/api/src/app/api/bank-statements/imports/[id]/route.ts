@@ -9,6 +9,12 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 export const runtime = "nodejs";
 
+function readRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
 function serializeImport(row: Record<string, unknown>) {
   return {
     id: String(row.id),
@@ -99,10 +105,14 @@ export async function GET(
 
     if (previewError) throw previewError;
 
-    const processingMeta =
-      importRow.processing_meta && typeof importRow.processing_meta === "object"
-        ? (importRow.processing_meta as Record<string, unknown>)
-        : {};
+    const processingMeta = readRecord(importRow.processing_meta);
+    const previewMeta = readRecord(processingMeta.preview);
+    const previewTransactions = previewRows ?? [];
+    const processing = importRow.status === "processing";
+    const requiresManualExtraction =
+      importRow.status === "manual_review_required" ||
+      importRow.status === "failed" ||
+      (!processing && previewTransactions.length === 0);
     const account = {
       bankName: importRow.extracted_bank_name ?? null,
       accountNumber: importRow.extracted_account_number ?? null,
@@ -125,9 +135,12 @@ export async function GET(
       import: serializeImport(importRow as Record<string, unknown>),
       account,
       candidates: candidates.map(serializeAccount),
-      transactions: (previewRows ?? []).map((row) => serializePreviewTransaction(row as Record<string, unknown>)),
-      requiresManualExtraction: importRow.status === "manual_review_required" || importRow.status === "failed",
-      processing: importRow.status === "processing",
+      transactions: previewTransactions.map((row) => serializePreviewTransaction(row as Record<string, unknown>)),
+      requiresManualExtraction,
+      extractionSource: previewMeta.extractionSource ?? null,
+      extractionError: previewMeta.extractionError ?? null,
+      extractionDiagnostics: previewMeta.extractionDiagnostics ?? null,
+      processing,
       job: jobRow
         ? {
             id: jobRow.id,
