@@ -58,6 +58,10 @@ function serializePreviewTransaction(row: Record<string, unknown>) {
   };
 }
 
+function isPreviewTransactionArray(value: unknown) {
+  return Array.isArray(value) ? (value as Array<Record<string, unknown>>) : [];
+}
+
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
@@ -107,22 +111,49 @@ export async function GET(
 
     const processingMeta = readRecord(importRow.processing_meta);
     const previewMeta = readRecord(processingMeta.preview);
-    const previewTransactions = previewRows ?? [];
-    const processing = importRow.status === "processing";
+    const previewAccount = readRecord(previewMeta.account);
+    const storedPreviewTransactions = isPreviewTransactionArray(previewMeta.transactions);
+    const tablePreviewTransactions = (previewRows ?? []) as Array<Record<string, unknown>>;
+    const transactions =
+      tablePreviewTransactions.length > 0
+        ? tablePreviewTransactions.map((row) => serializePreviewTransaction(row))
+        : storedPreviewTransactions;
+    const analysis = readRecord(processingMeta.analysis);
+    const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
+    const processing =
+      importRow.status === "processing" || analysisStatus === "queued" || analysisStatus === "processing";
     const requiresManualExtraction =
       importRow.status === "manual_review_required" ||
       importRow.status === "failed" ||
-      (!processing && previewTransactions.length === 0);
+      Boolean(previewMeta.requiresManualExtraction) ||
+      (!processing && transactions.length === 0);
     const account = {
-      bankName: importRow.extracted_bank_name ?? null,
-      accountNumber: importRow.extracted_account_number ?? null,
-      accountNumberMasked: maskAccountNumber(importRow.extracted_account_number),
-      accountHolderName: importRow.extracted_account_holder_name ?? null,
-      ifscCode: importRow.extracted_ifsc_code ?? null,
+      bankName:
+        typeof previewAccount.bankName === "string"
+          ? previewAccount.bankName
+          : importRow.extracted_bank_name ?? null,
+      accountNumber:
+        typeof previewAccount.accountNumber === "string"
+          ? previewAccount.accountNumber
+          : importRow.extracted_account_number ?? null,
+      accountNumberMasked:
+        typeof previewAccount.accountNumberMasked === "string"
+          ? previewAccount.accountNumberMasked
+          : maskAccountNumber(importRow.extracted_account_number),
+      accountHolderName:
+        typeof previewAccount.accountHolderName === "string"
+          ? previewAccount.accountHolderName
+          : importRow.extracted_account_holder_name ?? null,
+      ifscCode:
+        typeof previewAccount.ifscCode === "string"
+          ? previewAccount.ifscCode
+          : importRow.extracted_ifsc_code ?? null,
       tallyLedgerName:
         typeof processingMeta.tallyLedgerName === "string" ? processingMeta.tallyLedgerName : null,
     };
-    const candidates = ["ready_to_review", "ready_to_confirm", "needs_account_selection"].includes(importRow.status)
+    const candidates = Array.isArray(previewMeta.candidates)
+      ? previewMeta.candidates
+      : ["ready_to_review", "ready_to_confirm", "needs_account_selection"].includes(importRow.status)
       ? await findBankAccountCandidates(supabase, user.id, {
           bankName: account.bankName,
           accountNumber: account.accountNumber,
@@ -134,8 +165,8 @@ export async function GET(
     return jsonWithCors(request, {
       import: serializeImport(importRow as Record<string, unknown>),
       account,
-      candidates: candidates.map(serializeAccount),
-      transactions: previewTransactions.map((row) => serializePreviewTransaction(row as Record<string, unknown>)),
+      candidates: Array.isArray(previewMeta.candidates) ? candidates : candidates.map(serializeAccount),
+      transactions,
       requiresManualExtraction,
       extractionSource: previewMeta.extractionSource ?? null,
       extractionError: previewMeta.extractionError ?? null,
@@ -149,7 +180,13 @@ export async function GET(
             stage: jobRow.stage,
             error: jobRow.error,
           }
-        : null,
+        : {
+            id: String(importRow.id),
+            status: analysisStatus || (processing ? "processing" : "completed"),
+            progress: Number(analysis.progress ?? (processing ? 5 : 100)),
+            stage: typeof analysis.stage === "string" ? analysis.stage : null,
+            error: typeof analysis.error === "string" ? analysis.error : null,
+          },
     });
   } catch (error) {
     console.error("Error in GET /api/bank-statements/imports/[id]:", error);

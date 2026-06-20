@@ -238,7 +238,6 @@ async function processBankStatementImport(importId: string, ownerUserId: string)
       ifscCode: manualAccount.ifscCode || parsed.account.ifscCode || null,
     };
     const candidates = await findBankAccountCandidates(supabase, ownerUserId, account);
-    const status = resolveImportStatus(candidates.length);
     const selectedAccountId = candidates.length === 1 ? candidates[0].id : null;
     const recommendationAccountId =
       selectedAccountId ||
@@ -250,6 +249,8 @@ async function processBankStatementImport(importId: string, ownerUserId: string)
       accountId: recommendationAccountId,
       transactions: parsed.transactions,
     });
+    const status =
+      transactions.length === 0 ? "manual_review_required" : resolveImportStatus(candidates.length);
 
     const preview = {
       account: {
@@ -389,7 +390,7 @@ export async function POST(request: Request) {
       storage_path: storagePath,
       mime_type: file.type || null,
       size_bytes: file.size,
-      status: "extracted",
+      status: "processing",
       processing_meta: {
         source: "bank_statement_upload",
         analysis: {
