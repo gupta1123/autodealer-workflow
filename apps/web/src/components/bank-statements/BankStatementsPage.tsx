@@ -137,7 +137,7 @@ type PreviewResponse = {
   };
   candidates: BankAccount[];
   transactions: PreviewTransaction[];
-  requiresManualExtraction: boolean;
+  requiresManualExtraction?: boolean;
   extractionError?: string | null;
   extractionDiagnostics?: {
     rawAiTransactionCount?: number;
@@ -1084,7 +1084,7 @@ function getAnalysisCompleteMessage(payload: PreviewResponse) {
       ? `AI found ${payload.extractionDiagnostics.rawAiTransactionCount} row(s), but ${payload.extractionDiagnostics.normalizedAiTransactionCount ?? 0} passed validation.`
       : "No transaction rows were extracted.";
 
-  if (payload.requiresManualExtraction) {
+  if (payload.requiresManualExtraction || payload.transactions.length === 0) {
     return {
       tone: "info" as const,
       text: `File stored. ${extractionIssue} Please verify rows before sending.`,
