@@ -127,6 +127,7 @@ type ReviewTransaction = {
   ledgerAction: LedgerRecommendationAction;
   ledgerGroup: string;
   requiresUserConfirmation: boolean;
+  ledgerSelectionTouched?: boolean;
 };
 
 type PreviewResponse = {
@@ -233,9 +234,11 @@ function ledgerNameTokens(value?: string | null) {
       if (!token) return "";
       if (["pvt", "private", "ltd", "limited", "llp", "inc"].includes(token)) return "";
       if (token === "shri") return "shree";
-      if (token === "ind" || token === "industry" || token === "industries") return "industry";
+      if (["ind", "industry", "industries", "industires", "indutries", "indstries"].includes(token)) return "industry";
       if (token === "supply" || token === "supplies" || token === "supplier" || token === "suppliers") return "supply";
       if (token === "enterprise" || token === "enterprises") return "enterprise";
+      if (["engr", "engrs", "engg", "engineer", "engineers", "engineering"].includes(token)) return "engineer";
+      if (["mech", "mechanical"].includes(token)) return "mech";
       if (token === "co" || token === "company") return "company";
       return token;
     })
@@ -244,6 +247,92 @@ function ledgerNameTokens(value?: string | null) {
 
 function compactLedgerName(value?: string | null) {
   return ledgerNameTokens(value).join("");
+}
+
+const GENERIC_PARTY_SUFFIX_TOKENS = new Set([
+  "company",
+  "enterprise",
+  "firm",
+  "group",
+  "trader",
+  "traders",
+  "trading",
+]);
+
+function coreLedgerNameTokens(value?: string | null) {
+  return ledgerNameTokens(value).filter(
+    (token) => token.length > 1 && !GENERIC_PARTY_SUFFIX_TOKENS.has(token)
+  );
+}
+
+function compactCoreLedgerName(value?: string | null) {
+  return coreLedgerNameTokens(value).join("");
+}
+
+const LEDGER_PARTY_PREFIXES = new Set([
+  "neft",
+  "rtgs",
+  "imps",
+  "upi",
+  "ach",
+  "ecs",
+  "nach",
+  "cr",
+  "dr",
+  "credit",
+  "debit",
+  "hdfc",
+  "icici",
+  "sbi",
+  "axis",
+  "kotak",
+  "idfc",
+  "indusind",
+  "canara",
+  "federal",
+  "yes",
+]);
+
+function cleanLedgerCandidateText(value?: string | null) {
+  let cleaned = String(value ?? "")
+    .replace(/\b(?:utr|ref|reference|invoice|bill|chq|cheque)\b[\s:#/-]*[a-z0-9-]+.*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  for (let index = 0; index < 4; index += 1) {
+    const match = cleaned.match(/^([a-z0-9]+)(?:\s+|[-:/._]+)(.+)$/i);
+    if (!match || !LEDGER_PARTY_PREFIXES.has(match[1].toLowerCase())) break;
+    cleaned = match[2].trim();
+  }
+
+  return cleaned;
+}
+
+function ledgerNameCandidateVariants(...values: Array<string | null | undefined>) {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  function addCandidate(value?: string | null) {
+    const trimmed = String(value ?? "").replace(/\s+/g, " ").trim();
+    if (!trimmed) return;
+    const key = normalizeName(trimmed);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    candidates.push(trimmed);
+  }
+
+  for (const value of values) {
+    const raw = String(value ?? "").trim();
+    addCandidate(raw);
+    addCandidate(cleanLedgerCandidateText(raw));
+
+    for (const part of raw.split(/\s+\/\s+|\s+\|\s+|\s{2,}/)) {
+      addCandidate(part);
+      addCandidate(cleanLedgerCandidateText(part));
+    }
+  }
+
+  return candidates;
 }
 
 function levenshteinDistance(left: string, right: string) {
@@ -277,12 +366,23 @@ function ledgerNameSimilarity(left: string, right: string) {
   if (leftCompact === rightCompact) return 1;
 
   const maxLength = Math.max(leftCompact.length, rightCompact.length);
-  if (maxLength < 8) return 0;
+  if (maxLength < 5) return 0;
 
   const editScore = 1 - levenshteinDistance(leftCompact, rightCompact) / maxLength;
   const substringScore =
     leftCompact.includes(rightCompact) || rightCompact.includes(leftCompact)
       ? 0.82 + (Math.min(leftCompact.length, rightCompact.length) / maxLength) * 0.1
+      : 0;
+  const leftCoreCompact = compactCoreLedgerName(left);
+  const rightCoreCompact = compactCoreLedgerName(right);
+  const coreMaxLength = Math.max(leftCoreCompact.length, rightCoreCompact.length);
+  const coreScore =
+    coreMaxLength >= 5 && leftCoreCompact && rightCoreCompact
+      ? leftCoreCompact === rightCoreCompact
+        ? 0.96
+        : leftCoreCompact.includes(rightCoreCompact) || rightCoreCompact.includes(leftCoreCompact)
+          ? 0.88 + (Math.min(leftCoreCompact.length, rightCoreCompact.length) / coreMaxLength) * 0.08
+          : 1 - levenshteinDistance(leftCoreCompact, rightCoreCompact) / coreMaxLength
       : 0;
   const leftTokens = new Set(ledgerNameTokens(left));
   const rightTokens = new Set(ledgerNameTokens(right));
@@ -290,28 +390,35 @@ function ledgerNameSimilarity(left: string, right: string) {
   const totalTokenCount = new Set([...leftTokens, ...rightTokens]).size;
   const tokenScore = totalTokenCount > 0 ? sharedTokenCount / totalTokenCount : 0;
 
-  return Math.max(editScore, substringScore, tokenScore);
+  return Math.max(editScore, substringScore, coreScore, tokenScore);
 }
 
-function findBestCloseLedgerMatch(
+function findCloseLedgerMatches(
   ledgerMasters: TallyMaster[],
   ledgerName?: string | null,
   threshold = 0.84
 ) {
   const compactName = compactLedgerName(ledgerName);
-  if (compactName.length < 8) return null;
+  if (compactName.length < 5) return [];
 
-  let bestMatch: { ledger: TallyMaster; score: number } | null = null;
+  const matches: Array<{ ledger: TallyMaster; score: number }> = [];
   for (const ledger of ledgerMasters) {
     if (normalizeName(ledger.name) === normalizeName(ledgerName)) continue;
     const score = ledgerNameSimilarity(ledgerName ?? "", ledger.name);
     if (score < threshold) continue;
-    if (!bestMatch || score > bestMatch.score || (score === bestMatch.score && ledger.name < bestMatch.ledger.name)) {
-      bestMatch = { ledger, score };
-    }
+    matches.push({ ledger, score });
   }
 
-  return bestMatch;
+  return matches.sort((left, right) => right.score - left.score || left.ledger.name.localeCompare(right.ledger.name));
+}
+
+function findUniqueCloseLedgerMatch(
+  ledgerMasters: TallyMaster[],
+  ledgerName?: string | null,
+  threshold = 0.84
+) {
+  const matches = findCloseLedgerMatches(ledgerMasters, ledgerName, threshold);
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function findLedgerByNormalizedName(ledgerMasters: TallyMaster[], ledgerName?: string | null) {
@@ -321,6 +428,33 @@ function findLedgerByNormalizedName(ledgerMasters: TallyMaster[], ledgerName?: s
   return (
     ledgerMasters.find((ledger) => normalizeName(ledger.name) === normalizedLedgerName) ?? null
   );
+}
+
+function findLedgerByCandidates(ledgerMasters: TallyMaster[], candidates: string[]) {
+  for (const candidate of candidates) {
+    const ledger = findLedgerByNormalizedName(ledgerMasters, candidate);
+    if (ledger) return ledger;
+  }
+  return null;
+}
+
+function findUniqueCloseLedgerMatchByCandidates(ledgerMasters: TallyMaster[], candidates: string[]) {
+  const matchesByLedger = new Map<string, { ledger: TallyMaster; score: number }>();
+
+  for (const candidate of candidates) {
+    for (const match of findCloseLedgerMatches(ledgerMasters, candidate)) {
+      const key = normalizeName(match.ledger.name);
+      const existing = matchesByLedger.get(key);
+      if (!existing || match.score > existing.score) {
+        matchesByLedger.set(key, match);
+      }
+    }
+  }
+
+  const matches = Array.from(matchesByLedger.values()).sort(
+    (left, right) => right.score - left.score || left.ledger.name.localeCompare(right.ledger.name)
+  );
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function getTallyConnectionRank(connection: TallyConnection) {
@@ -371,42 +505,36 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
   const recommendedLedgerName = recommendation?.ledgerName || suggestedLedgerName || fallbackReviewLedgerName(transaction);
   const suspenseLedger = findLedgerByNormalizedName(ledgerMasters, "Suspense");
   const suspenseName = suspenseLedger?.name || "Suspense";
-  const matchedLedger = findLedgerByNormalizedName(ledgerMasters, recommendedLedgerName);
-  const shouldReviewRecommendedLedger = Boolean(matchedLedger && recommendation?.requiresUserConfirmation);
-  const closeLedgerMatch = shouldReviewRecommendedLedger && matchedLedger
-    ? { ledger: matchedLedger, score: recommendation?.confidence ?? 0.84 }
-    : !matchedLedger
-    ? findBestCloseLedgerMatch(ledgerMasters, recommendedLedgerName || transaction.counterpartyName)
+  const confirmedLedger = findLedgerByNormalizedName(ledgerMasters, transaction.confirmedLedgerName);
+  const confirmedSuspenseLedger = confirmedLedger && isSuspenseLedgerName(confirmedLedger.name) ? confirmedLedger : null;
+  const confirmedMappedLedger = confirmedLedger && !isSuspenseLedgerName(confirmedLedger.name) ? confirmedLedger : null;
+  const ledgerCandidates = ledgerNameCandidateVariants(
+    recommendedLedgerName,
+    transaction.counterpartyName,
+    transaction.description
+  );
+  const matchedLedger = findLedgerByCandidates(ledgerMasters, ledgerCandidates);
+  const closeLedgerMatch = !matchedLedger
+    ? findUniqueCloseLedgerMatchByCandidates(ledgerMasters, ledgerCandidates)
     : null;
-  const shouldReviewCloseMatch =
-    Boolean(closeLedgerMatch) &&
-    (shouldReviewRecommendedLedger ||
-      action === "create_new_ledger" ||
-      action === "needs_review" ||
-      recommendation?.requiresUserConfirmation);
-  const hasExistingLedgerRecommendation =
-    action === "use_existing_ledger" || action === "use_standard_ledger";
-  const reviewSuggestedLedgerName = shouldReviewCloseMatch
+  const reviewSuggestedLedgerName = closeLedgerMatch
     ? closeLedgerMatch?.ledger.name || recommendedLedgerName
     : recommendedLedgerName;
   const selectedLedgerName =
-    transaction.confirmedLedgerName ||
-    (shouldReviewCloseMatch ? "" : matchedLedger?.name) ||
-    (hasExistingLedgerRecommendation || action === "use_suspense"
-      ? recommendedLedgerName
-      : suspenseName) ||
-    "";
-  const ledgerAction: LedgerRecommendationAction = shouldReviewCloseMatch
-    ? "needs_review"
-    : action === "use_suspense" || (!matchedLedger && !hasExistingLedgerRecommendation)
-    ? "use_suspense"
+    confirmedMappedLedger?.name ||
+    matchedLedger?.name ||
+    closeLedgerMatch?.ledger.name ||
+    confirmedSuspenseLedger?.name ||
+    suspenseName;
+  const ledgerAction: LedgerRecommendationAction = confirmedMappedLedger
+    ? "use_existing_ledger"
+    : closeLedgerMatch
+    ? "use_existing_ledger"
     : matchedLedger
     ? action === "use_standard_ledger"
       ? "use_standard_ledger"
       : "use_existing_ledger"
-    : hasExistingLedgerRecommendation
-      ? action
-      : "use_suspense";
+    : "use_suspense";
 
   return {
     id: transaction.id || crypto.randomUUID(),
@@ -431,27 +559,70 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     counterpartyName: transaction.counterpartyName || "",
     suggestedLedgerName: reviewSuggestedLedgerName,
     suggestionConfidence: recommendation?.confidence ?? transaction.suggestionConfidence ?? null,
-    suggestionReason: shouldReviewCloseMatch
-      ? `Possible existing ledger: ${closeLedgerMatch?.ledger.name}. Review before using Suspense.`
+    suggestionReason: closeLedgerMatch
+      ? `Single close Tally ledger match found: ${closeLedgerMatch.ledger.name}.`
       : ledgerAction === "use_suspense" && !matchedLedger
         ? "No matching Tally ledger was found. This row will go to Suspense unless changed."
         : recommendation?.reason || transaction.suggestionReason || "",
     selectedLedgerName,
     ledgerAction,
     ledgerGroup: recommendation?.ledgerGroup || "",
-    requiresUserConfirmation: shouldReviewCloseMatch || (matchedLedger ? false : recommendation?.requiresUserConfirmation ?? false),
+    requiresUserConfirmation: false,
+    ledgerSelectionTouched: false,
   };
 }
 
-function transactionIsValid(transaction: ReviewTransaction) {
-  return Boolean(transaction.transactionDate && transaction.description.trim());
+function autoMatchUntouchedLedgerSelection(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
+  if (transaction.ledgerSelectionTouched) return transaction;
+
+  const currentLedger = findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
+  if (
+    currentLedger &&
+    !isSuspenseLedgerName(currentLedger.name) &&
+    (transaction.ledgerAction === "use_existing_ledger" || transaction.ledgerAction === "use_standard_ledger")
+  ) {
+    return transaction;
+  }
+
+  const matchedLedger =
+    findLedgerByNormalizedName(ledgerMasters, transaction.suggestedLedgerName) ||
+    findLedgerByNormalizedName(ledgerMasters, transaction.counterpartyName) ||
+    findLedgerByNormalizedName(ledgerMasters, fallbackReviewLedgerName(transaction)) ||
+    findLedgerByCandidates(
+      ledgerMasters,
+      ledgerNameCandidateVariants(transaction.suggestedLedgerName, transaction.counterpartyName, transaction.description)
+    ) ||
+    findUniqueCloseLedgerMatchByCandidates(
+      ledgerMasters,
+      ledgerNameCandidateVariants(transaction.suggestedLedgerName, transaction.counterpartyName, transaction.description)
+    )?.ledger;
+
+  if (!matchedLedger || isSuspenseLedgerName(matchedLedger.name)) return transaction;
+
+  return {
+    ...transaction,
+    selectedLedgerName: matchedLedger.name,
+    suggestedLedgerName: matchedLedger.name,
+    ledgerAction: "use_existing_ledger" as const,
+    ledgerGroup: matchedLedger.parent || transaction.ledgerGroup,
+    suggestionReason: transaction.suggestionReason || "Matched by synced Tally ledger name.",
+    requiresUserConfirmation: false,
+  };
 }
 
-function parseNumber(value: string) {
-  const trimmed = value.trim();
+function parseNumber(value: unknown) {
+  const trimmed = String(value ?? "").trim();
   if (!trimmed) return null;
   const parsed = Number(trimmed.replace(/,/g, ""));
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function transactionHasPostingAmount(transaction: ReviewTransaction) {
+  return Math.max(parseNumber(transaction.debitAmount) ?? 0, parseNumber(transaction.creditAmount) ?? 0) > 0;
+}
+
+function transactionIsValid(transaction: ReviewTransaction) {
+  return Boolean(transaction.transactionDate && transaction.description.trim() && transactionHasPostingAmount(transaction));
 }
 
 function formatAmount(value: string | number | null | undefined) {
@@ -1131,24 +1302,24 @@ export function BankStatementsPage() {
     return bankLedgers.length > 0 ? bankLedgers : ledgerMasters;
   }, [ledgerMasters]);
   const missingLedgerCount = useMemo(
-    () => transactions.filter((transaction) => !transaction.selectedLedgerName.trim()).length,
-    [transactions]
+    () => validTransactions.filter((transaction) => !transaction.selectedLedgerName.trim()).length,
+    [validTransactions]
   );
-  const matchedLedgerCount = transactions.filter(
+  const matchedLedgerCount = validTransactions.filter(
     (transaction) =>
       transaction.selectedLedgerName.trim() &&
       !isSuspenseLedgerName(transaction.selectedLedgerName) &&
       (transaction.ledgerAction === "use_existing_ledger" || transaction.ledgerAction === "use_standard_ledger")
   ).length;
-  const suspenseLedgerCount = transactions.filter(
+  const suspenseLedgerCount = validTransactions.filter(
     (transaction) => transaction.ledgerAction === "use_suspense" || isSuspenseLedgerName(transaction.selectedLedgerName)
   ).length;
-  const needsReviewCount = transactions.filter(
+  const needsReviewCount = validTransactions.filter(
     (transaction) => getReviewStatus(transaction) === "needs_review"
   ).length;
   const filteredTransactions = useMemo(() => {
     const normalizedSearch = normalizeName(reviewSearch);
-    return transactions.filter((transaction) => {
+    return validTransactions.filter((transaction) => {
       if (reviewStatusFilter !== "all" && getReviewStatus(transaction) !== reviewStatusFilter) {
         return false;
       }
@@ -1183,7 +1354,7 @@ export function BankStatementsPage() {
       ].join(" ");
       return normalizeName(searchable).includes(normalizedSearch);
     });
-  }, [reviewDateFrom, reviewDateTo, reviewDirectionFilter, reviewSearch, reviewStatusFilter, transactions]);
+  }, [reviewDateFrom, reviewDateTo, reviewDirectionFilter, reviewSearch, reviewStatusFilter, validTransactions]);
   const visibleReviewTransactions = useMemo(
     () => filteredTransactions.slice(0, rowsPerPage),
     [filteredTransactions, rowsPerPage]
@@ -1310,6 +1481,9 @@ export function BankStatementsPage() {
 
     setTransactions((current) =>
       current.map((transaction) => {
+        const autoMatchedTransaction = autoMatchUntouchedLedgerSelection(transaction, ledgerMasters);
+        if (autoMatchedTransaction !== transaction) return autoMatchedTransaction;
+
         if (
           transaction.ledgerAction === "use_suspense" ||
           transaction.ledgerAction === "needs_review" ||
@@ -1344,6 +1518,7 @@ export function BankStatementsPage() {
               ledgerAction: selection.action,
               ledgerGroup: selection.ledgerGroup || "",
               requiresUserConfirmation: false,
+              ledgerSelectionTouched: true,
             }
           : transaction
       )

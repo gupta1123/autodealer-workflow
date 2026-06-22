@@ -43,6 +43,12 @@ type PostedLogRow = {
   tally_posted_at: string | null;
 };
 
+type ExistingTransactionRow = {
+  id: string;
+  fingerprint: string | null;
+  tally_status: string | null;
+};
+
 type TransactionCheckpointMarker = {
   transactionDate: string;
   valueDate: string | null;
@@ -163,7 +169,7 @@ function normalizeCheckpointText(value?: string | null) {
 
 function normalizeCheckpointAmount(value: number | string | null | undefined) {
   if (value === null || value === undefined || value === "") return null;
-  const parsed = Number(value);
+  const parsed = Number(String(value).replace(/,/g, ""));
   return Number.isFinite(parsed) ? Number(parsed.toFixed(2)) : null;
 }
 
@@ -247,6 +253,15 @@ function rowsAfterImportCheckpoint(
     };
   }
 
+  if (marker && !hasPostingAmount({ debit_amount: marker.debitAmount, credit_amount: marker.creditAmount })) {
+    const nextRows = rows.filter((row) => row.transaction_date >= markerDate);
+    return {
+      markerFound: false,
+      rows: nextRows,
+      skippedCount: rows.length - nextRows.length,
+    };
+  }
+
   const sameDateRowExists = rows.some((row) => row.transaction_date === markerDate);
   if (!sameDateRowExists) {
     const nextRows = rows.filter((row) => row.transaction_date > markerDate);
@@ -288,15 +303,22 @@ function getTransactionAmount(row: {
   debit_amount?: number | string | null;
   credit_amount?: number | string | null;
 }) {
-  return Math.max(Number(row.debit_amount ?? 0) || 0, Number(row.credit_amount ?? 0) || 0);
+  return Math.max(normalizeCheckpointAmount(row.debit_amount) ?? 0, normalizeCheckpointAmount(row.credit_amount) ?? 0);
+}
+
+function hasPostingAmount(row: {
+  debit_amount?: number | string | null;
+  credit_amount?: number | string | null;
+}) {
+  return getTransactionAmount(row) > 0;
 }
 
 function getVoucherType(row: {
   debit_amount?: number | string | null;
   credit_amount?: number | string | null;
 }) {
-  const debit = Number(row.debit_amount ?? 0) || 0;
-  const credit = Number(row.credit_amount ?? 0) || 0;
+  const debit = normalizeCheckpointAmount(row.debit_amount) ?? 0;
+  const credit = normalizeCheckpointAmount(row.credit_amount) ?? 0;
   if (debit > 0 && credit <= 0) return "Payment";
   if (credit > 0 && debit <= 0) return "Receipt";
   return "Contra";
@@ -318,15 +340,21 @@ export async function POST(
 
     const { id } = await context.params;
     const body = (await request.json().catch(() => ({}))) as ConfirmPayload;
-    const transactions = (body.transactions ?? []).flatMap((value) => {
+    const submittedTransactions = (body.transactions ?? []).flatMap((value) => {
       const transaction = toTransaction(value);
       return transaction ? [transaction] : [];
     });
+    const transactions = submittedTransactions.filter((transaction) =>
+      hasPostingAmount({
+        debit_amount: transaction.debitAmount,
+        credit_amount: transaction.creditAmount,
+      })
+    );
 
     if (transactions.length === 0) {
       return jsonWithCors(
         request,
-        { error: "Add at least one valid transaction before confirming." },
+        { error: "Add at least one valid debit or credit transaction before confirming." },
         { status: 400 }
       );
     }
@@ -495,35 +523,39 @@ export async function POST(
       if (postedLogError) throw postedLogError;
     }
 
-    const fingerprints = rowsAfterCheckpoint.map((row) => row.fingerprint);
-    const { data: postedLogData, error: postedLogReadError } = fingerprints.length
+    const submittedFingerprints = rows.map((row) => row.fingerprint);
+    const { data: postedLogData, error: postedLogReadError } = submittedFingerprints.length
       ? await supabase
           .from("bank_transaction_posting_log")
           .select("fingerprint, tally_voucher_id, tally_posted_at")
           .eq("owner_user_id", user.id)
           .eq("bank_account_id", accountId)
           .eq("status", "posted")
-          .in("fingerprint", fingerprints)
+          .in("fingerprint", submittedFingerprints)
       : { data: [], error: null };
 
     if (postedLogReadError) throw postedLogReadError;
 
-    const { data: existingTransactionData, error: existingTransactionReadError } = fingerprints.length
+    const { data: existingTransactionData, error: existingTransactionReadError } = submittedFingerprints.length
       ? await supabase
           .from("bank_transactions")
-          .select("fingerprint")
+          .select("id, fingerprint, tally_status")
           .eq("owner_user_id", user.id)
           .eq("bank_account_id", accountId)
-          .in("fingerprint", fingerprints)
+          .in("fingerprint", submittedFingerprints)
       : { data: [], error: null };
 
     if (existingTransactionReadError) throw existingTransactionReadError;
 
     const existingFingerprints = new Set(
-      ((existingTransactionData ?? []) as Array<{ fingerprint: string | null }>).flatMap((row) =>
+      ((existingTransactionData ?? []) as ExistingTransactionRow[]).flatMap((row) =>
         row.fingerprint ? [row.fingerprint] : []
       )
     );
+    const existingQueueableRows = ((existingTransactionData ?? []) as ExistingTransactionRow[]).filter(
+      (row) => row.id && row.fingerprint && (row.tally_status === "pending" || row.tally_status === "failed")
+    );
+    const submittedRowsByFingerprint = new Map(rows.map((row) => [row.fingerprint, row]));
     const postedByFingerprint = new Map(
       ((postedLogData ?? []) as unknown as PostedLogRow[]).map((row) => [row.fingerprint, row])
     );
@@ -574,6 +606,29 @@ export async function POST(
       if (insertError) throw insertError;
     }
 
+    if (existingQueueableRows.length > 0) {
+      const updateResults = await Promise.all(
+        existingQueueableRows.map((existingRow) => {
+          const matchingRow = existingRow.fingerprint ? submittedRowsByFingerprint.get(existingRow.fingerprint) : null;
+
+          return supabase
+            .from("bank_transactions")
+            .update({
+              statement_import_id: id,
+              suggested_ledger_name: matchingRow?.suggested_ledger_name ?? null,
+              suggestion_confidence: matchingRow?.suggestion_confidence ?? null,
+              suggestion_reason: matchingRow?.suggestion_reason ?? null,
+              confirmed_ledger_name: matchingRow?.confirmed_ledger_name ?? null,
+              ledger_mapping_source: matchingRow?.ledger_mapping_source ?? null,
+            })
+            .eq("id", existingRow.id)
+            .eq("owner_user_id", user.id);
+        })
+      );
+      const updateError = updateResults.find((result) => result.error)?.error;
+      if (updateError) throw updateError;
+    }
+
     const latestAcceptedRow = latestTransactionRow(rowsAfterCheckpoint);
     const latestAcceptedDate = latestAcceptedRow?.transaction_date ?? latestRowTransactionDate(rowsAfterCheckpoint);
     const latestAcceptedMarker = latestAcceptedRow ? buildTransactionCheckpointMarker(latestAcceptedRow) : null;
@@ -615,11 +670,13 @@ export async function POST(
                 : {}),
               confirmedAt: new Date().toISOString(),
               confirmedTransactionCount: transactions.length,
+              ignoredNonPostingRowCount: submittedTransactions.length - transactions.length,
               importedAfterTransactionDate: lastImportedTransactionDate,
               importedAfterTransactionMarker: lastImportedTransactionMarker,
               checkpointMarkerFound: checkpointResult.markerFound,
               skippedByCheckpointCount: checkpointResult.skippedCount,
               existingTransactionCount: existingFingerprints.size,
+              existingQueueableTransactionCount: existingQueueableRows.length,
               appendCompletedAt: new Date().toISOString(),
               alreadyPostedTransactionCount: postedByFingerprint.size,
             },
@@ -668,6 +725,7 @@ export async function POST(
       duplicateTransactionCount: transactions.length - rowsToInsert.length,
       skippedByCheckpointCount: checkpointResult.skippedCount,
       existingTransactionCount: existingFingerprints.size,
+      existingQueueableTransactionCount: existingQueueableRows.length,
       alreadyPostedTransactionCount: postedByFingerprint.size,
     });
   } catch (error) {

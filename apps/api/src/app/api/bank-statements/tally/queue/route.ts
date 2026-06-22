@@ -115,8 +115,13 @@ function toText(value: unknown, maxLength = 500) {
 }
 
 function toNumber(value: unknown) {
-  const parsed = Number(value);
+  const parsed = Number(String(value ?? "").replace(/,/g, ""));
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isSuspenseLedger(value?: string | null) {
+  const normalized = normalizeName(value);
+  return normalized === "suspense" || normalized === "suspenseac" || normalized === "suspenseaccount";
 }
 
 function isValidTransactionDate(value: unknown) {
@@ -434,12 +439,24 @@ export async function POST(request: Request) {
         const selectedLedger = ledgerSelectionByTransactionId.get(transaction.id);
         const createLedgerName = selectedLedger?.createLedgerName || "";
         const legacyFallback = requestedTransactionIds.length === 1 ? toText(body.counterpartyLedgerName, 500) : "";
+        const strongSuggestedLedger =
+          suggestion.ledgerName && !isSuspenseLedger(suggestion.ledgerName) && suggestion.confidence >= 0.85
+            ? suggestion.ledgerName
+            : "";
+        const confirmedLedgerName =
+          transaction.confirmed_ledger_name && !(isSuspenseLedger(transaction.confirmed_ledger_name) && strongSuggestedLedger)
+            ? transaction.confirmed_ledger_name
+            : "";
+        const storedSuggestedLedgerName =
+          transaction.suggested_ledger_name && !(isSuspenseLedger(transaction.suggested_ledger_name) && strongSuggestedLedger)
+            ? transaction.suggested_ledger_name
+            : "";
         const counterpartyLedgerName =
           createLedgerName ||
           selectedLedger?.counterpartyLedgerName ||
-          transaction.confirmed_ledger_name ||
-          (Number(transaction.suggestion_confidence ?? 0) >= 0.85 ? transaction.suggested_ledger_name || "" : "") ||
-          (suggestion.confidence >= 0.85 ? suggestion.ledgerName || "" : "") ||
+          confirmedLedgerName ||
+          strongSuggestedLedger ||
+          (Number(transaction.suggestion_confidence ?? 0) >= 0.85 ? storedSuggestedLedgerName : "") ||
           legacyFallback;
 
         return {

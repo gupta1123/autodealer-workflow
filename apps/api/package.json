@@ -13,6 +13,6 @@
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "worker": "node ./worker/process-packet-jobs.mjs",
-    "worker:local": "node --env-file=.env.local ./worker/process-packet-jobs.mjs"
+    "worker:local": "node --env-file=.env.local --env-file=.env.development.local ./worker/process-packet-jobs.mjs"
   }
 }

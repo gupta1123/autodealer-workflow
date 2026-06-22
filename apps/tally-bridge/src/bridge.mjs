@@ -493,7 +493,7 @@ function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) {
   const counterpartyIsPartyLedger = payload?.counterpartyIsPartyLedger === true;
   const bankLedgerEntryIsDebit = payload?.bankLedgerEntryIsDebit === true;
   const amount = toMoney(payload?.amount);
-  const narration = String(payload?.narration || "").trim();
+  const narration = String(payload?.narration || payload?.description || "").trim();
   const referenceNumber = String(payload?.referenceNumber || payload?.transactionId || "").trim();
 
   if (!bankLedgerName || !counterpartyLedgerName) {
@@ -525,16 +525,16 @@ function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) {
       : voucherType === "Receipt"
       ? [
           buildLedgerEntryXml({
-            ledgerName: bankLedgerName,
-            amount,
-            isDebit: true,
-            bankAllocation,
-          }),
-          buildLedgerEntryXml({
             ledgerName: counterpartyLedgerName,
             amount,
             isDebit: false,
             isPartyLedger: counterpartyIsPartyLedger,
+          }),
+          buildLedgerEntryXml({
+            ledgerName: bankLedgerName,
+            amount,
+            isDebit: true,
+            bankAllocation,
           }),
         ]
       : voucherType === "Contra"

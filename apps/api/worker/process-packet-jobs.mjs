@@ -233,6 +233,14 @@ function textCell(value) {
   return String(value ?? "").trim();
 }
 
+function firstTextCell(...values) {
+  for (const value of values) {
+    const text = textCell(value);
+    if (text) return text;
+  }
+  return "";
+}
+
 function normalizeName(value) {
   return String(value ?? "")
     .toLowerCase()
@@ -250,6 +258,55 @@ function titleCaseName(value) {
     .join(" ");
 }
 
+const COUNTERPARTY_PREFIXES = new Set([
+  "neft",
+  "rtgs",
+  "imps",
+  "upi",
+  "ach",
+  "ecs",
+  "nach",
+  "cr",
+  "dr",
+  "credit",
+  "debit",
+  "from",
+  "to",
+  "by",
+  "hdfc",
+  "icici",
+  "sbi",
+  "axis",
+  "kotak",
+  "idfc",
+  "indusind",
+  "canara",
+  "federal",
+  "yes",
+]);
+
+function cleanCounterpartyCandidate(value) {
+  let cleaned = String(value ?? "")
+    .replace(/\b(?:utr|ref|reference|invoice|bill|chq|cheque|txn|transaction)\b[\s:#/-]*[a-z0-9-]+.*$/i, "")
+    .replace(/[^a-zA-Z0-9 .&'/-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  for (let index = 0; index < 5; index += 1) {
+    const match = cleaned.match(/^([a-z0-9]+)(?:\s+|[-:/._]+)(.+)$/i);
+    if (!match) break;
+    const prefix = match[1].toLowerCase();
+    if (!COUNTERPARTY_PREFIXES.has(prefix) && !/^\d{4,}$/.test(prefix)) break;
+    cleaned = match[2].trim();
+  }
+
+  return cleaned
+    .split(/\s*[/|]\s*/)[0]
+    .replace(/[-:/._\s]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function extractCounterpartyName(description) {
   const raw = String(description ?? "").replace(/\s+/g, " ").trim();
   if (!raw) return null;
@@ -263,10 +320,7 @@ function extractCounterpartyName(description) {
   ];
   for (const pattern of patterns) {
     const match = raw.match(pattern);
-    const candidate = match?.[1]
-      ?.replace(/[^a-zA-Z0-9 .&'-]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+    const candidate = cleanCounterpartyCandidate(match?.[1]);
     if (candidate && normalizeName(candidate).length >= 3) return titleCaseName(candidate);
   }
   return null;
@@ -402,7 +456,25 @@ function normalizeAiTransaction(value, rowNumber) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const row = value;
   const transactionDate = parseDate(row.transactionDate ?? row.date ?? row.txnDate ?? row.postingDate);
-  const description = textCell(row.description ?? row.narration ?? row.particulars ?? row.remarks);
+  const description = firstTextCell(
+    row.fullNarration,
+    row["full narration"],
+    row.bankNarration,
+    row["bank narration"],
+    row.transactionNarration,
+    row["transaction narration"],
+    row.description,
+    row.narration,
+    row.particulars,
+    row.remarks,
+    row.details,
+    row.transactionDetails,
+    row["transaction details"],
+    row.transactionDescription,
+    row["transaction description"],
+    row.rawLine,
+    row["raw line"]
+  );
   if (!transactionDate || !description) return null;
 
   const debitAmount = parseAmount(row.debitAmount ?? row.debit ?? row.withdrawal ?? row.paidOut);
@@ -410,7 +482,11 @@ function normalizeAiTransaction(value, rowNumber) {
   const balanceAmount = parseAmount(row.balanceAmount ?? row.balance ?? row.runningBalance ?? row.closingBalance);
   const transactionType = textCell(row.transactionType) || detectTransactionType(description);
   const category = textCell(row.category) || detectCategory(description, debitAmount, creditAmount);
-  const counterpartyName = textCell(row.counterpartyName) || extractCounterpartyName(description);
+  const cleanedCounterpartyName = cleanCounterpartyCandidate(row.counterpartyName);
+  const counterpartyName =
+    (cleanedCounterpartyName && normalizeName(cleanedCounterpartyName).length >= 3
+      ? titleCaseName(cleanedCounterpartyName)
+      : null) || extractCounterpartyName(description);
 
   return {
     row_index: rowNumber,
@@ -567,7 +643,8 @@ async function extractBankStatementFromImages(fileName, images) {
         "Extract bank statement account details and transaction rows. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
         "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
         "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
-        "Use numbers for amounts, with debit and credit as positive values in their own columns. Do not invent rows. Preserve narration text exactly enough for audit matching. " +
+        "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
+        "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use numbers for amounts, with debit and credit as positive values in their own columns. Do not invent rows. Preserve narration text exactly enough for audit matching. " +
         "If a page contains only summary information and no ledger rows, extract account/period only and leave transactions empty.",
     },
     {
@@ -601,7 +678,8 @@ async function extractBankStatementFromPdfFile(fileName, mimeType, bytes) {
             "Extract bank statement account details and transaction rows from the attached PDF. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
             "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
             "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
-            "Use numbers for amounts, with debit and credit as positive values in their own columns. Preserve multi-line narration text in the description. " +
+            "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
+            "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use numbers for amounts, with debit and credit as positive values in their own columns. Preserve multi-line narration text in the description. " +
             "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
             "Do not treat BALANCE FORWARD, page footers, insurance notices, reward-points sections, summary totals, or opening/closing balance-only lines as transactions. " +
             "Do not invent rows or amounts. If the PDF contains only summary information and no ledger rows, extract account/period only and leave transactions empty.",
@@ -621,7 +699,8 @@ async function extractBankStatementFromText(fileName, pages) {
         "Extract bank statement account details and transaction rows from PDF text. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
         "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
         "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
-        "Use numbers for amounts, with debit and credit as positive values in their own columns. Preserve multi-line narration text in the description. " +
+        "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
+        "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use numbers for amounts, with debit and credit as positive values in their own columns. Preserve multi-line narration text in the description. " +
         "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
         "Do not treat BALANCE FORWARD, page footers, insurance notices, reward-points sections, summary totals, or opening/closing balance-only lines as transactions. " +
         "Do not invent rows or amounts. If the text is only summary information and no ledger rows are present, extract account/period only and leave transactions empty.",
@@ -667,7 +746,8 @@ async function extractBankStatementFromTextPages(fileName, pages) {
         content:
           "Extract bank statement rows from one page of PDF text. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
           "Dates must be ISO YYYY-MM-DD. Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
-          "Use positive numbers for debit and credit in their own columns. The columns are Date, Value Date, Description, Cheque, Deposit, Withdrawal, Balance. " +
+          "description must be the complete bank narration/description exactly as printed in the Description column, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
+          "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use positive numbers for debit and credit in their own columns. The columns are Date, Value Date, Description, Cheque, Deposit, Withdrawal, Balance. " +
           "If a transaction line has amounts and narration but no printed date, use the most recent transaction date/value date visible above it on the same page. " +
           "Attach continuation narration lines to the previous transaction. Ignore BALANCE FORWARD, TOTAL, reward-points sections, page footers, and bank notices. Do not invent rows.",
       },
@@ -914,6 +994,11 @@ async function runBankStatementJob(job) {
     importRow.processing_meta && typeof importRow.processing_meta === "object" && !Array.isArray(importRow.processing_meta)
       ? importRow.processing_meta
       : {};
+  const previousAnalysis =
+    processingMeta.analysis && typeof processingMeta.analysis === "object" && !Array.isArray(processingMeta.analysis)
+      ? processingMeta.analysis
+      : {};
+  const completedAt = new Date().toISOString();
   const { error: importUpdateError } = await supabase
     .from("bank_statement_imports")
     .update({
@@ -935,7 +1020,16 @@ async function runBankStatementJob(job) {
         maskedAccountNumber: maskAccountNumber(account.accountNumber),
         ifscCode: account.ifscCode,
         previewTransactionCount: rows.length,
-        completedAt: new Date().toISOString(),
+        completedAt,
+        analysis: {
+          ...previousAnalysis,
+          status: "completed",
+          progress: 100,
+          stage: "Statement analyzed",
+          error: null,
+          completedAt,
+          updatedAt: completedAt,
+        },
       },
     })
     .eq("id", job.import_id)

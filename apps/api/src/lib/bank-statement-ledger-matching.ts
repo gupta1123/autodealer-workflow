@@ -6,6 +6,7 @@ import {
   normalizeNarrationPattern,
   type ParsedBankTransaction,
 } from "@/lib/bank-statements";
+import { callOpenRouter, getQualityExtractionModel, getQualityExtractionReasoning } from "@/lib/processing/openrouter";
 import { normalizeMasterKey, type TallyMappingRow, type TallyMasterRow } from "@/lib/tally/masters";
 
 export type BankLedgerSuggestion = {
@@ -13,7 +14,7 @@ export type BankLedgerSuggestion = {
   ledgerName: string | null;
   confidence: number;
   reason: string | null;
-  mappingSource: "saved_narration" | "category" | "ledger_name" | "close_match" | "none";
+  mappingSource: "saved_narration" | "category" | "ledger_name" | "close_match" | "ai_match" | "none";
 };
 
 type MatchableTransaction = Pick<ParsedBankTransaction, "description" | "category" | "counterpartyName">;
@@ -57,9 +58,11 @@ function ledgerNameTokens(value?: string | null) {
       if (!token) return "";
       if (["pvt", "private", "ltd", "limited", "llp", "inc"].includes(token)) return "";
       if (token === "shri") return "shree";
-      if (token === "ind" || token === "industry" || token === "industries") return "industry";
+      if (["ind", "industry", "industries", "industires", "indutries", "indstries"].includes(token)) return "industry";
       if (token === "supply" || token === "supplies" || token === "supplier" || token === "suppliers") return "supply";
       if (token === "enterprise" || token === "enterprises") return "enterprise";
+      if (["engr", "engrs", "engg", "engineer", "engineers", "engineering"].includes(token)) return "engineer";
+      if (["mech", "mechanical"].includes(token)) return "mech";
       if (token === "co" || token === "company") return "company";
       return token;
     })
@@ -68,6 +71,26 @@ function ledgerNameTokens(value?: string | null) {
 
 function compactLedgerName(value?: string | null) {
   return ledgerNameTokens(value).join("");
+}
+
+const GENERIC_PARTY_SUFFIX_TOKENS = new Set([
+  "company",
+  "enterprise",
+  "firm",
+  "group",
+  "trader",
+  "traders",
+  "trading",
+]);
+
+function coreLedgerNameTokens(value?: string | null) {
+  return ledgerNameTokens(value).filter(
+    (token) => token.length > 1 && !GENERIC_PARTY_SUFFIX_TOKENS.has(token)
+  );
+}
+
+function compactCoreLedgerName(value?: string | null) {
+  return coreLedgerNameTokens(value).join("");
 }
 
 function levenshteinDistance(left: string, right: string) {
@@ -101,12 +124,23 @@ function ledgerNameSimilarity(left: string, right: string) {
   if (leftCompact === rightCompact) return 1;
 
   const maxLength = Math.max(leftCompact.length, rightCompact.length);
-  if (maxLength < 8) return 0;
+  if (maxLength < 5) return 0;
 
   const editScore = 1 - levenshteinDistance(leftCompact, rightCompact) / maxLength;
   const substringScore =
     leftCompact.includes(rightCompact) || rightCompact.includes(leftCompact)
       ? 0.82 + (Math.min(leftCompact.length, rightCompact.length) / maxLength) * 0.1
+      : 0;
+  const leftCoreCompact = compactCoreLedgerName(left);
+  const rightCoreCompact = compactCoreLedgerName(right);
+  const coreMaxLength = Math.max(leftCoreCompact.length, rightCoreCompact.length);
+  const coreScore =
+    coreMaxLength >= 5 && leftCoreCompact && rightCoreCompact
+      ? leftCoreCompact === rightCoreCompact
+        ? 0.96
+        : leftCoreCompact.includes(rightCoreCompact) || rightCoreCompact.includes(leftCoreCompact)
+          ? 0.88 + (Math.min(leftCoreCompact.length, rightCoreCompact.length) / coreMaxLength) * 0.08
+          : 1 - levenshteinDistance(leftCoreCompact, rightCoreCompact) / coreMaxLength
       : 0;
 
   const leftTokens = new Set(ledgerNameTokens(left));
@@ -115,23 +149,148 @@ function ledgerNameSimilarity(left: string, right: string) {
   const totalTokenCount = new Set([...leftTokens, ...rightTokens]).size;
   const tokenScore = totalTokenCount > 0 ? sharedTokenCount / totalTokenCount : 0;
 
-  return Math.max(editScore, substringScore, tokenScore);
+  return Math.max(editScore, substringScore, coreScore, tokenScore);
 }
 
-function findClosestLedgerByName(ledgers: TallyMasterRow[], candidateName?: string | null) {
+function findCloseLedgerMatches(ledgers: TallyMasterRow[], candidateName?: string | null) {
   const normalizedCandidate = normalizeName(candidateName);
-  if (!normalizedCandidate || compactLedgerName(normalizedCandidate).length < 8) return null;
+  if (!normalizedCandidate || compactLedgerName(normalizedCandidate).length < 5) return [];
 
-  let bestMatch: { ledgerName: string; score: number } | null = null;
+  const matches: Array<{ ledgerName: string; score: number }> = [];
   for (const ledger of ledgers) {
     const score = ledgerNameSimilarity(normalizedCandidate, ledger.tally_name);
     if (score < 0.84) continue;
-    if (!bestMatch || score > bestMatch.score || (score === bestMatch.score && ledger.tally_name < bestMatch.ledgerName)) {
-      bestMatch = { ledgerName: ledger.tally_name, score };
-    }
+    matches.push({ ledgerName: ledger.tally_name, score });
   }
 
-  return bestMatch;
+  return matches.sort((left, right) => right.score - left.score || left.ledgerName.localeCompare(right.ledgerName));
+}
+
+function findUniqueCloseLedgerByName(ledgers: TallyMasterRow[], candidateName?: string | null) {
+  const matches = findCloseLedgerMatches(ledgers, candidateName);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function safeJsonParse<T>(raw: string, fallback: T): T {
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return fallback;
+    try {
+      return JSON.parse(match[0]) as T;
+    } catch {
+      return fallback;
+    }
+  }
+}
+
+function compactPromptJson(value: unknown) {
+  return JSON.stringify(value, null, 2);
+}
+
+function clampConfidence(value: unknown) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.min(1, parsed));
+}
+
+function findLedgerByNormalizedName(ledgers: TallyMasterRow[], ledgerName?: string | null) {
+  const normalized = normalizeName(ledgerName);
+  if (!normalized) return null;
+  return ledgers.find((ledger) => normalizeName(ledger.tally_name) === normalized) ?? null;
+}
+
+function ledgerShortlistScore(ledger: TallyMasterRow, transaction: MatchableTransaction, counterpartyName: string | null) {
+  const candidates = [
+    counterpartyName,
+    transaction.counterpartyName,
+    extractCounterpartyName(transaction.description),
+    transaction.description,
+  ].filter(Boolean) as string[];
+
+  return Math.max(0, ...candidates.map((candidate) => ledgerNameSimilarity(candidate, ledger.tally_name)));
+}
+
+function shortlistLedgersForAi(ledgers: TallyMasterRow[], transaction: MatchableTransaction, counterpartyName: string | null) {
+  if (ledgers.length <= 200) return ledgers;
+
+  const scoredLedgers = ledgers
+    .map((ledger) => ({
+      ledger,
+      score: ledgerShortlistScore(ledger, transaction, counterpartyName),
+    }))
+    .filter((entry) => entry.score >= 0.35)
+    .sort((left, right) => right.score - left.score || left.ledger.tally_name.localeCompare(right.ledger.tally_name))
+    .slice(0, 120)
+    .map((entry) => entry.ledger);
+
+  return scoredLedgers.length > 0 ? scoredLedgers : ledgers.slice(0, 200);
+}
+
+async function aiMatchLedgerForTransaction(input: {
+  ledgers: TallyMasterRow[];
+  transaction: MatchableTransaction;
+  counterpartyName: string | null;
+}) {
+  const candidateLedgers = shortlistLedgersForAi(input.ledgers, input.transaction, input.counterpartyName);
+  if (candidateLedgers.length === 0) return null;
+
+  const raw = await callOpenRouter(
+    [
+      {
+        role: "system",
+        content:
+          "You match one Indian bank statement transaction to one synced Tally ledger. Return only valid JSON. " +
+          "You may choose only from the provided tallyLedgers list. Never invent a ledger name. " +
+          "Match real party names even when bank narration has spelling mistakes, missing spaces, joined words, generic suffixes, trailing initials, legal suffixes, or abbreviations. " +
+          "Examples: 'Raja Guru Enterprises' can match 'RAJAGURU R'; 'Quali Mech Engrs' can match 'QUALIMECH ENGINEERS'; 'Maharaj Industires' can match 'Maharaj Industries'; 'Office Supply CO' can match 'Office Supplies'. " +
+          "If exactly one ledger is clearly the same party, return action use_existing_ledger with that exact ledgerName and confidence >= 0.90. " +
+          "If there are multiple plausible ledgers, no clear ledger, a standard category instead of a party, or you are unsure, return action use_suspense with ledgerName null and confidence <= 0.60. " +
+          "Return JSON shape: {\"action\":\"use_existing_ledger|use_suspense\",\"ledgerName\":\"...\",\"confidence\":0.0,\"reason\":\"short reason\"}.",
+      },
+      {
+        role: "user",
+        content: compactPromptJson({
+          transaction: {
+            description: input.transaction.description,
+            category: input.transaction.category,
+            counterpartyName: input.counterpartyName ?? input.transaction.counterpartyName ?? null,
+          },
+          tallyLedgers: candidateLedgers.map((ledger) => ({
+            name: ledger.tally_name,
+            group: ledger.parent_name ?? null,
+          })),
+        }),
+      },
+    ],
+    {
+      expectJson: true,
+      jsonMode: true,
+      model: getQualityExtractionModel(),
+      reasoning: getQualityExtractionReasoning(),
+      maxTokens: 1200,
+    }
+  );
+
+  const parsed = safeJsonParse<{
+    action?: unknown;
+    ledgerName?: unknown;
+    confidence?: unknown;
+    reason?: unknown;
+  }>(raw, {});
+  if (String(parsed.action ?? "") !== "use_existing_ledger") return null;
+
+  const ledgerName = String(parsed.ledgerName ?? "").trim();
+  const matchedLedger = findLedgerByNormalizedName(candidateLedgers, ledgerName);
+  const confidence = clampConfidence(parsed.confidence);
+  if (!matchedLedger || confidence < 0.9) return null;
+
+  return {
+    ledgerName: matchedLedger.tally_name,
+    confidence,
+    reason: String(parsed.reason ?? "AI matched one synced Tally ledger.").trim() || "AI matched one synced Tally ledger.",
+  };
 }
 
 function sourceKeyForNarration(accountId: string, description: string) {
@@ -208,13 +367,13 @@ export async function suggestBankLedgerForTransaction(input: {
       };
     }
 
-    const closeLedger = findClosestLedgerByName(ledgers, counterpartyName);
+    const closeLedger = findUniqueCloseLedgerByName(ledgers, counterpartyName);
     if (closeLedger) {
       return {
         counterpartyName,
         ledgerName: closeLedger.ledgerName,
-        confidence: Math.min(0.84, Math.max(0.7, closeLedger.score)),
-        reason: "Close Tally ledger match found; review before creating a new ledger",
+        confidence: Math.min(0.95, Math.max(0.86, closeLedger.score)),
+        reason: "One close Tally ledger match found",
         mappingSource: "close_match",
       };
     }
@@ -232,6 +391,27 @@ export async function suggestBankLedgerForTransaction(input: {
         : "Category detected, but no matching Tally ledger was synced",
       mappingSource: categoryLedgerName ? "category" : "none",
     };
+  }
+
+  if (counterpartyName) {
+    try {
+      const aiLedger = await aiMatchLedgerForTransaction({
+        ledgers,
+        transaction: input.transaction,
+        counterpartyName,
+      });
+      if (aiLedger) {
+        return {
+          counterpartyName,
+          ledgerName: aiLedger.ledgerName,
+          confidence: aiLedger.confidence,
+          reason: aiLedger.reason,
+          mappingSource: "ai_match",
+        };
+      }
+    } catch (error) {
+      console.warn("AI ledger match fallback failed:", error);
+    }
   }
 
   return {

@@ -89,7 +89,7 @@ export async function GET(
       return jsonWithCors(request, { error: "Bank statement import was not found." }, { status: 404 });
     }
 
-    const { data: jobRow, error: jobError } = await supabase
+    const { data: latestJobRow, error: jobError } = await supabase
       .from("bank_statement_extraction_jobs")
       .select("*")
       .eq("import_id", id)
@@ -99,6 +99,7 @@ export async function GET(
       .maybeSingle();
 
     if (jobError) throw jobError;
+    let jobRow = latestJobRow;
 
     const { data: previewRows, error: previewError } = await supabase
       .from("bank_statement_import_preview_transactions")
@@ -120,8 +121,30 @@ export async function GET(
         : storedPreviewTransactions;
     const analysis = readRecord(processingMeta.analysis);
     const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
+    const jobStatus = typeof jobRow?.status === "string" ? jobRow.status : "";
+    const jobIsTerminal = ["succeeded", "failed", "cancelled"].includes(jobStatus);
     const processing =
-      importRow.status === "processing" || analysisStatus === "queued" || analysisStatus === "processing";
+      !jobIsTerminal &&
+      (importRow.status === "processing" || analysisStatus === "queued" || analysisStatus === "processing");
+
+    if (!jobRow && processing) {
+      const { data: repairedJobRow, error: repairJobError } = await supabase
+        .from("bank_statement_extraction_jobs")
+        .insert({
+          import_id: id,
+          owner_user_id: user.id,
+          status: "queued",
+          progress: Number(analysis.progress ?? 5),
+          stage: typeof analysis.stage === "string" ? analysis.stage : "Statement uploaded",
+          result: {},
+        })
+        .select("*")
+        .single();
+
+      if (repairJobError) throw repairJobError;
+      jobRow = repairedJobRow;
+    }
+
     const requiresManualExtraction =
       importRow.status === "manual_review_required" ||
       importRow.status === "failed" ||

@@ -28,13 +28,41 @@ type BankTransactionRow = {
 };
 
 function toNumber(value: unknown) {
-  const parsed = Number(value);
+  const parsed = Number(String(value ?? "").replace(/,/g, ""));
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function hasPostingAmount(row: BankTransactionRow) {
+  return Math.max(toNumber(row.debit_amount) ?? 0, toNumber(row.credit_amount) ?? 0) > 0;
+}
+
+function normalizeLedgerName(value?: string | null) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function isSuspenseLedger(value?: string | null) {
+  const normalized = normalizeLedgerName(value);
+  return normalized === "suspense" || normalized === "suspenseac" || normalized === "suspenseaccount";
+}
+
 function serializeTransaction(row: BankTransactionRow, suggestion?: Awaited<ReturnType<typeof suggestBankLedgerForTransaction>>) {
-  const suggestedLedgerName = row.confirmed_ledger_name || row.suggested_ledger_name || suggestion?.ledgerName || null;
-  const suggestionConfidence = toNumber(row.suggestion_confidence) ?? suggestion?.confidence ?? null;
+  const strongSuggestedLedger =
+    suggestion?.ledgerName && !isSuspenseLedger(suggestion.ledgerName) && suggestion.confidence >= 0.85
+      ? suggestion.ledgerName
+      : null;
+  const confirmedLedgerName =
+    row.confirmed_ledger_name && !(isSuspenseLedger(row.confirmed_ledger_name) && strongSuggestedLedger)
+      ? row.confirmed_ledger_name
+      : null;
+  const storedSuggestedLedgerName =
+    row.suggested_ledger_name && !(isSuspenseLedger(row.suggested_ledger_name) && strongSuggestedLedger)
+      ? row.suggested_ledger_name
+      : null;
+  const suggestedLedgerName = confirmedLedgerName || strongSuggestedLedger || storedSuggestedLedgerName || suggestion?.ledgerName || null;
+  const suggestionConfidence =
+    suggestedLedgerName === suggestion?.ledgerName
+      ? suggestion.confidence
+      : toNumber(row.suggestion_confidence) ?? suggestion?.confidence ?? null;
 
   return {
     id: row.id,
@@ -52,7 +80,7 @@ function serializeTransaction(row: BankTransactionRow, suggestion?: Awaited<Retu
     suggestedLedgerName,
     suggestionConfidence,
     suggestionReason: row.suggestion_reason || suggestion?.reason || null,
-    confirmedLedgerName: row.confirmed_ledger_name,
+    confirmedLedgerName: confirmedLedgerName || (strongSuggestedLedger ? null : row.confirmed_ledger_name),
     ledgerMappingSource: row.ledger_mapping_source || suggestion?.mappingSource || null,
     tallyStatus: row.tally_status,
     needsLedgerConfirmation: !suggestedLedgerName || (suggestionConfidence ?? 0) < 0.85,
@@ -114,7 +142,8 @@ export async function GET(request: Request) {
     const { data, error } = await builder;
     if (error) throw error;
 
-    const rows = (data ?? []) as unknown as BankTransactionRow[];
+    const allRows = (data ?? []) as unknown as BankTransactionRow[];
+    const rows = status === "queueable" ? allRows.filter(hasPostingAmount) : allRows;
     const suggestions = await Promise.all(
       rows.map((row) =>
         suggestBankLedgerForTransaction({

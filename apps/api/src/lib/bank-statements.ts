@@ -147,6 +147,55 @@ export function normalizeNarrationPattern(value?: string | null) {
     .trim();
 }
 
+const COUNTERPARTY_PREFIXES = new Set([
+  "neft",
+  "rtgs",
+  "imps",
+  "upi",
+  "ach",
+  "ecs",
+  "nach",
+  "cr",
+  "dr",
+  "credit",
+  "debit",
+  "from",
+  "to",
+  "by",
+  "hdfc",
+  "icici",
+  "sbi",
+  "axis",
+  "kotak",
+  "idfc",
+  "indusind",
+  "canara",
+  "federal",
+  "yes",
+]);
+
+function cleanCounterpartyCandidate(value?: string | null) {
+  let cleaned = String(value ?? "")
+    .replace(/\b(?:utr|ref|reference|invoice|bill|chq|cheque|txn|transaction)\b[\s:#/-]*[a-z0-9-]+.*$/i, "")
+    .replace(/[^a-zA-Z0-9 .&'/-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  for (let index = 0; index < 5; index += 1) {
+    const match = cleaned.match(/^([a-z0-9]+)(?:\s+|[-:/._]+)(.+)$/i);
+    if (!match) break;
+    const prefix = match[1].toLowerCase();
+    if (!COUNTERPARTY_PREFIXES.has(prefix) && !/^\d{4,}$/.test(prefix)) break;
+    cleaned = match[2].trim();
+  }
+
+  return cleaned
+    .split(/\s*[/|]\s*/)[0]
+    .replace(/[-:/._\s]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function extractCounterpartyName(description?: string | null) {
   const raw = String(description ?? "").replace(/\s+/g, " ").trim();
   if (!raw) return null;
@@ -164,10 +213,7 @@ export function extractCounterpartyName(description?: string | null) {
 
   for (const pattern of patterns) {
     const match = raw.match(pattern);
-    const candidate = match?.[1]
-      ?.replace(/[^a-zA-Z0-9 .&'-]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+    const candidate = cleanCounterpartyCandidate(match?.[1]);
     if (candidate && normalizeName(candidate).length >= 3) return titleCaseName(candidate);
   }
 
@@ -469,12 +515,15 @@ export async function classifyBankTransactionsForTallyWithAI(params: {
         content:
           "You are classifying Indian business bank statement transactions for Tally Prime accounting. Return only valid JSON. " +
           "Do not invent existing ledgers. You may use an existing ledger only if it appears in the provided tallyLedgerNames list, matching case-insensitively. " +
-          "For a receipt from a named customer/business party with no existing ledger, recommend create_new_ledger under Sundry Debtors. " +
-          "For a payment to a named vendor/business party with no existing ledger, recommend create_new_ledger under Sundry Creditors. " +
+          "Before recommending suspense, compare the counterpartyName and description against tallyLedgerNames for normal Indian bank narration variations: spelling mistakes, missing spaces, joined words, singular/plural, legal suffixes (Pvt, Private, Ltd, Limited, LLP), generic suffixes (Enterprise, Enterprises, Company, Co, Traders, Trading), trailing initials, and abbreviations such as Co/Company, Ind/Industries, Engrs/Engg/Engineers/Engineering, Mech/Mechanical, Supply/Supplies/Supplier. " +
+          "Examples: 'Quali Mech Engrs' should match a provided ledger named 'QUALIMECH ENGINEERS'; 'Maharaj Industires' should match 'Maharaj Industries'; 'Office Supply CO' should match 'Office Supplies'; 'Pushpak Steels IND' should match 'Pushpak Steel Industries'; 'Raja Guru Enterprises' should match 'RAJAGURU R' when that is the only clear Rajaguru ledger. " +
+          "If exactly one provided Tally ledger is the clear party match, recommend use_existing_ledger with that exact ledger name and confidence at least 0.90. " +
+          "If two or more provided ledgers are plausible party matches, recommend use_suspense when a Suspense ledger exists. " +
+          "For a named customer/vendor/business party with no clear existing ledger, recommend use_suspense when a Suspense ledger exists; do not recommend creating a new party ledger during import. " +
           "For bank charges, fees, GST on bank charges, interest, cash withdrawal/deposit, tax, TDS, GST, salary, or other standard categories, prefer an existing standard ledger from tallyLedgerNames when present. " +
           "Do not create a party ledger for bank charges, tax, GST, TDS, interest, cash, salary, or internal bank transfers. " +
-          "Use use_suspense only when the transaction is genuinely unclear and a Suspense ledger exists. Use needs_review when the data is insufficient or risky. " +
-          "Creating a new ledger, using suspense, or any confidence below 0.85 must set requiresUserConfirmation true. " +
+          "Use needs_review when the data is insufficient or risky and no safe Suspense ledger is available. " +
+          "Using suspense or any confidence below 0.85 must set requiresUserConfirmation true. " +
           "Allowed recommendedAction values: use_existing_ledger, create_new_ledger, use_standard_ledger, use_suspense, needs_review. " +
           "Allowed create_new_ledger groups: Sundry Debtors, Sundry Creditors, Indirect Expenses, Indirect Incomes, Duties & Taxes, Cash-in-Hand. " +
           "Return JSON shape: {\"recommendations\":[{\"index\":0,\"counterpartyName\":\"...\",\"transactionNature\":\"customer_receipt|vendor_payment|bank_charge|interest|tax|cash|transfer|unknown\",\"recommendedAction\":\"...\",\"recommendedLedgerName\":\"...\",\"recommendedLedgerGroup\":\"...\",\"confidence\":0.0,\"requiresUserConfirmation\":true,\"reason\":\"short reason\"}]}.",
@@ -980,6 +1029,28 @@ function readLooseText(row: Record<string, unknown>, aliases: string[]) {
   return textCell(readLooseField(row, aliases));
 }
 
+function readLooseNarration(row: Record<string, unknown>) {
+  return readLooseText(row, [
+    "fullNarration",
+    "full narration",
+    "bankNarration",
+    "bank narration",
+    "transactionNarration",
+    "transaction narration",
+    "description",
+    "narration",
+    "particulars",
+    "remarks",
+    "details",
+    "transactionDetails",
+    "transaction details",
+    "transactionDescription",
+    "transaction description",
+    "rawLine",
+    "raw line",
+  ]);
+}
+
 function readLooseAmount(row: Record<string, unknown>, aliases: string[]) {
   return parseAmount(readLooseField(row, aliases));
 }
@@ -1030,20 +1101,7 @@ function normalizeAiTransaction(value: unknown, rowNumber: number): ParsedBankTr
     "posting date",
     "post date",
   ]);
-  const description =
-    readLooseText(row, [
-      "description",
-      "narration",
-      "particulars",
-      "remarks",
-      "details",
-      "transactionDetails",
-      "transaction details",
-      "transactionDescription",
-      "transaction description",
-      "rawLine",
-      "raw line",
-    ]) || `Transaction ${rowNumber}`;
+  const description = readLooseNarration(row) || `Transaction ${rowNumber}`;
   const splitAmount = splitLooseSignedAmount(row);
   const debitAmount =
     readLooseAmount(row, [
@@ -1089,7 +1147,12 @@ function normalizeAiTransaction(value: unknown, rowNumber: number): ParsedBankTr
 
   const transactionType = readLooseText(row, ["transactionType", "transaction type", "type"]) || detectTransactionType(description);
   const category = readLooseText(row, ["category"]) || detectCategory(description, debitAmount, creditAmount);
-  const counterpartyName = readLooseText(row, ["counterpartyName", "counterparty name", "counterparty", "party"]) || extractCounterpartyName(description);
+  const rawCounterpartyName = readLooseText(row, ["counterpartyName", "counterparty name", "counterparty", "party"]);
+  const cleanedCounterpartyName = cleanCounterpartyCandidate(rawCounterpartyName);
+  const counterpartyName =
+    (cleanedCounterpartyName && normalizeName(cleanedCounterpartyName).length >= 3
+      ? titleCaseName(cleanedCounterpartyName)
+      : null) || extractCounterpartyName(description);
 
   return {
     transactionDate,
@@ -1216,7 +1279,8 @@ async function extractBankStatementFromImages(params: {
           "Extract bank statement account details and transaction rows. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
           "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
           "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, confidence, and rawLine. " +
-          "Use numbers for amounts, with debit and credit as positive values in their own columns. Do not invent rows. Preserve narration text exactly enough for audit matching. " +
+          "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
+          "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use numbers for amounts, with debit and credit as positive values in their own columns. Do not invent rows. Preserve narration text exactly enough for audit matching. " +
           "Merge wrapped narration lines into the preceding transaction row. Ignore balance-forward, subtotal, total, reward-points, and footer rows. If a page contains only summary information and no ledger rows, extract account/period only and leave transactions empty. " +
           (params.repairMode
             ? "Repair mode: a previous pass found no usable rows. Treat the visible fixed-width or tabular bank statement as authoritative and extract every ledger transaction row you can see."
