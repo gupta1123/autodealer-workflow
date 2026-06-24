@@ -24,6 +24,18 @@ const WORKER_STALE_RUNNING_JOB_INTERVAL = `${Math.max(1, Math.round(WORKER_STALE
 const WORKER_IN_FLIGHT_WAIT_MS = Number(process.env.WORKER_IN_FLIGHT_WAIT_MS ?? 2 * 60_000);
 const WORKER_IN_FLIGHT_POLL_MS = Number(process.env.WORKER_IN_FLIGHT_POLL_MS ?? 5_000);
 const BANK_STATEMENT_AI_MAX_PAGES = Number(process.env.BANK_STATEMENT_AI_MAX_PAGES ?? 8);
+const BANK_STATEMENT_SINGLE_SHOT_MAX_PAGES = Number(
+  process.env.BANK_STATEMENT_SINGLE_SHOT_MAX_PAGES ?? BANK_STATEMENT_AI_MAX_PAGES
+);
+const BANK_STATEMENT_MAX_TOTAL_PAGES = Number(process.env.BANK_STATEMENT_MAX_TOTAL_PAGES ?? 1000);
+const BANK_STATEMENT_BATCH_PAGE_SIZE = Math.max(1, Number(process.env.BANK_STATEMENT_BATCH_PAGE_SIZE ?? 2));
+const BANK_STATEMENT_BATCH_CONCURRENCY = Math.max(1, Number(process.env.BANK_STATEMENT_BATCH_CONCURRENCY ?? 3));
+const BANK_STATEMENT_BATCH_RETRY_LIMIT = Math.max(0, Number(process.env.BANK_STATEMENT_BATCH_RETRY_LIMIT ?? 2));
+const BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT = Math.max(
+  0,
+  Number(process.env.BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT ?? 50)
+);
+const BANK_STATEMENT_TEXT_PROMPT_MAX_CHARS = Number(process.env.BANK_STATEMENT_TEXT_PROMPT_MAX_CHARS ?? 80_000);
 const BANK_STATEMENT_PDF_RENDER_DPI = Number(process.env.BANK_STATEMENT_PDF_RENDER_DPI ?? 170);
 const BANK_STATEMENT_PROVIDER_IMAGE_TARGET_BYTES = Number(
   process.env.BANK_STATEMENT_PROVIDER_IMAGE_TARGET_BYTES ?? 8 * 1024 * 1024
@@ -108,6 +120,24 @@ function formatError(error) {
   return String(error ?? "Unknown error");
 }
 
+function diagnosticError(error) {
+  return formatError(error).slice(0, 500);
+}
+
+async function runWithConcurrency(items, concurrency, handler) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await handler(items[currentIndex], currentIndex);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 function normalizeImageMimeType(mimeType) {
   const lower = String(mimeType || "").toLowerCase();
   if (lower === "image/jpg") return "image/jpeg";
@@ -160,7 +190,7 @@ function reconstructPdfTextLines(items) {
     .join("\n");
 }
 
-async function extractBankStatementPdfTextPages(data) {
+async function extractBankStatementPdfTextPages(data, options = {}) {
   const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
   if ("GlobalWorkerOptions" in pdfjsLib) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_SRC;
@@ -172,20 +202,32 @@ async function extractBankStatementPdfTextPages(data) {
     useSystemFonts: true,
     verbosity: pdfjsLib.VerbosityLevel?.ERRORS,
   }).promise;
-  const pageCount = Math.min(pdf.numPages, BANK_STATEMENT_AI_MAX_PAGES);
+  const maxPages = Number.isFinite(options.maxPages) ? options.maxPages : BANK_STATEMENT_MAX_TOTAL_PAGES;
+  const pageCount = Math.min(pdf.numPages, Math.max(1, maxPages));
   const pages = [];
 
   for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
     const page = await pdf.getPage(pageNumber);
     const textContent = await page.getTextContent();
-    pages.push(reconstructPdfTextLines(textContent.items));
+    pages.push({
+      pageNumber,
+      text: reconstructPdfTextLines(textContent.items),
+    });
   }
 
-  return pages;
+  return {
+    pageCount: pdf.numPages,
+    pages,
+    truncated: pdf.numPages > pageCount,
+  };
 }
 
 function hasUsableBankStatementText(pages) {
-  const combined = pages.join("\n").replace(/\s+/g, " ").trim();
+  const combined = pages
+    .map((page) => (typeof page === "string" ? page : page?.text || ""))
+    .join("\n")
+    .replace(/\s+/g, " ")
+    .trim();
   if (combined.length < 300) return false;
   return /\b(?:date|value date|description|narration|particulars)\b/i.test(combined) &&
     /\b(?:balance|deposit|withdrawal|debit|credit)\b/i.test(combined);
@@ -193,9 +235,13 @@ function hasUsableBankStatementText(pages) {
 
 function formatBankStatementTextForAi(pages) {
   return pages
-    .map((page, index) => `Page ${index + 1}\n${page || "[No text extracted]"}`)
+    .map((page, index) => {
+      const pageNumber = typeof page === "object" && page ? page.pageNumber : index + 1;
+      const text = typeof page === "string" ? page : page?.text;
+      return `Page ${pageNumber}\n${text || "[No text extracted]"}`;
+    })
     .join("\n\n---\n\n")
-    .slice(0, 80_000);
+    .slice(0, BANK_STATEMENT_TEXT_PROMPT_MAX_CHARS);
 }
 
 function parseDate(value) {
@@ -417,10 +463,12 @@ async function imageBytesToProviderDataUrl(data, mimeType, label) {
   throw new Error(`Unable to prepare "${label}" for bank statement extraction: ${reason}`);
 }
 
-async function renderBankStatementPdfToImages(data, sourceName) {
+async function renderBankStatementPdfToImages(data, sourceName, options = {}) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bank-statement-pdf-"));
   const inputPath = path.join(tmpDir, "input.pdf");
   const outputPrefix = path.join(tmpDir, "page");
+  const startPage = Math.max(1, Number(options.startPage ?? 1));
+  const endPage = Math.max(startPage, Number(options.endPage ?? BANK_STATEMENT_AI_MAX_PAGES));
 
   try {
     fs.writeFileSync(inputPath, Buffer.from(data));
@@ -429,9 +477,9 @@ async function renderBankStatementPdfToImages(data, sourceName) {
       String(BANK_STATEMENT_PDF_RENDER_DPI),
       "-png",
       "-f",
-      "1",
+      String(startPage),
       "-l",
-      String(BANK_STATEMENT_AI_MAX_PAGES),
+      String(endPage),
       inputPath,
       outputPrefix,
     ]);
@@ -716,6 +764,7 @@ async function extractBankStatementFromText(fileName, pages) {
 
 function mergeBankStatementResults(results) {
   const merged = normalizeAiBankStatement({});
+  const seenTransactions = new Set();
   for (const result of results) {
     if (!result) continue;
     merged.account = {
@@ -726,46 +775,378 @@ function mergeBankStatementResults(results) {
     };
     merged.statementPeriodStart = merged.statementPeriodStart || result.statementPeriodStart || null;
     merged.statementPeriodEnd = merged.statementPeriodEnd || result.statementPeriodEnd || null;
-    merged.transactions.push(...result.transactions);
+    for (const transaction of result.transactions) {
+      const key = [
+        transaction.transaction_date,
+        normalizeName(transaction.description),
+        normalizeName(transaction.reference_number),
+        transaction.debit_amount ?? "",
+        transaction.credit_amount ?? "",
+        transaction.balance_amount ?? "",
+      ].join("|");
+      if (seenTransactions.has(key)) continue;
+      seenTransactions.add(key);
+      merged.transactions.push(transaction);
+    }
   }
   return merged;
 }
 
-async function extractBankStatementFromTextPages(fileName, pages) {
-  const results = [];
+function likelyHasTransactionRows(page) {
+  const text = String(typeof page === "string" ? page : page?.text || "").replace(/\s+/g, " ").trim();
+  if (!text) return false;
+  const hasAmount = /(?:\d{1,3}(?:,\d{2,3})+|\d+)\.\d{2}|(?:\d{1,3}(?:,\d{2,3})+|\d+)\b/.test(text);
+  const hasDate =
+    /\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b/.test(text) ||
+    /\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\b/.test(text) ||
+    /\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b/.test(text);
+  const hasStatementWords = /\b(?:neft|rtgs|imps|upi|deposit|withdrawal|debit|credit|balance|particulars|narration)\b/i.test(text);
+  return hasAmount && (hasDate || hasStatementWords);
+}
 
-  for (let index = 0; index < pages.length; index += 1) {
-    const pageText = String(pages[index] || "").trim();
-    if (!pageText || !/\d{1,2}\s+[A-Za-z]{3}\s+\d{2}/.test(pageText)) {
-      continue;
+function pageRangeLabel(pages) {
+  const first = pages[0]?.pageNumber ?? 1;
+  const last = pages[pages.length - 1]?.pageNumber ?? first;
+  return first === last ? `page ${first}` : `pages ${first}-${last}`;
+}
+
+function chunkPages(pages, size) {
+  const chunks = [];
+  for (let index = 0; index < pages.length; index += size) {
+    chunks.push(pages.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function lastItem(items) {
+  return items[items.length - 1];
+}
+
+async function extractBankStatementFromTextBatch(fileName, pages) {
+  const raw = await callOpenRouterForBankStatement([
+    {
+      role: "system",
+      content:
+        "Extract bank statement account details and transaction rows from a batch of PDF text pages. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
+        "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
+        "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
+        "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
+        "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. " +
+        "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
+        "Ignore BALANCE FORWARD, OPENING BALANCE, CLOSING BALANCE, page footers, reward-points sections, summary totals, and bank notices unless they have a real debit or credit transaction amount. " +
+        "Do not invent rows. If this batch contains only summary/header information and no ledger rows, return account/period if visible and an empty transactions array.",
+    },
+    {
+      role: "user",
+      content: `Extract ${pageRangeLabel(pages)} from ${fileName}:\n\n${formatBankStatementTextForAi(pages)}`,
+    },
+  ]);
+
+  return normalizeAiBankStatement(safeJsonParse(raw, {}));
+}
+
+async function extractBankStatementFromImageBatch(fileName, images, rangeLabel) {
+  if (images.length === 0) return normalizeAiBankStatement({});
+  const raw = await callOpenRouterForBankStatement([
+    {
+      role: "system",
+      content:
+        "Extract bank statement account details and transaction rows from these rendered statement pages. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
+        "Dates must be ISO YYYY-MM-DD. Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
+        "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. counterpartyName must be only the party/vendor/customer name. " +
+        "Ignore BALANCE FORWARD, OPENING BALANCE, CLOSING BALANCE, summary totals, page footers, and bank notices. Do not invent rows.",
+    },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: `Extract ${rangeLabel} from ${fileName}.` },
+        ...images.map((image) => ({ type: "image_url", image_url: { url: image } })),
+      ],
+    },
+  ]);
+
+  return normalizeAiBankStatement(safeJsonParse(raw, {}));
+}
+
+async function callWithBatchRetries(label, handler) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= BANK_STATEMENT_BATCH_RETRY_LIMIT; attempt += 1) {
+    try {
+      return await handler(attempt);
+    } catch (error) {
+      lastError = error;
+      if (attempt < BANK_STATEMENT_BATCH_RETRY_LIMIT) {
+        await sleep(OPENROUTER_RETRY_BASE_MS * Math.pow(2, attempt));
+      }
+    }
+  }
+  throw new Error(`${label} failed: ${diagnosticError(lastError)}`);
+}
+
+async function extractBankStatementTextBatches(fileName, pages, jobId) {
+  const batches = chunkPages(pages, BANK_STATEMENT_BATCH_PAGE_SIZE);
+  const diagnostics = [];
+  const failedBatches = [];
+  const results = await runWithConcurrency(batches, BANK_STATEMENT_BATCH_CONCURRENCY, async (batch, index) => {
+    const label = pageRangeLabel(batch);
+    const hasLikelyRows = batch.some(likelyHasTransactionRows);
+    if (!hasLikelyRows && !hasUsableBankStatementText(batch)) {
+      diagnostics[index] = {
+        startPage: batch[0]?.pageNumber,
+        endPage: lastItem(batch)?.pageNumber,
+        status: "skipped",
+        rowCount: 0,
+      };
+      return null;
     }
 
-    const raw = await callOpenRouterForBankStatement([
-      {
-        role: "system",
-        content:
-          "Extract bank statement rows from one page of PDF text. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
-          "Dates must be ISO YYYY-MM-DD. Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
-          "description must be the complete bank narration/description exactly as printed in the Description column, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
-          "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use positive numbers for debit and credit in their own columns. The columns are Date, Value Date, Description, Cheque, Deposit, Withdrawal, Balance. " +
-          "If a transaction line has amounts and narration but no printed date, use the most recent transaction date/value date visible above it on the same page. " +
-          "Attach continuation narration lines to the previous transaction. Ignore BALANCE FORWARD, TOTAL, reward-points sections, page footers, and bank notices. Do not invent rows.",
-      },
-      {
-        role: "user",
-        content: `Extract only page ${index + 1} from ${fileName}:\n\n${pageText}`,
-      },
-    ]);
+    try {
+      const parsed = await callWithBatchRetries(label, () => extractBankStatementFromTextBatch(fileName, batch));
+      diagnostics[index] = {
+        startPage: batch[0]?.pageNumber,
+        endPage: lastItem(batch)?.pageNumber,
+        status: parsed.transactions.length > 0 ? "succeeded" : "empty",
+        rowCount: parsed.transactions.length,
+      };
+      if (parsed.transactions.length === 0 && hasLikelyRows) {
+        failedBatches.push({ pages: batch, reason: "empty" });
+      }
+      const completed = diagnostics.filter(Boolean).length;
+      await updateBankJob(jobId, {
+        progress: Math.min(70, 35 + Math.round((completed / Math.max(1, batches.length)) * 30)),
+        stage: `Analyzing statement batches ${completed}/${batches.length}`,
+      });
+      return parsed;
+    } catch (error) {
+      diagnostics[index] = {
+        startPage: batch[0]?.pageNumber,
+        endPage: lastItem(batch)?.pageNumber,
+        status: "failed",
+        rowCount: 0,
+        error: diagnosticError(error),
+      };
+      failedBatches.push({ pages: batch, reason: "failed" });
+      return null;
+    }
+  });
 
-    const parsed = normalizeAiBankStatement(safeJsonParse(raw, {}));
-    if (parsed.transactions.length > 0 || parsed.account.accountNumber) {
-      results.push(parsed);
-    } else {
-      console.warn(`[worker] PDF text page ${index + 1} produced no bank rows for ${fileName}`);
+  return {
+    parsed: mergeBankStatementResults(results),
+    diagnostics,
+    failedBatches,
+  };
+}
+
+async function extractBankStatementImageBatches(fileName, bytes, pageCount, jobId) {
+  const pageNumbers = Array.from({ length: pageCount }, (_, index) => index + 1);
+  const ranges = chunkPages(pageNumbers.map((pageNumber) => ({ pageNumber })), BANK_STATEMENT_BATCH_PAGE_SIZE);
+  const diagnostics = [];
+  const failedBatches = [];
+  const results = await runWithConcurrency(ranges, BANK_STATEMENT_BATCH_CONCURRENCY, async (range, index) => {
+    const startPage = range[0].pageNumber;
+    const endPage = lastItem(range).pageNumber;
+    const label = startPage === endPage ? `page ${startPage}` : `pages ${startPage}-${endPage}`;
+    try {
+      const parsed = await callWithBatchRetries(label, async () => {
+        const images = await renderBankStatementPdfToImages(bytes, fileName, { startPage, endPage });
+        return extractBankStatementFromImageBatch(fileName, images, label);
+      });
+      diagnostics[index] = {
+        startPage,
+        endPage,
+        status: parsed.transactions.length > 0 ? "succeeded" : "empty",
+        rowCount: parsed.transactions.length,
+      };
+      if (parsed.transactions.length === 0) {
+        failedBatches.push({ pages: range, reason: "empty" });
+      }
+      const completed = diagnostics.filter(Boolean).length;
+      await updateBankJob(jobId, {
+        progress: Math.min(70, 35 + Math.round((completed / Math.max(1, ranges.length)) * 30)),
+        stage: `Analyzing rendered page batches ${completed}/${ranges.length}`,
+      });
+      return parsed;
+    } catch (error) {
+      diagnostics[index] = { startPage, endPage, status: "failed", rowCount: 0, error: diagnosticError(error) };
+      failedBatches.push({ pages: range, reason: "failed" });
+      return null;
+    }
+  });
+
+  return {
+    parsed: mergeBankStatementResults(results),
+    diagnostics,
+    failedBatches,
+  };
+}
+
+async function recoverSinglePages({ fileName, bytes, textPagesByNumber, failedBatches, jobId }) {
+  const pageMap = new Map();
+  for (const batch of failedBatches) {
+    for (const page of batch.pages) {
+      const pageNumber = page.pageNumber;
+      if (!pageMap.has(pageNumber)) {
+        pageMap.set(pageNumber, textPagesByNumber.get(pageNumber) ?? { pageNumber, text: "" });
+      }
+    }
+  }
+  const pages = [...pageMap.values()]
+    .filter((page) => likelyHasTransactionRows(page) || !String(page.text || "").trim())
+    .slice(0, BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT);
+  if (pages.length === 0) {
+    return { parsed: normalizeAiBankStatement({}), diagnostics: [] };
+  }
+
+  const diagnostics = [];
+  const results = await runWithConcurrency(pages, BANK_STATEMENT_BATCH_CONCURRENCY, async (page, index) => {
+    try {
+      const parsed = await callWithBatchRetries(`recovery page ${page.pageNumber}`, async () => {
+        if (String(page.text || "").trim()) {
+          return extractBankStatementFromTextBatch(fileName, [page]);
+        }
+        const images = await renderBankStatementPdfToImages(bytes, fileName, {
+          startPage: page.pageNumber,
+          endPage: page.pageNumber,
+        });
+        return extractBankStatementFromImageBatch(fileName, images, `page ${page.pageNumber}`);
+      });
+      diagnostics[index] = {
+        page: page.pageNumber,
+        status: parsed.transactions.length > 0 ? "succeeded" : "empty",
+        rowCount: parsed.transactions.length,
+      };
+      const completed = diagnostics.filter(Boolean).length;
+      await updateBankJob(jobId, {
+        progress: Math.min(74, 70 + Math.round((completed / Math.max(1, pages.length)) * 4)),
+        stage: `Recovering difficult pages ${completed}/${pages.length}`,
+      });
+      return parsed;
+    } catch (error) {
+      diagnostics[index] = { page: page.pageNumber, status: "failed", rowCount: 0, error: diagnosticError(error) };
+      return null;
+    }
+  });
+
+  return {
+    parsed: mergeBankStatementResults(results),
+    diagnostics,
+  };
+}
+
+async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, isImage, jobId }) {
+  const diagnostics = {
+    pipeline: null,
+    pageCount: isImage ? 1 : null,
+    singleShotAttempted: false,
+    singleShotRows: 0,
+    batchSize: BANK_STATEMENT_BATCH_PAGE_SIZE,
+    batchConcurrency: BANK_STATEMENT_BATCH_CONCURRENCY,
+    batches: [],
+    recovery: [],
+    errors: [],
+  };
+  let parsed = null;
+  let extractionSource = "none";
+  let extractionError = null;
+  let textInfo = { pages: [], pageCount: isImage ? 1 : 0, truncated: false };
+
+  if (isPdf) {
+    try {
+      textInfo = await extractBankStatementPdfTextPages(bytes);
+      diagnostics.pageCount = textInfo.pageCount;
+      diagnostics.textPagesExtracted = textInfo.pages.length;
+      diagnostics.textExtractionTruncated = textInfo.truncated;
+    } catch (error) {
+      diagnostics.errors.push({ stage: "pdf_text_extraction", error: diagnosticError(error) });
+      console.warn(`[worker] PDF text extraction skipped for ${fileName}: ${diagnosticError(error)}`);
     }
   }
 
-  return mergeBankStatementResults(results);
+  const canUseSingleShot = !isPdf || Number(textInfo.pageCount || 0) <= BANK_STATEMENT_SINGLE_SHOT_MAX_PAGES;
+  if (canUseSingleShot) {
+    diagnostics.singleShotAttempted = true;
+    try {
+      await updateBankJob(jobId, { progress: 45, stage: "Running single-shot AI extraction" });
+      if (isPdf && hasUsableBankStatementText(textInfo.pages)) {
+        parsed = await extractBankStatementFromText(fileName, textInfo.pages);
+        extractionSource = "single_shot_ai_pdf_text";
+      } else if (isPdf) {
+        parsed = await extractBankStatementFromPdfFile(fileName, mimeType || "application/pdf", bytes);
+        extractionSource = "single_shot_ai_pdf_file";
+      } else if (isImage) {
+        const image = await imageBytesToProviderDataUrl(bytes, mimeType || "image/jpeg", fileName);
+        parsed = await extractBankStatementFromImages(fileName, [image]);
+        extractionSource = "single_shot_ai_image";
+      }
+      diagnostics.singleShotRows = parsed?.transactions.length ?? 0;
+      if (parsed && parsed.transactions.length > 0) {
+        diagnostics.pipeline = "single_shot_ai";
+        return { parsed, extractionSource, extractionError: null, diagnostics };
+      }
+    } catch (error) {
+      diagnostics.errors.push({ stage: "single_shot_ai", error: diagnosticError(error) });
+      console.warn(`[worker] single-shot AI extraction skipped for ${fileName}: ${diagnosticError(error)}`);
+    }
+  }
+
+  if (!isPdf) {
+    diagnostics.pipeline = "manual_review_required";
+    extractionError =
+      lastItem(diagnostics.errors)?.error || "No transaction rows were extracted from the image.";
+    return { parsed: parsed ?? normalizeAiBankStatement({}), extractionSource, extractionError, diagnostics };
+  }
+
+  const textPages = textInfo.pages ?? [];
+  const textPagesByNumber = new Map(textPages.map((page) => [page.pageNumber, page]));
+  const pageCount = Math.min(Number(textInfo.pageCount || textPages.length || 0), BANK_STATEMENT_MAX_TOTAL_PAGES);
+
+  try {
+    await updateBankJob(jobId, { progress: 35, stage: "Running batched AI extraction" });
+    let batchResult;
+    if (hasUsableBankStatementText(textPages)) {
+      batchResult = await extractBankStatementTextBatches(fileName, textPages, jobId);
+      extractionSource = "batched_ai_pdf_text";
+    } else {
+      batchResult = await extractBankStatementImageBatches(fileName, bytes, pageCount, jobId);
+      extractionSource = "batched_ai_pdf_images";
+    }
+
+    diagnostics.pipeline = "batched_ai";
+    diagnostics.batches = batchResult.diagnostics;
+    parsed = batchResult.parsed;
+
+    if (batchResult.failedBatches.length > 0 && BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT > 0) {
+      await updateBankJob(jobId, { progress: 70, stage: "Recovering difficult pages" });
+      const recovery = await recoverSinglePages({
+        fileName,
+        bytes,
+        textPagesByNumber,
+        failedBatches: batchResult.failedBatches,
+        jobId,
+      });
+      diagnostics.pipeline = "single_page_recovery";
+      diagnostics.recovery = recovery.diagnostics;
+      parsed = mergeBankStatementResults([parsed, recovery.parsed]);
+    }
+
+    if (parsed.transactions.length > 0) {
+      return { parsed, extractionSource, extractionError: null, diagnostics };
+    }
+  } catch (error) {
+    diagnostics.errors.push({ stage: "batched_ai", error: diagnosticError(error) });
+    console.warn(`[worker] batched AI extraction failed for ${fileName}: ${diagnosticError(error)}`);
+  }
+
+  diagnostics.pipeline = "manual_review_required";
+  extractionError =
+    lastItem(diagnostics.errors)?.error ||
+    "No transaction rows were extracted. The file may need manual review or a clearer scan.";
+  return {
+    parsed: parsed ?? normalizeAiBankStatement({}),
+    extractionSource: extractionSource === "none" ? "manual_review_required" : extractionSource,
+    extractionError,
+    diagnostics,
+  };
 }
 
 async function updateBankJob(jobId, fields) {
@@ -879,71 +1260,21 @@ async function runBankStatementJob(job) {
   await updateBankJob(job.id, { progress: 30, stage: "Preparing pages for AI" });
   const isPdf = mimeType.includes("pdf") || /\.pdf$/i.test(fileName);
   const isImage = mimeType.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(fileName);
-  let parsed = null;
-  let extractionSource = "none";
-
-  let textPages = null;
-
-  if (isPdf) {
-    try {
-      textPages = await extractBankStatementPdfTextPages(bytes);
-    } catch (error) {
-      console.warn(
-        `[worker] PDF text extraction skipped for ${fileName}: ${error instanceof Error ? error.message : String(error ?? "")}`
-      );
-    }
-  }
-
-  if (isPdf && textPages && hasUsableBankStatementText(textPages)) {
-    try {
-      await updateBankJob(job.id, { progress: 55, stage: "Running page-by-page AI extraction from PDF text" });
-      parsed = await extractBankStatementFromTextPages(fileName, textPages);
-      extractionSource = "pdf_text_page_ai";
-      console.log(`[worker] page-by-page PDF text AI returned ${parsed.transactions.length} row(s) for ${fileName}`);
-    } catch (error) {
-      console.warn(
-        `[worker] page-by-page PDF text AI extraction skipped for ${fileName}: ${error instanceof Error ? error.message : String(error ?? "")}`
-      );
-    }
-  }
-
-  if (isPdf && (!parsed || parsed.transactions.length === 0) && !hasUsableBankStatementText(textPages ?? [])) {
-    try {
-      await updateBankJob(job.id, { progress: 50, stage: "Running AI extraction from PDF file" });
-      parsed = await extractBankStatementFromPdfFile(fileName, mimeType || "application/pdf", bytes);
-      extractionSource = "pdf_file_ai";
-      console.log(`[worker] PDF file AI returned ${parsed.transactions.length} row(s) for ${fileName}`);
-    } catch (error) {
-      console.warn(
-        `[worker] PDF file AI extraction skipped for ${fileName}: ${error instanceof Error ? error.message : String(error ?? "")}`
-      );
-    }
-  }
-
-  if (!parsed || parsed.transactions.length === 0) {
-    await updateBankJob(job.id, {
-      progress: 45,
-      stage: isPdf ? "Preparing page images for AI fallback" : "Preparing image for AI",
-    });
-    try {
-      const images = isPdf
-        ? await renderBankStatementPdfToImages(bytes, fileName)
-        : isImage
-          ? [await imageBytesToProviderDataUrl(bytes, mimeType || "image/jpeg", fileName)]
-          : [];
-
-      await updateBankJob(job.id, { progress: 55, stage: "Running AI extraction from images" });
-      parsed = await extractBankStatementFromImages(fileName, images);
-      extractionSource = "image_ai";
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
-      console.warn(`[worker] image AI fallback skipped for ${fileName}: ${message}`);
-      if (!parsed) {
-        parsed = normalizeAiBankStatement({});
-      }
-      extractionSource = extractionSource === "none" ? "image_ai_failed" : `${extractionSource}_image_fallback_failed`;
-    }
-  }
+  const extraction = await extractBankStatementAdaptive({
+    fileName,
+    mimeType,
+    bytes,
+    isPdf,
+    isImage,
+    jobId: job.id,
+  });
+  const parsed = extraction.parsed ?? normalizeAiBankStatement({});
+  const extractionSource = extraction.extractionSource;
+  const extractionError = extraction.extractionError;
+  const extractionDiagnostics = extraction.diagnostics;
+  console.log(
+    `[worker] ${extractionDiagnostics.pipeline} returned ${parsed.transactions.length} row(s) for ${fileName}`
+  );
 
   const account = {
     bankName: importRow.extracted_bank_name || parsed.account.bankName || null,
@@ -1015,7 +1346,8 @@ async function runBankStatementJob(job) {
         parser: "openrouter_bank_statement_v1",
         extractionSource,
         jobStatus: "completed",
-        extractionError: null,
+        extractionError,
+        extractionDiagnostics,
         normalizedAccountNumber,
         maskedAccountNumber: maskAccountNumber(account.accountNumber),
         ifscCode: account.ifscCode,
@@ -1237,7 +1569,7 @@ async function waitForInFlightRun(jobId) {
 
 async function main() {
   console.log(
-    `[worker] started name=${WORKER_NAME} appBase=${APP_BASE_URL} pollMs=${WORKER_POLL_INTERVAL_MS} bankPdfMode=pdf_file_ai`
+    `[worker] started name=${WORKER_NAME} appBase=${APP_BASE_URL} pollMs=${WORKER_POLL_INTERVAL_MS} bankPdfMode=adaptive_ai batchPages=${BANK_STATEMENT_BATCH_PAGE_SIZE} concurrency=${BANK_STATEMENT_BATCH_CONCURRENCY}`
   );
   let lastIdleLogAt = 0;
 

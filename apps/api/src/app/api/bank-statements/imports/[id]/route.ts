@@ -191,9 +191,9 @@ export async function GET(
       candidates: Array.isArray(previewMeta.candidates) ? candidates : candidates.map(serializeAccount),
       transactions,
       requiresManualExtraction,
-      extractionSource: previewMeta.extractionSource ?? null,
-      extractionError: previewMeta.extractionError ?? null,
-      extractionDiagnostics: previewMeta.extractionDiagnostics ?? null,
+      extractionSource: previewMeta.extractionSource ?? processingMeta.extractionSource ?? null,
+      extractionError: previewMeta.extractionError ?? processingMeta.extractionError ?? null,
+      extractionDiagnostics: previewMeta.extractionDiagnostics ?? processingMeta.extractionDiagnostics ?? null,
       processing,
       job: jobRow
         ? {

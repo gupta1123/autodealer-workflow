@@ -189,7 +189,7 @@ export async function POST(request: Request) {
     }
 
     const body = (await request.json().catch(() => ({}))) as QueuePayload;
-    const connectionId = toText(body.connectionId, 80);
+    const submittedConnectionId = toText(body.connectionId, 80);
     const requestedTransactionIds = Array.isArray(body.transactionIds)
       ? body.transactionIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
       : [];
@@ -221,7 +221,7 @@ export async function POST(request: Request) {
     );
     const accountId = toText(body.accountId, 80);
 
-    if (!connectionId) {
+    if (!submittedConnectionId) {
       return jsonWithCors(request, { error: "Tally connection is required." }, { status: 400 });
     }
     if (!accountId && requestedTransactionIds.length === 0) {
@@ -233,17 +233,41 @@ export async function POST(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
-    const { data: connection, error: connectionError } = await supabase
+    const { data: submittedConnection, error: submittedConnectionError } = await supabase
       .from("tally_connections")
       .select("id, owner_user_id, last_company_name")
-      .eq("id", connectionId)
+      .eq("id", submittedConnectionId)
       .eq("owner_user_id", user.id)
       .maybeSingle();
 
-    if (connectionError) throw connectionError;
-    if (!connection) {
+    if (submittedConnectionError) throw submittedConnectionError;
+    if (!submittedConnection) {
       return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
     }
+
+    const liveHeartbeatCutoff = new Date(Date.now() - 60_000).toISOString();
+    const { data: liveConnection, error: liveConnectionError } = await supabase
+      .from("tally_connections")
+      .select("id, owner_user_id, last_company_name")
+      .eq("owner_user_id", user.id)
+      .in("status", ["company_loaded", "tally_reachable", "bridge_connected"])
+      .eq("last_tally_reachable", true)
+      .gte("last_heartbeat_at", liveHeartbeatCutoff)
+      .order("last_heartbeat_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (liveConnectionError) throw liveConnectionError;
+    if (!liveConnection) {
+      return jsonWithCors(
+        request,
+        { error: "No active Tally bridge connection found. Refresh the connection and try again." },
+        { status: 400 }
+      );
+    }
+
+    const connection = liveConnection;
+    const connectionId = connection.id;
 
     let query = supabase
       .from("bank_transactions")

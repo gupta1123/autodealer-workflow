@@ -28,6 +28,30 @@ function normalizeDisplayName(value: unknown) {
   return value.trim().slice(0, 120);
 }
 
+function connectionSortTime(connection: ReturnType<typeof serializeTallyConnectionStatus>) {
+  const heartbeatTime = connection.lastHeartbeatAt
+    ? new Date(connection.lastHeartbeatAt).getTime()
+    : 0;
+  if (heartbeatTime) return heartbeatTime;
+  return new Date(connection.updatedAt ?? connection.createdAt ?? 0).getTime();
+}
+
+function pickRelevantConnections(rows: TallyConnectionRow[]) {
+  const serialized = rows.map(serializeTallyConnectionStatus);
+  const liveConnections = serialized.filter(
+    (connection) =>
+      connection.bridgeConnected &&
+      (connection.status === "company_loaded" ||
+        connection.status === "tally_reachable" ||
+        connection.status === "bridge_connected")
+  );
+  const source = liveConnections.length > 0 ? liveConnections : serialized;
+
+  return [...source]
+    .sort((left, right) => connectionSortTime(right) - connectionSortTime(left))
+    .slice(0, 1);
+}
+
 async function logConnectionEvent(
   connectionId: string,
   ownerUserId: string,
@@ -92,7 +116,7 @@ export async function GET(request: Request) {
     const rows = (data ?? []) as unknown as TallyConnectionRow[];
 
     return jsonWithCors(request, {
-      connections: rows.map(serializeTallyConnectionStatus),
+      connections: pickRelevantConnections(rows),
     });
   } catch (error) {
     console.error("Error in GET /api/tally/connections:", error);

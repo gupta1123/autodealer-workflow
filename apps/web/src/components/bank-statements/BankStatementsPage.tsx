@@ -1377,7 +1377,12 @@ export function BankStatementsPage() {
     const loadedConnections = payload.connections ?? [];
     const preferredConnection = getRelevantTallyConnections(loadedConnections)[0];
     setConnections(loadedConnections);
-    setTallyConnectionId((current) => current || preferredConnection?.id || "");
+    setTallyConnectionId((current) => {
+      if (current && loadedConnections.some((connection) => connection.id === current)) {
+        return current;
+      }
+      return preferredConnection?.id || "";
+    });
     return loadedConnections;
   }, []);
 
