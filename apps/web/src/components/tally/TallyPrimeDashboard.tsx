@@ -113,6 +113,29 @@ function buildStartCommand(connection?: TallyConnection | null) {
   return `npm.cmd run start${companyFlag}`;
 }
 
+function buildConnectorConnectUrl(connection: TallyConnection, pairingCode: string) {
+  const params = new URLSearchParams({
+    apiBase: getBridgeApiBaseUrl(),
+    connectionId: connection.id,
+    pairingCode,
+    tallyUrl: connection.tallyUrl || "http://localhost:9000",
+  });
+
+  return `kalika-tally://connect?${params.toString()}`;
+}
+
+function buildConnectorDisconnectUrl(connection: TallyConnection) {
+  const params = new URLSearchParams({
+    connectionId: connection.id,
+  });
+
+  return `kalika-tally://disconnect?${params.toString()}`;
+}
+
+function openConnectorUrl(value: string) {
+  window.location.assign(value);
+}
+
 function StatusCard({
   title,
   value,
@@ -221,12 +244,16 @@ export function TallyPrimeDashboard() {
   const [pairingCode, setPairingCode] = useState("");
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
   const [testing, setTesting] = useState(false);
   const [message, setMessage] = useState<{ tone: "success" | "error"; text: string } | null>(null);
 
   const selectedConnection =
     connections.find((connection) => connection.id === selectedId) ?? connections[0] ?? null;
   const statusTone = getStatusTone(selectedConnection);
+  const connectorActive = Boolean(selectedConnection?.bridgeConnected);
+  const companyDetail = selectedConnection?.lastCompanyName
+    || (selectedConnection?.lastCompanyLoaded ? "Company loaded" : "Company not detected yet");
   const pairCommand = useMemo(() => {
     if (!selectedConnection || !pairingCode) return "";
     return buildPairCommand(selectedConnection, pairingCode);
@@ -292,7 +319,7 @@ export function TallyPrimeDashboard() {
     }
   }, []);
 
-  async function createConnection() {
+  async function connectConnector() {
     try {
       setCreating(true);
       setMessage(null);
@@ -318,17 +345,56 @@ export function TallyPrimeDashboard() {
       setConnections((current) => [payload.connection as TallyConnection, ...current]);
       setSelectedId(payload.connection.id);
       setPairingCode(payload.pairingCode);
+      openConnectorUrl(buildConnectorConnectUrl(payload.connection, payload.pairingCode));
       setMessage({
         tone: "success",
-        text: "Connection created. Copy the pair command below.",
+        text: "Connector launch requested. Approve the browser prompt if it appears.",
+      });
+      window.setTimeout(() => void refreshStatus(payload.connection?.id || ""), 2500);
+    } catch (error) {
+      setMessage({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to connect Tally connector.",
+      });
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function disconnectConnector() {
+    if (!selectedConnection) return;
+
+    try {
+      setDisconnecting(true);
+      setMessage(null);
+      openConnectorUrl(buildConnectorDisconnectUrl(selectedConnection));
+      const response = await apiFetch(`/api/tally/connections/${selectedConnection.id}/disconnect`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        throw new Error(await readError(response));
+      }
+
+      const payload = (await response.json()) as StatusResponse;
+      if (payload.connection) {
+        setConnections((current) =>
+          current.map((connection) =>
+            connection.id === payload.connection?.id ? payload.connection : connection
+          )
+        );
+      }
+      setPairingCode("");
+      setMessage({
+        tone: "success",
+        text: "Connector disconnected.",
       });
     } catch (error) {
       setMessage({
         tone: "error",
-        text: error instanceof Error ? error.message : "Failed to create Tally connection.",
+        text: error instanceof Error ? error.message : "Failed to disconnect connector.",
       });
     } finally {
-      setCreating(false);
+      setDisconnecting(false);
     }
   }
 
@@ -398,11 +464,10 @@ export function TallyPrimeDashboard() {
 
         {message ? (
           <div
-            className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${
-              message.tone === "success"
+            className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${message.tone === "success"
                 ? "border-[#10b981]/20 bg-[#ecfdf5] text-[#047857]"
                 : "border-[#ef4444]/20 bg-[#fff1f2] text-[#b91c1c]"
-            }`}
+              }`}
           >
             {message.text}
           </div>
@@ -457,25 +522,37 @@ export function TallyPrimeDashboard() {
             <RefreshCw className="h-4 w-4" />
             Refresh
           </Button>
-          <Button
-            className="rounded-xl bg-[#1a1a1a] px-5 font-bold text-white"
-            disabled={creating}
-            onClick={() => void createConnection()}
-            type="button"
-          >
-            {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
-            New Connection
-          </Button>
+          {connectorActive ? (
+            <Button
+              className="rounded-xl border-[#fecaca] bg-white px-5 font-bold text-[#991b1b] hover:bg-[#fff1f2]"
+              disabled={disconnecting}
+              onClick={() => void disconnectConnector()}
+              type="button"
+              variant="outline"
+            >
+              {disconnecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+              Disconnect
+            </Button>
+          ) : (
+            <Button
+              className="rounded-xl bg-[#1a1a1a] px-5 font-bold text-white"
+              disabled={creating}
+              onClick={() => void connectConnector()}
+              type="button"
+            >
+              {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+              Connect
+            </Button>
+          )}
         </div>
       </div>
 
       {message ? (
         <div
-          className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${
-            message.tone === "success"
+          className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${message.tone === "success"
               ? "border-[#10b981]/20 bg-[#ecfdf5] text-[#047857]"
               : "border-[#ef4444]/20 bg-[#fff1f2] text-[#b91c1c]"
-          }`}
+            }`}
         >
           {message.text}
         </div>
@@ -514,21 +591,45 @@ export function TallyPrimeDashboard() {
                     </Badge>
                   </div>
                   <div className="mt-1 text-sm font-medium text-[#8a7f72]">
-                    {selectedConnection.lastCompanyName || "Company not detected yet"}
+                    {companyDetail}
                   </div>
                 </div>
               </div>
 
-              <Button
-                className="w-fit rounded-xl border-[#e5ddd0] bg-white text-[#1a1a1a] hover:bg-[#f3eee7]"
-                disabled={testing}
-                onClick={() => void requestTest()}
-                type="button"
-                variant="outline"
-              >
-                {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                Test Connection
-              </Button>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  className="w-fit rounded-xl border-[#e5ddd0] bg-white text-[#1a1a1a] hover:bg-[#f3eee7]"
+                  disabled={testing}
+                  onClick={() => void requestTest()}
+                  type="button"
+                  variant="outline"
+                >
+                  {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                  Test
+                </Button>
+                {connectorActive ? (
+                  <Button
+                    className="w-fit rounded-xl border-[#fecaca] bg-white text-[#991b1b] hover:bg-[#fff1f2]"
+                    disabled={disconnecting}
+                    onClick={() => void disconnectConnector()}
+                    type="button"
+                    variant="outline"
+                  >
+                    {disconnecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+                    Disconnect
+                  </Button>
+                ) : (
+                  <Button
+                    className="w-fit rounded-xl bg-[#1a1a1a] text-white"
+                    disabled={creating}
+                    onClick={() => void connectConnector()}
+                    type="button"
+                  >
+                    {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+                    Connect
+                  </Button>
+                )}
+              </div>
             </div>
           </div>
 
@@ -546,7 +647,7 @@ export function TallyPrimeDashboard() {
               value={selectedConnection.lastTallyReachable ? "Reachable" : "Not reachable"}
             />
             <StatusCard
-              detail={selectedConnection.lastCompanyName || selectedConnection.lastError || "Open Tally Prime"}
+              detail={selectedConnection.lastCompanyName || selectedConnection.lastError || companyDetail}
               ok={selectedConnection.lastCompanyLoaded === true}
               title="Company"
               value={selectedConnection.lastCompanyLoaded ? "Loaded" : "Not detected"}
@@ -556,24 +657,54 @@ export function TallyPrimeDashboard() {
           <section className="rounded-xl border border-[#e5ddd0] bg-[#fffaf2] p-5 shadow-sm">
             <div className="mb-4">
               <div className="text-[11px] font-black uppercase tracking-[0.18em] text-[#8a7f72]">
-                Setup
+                Connector
               </div>
-              <h3 className="mt-2 text-base font-black text-[#1a1a1a]">Copy and run these commands</h3>
+              <h3 className="mt-2 text-base font-black text-[#1a1a1a]">One-click Tally bridge</h3>
               <p className="mt-1 max-w-2xl text-sm font-medium text-[#6f6256]">
-                Run them on the computer where Tally Prime is installed.
+                Use Connect on the computer where Tally Prime is installed. Keep the desktop connector running while posting entries.
               </p>
             </div>
 
-            <div className="space-y-3">
-              {pairCommand ? (
-                <CommandBlock command={pairCommand} onCopy={(value) => void copyText(value)} title="1. Pair connector" />
+            <div className="flex flex-wrap gap-2">
+              {connectorActive ? (
+                <Button
+                  className="rounded-xl border-[#fecaca] bg-white px-5 font-bold text-[#991b1b] hover:bg-[#fff1f2]"
+                  disabled={disconnecting}
+                  onClick={() => void disconnectConnector()}
+                  type="button"
+                  variant="outline"
+                >
+                  {disconnecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+                  Disconnect
+                </Button>
               ) : (
-                <div className="rounded-xl border border-[#e3d6c6] bg-white px-4 py-3 text-sm font-semibold text-[#7c6f62]">
-                  Create a new connection to get the pair command.
-                </div>
+                <Button
+                  className="rounded-xl bg-[#1a1a1a] px-5 font-bold text-white"
+                  disabled={creating}
+                  onClick={() => void connectConnector()}
+                  type="button"
+                >
+                  {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+                  Connect
+                </Button>
               )}
-              <CommandBlock command={startCommand} onCopy={(value) => void copyText(value)} title="2. Start connector" />
             </div>
+
+            <details className="mt-5 rounded-xl border border-[#e3d6c6] bg-white p-4">
+              <summary className="cursor-pointer text-sm font-black text-[#1a1a1a]">
+                Advanced manual commands
+              </summary>
+              <div className="mt-4 space-y-3">
+                {pairCommand ? (
+                  <CommandBlock command={pairCommand} onCopy={(value) => void copyText(value)} title="1. Pair connector" />
+                ) : (
+                  <div className="rounded-xl border border-[#e3d6c6] bg-white px-4 py-3 text-sm font-semibold text-[#7c6f62]">
+                    Use Connect to create a fresh pairing code.
+                  </div>
+                )}
+                <CommandBlock command={startCommand} onCopy={(value) => void copyText(value)} title="2. Start connector" />
+              </div>
+            </details>
           </section>
         </div>
       ) : (
@@ -584,8 +715,17 @@ export function TallyPrimeDashboard() {
             </div>
             <h3 className="mt-4 text-base font-black text-[#1a1a1a]">No Tally connection yet</h3>
             <p className="mt-1 max-w-md text-sm font-medium text-[#8a7f72]">
-              Create a connection to get the setup commands.
+              Connect this computer to start the Tally desktop connector.
             </p>
+            <Button
+              className="mt-5 rounded-xl bg-[#1a1a1a] px-5 font-bold text-white"
+              disabled={creating}
+              onClick={() => void connectConnector()}
+              type="button"
+            >
+              {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+              Connect
+            </Button>
           </div>
         </div>
       )}

@@ -56,6 +56,8 @@ type TallyConnection = {
 
 type TallyCommand = {
   id: string;
+  connectionId?: string;
+  connection_id?: string;
   commandType?: string;
   command_type?: string;
   status: string;
@@ -189,6 +191,19 @@ type ToastMessage = {
   id: string;
   tone: MessageTone;
   text: string;
+};
+
+type TallyPostingStatus = {
+  connectionId: string;
+  commandIds: string[];
+  total: number;
+  waiting: number;
+  sent: number;
+  completed: number;
+  failed: number;
+  canceled: number;
+  finished: boolean;
+  errors: string[];
 };
 
 type LedgerSelection = {
@@ -1211,6 +1226,60 @@ function transactionQueueKey(transaction: {
   ].join("|");
 }
 
+function chunkValues<T>(values: T[], size: number) {
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function buildTallyPostingStatus(
+  connectionId: string,
+  commandIds: string[],
+  commands: TallyCommand[]
+): TallyPostingStatus {
+  const commandById = new Map(commands.map((command) => [command.id, command]));
+  let waiting = 0;
+  let sent = 0;
+  let completed = 0;
+  let failed = 0;
+  let canceled = 0;
+  const errors: string[] = [];
+
+  for (const commandId of commandIds) {
+    const command = commandById.get(commandId);
+    const status = command?.status ?? "queued";
+
+    if (status === "succeeded") {
+      completed += 1;
+    } else if (status === "failed") {
+      failed += 1;
+      if (command?.error) errors.push(command.error);
+    } else if (status === "canceled") {
+      canceled += 1;
+      if (command?.error) errors.push(command.error);
+    } else if (status === "claimed") {
+      sent += 1;
+    } else {
+      waiting += 1;
+    }
+  }
+
+  return {
+    connectionId,
+    commandIds,
+    total: commandIds.length,
+    waiting,
+    sent,
+    completed,
+    failed,
+    canceled,
+    finished: completed + failed + canceled >= commandIds.length,
+    errors: Array.from(new Set(errors)).slice(0, 3),
+  };
+}
+
 function wait(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
@@ -1275,6 +1344,7 @@ export function BankStatementsPage() {
   const [refreshingConnections, setRefreshingConnections] = useState(false);
   const [banner, setBanner] = useState<{ tone: MessageTone; text: string } | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const [tallyPostingStatus, setTallyPostingStatus] = useState<TallyPostingStatus | null>(null);
   const [reviewFiltersOpen, setReviewFiltersOpen] = useState(false);
   const [reviewSearch, setReviewSearch] = useState("");
   const [reviewStatusFilter, setReviewStatusFilter] = useState<ReviewStatusFilter>("all");
@@ -1359,6 +1429,7 @@ export function BankStatementsPage() {
     () => filteredTransactions.slice(0, rowsPerPage),
     [filteredTransactions, rowsPerPage]
   );
+  const tallyPostingInProgress = Boolean(tallyPostingStatus && !tallyPostingStatus.finished);
   const activeReviewFilterCount = [
     reviewSearch.trim(),
     reviewStatusFilter !== "all" ? reviewStatusFilter : "",
@@ -1422,6 +1493,56 @@ export function BankStatementsPage() {
 
     return null;
   }, []);
+
+  const clearStatementReview = useCallback(() => {
+    setPreview(null);
+    setTransactions([]);
+    setFile(null);
+    setSelectedAccountId("");
+    setEditingLedgerIds(new Set());
+    setBanner(null);
+    setTallyPostingStatus(null);
+  }, []);
+
+  const pollTallyPostingStatus = useCallback(async (connectionId: string, commandIds: string[]) => {
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      await wait(2000);
+
+      const commandChunks = await Promise.all(
+        chunkValues(commandIds, 80).map(async (chunk) => {
+          const response = await apiFetch(
+            `/api/tally/connections/${connectionId}/commands?${new URLSearchParams({
+              ids: chunk.join(","),
+              limit: String(chunk.length),
+            }).toString()}`,
+            { cache: "no-store" }
+          );
+          if (!response.ok) {
+            throw new Error(await readError(response));
+          }
+          const payload = (await response.json()) as { commands?: TallyCommand[] };
+          return payload.commands ?? [];
+        })
+      );
+      const nextStatus = buildTallyPostingStatus(connectionId, commandIds, commandChunks.flat());
+      setTallyPostingStatus(nextStatus);
+
+      if (nextStatus.finished) {
+        if (nextStatus.failed > 0 || nextStatus.canceled > 0) {
+          showToast(
+            "error",
+            `${nextStatus.completed} completed, ${nextStatus.failed + nextStatus.canceled} failed or canceled.`
+          );
+        } else {
+          showToast("success", `${nextStatus.completed} voucher(s) posted to Tally.`);
+          clearStatementReview();
+        }
+        return;
+      }
+    }
+
+    showToast("info", "Tally posting is still running. Keep the connector open.");
+  }, [clearStatementReview]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1601,6 +1722,7 @@ export function BankStatementsPage() {
     setBankLedgerName(nextTallyLedgerName || "");
     setTransactions(payload.transactions.map((transaction) => normalizeReviewTransaction(transaction, ledgerMasters)));
     setEditingLedgerIds(new Set());
+    setTallyPostingStatus(null);
   }
 
   async function pollImportUntilReady(importId: string) {
@@ -1645,6 +1767,7 @@ export function BankStatementsPage() {
     try {
       setLoading(true);
       setBanner(null);
+      setTallyPostingStatus(null);
       setFile(nextFile);
       const formData = new FormData();
       formData.set("file", nextFile);
@@ -1766,6 +1889,7 @@ export function BankStatementsPage() {
 
     try {
       setSending(true);
+      setTallyPostingStatus(null);
       setBanner(null);
       const confirmResponse = await apiFetch(`/api/bank-statements/imports/${preview.import.id}/confirm`, {
         method: "POST",
@@ -1869,13 +1993,28 @@ export function BankStatementsPage() {
       }
 
       const queuedPayload = (await queueResponse.json()) as { queuedCount?: number; commands?: TallyCommand[] };
+      const queuedCommands = queuedPayload.commands ?? [];
+      const commandIds = queuedCommands.map((command) => command.id).filter(Boolean);
+      const postingConnectionId =
+        queuedCommands[0]?.connectionId || queuedCommands[0]?.connection_id || tallyConnectionId;
       setAccounts((current) => [confirmPayload.account, ...current.filter((item) => item.id !== confirmPayload.account.id)]);
       setRecentImports((current) => [confirmPayload.import, ...current.filter((item) => item.id !== confirmPayload.import.id)]);
-      setPreview(null);
-      setTransactions([]);
-      setFile(null);
-      setSelectedAccountId("");
-      setBanner(null);
+      setSelectedAccountId(confirmPayload.account.id);
+      if (commandIds.length > 0) {
+        setTallyPostingStatus(buildTallyPostingStatus(postingConnectionId, commandIds, queuedCommands));
+        setBanner({
+          tone: "info",
+          text: `${queuedPayload.queuedCount ?? commandIds.length} voucher(s) queued. Keep this page open while Tally posts them.`,
+        });
+        void pollTallyPostingStatus(postingConnectionId, commandIds).catch((pollError) => {
+          showToast(
+            "error",
+            pollError instanceof Error ? pollError.message : "Could not refresh Tally posting status."
+          );
+        });
+      } else {
+        setBanner(null);
+      }
       showToast(
         "success",
         `${confirmPayload.importedTransactionCount} transactions imported. ${queuedPayload.queuedCount ?? 0} voucher(s) queued for Tally.`
@@ -2462,8 +2601,45 @@ export function BankStatementsPage() {
 
               <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-[#d8cbbb] bg-[#fbf7f1]/95 px-4 py-3 shadow-[0_-8px_24px_rgba(74,56,40,0.10)] backdrop-blur sm:left-[224px] sm:px-8">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <div className="text-sm font-semibold text-[#5f5348]">
-                  {validTransactions.length} row(s) ready after review.
+                <div className="space-y-2">
+                  <div className="text-sm font-semibold text-[#5f5348]">
+                    {validTransactions.length} row(s) ready after review.
+                  </div>
+                  {tallyPostingStatus ? (
+                    <div
+                      className="flex flex-wrap items-center gap-2 text-xs font-bold"
+                      role={tallyPostingStatus.finished ? "status" : "progressbar"}
+                      aria-valuemin={0}
+                      aria-valuemax={tallyPostingStatus.total}
+                      aria-valuenow={tallyPostingStatus.completed + tallyPostingStatus.failed + tallyPostingStatus.canceled}
+                    >
+                      <Badge className="border-[#d6c8b8] bg-white text-[#6f4e2f]" variant="outline">
+                        {tallyPostingStatus.total} enqueued
+                      </Badge>
+                      <Badge className="border-blue-200 bg-blue-50 text-blue-800" variant="outline">
+                        {tallyPostingStatus.waiting + tallyPostingStatus.sent} pending
+                      </Badge>
+                      <Badge className="border-emerald-200 bg-emerald-50 text-emerald-800" variant="outline">
+                        {tallyPostingStatus.completed} completed
+                      </Badge>
+                      {(tallyPostingStatus.failed > 0 || tallyPostingStatus.canceled > 0) ? (
+                        <Badge className="border-rose-200 bg-rose-50 text-rose-800" variant="outline">
+                          {tallyPostingStatus.failed + tallyPostingStatus.canceled} failed
+                        </Badge>
+                      ) : null}
+                      {!tallyPostingStatus.finished ? (
+                        <span className="inline-flex items-center gap-1 text-[#6f6256]">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          Posting to Tally
+                        </span>
+                      ) : null}
+                      {tallyPostingStatus.errors[0] ? (
+                        <span className="max-w-[520px] truncate text-rose-700">
+                          {tallyPostingStatus.errors[0]}
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <Button
@@ -2473,7 +2649,9 @@ export function BankStatementsPage() {
                       setTransactions([]);
                       setFile(null);
                       setBanner(null);
+                      setTallyPostingStatus(null);
                     }}
+                    disabled={sending || tallyPostingInProgress}
                     type="button"
                     variant="outline"
                   >
@@ -2482,10 +2660,10 @@ export function BankStatementsPage() {
                   <Button
                     className="bg-[#4b3828] text-white hover:bg-[#38291d]"
                     onClick={sendToTally}
-                    disabled={sending || validTransactions.length === 0}
+                    disabled={sending || tallyPostingInProgress || validTransactions.length === 0}
                   >
                     {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
-                    Send To Tally
+                    {tallyPostingInProgress ? "Posting To Tally" : "Send To Tally"}
                   </Button>
                 </div>
                 </div>

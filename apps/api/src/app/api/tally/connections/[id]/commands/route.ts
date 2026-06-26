@@ -49,14 +49,33 @@ export async function GET(
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
     }
 
+    const url = new URL(request.url);
+    const requestedCommandIds = (url.searchParams.get("ids") ?? "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .slice(0, 100);
+    const requestedLimit = Number(url.searchParams.get("limit") ?? "");
+    const limit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 200)
+      : requestedCommandIds.length > 0
+        ? requestedCommandIds.length
+        : 20;
+
     const supabase = createSupabaseAdminClient();
-    const { data, error } = await supabase
+    let query = supabase
       .from("tally_bridge_commands")
       .select("*")
       .eq("connection_id", id)
       .eq("owner_user_id", user.id)
       .order("created_at", { ascending: false })
-      .limit(20);
+      .limit(limit);
+
+    if (requestedCommandIds.length > 0) {
+      query = query.in("id", requestedCommandIds);
+    }
+
+    const { data, error } = await query;
 
     if (error) throw error;
 
