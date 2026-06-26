@@ -1,18 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
   ArrowRight,
   CheckCircle2,
-  Clipboard,
   FileText,
   Loader2,
   PlugZap,
   RefreshCw,
   Server,
-  Terminal,
   TriangleAlert,
 } from "lucide-react";
 
@@ -96,23 +94,6 @@ function getBridgeApiBaseUrl() {
   return "http://localhost:3001";
 }
 
-function escapeCommandValue(value: string) {
-  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-function buildPairCommand(connection: TallyConnection, pairingCode: string) {
-  const apiBaseUrl = getBridgeApiBaseUrl();
-  return `npm.cmd run pair -- --api-base "${apiBaseUrl}" --connection-id "${connection.id}" --pairing-code "${pairingCode}"`;
-}
-
-function buildStartCommand(connection?: TallyConnection | null) {
-  const companyFlag = connection?.lastCompanyName
-    ? ` -- --company-name "${escapeCommandValue(connection.lastCompanyName)}"`
-    : "";
-
-  return `npm.cmd run start${companyFlag}`;
-}
-
 function buildConnectorConnectUrl(connection: TallyConnection, pairingCode: string) {
   const params = new URLSearchParams({
     apiBase: getBridgeApiBaseUrl(),
@@ -167,39 +148,6 @@ function StatusCard({
   );
 }
 
-function CommandBlock({
-  title,
-  command,
-  onCopy,
-}: {
-  title: string;
-  command: string;
-  onCopy: (value: string) => void;
-}) {
-  return (
-    <div className="rounded-xl border border-[#e3d6c6] bg-white p-4">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2 text-sm font-black text-[#1a1a1a]">
-          <Terminal className="h-4 w-4 text-[#8a7f72]" />
-          {title}
-        </div>
-        <Button
-          className="h-9 rounded-lg border-[#e5ddd0] bg-white px-3 text-[#1a1a1a] hover:bg-[#f3eee7]"
-          onClick={() => onCopy(command)}
-          type="button"
-          variant="outline"
-        >
-          <Clipboard className="h-4 w-4" />
-          Copy
-        </Button>
-      </div>
-      <code className="block overflow-x-auto whitespace-nowrap rounded-lg bg-[#1a1a1a] px-3 py-3 font-mono text-xs font-semibold text-white">
-        {command}
-      </code>
-    </div>
-  );
-}
-
 function HubCard({
   title,
   description,
@@ -241,11 +189,9 @@ export function TallyPrimeDashboard() {
   const [view, setView] = useState<"home" | "connection">("home");
   const [connections, setConnections] = useState<TallyConnection[]>([]);
   const [selectedId, setSelectedId] = useState("");
-  const [pairingCode, setPairingCode] = useState("");
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
-  const [testing, setTesting] = useState(false);
   const [message, setMessage] = useState<{ tone: "success" | "error"; text: string } | null>(null);
 
   const selectedConnection =
@@ -254,11 +200,6 @@ export function TallyPrimeDashboard() {
   const connectorActive = Boolean(selectedConnection?.bridgeConnected);
   const companyDetail = selectedConnection?.lastCompanyName
     || (selectedConnection?.lastCompanyLoaded ? "Company loaded" : "Company not detected yet");
-  const pairCommand = useMemo(() => {
-    if (!selectedConnection || !pairingCode) return "";
-    return buildPairCommand(selectedConnection, pairingCode);
-  }, [pairingCode, selectedConnection]);
-  const startCommand = useMemo(() => buildStartCommand(selectedConnection), [selectedConnection]);
 
   async function loadConnections(options?: { quiet?: boolean }) {
     try {
@@ -344,7 +285,6 @@ export function TallyPrimeDashboard() {
 
       setConnections((current) => [payload.connection as TallyConnection, ...current]);
       setSelectedId(payload.connection.id);
-      setPairingCode(payload.pairingCode);
       openConnectorUrl(buildConnectorConnectUrl(payload.connection, payload.pairingCode));
       setMessage({
         tone: "success",
@@ -383,7 +323,6 @@ export function TallyPrimeDashboard() {
           )
         );
       }
-      setPairingCode("");
       setMessage({
         tone: "success",
         text: "Connector disconnected.",
@@ -396,47 +335,6 @@ export function TallyPrimeDashboard() {
     } finally {
       setDisconnecting(false);
     }
-  }
-
-  async function requestTest() {
-    if (!selectedConnection) return;
-
-    try {
-      setTesting(true);
-      setMessage(null);
-      const response = await apiFetch(`/api/tally/connections/${selectedConnection.id}/test`, {
-        method: "POST",
-      });
-      if (!response.ok) {
-        throw new Error(await readError(response));
-      }
-
-      const payload = (await response.json()) as StatusResponse;
-      if (payload.connection) {
-        setConnections((current) =>
-          current.map((connection) =>
-            connection.id === payload.connection?.id ? payload.connection : connection
-          )
-        );
-      }
-
-      setMessage({
-        tone: "success",
-        text: "Connection checked.",
-      });
-    } catch (error) {
-      setMessage({
-        tone: "error",
-        text: error instanceof Error ? error.message : "Failed to test Tally connection.",
-      });
-    } finally {
-      setTesting(false);
-    }
-  }
-
-  async function copyText(value: string) {
-    await navigator.clipboard.writeText(value);
-    setMessage({ tone: "success", text: "Command copied." });
   }
 
   useEffect(() => {
@@ -522,28 +420,6 @@ export function TallyPrimeDashboard() {
             <RefreshCw className="h-4 w-4" />
             Refresh
           </Button>
-          {connectorActive ? (
-            <Button
-              className="rounded-xl border-[#fecaca] bg-white px-5 font-bold text-[#991b1b] hover:bg-[#fff1f2]"
-              disabled={disconnecting}
-              onClick={() => void disconnectConnector()}
-              type="button"
-              variant="outline"
-            >
-              {disconnecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
-              Disconnect
-            </Button>
-          ) : (
-            <Button
-              className="rounded-xl bg-[#1a1a1a] px-5 font-bold text-white"
-              disabled={creating}
-              onClick={() => void connectConnector()}
-              type="button"
-            >
-              {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
-              Connect
-            </Button>
-          )}
         </div>
       </div>
 
@@ -597,16 +473,6 @@ export function TallyPrimeDashboard() {
               </div>
 
               <div className="flex flex-wrap gap-2">
-                <Button
-                  className="w-fit rounded-xl border-[#e5ddd0] bg-white text-[#1a1a1a] hover:bg-[#f3eee7]"
-                  disabled={testing}
-                  onClick={() => void requestTest()}
-                  type="button"
-                  variant="outline"
-                >
-                  {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                  Test
-                </Button>
                 {connectorActive ? (
                   <Button
                     className="w-fit rounded-xl border-[#fecaca] bg-white text-[#991b1b] hover:bg-[#fff1f2]"
@@ -653,59 +519,6 @@ export function TallyPrimeDashboard() {
               value={selectedConnection.lastCompanyLoaded ? "Loaded" : "Not detected"}
             />
           </div>
-
-          <section className="rounded-xl border border-[#e5ddd0] bg-[#fffaf2] p-5 shadow-sm">
-            <div className="mb-4">
-              <div className="text-[11px] font-black uppercase tracking-[0.18em] text-[#8a7f72]">
-                Connector
-              </div>
-              <h3 className="mt-2 text-base font-black text-[#1a1a1a]">One-click Tally bridge</h3>
-              <p className="mt-1 max-w-2xl text-sm font-medium text-[#6f6256]">
-                Use Connect on the computer where Tally Prime is installed. Keep the desktop connector running while posting entries.
-              </p>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              {connectorActive ? (
-                <Button
-                  className="rounded-xl border-[#fecaca] bg-white px-5 font-bold text-[#991b1b] hover:bg-[#fff1f2]"
-                  disabled={disconnecting}
-                  onClick={() => void disconnectConnector()}
-                  type="button"
-                  variant="outline"
-                >
-                  {disconnecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
-                  Disconnect
-                </Button>
-              ) : (
-                <Button
-                  className="rounded-xl bg-[#1a1a1a] px-5 font-bold text-white"
-                  disabled={creating}
-                  onClick={() => void connectConnector()}
-                  type="button"
-                >
-                  {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
-                  Connect
-                </Button>
-              )}
-            </div>
-
-            <details className="mt-5 rounded-xl border border-[#e3d6c6] bg-white p-4">
-              <summary className="cursor-pointer text-sm font-black text-[#1a1a1a]">
-                Advanced manual commands
-              </summary>
-              <div className="mt-4 space-y-3">
-                {pairCommand ? (
-                  <CommandBlock command={pairCommand} onCopy={(value) => void copyText(value)} title="1. Pair connector" />
-                ) : (
-                  <div className="rounded-xl border border-[#e3d6c6] bg-white px-4 py-3 text-sm font-semibold text-[#7c6f62]">
-                    Use Connect to create a fresh pairing code.
-                  </div>
-                )}
-                <CommandBlock command={startCommand} onCopy={(value) => void copyText(value)} title="2. Start connector" />
-              </div>
-            </details>
-          </section>
         </div>
       ) : (
         <div className="flex min-h-[320px] items-center justify-center rounded-xl border border-dashed border-[#d8ccbc] bg-[#fafafa] p-8 text-center">
