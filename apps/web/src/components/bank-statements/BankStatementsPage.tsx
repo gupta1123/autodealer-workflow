@@ -1430,6 +1430,7 @@ export function BankStatementsPage() {
     [filteredTransactions, rowsPerPage]
   );
   const tallyPostingInProgress = Boolean(tallyPostingStatus && !tallyPostingStatus.finished);
+  const footerReadyCount = tallyPostingStatus?.total ?? validTransactions.length;
   const activeReviewFilterCount = [
     reviewSearch.trim(),
     reviewStatusFilter !== "all" ? reviewStatusFilter : "",
@@ -1494,6 +1495,20 @@ export function BankStatementsPage() {
     return null;
   }, []);
 
+  const dismissToast = useCallback((id: string) => {
+    setToasts((current) => current.filter((toast) => toast.id !== id));
+  }, []);
+
+  const showToast = useCallback((tone: MessageTone, text: string) => {
+    const id =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random()}`;
+
+    setToasts((current) => [...current, { id, tone, text }].slice(-3));
+    window.setTimeout(() => dismissToast(id), 5000);
+  }, [dismissToast]);
+
   const clearStatementReview = useCallback(() => {
     setPreview(null);
     setTransactions([]);
@@ -1535,14 +1550,17 @@ export function BankStatementsPage() {
           );
         } else {
           showToast("success", `${nextStatus.completed} voucher(s) posted to Tally.`);
-          clearStatementReview();
+          setBanner({
+            tone: "success",
+            text: `${nextStatus.completed} voucher(s) posted to Tally. You can upload another statement now.`,
+          });
         }
         return;
       }
     }
 
     showToast("info", "Tally posting is still running. Keep the connector open.");
-  }, [clearStatementReview]);
+  }, [showToast]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1649,20 +1667,6 @@ export function BankStatementsPage() {
           : transaction
       )
     );
-  }
-
-  function dismissToast(id: string) {
-    setToasts((current) => current.filter((toast) => toast.id !== id));
-  }
-
-  function showToast(tone: MessageTone, text: string) {
-    const id =
-      typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random()}`;
-
-    setToasts((current) => [...current, { id, tone, text }].slice(-3));
-    window.setTimeout(() => dismissToast(id), 5000);
   }
 
   async function refreshTallyConnectionStatus() {
@@ -2002,6 +2006,9 @@ export function BankStatementsPage() {
       setSelectedAccountId(confirmPayload.account.id);
       if (commandIds.length > 0) {
         setTallyPostingStatus(buildTallyPostingStatus(postingConnectionId, commandIds, queuedCommands));
+        setTransactions([]);
+        setEditingLedgerIds(new Set());
+        setReviewFiltersOpen(false);
         setBanner({
           tone: "info",
           text: `${queuedPayload.queuedCount ?? commandIds.length} voucher(s) queued. Keep this page open while Tally posts them.`,
@@ -2316,31 +2323,49 @@ export function BankStatementsPage() {
                     </button>
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge className="border-[#d6c8b8] bg-[#f6efe6] text-[#6f4e2f]" variant="outline">
-                        {transactions.length} total
+                        {tallyPostingStatus ? `${tallyPostingStatus.total} queued` : `${transactions.length} total`}
                       </Badge>
-                      <Badge className="border-emerald-200 bg-emerald-50 text-emerald-800" variant="outline">
-                        {matchedLedgerCount} matched
-                      </Badge>
-                      {needsReviewCount > 0 ? (
-                        <Badge className="border-amber-200 bg-amber-50 text-amber-800" variant="outline">
-                          {needsReviewCount} needs review
-                        </Badge>
-                      ) : null}
-                      {suspenseLedgerCount > 0 ? (
-                        <Badge className="border-amber-200 bg-amber-50 text-amber-800" variant="outline">
-                          {suspenseLedgerCount} in suspense
-                        </Badge>
-                      ) : null}
-                      <Badge
-                        className={
-                          missingLedgerCount === 0
-                            ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-                            : "border-amber-200 bg-amber-50 text-amber-800"
-                        }
-                        variant="outline"
-                      >
-                        {missingLedgerCount === 0 ? "Ready" : `${missingLedgerCount} need ledger`}
-                      </Badge>
+                      {tallyPostingStatus ? (
+                        <>
+                          <Badge className="border-blue-200 bg-blue-50 text-blue-800" variant="outline">
+                            {tallyPostingStatus.waiting + tallyPostingStatus.sent} pending
+                          </Badge>
+                          <Badge className="border-emerald-200 bg-emerald-50 text-emerald-800" variant="outline">
+                            {tallyPostingStatus.completed} completed
+                          </Badge>
+                          {(tallyPostingStatus.failed > 0 || tallyPostingStatus.canceled > 0) ? (
+                            <Badge className="border-rose-200 bg-rose-50 text-rose-800" variant="outline">
+                              {tallyPostingStatus.failed + tallyPostingStatus.canceled} failed
+                            </Badge>
+                          ) : null}
+                        </>
+                      ) : (
+                        <>
+                          <Badge className="border-emerald-200 bg-emerald-50 text-emerald-800" variant="outline">
+                            {matchedLedgerCount} matched
+                          </Badge>
+                          {needsReviewCount > 0 ? (
+                            <Badge className="border-amber-200 bg-amber-50 text-amber-800" variant="outline">
+                              {needsReviewCount} needs review
+                            </Badge>
+                          ) : null}
+                          {suspenseLedgerCount > 0 ? (
+                            <Badge className="border-amber-200 bg-amber-50 text-amber-800" variant="outline">
+                              {suspenseLedgerCount} in suspense
+                            </Badge>
+                          ) : null}
+                          <Badge
+                            className={
+                              missingLedgerCount === 0
+                                ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                                : "border-amber-200 bg-amber-50 text-amber-800"
+                            }
+                            variant="outline"
+                          >
+                            {missingLedgerCount === 0 ? "Ready" : `${missingLedgerCount} need ledger`}
+                          </Badge>
+                        </>
+                      )}
                     </div>
                   </div>
                   {reviewFiltersOpen ? (
@@ -2454,7 +2479,9 @@ export function BankStatementsPage() {
                       {transactions.length === 0 ? (
                         <tr>
                           <td colSpan={9} className="px-6 py-12 text-center text-sm font-semibold text-[#8a7f72]">
-                            No rows were extracted. Upload another file or add rows after extraction support improves.
+                            {tallyPostingStatus
+                              ? "Rows were queued for Tally. Track posting status below."
+                              : "No rows were extracted. Upload another file or add rows after extraction support improves."}
                           </td>
                         </tr>
                       ) : visibleReviewTransactions.length === 0 ? (
@@ -2603,7 +2630,9 @@ export function BankStatementsPage() {
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="space-y-2">
                   <div className="text-sm font-semibold text-[#5f5348]">
-                    {validTransactions.length} row(s) ready after review.
+                    {tallyPostingStatus
+                      ? `${footerReadyCount} row(s) queued for Tally.`
+                      : `${footerReadyCount} row(s) ready after review.`}
                   </div>
                   {tallyPostingStatus ? (
                     <div
@@ -2644,13 +2673,7 @@ export function BankStatementsPage() {
                 <div className="flex flex-wrap gap-2">
                   <Button
                     className="border-[#d8cbbb] bg-white text-[#2b241d] hover:bg-[#f7efe5]"
-                    onClick={() => {
-                      setPreview(null);
-                      setTransactions([]);
-                      setFile(null);
-                      setBanner(null);
-                      setTallyPostingStatus(null);
-                    }}
+                    onClick={clearStatementReview}
                     disabled={sending || tallyPostingInProgress}
                     type="button"
                     variant="outline"
@@ -2660,10 +2683,14 @@ export function BankStatementsPage() {
                   <Button
                     className="bg-[#4b3828] text-white hover:bg-[#38291d]"
                     onClick={sendToTally}
-                    disabled={sending || tallyPostingInProgress || validTransactions.length === 0}
+                    disabled={sending || Boolean(tallyPostingStatus) || validTransactions.length === 0}
                   >
                     {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
-                    {tallyPostingInProgress ? "Posting To Tally" : "Send To Tally"}
+                    {tallyPostingInProgress
+                      ? "Posting To Tally"
+                      : tallyPostingStatus?.finished
+                        ? "Posting Complete"
+                        : "Send To Tally"}
                   </Button>
                 </div>
                 </div>
