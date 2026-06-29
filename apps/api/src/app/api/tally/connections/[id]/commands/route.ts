@@ -1,12 +1,19 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { isLocalDbMode } from "@/lib/local/mode";
+import {
+  createLocalTallyCommand,
+  getLocalTallyConnection,
+  listLocalTallyCommands,
+} from "@/lib/local/tally-store";
 import {
   serializeTallyBridgeCommand,
   TALLY_BRIDGE_COMMAND_TYPES,
   type TallyBridgeCommandRow,
   type TallyBridgeCommandType,
 } from "@/lib/tally/commands";
+import { queueTallyMasterSyncCommand } from "@/lib/tally/master-sync";
 import { toNullableText, toRequiredText, type TallyMasterRow } from "@/lib/tally/masters";
 
 function parseCommandType(value: unknown): TallyBridgeCommandType | null {
@@ -44,7 +51,9 @@ export async function GET(
     }
 
     const { id } = await context.params;
-    const connection = await requireConnection(user.id, id);
+    const connection = isLocalDbMode()
+      ? await getLocalTallyConnection(id, user.id)
+      : await requireConnection(user.id, id);
     if (!connection) {
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
     }
@@ -61,6 +70,17 @@ export async function GET(
       : requestedCommandIds.length > 0
         ? requestedCommandIds.length
         : 20;
+
+    if (isLocalDbMode()) {
+      return jsonWithCors(request, {
+        commands: (await listLocalTallyCommands({
+          connectionId: id,
+          ownerUserId: user.id,
+          ids: requestedCommandIds,
+          limit,
+        })).map(serializeTallyBridgeCommand),
+      });
+    }
 
     const supabase = createSupabaseAdminClient();
     let query = supabase
@@ -99,7 +119,9 @@ export async function POST(
     }
 
     const { id } = await context.params;
-    const connection = await requireConnection(user.id, id);
+    const connection = isLocalDbMode()
+      ? await getLocalTallyConnection(id, user.id)
+      : await requireConnection(user.id, id);
     if (!connection) {
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
     }
@@ -127,36 +149,34 @@ export async function POST(
         mode: "ledger_accuracy",
       };
 
-      const supabase = createSupabaseAdminClient();
-      const { data, error } = await supabase
-        .from("tally_bridge_commands")
-        .insert({
-          connection_id: id,
-          owner_user_id: user.id,
-          command_type: commandType,
-          status: "queued",
-          priority: 10,
-          payload,
-        })
-        .select("*")
-        .single();
-
-      if (error) throw error;
-
-      await supabase.from("tally_connection_events").insert({
-        connection_id: id,
-        owner_user_id: user.id,
-        event_type: "command_queued",
-        message: "Tally master sync queued for bridge.",
-        payload: {
+      if (isLocalDbMode()) {
+        const command = await createLocalTallyCommand({
+          connectionId: id,
+          ownerUserId: user.id,
           commandType,
-          companyName,
-          requestedMasterTypes,
-        },
+          payload,
+          priority: 10,
+        });
+
+        return jsonWithCors(request, {
+          command: serializeTallyBridgeCommand(command),
+        });
+      }
+
+      const syncDecision = await queueTallyMasterSyncCommand({
+        supabase: createSupabaseAdminClient(),
+        connectionId: id,
+        ownerUserId: user.id,
+        companyName,
+        requestedMasterTypes,
+        force: true,
+        priority: 10,
+        reason: "manual_sync",
       });
 
       return jsonWithCors(request, {
-        command: serializeTallyBridgeCommand(data as unknown as TallyBridgeCommandRow),
+        command: syncDecision.command,
+        masterSync: syncDecision,
       });
     }
 

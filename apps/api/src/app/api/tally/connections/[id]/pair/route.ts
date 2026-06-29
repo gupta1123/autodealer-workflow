@@ -1,5 +1,7 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { isLocalDbMode } from "@/lib/local/mode";
+import { pairLocalTallyConnection } from "@/lib/local/tally-store";
 import {
   createBridgeToken,
   hashSecret,
@@ -77,6 +79,25 @@ export async function POST(
 
     if (!pairingCode) {
       return jsonWithCors(request, { error: "Pairing code is required." }, { status: 400 });
+    }
+
+    if (isLocalDbMode()) {
+      const result = await pairLocalTallyConnection({
+        connectionId: id,
+        pairingCode,
+        bridgeName: normalizeMetadata(body.bridgeName, "Tally Bridge"),
+        bridgeVersion: normalizeMetadata(body.bridgeVersion, "unknown"),
+        bridgeMachineId: normalizeMetadata(body.bridgeMachineId, "unknown"),
+      });
+
+      if ("error" in result) {
+        return jsonWithCors(request, { error: result.error }, { status: result.status });
+      }
+
+      return jsonWithCors(request, {
+        connection: serializeTallyConnection(result.connection),
+        bridgeToken: result.bridgeToken,
+      });
     }
 
     const supabase = createSupabaseAdminClient();

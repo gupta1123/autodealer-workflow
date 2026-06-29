@@ -1,5 +1,10 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { isLocalDbMode } from "@/lib/local/mode";
+import {
+  getLocalTallyConnection,
+  listLocalTallyMasters,
+} from "@/lib/local/tally-store";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
   MASTER_TYPES,
@@ -32,6 +37,26 @@ export async function GET(
     const type = parseMasterType(url.searchParams.get("type"));
     const query = url.searchParams.get("q")?.trim() ?? "";
     const limit = Math.min(Number(url.searchParams.get("limit") || 100), 5000);
+
+    if (isLocalDbMode()) {
+      const connection = await getLocalTallyConnection(id, user.id);
+      if (!connection) {
+        return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
+      }
+
+      const local = await listLocalTallyMasters({
+        connectionId: id,
+        ownerUserId: user.id,
+        masterType: type,
+        query,
+        limit,
+      });
+
+      return jsonWithCors(request, {
+        masters: local.masters.map(serializeTallyMaster),
+        latestSync: local.latestSync,
+      });
+    }
 
     const supabase = createSupabaseAdminClient();
     const { data: connection, error: connectionError } = await supabase

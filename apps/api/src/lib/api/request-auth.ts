@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 
+import { isLocalDbMode, LOCAL_USER_ID } from "@/lib/local/mode";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 type RequestUser = { id: string };
@@ -135,6 +136,10 @@ async function resolveUserFromCookies(): Promise<RequestUser | null> {
 }
 
 export async function requireRequestUser(request: Request): Promise<RequestUser | null> {
+  if (isLocalDbMode()) {
+    return { id: LOCAL_USER_ID };
+  }
+
   const bearerUser = await resolveUserFromBearer(request);
   if (bearerUser) {
     return bearerUser;

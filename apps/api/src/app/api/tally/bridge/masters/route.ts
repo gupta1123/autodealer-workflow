@@ -1,5 +1,7 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { isLocalDbMode } from "@/lib/local/mode";
+import { syncLocalTallyMasters } from "@/lib/local/tally-store";
 import { hashSecret, type TallyConnectionRow } from "@/lib/tally/connections";
 import {
   MASTER_TYPES,
@@ -67,6 +69,31 @@ export async function POST(request: Request) {
       return jsonWithCors(request, { error: "Connection id and bridge token are required." }, { status: 400 });
     }
 
+    const mastersPayload = body.masters && typeof body.masters === "object" ? body.masters : {};
+
+    if (isLocalDbMode()) {
+      const localSync = await syncLocalTallyMasters({
+        connectionId,
+        token,
+        companyName: toNullableText(body.companyName, 240),
+        bridgeVersion: toNullableText(body.bridgeVersion, 80),
+        masters: mastersPayload as Record<string, TallyMasterInput[]>,
+        masterTypesByPayloadKey: MASTER_INPUT_KEYS,
+      });
+
+      if (localSync.unauthorized || !localSync.result) {
+        return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
+      }
+
+      return jsonWithCors(request, {
+        syncRunId: localSync.result.syncRunId,
+        totals: localSync.result.totals,
+        accepted: localSync.result.accepted,
+        masters: localSync.result.masters.slice(0, 50).map(serializeTallyMaster),
+        supportedTypes: MASTER_TYPES,
+      });
+    }
+
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_connections")
@@ -84,7 +111,6 @@ export async function POST(request: Request) {
       return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
     }
 
-    const mastersPayload = body.masters && typeof body.masters === "object" ? body.masters : {};
     const now = new Date().toISOString();
     const rows: Array<Record<string, unknown>> = [];
     const totals: Record<string, number> = {};

@@ -7,7 +7,14 @@ import {
   buildLedgerMappingTarget,
   suggestBankLedgerForTransaction,
 } from "@/lib/bank-statement-ledger-matching";
+import { isLocalDbMode } from "@/lib/local/mode";
+import {
+  createLocalTallyCommand,
+  getLocalTallyConnection,
+  listLocalTallyMasters,
+} from "@/lib/local/tally-store";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { queueTallyMasterSyncCommand } from "@/lib/tally/master-sync";
 
 export const runtime = "nodejs";
 
@@ -45,6 +52,7 @@ type BankTransactionRow = {
   suggested_ledger_name: string | null;
   suggestion_confidence: number | string | null;
   confirmed_ledger_name: string | null;
+  raw_payload?: unknown;
   fingerprint: string;
 };
 
@@ -63,6 +71,7 @@ type BankStatementImportRow = {
 
 type PostingLogRow = {
   fingerprint: string;
+  reference_number: string | null;
   status: string;
   command_id: string | null;
 };
@@ -79,6 +88,15 @@ type TransactionStatusSummaryRow = {
 type TallyLedgerRow = {
   tally_name: string;
   parent_name: string | null;
+};
+
+type QueueConnectionRow = {
+  id: string;
+  owner_user_id: string;
+  last_company_name: string | null;
+  status?: string | null;
+  last_tally_reachable?: boolean | null;
+  last_heartbeat_at?: string | null;
 };
 
 type MappingRow = {
@@ -122,6 +140,13 @@ function toNumber(value: unknown) {
 function isSuspenseLedger(value?: string | null) {
   const normalized = normalizeName(value);
   return normalized === "suspense" || normalized === "suspenseac" || normalized === "suspenseaccount";
+}
+
+function normalizeReferenceNumber(value?: string | null) {
+  const normalized = String(value ?? "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  return normalized.length >= 3 ? normalized : "";
 }
 
 function isValidTransactionDate(value: unknown) {
@@ -233,31 +258,44 @@ export async function POST(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
-    const { data: submittedConnection, error: submittedConnectionError } = await supabase
-      .from("tally_connections")
-      .select("id, owner_user_id, last_company_name")
-      .eq("id", submittedConnectionId)
-      .eq("owner_user_id", user.id)
-      .maybeSingle();
-
-    if (submittedConnectionError) throw submittedConnectionError;
+    const localMode = isLocalDbMode();
+    const submittedConnection: QueueConnectionRow | null = localMode
+      ? await getLocalTallyConnection(submittedConnectionId, user.id)
+      : await supabase
+          .from("tally_connections")
+          .select("id, owner_user_id, last_company_name")
+          .eq("id", submittedConnectionId)
+          .eq("owner_user_id", user.id)
+          .maybeSingle()
+          .then(({ data, error }) => {
+            if (error) throw error;
+            return data;
+          });
     if (!submittedConnection) {
       return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
     }
 
     const liveHeartbeatCutoff = new Date(Date.now() - 60_000).toISOString();
-    const { data: liveConnection, error: liveConnectionError } = await supabase
-      .from("tally_connections")
-      .select("id, owner_user_id, last_company_name")
-      .eq("owner_user_id", user.id)
-      .in("status", ["company_loaded", "tally_reachable", "bridge_connected"])
-      .eq("last_tally_reachable", true)
-      .gte("last_heartbeat_at", liveHeartbeatCutoff)
-      .order("last_heartbeat_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (liveConnectionError) throw liveConnectionError;
+    const liveConnection = localMode
+      ? ["company_loaded", "tally_reachable", "bridge_connected"].includes(String(submittedConnection.status ?? "")) &&
+        submittedConnection.last_tally_reachable === true &&
+        String(submittedConnection.last_heartbeat_at ?? "") >= liveHeartbeatCutoff
+        ? submittedConnection
+        : null
+      : await supabase
+          .from("tally_connections")
+          .select("id, owner_user_id, last_company_name")
+          .eq("owner_user_id", user.id)
+          .in("status", ["company_loaded", "tally_reachable", "bridge_connected"])
+          .eq("last_tally_reachable", true)
+          .gte("last_heartbeat_at", liveHeartbeatCutoff)
+          .order("last_heartbeat_at", { ascending: false })
+          .limit(1)
+          .maybeSingle()
+          .then(({ data, error }) => {
+            if (error) throw error;
+            return data;
+          });
     if (!liveConnection) {
       return jsonWithCors(
         request,
@@ -331,6 +369,33 @@ export async function POST(request: Request) {
       );
     }
 
+    const preQueueSync = localMode
+      ? null
+      : await queueTallyMasterSyncCommand({
+          supabase,
+          connectionId,
+          ownerUserId: user.id,
+          companyName: connection.last_company_name,
+          reason: "pre_queue",
+          priority: 12,
+        });
+
+    if (preQueueSync && (preQueueSync.queued || preQueueSync.pending)) {
+      return jsonWithCors(
+        request,
+        {
+          error: preQueueSync.queued
+            ? "Tally ledgers are syncing. Please keep Tally Bridge open and try Send to Tally again shortly."
+            : "Tally ledger sync is already running. Please try Send to Tally again shortly.",
+          queuedCount: 0,
+          commands: [],
+          syncRequired: true,
+          masterSync: preQueueSync,
+        },
+        { status: 409 }
+      );
+    }
+
     const accountIds = Array.from(new Set(transactions.map((transaction) => transaction.bank_account_id)));
     const { data: accountRows, error: accountError } = await supabase
       .from("bank_accounts")
@@ -369,10 +434,9 @@ export async function POST(request: Request) {
     const fingerprints = transactions.map((transaction) => transaction.fingerprint);
     const { data: postingLogRows, error: postingLogError } = await supabase
       .from("bank_transaction_posting_log")
-      .select("fingerprint, status, command_id")
+      .select("fingerprint, reference_number, status, command_id")
       .eq("owner_user_id", user.id)
       .in("bank_account_id", accountIds)
-      .in("fingerprint", fingerprints)
       .in("status", ["queued", "posted"]);
 
     if (postingLogError) throw postingLogError;
@@ -400,6 +464,12 @@ export async function POST(request: Request) {
         .filter((row) => row.status === "posted" || (row.command_id && activeCommandIds.has(row.command_id)))
         .map((row) => row.fingerprint)
     );
+    const blockedReferences = new Set(
+      postingLogs
+        .filter((row) => row.status === "posted" || (row.command_id && activeCommandIds.has(row.command_id)))
+        .map((row) => normalizeReferenceNumber(row.reference_number))
+        .filter(Boolean)
+    );
 
     const skipped = {
       alreadyPostedOrActive: 0,
@@ -413,22 +483,34 @@ export async function POST(request: Request) {
       invalidAmount: 0,
     };
 
-    const { data: ledgerRows, error: ledgerError } = await supabase
-      .from("tally_masters")
-      .select("tally_name, parent_name")
-      .eq("owner_user_id", user.id)
-      .eq("connection_id", connectionId)
-      .eq("master_type", "ledger")
-      .eq("is_active", true)
-      .limit(5000);
-
-    if (ledgerError) throw ledgerError;
+    const ledgerRows = localMode
+      ? (await listLocalTallyMasters({
+          connectionId,
+          ownerUserId: user.id,
+          masterType: "ledger",
+          limit: 5000,
+        })).masters.map((ledger) => ({
+          tally_name: ledger.tally_name,
+          parent_name: ledger.parent_name,
+        }))
+      : await supabase
+          .from("tally_masters")
+          .select("tally_name, parent_name")
+          .eq("owner_user_id", user.id)
+          .eq("connection_id", connectionId)
+          .eq("master_type", "ledger")
+          .eq("is_active", true)
+          .limit(5000)
+          .then(({ data, error }) => {
+            if (error) throw error;
+            return data ?? [];
+          });
 
     const syncedLedgerNames = new Set(
-      ((ledgerRows ?? []) as unknown as TallyLedgerRow[]).map((ledger) => normalizeName(ledger.tally_name))
+      (ledgerRows as unknown as TallyLedgerRow[]).map((ledger) => normalizeName(ledger.tally_name))
     );
     const ledgerParentByName = new Map(
-      ((ledgerRows ?? []) as unknown as TallyLedgerRow[]).map((ledger) => [
+      (ledgerRows as unknown as TallyLedgerRow[]).map((ledger) => [
         normalizeName(ledger.tally_name),
         ledger.parent_name ?? "",
       ])
@@ -436,6 +518,14 @@ export async function POST(request: Request) {
 
     function ledgerExists(ledgerName: string) {
       return syncedLedgerNames.has(normalizeName(ledgerName));
+    }
+
+    function hasAiStoredLedgerSuggestion(transaction: BankTransactionRow) {
+      const rawPayload = transaction.raw_payload;
+      if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) return false;
+      const ledgerMatch = (rawPayload as { ledgerMatch?: unknown }).ledgerMatch;
+      if (!ledgerMatch || typeof ledgerMatch !== "object" || Array.isArray(ledgerMatch)) return false;
+      return (ledgerMatch as { source?: unknown }).source === "ai_match";
     }
 
     function isPartyParent(parentName: string) {
@@ -472,7 +562,9 @@ export async function POST(request: Request) {
             ? transaction.confirmed_ledger_name
             : "";
         const storedSuggestedLedgerName =
-          transaction.suggested_ledger_name && !(isSuspenseLedger(transaction.suggested_ledger_name) && strongSuggestedLedger)
+          transaction.suggested_ledger_name &&
+          hasAiStoredLedgerSuggestion(transaction) &&
+          !(isSuspenseLedger(transaction.suggested_ledger_name) && strongSuggestedLedger)
             ? transaction.suggested_ledger_name
             : "";
         const counterpartyLedgerName =
@@ -496,7 +588,10 @@ export async function POST(request: Request) {
     const queuedCreateLedgerKeys = new Set<string>();
     const commands: TallyCommandInsert[] = commandInputs.flatMap(
       ({ transaction, suggestion, counterpartyLedgerName, createLedgerName, createLedgerParentName }) => {
-        if (blockedFingerprints.has(transaction.fingerprint)) {
+        if (
+          blockedFingerprints.has(transaction.fingerprint) ||
+          blockedReferences.has(normalizeReferenceNumber(transaction.reference_number))
+        ) {
           skipped.alreadyPostedOrActive += 1;
           return [];
         }
@@ -607,27 +702,60 @@ export async function POST(request: Request) {
     const voucherCommands = commands.filter((command) => command.command_type === "post_bank_voucher");
 
     if (voucherCommands.length === 0) {
+      const ledgerSync =
+        skipped.ledgerNotSynced > 0 && !localMode
+          ? await queueTallyMasterSyncCommand({
+              supabase,
+              connectionId,
+              ownerUserId: user.id,
+              companyName: connection.last_company_name,
+              force: true,
+              reason: "ledger_not_synced",
+              priority: 12,
+            })
+          : null;
+
       return jsonWithCors(
         request,
         {
-          error: "No transactions could be queued. Check diagnostics for the skipped reason.",
+          error: ledgerSync
+            ? ledgerSync.queued
+              ? "Tally ledgers are syncing because one or more selected ledgers were not found. Please try Send to Tally again shortly."
+              : "Tally ledger sync is already running. Please try Send to Tally again shortly."
+            : "No transactions could be queued. Check diagnostics for the skipped reason.",
           queuedCount: 0,
           commands: [],
+          syncRequired: Boolean(ledgerSync),
+          masterSync: ledgerSync,
           diagnostics: {
             eligibleTransactionCount: transactions.length,
             skipped,
           },
         },
-        { status: 400 }
+        { status: ledgerSync ? 409 : 400 }
       );
     }
 
-    const { data: createdCommands, error: commandError } = await supabase
-      .from("tally_bridge_commands")
-      .insert(commands)
-      .select("*");
-
-    if (commandError) throw commandError;
+    const createdCommands = localMode
+      ? await Promise.all(
+          commands.map((command) =>
+            createLocalTallyCommand({
+              connectionId,
+              ownerUserId: user.id,
+              commandType: command.command_type,
+              payload: command.payload,
+              priority: command.priority,
+            })
+          )
+        )
+      : await supabase
+          .from("tally_bridge_commands")
+          .insert(commands)
+          .select("*")
+          .then(({ data, error }) => {
+            if (error) throw error;
+            return data ?? [];
+          });
 
     const createdCommandRows = (createdCommands ?? []) as Array<{
       id: string;
@@ -663,7 +791,7 @@ export async function POST(request: Request) {
       ];
     });
 
-    if (logRows.length > 0) {
+    if (logRows.length > 0 && !localMode) {
       const { error: logError } = await supabase
         .from("bank_transaction_posting_log")
         .upsert(logRows, {
@@ -759,7 +887,7 @@ export async function POST(request: Request) {
       ).values()
     );
 
-    if (uniqueMappingRows.length > 0) {
+    if (uniqueMappingRows.length > 0 && !localMode) {
       const { error: mappingError } = await supabase
         .from("tally_mapping_settings")
         .upsert(uniqueMappingRows, { onConflict: "connection_id,mapping_type,source_key" });
@@ -780,25 +908,29 @@ export async function POST(request: Request) {
       Array.from(bankLedgerByAccountId.entries()).map(([bankAccountId, ledgerName]) =>
         supabase
           .from("bank_accounts")
-          .update({ tally_connection_id: connectionId, tally_ledger_name: ledgerName })
+          .update(localMode
+            ? { tally_ledger_name: ledgerName }
+            : { tally_connection_id: connectionId, tally_ledger_name: ledgerName })
           .eq("owner_user_id", user.id)
           .eq("id", bankAccountId)
       )
     );
 
-    await supabase.from("tally_connection_events").insert({
-      connection_id: connectionId,
-      owner_user_id: user.id,
-      event_type: "command_queued",
-      message: "Bank voucher posting queued for bridge.",
-      payload: {
-        commandType: "post_bank_voucher",
-        queuedCount: voucherCommands.length,
-        commandCount: commands.length,
-        transactionIds: queuedTransactionIds,
-        savedMappingCount: uniqueMappingRows.length,
-      },
-    });
+    if (!localMode) {
+      await supabase.from("tally_connection_events").insert({
+        connection_id: connectionId,
+        owner_user_id: user.id,
+        event_type: "command_queued",
+        message: "Bank voucher posting queued for bridge.",
+        payload: {
+          commandType: "post_bank_voucher",
+          queuedCount: voucherCommands.length,
+          commandCount: commands.length,
+          transactionIds: queuedTransactionIds,
+          savedMappingCount: uniqueMappingRows.length,
+        },
+      });
+    }
 
     return jsonWithCors(request, {
       queuedCount: voucherCommands.length,

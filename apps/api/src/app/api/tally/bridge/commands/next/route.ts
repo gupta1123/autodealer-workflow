@@ -1,5 +1,7 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { isLocalDbMode } from "@/lib/local/mode";
+import { claimNextLocalTallyCommand } from "@/lib/local/tally-store";
 import { hashSecret, type TallyConnectionRow } from "@/lib/tally/connections";
 import {
   serializeTallyBridgeCommand,
@@ -47,6 +49,22 @@ export async function GET(request: Request) {
 
     if (!connectionId || !token) {
       return jsonWithCors(request, { error: "Connection id and bridge token are required." }, { status: 400 });
+    }
+
+    if (isLocalDbMode()) {
+      const result = await claimNextLocalTallyCommand({
+        connectionId,
+        token,
+        bridgeVersion,
+      });
+
+      if (result.unauthorized) {
+        return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
+      }
+
+      return jsonWithCors(request, {
+        command: result.command ? serializeTallyBridgeCommand(result.command) : null,
+      });
     }
 
     const supabase = createSupabaseAdminClient();

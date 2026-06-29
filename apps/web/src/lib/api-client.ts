@@ -7,6 +7,10 @@ const USE_CROSS_ORIGIN_API =
   process.env.NEXT_PUBLIC_USE_DIRECT_API_BASE_URL === "true" && API_BASE_URL.length > 0;
 const ACCESS_TOKEN_EXPIRY_SAFETY_MS = 30_000;
 
+function isLocalDbMode() {
+  return process.env.NEXT_PUBLIC_LOCAL_DB_MODE === "true";
+}
+
 let browserClient: ReturnType<typeof createSupabaseBrowserClient> | null = null;
 let cachedAccessToken: { token: string; expiresAt: number } | null = null;
 let pendingAccessToken: Promise<string | null> | null = null;
@@ -26,6 +30,10 @@ function getBrowserClient() {
 }
 
 async function readAccessToken() {
+  if (isLocalDbMode()) {
+    return null;
+  }
+
   if (cachedAccessToken && cachedAccessToken.expiresAt > Date.now()) {
     return cachedAccessToken.token;
   }

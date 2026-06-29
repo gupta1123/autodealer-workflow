@@ -38,7 +38,7 @@ type PostedTransactionRow = {
 };
 
 type PostedLogRow = {
-  fingerprint: string;
+  reference_number: string | null;
   tally_voucher_id: string | null;
   tally_posted_at: string | null;
 };
@@ -102,6 +102,13 @@ function toText(value: unknown) {
   return String(value ?? "").trim();
 }
 
+function normalizeReferenceNumber(value: unknown) {
+  const normalized = String(value ?? "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  return normalized.length >= 3 ? normalized : null;
+}
+
 function toTransaction(value: unknown): ParsedBankTransaction | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
@@ -145,13 +152,6 @@ function toTransaction(value: unknown): ParsedBankTransaction | null {
         ? (row.rawPayload as Record<string, unknown>)
         : {},
   };
-}
-
-function latestRowTransactionDate(rows: Array<{ transaction_date: string }>) {
-  return rows
-    .map((row) => row.transaction_date)
-    .sort()
-    .at(-1);
 }
 
 function checkpointDate(value: unknown) {
@@ -207,22 +207,6 @@ function readTransactionCheckpointMarker(value: unknown): TransactionCheckpointM
     category: typeof marker.category === "string" ? marker.category : "unknown",
     counterpartyName: typeof marker.counterpartyName === "string" ? marker.counterpartyName : null,
     fingerprint: typeof marker.fingerprint === "string" ? marker.fingerprint : "",
-  };
-}
-
-function buildTransactionCheckpointMarker(row: DraftTransactionRow): TransactionCheckpointMarker {
-  return {
-    transactionDate: row.transaction_date,
-    valueDate: row.value_date,
-    description: row.description,
-    referenceNumber: row.reference_number,
-    debitAmount: normalizeCheckpointAmount(row.debit_amount),
-    creditAmount: normalizeCheckpointAmount(row.credit_amount),
-    balanceAmount: normalizeCheckpointAmount(row.balance_amount),
-    transactionType: row.transaction_type,
-    category: row.category,
-    counterpartyName: row.counterparty_name,
-    fingerprint: row.fingerprint,
   };
 }
 
@@ -290,13 +274,6 @@ function rowsAfterImportCheckpoint(
     rows: nextRows,
     skippedCount: rows.length - nextRows.length,
   };
-}
-
-function latestTransactionRow(rows: DraftTransactionRow[]) {
-  return rows.reduce<DraftTransactionRow | null>((latest, row) => {
-    if (!latest) return row;
-    return row.transaction_date >= latest.transaction_date ? row : latest;
-  }, null);
 }
 
 function getTransactionAmount(row: {
@@ -469,14 +446,14 @@ export async function POST(
       })
     );
     const rows = Array.from(rowsByFingerprint.values());
-    const lastImportedTransactionDate = checkpointDate(accountRow.last_imported_transaction_at);
-    const lastImportedTransactionMarker = readTransactionCheckpointMarker(
+    const lastPostedTransactionDate = checkpointDate(accountRow.last_tally_posted_transaction_at);
+    const lastPostedTransactionMarker = readTransactionCheckpointMarker(
       accountRow.last_imported_transaction_marker
     );
     const checkpointResult = rowsAfterImportCheckpoint(
       rows,
-      lastImportedTransactionMarker,
-      lastImportedTransactionDate
+      lastPostedTransactionMarker,
+      lastPostedTransactionDate
     );
     const rowsAfterCheckpoint = checkpointResult.rows;
 
@@ -524,14 +501,22 @@ export async function POST(
     }
 
     const submittedFingerprints = rows.map((row) => row.fingerprint);
-    const { data: postedLogData, error: postedLogReadError } = submittedFingerprints.length
+    const submittedReferenceNumbers = Array.from(
+      new Set(
+        rowsAfterCheckpoint.flatMap((row) => {
+          const normalizedReference = normalizeReferenceNumber(row.reference_number);
+          return normalizedReference ? [normalizedReference] : [];
+        })
+      )
+    );
+    const submittedReferenceSet = new Set(submittedReferenceNumbers);
+    const { data: postedLogData, error: postedLogReadError } = submittedReferenceNumbers.length
       ? await supabase
           .from("bank_transaction_posting_log")
-          .select("fingerprint, tally_voucher_id, tally_posted_at")
+          .select("reference_number, tally_voucher_id, tally_posted_at")
           .eq("owner_user_id", user.id)
           .eq("bank_account_id", accountId)
           .eq("status", "posted")
-          .in("fingerprint", submittedFingerprints)
       : { data: [], error: null };
 
     if (postedLogReadError) throw postedLogReadError;
@@ -556,12 +541,30 @@ export async function POST(
       (row) => row.id && row.fingerprint && (row.tally_status === "pending" || row.tally_status === "failed")
     );
     const submittedRowsByFingerprint = new Map(rows.map((row) => [row.fingerprint, row]));
-    const postedByFingerprint = new Map(
-      ((postedLogData ?? []) as unknown as PostedLogRow[]).map((row) => [row.fingerprint, row])
+    const postedByReference = new Map<string, PostedLogRow>();
+    for (const row of (postedLogData ?? []) as unknown as PostedLogRow[]) {
+      const referenceKeys = [
+        normalizeReferenceNumber(row.reference_number),
+        normalizeReferenceNumber(row.tally_voucher_id),
+      ].filter((value): value is string => Boolean(value));
+      for (const referenceKey of referenceKeys) {
+        if (submittedReferenceSet.has(referenceKey) && !postedByReference.has(referenceKey)) {
+          postedByReference.set(referenceKey, row);
+        }
+      }
+    }
+    const alreadyPostedRows = rowsAfterCheckpoint.filter((row) => {
+      const referenceKey = normalizeReferenceNumber(row.reference_number);
+      return Boolean(referenceKey && postedByReference.has(referenceKey));
+    });
+    const alreadyPresentTransactionCount = alreadyPostedRows.length + checkpointResult.skippedCount;
+    const alreadyPostedReferences = Array.from(
+      new Set(alreadyPostedRows.flatMap((row) => (row.reference_number ? [row.reference_number] : [])))
     );
     const snapshotRows = rowsAfterCheckpoint.flatMap((row) => {
       if (existingFingerprints.has(row.fingerprint)) return [];
-      const postedLog = postedByFingerprint.get(row.fingerprint);
+      const referenceKey = normalizeReferenceNumber(row.reference_number);
+      const postedLog = referenceKey ? postedByReference.get(referenceKey) : null;
       if (!postedLog) return [row];
       return [
         {
@@ -629,30 +632,12 @@ export async function POST(
       if (updateError) throw updateError;
     }
 
-    const latestAcceptedRow = latestTransactionRow(rowsAfterCheckpoint);
-    const latestAcceptedDate = latestAcceptedRow?.transaction_date ?? latestRowTransactionDate(rowsAfterCheckpoint);
-    const latestAcceptedMarker = latestAcceptedRow ? buildTransactionCheckpointMarker(latestAcceptedRow) : null;
-    const accountUpdate = latestAcceptedDate
-      ? {
-          last_imported_transaction_at: `${latestAcceptedDate}T00:00:00.000Z`,
-          last_imported_transaction_marker: latestAcceptedMarker,
-        }
-      : {};
-
-    const accountUpdatePromise = latestAcceptedDate
-      ? supabase
-          .from("bank_accounts")
-          .update(accountUpdate)
-          .eq("id", accountId)
-          .eq("owner_user_id", user.id)
-          .select("*")
-          .single()
-      : supabase
-          .from("bank_accounts")
-          .select("*")
-          .eq("id", accountId)
-          .eq("owner_user_id", user.id)
-          .single();
+    const accountUpdatePromise = supabase
+      .from("bank_accounts")
+      .select("*")
+      .eq("id", accountId)
+      .eq("owner_user_id", user.id)
+      .single();
 
     const [{ data: updatedAccount, error: accountUpdateError }, { data: updatedImport, error: importUpdateError }] =
       await Promise.all([
@@ -671,14 +656,16 @@ export async function POST(
               confirmedAt: new Date().toISOString(),
               confirmedTransactionCount: transactions.length,
               ignoredNonPostingRowCount: submittedTransactions.length - transactions.length,
-              importedAfterTransactionDate: lastImportedTransactionDate,
-              importedAfterTransactionMarker: lastImportedTransactionMarker,
+              importedAfterTransactionDate: lastPostedTransactionDate,
+              importedAfterTransactionMarker: lastPostedTransactionMarker,
+              checkpointSource: "last_tally_posted_transaction_at",
               checkpointMarkerFound: checkpointResult.markerFound,
               skippedByCheckpointCount: checkpointResult.skippedCount,
               existingTransactionCount: existingFingerprints.size,
               existingQueueableTransactionCount: existingQueueableRows.length,
               appendCompletedAt: new Date().toISOString(),
-              alreadyPostedTransactionCount: postedByFingerprint.size,
+              alreadyPostedTransactionCount: alreadyPresentTransactionCount,
+              alreadyPostedReferences,
             },
           })
           .eq("id", id)
@@ -726,7 +713,8 @@ export async function POST(
       skippedByCheckpointCount: checkpointResult.skippedCount,
       existingTransactionCount: existingFingerprints.size,
       existingQueueableTransactionCount: existingQueueableRows.length,
-      alreadyPostedTransactionCount: postedByFingerprint.size,
+      alreadyPostedTransactionCount: alreadyPresentTransactionCount,
+      alreadyPostedReferences,
     });
   } catch (error) {
     console.error("Error in POST /api/bank-statements/imports/[id]/confirm:", error);

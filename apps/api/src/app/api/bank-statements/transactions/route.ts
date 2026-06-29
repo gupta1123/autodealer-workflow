@@ -24,7 +24,10 @@ type BankTransactionRow = {
   suggestion_reason: string | null;
   confirmed_ledger_name: string | null;
   ledger_mapping_source: string | null;
+  raw_payload?: unknown;
   tally_status: string;
+  tally_voucher_id: string | null;
+  tally_posted_at: string | null;
 };
 
 function toNumber(value: unknown) {
@@ -40,9 +43,24 @@ function normalizeLedgerName(value?: string | null) {
   return String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+function normalizeReferenceNumber(value?: string | null) {
+  const normalized = String(value ?? "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  return normalized.length >= 3 ? normalized : "";
+}
+
 function isSuspenseLedger(value?: string | null) {
   const normalized = normalizeLedgerName(value);
   return normalized === "suspense" || normalized === "suspenseac" || normalized === "suspenseaccount";
+}
+
+function hasAiStoredLedgerSuggestion(row: BankTransactionRow) {
+  const rawPayload = row.raw_payload;
+  if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) return false;
+  const ledgerMatch = (rawPayload as { ledgerMatch?: unknown }).ledgerMatch;
+  if (!ledgerMatch || typeof ledgerMatch !== "object" || Array.isArray(ledgerMatch)) return false;
+  return (ledgerMatch as { source?: unknown }).source === "ai_match";
 }
 
 function serializeTransaction(row: BankTransactionRow, suggestion?: Awaited<ReturnType<typeof suggestBankLedgerForTransaction>>) {
@@ -55,7 +73,9 @@ function serializeTransaction(row: BankTransactionRow, suggestion?: Awaited<Retu
       ? row.confirmed_ledger_name
       : null;
   const storedSuggestedLedgerName =
-    row.suggested_ledger_name && !(isSuspenseLedger(row.suggested_ledger_name) && strongSuggestedLedger)
+    row.suggested_ledger_name &&
+    hasAiStoredLedgerSuggestion(row) &&
+    !(isSuspenseLedger(row.suggested_ledger_name) && strongSuggestedLedger)
       ? row.suggested_ledger_name
       : null;
   const suggestedLedgerName = confirmedLedgerName || strongSuggestedLedger || storedSuggestedLedgerName || suggestion?.ledgerName || null;
@@ -83,6 +103,8 @@ function serializeTransaction(row: BankTransactionRow, suggestion?: Awaited<Retu
     confirmedLedgerName: confirmedLedgerName || (strongSuggestedLedger ? null : row.confirmed_ledger_name),
     ledgerMappingSource: row.ledger_mapping_source || suggestion?.mappingSource || null,
     tallyStatus: row.tally_status,
+    tallyVoucherId: row.tally_voucher_id,
+    tallyPostedAt: row.tally_posted_at,
     needsLedgerConfirmation: !suggestedLedgerName || (suggestionConfidence ?? 0) < 0.85,
   };
 }
@@ -143,7 +165,34 @@ export async function GET(request: Request) {
     if (error) throw error;
 
     const allRows = (data ?? []) as unknown as BankTransactionRow[];
-    const rows = status === "queueable" ? allRows.filter(hasPostingAmount) : allRows;
+    let rows = status === "queueable" ? allRows.filter(hasPostingAmount) : allRows;
+
+    if (status === "queueable" && rows.length > 0) {
+      const references = Array.from(
+        new Set(rows.map((row) => normalizeReferenceNumber(row.reference_number)).filter(Boolean))
+      );
+      const { data: postedLogRows, error: postedLogError } = references.length
+        ? await supabase
+            .from("bank_transaction_posting_log")
+            .select("reference_number, tally_voucher_id")
+            .eq("owner_user_id", user.id)
+            .eq("bank_account_id", accountId)
+            .eq("status", "posted")
+        : { data: [], error: null };
+
+      if (postedLogError) throw postedLogError;
+
+      const postedReferences = new Set(
+        ((postedLogRows ?? []) as Array<{ reference_number: string | null; tally_voucher_id: string | null }>).flatMap(
+          (row) =>
+            [normalizeReferenceNumber(row.reference_number), normalizeReferenceNumber(row.tally_voucher_id)].filter(
+              Boolean
+            )
+        )
+      );
+      rows = rows.filter((row) => !postedReferences.has(normalizeReferenceNumber(row.reference_number)));
+    }
+
     const suggestions = await Promise.all(
       rows.map((row) =>
         suggestBankLedgerForTransaction({

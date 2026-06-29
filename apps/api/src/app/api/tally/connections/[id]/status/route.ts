@@ -1,6 +1,8 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { isLocalDbMode } from "@/lib/local/mode";
+import { getLocalTallyConnection } from "@/lib/local/tally-store";
 import {
   serializeTallyConnectionStatus,
   type TallyConnectionRow,
@@ -43,6 +45,18 @@ export async function GET(
     }
 
     const { id } = await context.params;
+
+    if (isLocalDbMode()) {
+      const connection = await getLocalTallyConnection(id, user.id);
+      if (!connection) {
+        return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
+      }
+
+      return jsonWithCors(request, {
+        connection: serializeTallyConnectionStatus(connection),
+      });
+    }
+
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_connections")

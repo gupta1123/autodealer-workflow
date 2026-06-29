@@ -1,5 +1,10 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { isLocalDbMode, LOCAL_USER_ID } from "@/lib/local/mode";
+import {
+  createLocalTallyConnection,
+  listLocalTallyConnections,
+} from "@/lib/local/tally-store";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
   createPairingCode,
@@ -75,9 +80,16 @@ export function OPTIONS(request: Request) {
 
 export async function GET(request: Request) {
   try {
-    const user = await requireRequestUser(request);
+    const localMode = isLocalDbMode();
+    const user = localMode ? { id: LOCAL_USER_ID } : await requireRequestUser(request);
     if (!user) {
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
+    }
+
+    if (localMode) {
+      return jsonWithCors(request, {
+        connections: pickRelevantConnections(await listLocalTallyConnections(user.id)),
+      });
     }
 
     const supabase = createSupabaseAdminClient();
@@ -126,12 +138,30 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
-    const user = await requireRequestUser(request);
+    const localMode = isLocalDbMode();
+    const user = localMode ? { id: LOCAL_USER_ID } : await requireRequestUser(request);
     if (!user) {
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }
 
     const body = await request.json().catch(() => ({}));
+
+    if (localMode) {
+      const local = await createLocalTallyConnection({
+        ownerUserId: user.id,
+        displayName: normalizeDisplayName(body.displayName),
+        tallyUrl: normalizeTallyUrl(body.tallyUrl),
+      });
+      return jsonWithCors(
+        request,
+        {
+          connection: serializeTallyConnection(local.connection),
+          pairingCode: local.pairingCode,
+        },
+        { status: 201 }
+      );
+    }
+
     const pairingCode = createPairingCode();
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase

@@ -18,6 +18,10 @@ function safeNextPath(value: string | null) {
   return value;
 }
 
+function isLocalDbMode() {
+  return process.env.NEXT_PUBLIC_LOCAL_DB_MODE === "true";
+}
+
 export function Login() {
   const searchParams = useSearchParams();
   const supabase = useMemo(() => createSupabaseBrowserClient(), []);
@@ -103,6 +107,11 @@ export function Login() {
     setLoadingMode("signin");
     setError(null);
     setMessage(null);
+
+    if (isLocalDbMode()) {
+      window.location.assign(nextPath);
+      return;
+    }
 
     const { data, error: signInError } = await supabase.auth.signInWithPassword({
       email,

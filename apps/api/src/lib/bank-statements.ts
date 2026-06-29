@@ -8,7 +8,12 @@ import { promisify } from "node:util";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import sharp from "sharp";
 
-import { callOpenRouter, getQualityExtractionModel, getQualityExtractionReasoning } from "@/lib/processing/openrouter";
+import {
+  callOpenRouter,
+  getLedgerMatchingModel,
+  getQualityExtractionModel,
+  getQualityExtractionReasoning,
+} from "@/lib/processing/openrouter";
 
 export const BANK_STATEMENT_BUCKET = "bank-statement-files";
 const execFileAsync = promisify(execFile);
@@ -515,8 +520,9 @@ export async function classifyBankTransactionsForTallyWithAI(params: {
         content:
           "You are classifying Indian business bank statement transactions for Tally Prime accounting. Return only valid JSON. " +
           "Do not invent existing ledgers. You may use an existing ledger only if it appears in the provided tallyLedgerNames list, matching case-insensitively. " +
-          "Before recommending suspense, compare the counterpartyName and description against tallyLedgerNames for normal Indian bank narration variations: spelling mistakes, missing spaces, joined words, singular/plural, legal suffixes (Pvt, Private, Ltd, Limited, LLP), generic suffixes (Enterprise, Enterprises, Company, Co, Traders, Trading), trailing initials, and abbreviations such as Co/Company, Ind/Industries, Engrs/Engg/Engineers/Engineering, Mech/Mechanical, Supply/Supplies/Supplier. " +
-          "Examples: 'Quali Mech Engrs' should match a provided ledger named 'QUALIMECH ENGINEERS'; 'Maharaj Industires' should match 'Maharaj Industries'; 'Office Supply CO' should match 'Office Supplies'; 'Pushpak Steels IND' should match 'Pushpak Steel Industries'; 'Raja Guru Enterprises' should match 'RAJAGURU R' when that is the only clear Rajaguru ledger. " +
+          "Before recommending suspense, compare the counterpartyName and description against tallyLedgerNames for normal Indian bank narration variations: OCR mistakes, spelling mistakes, phonetic spelling variants, missing spaces, joined words, split words, singular/plural, legal suffixes (Pvt, Private, Ltd, Limited, LLP), generic suffixes (Enterprise, Enterprises, Company, Co, Traders, Trading), trailing initials, and abbreviations such as Co/Company, Ind/Industries, Engrs/Engg/Engineers/Engineering, Mech/Mechanical, Supply/Supplies/Supplier. " +
+          "Treat common Indian party-name variants as the same root name when context supports it: Bharat/Bharath/Bharta/Bhartha, Maharaj/Maharaja/Maha Raj, Rajaguru/Raja Guru, Shree/Shri/Sri, Ganesh/Ganeshh, Steel/Steels, Supply/Supplies/Supplier, Engineer/Engineers/Engineering/Engg/Engrs. " +
+          "Examples: 'Bharath Steel Pvt Ltd' should match a provided ledger named 'Bharat' when that is the only Bharat-like ledger; 'Quali Mech Engrs' should match 'QUALIMECH ENGINEERS'; 'Maha RAJ Engineerings' should match 'Maharaja Engg'; 'Maharaj Industires' should match 'Maharaj Industries'; 'Office Supply CO' should match 'Office Supplies'; 'Pushpak Steels IND' should match 'Pushpak Steel Industries'; 'Raja Guru Enterprises' should match 'RAJAGURU R' when that is the only clear Rajaguru ledger. " +
           "If exactly one provided Tally ledger is the clear party match, recommend use_existing_ledger with that exact ledger name and confidence at least 0.90. " +
           "If two or more provided ledgers are plausible party matches, recommend use_suspense when a Suspense ledger exists. " +
           "For a named customer/vendor/business party with no clear existing ledger, recommend use_suspense when a Suspense ledger exists; do not recommend creating a new party ledger during import. " +
@@ -553,7 +559,7 @@ export async function classifyBankTransactionsForTallyWithAI(params: {
     {
       expectJson: true,
       jsonMode: true,
-      model: getQualityExtractionModel(),
+      model: getLedgerMatchingModel(),
       reasoning: getQualityExtractionReasoning(),
       maxTokens: 8192,
     }

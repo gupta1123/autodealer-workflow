@@ -8,6 +8,9 @@ const OPENROUTER_QUALITY_MODEL =
   process.env.OPENROUTER_QUALITY_MODEL ||
   process.env.GEMINI_THINKING_MODEL ||
   "google/gemini-2.5-flash";
+const OPENROUTER_LEDGER_MATCH_MODEL =
+  process.env.OPENROUTER_LEDGER_MATCH_MODEL ||
+  OPENROUTER_QUALITY_MODEL;
 const OPENROUTER_REVIEW_MODEL =
   process.env.OPENROUTER_REVIEW_MODEL ||
   process.env.OPENROUTER_EXTRACTION_REVIEW_MODEL ||
@@ -177,6 +180,10 @@ export async function callOpenRouter(
 
 export function getQualityExtractionModel() {
   return OPENROUTER_QUALITY_MODEL;
+}
+
+export function getLedgerMatchingModel() {
+  return OPENROUTER_LEDGER_MATCH_MODEL;
 }
 
 function getConfiguredExtractionReviewProvider() {

@@ -1,6 +1,10 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
+function isLocalDbMode() {
+  return process.env.LOCAL_DB_MODE === "true" || process.env.NEXT_PUBLIC_LOCAL_DB_MODE === "true";
+}
+
 function requireEnv(name: string, value?: string) {
   if (!value) {
     throw new Error(`Missing required environment variable: ${name}`);
@@ -9,6 +13,12 @@ function requireEnv(name: string, value?: string) {
 }
 
 export async function updateSession(request: NextRequest) {
+  if (isLocalDbMode()) {
+    return NextResponse.next({
+      request,
+    });
+  }
+
   let response = NextResponse.next({
     request,
   });

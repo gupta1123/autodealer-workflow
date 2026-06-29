@@ -55,6 +55,7 @@ function serializePreviewTransaction(row: Record<string, unknown>) {
           : null,
     suggestionReason: row.suggestion_reason ? String(row.suggestion_reason) : null,
     confirmedLedgerName: row.confirmed_ledger_name ? String(row.confirmed_ledger_name) : null,
+    rawPayload: readRecord(row.raw_payload),
   };
 }
 

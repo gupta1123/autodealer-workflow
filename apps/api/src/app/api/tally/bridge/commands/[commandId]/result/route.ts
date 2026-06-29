@@ -1,5 +1,7 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { isLocalDbMode } from "@/lib/local/mode";
+import { completeLocalTallyCommand } from "@/lib/local/tally-store";
 import { hashSecret, type TallyConnectionRow } from "@/lib/tally/connections";
 import {
   serializeTallyBridgeCommand,
@@ -30,10 +32,46 @@ const CONNECTION_SELECT = [
   "updated_at",
 ].join(", ");
 
+type PostedBankTransactionRow = {
+  transaction_date: string;
+  value_date: string | null;
+  description: string;
+  reference_number: string | null;
+  debit_amount: number | string | null;
+  credit_amount: number | string | null;
+  balance_amount: number | string | null;
+  transaction_type: string | null;
+  category: string | null;
+  counterparty_name: string | null;
+  fingerprint: string | null;
+};
+
 function getBridgeToken(request: Request) {
   const authorization = request.headers.get("authorization");
   const bearerMatch = authorization?.match(/^Bearer\s+(.+)$/i);
   return bearerMatch?.[1] ?? request.headers.get("x-bridge-token") ?? "";
+}
+
+function normalizeCheckpointAmount(value: number | string | null | undefined) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(String(value).replace(/,/g, ""));
+  return Number.isFinite(parsed) ? Number(parsed.toFixed(2)) : null;
+}
+
+function buildPostedTransactionCheckpointMarker(row: PostedBankTransactionRow) {
+  return {
+    transactionDate: row.transaction_date,
+    valueDate: row.value_date,
+    description: row.description,
+    referenceNumber: row.reference_number,
+    debitAmount: normalizeCheckpointAmount(row.debit_amount),
+    creditAmount: normalizeCheckpointAmount(row.credit_amount),
+    balanceAmount: normalizeCheckpointAmount(row.balance_amount),
+    transactionType: row.transaction_type ?? "unknown",
+    category: row.category ?? "unknown",
+    counterpartyName: row.counterparty_name,
+    fingerprint: row.fingerprint ?? "",
+  };
 }
 
 export function OPTIONS(request: Request) {
@@ -53,6 +91,139 @@ export async function POST(
       return jsonWithCors(request, { error: "Connection id and bridge token are required." }, { status: 400 });
     }
 
+    const { commandId } = await context.params;
+    const success = body.status === "succeeded" || body.success === true;
+    const result = body.result && typeof body.result === "object" ? body.result : {};
+    const errorMessage = success ? null : toNullableText(body.error, 2000) ?? "Tally command failed.";
+    const now = new Date().toISOString();
+
+    if (isLocalDbMode()) {
+      const completed = await completeLocalTallyCommand({
+        connectionId,
+        token,
+        commandId,
+        success,
+        result,
+        error: errorMessage,
+      });
+
+      if (completed.unauthorized) {
+        return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
+      }
+
+      if (!completed.command) {
+        return jsonWithCors(request, { error: "Tally command not found." }, { status: 404 });
+      }
+
+      const command = completed.command as TallyBridgeCommandRow;
+      const commandPayload =
+        command.payload && typeof command.payload === "object"
+          ? (command.payload as Record<string, unknown>)
+          : {};
+
+      if (command.command_type === "post_bank_voucher") {
+        const supabase = createSupabaseAdminClient();
+        const transactionId = toNullableText(commandPayload.transactionId, 80);
+        const bankAccountId = toNullableText(commandPayload.bankAccountId, 80);
+        const fingerprint = toNullableText(commandPayload.fingerprint, 500);
+        const voucherId =
+          toNullableText((result as Record<string, unknown>).voucherId, 500) ??
+          toNullableText((result as Record<string, unknown>).masterId, 500) ??
+          commandId;
+
+        if (transactionId) {
+          await supabase
+            .from("bank_transactions")
+            .update({
+              tally_status: success ? "posted" : "failed",
+              tally_posted_at: success ? now : null,
+              tally_voucher_id: success ? voucherId : null,
+            })
+            .eq("id", transactionId)
+            .eq("owner_user_id", command.owner_user_id);
+        }
+
+        if (bankAccountId && fingerprint) {
+          await supabase
+            .from("bank_transaction_posting_log")
+            .upsert(
+              {
+                owner_user_id: command.owner_user_id,
+                bank_account_id: bankAccountId,
+                connection_id: null,
+                source_transaction_id: transactionId,
+                fingerprint,
+                transaction_date: toNullableText(commandPayload.voucherDate, 20) ?? now.slice(0, 10),
+                reference_number: toNullableText(commandPayload.referenceNumber, 500),
+                description: toNullableText(commandPayload.narration, 2000) ?? "Bank transaction",
+                amount:
+                  typeof commandPayload.amount === "number"
+                    ? commandPayload.amount
+                    : Number(commandPayload.amount ?? 0) || null,
+                voucher_type: toNullableText(commandPayload.voucherType, 80),
+                bank_ledger_name: toNullableText(commandPayload.bankLedgerName, 500),
+                counterparty_ledger_name: toNullableText(commandPayload.counterpartyLedgerName, 500),
+                command_id: null,
+                status: success ? "posted" : "failed",
+                tally_voucher_id: success ? voucherId : null,
+                tally_posted_at: success ? now : null,
+                error: errorMessage,
+                result,
+              },
+              {
+                onConflict: "owner_user_id,bank_account_id,fingerprint",
+              }
+            );
+        }
+
+        if (success && bankAccountId) {
+          const { data: latestPostedRows, error: latestPostedError } = await supabase
+            .from("bank_transactions")
+            .select(
+              [
+                "transaction_date",
+                "value_date",
+                "description",
+                "reference_number",
+                "debit_amount",
+                "credit_amount",
+                "balance_amount",
+                "transaction_type",
+                "category",
+                "counterparty_name",
+                "fingerprint",
+              ].join(", ")
+            )
+            .eq("owner_user_id", command.owner_user_id)
+            .eq("bank_account_id", bankAccountId)
+            .eq("tally_status", "posted")
+            .order("transaction_date", { ascending: false })
+            .order("created_at", { ascending: false })
+            .limit(1);
+
+          if (latestPostedError) throw latestPostedError;
+
+          const latestPosted = (latestPostedRows?.[0] ?? null) as unknown as PostedBankTransactionRow | null;
+          const checkpointDate = latestPosted?.transaction_date ?? toNullableText(commandPayload.voucherDate, 20);
+          await supabase
+            .from("bank_accounts")
+            .update({
+              last_imported_transaction_at: checkpointDate ? `${checkpointDate}T00:00:00.000Z` : now,
+              last_imported_transaction_marker: latestPosted
+                ? buildPostedTransactionCheckpointMarker(latestPosted)
+                : {},
+              last_tally_posted_transaction_at: checkpointDate ? `${checkpointDate}T00:00:00.000Z` : now,
+            })
+            .eq("id", bankAccountId)
+            .eq("owner_user_id", command.owner_user_id);
+        }
+      }
+
+      return jsonWithCors(request, {
+        command: serializeTallyBridgeCommand(command),
+      });
+    }
+
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_connections")
@@ -66,12 +237,6 @@ export async function POST(
     if (!connection?.bridge_token_hash || hashSecret(token) !== connection.bridge_token_hash) {
       return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
     }
-
-    const { commandId } = await context.params;
-    const success = body.status === "succeeded" || body.success === true;
-    const now = new Date().toISOString();
-    const result = body.result && typeof body.result === "object" ? body.result : {};
-    const errorMessage = success ? null : toNullableText(body.error, 2000) ?? "Tally command failed.";
 
     const { data: commandData, error: updateError } = await supabase
       .from("tally_bridge_commands")
@@ -204,13 +369,42 @@ export async function POST(
       }
 
       if (success && bankAccountId) {
-        const voucherDate = toNullableText(commandPayload.voucherDate, 20);
+        const { data: latestPostedRows, error: latestPostedError } = await supabase
+          .from("bank_transactions")
+          .select(
+            [
+              "transaction_date",
+              "value_date",
+              "description",
+              "reference_number",
+              "debit_amount",
+              "credit_amount",
+              "balance_amount",
+              "transaction_type",
+              "category",
+              "counterparty_name",
+              "fingerprint",
+            ].join(", ")
+          )
+          .eq("owner_user_id", connection.owner_user_id)
+          .eq("bank_account_id", bankAccountId)
+          .eq("tally_status", "posted")
+          .order("transaction_date", { ascending: false })
+          .order("created_at", { ascending: false })
+          .limit(1);
+
+        if (latestPostedError) throw latestPostedError;
+
+        const latestPosted = (latestPostedRows?.[0] ?? null) as unknown as PostedBankTransactionRow | null;
+        const checkpointDate = latestPosted?.transaction_date ?? toNullableText(commandPayload.voucherDate, 20);
         await supabase
           .from("bank_accounts")
           .update({
-            last_tally_posted_transaction_at: voucherDate
-              ? `${voucherDate}T00:00:00.000Z`
-              : now,
+            last_imported_transaction_at: checkpointDate ? `${checkpointDate}T00:00:00.000Z` : now,
+            last_imported_transaction_marker: latestPosted
+              ? buildPostedTransactionCheckpointMarker(latestPosted)
+              : {},
+            last_tally_posted_transaction_at: checkpointDate ? `${checkpointDate}T00:00:00.000Z` : now,
           })
           .eq("id", bankAccountId)
           .eq("owner_user_id", connection.owner_user_id);
