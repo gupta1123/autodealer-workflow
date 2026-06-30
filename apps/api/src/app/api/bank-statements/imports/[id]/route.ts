@@ -122,11 +122,22 @@ export async function GET(
         : storedPreviewTransactions;
     const analysis = readRecord(processingMeta.analysis);
     const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
+    const ledgerMatching = readRecord(analysis.ledgerMatching);
+    const ledgerMatchingStatus = typeof ledgerMatching.status === "string" ? ledgerMatching.status : "";
+    const ledgerMatchingCompleted = ledgerMatchingStatus === "completed";
     const jobStatus = typeof jobRow?.status === "string" ? jobRow.status : "";
     const jobIsTerminal = ["succeeded", "failed", "cancelled"].includes(jobStatus);
     const processing =
       !jobIsTerminal &&
       (importRow.status === "processing" || analysisStatus === "queued" || analysisStatus === "processing");
+    const readyStatus = ["ready_to_review", "ready_to_confirm", "needs_account_selection"].includes(importRow.status);
+    const waitingForLedgerMatching =
+      readyStatus &&
+      transactions.length > 0 &&
+      analysisStatus === "completed" &&
+      Boolean(ledgerMatchingStatus) &&
+      jobStatus !== "succeeded" &&
+      !ledgerMatchingCompleted;
 
     if (!jobRow && processing) {
       const { data: repairedJobRow, error: repairJobError } = await supabase
@@ -146,11 +157,14 @@ export async function GET(
       jobRow = repairedJobRow;
     }
 
+    const effectiveProcessing = processing || waitingForLedgerMatching;
+    const visibleTransactions = effectiveProcessing ? [] : transactions;
+
     const requiresManualExtraction =
       importRow.status === "manual_review_required" ||
       importRow.status === "failed" ||
       Boolean(previewMeta.requiresManualExtraction) ||
-      (!processing && transactions.length === 0);
+      (!effectiveProcessing && transactions.length === 0);
     const account = {
       bankName:
         typeof previewAccount.bankName === "string"
@@ -190,25 +204,29 @@ export async function GET(
       import: serializeImport(importRow as Record<string, unknown>),
       account,
       candidates: Array.isArray(previewMeta.candidates) ? candidates : candidates.map(serializeAccount),
-      transactions,
+      transactions: visibleTransactions,
       requiresManualExtraction,
       extractionSource: previewMeta.extractionSource ?? processingMeta.extractionSource ?? null,
       extractionError: previewMeta.extractionError ?? processingMeta.extractionError ?? null,
       extractionDiagnostics: previewMeta.extractionDiagnostics ?? processingMeta.extractionDiagnostics ?? null,
-      processing,
+      processing: effectiveProcessing,
       job: jobRow
         ? {
             id: jobRow.id,
-            status: jobRow.status,
-            progress: jobRow.progress,
-            stage: jobRow.stage,
+            status: effectiveProcessing && jobRow.status === "succeeded" ? "processing" : jobRow.status,
+            progress: waitingForLedgerMatching ? 95 : jobRow.progress,
+            stage: waitingForLedgerMatching ? "Matching Tally ledgers" : jobRow.stage,
             error: jobRow.error,
           }
         : {
             id: String(importRow.id),
-            status: analysisStatus || (processing ? "processing" : "completed"),
-            progress: Number(analysis.progress ?? (processing ? 5 : 100)),
-            stage: typeof analysis.stage === "string" ? analysis.stage : null,
+            status: analysisStatus || (effectiveProcessing ? "processing" : "completed"),
+            progress: waitingForLedgerMatching ? 95 : Number(analysis.progress ?? (effectiveProcessing ? 5 : 100)),
+            stage: waitingForLedgerMatching
+              ? "Matching Tally ledgers"
+              : typeof analysis.stage === "string"
+                ? analysis.stage
+                : null,
             error: typeof analysis.error === "string" ? analysis.error : null,
           },
     });

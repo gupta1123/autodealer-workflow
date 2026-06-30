@@ -489,6 +489,34 @@ function findUniqueCloseLedger(ledgers, candidateName) {
   return matches[0];
 }
 
+function findDeterministicLedgerMatch(ledgers, transaction) {
+  const candidateName = transaction.counterparty_name || extractCounterpartyName(transaction.description);
+  if (!candidateName) return null;
+
+  const exact = ledgers.find((ledger) => normalizeName(ledger.tally_name) === normalizeName(candidateName));
+  if (exact) {
+    return {
+      ledgerName: exact.tally_name,
+      confidence: 1,
+      reason: "Matched exact synced Tally ledger name.",
+      source: "deterministic_match",
+      matchType: "direct_match",
+      candidateLedgerNames: [],
+    };
+  }
+
+  const close = findUniqueCloseLedger(ledgers, candidateName);
+  if (!close || close.score < 0.9) return null;
+  return {
+    ledgerName: close.ledger.tally_name,
+    confidence: close.score,
+    reason: "Matched unique synced Tally ledger by normalized party name.",
+    source: "deterministic_match",
+    matchType: "direct_match",
+    candidateLedgerNames: [],
+  };
+}
+
 function detectTransactionType(description) {
   const text = String(description || "").toLowerCase();
   if (/\bupi\b/.test(text)) return "upi";
@@ -1256,7 +1284,6 @@ async function matchTransactionLedgers(transactions, ledgers) {
       counterparty_name: transaction.counterparty_name || extractCounterpartyName(transaction.description),
     },
   }));
-
   let aiMatches = new Map();
   let aiFailureReason = "";
   try {
@@ -1289,6 +1316,35 @@ async function matchTransactionLedgers(transactions, ledgers) {
             confidence: aiMatch.confidence,
             candidateLedgerNames: aiMatch.candidateLedgerNames,
             reason: aiMatch.reason,
+          },
+        },
+      };
+    }
+
+    const fallbackMatch = aiFailureReason ? findDeterministicLedgerMatch(ledgers, transaction) : null;
+    if (fallbackMatch?.ledgerName) {
+      console.log("[worker] Deterministic ledger fallback accepted after AI did not produce a usable match", {
+        index,
+        ledgerName: fallbackMatch.ledgerName,
+        confidence: fallbackMatch.confidence,
+      });
+      return {
+        ...transaction,
+        suggested_ledger_name: fallbackMatch.ledgerName,
+        suggestion_confidence: fallbackMatch.confidence,
+        suggestion_reason: fallbackMatch.reason,
+        raw_payload: {
+          ...(transaction.raw_payload ?? {}),
+          ledgerMatch: {
+            source: fallbackMatch.source,
+            action: "use_existing_ledger",
+            matchType: fallbackMatch.matchType,
+            ledgerName: fallbackMatch.ledgerName,
+            confidence: fallbackMatch.confidence,
+            candidateLedgerNames: fallbackMatch.candidateLedgerNames,
+            reason: fallbackMatch.reason,
+            fallbackAfterAi: true,
+            aiFailureReason: aiFailureReason || aiMatch?.reason || null,
           },
         },
       };
@@ -1955,6 +2011,8 @@ async function runBankStatementJob(job) {
     `[worker] Loaded ${tallyLedgers.length} Tally ledger(s) for bank statement matching connection=${connectionId || "none"}.`
   );
   const matchedTransactions = await matchTransactionLedgers(parsed.transactions, tallyLedgers);
+  const ledgerMatchedCount = matchedTransactions.filter((transaction) => transaction.suggested_ledger_name).length;
+  const ledgerUnmatchedCount = Math.max(0, matchedTransactions.length - ledgerMatchedCount);
   const normalizedAccountNumber = normalizeAccountNumber(account.accountNumber);
   const { data: candidateRows, error: candidateError } = normalizedAccountNumber
     ? await supabase
@@ -2026,6 +2084,13 @@ async function runBankStatementJob(job) {
           error: null,
           tallyMasterSync,
           tallyLedgerCount: tallyLedgers.length,
+          ledgerMatching: {
+            status: "completed",
+            matchedCount: ledgerMatchedCount,
+            unmatchedCount: ledgerUnmatchedCount,
+            totalCount: matchedTransactions.length,
+            completedAt,
+          },
           completedAt,
           updatedAt: completedAt,
         },

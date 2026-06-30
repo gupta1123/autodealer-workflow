@@ -176,6 +176,30 @@ function findUniqueCloseLedgerByName(ledgers: TallyMasterRow[], candidateName?: 
   return matches.length === 1 ? matches[0] : null;
 }
 
+function findDeterministicLedgerMatch(ledgers: TallyMasterRow[], candidateName?: string | null) {
+  const normalizedCandidate = normalizeName(candidateName);
+  if (!normalizedCandidate) return null;
+
+  const exact = ledgers.find((ledger) => normalizeName(ledger.tally_name) === normalizedCandidate);
+  if (exact) {
+    return {
+      ledgerName: exact.tally_name,
+      confidence: 1,
+      reason: "Matched exact synced Tally ledger name.",
+      mappingSource: "ledger_name" as const,
+    };
+  }
+
+  const close = findUniqueCloseLedgerByName(ledgers, candidateName);
+  if (!close || close.score < 0.9) return null;
+  return {
+    ledgerName: close.ledgerName,
+    confidence: close.score,
+    reason: "Matched unique synced Tally ledger by normalized party name.",
+    mappingSource: "close_match" as const,
+  };
+}
+
 function safeJsonParse<T>(raw: string, fallback: T): T {
   try {
     return JSON.parse(raw) as T;
@@ -500,6 +524,24 @@ export async function suggestBankLedgerForTransaction(input: {
         error: error instanceof Error ? error.message : String(error),
         transaction: summarizeMatcherTransaction(input.transaction, counterpartyName),
       });
+
+      const deterministicLedger = findDeterministicLedgerMatch(ledgers, counterpartyName);
+      if (deterministicLedger) {
+        console.warn("[bank-ledger-match] deterministic fallback accepted after AI call failed", {
+          accountId: input.accountId,
+          connectionId: input.connectionId,
+          ledgerName: deterministicLedger.ledgerName,
+          confidence: deterministicLedger.confidence,
+          transaction: summarizeMatcherTransaction(input.transaction, counterpartyName),
+        });
+        return {
+          counterpartyName,
+          ledgerName: deterministicLedger.ledgerName,
+          confidence: deterministicLedger.confidence,
+          reason: deterministicLedger.reason,
+          mappingSource: deterministicLedger.mappingSource,
+        };
+      }
     }
   }
 

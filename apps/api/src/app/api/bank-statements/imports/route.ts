@@ -144,6 +144,9 @@ export async function POST(request: Request) {
           error: null,
           connectionId,
           manualAccount,
+          ledgerMatching: {
+            status: "queued",
+          },
           startedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         },
