@@ -910,7 +910,10 @@ async function loadLocalTallyLedgers(connectionId, ownerUserId) {
 }
 
 async function loadTallyLedgers(connectionId, ownerUserId) {
-  if (!connectionId) return [];
+  if (!connectionId) {
+    console.warn("[worker] Bank statement ledger matching skipped Tally ledger load: no connection id.");
+    return [];
+  }
   if (process.env.LOCAL_DB_MODE === "true") {
     return loadLocalTallyLedgers(connectionId, ownerUserId);
   }
@@ -1137,7 +1140,18 @@ async function ensureTallyMastersForAnalysis(connectionId, ownerUserId) {
 }
 
 async function aiMatchLedgers(transactions, ledgers) {
-  if (!OPENROUTER_API_KEY || transactions.length === 0 || ledgers.length === 0) return new Map();
+  if (!OPENROUTER_API_KEY) {
+    console.warn("[worker] AI ledger matching skipped: OPENROUTER_API_KEY is not configured.");
+    return new Map();
+  }
+  if (transactions.length === 0) {
+    console.warn("[worker] AI ledger matching skipped: no transactions to match.");
+    return new Map();
+  }
+  if (ledgers.length === 0) {
+    console.warn("[worker] AI ledger matching skipped: no synced Tally ledgers available.");
+    return new Map();
+  }
   const raw = await callOpenRouterForBankStatement(
     [
       {
@@ -1181,11 +1195,23 @@ async function aiMatchLedgers(transactions, ledgers) {
       ? match.candidateLedgerNames.map((name) => textCell(name)).filter(Boolean).slice(0, 5)
       : [];
     const reason = textCell(match.reason) || "AI did not find one clear existing Tally ledger.";
+    const accepted = action === "use_existing_ledger" && matched && confidence >= 0.9;
+    if (!accepted) {
+      console.warn("[worker] AI ledger match rejected", {
+        index,
+        action,
+        matchType,
+        returnedLedgerName: ledgerName || null,
+        ledgerFound: Boolean(matched),
+        confidence,
+        reason: reason.slice(0, 240),
+      });
+    }
 
     byIndex.set(index, {
       action,
       matchType,
-      ledgerName: action === "use_existing_ledger" && matched && confidence >= 0.9 ? matched.tally_name : null,
+      ledgerName: accepted ? matched.tally_name : null,
       confidence,
       reason,
       source: "ai_match",
@@ -1235,7 +1261,11 @@ async function matchTransactionLedgers(transactions, ledgers) {
   let aiFailureReason = "";
   try {
     aiMatches = await aiMatchLedgers(aiInputs, ledgers);
-    console.log(`[worker] AI ledger matcher returned ${aiMatches.size} result(s).`);
+    const acceptedCount = Array.from(aiMatches.values()).filter((match) => match?.ledgerName).length;
+    const rejectedCount = aiMatches.size - acceptedCount;
+    console.log(
+      `[worker] AI ledger matcher returned ${aiMatches.size} result(s), accepted=${acceptedCount}, rejected=${rejectedCount}.`
+    );
   } catch (error) {
     aiFailureReason = formatError(error);
     console.warn("[worker] AI ledger match failed:", aiFailureReason);
@@ -1921,6 +1951,9 @@ async function runBankStatementJob(job) {
   }
   await updateBankJob(job.id, { progress: 72, stage: "Matching Tally ledgers" });
   const tallyLedgers = await loadTallyLedgers(connectionId, job.owner_user_id);
+  console.log(
+    `[worker] Loaded ${tallyLedgers.length} Tally ledger(s) for bank statement matching connection=${connectionId || "none"}.`
+  );
   const matchedTransactions = await matchTransactionLedgers(parsed.transactions, tallyLedgers);
   const normalizedAccountNumber = normalizeAccountNumber(account.accountNumber);
   const { data: candidateRows, error: candidateError } = normalizedAccountNumber

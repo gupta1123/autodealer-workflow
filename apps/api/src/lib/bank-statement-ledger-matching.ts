@@ -325,13 +325,27 @@ function shortlistLedgersForAi(ledgers: TallyMasterRow[], transaction: Matchable
   return scoredLedgers.length > 0 ? scoredLedgers : ledgers.slice(0, 200);
 }
 
+function summarizeMatcherTransaction(transaction: MatchableTransaction, counterpartyName?: string | null) {
+  return {
+    counterpartyName: counterpartyName || transaction.counterpartyName || null,
+    category: transaction.category || null,
+    descriptionLength: String(transaction.description ?? "").length,
+  };
+}
+
 async function aiMatchLedgerForTransaction(input: {
   ledgers: TallyMasterRow[];
   transaction: MatchableTransaction;
   counterpartyName: string | null;
 }) {
   const candidateLedgers = shortlistLedgersForAi(input.ledgers, input.transaction, input.counterpartyName);
-  if (candidateLedgers.length === 0) return null;
+  if (candidateLedgers.length === 0) {
+    console.warn("[bank-ledger-match] skipped: no candidate ledgers after shortlist", {
+      ledgerCount: input.ledgers.length,
+      transaction: summarizeMatcherTransaction(input.transaction, input.counterpartyName),
+    });
+    return null;
+  }
 
   const raw = await callOpenRouter(
     [
@@ -371,15 +385,41 @@ async function aiMatchLedgerForTransaction(input: {
     action?: unknown;
     ledgerName?: unknown;
     confidence?: unknown;
+    matchType?: unknown;
     reason?: unknown;
   }>(raw, {});
   const match = Array.isArray(parsed.matches) ? parsed.matches[0] ?? {} : parsed;
-  if (String(match.action ?? "") !== "use_existing_ledger") return null;
+  const action = String(match.action ?? "");
+  if (action !== "use_existing_ledger") {
+    console.warn("[bank-ledger-match] rejected OpenRouter result: action was not use_existing_ledger", {
+      model: getLedgerMatchingModel(),
+      ledgerCount: input.ledgers.length,
+      candidateLedgerCount: candidateLedgers.length,
+      action,
+      matchType: String(match.matchType ?? ""),
+      confidence: clampConfidence(match.confidence),
+      reason: String(match.reason ?? "").slice(0, 240),
+      transaction: summarizeMatcherTransaction(input.transaction, input.counterpartyName),
+    });
+    return null;
+  }
 
   const ledgerName = String(match.ledgerName ?? "").trim();
   const matchedLedger = findLedgerByNormalizedName(candidateLedgers, ledgerName);
   const confidence = clampConfidence(match.confidence);
-  if (!matchedLedger || confidence < 0.9) return null;
+  if (!matchedLedger || confidence < 0.9) {
+    console.warn("[bank-ledger-match] rejected OpenRouter result: ledger missing or confidence too low", {
+      model: getLedgerMatchingModel(),
+      ledgerCount: input.ledgers.length,
+      candidateLedgerCount: candidateLedgers.length,
+      returnedLedgerName: ledgerName || null,
+      ledgerFound: Boolean(matchedLedger),
+      confidence,
+      reason: String(match.reason ?? "").slice(0, 240),
+      transaction: summarizeMatcherTransaction(input.transaction, input.counterpartyName),
+    });
+    return null;
+  }
 
   return {
     ledgerName: matchedLedger.tally_name,
@@ -423,6 +463,18 @@ export async function suggestBankLedgerForTransaction(input: {
   if (ledgerError) throw ledgerError;
 
   const ledgers = (ledgerRows ?? []) as unknown as TallyMasterRow[];
+  if (!input.connectionId) {
+    console.warn("[bank-ledger-match] skipped: no Tally connection id was provided", {
+      accountId: input.accountId,
+      transaction: summarizeMatcherTransaction(input.transaction, counterpartyName),
+    });
+  } else if (ledgers.length === 0) {
+    console.warn("[bank-ledger-match] skipped: no active synced Tally ledgers found", {
+      accountId: input.accountId,
+      connectionId: input.connectionId,
+      transaction: summarizeMatcherTransaction(input.transaction, counterpartyName),
+    });
+  }
   if (ledgers.length > 0 && (counterpartyName || input.transaction.description || input.transaction.category)) {
     try {
       const aiLedger = await aiMatchLedgerForTransaction({
@@ -440,7 +492,14 @@ export async function suggestBankLedgerForTransaction(input: {
         };
       }
     } catch (error) {
-      console.warn("AI ledger match fallback failed:", error);
+      console.warn("[bank-ledger-match] OpenRouter call failed", {
+        model: getLedgerMatchingModel(),
+        accountId: input.accountId,
+        connectionId: input.connectionId,
+        ledgerCount: ledgers.length,
+        error: error instanceof Error ? error.message : String(error),
+        transaction: summarizeMatcherTransaction(input.transaction, counterpartyName),
+      });
     }
   }
 

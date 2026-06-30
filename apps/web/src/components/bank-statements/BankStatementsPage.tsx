@@ -615,8 +615,6 @@ function autoMatchUntouchedLedgerSelection(transaction: ReviewTransaction, ledge
     return transaction;
   }
 
-  if (transaction.ledgerAction === "use_suspense" || transaction.ledgerAction === "needs_review") return transaction;
-
   const matchedLedger = findLedgerByNormalizedName(ledgerMasters, transaction.suggestedLedgerName);
 
   if (!matchedLedger || isSuspenseLedgerName(matchedLedger.name)) return transaction;
