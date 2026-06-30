@@ -59,8 +59,14 @@ function hasAiStoredLedgerSuggestion(row: BankTransactionRow) {
   const rawPayload = row.raw_payload;
   if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) return false;
   const ledgerMatch = (rawPayload as { ledgerMatch?: unknown }).ledgerMatch;
-  if (!ledgerMatch || typeof ledgerMatch !== "object" || Array.isArray(ledgerMatch)) return false;
-  return (ledgerMatch as { source?: unknown }).source === "ai_match";
+  if (ledgerMatch && typeof ledgerMatch === "object" && !Array.isArray(ledgerMatch)) {
+    return (ledgerMatch as { source?: unknown }).source === "ai_match";
+  }
+  const aiLedgerRecommendation = (rawPayload as { aiLedgerRecommendation?: unknown }).aiLedgerRecommendation;
+  if (!aiLedgerRecommendation || typeof aiLedgerRecommendation !== "object" || Array.isArray(aiLedgerRecommendation)) {
+    return false;
+  }
+  return (aiLedgerRecommendation as { action?: unknown }).action === "use_existing_ledger";
 }
 
 function serializeTransaction(row: BankTransactionRow, suggestion?: Awaited<ReturnType<typeof suggestBankLedgerForTransaction>>) {
@@ -193,21 +199,24 @@ export async function GET(request: Request) {
       rows = rows.filter((row) => !postedReferences.has(normalizeReferenceNumber(row.reference_number)));
     }
 
-    const suggestions = await Promise.all(
-      rows.map((row) =>
-        suggestBankLedgerForTransaction({
-          supabase,
-          ownerUserId: user.id,
-          connectionId,
-          accountId,
-          transaction: {
-            description: row.description,
-            category: row.category,
-            counterpartyName: row.counterparty_name,
-          },
-        })
-      )
-    );
+    const suggestions =
+      status === "queueable"
+        ? rows.map(() => undefined)
+        : await Promise.all(
+            rows.map((row) =>
+              suggestBankLedgerForTransaction({
+                supabase,
+                ownerUserId: user.id,
+                connectionId,
+                accountId,
+                transaction: {
+                  description: row.description,
+                  category: row.category,
+                  counterpartyName: row.counterparty_name,
+                },
+              })
+            )
+          );
 
     return jsonWithCors(request, {
       transactions: rows.map((row, index) => serializeTransaction(row, suggestions[index])),

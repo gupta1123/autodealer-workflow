@@ -1,5 +1,6 @@
 "use client";
 
+import type { UIEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
@@ -1335,6 +1336,8 @@ async function readError(response: Response) {
 export function BankStatementsPage() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const reviewTableTopScrollRef = useRef<HTMLDivElement | null>(null);
+  const reviewTableScrollRef = useRef<HTMLDivElement | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [account, setAccount] = useState<DraftAccount>(EMPTY_ACCOUNT);
@@ -1362,6 +1365,18 @@ export function BankStatementsPage() {
   const [reviewDirectionFilter, setReviewDirectionFilter] = useState<ReviewDirectionFilter>("all");
   const [reviewDateFrom, setReviewDateFrom] = useState("");
   const [reviewDateTo, setReviewDateTo] = useState("");
+
+  const syncReviewTableScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
+    const nextScrollLeft = event.currentTarget.scrollLeft;
+    const top = reviewTableTopScrollRef.current;
+    const table = reviewTableScrollRef.current;
+    if (top && top !== event.currentTarget && top.scrollLeft !== nextScrollLeft) {
+      top.scrollLeft = nextScrollLeft;
+    }
+    if (table && table !== event.currentTarget && table.scrollLeft !== nextScrollLeft) {
+      table.scrollLeft = nextScrollLeft;
+    }
+  }, []);
   const [rowsPerPage, setRowsPerPage] = useState(50);
 
   const validTransactions = useMemo(
@@ -2619,7 +2634,21 @@ export function BankStatementsPage() {
                   ) : null}
                 </div>
 
-                <div className="overflow-x-auto">
+                <div className="border-t border-[#eee5da] bg-[#fbf7f1] px-4 py-2">
+                  <div
+                    ref={reviewTableTopScrollRef}
+                    className="overflow-x-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
+                    onScroll={syncReviewTableScroll}
+                  >
+                    <div className="h-2 min-w-[1120px]" />
+                  </div>
+                </div>
+
+                <div
+                  ref={reviewTableScrollRef}
+                  className="overflow-x-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
+                  onScroll={syncReviewTableScroll}
+                >
                   <table className="w-full min-w-[1120px] border-collapse text-left">
                     <thead>
                       <tr className="border-b border-[#eee5da] bg-[#fbf7f1] text-[10px] font-black uppercase tracking-[0.14em] text-[#8a7f72]">
