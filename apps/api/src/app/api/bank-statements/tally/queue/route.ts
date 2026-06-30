@@ -5,7 +5,6 @@ import {
   buildBankAccountLedgerSourceKey,
   buildBankNarrationLedgerSourceKey,
   buildLedgerMappingTarget,
-  suggestBankLedgerForTransaction,
 } from "@/lib/bank-statement-ledger-matching";
 import { isLocalDbMode } from "@/lib/local/mode";
 import {
@@ -524,8 +523,14 @@ export async function POST(request: Request) {
       const rawPayload = transaction.raw_payload;
       if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) return false;
       const ledgerMatch = (rawPayload as { ledgerMatch?: unknown }).ledgerMatch;
-      if (!ledgerMatch || typeof ledgerMatch !== "object" || Array.isArray(ledgerMatch)) return false;
-      return (ledgerMatch as { source?: unknown }).source === "ai_match";
+      if (ledgerMatch && typeof ledgerMatch === "object" && !Array.isArray(ledgerMatch)) {
+        return (ledgerMatch as { source?: unknown }).source === "ai_match";
+      }
+      const aiLedgerRecommendation = (rawPayload as { aiLedgerRecommendation?: unknown }).aiLedgerRecommendation;
+      if (!aiLedgerRecommendation || typeof aiLedgerRecommendation !== "object" || Array.isArray(aiLedgerRecommendation)) {
+        return false;
+      }
+      return (aiLedgerRecommendation as { action?: unknown }).action === "use_existing_ledger";
     }
 
     function isPartyParent(parentName: string) {
@@ -537,57 +542,39 @@ export async function POST(request: Request) {
       return isPartyParent(ledgerParentByName.get(normalizeName(ledgerName)) || "");
     }
 
-    const commandInputs = await Promise.all(
-      transactions.map(async (transaction) => {
-        const suggestion = await suggestBankLedgerForTransaction({
-          supabase,
-          ownerUserId: user.id,
-          connectionId,
-          accountId: transaction.bank_account_id,
-          transaction: {
-            description: transaction.description,
-            category: transaction.category,
-            counterpartyName: transaction.counterparty_name,
-          },
-        });
+    const commandInputs = transactions.map((transaction) => {
         const selectedLedger = ledgerSelectionByTransactionId.get(transaction.id);
         const createLedgerName = selectedLedger?.createLedgerName || "";
         const legacyFallback = requestedTransactionIds.length === 1 ? toText(body.counterpartyLedgerName, 500) : "";
-        const strongSuggestedLedger =
-          suggestion.ledgerName && !isSuspenseLedger(suggestion.ledgerName) && suggestion.confidence >= 0.85
-            ? suggestion.ledgerName
-            : "";
-        const confirmedLedgerName =
-          transaction.confirmed_ledger_name && !(isSuspenseLedger(transaction.confirmed_ledger_name) && strongSuggestedLedger)
-            ? transaction.confirmed_ledger_name
-            : "";
-        const storedSuggestedLedgerName =
+        const storedAiLedgerName =
           transaction.suggested_ledger_name &&
           hasAiStoredLedgerSuggestion(transaction) &&
-          !(isSuspenseLedger(transaction.suggested_ledger_name) && strongSuggestedLedger)
+          Number(transaction.suggestion_confidence ?? 0) >= 0.85 &&
+          !isSuspenseLedger(transaction.suggested_ledger_name)
             ? transaction.suggested_ledger_name
+            : "";
+        const confirmedLedgerName =
+          transaction.confirmed_ledger_name && !(isSuspenseLedger(transaction.confirmed_ledger_name) && storedAiLedgerName)
+            ? transaction.confirmed_ledger_name
             : "";
         const counterpartyLedgerName =
           createLedgerName ||
           selectedLedger?.counterpartyLedgerName ||
           confirmedLedgerName ||
-          strongSuggestedLedger ||
-          (Number(transaction.suggestion_confidence ?? 0) >= 0.85 ? storedSuggestedLedgerName : "") ||
+          storedAiLedgerName ||
           legacyFallback;
 
         return {
           transaction,
-          suggestion,
           counterpartyLedgerName,
           createLedgerName,
           createLedgerParentName: selectedLedger?.createLedgerParentName || "Sundry Creditors",
         };
-      })
-    );
+      });
 
     const queuedCreateLedgerKeys = new Set<string>();
     const commands: TallyCommandInsert[] = commandInputs.flatMap(
-      ({ transaction, suggestion, counterpartyLedgerName, createLedgerName, createLedgerParentName }) => {
+      ({ transaction, counterpartyLedgerName, createLedgerName, createLedgerParentName }) => {
         if (
           blockedFingerprints.has(transaction.fingerprint) ||
           blockedReferences.has(normalizeReferenceNumber(transaction.reference_number))
@@ -690,7 +677,7 @@ export async function POST(request: Request) {
             referenceNumber,
             transactionType: transaction.transaction_type,
             category: transaction.category,
-            counterpartyName: transaction.counterparty_name || suggestion.counterpartyName,
+            counterpartyName: transaction.counterparty_name,
             accountNumberMasked: account.account_number_masked,
           },
         });
