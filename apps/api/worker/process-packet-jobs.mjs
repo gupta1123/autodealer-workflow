@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -23,6 +24,9 @@ const WORKER_STALE_RUNNING_JOB_MS = Number(process.env.WORKER_STALE_RUNNING_JOB_
 const WORKER_STALE_RUNNING_JOB_INTERVAL = `${Math.max(1, Math.round(WORKER_STALE_RUNNING_JOB_MS / 60_000))} minutes`;
 const WORKER_IN_FLIGHT_WAIT_MS = Number(process.env.WORKER_IN_FLIGHT_WAIT_MS ?? 2 * 60_000);
 const WORKER_IN_FLIGHT_POLL_MS = Number(process.env.WORKER_IN_FLIGHT_POLL_MS ?? 5_000);
+const BANK_STATEMENT_TALLY_SYNC_ON_ANALYZE = process.env.BANK_STATEMENT_TALLY_SYNC_ON_ANALYZE !== "false";
+const BANK_STATEMENT_TALLY_SYNC_WAIT_MS = Number(process.env.BANK_STATEMENT_TALLY_SYNC_WAIT_MS ?? 45_000);
+const BANK_STATEMENT_TALLY_SYNC_POLL_MS = Number(process.env.BANK_STATEMENT_TALLY_SYNC_POLL_MS ?? 1_500);
 const BANK_STATEMENT_AI_MAX_PAGES = Number(process.env.BANK_STATEMENT_AI_MAX_PAGES ?? 8);
 const BANK_STATEMENT_SINGLE_SHOT_MAX_PAGES = Number(
   process.env.BANK_STATEMENT_SINGLE_SHOT_MAX_PAGES ?? BANK_STATEMENT_AI_MAX_PAGES
@@ -922,6 +926,216 @@ async function loadTallyLedgers(connectionId, ownerUserId) {
   return (data ?? []).filter((master) => master.tally_name);
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function localTallyStorePath() {
+  return path.join(process.cwd(), ".local-data", "tally-store.json");
+}
+
+function readLocalTallyState() {
+  try {
+    return JSON.parse(fs.readFileSync(localTallyStorePath(), "utf8"));
+  } catch {
+    return { connections: [], commands: [], events: [], masters: [], masterSyncRuns: [] };
+  }
+}
+
+function writeLocalTallyState(state) {
+  const storePath = localTallyStorePath();
+  fs.mkdirSync(path.dirname(storePath), { recursive: true });
+  fs.writeFileSync(storePath, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+async function queueLocalMasterSyncForAnalysis(connectionId, ownerUserId) {
+  const state = readLocalTallyState();
+  const connection = (state.connections ?? []).find(
+    (row) => row.id === connectionId && row.owner_user_id === ownerUserId
+  );
+  if (!connection) {
+    return { status: "skipped", reason: "local_connection_not_found", commandId: null };
+  }
+  if (connection.last_tally_reachable !== true || connection.last_company_loaded !== true) {
+    return { status: "skipped", reason: "local_tally_not_ready", commandId: null };
+  }
+
+  const pending = (state.commands ?? [])
+    .filter((command) => command.connection_id === connectionId)
+    .filter((command) => command.owner_user_id === ownerUserId)
+    .filter((command) => command.command_type === "sync_masters")
+    .filter((command) => command.status === "queued" || command.status === "claimed")
+    .sort((left, right) => String(right.created_at ?? "").localeCompare(String(left.created_at ?? "")))[0];
+  if (pending) {
+    return { status: "pending", reason: "sync_already_pending", commandId: pending.id };
+  }
+
+  const now = nowIso();
+  const command = {
+    id: randomUUID(),
+    connection_id: connectionId,
+    owner_user_id: ownerUserId,
+    command_type: "sync_masters",
+    status: "queued",
+    priority: 25,
+    payload: {
+      companyName: connection.last_company_name ?? null,
+      requestedMasterTypes: ["ledger", "group", "voucher_type", "gst_ledger", "tax_ledger"],
+      mode: "ledger_accuracy",
+      reason: "analysis_ledger_matching",
+    },
+    result: null,
+    error: null,
+    attempts: 0,
+    max_attempts: 3,
+    available_at: now,
+    claimed_at: null,
+    completed_at: null,
+    bridge_version: null,
+    created_at: now,
+    updated_at: now,
+  };
+  state.commands = [command, ...(state.commands ?? [])];
+  writeLocalTallyState(state);
+  return { status: "queued", reason: "analysis_ledger_matching", commandId: command.id };
+}
+
+async function waitForLocalMasterSync(commandId) {
+  if (!commandId || BANK_STATEMENT_TALLY_SYNC_WAIT_MS <= 0) {
+    return { status: "skipped", reason: "wait_disabled", commandId };
+  }
+  const deadline = Date.now() + BANK_STATEMENT_TALLY_SYNC_WAIT_MS;
+  while (Date.now() <= deadline) {
+    const state = readLocalTallyState();
+    const command = (state.commands ?? []).find((row) => row.id === commandId);
+    if (!command) return { status: "missing", reason: "command_not_found", commandId };
+    if (command.status === "succeeded") {
+      return { status: "succeeded", reason: "completed", commandId, completedAt: command.completed_at ?? null };
+    }
+    if (command.status === "failed" || command.status === "canceled") {
+      return { status: command.status, reason: command.error || "sync_failed", commandId };
+    }
+    await sleep(BANK_STATEMENT_TALLY_SYNC_POLL_MS);
+  }
+  return { status: "timeout", reason: "sync_wait_timeout", commandId };
+}
+
+async function queueRemoteMasterSyncForAnalysis(connectionId, ownerUserId) {
+  const { data: connection, error: connectionError } = await supabase
+    .from("tally_connections")
+    .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_company_loaded, last_heartbeat_at")
+    .eq("id", connectionId)
+    .eq("owner_user_id", ownerUserId)
+    .maybeSingle();
+  if (connectionError) throw connectionError;
+  if (!connection) return { status: "skipped", reason: "connection_not_found", commandId: null };
+  if (connection.last_tally_reachable !== true || connection.last_company_loaded !== true) {
+    return { status: "skipped", reason: "tally_not_ready", commandId: null };
+  }
+
+  const { data: pendingCommand, error: pendingError } = await supabase
+    .from("tally_bridge_commands")
+    .select("id, status")
+    .eq("connection_id", connectionId)
+    .eq("owner_user_id", ownerUserId)
+    .eq("command_type", "sync_masters")
+    .in("status", ["queued", "claimed"])
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (pendingError) throw pendingError;
+  if (pendingCommand?.id) {
+    return { status: "pending", reason: "sync_already_pending", commandId: pendingCommand.id };
+  }
+
+  const payload = {
+    companyName: connection.last_company_name ?? null,
+    requestedMasterTypes: ["ledger", "group", "voucher_type", "gst_ledger", "tax_ledger"],
+    mode: "ledger_accuracy",
+    reason: "analysis_ledger_matching",
+  };
+  const { data: command, error: commandError } = await supabase
+    .from("tally_bridge_commands")
+    .insert({
+      connection_id: connectionId,
+      owner_user_id: ownerUserId,
+      command_type: "sync_masters",
+      status: "queued",
+      priority: 25,
+      payload,
+    })
+    .select("id, status")
+    .single();
+  if (commandError) throw commandError;
+
+  await supabase.from("tally_connection_events").insert({
+    connection_id: connectionId,
+    owner_user_id: ownerUserId,
+    event_type: "command_queued",
+    message: "Tally master sync queued before bank statement ledger matching.",
+    payload,
+  });
+
+  return { status: "queued", reason: "analysis_ledger_matching", commandId: command.id };
+}
+
+async function waitForRemoteMasterSync(commandId) {
+  if (!commandId || BANK_STATEMENT_TALLY_SYNC_WAIT_MS <= 0) {
+    return { status: "skipped", reason: "wait_disabled", commandId };
+  }
+  const deadline = Date.now() + BANK_STATEMENT_TALLY_SYNC_WAIT_MS;
+  while (Date.now() <= deadline) {
+    const { data: command, error } = await supabase
+      .from("tally_bridge_commands")
+      .select("id, status, error, completed_at")
+      .eq("id", commandId)
+      .maybeSingle();
+    if (error) throw error;
+    if (!command) return { status: "missing", reason: "command_not_found", commandId };
+    if (command.status === "succeeded") {
+      return { status: "succeeded", reason: "completed", commandId, completedAt: command.completed_at ?? null };
+    }
+    if (command.status === "failed" || command.status === "canceled") {
+      return { status: command.status, reason: command.error || "sync_failed", commandId };
+    }
+    await sleep(BANK_STATEMENT_TALLY_SYNC_POLL_MS);
+  }
+  return { status: "timeout", reason: "sync_wait_timeout", commandId };
+}
+
+async function ensureTallyMastersForAnalysis(connectionId, ownerUserId) {
+  if (!BANK_STATEMENT_TALLY_SYNC_ON_ANALYZE) {
+    return { status: "skipped", reason: "disabled", commandId: null };
+  }
+  if (!connectionId) {
+    return { status: "skipped", reason: "no_connection", commandId: null };
+  }
+
+  try {
+    const queued =
+      process.env.LOCAL_DB_MODE === "true"
+        ? await queueLocalMasterSyncForAnalysis(connectionId, ownerUserId)
+        : await queueRemoteMasterSyncForAnalysis(connectionId, ownerUserId);
+    if (!queued.commandId) return queued;
+
+    const completed =
+      process.env.LOCAL_DB_MODE === "true"
+        ? await waitForLocalMasterSync(queued.commandId)
+        : await waitForRemoteMasterSync(queued.commandId);
+    return {
+      ...completed,
+      queuedStatus: queued.status,
+      queuedReason: queued.reason,
+    };
+  } catch (error) {
+    return {
+      status: "failed",
+      reason: formatError(error),
+      commandId: null,
+    };
+  }
+}
+
 async function aiMatchLedgers(transactions, ledgers) {
   if (!OPENROUTER_API_KEY || transactions.length === 0 || ledgers.length === 0) return new Map();
   const raw = await callOpenRouterForBankStatement(
@@ -1694,6 +1908,18 @@ async function runBankStatementJob(job) {
     typeof previousAnalysis.connectionId === "string" && previousAnalysis.connectionId.trim()
       ? previousAnalysis.connectionId.trim()
       : "";
+  await updateBankJob(job.id, { progress: 68, stage: "Syncing Tally ledgers" });
+  const tallyMasterSync = await ensureTallyMastersForAnalysis(connectionId, job.owner_user_id);
+  if (tallyMasterSync.status === "succeeded") {
+    console.log(
+      `[worker] Tally masters synced before bank statement matching command=${tallyMasterSync.commandId}.`
+    );
+  } else if (tallyMasterSync.status !== "skipped") {
+    console.warn(
+      `[worker] Tally master sync before bank statement matching did not complete: ${tallyMasterSync.status} ${tallyMasterSync.reason}.`
+    );
+  }
+  await updateBankJob(job.id, { progress: 72, stage: "Matching Tally ledgers" });
   const tallyLedgers = await loadTallyLedgers(connectionId, job.owner_user_id);
   const matchedTransactions = await matchTransactionLedgers(parsed.transactions, tallyLedgers);
   const normalizedAccountNumber = normalizeAccountNumber(account.accountNumber);
@@ -1765,6 +1991,8 @@ async function runBankStatementJob(job) {
           progress: 100,
           stage: "Statement analyzed",
           error: null,
+          tallyMasterSync,
+          tallyLedgerCount: tallyLedgers.length,
           completedAt,
           updatedAt: completedAt,
         },
