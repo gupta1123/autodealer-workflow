@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const BRIDGE_VERSION = "0.1.5";
+const BRIDGE_VERSION = "0.1.8";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
@@ -383,12 +383,36 @@ function buildBankAllocationXml({ voucherDate, referenceNumber, amount, isDebit 
   ].join("");
 }
 
+function normalizeBillAllocationType(value) {
+  return String(value || "").trim().toLowerCase() === "advance" ? "Advance" : "Agst Ref";
+}
+
+function buildBillAllocationsXml({ allocations, isDebit }) {
+  if (!Array.isArray(allocations) || allocations.length === 0) return "";
+  return allocations
+    .map((allocation) => {
+      const referenceName = String(allocation?.referenceName || "").trim();
+      const amount = Number(allocation?.amount);
+      if (!referenceName || !Number.isFinite(amount) || amount <= 0) return "";
+      const signedAmount = isDebit ? `-${amount.toFixed(2)}` : amount.toFixed(2);
+      return [
+        "<BILLALLOCATIONS.LIST>",
+        `<NAME>${escapeXml(referenceName)}</NAME>`,
+        `<BILLTYPE>${normalizeBillAllocationType(allocation?.referenceType)}</BILLTYPE>`,
+        `<AMOUNT>${signedAmount}</AMOUNT>`,
+        "</BILLALLOCATIONS.LIST>",
+      ].join("");
+    })
+    .join("");
+}
+
 function buildLedgerEntryXml({
   ledgerName,
   amount,
   isDebit,
   isPartyLedger = false,
   bankAllocation = null,
+  billAllocations = null,
 }) {
   const signedAmount = isDebit ? `-${amount}` : amount;
   return [
@@ -398,6 +422,7 @@ function buildLedgerEntryXml({
     "<REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>",
     `<ISDEEMEDPOSITIVE>${isDebit ? "Yes" : "No"}</ISDEEMEDPOSITIVE>`,
     `<AMOUNT>${signedAmount}</AMOUNT>`,
+    billAllocations || "",
     bankAllocation || "",
     "</ALLLEDGERENTRIES.LIST>",
   ].join("");
@@ -440,6 +465,93 @@ function buildVoucherMessageXml({
     "</VOUCHER>",
     "</TALLYMESSAGE>",
   ].join("");
+}
+
+function buildCustomerAdvanceAdjustmentXml(payload, fallbackCompanyName) {
+  const companyName = payload?.companyName || fallbackCompanyName;
+  const voucherDate = toIsoLikeDate(payload?.voucherDate);
+  const ledgerName = String(payload?.ledgerName || "").trim();
+  const referenceNumber = String(payload?.referenceNumber || "").trim();
+  const narration = String(payload?.narration || `Adjust customer advance ${referenceNumber}`).trim();
+  const adjustments = Array.isArray(payload?.adjustments) ? payload.adjustments : [];
+
+  if (!ledgerName) {
+    throw new Error("Customer advance adjustment requires ledgerName.");
+  }
+
+  const normalizedAdjustments = adjustments.flatMap((adjustment) => {
+    const advanceReferenceName = String(adjustment?.advanceReferenceName || "").trim();
+    const billReferenceName = String(adjustment?.billReferenceName || "").trim();
+    const amount = Number(adjustment?.amount);
+    if (!advanceReferenceName || !billReferenceName || !Number.isFinite(amount) || amount <= 0) return [];
+    return [{ advanceReferenceName, billReferenceName, amount: amount.toFixed(2) }];
+  });
+
+  if (normalizedAdjustments.length === 0) {
+    throw new Error("Customer advance adjustment requires at least one valid adjustment line.");
+  }
+
+  const totalAmount = normalizedAdjustments
+    .reduce((sum, adjustment) => sum + Number(adjustment.amount), 0)
+    .toFixed(2);
+  const advanceBillAllocations = normalizedAdjustments
+    .map((adjustment) =>
+      buildBillAllocationsXml({
+        allocations: [
+          {
+            referenceType: "Advance",
+            referenceName: adjustment.advanceReferenceName,
+            amount: adjustment.amount,
+          },
+        ],
+        isDebit: true,
+      })
+    )
+    .join("");
+  const billAllocations = normalizedAdjustments
+    .map((adjustment) =>
+      buildBillAllocationsXml({
+        allocations: [
+          {
+            referenceType: "Agst Ref",
+            referenceName: adjustment.billReferenceName,
+            amount: adjustment.amount,
+          },
+        ],
+        isDebit: false,
+      })
+    )
+    .join("");
+
+  const message = buildVoucherMessageXml({
+    voucherDate,
+    voucherType: "Journal",
+    referenceNumber,
+    narration,
+    partyLedgerName: ledgerName,
+    entries: [
+      buildLedgerEntryXml({
+        ledgerName,
+        amount: totalAmount,
+        isDebit: true,
+        isPartyLedger: true,
+        billAllocations: advanceBillAllocations,
+      }),
+      buildLedgerEntryXml({
+        ledgerName,
+        amount: totalAmount,
+        isDebit: false,
+        isPartyLedger: true,
+        billAllocations,
+      }),
+    ],
+  });
+
+  return wrapVoucherMessagesXml({
+    companyName,
+    voucherDate,
+    messages: [message],
+  });
 }
 
 function wrapVoucherMessagesXml({ companyName, voucherDate, messages, legacyHeader = false }) {
@@ -495,6 +607,7 @@ function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) {
   const amount = toMoney(payload?.amount);
   const narration = String(payload?.narration || payload?.description || "").trim();
   const referenceNumber = String(payload?.referenceNumber || payload?.transactionId || "").trim();
+  const billAllocations = Array.isArray(payload?.billAllocations) ? payload.billAllocations : [];
 
   if (!bankLedgerName || !counterpartyLedgerName) {
     throw new Error("Bank voucher command requires bank and counterparty ledgers.");
@@ -529,6 +642,7 @@ function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) {
             amount,
             isDebit: false,
             isPartyLedger: counterpartyIsPartyLedger,
+            billAllocations: buildBillAllocationsXml({ allocations: billAllocations, isDebit: false }),
           }),
           buildLedgerEntryXml({
             ledgerName: bankLedgerName,
@@ -738,6 +852,13 @@ async function postBankVoucher(tallyUrl, payload, companyName) {
   return { outcome: primaryOutcome, xml: primaryXml, retriedWithLegacyHeader: false };
 }
 
+async function postCustomerAdvanceAdjustment(tallyUrl, payload, companyName) {
+  const xml = buildCustomerAdvanceAdjustmentXml(payload, companyName);
+  const outcome = requireCreatedVoucher(await invokeTallyXml(tallyUrl, xml));
+
+  return { outcome, xml };
+}
+
 async function invokeTallyXml(tallyUrl, xml) {
   const controller = new AbortController();
   let timeout;
@@ -894,6 +1015,122 @@ function toVoucher(block) {
 
 function parseVoucherCollection(xml) {
   return extractBlocks(xml, "VOUCHER").map(toVoucher);
+}
+
+function parseTallyAmount(value) {
+  const cleaned = String(value ?? "")
+    .replace(/,/g, "")
+    .replace(/\s*(Dr|Cr)$/i, "")
+    .trim();
+  if (!cleaned) return null;
+  const negative = cleaned.startsWith("-") || /^\(.*\)$/.test(cleaned);
+  const normalized = cleaned.replace(/[()]/g, "").replace(/^-/, "");
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed)) return null;
+  return negative ? -parsed : parsed;
+}
+
+function parseTallyDate(value) {
+  const raw = String(value ?? "").trim();
+  if (/^\d{8}$/.test(raw)) return `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  return raw || null;
+}
+
+function billReferenceType(block) {
+  return (
+    getTagText(block, "BILLTYPE") ||
+    getTagText(block, "TYPEOFREF") ||
+    getTagText(block, "REFERENCE_TYPE") ||
+    ""
+  ).trim();
+}
+
+function billLedgerName(block) {
+  return (
+    getTagText(block, "LEDGERNAME") ||
+    getTagText(block, "PARTYLEDGERNAME") ||
+    getTagText(block, "PARENT") ||
+    getTagText(block, "LEDGER") ||
+    ""
+  ).trim();
+}
+
+function normalizeLooseName(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function toOpenBill(block, ledgerName) {
+  const referenceName = getAttribute(block, "NAME") || getTagText(block, "NAME") || getTagText(block, "BILLREF");
+  if (!referenceName) return null;
+  const rowLedgerName = billLedgerName(block);
+  if (rowLedgerName && normalizeLooseName(rowLedgerName) !== normalizeLooseName(ledgerName)) return null;
+
+  const closing =
+    parseTallyAmount(getTagText(block, "CLOSINGBALANCE")) ??
+    parseTallyAmount(getTagText(block, "BALANCE")) ??
+    parseTallyAmount(getTagText(block, "PENDINGAMOUNT")) ??
+    parseTallyAmount(getTagText(block, "AMOUNT"));
+  const pendingAmount = Math.abs(closing ?? 0);
+  if (pendingAmount <= 0) return null;
+
+  const type = billReferenceType(block).toLowerCase();
+  const common = {
+    referenceName,
+    voucherNumber: getTagText(block, "VOUCHERNUMBER") || referenceName,
+    invoiceDate: parseTallyDate(getTagText(block, "DATE") || getTagText(block, "BILLDATE")),
+    dueDate: parseTallyDate(getTagText(block, "DUEDATE")),
+    originalAmount: Math.abs(parseTallyAmount(getTagText(block, "OPENINGBALANCE")) ?? pendingAmount),
+    settledAmount: null,
+    pendingAmount,
+    sourceVoucherType: getTagText(block, "VOUCHERTYPENAME") || getTagText(block, "VOUCHERTYPE") || null,
+    status: "open",
+  };
+
+  if (type.includes("advance")) {
+    return {
+      kind: "advance",
+      referenceName,
+      receiptDate: common.invoiceDate,
+      pendingAdvanceAmount: pendingAmount,
+      status: "unadjusted",
+    };
+  }
+
+  return { kind: "bill", ...common };
+}
+
+async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
+  const ledgerName = String(commandPayload.ledgerName || "").trim();
+  if (!ledgerName) {
+    throw new Error("Customer open bill fetch requires ledgerName.");
+  }
+
+  const companyName = commandPayload.companyName || config.companyName || null;
+  const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
+  const xml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Autodealer Customer Open Bills",
+    tallyType: "Bill",
+    childOf: ledgerName,
+    fetchFields:
+      "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
+    companyName,
+  });
+  const parsed = extractBlocks(xml, "BILL")
+    .map((block) => toOpenBill(block, ledgerName))
+    .filter(Boolean);
+
+  return {
+    success: true,
+    result: {
+      ledgerName,
+      openBills: parsed.filter((entry) => entry.kind === "bill").map(({ kind, ...entry }) => entry),
+      existingAdvances: parsed.filter((entry) => entry.kind === "advance").map(({ kind, ...entry }) => entry),
+      rawCount: parsed.length,
+    },
+  };
 }
 
 function isTaxLedger(master) {
@@ -1168,6 +1405,25 @@ async function runCommand(config, command) {
     return;
   }
 
+  if (command.commandType === "fetch_customer_open_bills") {
+    try {
+      const outcome = await fetchCustomerOpenBillsFromTally(config, command.payload);
+      await sendCommandResult(config, command, outcome);
+      console.log(
+        `Command ${command.id} completed: fetched open bills for ${command.payload?.ledgerName || "customer"}.`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Open bill fetch failed.");
+      await sendCommandResult(config, command, {
+        success: false,
+        result: {},
+        error: message,
+      });
+      console.log(`Command ${command.id} failed: ${message}`);
+    }
+    return;
+  }
+
   if (command.commandType === "post_bank_voucher") {
     let xml = null;
     try {
@@ -1210,6 +1466,55 @@ async function runCommand(config, command) {
           requestXml: xml ? previewXml(xml) : null,
           commandPayload: command.payload ?? {},
           transactionId: command.payload?.transactionId,
+          voucherId: command.payload?.referenceNumber || command.id,
+        },
+      });
+      console.log(`Command ${command.id} failed: ${message}`);
+    }
+    return;
+  }
+
+  if (command.commandType === "adjust_customer_advance") {
+    let xml = null;
+    try {
+      const posted = await postCustomerAdvanceAdjustment(
+        config.tallyUrl,
+        command.payload,
+        config.companyName
+      );
+      xml = posted.xml;
+      const outcome = posted.outcome;
+      await sendCommandResult(config, command, {
+        ...outcome,
+        result: {
+          ...(outcome.result || {}),
+          requestXml: previewXml(xml),
+          sourceBankTransactionId: command.payload?.sourceBankTransactionId,
+          voucherId: command.payload?.referenceNumber || command.id,
+        },
+      });
+      console.log(
+        outcome.success
+          ? `Command ${command.id} completed: customer advance adjusted.`
+          : `Command ${command.id} failed: ${outcome.error || "Tally returned an error."}`
+      );
+      if (!outcome.success) {
+        console.log(`Command ${command.id} Tally request XML: ${previewXml(xml)}`);
+      }
+    } catch (error) {
+      const message =
+        error?.name === "AbortError"
+          ? "Tally did not respond within 30 seconds while adjusting the customer advance."
+          : error instanceof Error
+            ? error.message
+            : String(error ?? "Customer advance adjustment failed.");
+      await sendCommandResult(config, command, {
+        success: false,
+        error: message,
+        result: {
+          requestXml: xml ? previewXml(xml) : null,
+          commandPayload: command.payload ?? {},
+          sourceBankTransactionId: command.payload?.sourceBankTransactionId,
           voucherId: command.payload?.referenceNumber || command.id,
         },
       });

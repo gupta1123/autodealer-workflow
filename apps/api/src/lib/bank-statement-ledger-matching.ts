@@ -6,6 +6,8 @@ import {
   normalizeNarrationPattern,
   type ParsedBankTransaction,
 } from "@/lib/bank-statements";
+import { isLocalDbMode } from "@/lib/local/mode";
+import { listLocalTallyMasters } from "@/lib/local/tally-store";
 import { callOpenRouter, getLedgerMatchingModel, getQualityExtractionReasoning } from "@/lib/processing/openrouter";
 import { normalizeMasterKey, type TallyMasterRow } from "@/lib/tally/masters";
 
@@ -473,20 +475,29 @@ export async function suggestBankLedgerForTransaction(input: {
 }): Promise<BankLedgerSuggestion> {
   const counterpartyName = input.transaction.counterpartyName ?? extractCounterpartyName(input.transaction.description);
 
-  const { data: ledgerRows, error: ledgerError } = input.connectionId
-    ? await input.supabase
-        .from("tally_masters")
-        .select("*")
-        .eq("owner_user_id", input.ownerUserId)
-        .eq("connection_id", input.connectionId)
-        .eq("master_type", "ledger")
-        .eq("is_active", true)
-        .limit(5000)
-    : { data: [], error: null };
-
-  if (ledgerError) throw ledgerError;
-
-  const ledgers = (ledgerRows ?? []) as unknown as TallyMasterRow[];
+  const ledgers = input.connectionId
+    ? isLocalDbMode()
+      ? (
+          await listLocalTallyMasters({
+            connectionId: input.connectionId,
+            ownerUserId: input.ownerUserId,
+            masterType: "ledger",
+            limit: 5000,
+          })
+        ).masters
+      : await input.supabase
+          .from("tally_masters")
+          .select("*")
+          .eq("owner_user_id", input.ownerUserId)
+          .eq("connection_id", input.connectionId)
+          .eq("master_type", "ledger")
+          .eq("is_active", true)
+          .limit(5000)
+          .then(({ data, error }) => {
+            if (error) throw error;
+            return (data ?? []) as unknown as TallyMasterRow[];
+          })
+    : [];
   if (!input.connectionId) {
     console.warn("[bank-ledger-match] skipped: no Tally connection id was provided", {
       accountId: input.accountId,

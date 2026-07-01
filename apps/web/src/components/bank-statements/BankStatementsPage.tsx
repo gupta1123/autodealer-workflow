@@ -173,6 +173,8 @@ type TallyMaster = {
   name: string;
   type: string;
   parent?: string | null;
+  billWiseEnabled?: boolean | null;
+  ledgerType?: string | null;
   bankName?: string | null;
   bankAccountNumber?: string | null;
   ifscCode?: string | null;
@@ -224,6 +226,73 @@ type LedgerSelection = {
   name: string;
   action: LedgerRecommendationAction;
   ledgerGroup?: string;
+};
+
+type OpenBillReference = {
+  referenceName: string;
+  voucherNumber?: string | null;
+  invoiceDate?: string | null;
+  dueDate?: string | null;
+  originalAmount?: number | null;
+  settledAmount?: number | null;
+  pendingAmount: number;
+  sourceVoucherType?: string | null;
+  status?: string | null;
+};
+
+type ExistingAdvanceReference = {
+  referenceName: string;
+  receiptDate?: string | null;
+  pendingAdvanceAmount: number;
+  status?: string | null;
+};
+
+type BillAllocationLine = {
+  referenceType: "Agst Ref" | "Advance";
+  referenceName: string;
+  voucherNumber?: string | null;
+  invoiceDate?: string | null;
+  dueDate?: string | null;
+  previousPendingAmount?: number | null;
+  allocatedAmount: number;
+  pendingAmountAfterAllocation?: number | null;
+  statusAfterAllocation?: string | null;
+};
+
+type ExistingAdvanceAdjustmentLine = {
+  advanceReferenceName: string;
+  advanceDate?: string | null;
+  billReferenceName: string;
+  billInvoiceDate?: string | null;
+  amount: number;
+  remainingAdvanceAfterAdjustment: number;
+  remainingBillAfterAdjustment: number;
+};
+
+type BillAllocationDraft = {
+  status:
+    | "not_applicable"
+    | "cannot_match_yet"
+    | "ready_to_post"
+    | "needs_review"
+    | "stale_data"
+    | "posted"
+    | "post_failed";
+  caseType: string;
+  caseLabel: string;
+  reason: string;
+  receiptAmount: number;
+  totalAllocatedAmount: number;
+  newAdvanceAmount: number;
+  totalExistingAdvanceAdjustmentAmount: number;
+  unallocatedAmount: number;
+  allocations: BillAllocationLine[];
+  advanceAdjustments: ExistingAdvanceAdjustmentLine[];
+  applyExistingAdvances: boolean;
+  candidateBills: OpenBillReference[];
+  existingAdvances: ExistingAdvanceReference[];
+  requiresUserReview: boolean;
+  isEligibleForPosting: boolean;
 };
 
 type LedgerPickerOption = LedgerSelection & {
@@ -647,12 +716,17 @@ function transactionIsValid(transaction: ReviewTransaction) {
 }
 
 function formatAmount(value: string | number | null | undefined) {
-  const parsed = Number(value ?? 0);
+  const parsed = parseNumber(value) ?? 0;
   if (!Number.isFinite(parsed) || parsed === 0) return "";
   return new Intl.NumberFormat(undefined, {
     maximumFractionDigits: 2,
     minimumFractionDigits: 0,
   }).format(parsed);
+}
+
+function formatCurrencyAmount(value: string | number | null | undefined) {
+  const formatted = formatAmount(value);
+  return formatted ? `₹${formatted}` : "₹0";
 }
 
 function formatDataLabel(value?: string | null) {
@@ -1221,6 +1295,325 @@ function getLedgerGroupLabel(transaction: ReviewTransaction, ledgerMasters: Tall
   return ledger?.parent || transaction.ledgerGroup || "-";
 }
 
+function getSelectedLedger(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
+  return findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
+}
+
+function isCustomerReceiptTransaction(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
+  const credit = parseNumber(transaction.creditAmount) ?? 0;
+  if (credit <= 0) return false;
+  if (!transaction.selectedLedgerName.trim() || isSuspenseLedgerName(transaction.selectedLedgerName)) return false;
+  if (transaction.tallyStatus === "posted") return false;
+  const ledger = getSelectedLedger(transaction, ledgerMasters);
+  const parent = ledger?.parent || transaction.ledgerGroup || "";
+  const text = `${transaction.transactionType} ${transaction.category} ${transaction.description}`.toLowerCase();
+  if (/\brefund|reversal|failed|chargeback|internal transfer|self transfer|own account\b/.test(text)) return false;
+  const isSundryDebtor = /sundry\s+debtors/i.test(parent) || ledger?.ledgerType === "customer";
+  return isSundryDebtor && ledger?.billWiseEnabled !== false;
+}
+
+function getBillAllocationLabel(draft?: BillAllocationDraft | null) {
+  if (!draft) return "Not Matched";
+  if (draft.status === "not_applicable") return "Not Applicable";
+  if (draft.status === "cannot_match_yet") return "Cannot Match Yet";
+  if (draft.status === "ready_to_post") {
+    if (draft.newAdvanceAmount > 0 && draft.allocations.some((line) => line.referenceType === "Agst Ref")) {
+      return "Bills + Advance";
+    }
+    if (draft.allocations.some((line) => line.referenceType === "Advance")) return "Advance";
+    return `Ready · ${draft.allocations.length} Bill${draft.allocations.length === 1 ? "" : "s"}`;
+  }
+  if (draft.status === "needs_review") return "Needs Review";
+  if (draft.status === "stale_data") return "Re-match Required";
+  if (draft.status === "posted") return "Posted";
+  if (draft.status === "post_failed") return "Posting Failed";
+  return "Not Matched";
+}
+
+function getBillAllocationClass(draft?: BillAllocationDraft | null) {
+  if (!draft || draft.status === "not_applicable") return "border-[#d8cbbb] bg-white text-[#6f6256]";
+  if (draft.status === "ready_to_post") return "border-emerald-200 bg-emerald-50 text-emerald-800";
+  if (draft.status === "cannot_match_yet" || draft.status === "needs_review" || draft.status === "stale_data") {
+    return "border-amber-200 bg-amber-50 text-amber-800";
+  }
+  if (draft.status === "post_failed") return "border-rose-200 bg-rose-50 text-rose-800";
+  return "border-blue-200 bg-blue-50 text-blue-800";
+}
+
+function normalizeReferenceToken(value?: string | null) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function findNarrationBill(openBills: OpenBillReference[], transaction: ReviewTransaction) {
+  const narration = normalizeReferenceToken(`${transaction.description} ${transaction.referenceNumber}`);
+  return openBills.find((bill) => {
+    const ref = normalizeReferenceToken(bill.referenceName);
+    return ref.length >= 5 && narration.includes(ref);
+  }) ?? null;
+}
+
+function sortOpenBills(openBills: OpenBillReference[]) {
+  return [...openBills].sort((left, right) => {
+    const leftDate = left.dueDate || left.invoiceDate || "";
+    const rightDate = right.dueDate || right.invoiceDate || "";
+    return leftDate.localeCompare(rightDate) || left.referenceName.localeCompare(right.referenceName);
+  });
+}
+
+function buildAdvanceReference(transaction: ReviewTransaction) {
+  const date = transaction.transactionDate.replace(/-/g, "");
+  const suffix = normalizeReferenceToken(transaction.referenceNumber || transaction.id).slice(-8) || transaction.id.slice(0, 8);
+  return `ADV-${date}-${suffix}`.slice(0, 80);
+}
+
+function isAllocationTotalValid(receiptAmount: number, totalAllocatedAmount: number) {
+  return Math.abs(receiptAmount - totalAllocatedAmount) < 0.005;
+}
+
+function getAllocationCaseLabel(allocations: BillAllocationLine[], newAdvanceAmount: number, manual = false) {
+  if (manual) return "Manual Review";
+  const billLines = allocations.filter((line) => line.referenceType === "Agst Ref");
+  if (billLines.length === 0) return "No Pending Bill - Advance";
+  if (newAdvanceAmount > 0) return "Bills Cleared + Advance";
+  if (billLines.length > 1) return "Split Across Bills";
+  return billLines[0]?.pendingAmountAfterAllocation === 0 ? "Exact Bill Match" : "Partial Settlement";
+}
+
+function getAllocationCaseType(allocations: BillAllocationLine[], newAdvanceAmount: number, manual = false) {
+  if (manual) return "manual_review";
+  const billLines = allocations.filter((line) => line.referenceType === "Agst Ref");
+  if (billLines.length === 0) return "no_pending_bill_advance";
+  if (newAdvanceAmount > 0) return "bills_cleared_plus_advance";
+  if (billLines.length > 1) return "split_across_bills";
+  return billLines[0]?.pendingAmountAfterAllocation === 0 ? "exact_or_full_bill_match" : "partial_settlement";
+}
+
+function buildExistingAdvanceAdjustments(
+  openBills: OpenBillReference[],
+  existingAdvances: ExistingAdvanceReference[],
+  receiptAllocations: BillAllocationLine[]
+) {
+  const receiptByBillReference = new Map(
+    receiptAllocations
+      .filter((line) => line.referenceType === "Agst Ref")
+      .map((line) => [line.referenceName, line.allocatedAmount])
+  );
+  const billsWithRemaining = sortOpenBills(openBills).flatMap((bill) => {
+    const pendingAmount = Math.max(0, Number(bill.pendingAmount ?? 0));
+    const receiptAllocatedAmount = Math.max(0, receiptByBillReference.get(bill.referenceName) ?? 0);
+    const remainingBillAmount = Number(Math.max(0, pendingAmount - receiptAllocatedAmount).toFixed(2));
+    return remainingBillAmount > 0 ? [{ bill, remainingBillAmount }] : [];
+  });
+  const advancesWithRemaining = [...existingAdvances]
+    .sort((left, right) => {
+      const leftDate = left.receiptDate || "";
+      const rightDate = right.receiptDate || "";
+      return leftDate.localeCompare(rightDate) || left.referenceName.localeCompare(right.referenceName);
+    })
+    .flatMap((advance) => {
+      const pendingAdvanceAmount = Math.max(0, Number(advance.pendingAdvanceAmount ?? 0));
+      return pendingAdvanceAmount > 0 ? [{ advance, remainingAdvanceAmount: pendingAdvanceAmount }] : [];
+    });
+
+  const adjustments: ExistingAdvanceAdjustmentLine[] = [];
+
+  for (const billEntry of billsWithRemaining) {
+    for (const advanceEntry of advancesWithRemaining) {
+      if (billEntry.remainingBillAmount <= 0) break;
+      if (advanceEntry.remainingAdvanceAmount <= 0) continue;
+
+      const amount = Number(Math.min(billEntry.remainingBillAmount, advanceEntry.remainingAdvanceAmount).toFixed(2));
+      if (amount <= 0) continue;
+
+      billEntry.remainingBillAmount = Number((billEntry.remainingBillAmount - amount).toFixed(2));
+      advanceEntry.remainingAdvanceAmount = Number((advanceEntry.remainingAdvanceAmount - amount).toFixed(2));
+
+      adjustments.push({
+        advanceReferenceName: advanceEntry.advance.referenceName,
+        advanceDate: advanceEntry.advance.receiptDate,
+        billReferenceName: billEntry.bill.referenceName,
+        billInvoiceDate: billEntry.bill.invoiceDate,
+        amount,
+        remainingAdvanceAfterAdjustment: advanceEntry.remainingAdvanceAmount,
+        remainingBillAfterAdjustment: billEntry.remainingBillAmount,
+      });
+    }
+  }
+
+  return adjustments;
+}
+
+function buildManualAllocationDraft(
+  transaction: ReviewTransaction,
+  existingDraft: BillAllocationDraft,
+  nextBillAmounts: Record<string, number>,
+  nextAdvanceAmount: number
+): BillAllocationDraft {
+  const receiptAmount = parseNumber(transaction.creditAmount) ?? existingDraft.receiptAmount;
+  const allocations: BillAllocationLine[] = [];
+
+  for (const bill of existingDraft.candidateBills) {
+    const pendingAmount = Math.max(0, Number(bill.pendingAmount ?? 0));
+    const requestedAmount = Math.max(0, Number(nextBillAmounts[bill.referenceName] ?? 0));
+    const allocatedAmount = Number(Math.min(requestedAmount, pendingAmount).toFixed(2));
+    if (allocatedAmount <= 0) continue;
+
+    allocations.push({
+      referenceType: "Agst Ref",
+      referenceName: bill.referenceName,
+      voucherNumber: bill.voucherNumber,
+      invoiceDate: bill.invoiceDate,
+      dueDate: bill.dueDate,
+      previousPendingAmount: pendingAmount,
+      allocatedAmount,
+      pendingAmountAfterAllocation: Number((pendingAmount - allocatedAmount).toFixed(2)),
+      statusAfterAllocation: pendingAmount - allocatedAmount <= 0 ? "cleared" : "partially_settled",
+    });
+  }
+
+  const advanceAmount = Number(Math.max(0, nextAdvanceAmount).toFixed(2));
+  if (advanceAmount > 0) {
+    allocations.push({
+      referenceType: "Advance",
+      referenceName:
+        existingDraft.allocations.find((line) => line.referenceType === "Advance")?.referenceName ||
+        buildAdvanceReference(transaction),
+      allocatedAmount: advanceAmount,
+      pendingAmountAfterAllocation: advanceAmount,
+      statusAfterAllocation: "advance",
+    });
+  }
+
+  const totalAllocatedAmount = Number(allocations.reduce((sum, line) => sum + line.allocatedAmount, 0).toFixed(2));
+  const unallocatedAmount = Number((receiptAmount - totalAllocatedAmount).toFixed(2));
+  const valid = isAllocationTotalValid(receiptAmount, totalAllocatedAmount);
+  const advanceAdjustments = buildExistingAdvanceAdjustments(
+    existingDraft.candidateBills,
+    existingDraft.existingAdvances,
+    allocations
+  );
+  const applyExistingAdvances = existingDraft.applyExistingAdvances && advanceAdjustments.length > 0;
+  const totalExistingAdvanceAdjustmentAmount = applyExistingAdvances
+    ? Number(advanceAdjustments.reduce((sum, line) => sum + line.amount, 0).toFixed(2))
+    : 0;
+
+  return {
+    ...existingDraft,
+    status: valid ? "ready_to_post" : "needs_review",
+    caseType: getAllocationCaseType(allocations, advanceAmount, true),
+    caseLabel: getAllocationCaseLabel(allocations, advanceAmount, true),
+    reason: valid
+      ? "Manual allocation was reviewed and balances to the receipt amount."
+      : "Selected bill allocation and advance must equal the receipt amount.",
+    receiptAmount,
+    totalAllocatedAmount,
+    newAdvanceAmount: advanceAmount,
+    totalExistingAdvanceAdjustmentAmount,
+    unallocatedAmount,
+    allocations,
+    advanceAdjustments,
+    applyExistingAdvances,
+    requiresUserReview: !valid,
+    isEligibleForPosting: valid,
+  };
+}
+
+function allocateBillsForTransaction(
+  transaction: ReviewTransaction,
+  openBills: OpenBillReference[],
+  existingAdvances: ExistingAdvanceReference[]
+): BillAllocationDraft {
+  const receiptAmount = parseNumber(transaction.creditAmount) ?? 0;
+  if (receiptAmount <= 0) {
+    return {
+      status: "not_applicable",
+      caseType: "not_applicable",
+      caseLabel: "Not Applicable",
+      reason: "This row is not a customer receipt.",
+      receiptAmount,
+      totalAllocatedAmount: 0,
+      newAdvanceAmount: 0,
+      totalExistingAdvanceAdjustmentAmount: 0,
+      unallocatedAmount: 0,
+      allocations: [],
+      advanceAdjustments: [],
+      applyExistingAdvances: false,
+      candidateBills: openBills,
+      existingAdvances,
+      requiresUserReview: false,
+      isEligibleForPosting: true,
+    };
+  }
+
+  let remaining = receiptAmount;
+  const allocations: BillAllocationLine[] = [];
+  const narrationBill = findNarrationBill(openBills, transaction);
+  const candidateBills = narrationBill
+    ? [narrationBill, ...sortOpenBills(openBills.filter((bill) => bill.referenceName !== narrationBill.referenceName))]
+    : sortOpenBills(openBills);
+
+  for (const bill of candidateBills) {
+    if (remaining <= 0) break;
+    const pendingAmount = Math.max(0, Number(bill.pendingAmount ?? 0));
+    if (pendingAmount <= 0) continue;
+    const allocatedAmount = Math.min(remaining, pendingAmount);
+    remaining = Number((remaining - allocatedAmount).toFixed(2));
+    allocations.push({
+      referenceType: "Agst Ref",
+      referenceName: bill.referenceName,
+      voucherNumber: bill.voucherNumber,
+      invoiceDate: bill.invoiceDate,
+      dueDate: bill.dueDate,
+      previousPendingAmount: pendingAmount,
+      allocatedAmount,
+      pendingAmountAfterAllocation: Number((pendingAmount - allocatedAmount).toFixed(2)),
+      statusAfterAllocation: pendingAmount - allocatedAmount <= 0 ? "cleared" : "partially_settled",
+    });
+  }
+
+  const newAdvanceAmount = Number(Math.max(0, remaining).toFixed(2));
+  if (newAdvanceAmount > 0) {
+    allocations.push({
+      referenceType: "Advance",
+      referenceName: buildAdvanceReference(transaction),
+      allocatedAmount: newAdvanceAmount,
+      pendingAmountAfterAllocation: newAdvanceAmount,
+      statusAfterAllocation: "advance",
+    });
+  }
+
+  const totalAllocatedAmount = Number(allocations.reduce((sum, line) => sum + line.allocatedAmount, 0).toFixed(2));
+  const unallocatedAmount = Number(Math.max(0, receiptAmount - totalAllocatedAmount).toFixed(2));
+  const billCount = allocations.filter((line) => line.referenceType === "Agst Ref").length;
+  const advanceAdjustments = buildExistingAdvanceAdjustments(openBills, existingAdvances, allocations);
+  const totalExistingAdvanceAdjustmentAmount = Number(
+    advanceAdjustments.reduce((sum, line) => sum + line.amount, 0).toFixed(2)
+  );
+
+  return {
+    status: unallocatedAmount === 0 ? "ready_to_post" : "needs_review",
+    caseType: getAllocationCaseType(allocations, newAdvanceAmount),
+    caseLabel: getAllocationCaseLabel(allocations, newAdvanceAmount),
+    reason: narrationBill
+      ? `Matched visible bill reference ${narrationBill.referenceName}; remaining amount used FIFO.`
+      : billCount > 0
+        ? "Allocated using FIFO from oldest due date or invoice date."
+        : "No open bill found; receipt will be posted as a new advance.",
+    receiptAmount,
+    totalAllocatedAmount,
+    newAdvanceAmount,
+    totalExistingAdvanceAdjustmentAmount,
+    unallocatedAmount,
+    allocations,
+    advanceAdjustments,
+    applyExistingAdvances: advanceAdjustments.length > 0,
+    candidateBills: openBills,
+    existingAdvances,
+    requiresUserReview: unallocatedAmount !== 0,
+    isEligibleForPosting: unallocatedAmount === 0,
+  };
+}
+
 function transactionQueueKey(transaction: {
   transactionDate: string;
   description: string;
@@ -1365,6 +1758,9 @@ export function BankStatementsPage() {
   const [reviewDirectionFilter, setReviewDirectionFilter] = useState<ReviewDirectionFilter>("all");
   const [reviewDateFrom, setReviewDateFrom] = useState("");
   const [reviewDateTo, setReviewDateTo] = useState("");
+  const [matchingBills, setMatchingBills] = useState(false);
+  const [billAllocationsByTransactionId, setBillAllocationsByTransactionId] = useState<Record<string, BillAllocationDraft>>({});
+  const [billAllocationReviewTransactionId, setBillAllocationReviewTransactionId] = useState<string | null>(null);
 
   const syncReviewTableScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
     const nextScrollLeft = event.currentTarget.scrollLeft;
@@ -1418,6 +1814,18 @@ export function BankStatementsPage() {
   const needsReviewCount = queueableReviewTransactions.filter(
     (transaction) => getReviewStatus(transaction) === "needs_review"
   ).length;
+  const pendingBillEligibleTransactions = useMemo(
+    () => queueableReviewTransactions.filter((transaction) => isCustomerReceiptTransaction(transaction, ledgerMasters)),
+    [ledgerMasters, queueableReviewTransactions]
+  );
+  const blockingBillAllocationCount = useMemo(
+    () =>
+      pendingBillEligibleTransactions.filter((transaction) => {
+        const draft = billAllocationsByTransactionId[transaction.id];
+        return !draft || draft.status === "cannot_match_yet" || draft.status === "needs_review" || draft.status === "stale_data";
+      }).length,
+    [billAllocationsByTransactionId, pendingBillEligibleTransactions]
+  );
   const filteredTransactions = useMemo(() => {
     const normalizedSearch = normalizeName(reviewSearch);
     return validTransactions.filter((transaction) => {
@@ -1471,6 +1879,12 @@ export function BankStatementsPage() {
     reviewDateFrom,
     reviewDateTo,
   ].filter(Boolean).length;
+  const billAllocationReviewTransaction = billAllocationReviewTransactionId
+    ? validTransactions.find((transaction) => transaction.id === billAllocationReviewTransactionId) ?? null
+    : null;
+  const billAllocationReviewDraft = billAllocationReviewTransaction
+    ? billAllocationsByTransactionId[billAllocationReviewTransaction.id] ?? null
+    : null;
 
   const loadTallyConnections = useCallback(async () => {
     const response = await apiFetch("/api/tally/connections", { cache: "no-store" });
@@ -1551,6 +1965,8 @@ export function BankStatementsPage() {
     setBanner(null);
     setTallyPostingStatus(null);
     setLastPostingSummary(null);
+    setBillAllocationsByTransactionId({});
+    setBillAllocationReviewTransactionId(null);
   }, []);
 
   const pollTallyPostingStatus = useCallback(async (connectionId: string, commandIds: string[]) => {
@@ -1701,6 +2117,82 @@ export function BankStatementsPage() {
           : transaction
       )
     );
+    setBillAllocationsByTransactionId((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+    setBillAllocationReviewTransactionId((current) => (current === id ? null : current));
+  }
+
+  function updateManualBillAmount(transaction: ReviewTransaction, referenceName: string, value: string) {
+    const currentDraft = billAllocationsByTransactionId[transaction.id];
+    if (!currentDraft) return;
+
+    const nextAmount = Math.max(0, parseNumber(value) ?? 0);
+    const billAmounts = Object.fromEntries(
+      currentDraft.allocations
+        .filter((line) => line.referenceType === "Agst Ref")
+        .map((line) => [line.referenceName, line.allocatedAmount])
+    );
+    billAmounts[referenceName] = nextAmount;
+    const receiptAmount = parseNumber(transaction.creditAmount) ?? currentDraft.receiptAmount;
+    const nextBillTotal = currentDraft.candidateBills.reduce((sum, bill) => {
+      const pendingAmount = Math.max(0, Number(bill.pendingAmount ?? 0));
+      const requestedAmount = Math.max(0, Number(billAmounts[bill.referenceName] ?? 0));
+      return sum + Math.min(requestedAmount, pendingAmount);
+    }, 0);
+    const nextAdvanceAmount = Number(Math.max(0, receiptAmount - nextBillTotal).toFixed(2));
+
+    setBillAllocationsByTransactionId((current) => ({
+      ...current,
+      [transaction.id]: buildManualAllocationDraft(
+        transaction,
+        currentDraft,
+        billAmounts,
+        nextAdvanceAmount
+      ),
+    }));
+  }
+
+  function updateManualAdvanceAmount(transaction: ReviewTransaction, value: string) {
+    const currentDraft = billAllocationsByTransactionId[transaction.id];
+    if (!currentDraft) return;
+
+    const nextAdvanceAmount = Math.max(0, parseNumber(value) ?? 0);
+    const billAmounts = Object.fromEntries(
+      currentDraft.allocations
+        .filter((line) => line.referenceType === "Agst Ref")
+        .map((line) => [line.referenceName, line.allocatedAmount])
+    );
+
+    setBillAllocationsByTransactionId((current) => ({
+      ...current,
+      [transaction.id]: buildManualAllocationDraft(
+        transaction,
+        currentDraft,
+        billAmounts,
+        nextAdvanceAmount
+      ),
+    }));
+  }
+
+  function updateApplyExistingAdvances(transaction: ReviewTransaction, checked: boolean) {
+    const currentDraft = billAllocationsByTransactionId[transaction.id];
+    if (!currentDraft) return;
+
+    const totalExistingAdvanceAdjustmentAmount = checked
+      ? Number(currentDraft.advanceAdjustments.reduce((sum, line) => sum + line.amount, 0).toFixed(2))
+      : 0;
+
+    setBillAllocationsByTransactionId((current) => ({
+      ...current,
+      [transaction.id]: {
+        ...currentDraft,
+        applyExistingAdvances: checked && currentDraft.advanceAdjustments.length > 0,
+        totalExistingAdvanceAdjustmentAmount,
+      },
+    }));
   }
 
   async function refreshTallyConnectionStatus() {
@@ -1832,6 +2324,8 @@ export function BankStatementsPage() {
     setEditingLedgerIds(new Set());
     setTallyPostingStatus(null);
     setLastPostingSummary(null);
+    setBillAllocationsByTransactionId({});
+    setBillAllocationReviewTransactionId(null);
     if (singleCandidate?.id) {
       void markAlreadyPostedTransactions(singleCandidate.id, nextTransactions);
     }
@@ -1981,6 +2475,134 @@ export function BankStatementsPage() {
     }
   }
 
+  async function fetchOpenBillsForLedger(connection: TallyConnection, ledgerName: string) {
+    const response = await apiFetch(`/api/tally/connections/${connection.id}/commands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commandType: "fetch_customer_open_bills",
+        payload: {
+          ledgerName,
+          companyName: connection.lastCompanyName,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(await readError(response));
+    }
+
+    const payload = (await response.json()) as { command?: TallyCommand };
+    const command = payload.command;
+    if (!command?.id) {
+      throw new Error("Open bill fetch was queued, but no command id was returned.");
+    }
+
+    const completedCommand = await waitForCommand(connection.id, command.id);
+    if (!completedCommand) {
+      throw new Error(`Open bill fetch for ${ledgerName} is still pending.`);
+    }
+    if (completedCommand.status !== "succeeded") {
+      throw new Error(completedCommand.error || `Open bill fetch for ${ledgerName} ${completedCommand.status}.`);
+    }
+
+    const result = completedCommand.result ?? {};
+    return {
+      openBills: Array.isArray(result.openBills) ? result.openBills as OpenBillReference[] : [],
+      existingAdvances: Array.isArray(result.existingAdvances)
+        ? result.existingAdvances as ExistingAdvanceReference[]
+        : [],
+    };
+  }
+
+  async function matchPendingBills() {
+    const connection = connections.find((item) => item.id === tallyConnectionId);
+    if (!connection) {
+      showToast("error", "Select a Tally connection before matching pending bills.");
+      return;
+    }
+    if (pendingBillEligibleTransactions.length === 0) {
+      showToast("info", "No eligible customer receipt rows were found. Confirm a Sundry Debtors ledger with bill-wise enabled.");
+      return;
+    }
+
+    try {
+      setMatchingBills(true);
+      setBanner({ tone: "info", text: "Fetching customer open bills from Tally..." });
+      const ledgers = Array.from(new Set(pendingBillEligibleTransactions.map((transaction) => transaction.selectedLedgerName)));
+      const billDataByLedger = new Map<string, { openBills: OpenBillReference[]; existingAdvances: ExistingAdvanceReference[] }>();
+
+      for (const ledgerName of ledgers) {
+        billDataByLedger.set(ledgerName, await fetchOpenBillsForLedger(connection, ledgerName));
+      }
+
+      const nextDrafts: Record<string, BillAllocationDraft> = {};
+      for (const transaction of queueableReviewTransactions) {
+        if (!isCustomerReceiptTransaction(transaction, ledgerMasters)) {
+          nextDrafts[transaction.id] = {
+            status: "not_applicable",
+            caseType: "not_applicable",
+            caseLabel: "Not Applicable",
+            reason: "This row is not an eligible customer receipt.",
+            receiptAmount: parseNumber(transaction.creditAmount) ?? 0,
+            totalAllocatedAmount: 0,
+            newAdvanceAmount: 0,
+            totalExistingAdvanceAdjustmentAmount: 0,
+            unallocatedAmount: 0,
+            allocations: [],
+            advanceAdjustments: [],
+            applyExistingAdvances: false,
+            candidateBills: [],
+            existingAdvances: [],
+            requiresUserReview: false,
+            isEligibleForPosting: true,
+          };
+          continue;
+        }
+
+        const data = billDataByLedger.get(transaction.selectedLedgerName);
+        if (!data) {
+          nextDrafts[transaction.id] = {
+            status: "cannot_match_yet",
+            caseType: "cannot_match_yet",
+            caseLabel: "Cannot Match Yet",
+            reason: "Could not fetch open bills for the selected customer ledger.",
+            receiptAmount: parseNumber(transaction.creditAmount) ?? 0,
+            totalAllocatedAmount: 0,
+            newAdvanceAmount: 0,
+            totalExistingAdvanceAdjustmentAmount: 0,
+            unallocatedAmount: parseNumber(transaction.creditAmount) ?? 0,
+            allocations: [],
+            advanceAdjustments: [],
+            applyExistingAdvances: false,
+            candidateBills: [],
+            existingAdvances: [],
+            requiresUserReview: true,
+            isEligibleForPosting: false,
+          };
+          continue;
+        }
+
+        nextDrafts[transaction.id] = allocateBillsForTransaction(
+          transaction,
+          data.openBills,
+          data.existingAdvances
+        );
+      }
+
+      setBillAllocationsByTransactionId(nextDrafts);
+      const readyCount = Object.values(nextDrafts).filter((draft) => draft.status === "ready_to_post").length;
+      setBanner({ tone: "success", text: `${readyCount} customer receipt row(s) matched with pending bills.` });
+    } catch (error) {
+      setBanner({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Could not match pending bills.",
+      });
+    } finally {
+      setMatchingBills(false);
+    }
+  }
+
   async function sendToTally() {
     if (!preview) return;
     if (!tallyConnectionId) {
@@ -1997,6 +2619,14 @@ export function BankStatementsPage() {
     }
     if (missingLedgerCount > 0) {
       showToast("error", "Select a ledger for every row before sending to Tally.");
+      return;
+    }
+    if (blockingBillAllocationCount > 0) {
+      setBanner({
+        tone: "error",
+        text: `${blockingBillAllocationCount} customer receipt row(s) need bill allocation review before sending to Tally.`,
+      });
+      showToast("error", "Match or review pending bills for customer receipts before sending to Tally.");
       return;
     }
 
@@ -2070,6 +2700,8 @@ export function BankStatementsPage() {
         setPreview(null);
         setTransactions([]);
         setFile(null);
+        setBillAllocationsByTransactionId({});
+        setBillAllocationReviewTransactionId(null);
         const alreadyPosted = confirmPayload.alreadyPostedTransactionCount ?? 0;
         const summaryMessage =
           alreadyPosted > 0
@@ -2104,6 +2736,9 @@ export function BankStatementsPage() {
             transactionId: transaction.id,
             ...(() => {
               const reviewedTransaction = reviewedTransactionsByKey.get(transactionQueueKey(transaction));
+              const billAllocation = reviewedTransaction
+                ? billAllocationsByTransactionId[reviewedTransaction.id]
+                : null;
               return {
                 counterpartyLedgerName:
                   reviewedTransaction?.selectedLedgerName ||
@@ -2112,6 +2747,22 @@ export function BankStatementsPage() {
                   "Suspense",
                 createLedgerName: "",
                 createLedgerParentName: "",
+                billAllocations:
+                  billAllocation?.status === "ready_to_post"
+                    ? billAllocation.allocations.map((allocation) => ({
+                        referenceType: allocation.referenceType,
+                        referenceName: allocation.referenceName,
+                        amount: allocation.allocatedAmount,
+                      }))
+                    : [],
+                advanceAdjustments:
+                  billAllocation?.status === "ready_to_post" && billAllocation.applyExistingAdvances
+                    ? billAllocation.advanceAdjustments.map((adjustment) => ({
+                        advanceReferenceName: adjustment.advanceReferenceName,
+                        billReferenceName: adjustment.billReferenceName,
+                        amount: adjustment.amount,
+                      }))
+                    : [],
               };
             })(),
             saveMapping: true,
@@ -2172,6 +2823,8 @@ export function BankStatementsPage() {
         setTallyPostingStatus(buildTallyPostingStatus(postingConnectionId, commandIds, queuedCommands));
         setTransactions([]);
         setEditingLedgerIds(new Set());
+        setBillAllocationsByTransactionId({});
+        setBillAllocationReviewTransactionId(null);
         setReviewFiltersOpen(false);
         setBanner({
           tone: "info",
@@ -2491,7 +3144,7 @@ export function BankStatementsPage() {
                     </button>
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge className="border-[#d6c8b8] bg-[#f6efe6] text-[#6f4e2f]" variant="outline">
-                        {tallyPostingStatus ? `${tallyPostingStatus.total} queued` : `${transactions.length} total`}
+                        {tallyPostingStatus ? `${tallyPostingStatus.total} queued` : `${validTransactions.length} total`}
                       </Badge>
                       {tallyPostingStatus ? (
                         <>
@@ -2640,7 +3293,7 @@ export function BankStatementsPage() {
                     className="overflow-x-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
                     onScroll={syncReviewTableScroll}
                   >
-                    <div className="h-2 min-w-[1120px]" />
+                    <div className="h-2 min-w-[1260px]" />
                   </div>
                 </div>
 
@@ -2649,7 +3302,7 @@ export function BankStatementsPage() {
                   className="overflow-x-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
                   onScroll={syncReviewTableScroll}
                 >
-                  <table className="w-full min-w-[1120px] border-collapse text-left">
+                  <table className="w-full min-w-[1260px] border-collapse text-left">
                     <thead>
                       <tr className="border-b border-[#eee5da] bg-[#fbf7f1] text-[10px] font-black uppercase tracking-[0.14em] text-[#8a7f72]">
                         <th className="w-32 px-3 py-3">Date</th>
@@ -2659,6 +3312,7 @@ export function BankStatementsPage() {
                         <th className="w-36 px-3 py-3 text-right">Withdrawal (Dr)</th>
                         <th className="w-36 px-3 py-3 text-right">Deposit (Cr)</th>
                         <th className="w-72 px-3 py-3">Tally ledger</th>
+                        <th className="w-44 px-3 py-3">Bill Allocation</th>
                         <th className="w-32 px-3 py-3">Status</th>
                         <th className="w-20 px-3 py-3 text-right">Actions</th>
                       </tr>
@@ -2666,7 +3320,7 @@ export function BankStatementsPage() {
                     <tbody className="divide-y divide-[#eee5da]">
                       {transactions.length === 0 ? (
                         <tr>
-                          <td colSpan={9} className="px-6 py-12 text-center text-sm font-semibold text-[#8a7f72]">
+                          <td colSpan={10} className="px-6 py-12 text-center text-sm font-semibold text-[#8a7f72]">
                             {tallyPostingStatus
                               ? "Rows were queued for Tally. Track posting status below."
                               : "No rows were extracted. Upload another file or add rows after extraction support improves."}
@@ -2674,7 +3328,7 @@ export function BankStatementsPage() {
                         </tr>
                       ) : visibleReviewTransactions.length === 0 ? (
                         <tr>
-                          <td colSpan={9} className="px-6 py-12 text-center text-sm font-semibold text-[#8a7f72]">
+                          <td colSpan={10} className="px-6 py-12 text-center text-sm font-semibold text-[#8a7f72]">
                             No rows match the current filters.
                           </td>
                         </tr>
@@ -2688,6 +3342,7 @@ export function BankStatementsPage() {
                           const reference = getTransactionReference(transaction);
                           const isEditingLedger = editingLedgerIds.has(transaction.id);
                           const showLedgerSelect = isEditingLedger;
+                          const billAllocation = billAllocationsByTransactionId[transaction.id];
 
                           return (
                             <tr key={transaction.id} className="align-middle text-sm text-[#2b241d] hover:bg-[#fffaf4]">
@@ -2754,6 +3409,23 @@ export function BankStatementsPage() {
                                 )}
                               </td>
                               <td className="px-3 py-3">
+                                <button
+                                  className="flex max-w-full flex-col gap-1 rounded-md px-1 py-1 text-left transition hover:bg-[#f6efe6]"
+                                  onClick={() => setBillAllocationReviewTransactionId(transaction.id)}
+                                  title="Review bill allocation"
+                                  type="button"
+                                >
+                                  <Badge className={getBillAllocationClass(billAllocation)} variant="outline">
+                                    {getBillAllocationLabel(billAllocation)}
+                                  </Badge>
+                                  {billAllocation?.caseLabel && billAllocation.status === "ready_to_post" ? (
+                                    <span className="truncate text-[11px] font-semibold text-[#8a7f72]" title={billAllocation.reason}>
+                                      {billAllocation.caseLabel}
+                                    </span>
+                                  ) : null}
+                                </button>
+                              </td>
+                              <td className="px-3 py-3">
                                 <Badge className={getReviewStatusClass(transaction)} variant="outline">
                                   {getReviewStatusLabel(transaction)}
                                 </Badge>
@@ -2814,6 +3486,329 @@ export function BankStatementsPage() {
                 </div>
               </div>
 
+              {billAllocationReviewTransaction ? (
+                <div className="fixed inset-0 z-50 flex justify-end bg-[#1f1812]/35 backdrop-blur-[2px]">
+                  <button
+                    aria-label="Close bill allocation review"
+                    className="absolute inset-0 cursor-default"
+                    onClick={() => setBillAllocationReviewTransactionId(null)}
+                    type="button"
+                  />
+                  <aside className="relative flex h-full w-full max-w-[760px] flex-col border-l border-[#d8cbbb] bg-[#fffaf4] shadow-2xl">
+                    <div className="border-b border-[#eadfce] bg-[#fffaf4] px-4 py-3">
+                      <div className="flex items-start justify-between gap-5">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-[11px] font-black uppercase tracking-[0.18em] text-[#8a7f72]">
+                              Bill Allocation
+                            </span>
+                            {billAllocationReviewDraft ? (
+                              <Badge className={getBillAllocationClass(billAllocationReviewDraft)} variant="outline">
+                                {getBillAllocationLabel(billAllocationReviewDraft)}
+                              </Badge>
+                            ) : null}
+                          </div>
+                          <h2 className="mt-1 truncate text-xl font-black text-[#2b241d]">
+                            {getTransactionPartyTitle(billAllocationReviewTransaction)}
+                          </h2>
+                          <p className="mt-1 line-clamp-1 text-xs font-semibold leading-5 text-[#6f6256]">
+                            {billAllocationReviewTransaction.description || "Narration not found"}
+                          </p>
+                        </div>
+                        <button
+                          className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-[#6f6256] transition hover:bg-[#f1e7d9] hover:text-[#2b241d]"
+                          onClick={() => setBillAllocationReviewTransactionId(null)}
+                          title="Close"
+                          type="button"
+                        >
+                          <X className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="min-h-0 flex-1 overflow-hidden px-4 py-3">
+                      <div className="grid gap-2 grid-cols-3">
+                        {[
+                          ["Bank Date", formatShortDate(billAllocationReviewTransaction.transactionDate)],
+                          ["Type", getTransactionDirection(billAllocationReviewTransaction) || "-"],
+                          ["Receipt Amount", formatCurrencyAmount(billAllocationReviewTransaction.creditAmount)],
+                          ["UTR / Ref", getTransactionReference(billAllocationReviewTransaction) || "-"],
+                          ["Matched Customer", billAllocationReviewTransaction.selectedLedgerName || "-"],
+                          ["Ledger Group", getLedgerGroupLabel(billAllocationReviewTransaction, ledgerMasters)],
+                        ].map(([label, value]) => (
+                          <div key={label} className="min-w-0 rounded-md border border-[#eadfce] bg-white px-2.5 py-2 shadow-[0_1px_0_rgba(75,56,40,0.03)]">
+                            <div className="truncate text-[10px] font-black uppercase tracking-[0.12em] text-[#9b8c7b]">
+                              {label}
+                            </div>
+                            <div className="mt-1 truncate text-xs font-black text-[#2b241d]" title={String(value)}>
+                              {value}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      {!billAllocationReviewDraft ? (
+                        <div className="mt-5 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-900">
+                          Match pending bills first. This row has no allocation draft yet.
+                        </div>
+                      ) : (
+                        <>
+                          <div className="mt-3 grid grid-cols-4 gap-2">
+                            {[
+                              ["Receipt", billAllocationReviewDraft.receiptAmount],
+                              ["Bills", billAllocationReviewDraft.totalAllocatedAmount - billAllocationReviewDraft.newAdvanceAmount],
+                              ["Advance", billAllocationReviewDraft.newAdvanceAmount],
+                              ["Difference", billAllocationReviewDraft.unallocatedAmount],
+                            ].map(([label, value]) => (
+                              <div
+                                key={label}
+                                className={`min-w-0 rounded-md border bg-white px-2.5 py-2 shadow-[0_1px_0_rgba(75,56,40,0.03)] ${
+                                  label === "Difference" && Number(value) !== 0
+                                    ? "border-amber-300 bg-amber-50"
+                                    : "border-[#eadfce]"
+                                }`}
+                              >
+                                <div className="truncate text-[10px] font-black uppercase tracking-[0.12em] text-[#9b8c7b]">
+                                  {label}
+                                </div>
+                                <div className="mt-1 truncate text-base font-black tabular-nums text-[#2b241d]">
+                                  {formatCurrencyAmount(value as number)}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                          {billAllocationReviewDraft.advanceAdjustments.length > 0 ? (
+                            <div className="mt-2 rounded-md border border-blue-100 bg-blue-50 px-3 py-2">
+                              <label className="flex items-center justify-between gap-3">
+                                <span className="min-w-0">
+                                  <span className="block text-xs font-black text-blue-950">Apply Existing Advances</span>
+                                  <span className="block truncate text-[11px] font-semibold text-blue-800">
+                                    Separate journal after receipt: {formatCurrencyAmount(billAllocationReviewDraft.totalExistingAdvanceAdjustmentAmount)}
+                                  </span>
+                                </span>
+                                <input
+                                  checked={billAllocationReviewDraft.applyExistingAdvances}
+                                  className="h-4 w-4 accent-[#6f4e2f]"
+                                  onChange={(event) =>
+                                    updateApplyExistingAdvances(billAllocationReviewTransaction, event.target.checked)
+                                  }
+                                  type="checkbox"
+                                />
+                              </label>
+                            </div>
+                          ) : null}
+
+                          <div className="mt-3 rounded-md border border-[#eadfce] bg-[#fbf7f1] px-3 py-1.5">
+                            <div className="flex flex-wrap items-center gap-2">
+                            <Badge className={getBillAllocationClass(billAllocationReviewDraft)} variant="outline">
+                              {getBillAllocationLabel(billAllocationReviewDraft)}
+                            </Badge>
+                            <Badge className="border-[#d8cbbb] bg-white text-[#6f6256]" variant="outline">
+                              {billAllocationReviewDraft.caseLabel}
+                            </Badge>
+                              <span className="truncate text-xs font-semibold leading-5 text-[#6f6256]">
+                              {billAllocationReviewDraft.reason}
+                            </span>
+                            </div>
+                          </div>
+
+                          <section className="mt-3">
+                            <div className="flex items-end justify-between gap-3">
+                              <div>
+                                <h3 className="text-sm font-black text-[#2b241d]">Proposed Allocation</h3>
+                                <p className="mt-0.5 text-[11px] font-semibold text-[#8a7f72]">
+                                  What will be sent to Tally with the receipt voucher.
+                                </p>
+                              </div>
+                              <span className="text-xs font-black text-[#6f6256]">
+                                {billAllocationReviewDraft.allocations.length} line(s)
+                              </span>
+                            </div>
+                            <div className="mt-2 rounded-md border border-[#eadfce] bg-white shadow-[0_1px_0_rgba(75,56,40,0.03)]">
+                              <table className="w-full table-fixed text-left text-[11px]">
+                                <thead className="bg-[#f6efe6] text-[10px] font-black uppercase tracking-[0.14em] text-[#8a7f72]">
+                                  <tr>
+                                    <th className="w-[14%] px-2 py-2">Ref Type</th>
+                                    <th className="w-[18%] px-2 py-2">Bill Ref</th>
+                                    <th className="w-[14%] px-2 py-2">Date</th>
+                                    <th className="w-[16%] px-2 py-2 text-right">Pending</th>
+                                    <th className="w-[16%] px-2 py-2 text-right">Allocated</th>
+                                    <th className="w-[14%] px-2 py-2 text-right">After</th>
+                                    <th className="w-[8%] px-2 py-2">Result</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-[#eee5da]">
+                                  {billAllocationReviewDraft.allocations.length === 0 ? (
+                                    <tr>
+                                        <td className="px-2 py-3 text-center font-semibold text-[#8a7f72]" colSpan={7}>
+                                        No allocation selected.
+                                      </td>
+                                    </tr>
+                                  ) : (
+                                    billAllocationReviewDraft.allocations.map((allocation) => (
+                                      <tr key={`${allocation.referenceType}-${allocation.referenceName}`}>
+                                        <td className="px-2 py-2">
+                                          <Badge className="border-[#d8cbbb] bg-[#fbf7f1] text-[#4b3828]" variant="outline">
+                                            {allocation.referenceType}
+                                          </Badge>
+                                        </td>
+                                        <td className="truncate px-2 py-2 font-black text-[#2b241d]">{allocation.referenceName}</td>
+                                        <td className="px-2 py-2 text-[#5f5348]">{allocation.invoiceDate ? formatShortDate(allocation.invoiceDate) : "-"}</td>
+                                        <td className="px-2 py-2 text-right tabular-nums">
+                                          {formatCurrencyAmount(allocation.previousPendingAmount)}
+                                        </td>
+                                        <td className="px-2 py-2 text-right font-black tabular-nums text-[#2b241d]">
+                                          {formatCurrencyAmount(allocation.allocatedAmount)}
+                                        </td>
+                                        <td className="px-2 py-2 text-right tabular-nums">
+                                          {formatCurrencyAmount(allocation.pendingAmountAfterAllocation)}
+                                        </td>
+                                        <td className="truncate px-2 py-2 font-semibold text-[#5f5348]">{formatDataLabel(allocation.statusAfterAllocation)}</td>
+                                      </tr>
+                                    ))
+                                  )}
+                                </tbody>
+                              </table>
+                            </div>
+                          </section>
+
+                          <section className="mt-3">
+                            <div className="flex flex-wrap items-end justify-between gap-3">
+                              <div>
+                                <h3 className="text-sm font-black text-[#2b241d]">Review Allocation</h3>
+                                <p className="mt-0.5 text-[11px] font-semibold text-[#8a7f72]">
+                                  Adjust amounts before posting if the allocation is not correct.
+                                </p>
+                              </div>
+                              <span className="rounded-md border border-[#eadfce] bg-white px-2.5 py-1 text-[11px] font-black text-[#6f6256]">
+                                Total must equal {formatCurrencyAmount(billAllocationReviewDraft.receiptAmount)}
+                              </span>
+                            </div>
+                            <div className="mt-2 rounded-md border border-[#eadfce] bg-white shadow-[0_1px_0_rgba(75,56,40,0.03)]">
+                              <table className="w-full table-fixed text-left text-xs">
+                                <thead className="bg-[#f6efe6] text-[10px] font-black uppercase tracking-[0.14em] text-[#8a7f72]">
+                                  <tr>
+                                    <th className="w-[34%] px-3 py-2">Bill Reference</th>
+                                    <th className="w-[22%] px-3 py-2">Date</th>
+                                    <th className="w-[20%] px-3 py-2 text-right">Pending</th>
+                                    <th className="w-[24%] px-3 py-2 text-right">Allocation</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-[#eee5da]">
+                                  {billAllocationReviewDraft.candidateBills.length === 0 ? (
+                                    <tr>
+                                      <td className="px-3 py-4 text-center font-semibold text-[#8a7f72]" colSpan={4}>
+                                        No open bills returned by Tally.
+                                      </td>
+                                    </tr>
+                                  ) : (
+                                    billAllocationReviewDraft.candidateBills.map((bill) => {
+                                      const currentAmount =
+                                        billAllocationReviewDraft.allocations.find(
+                                          (line) => line.referenceType === "Agst Ref" && line.referenceName === bill.referenceName
+                                        )?.allocatedAmount ?? 0;
+
+                                      return (
+                                        <tr key={bill.referenceName}>
+                                          <td className="px-3 py-2 font-black text-[#2b241d]">{bill.referenceName}</td>
+                                          <td className="px-3 py-2 text-[#5f5348]">
+                                            {bill.dueDate || bill.invoiceDate ? formatShortDate(bill.dueDate || bill.invoiceDate || "") : "-"}
+                                          </td>
+                                          <td className="px-3 py-2 text-right tabular-nums">{formatCurrencyAmount(bill.pendingAmount)}</td>
+                                          <td className="px-3 py-2 text-right">
+                                            <input
+                                              className="h-8 w-32 rounded-md border border-[#d8cbbb] bg-white px-2 text-right text-xs font-bold tabular-nums text-[#2b241d] outline-none transition focus:border-[#6f4e2f] focus:ring-2 focus:ring-[#6f4e2f]/15"
+                                              min={0}
+                                              max={bill.pendingAmount}
+                                              onChange={(event) =>
+                                                updateManualBillAmount(
+                                                  billAllocationReviewTransaction,
+                                                  bill.referenceName,
+                                                  event.target.value
+                                                )
+                                              }
+                                              step="0.01"
+                                              type="number"
+                                              value={currentAmount}
+                                            />
+                                          </td>
+                                        </tr>
+                                      );
+                                    })
+                                  )}
+                                  <tr>
+                                    <td className="px-3 py-2 font-black text-[#2b241d]">New Advance</td>
+                                    <td className="px-3 py-2 text-[#5f5348]">-</td>
+                                    <td className="px-3 py-2 text-right">-</td>
+                                    <td className="px-3 py-2 text-right">
+                                      <input
+                                        className="h-8 w-32 rounded-md border border-[#d8cbbb] bg-white px-2 text-right text-xs font-bold tabular-nums text-[#2b241d] outline-none transition focus:border-[#6f4e2f] focus:ring-2 focus:ring-[#6f4e2f]/15"
+                                        min={0}
+                                        onChange={(event) =>
+                                          updateManualAdvanceAmount(billAllocationReviewTransaction, event.target.value)
+                                        }
+                                        step="0.01"
+                                        type="number"
+                                        value={billAllocationReviewDraft.newAdvanceAmount}
+                                      />
+                                    </td>
+                                  </tr>
+                                </tbody>
+                              </table>
+                            </div>
+                          </section>
+
+                          {billAllocationReviewDraft.advanceAdjustments.length > 0 ? (
+                            <section className="mt-3">
+                              <div className="flex items-end justify-between gap-3">
+                                <div>
+                                  <h3 className="text-sm font-black text-[#2b241d]">Existing Advance Adjustment</h3>
+                                  <p className="mt-0.5 text-[11px] font-semibold text-[#8a7f72]">
+                                    Posted as a separate journal only when enabled.
+                                  </p>
+                                </div>
+                                <span className="text-xs font-black text-[#6f6256]">
+                                  {billAllocationReviewDraft.advanceAdjustments.length} line(s)
+                                </span>
+                              </div>
+                              <div className="mt-2 overflow-x-auto rounded-md border border-[#eadfce] bg-white">
+                                <table className="w-full min-w-[520px] text-left text-xs">
+                                  <thead className="bg-[#fbf7f1] text-[10px] font-black uppercase tracking-[0.12em] text-[#8a7f72]">
+                                    <tr>
+                                      <th className="px-3 py-2">Advance Ref</th>
+                                      <th className="px-3 py-2">Bill Ref</th>
+                                      <th className="px-3 py-2 text-right">Adjust</th>
+                                      <th className="px-3 py-2 text-right">Bill After</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody className="divide-y divide-[#eee5da]">
+                                    {billAllocationReviewDraft.advanceAdjustments.map((adjustment) => (
+                                      <tr key={`${adjustment.advanceReferenceName}-${adjustment.billReferenceName}`}>
+                                        <td className="px-3 py-2 font-black">{adjustment.advanceReferenceName}</td>
+                                        <td className="px-3 py-2 font-black">{adjustment.billReferenceName}</td>
+                                        <td className="px-3 py-2 text-right font-black tabular-nums">
+                                          {formatCurrencyAmount(adjustment.amount)}
+                                        </td>
+                                        <td className="px-3 py-2 text-right">
+                                          {formatCurrencyAmount(adjustment.remainingBillAfterAdjustment)}
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                              <p className="mt-2 text-xs font-semibold text-[#6f6256]">
+                                This does not change the bank receipt amount; it only clears old advances against remaining bills.
+                              </p>
+                            </section>
+                          ) : null}
+                        </>
+                      )}
+                    </div>
+                  </aside>
+                </div>
+              ) : null}
+
               <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-[#d8cbbb] bg-[#fbf7f1]/95 px-4 py-3 shadow-[0_-8px_24px_rgba(74,56,40,0.10)] backdrop-blur sm:left-[224px] sm:px-8">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="space-y-2">
@@ -2862,16 +3857,38 @@ export function BankStatementsPage() {
                   <Button
                     className="border-[#d8cbbb] bg-white text-[#2b241d] hover:bg-[#f7efe5]"
                     onClick={clearStatementReview}
-                    disabled={sending || tallyPostingInProgress}
+                    disabled={sending || matchingBills || tallyPostingInProgress}
                     type="button"
                     variant="outline"
                   >
                     Upload Another
                   </Button>
                   <Button
+                    className="border-[#d8cbbb] bg-white text-[#2b241d] hover:bg-[#f7efe5]"
+                    onClick={matchPendingBills}
+                    disabled={
+                      sending ||
+                      matchingBills ||
+                      tallyPostingInProgress ||
+                      Boolean(tallyPostingStatus) ||
+                      pendingBillEligibleTransactions.length === 0
+                    }
+                    type="button"
+                    variant="outline"
+                  >
+                    {matchingBills ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                    Match Pending Bills ({pendingBillEligibleTransactions.length})
+                  </Button>
+                  <Button
                     className="bg-[#4b3828] text-white hover:bg-[#38291d]"
                     onClick={sendToTally}
-                    disabled={sending || Boolean(tallyPostingStatus) || queueableReviewTransactions.length === 0}
+                    disabled={
+                      sending ||
+                      matchingBills ||
+                      Boolean(tallyPostingStatus) ||
+                      queueableReviewTransactions.length === 0 ||
+                      blockingBillAllocationCount > 0
+                    }
                   >
                     {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
                     {tallyPostingInProgress

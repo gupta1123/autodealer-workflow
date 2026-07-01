@@ -30,6 +30,16 @@ type QueuePayload = {
     counterpartyLedgerName?: string;
     createLedgerName?: string;
     createLedgerParentName?: string;
+    billAllocations?: Array<{
+      referenceType?: string;
+      referenceName?: string;
+      amount?: number | string;
+    }>;
+    advanceAdjustments?: Array<{
+      advanceReferenceName?: string;
+      billReferenceName?: string;
+      amount?: number | string;
+    }>;
     saveMapping?: boolean;
   }>;
 };
@@ -115,12 +125,22 @@ type TransactionLedgerSelection = {
   counterpartyLedgerName: string;
   createLedgerName: string;
   createLedgerParentName: string;
+  billAllocations: Array<{
+    referenceType: string;
+    referenceName: string;
+    amount: number;
+  }>;
+  advanceAdjustments: Array<{
+    advanceReferenceName: string;
+    billReferenceName: string;
+    amount: number;
+  }>;
 };
 
 type TallyCommandInsert = {
   connection_id: string;
   owner_user_id: string;
-  command_type: "create_ledger" | "post_bank_voucher";
+  command_type: "create_ledger" | "post_bank_voucher" | "adjust_customer_advance";
   status: "queued";
   priority: number;
   payload: Record<string, unknown>;
@@ -134,6 +154,49 @@ function toText(value: unknown, maxLength = 500) {
 function toNumber(value: unknown) {
   const parsed = Number(String(value ?? "").replace(/,/g, ""));
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeBillReferenceType(value: unknown) {
+  const normalized = toText(value, 40).toLowerCase();
+  if (normalized === "advance") return "Advance";
+  return "Agst Ref";
+}
+
+function normalizeBillAllocations(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const row = entry as Record<string, unknown>;
+    const referenceName = toText(row.referenceName, 500);
+    const amount = toNumber(row.amount);
+    if (!referenceName || amount <= 0) return [];
+    return [
+      {
+        referenceType: normalizeBillReferenceType(row.referenceType),
+        referenceName,
+        amount,
+      },
+    ];
+  });
+}
+
+function normalizeAdvanceAdjustments(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const row = entry as Record<string, unknown>;
+    const advanceReferenceName = toText(row.advanceReferenceName, 500);
+    const billReferenceName = toText(row.billReferenceName, 500);
+    const amount = toNumber(row.amount);
+    if (!advanceReferenceName || !billReferenceName || amount <= 0) return [];
+    return [
+      {
+        advanceReferenceName,
+        billReferenceName,
+        amount,
+      },
+    ];
+  });
 }
 
 function isSuspenseLedger(value?: string | null) {
@@ -232,6 +295,8 @@ export async function POST(request: Request) {
               counterpartyLedgerName,
               createLedgerName,
               createLedgerParentName,
+              billAllocations: normalizeBillAllocations(transaction?.billAllocations),
+              advanceAdjustments: normalizeAdvanceAdjustments(transaction?.advanceAdjustments),
             },
           ] as const,
         ];
@@ -569,12 +634,14 @@ export async function POST(request: Request) {
           counterpartyLedgerName,
           createLedgerName,
           createLedgerParentName: selectedLedger?.createLedgerParentName || "Sundry Creditors",
+          billAllocations: selectedLedger?.billAllocations ?? [],
+          advanceAdjustments: selectedLedger?.advanceAdjustments ?? [],
         };
       });
 
     const queuedCreateLedgerKeys = new Set<string>();
     const commands: TallyCommandInsert[] = commandInputs.flatMap(
-      ({ transaction, counterpartyLedgerName, createLedgerName, createLedgerParentName }) => {
+      ({ transaction, counterpartyLedgerName, createLedgerName, createLedgerParentName, billAllocations, advanceAdjustments }) => {
         if (
           blockedFingerprints.has(transaction.fingerprint) ||
           blockedReferences.has(normalizeReferenceNumber(transaction.reference_number))
@@ -675,12 +742,34 @@ export async function POST(request: Request) {
             amount,
             narration: transaction.description,
             referenceNumber,
+            billAllocations,
             transactionType: transaction.transaction_type,
             category: transaction.category,
             counterpartyName: transaction.counterparty_name,
             accountNumberMasked: account.account_number_masked,
           },
         });
+
+        if (advanceAdjustments.length > 0 && counterpartyIsPartyLedger && !usesTallyFallbackLedger) {
+          nextCommands.push({
+            connection_id: connectionId,
+            owner_user_id: user.id,
+            command_type: "adjust_customer_advance",
+            status: "queued",
+            priority: 19,
+            payload: {
+              sourceBankTransactionId: transaction.id,
+              bankAccountId: account.id,
+              companyName: connection.last_company_name,
+              voucherDate: transaction.transaction_date,
+              ledgerName: tallyCounterpartyLedgerName,
+              referenceNumber: `${referenceNumber}-ADJ`.slice(0, 500),
+              narration: `Auto-adjust existing customer advance for ${referenceNumber}`,
+              adjustments: advanceAdjustments,
+              sourceReferenceNumber: referenceNumber,
+            },
+          });
+        }
 
         return nextCommands;
       }

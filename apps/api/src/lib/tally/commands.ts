@@ -1,4 +1,10 @@
-export type TallyBridgeCommandType = "alter_ledger" | "create_ledger" | "sync_masters" | "post_bank_voucher";
+export type TallyBridgeCommandType =
+  | "alter_ledger"
+  | "create_ledger"
+  | "sync_masters"
+  | "post_bank_voucher"
+  | "fetch_customer_open_bills"
+  | "adjust_customer_advance";
 
 export type TallyBridgeCommandStatus =
   | "queued"
@@ -32,6 +38,8 @@ export const TALLY_BRIDGE_COMMAND_TYPES: TallyBridgeCommandType[] = [
   "create_ledger",
   "sync_masters",
   "post_bank_voucher",
+  "fetch_customer_open_bills",
+  "adjust_customer_advance",
 ];
 
 export function serializeTallyBridgeCommand(row: TallyBridgeCommandRow) {

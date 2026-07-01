@@ -312,6 +312,65 @@ export async function POST(
       });
     }
 
+    if (commandType === "fetch_customer_open_bills") {
+      const ledgerName = toRequiredText(rawPayload.ledgerName).slice(0, 500);
+      if (!ledgerName) {
+        return jsonWithCors(request, { error: "Customer ledger name is required." }, { status: 400 });
+      }
+
+      const payload = {
+        ledgerName,
+        companyName:
+          toNullableText(rawPayload.companyName, 240) ??
+          toNullableText(connection.last_company_name, 240),
+      };
+
+      if (isLocalDbMode()) {
+        const command = await createLocalTallyCommand({
+          connectionId: id,
+          ownerUserId: user.id,
+          commandType,
+          payload,
+          priority: 15,
+        });
+
+        return jsonWithCors(request, {
+          command: serializeTallyBridgeCommand(command),
+        });
+      }
+
+      const supabase = createSupabaseAdminClient();
+      const { data, error } = await supabase
+        .from("tally_bridge_commands")
+        .insert({
+          connection_id: id,
+          owner_user_id: user.id,
+          command_type: commandType,
+          status: "queued",
+          priority: 15,
+          payload,
+        })
+        .select("*")
+        .single();
+
+      if (error) throw error;
+
+      await supabase.from("tally_connection_events").insert({
+        connection_id: id,
+        owner_user_id: user.id,
+        event_type: "command_queued",
+        message: "Customer open bill fetch queued for bridge.",
+        payload: {
+          commandType,
+          ledgerName,
+        },
+      });
+
+      return jsonWithCors(request, {
+        command: serializeTallyBridgeCommand(data as unknown as TallyBridgeCommandRow),
+      });
+    }
+
     return jsonWithCors(request, { error: "Unsupported Tally command type." }, { status: 400 });
   } catch (error) {
     console.error("Error in POST /api/tally/connections/[id]/commands:", error);

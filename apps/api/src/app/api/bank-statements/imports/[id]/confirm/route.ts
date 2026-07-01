@@ -268,7 +268,7 @@ function rowsAfterImportCheckpoint(
     };
   }
 
-  const nextRows = rows.filter((row) => row.transaction_date > markerDate);
+  const nextRows = rows.filter((row) => row.transaction_date >= markerDate);
   return {
     markerFound: false,
     rows: nextRows,
