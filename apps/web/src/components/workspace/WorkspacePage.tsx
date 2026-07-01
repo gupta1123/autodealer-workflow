@@ -1050,6 +1050,11 @@ export function WorkspacePage() {
   const handleCreateCaseDraft = async () => {
     if (!hasUploads) return;
 
+    if (duplicateCaseNotice) {
+      await handleCreateDuplicateTestCase();
+      return;
+    }
+
     if (persistence.savedCase) {
       setCaseDraftCreated(true);
       return;
@@ -1072,6 +1077,23 @@ export function WorkspacePage() {
       }
 
       setDraftCaseError(createError instanceof Error ? createError.message : "Failed to create case.");
+      setDraftCaseStatus("error");
+    }
+  };
+
+  const handleCreateDuplicateTestCase = async () => {
+    if (!hasUploads) return;
+
+    try {
+      setDraftCaseStatus("saving");
+      setDraftCaseError(null);
+      const created = await createDraftCase({ uploads: queuedUploads, allowDuplicate: true });
+      updateSavedCase(created.case);
+      setDuplicateCaseNotice(null);
+      setCaseDraftCreated(true);
+      setDraftCaseStatus("saved");
+    } catch (createError) {
+      setDraftCaseError(createError instanceof Error ? createError.message : "Failed to create test copy.");
       setDraftCaseStatus("error");
     }
   };
@@ -1162,7 +1184,7 @@ export function WorkspacePage() {
             </p>
           </div>
         </div>
-        <div className="flex shrink-0 gap-2">
+        <div className="flex shrink-0 flex-wrap gap-2">
           <Button
             type="button"
             variant="outline"
@@ -1170,6 +1192,20 @@ export function WorkspacePage() {
             onClick={resetWorkspace}
           >
             Clear upload
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={draftCaseStatus === "saving"}
+            className="rounded-xl border-amber-300 bg-white text-amber-950 hover:bg-amber-100 disabled:opacity-60"
+            onClick={handleCreateDuplicateTestCase}
+          >
+            {draftCaseStatus === "saving" ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <GitCompare className="mr-2 h-4 w-4" />
+            )}
+            Create test copy
           </Button>
           <Button
             type="button"
@@ -1493,6 +1529,8 @@ export function WorkspacePage() {
                 >
                   {draftCaseStatus === "saving" ? (
                     <span className="flex items-center justify-center gap-3"><Loader2 className="h-5 w-5 animate-spin" /> Creating case...</span>
+                  ) : duplicateCaseNotice ? (
+                    <span className="flex items-center justify-center gap-3"><GitCompare className="h-5 w-5" /> Create test copy</span>
                   ) : (
                     <span className="flex items-center justify-center gap-3"><FolderPlus className="h-5 w-5" /> Create case</span>
                   )}

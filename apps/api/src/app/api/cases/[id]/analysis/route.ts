@@ -30,6 +30,7 @@ import {
   serializeFieldsWithLineItems,
 } from "@/lib/line-items";
 import { mergePersistedStructuredData } from "@/lib/persisted-structured-data";
+import { appendPacketUploadAiLog } from "@/lib/processing/packet-upload-debug";
 import { getLatestProcessingJob, mapProcessingJob } from "@/lib/processing/jobs";
 import { assessCaseTermsComplianceDetailed } from "@/lib/processing/pipeline";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
@@ -40,6 +41,10 @@ import {
   TERMS_COMPLIANCE_MISMATCH_MODE,
 } from "@/lib/terms-compliance";
 import type { CaseAnalysisMode, CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
+
+type WebFormData = {
+  get(name: string): FormDataEntryValue | null;
+};
 
 function isRecycleBinSchemaMissing(error: unknown) {
   if (!error || typeof error !== "object") {
@@ -220,11 +225,15 @@ export async function POST(
 
     const supabase = createSupabaseAdminClient();
     const fieldConfiguration = await getPersistedPacketFieldConfiguration();
-    const formData = await request.formData();
+    const formData = (await request.formData()) as unknown as WebFormData;
     const analysisMode = parseAnalysisMode(formData.get("analysisMode"));
     const comparisonOptions = parseComparisonOptions(formData.get("comparisonOptions"));
     const rawDocuments = parseOptionalJsonField<CaseDoc[]>(formData.get("documents"));
     const rawMismatches = parseOptionalJsonField<Mismatch[]>(formData.get("mismatches"));
+    const packetAiUsage = parseOptionalJsonField<Record<string, unknown>>(formData.get("packetAiUsage"));
+    appendPacketUploadAiLog(
+      `[packet-upload-ai-flow] analysis-route case=${id}; mode=${analysisMode}; has_client_documents=${Boolean(rawDocuments)}`
+    );
 
     let existing:
       | {
@@ -290,6 +299,9 @@ export async function POST(
     if (!rawDocuments) {
       const latestJob = await getLatestProcessingJob(id);
       if (latestJob && (latestJob.status === "queued" || latestJob.status === "running")) {
+        appendPacketUploadAiLog(
+          `[packet-upload-ai-flow] analysis-route case=${id}; existing_job=${latestJob.id}; status=${latestJob.status}`
+        );
         const nextCase = {
           ...existing,
           status: "processing",
@@ -392,6 +404,9 @@ export async function POST(
       if (insertJobError) {
         throw insertJobError;
       }
+      appendPacketUploadAiLog(
+        `[packet-upload-ai-flow] analysis-route case=${id}; queued_job=${insertedJob.id}; mode=${analysisMode}`
+      );
 
       return applyCorsHeaders(
         NextResponse.json({
@@ -514,6 +529,7 @@ export async function POST(
         comparisonOptions,
         termsComplianceChecklist: termsCompliance.checklist,
         termsComplianceMismatchMode: TERMS_COMPLIANCE_MISMATCH_MODE,
+        ...(packetAiUsage ? { packetAiUsage } : {}),
       },
     };
 

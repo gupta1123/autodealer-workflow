@@ -4,17 +4,19 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
-  Search,
-  FolderOpen,
-  Folder,
-  AlertTriangle,
-  Database,
-  LayoutGrid,
-  List,
-  Upload,
-  Trash2,
+  ArrowUpDown,
   ChevronLeft,
   ChevronRight,
+  ChevronsUpDown,
+  FileText,
+  Folder,
+  FolderOpen,
+  LayoutGrid,
+  List,
+  MoreVertical,
+  Search,
+  Trash2,
+  Upload,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
@@ -36,18 +38,18 @@ import {
 } from "@/lib/case-persistence";
 
 type LoadState = "loading" | "ready" | "error";
-type ViewMode = "grid" | "table";
+type ViewMode = "list" | "grid";
 type CachedCaseList = {
   cases: SavedCaseRecord[];
   totalCount: number;
   totalPages: number;
 };
 
-const CASE_LIST_PAGE_SIZE = 25;
+const CASE_LIST_PAGE_SIZE = 10;
 const caseListCache = new Map<string, CachedCaseList>();
 
 function getCaseListCacheKey(query: string, page: number) {
-  return `active:${query.trim().toLowerCase()}:page:${page}`;
+  return `active:${query.trim().toLowerCase()}:page:${page}:limit:${CASE_LIST_PAGE_SIZE}`;
 }
 
 function getVisiblePages(currentPage: number, totalPages: number) {
@@ -57,36 +59,105 @@ function getVisiblePages(currentPage: number, totalPages: number) {
     .sort((a, b) => a - b);
 }
 
-function formatDateTime(value: string) {
-  return new Date(value).toLocaleString("en-US", {
+function formatDate(value: string) {
+  return new Date(value).toLocaleDateString("en-US", {
     month: "short",
     day: "numeric",
     year: "numeric",
   });
 }
 
-function getRiskColor(score: number) {
-  if (score >= 70) return "text-red-600 bg-red-50 border-red-200";
-  if (score >= 40) return "text-amber-600 bg-amber-50 border-amber-200";
-  return "text-emerald-600 bg-emerald-50 border-emerald-200";
+function formatTime(value: string) {
+  return new Date(value).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
-function getCaseStatusLabel(status: string) {
-  if (status === "draft") return "Draft";
-  if (status === "accepted") return "Accepted";
-  if (status === "rejected") return "Rejected";
-  if (status === "failed") return "Failed";
-  if (status === "processing") return "Processing";
-  return "Pending";
+function getAnalysisBadge(item: SavedCaseRecord) {
+  if (item.status === "failed") {
+    return { label: "Failed", className: "border-rose-200 bg-rose-50 text-rose-700" };
+  }
+  if (item.status === "processing") {
+    return { label: "Running", className: "border-violet-200 bg-violet-50 text-violet-700" };
+  }
+  if (item.status === "draft") {
+    return { label: "Draft", className: "border-amber-200 bg-amber-50 text-amber-700" };
+  }
+  return { label: "Done", className: "border-emerald-200 bg-emerald-50 text-emerald-700" };
 }
 
-function getCaseStatusColor(status: string) {
-  if (status === "draft") return "text-amber-700 bg-amber-50 border-amber-200";
-  if (status === "accepted") return "text-emerald-700 bg-emerald-50 border-emerald-200";
-  if (status === "rejected") return "text-rose-700 bg-rose-50 border-rose-200";
-  if (status === "failed") return "text-red-700 bg-red-50 border-red-200";
-  if (status === "processing") return "text-blue-700 bg-blue-50 border-blue-200";
-  return "text-slate-600 bg-slate-50 border-slate-200";
+function getReconciliationBadge(item: SavedCaseRecord) {
+  if (item.status === "draft") {
+    return { label: "Not checked", className: "border-slate-200 bg-slate-50 text-slate-600" };
+  }
+  if (item.status === "processing") {
+    return { label: "Checking", className: "border-violet-200 bg-violet-50 text-violet-700" };
+  }
+  if (item.status === "failed") {
+    return { label: "No result", className: "border-rose-200 bg-rose-50 text-rose-700" };
+  }
+  if (item.mismatchCount > 0) {
+    return {
+      label: `${item.mismatchCount} issue${item.mismatchCount === 1 ? "" : "s"}`,
+      className: "border-rose-200 bg-rose-50 text-rose-700",
+    };
+  }
+  return { label: "No issues", className: "border-emerald-200 bg-emerald-50 text-emerald-700" };
+}
+
+function getDecisionBadge(item: SavedCaseRecord) {
+  if (item.status === "accepted") {
+    return { label: "Approved", className: "border-emerald-200 bg-emerald-50 text-emerald-700" };
+  }
+  if (item.status === "rejected") {
+    return { label: "Rejected", className: "border-rose-200 bg-rose-50 text-rose-700" };
+  }
+  if (item.status === "completed") {
+    return { label: "Pending", className: "border-amber-200 bg-amber-50 text-amber-700" };
+  }
+  return { label: "-", className: "border-slate-200 bg-slate-50 text-slate-500" };
+}
+
+function CaseSignalBadge({ label, className }: { label: string; className: string }) {
+  return (
+    <span className={`inline-flex whitespace-nowrap rounded-md border px-2.5 py-1 text-[11px] font-medium uppercase ${className}`}>
+      {label}
+    </span>
+  );
+}
+
+function getCompanyName(item: SavedCaseRecord) {
+  return item.receiverName || item.buyerName || item.category || "Receiver pending";
+}
+
+function toReadableCaseText(value: string) {
+  return value
+    .split(/(\/)/)
+    .map((part) => {
+      if (part === "/") return part;
+      return part
+        .split(/(\s+)/)
+        .map((word) => {
+          if (!word.trim()) return word;
+          if (/[0-9]/.test(word)) return word;
+          if (word.length <= 3 && word === word.toUpperCase()) return word;
+          return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+        })
+        .join("");
+    })
+    .join("")
+    .replace(/\s+packet$/i, " packet");
+}
+
+function getCaseTitle(item: SavedCaseRecord) {
+  if (item.invoiceNumber) return `${toReadableCaseText(getCompanyName(item))} / ${item.invoiceNumber}`;
+  if (item.poNumber) return `${toReadableCaseText(getCompanyName(item))} / ${item.poNumber}`;
+  return toReadableCaseText(item.displayName);
+}
+
+function getCaseSubtitle(item: SavedCaseRecord) {
+  return toReadableCaseText(getCompanyName(item));
 }
 
 function useIsMobileView() {
@@ -105,81 +176,140 @@ function useIsMobileView() {
   return isMobileView;
 }
 
-function CasesGridSkeleton() {
+function DirectoryHeader({
+  totalCount,
+  documentCount,
+  viewMode,
+  status,
+  onViewModeChange,
+}: {
+  totalCount: number;
+  documentCount: number;
+  viewMode: ViewMode;
+  status: LoadState;
+  onViewModeChange: (mode: ViewMode) => void;
+}) {
   return (
-    <div className="grid grid-cols-1 gap-3 px-4 sm:grid-cols-2 md:px-6 lg:grid-cols-3 xl:grid-cols-4">
-      {Array.from({ length: 8 }).map((_, index) => (
-        <div
-          key={index}
-          className="flex flex-col rounded-xl border border-[#e5ddd0] bg-white p-3.5 shadow-sm"
-        >
-          <div className="flex items-start justify-between gap-2">
-            <div className="flex min-w-0 items-start gap-2.5">
-              <Skeleton className="h-8 w-8 shrink-0 rounded-lg bg-[#f0ece6]" />
-              <div className="min-w-0 space-y-2">
-                <Skeleton className="h-3.5 w-36 bg-slate-100" />
-                <Skeleton className="h-3 w-24 bg-slate-100" />
-              </div>
+    <section className="rounded-2xl border border-[#e6ded2] bg-white px-5 py-5 shadow-[0_18px_45px_rgba(46,36,28,0.08)] sm:px-7">
+      <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex items-center gap-4">
+          <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-[#f4eadf] text-[#332015] shadow-inner">
+            <FolderOpen className="h-8 w-8" />
+          </div>
+          <div>
+            <h1 className="text-2xl font-medium tracking-[-0.02em] text-[#111827] sm:text-3xl">
+              Case Directory
+            </h1>
+            <div className="mt-1 flex items-center gap-2 text-sm font-medium text-[#8a7f72]">
+              <span>Root</span>
+              <ChevronRight className="h-4 w-4 text-[#b8ad9f]" />
             </div>
-            <Skeleton className="h-5 w-5 rounded-md bg-slate-100" />
-          </div>
-          <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
-            <Skeleton className="h-5 w-16 rounded bg-slate-100" />
-            <Skeleton className="h-5 w-10 rounded bg-slate-100" />
-          </div>
-          <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5">
-            <Skeleton className="h-3 w-24 bg-slate-100" />
-            <Skeleton className="h-3 w-16 bg-slate-100" />
           </div>
         </div>
-      ))}
-    </div>
+
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center lg:gap-6">
+          <div className="grid grid-cols-2 gap-3 sm:min-w-[320px]">
+            <div className="flex items-center gap-3 rounded-2xl bg-[#fbfaf8] px-4 py-3 shadow-[0_10px_28px_rgba(46,36,28,0.05)]">
+              <div className="flex h-10 w-10 items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-600">
+                <Folder className="h-5 w-5" />
+              </div>
+              <div>
+                {status === "loading" ? (
+                  <Skeleton className="h-4 w-9 bg-[#eee7dd]" />
+                ) : (
+                  <div className="text-lg font-medium text-[#111827]">{totalCount}</div>
+                )}
+                <div className="text-xs font-medium text-[#7b7280]">Folders</div>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 rounded-2xl bg-[#fbfaf8] px-4 py-3 shadow-[0_10px_28px_rgba(46,36,28,0.05)]">
+              <div className="flex h-10 w-10 items-center justify-center rounded-full border border-sky-200 bg-sky-50 text-sky-600">
+                <FileText className="h-5 w-5" />
+              </div>
+              <div>
+                {status === "loading" ? (
+                  <Skeleton className="h-4 w-9 bg-[#eee7dd]" />
+                ) : (
+                  <div className="text-lg font-medium text-[#111827]">{documentCount}</div>
+                )}
+                <div className="text-xs font-medium text-[#7b7280]">Documents</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <div className="hidden rounded-xl border border-[#e8dfd4] bg-[#fbf7f1] p-1 md:flex">
+              <button
+                type="button"
+                aria-label="List view"
+                onClick={() => onViewModeChange("list")}
+                className={`flex h-10 w-12 items-center justify-center rounded-lg transition ${
+                  viewMode === "list"
+                    ? "bg-[#eadfd1] text-[#2a1d14] shadow-sm"
+                    : "text-[#6f675e] hover:text-[#2a1d14]"
+                }`}
+              >
+                <List className="h-5 w-5" />
+              </button>
+              <button
+                type="button"
+                aria-label="Grid view"
+                onClick={() => onViewModeChange("grid")}
+                className={`flex h-10 w-12 items-center justify-center rounded-lg transition ${
+                  viewMode === "grid"
+                    ? "bg-white text-[#2a1d14] shadow-sm"
+                    : "text-[#6f675e] hover:text-[#2a1d14]"
+                }`}
+              >
+                <LayoutGrid className="h-5 w-5" />
+              </button>
+            </div>
+
+            <Button
+              asChild
+              className="h-12 rounded-xl bg-[#2b1a10] px-5 font-medium text-white shadow-[0_14px_30px_rgba(43,26,16,0.22)] hover:bg-[#3b271a]"
+            >
+              <Link href="/workspace">
+                <Upload className="h-4 w-4" />
+                Upload
+              </Link>
+            </Button>
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 
 function CasesTableSkeleton() {
   return (
-    <Table className="w-full text-sm">
+    <Table className="min-w-[1020px]">
       <TableHeader>
-        <TableRow className="border-b border-slate-100 hover:bg-transparent">
-          <TableHead className="h-10 pl-4 md:pl-6 font-bold text-slate-400 text-[11px] uppercase tracking-wider">Name</TableHead>
-          <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider">Status</TableHead>
-          <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider hidden lg:table-cell">Category</TableHead>
-          <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider">Risk</TableHead>
-          <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider hidden md:table-cell">Date</TableHead>
-          <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider text-right pr-4 md:pr-6">Actions</TableHead>
+        <TableRow className="border-[#ece6dc] bg-[#fbfaf8] hover:bg-[#fbfaf8]">
+          {["Name", "Analysis", "Reconciliation", "Decision", "Last Updated", "Documents", "Actions"].map((heading) => (
+            <TableHead key={heading} className="h-11 px-4 text-[11px] font-medium uppercase text-[#536070]">
+              {heading}
+            </TableHead>
+          ))}
         </TableRow>
       </TableHeader>
       <TableBody>
-        {Array.from({ length: 9 }).map((_, index) => (
-          <TableRow key={index} className="border-slate-100/60 h-11">
-            <TableCell className="py-2 pl-4 md:pl-6">
-              <div className="flex items-center gap-2.5">
-                <Skeleton className="h-7 w-7 shrink-0 rounded-md bg-[#f0ece6]" />
-                <div className="min-w-0 space-y-1.5">
-                  <Skeleton className="h-3.5 w-44 bg-slate-100" />
-                  <Skeleton className="hidden h-3 w-28 bg-slate-100 sm:block" />
+        {Array.from({ length: CASE_LIST_PAGE_SIZE }).map((_, index) => (
+          <TableRow key={index} className="h-[58px] border-[#ece6dc]">
+            <TableCell className="px-4">
+              <div className="flex items-center gap-3">
+                <Skeleton className="h-8 w-8 rounded-lg bg-[#eee7dd]" />
+                <div className="space-y-1.5">
+                  <Skeleton className="h-3.5 w-64 bg-slate-100" />
+                  <Skeleton className="h-3 w-36 bg-slate-100" />
                 </div>
               </div>
             </TableCell>
-            <TableCell className="py-2">
-              <Skeleton className="h-5 w-16 rounded bg-slate-100" />
-            </TableCell>
-            <TableCell className="py-2 hidden lg:table-cell">
-              <Skeleton className="h-3.5 w-28 bg-slate-100" />
-            </TableCell>
-            <TableCell className="py-2">
-              <Skeleton className="h-5 w-10 rounded bg-slate-100" />
-            </TableCell>
-            <TableCell className="py-2 hidden md:table-cell">
-              <Skeleton className="h-3.5 w-20 bg-slate-100" />
-            </TableCell>
-            <TableCell className="pr-4 md:pr-6 py-2">
-              <div className="flex justify-end gap-3">
-                <Skeleton className="h-3.5 w-9 bg-slate-100" />
-                <Skeleton className="h-3.5 w-3.5 rounded bg-slate-100" />
-              </div>
-            </TableCell>
+            <TableCell><Skeleton className="h-5 w-20 rounded-md bg-slate-100" /></TableCell>
+            <TableCell><Skeleton className="h-3.5 w-16 bg-slate-100" /></TableCell>
+            <TableCell><Skeleton className="h-8 w-24 bg-slate-100" /></TableCell>
+            <TableCell><Skeleton className="h-3.5 w-16 bg-slate-100" /></TableCell>
+            <TableCell><Skeleton className="h-6 w-6 rounded-md bg-slate-100" /></TableCell>
           </TableRow>
         ))}
       </TableBody>
@@ -187,16 +317,63 @@ function CasesTableSkeleton() {
   );
 }
 
-function CasesLoadingSkeleton({ viewMode }: { viewMode: ViewMode }) {
+function CasesMobileCards({
+  cases,
+  onDelete,
+}: {
+  cases: SavedCaseRecord[];
+  onDelete: (item: SavedCaseRecord) => void;
+}) {
+  const router = useRouter();
+
   return (
-    <>
-      <div className="md:hidden">
-        <CasesGridSkeleton />
-      </div>
-      <div className="hidden md:block">
-        {viewMode === "grid" ? <CasesGridSkeleton /> : <CasesTableSkeleton />}
-      </div>
-    </>
+    <div className="grid grid-cols-1 gap-3 p-4 sm:grid-cols-2">
+      {cases.map((item) => (
+        <Link
+          key={item.id}
+          href={`/cases/${item.id}`}
+          className="group rounded-xl border border-[#e6ded2] bg-white p-4 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md"
+          onFocus={() => router.prefetch(`/cases/${item.id}`)}
+          onMouseEnter={() => router.prefetch(`/cases/${item.id}`)}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 gap-3">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[#e6ded2] bg-[#f4eadf] text-[#4d3828]">
+                <Folder className="h-4 w-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium text-[#111827]">{getCaseTitle(item)}</div>
+                <div className="mt-1 truncate text-xs font-medium text-[#596579]">{getCaseSubtitle(item)}</div>
+              </div>
+            </div>
+            <button
+              type="button"
+              className="rounded-lg p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
+              aria-label="Move to recycle bin"
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                onDelete(item);
+              }}
+            >
+              <Trash2 className="h-4 w-4" />
+            </button>
+          </div>
+
+          <div className="mt-4 flex flex-wrap items-center gap-2 text-xs font-medium">
+            <CaseSignalBadge {...getAnalysisBadge(item)} />
+            <CaseSignalBadge {...getReconciliationBadge(item)} />
+            <CaseSignalBadge {...getDecisionBadge(item)} />
+            <span className="rounded-md border border-[#e6ded2] bg-[#fbfaf8] px-2 py-1 text-[#596579]">
+              {item.documentCount} docs
+            </span>
+            <span className="rounded-md border border-[#e6ded2] bg-[#fbfaf8] px-2 py-1 text-[#596579]">
+              {formatDate(item.createdAt)}
+            </span>
+          </div>
+        </Link>
+      ))}
+    </div>
   );
 }
 
@@ -210,7 +387,7 @@ export function CasesPage() {
   const [currentPage, setCurrentPage] = useState(1);
   const [totalCount, setTotalCount] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
-  const [viewMode, setViewMode] = useState<ViewMode>("table");
+  const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [pendingCase, setPendingCase] = useState<SavedCaseRecord | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const isMobileView = useIsMobileView();
@@ -273,19 +450,17 @@ export function CasesPage() {
         setStatus("error");
       });
 
-    return () => {
-      controller.abort();
-    };
+    return () => controller.abort();
   }, [cacheKey, currentPage, debouncedSearchQuery]);
 
-  const totalDocs = useMemo(() => cases.reduce((acc, curr) => acc + curr.documentCount, 0), [cases]);
+  const displayedCases = cases;
   const visiblePages = useMemo(
     () => getVisiblePages(currentPage, totalPages),
     [currentPage, totalPages]
   );
   const pageStart = totalCount === 0 ? 0 : (currentPage - 1) * CASE_LIST_PAGE_SIZE + 1;
   const pageEnd = Math.min(currentPage * CASE_LIST_PAGE_SIZE, totalCount);
-
+  const pageDocumentCount = cases.reduce((sum, item) => sum + item.documentCount, 0);
   const effectiveViewMode: ViewMode = isMobileView ? "grid" : viewMode;
 
   async function handleConfirmDelete() {
@@ -297,6 +472,7 @@ export function CasesPage() {
       await recycleCase(pendingCase.id);
       const nextTotalCount = Math.max(0, totalCount - 1);
       const nextTotalPages = Math.max(1, Math.ceil(nextTotalCount / CASE_LIST_PAGE_SIZE));
+
       setCases((current) => {
         const nextCases = current.filter((item) => item.id !== pendingCase.id);
         caseListCache.set(cacheKey, {
@@ -325,274 +501,138 @@ export function CasesPage() {
 
   return (
     <AppShell>
-      <div className="mx-auto max-w-[1500px] w-full px-4 sm:px-6 lg:px-8 py-8 animate-in fade-in duration-700 ease-out text-[#1a1a1a]">
+      <div className="min-h-full bg-[#f7f4ef] px-4 py-6 tracking-normal text-[#111827] sm:px-6 lg:px-8">
+        <div className="mx-auto flex w-full max-w-[1540px] flex-col gap-7">
+          <DirectoryHeader
+            totalCount={totalCount}
+            documentCount={pageDocumentCount}
+            viewMode={viewMode}
+            status={status}
+            onViewModeChange={setViewMode}
+          />
 
-        {/* MAIN CONTAINER matching the image's white box UI */}
-        <div className="bg-white border border-[#e5ddd0] rounded-2xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] overflow-hidden flex flex-col">
-
-          {/* =========================================
-              HEADER SECTION (Matches Image)
-              ========================================= */}
-          <div className="p-6 md:p-8 border-b border-[#e5ddd0] flex flex-col xl:flex-row justify-between items-start xl:items-center gap-6">
-
-            {/* Title Area */}
-            <div className="flex items-center gap-5">
-              <div className="w-14 h-14 bg-[#f0ece6] border border-[#e5ddd0] text-[#1a1a1a] rounded-2xl flex items-center justify-center shadow-sm">
-                <FolderOpen className="w-7 h-7" />
-              </div>
-              <div>
-                <h1 className="text-2xl font-extrabold text-[#1a1a1a] tracking-tight">Case Directory</h1>
-                <p className="text-sm font-semibold text-[#8a7f72] mt-0.5">Root</p>
-              </div>
-            </div>
-
-            {/* Action Cluster */}
-            <div className="flex items-center gap-3 w-full xl:w-auto overflow-x-auto pb-2 xl:pb-0">
-              {/* View Toggles */}
-              <div className="hidden md:flex items-center gap-1 border border-[#e5ddd0] rounded-lg p-1 bg-[#faf8f4] shrink-0">
-                <button
-                  type="button"
-                  onClick={() => setViewMode("grid")}
-                  className={`p-1.5 rounded-md transition-colors ${viewMode === "grid"
-                      ? "bg-white shadow-sm border border-[#e5ddd0] text-[#1a1a1a]"
-                      : "text-[#8a7f72] hover:text-[#1a1a1a]"
-                    }`}
-                  aria-label="Card view"
-                >
-                  <LayoutGrid className="w-4 h-4" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setViewMode("table")}
-                  className={`p-1.5 rounded-md transition-colors ${viewMode === "table"
-                      ? "bg-white shadow-sm border border-[#e5ddd0] text-[#1a1a1a]"
-                      : "text-[#8a7f72] hover:text-[#1a1a1a]"
-                    }`}
-                  aria-label="Table view"
-                >
-                  <List className="w-4 h-4" />
-                </button>
-              </div>
-
-              {/* Status Summary */}
-              <div className="hidden md:flex items-center text-xs font-semibold text-[#8a7f72] px-4 border-x border-[#e5ddd0] shrink-0">
-                {status === "loading" ? (
-                  <Skeleton className="h-3.5 w-36 bg-[#e5ddd0]" />
-                ) : (
-                  `${totalCount} folders • ${totalDocs} documents on this page`
-                )}
-              </div>
-
-              <Button asChild className="bg-[#1a1a1a] hover:bg-[#2d2d2d] text-white font-bold shadow-md shadow-[#1a1a1a]/15 shrink-0 transition-transform hover:scale-[1.02]">
-                <Link href="/workspace">
-                  <Upload className="w-4 h-4 mr-2" /> Upload
-                </Link>
-              </Button>
-            </div>
-          </div>
-
-          {/* =========================================
-              FILTER / SEARCH BAR (Matches Image)
-              ========================================= */}
-          <div className="p-6 md:px-8 md:py-6">
-            <div className="flex items-center rounded-xl border border-slate-200 bg-white shadow-sm">
-              <div className="flex-1 flex items-center px-5 py-3 bg-white">
-                <Search className="w-4 h-4 text-slate-400 mr-3 shrink-0" />
+          <section className="overflow-hidden rounded-2xl border border-[#e6ded2] bg-white shadow-[0_18px_45px_rgba(46,36,28,0.08)]">
+            <div className="border-b border-[#eee7df] p-4 md:p-6">
+              <label className="flex h-12 min-w-0 items-center gap-3 rounded-lg border border-[#ded8d0] bg-white px-4 shadow-sm focus-within:border-[#b9aa99]">
+                <Search className="h-5 w-5 shrink-0 text-[#647084]" />
                 <input
-                  type="text"
-                  placeholder="Search documents..."
                   value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full outline-none text-sm font-medium text-slate-900 placeholder:text-slate-400 bg-transparent"
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  placeholder="Search cases by name or identifier..."
+                  className="min-w-0 flex-1 bg-transparent text-sm font-medium text-[#111827] outline-none placeholder:text-[#8b94a4]"
                 />
-              </div>
+              </label>
             </div>
-
-            <div className="mt-6 flex items-center gap-1 text-sm font-semibold text-slate-500">
-              <span>Documents</span>
-              {status === "loading" ? (
-                <Skeleton className="h-3.5 w-32 bg-slate-100" />
-              ) : (
-                <span className="text-slate-400">
-                  ({pageStart}-{pageEnd} of {totalCount})
-                </span>
-              )}
-            </div>
-          </div>
-
-          {/* =========================================
-              TABLE AREA
-              ========================================= */}
-          <div className="w-full overflow-x-auto pb-4">
 
             {status === "loading" && (
-              <CasesLoadingSkeleton viewMode={viewMode} />
+              <div className="overflow-x-auto">
+                <CasesTableSkeleton />
+              </div>
             )}
 
             {status === "error" && (
-              <div className="m-8 rounded-2xl border border-red-200 bg-red-50 p-6 text-sm text-red-700 flex items-start shadow-sm">
-                <AlertTriangle className="mr-3 h-5 w-5 text-red-500 shrink-0 mt-0.5" />
-                <div>
-                  <div className="font-bold text-base mb-1">Failed to load cases</div>
-                  <div>{error}</div>
-                </div>
+              <div className="m-6 rounded-xl border border-rose-200 bg-rose-50 p-5 text-sm font-medium text-rose-700">
+                {error}
               </div>
             )}
 
-            {status === "ready" && cases.length === 0 && (
-              <div className="flex flex-col items-center justify-center py-24 text-center px-4">
-                <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-full bg-slate-50 border border-slate-100 shadow-sm">
-                  <Database className="h-8 w-8 text-slate-300" />
+            {status === "ready" && displayedCases.length === 0 && (
+              <div className="flex min-h-[340px] flex-col items-center justify-center px-6 text-center">
+                <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-[#e6ded2] bg-[#fbfaf8] text-[#9c8f80]">
+                  <FolderOpen className="h-7 w-7" />
                 </div>
-                <h3 className="text-lg font-bold text-slate-900">
-                  {debouncedSearchQuery ? "No matching cases" : "Directory is empty"}
-                </h3>
-                <p className="mt-2 text-sm font-medium text-slate-500 max-w-sm">
+                <h2 className="text-lg font-medium text-[#111827]">
+                  {debouncedSearchQuery ? "No matching cases" : "No cases yet"}
+                </h2>
+                <p className="mt-2 max-w-sm text-sm font-medium text-[#667085]">
                   {debouncedSearchQuery
-                    ? "Try a different case name, receiver, PO, invoice, or slug."
-                    : "No cases have been processed yet. Upload your first packet to see it here."}
+                    ? "Try changing the search."
+                    : "Upload your first packet to create a case directory entry."}
                 </p>
                 {!debouncedSearchQuery && (
-                  <Button asChild className="mt-6 rounded-lg font-bold bg-[#1a1a1a] hover:bg-[#2d2d2d] text-white">
-                    <Link href="/workspace">Start Upload</Link>
+                  <Button asChild className="mt-5 rounded-xl bg-[#2b1a10] font-medium text-white hover:bg-[#3b271a]">
+                    <Link href="/workspace">Upload case</Link>
                   </Button>
                 )}
               </div>
             )}
 
-            {status === "ready" && cases.length > 0 && (
-              effectiveViewMode === "grid" ? (
-                <div className="grid grid-cols-1 gap-3 px-4 sm:grid-cols-2 md:px-6 lg:grid-cols-3 xl:grid-cols-4">
-                  {cases.map((item) => (
-                    <Link
-                      key={item.id}
-                      href={`/cases/${item.id}`}
-                      className="group flex flex-col rounded-xl border border-[#e5ddd0] bg-white p-3.5 shadow-sm transition-all hover:-translate-y-px hover:border-[#d4c9b8] hover:shadow-md"
-                      onFocus={() => router.prefetch(`/cases/${item.id}`)}
-                      onMouseEnter={() => router.prefetch(`/cases/${item.id}`)}
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="flex min-w-0 items-start gap-2.5">
-                          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#e5ddd0] bg-[#f0ece6] text-[#5a5046]">
-                            <Folder className="h-4 w-4 fill-[#e5ddd0]" />
-                          </div>
-                          <div className="min-w-0">
-                            <div className="truncate text-sm font-bold text-[#1a1a1a] group-hover:text-[#5a5046] transition-colors" title={item.displayName}>
-                              {item.displayName}
-                            </div>
-                            <div className="mt-0.5 truncate text-[11px] font-medium text-slate-400">
-                              {item.receiverName || "Receiver pending"}
-                            </div>
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          className="shrink-0 rounded-md p-1 text-slate-300 transition-colors hover:bg-rose-50 hover:text-rose-500"
-                          aria-label="Delete"
-                          onClick={(e) => { e.preventDefault(); e.stopPropagation(); setPendingCase(item); }}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
+            {status === "ready" && displayedCases.length > 0 && effectiveViewMode === "grid" && (
+              <CasesMobileCards cases={displayedCases} onDelete={setPendingCase} />
+            )}
 
-                      <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
-                        <span
-                          className={`rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider ${getCaseStatusColor(item.status)}`}
-                        >
-                          {getCaseStatusLabel(item.status)}
-                        </span>
-                        <span
-                          className={`rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider ${getRiskColor(item.riskScore)}`}
-                        >
-                          R:{item.riskScore}
-                        </span>
-                      </div>
-
-                      <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5 text-[11px] font-semibold text-slate-400">
-                        <span>{item.documentCount} docs · {item.mismatchCount} issues</span>
-                        <span>{formatDateTime(item.createdAt)}</span>
-                      </div>
-                    </Link>
-                  ))}
-                </div>
-              ) : (
-                <Table className="w-full text-sm">
+            {status === "ready" && displayedCases.length > 0 && effectiveViewMode === "list" && (
+              <div className="overflow-x-auto">
+                <Table className="min-w-[1040px]">
                   <TableHeader>
-                    <TableRow className="border-b border-slate-100 hover:bg-transparent">
-                      <TableHead className="h-10 pl-4 md:pl-6 font-bold text-slate-400 text-[11px] uppercase tracking-wider">Name</TableHead>
-                      <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider">Status</TableHead>
-                      <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider hidden lg:table-cell">Category</TableHead>
-                      <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider">Risk</TableHead>
-                      <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider hidden md:table-cell">Date</TableHead>
-                      <TableHead className="h-10 font-bold text-slate-400 text-[11px] uppercase tracking-wider text-right pr-4 md:pr-6">Actions</TableHead>
+                    <TableRow className="border-[#ece6dc] bg-[#fbfaf8] hover:bg-[#fbfaf8]">
+                      <TableHead className="h-11 px-4 text-[11px] font-medium uppercase text-[#536070]">
+                        <span className="inline-flex items-center gap-1">Name <ChevronsUpDown className="h-3 w-3" /></span>
+                      </TableHead>
+                      <TableHead className="h-11 px-4 text-[11px] font-medium uppercase text-[#536070]">Analysis</TableHead>
+                      <TableHead className="h-11 px-4 text-[11px] font-medium uppercase text-[#536070]">Reconciliation</TableHead>
+                      <TableHead className="h-11 px-4 text-[11px] font-medium uppercase text-[#536070]">Decision</TableHead>
+                      <TableHead className="h-11 px-4 text-[11px] font-medium uppercase text-[#536070]">
+                        <span className="inline-flex items-center gap-1">Last Updated <ArrowUpDown className="h-3 w-3" /></span>
+                      </TableHead>
+                      <TableHead className="h-11 px-4 text-[11px] font-medium uppercase text-[#536070]">Documents</TableHead>
+                      <TableHead className="h-11 px-4 text-right text-[11px] font-medium uppercase text-[#536070]">Actions</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {cases.map((item) => (
+                    {displayedCases.map((item) => (
                       <TableRow
                         key={item.id}
-                        className="group cursor-pointer border-slate-100/60 transition-colors hover:bg-slate-50/80 h-11"
+                        className="group h-[58px] border-[#ece6dc] hover:bg-[#fbfaf8]"
                       >
-                        <TableCell className="py-2 pl-4 md:pl-6">
+                        <TableCell className="px-4 py-2">
                           <Link
                             href={`/cases/${item.id}`}
-                            className="flex items-center gap-2.5 outline-none"
+                            className="flex min-w-0 items-center gap-3"
                             onFocus={() => router.prefetch(`/cases/${item.id}`)}
                             onMouseEnter={() => router.prefetch(`/cases/${item.id}`)}
                           >
-                            <div className="w-7 h-7 rounded-md bg-[#f0ece6] border border-[#e5ddd0] text-[#5a5046] flex items-center justify-center shrink-0">
-                              <Folder className="w-3.5 h-3.5 fill-[#e5ddd0]" />
-                            </div>
-                            <div className="min-w-0">
-                              <span className="font-semibold text-[#1a1a1a] text-[13px] group-hover:text-[#5a5046] transition-colors truncate block max-w-[180px] xl:max-w-[280px]" title={item.displayName}>
-                                {item.displayName}
+                            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#e6ded2] bg-[#f3eee7] text-[#5b4b3d]">
+                              <Folder className="h-4 w-4" />
+                            </span>
+                            <span className="min-w-0">
+                              <span className="block max-w-[330px] truncate text-sm font-medium text-[#111827]">
+                                {getCaseTitle(item)}
                               </span>
-                              <span className="hidden sm:block truncate text-[11px] text-slate-400 mt-px" title={item.receiverName || ""}>
-                                {item.receiverName || ""}
+                              <span className="mt-0.5 block max-w-[280px] truncate text-xs font-medium text-[#596579]">
+                                {getCaseSubtitle(item)}
                               </span>
-                            </div>
+                            </span>
                           </Link>
                         </TableCell>
-
-                        <TableCell className="py-2">
-                          <span className={`font-bold text-[9px] uppercase tracking-wider px-2 py-0.5 rounded border ${getCaseStatusColor(item.status)}`}>
-                            {getCaseStatusLabel(item.status)}
+                        <TableCell className="px-4 py-2">
+                          <CaseSignalBadge {...getAnalysisBadge(item)} />
+                        </TableCell>
+                        <TableCell className="px-4 py-2">
+                          <CaseSignalBadge {...getReconciliationBadge(item)} />
+                        </TableCell>
+                        <TableCell className="px-4 py-2">
+                          <CaseSignalBadge {...getDecisionBadge(item)} />
+                        </TableCell>
+                        <TableCell className="px-4 py-2">
+                          <span className="block text-sm font-medium leading-5 text-[#334155]">{formatDate(item.createdAt)}</span>
+                          <span className="block text-sm font-medium leading-5 text-[#334155]">{formatTime(item.createdAt)}</span>
+                        </TableCell>
+                        <TableCell className="px-4 py-2">
+                          <span className="inline-flex items-center gap-2 text-sm font-medium text-[#475569]">
+                            <FileText className="h-4 w-4 text-[#647084]" />
+                            {item.documentCount} docs
                           </span>
                         </TableCell>
-
-                        <TableCell className="py-2 hidden lg:table-cell">
-                          <span className="text-[13px] font-medium text-slate-500 truncate block max-w-[160px]" title={item.category}>
-                            {item.category}
-                          </span>
-                        </TableCell>
-
-                        <TableCell className="py-2">
-                          <span className={`font-bold text-[9px] uppercase tracking-wider px-2 py-0.5 rounded border ${getRiskColor(item.riskScore)}`}>
-                            {item.riskScore}
-                          </span>
-                        </TableCell>
-
-                        <TableCell className="py-2 whitespace-nowrap text-[13px] font-medium text-slate-400 hidden md:table-cell">
-                          {formatDateTime(item.createdAt)}
-                        </TableCell>
-
-                        <TableCell className="pr-4 md:pr-6 py-2 text-right">
-                          <div className="flex items-center justify-end gap-3 opacity-0 group-hover:opacity-100 transition-opacity">
-                            <Link
-                              href={`/cases/${item.id}`}
-                              className="text-[13px] font-bold text-[#1a1a1a] hover:text-[#5a5046] transition-colors"
-                              onFocus={() => router.prefetch(`/cases/${item.id}`)}
-                              onMouseEnter={() => router.prefetch(`/cases/${item.id}`)}
-                            >
-                              Open
-                            </Link>
+                        <TableCell className="px-4 py-2 text-right">
+                          <div className="flex justify-end">
                             <button
                               type="button"
-                              className="text-slate-300 hover:text-rose-500 transition-colors"
-                              aria-label="Delete"
+                              className="rounded-lg p-2 text-[#111827] transition hover:bg-[#f4eee6] hover:text-rose-700"
+                              aria-label="Move to recycle bin"
                               onClick={() => setPendingCase(item)}
                             >
-                              <Trash2 className="w-3.5 h-3.5" />
+                              <MoreVertical className="h-5 w-5" />
                             </button>
                           </div>
                         </TableCell>
@@ -600,20 +640,20 @@ export function CasesPage() {
                     ))}
                   </TableBody>
                 </Table>
-              )
+              </div>
             )}
 
             {status === "ready" && totalCount > 0 && (
-              <div className="flex flex-col gap-3 border-t border-slate-100 px-4 py-4 text-sm font-semibold text-slate-500 md:flex-row md:items-center md:justify-between md:px-8">
+              <div className="flex flex-col gap-4 border-t border-[#eee7df] px-4 py-4 text-sm font-medium text-[#475569] md:flex-row md:items-center md:justify-between md:px-6">
                 <div>
-                  Showing {pageStart}-{pageEnd} of {totalCount}
+                  Showing {pageStart} to {pageEnd} of {totalCount} cases
                 </div>
-                <div className="flex items-center gap-1">
+                <div className="flex flex-wrap items-center gap-2">
                   <Button
                     type="button"
                     variant="outline"
-                    size="sm"
-                    className="h-8 border-[#d4c9b8] bg-white px-2 font-bold text-[#5a5046] hover:bg-[#faf8f4]"
+                    size="icon-sm"
+                    className="h-9 w-9 rounded-lg border-[#ded8d0] bg-white text-[#647084]"
                     disabled={currentPage <= 1}
                     onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}
                     aria-label="Previous page"
@@ -623,9 +663,9 @@ export function CasesPage() {
                   {visiblePages.map((page, index) => {
                     const previousPage = visiblePages[index - 1];
                     return (
-                      <div key={page} className="flex items-center gap-1">
+                      <div key={page} className="flex items-center gap-2">
                         {previousPage && page - previousPage > 1 && (
-                          <span className="px-1 text-slate-300">...</span>
+                          <span className="px-1 text-[#8b94a4]">...</span>
                         )}
                         <Button
                           type="button"
@@ -633,8 +673,8 @@ export function CasesPage() {
                           size="sm"
                           className={
                             page === currentPage
-                              ? "h-8 min-w-8 bg-[#1a1a1a] px-2 font-bold text-white hover:bg-[#2d2d2d]"
-                              : "h-8 min-w-8 border-[#d4c9b8] bg-white px-2 font-bold text-[#5a5046] hover:bg-[#faf8f4]"
+                              ? "h-9 min-w-9 rounded-lg bg-[#f1e7db] px-3 font-medium text-[#2b1a10] hover:bg-[#eadccd]"
+                              : "h-9 min-w-9 rounded-lg border-[#ded8d0] bg-white px-3 font-medium text-[#475569] hover:bg-[#fbfaf8]"
                           }
                           onClick={() => setCurrentPage(page)}
                         >
@@ -646,8 +686,8 @@ export function CasesPage() {
                   <Button
                     type="button"
                     variant="outline"
-                    size="sm"
-                    className="h-8 border-[#d4c9b8] bg-white px-2 font-bold text-[#5a5046] hover:bg-[#faf8f4]"
+                    size="icon-sm"
+                    className="h-9 w-9 rounded-lg border-[#ded8d0] bg-white text-[#647084]"
                     disabled={currentPage >= totalPages}
                     onClick={() => setCurrentPage((page) => Math.min(totalPages, page + 1))}
                     aria-label="Next page"
@@ -657,7 +697,7 @@ export function CasesPage() {
                 </div>
               </div>
             )}
-          </div>
+          </section>
         </div>
 
         <CaseConfirmDialog
@@ -677,7 +717,6 @@ export function CasesPage() {
           loading={isDeleting}
           onConfirm={handleConfirmDelete}
         />
-
       </div>
     </AppShell>
   );

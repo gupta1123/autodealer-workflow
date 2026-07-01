@@ -31,6 +31,7 @@ import {
 } from "@/lib/line-items";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { assessCaseTermsComplianceDetailed } from "@/lib/processing/pipeline";
+import { appendPacketUploadAiLog } from "@/lib/processing/packet-upload-debug";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import {
   getLegacyHiddenTermsReviewCount,
@@ -50,6 +51,8 @@ const LIST_COLUMNS =
 const LIST_COLUMNS_WITHOUT_RECYCLE_BIN =
   "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta";
 type CaseListScope = "active" | "deleted";
+type CaseListStatusFilter = "all" | "pending" | "in_review" | "completed" | "failed";
+type CaseListSortMode = "recent" | "oldest" | "name";
 type CaseListCursor = {
   sortValue: string;
   id: string;
@@ -71,6 +74,26 @@ type CaseListRow = {
   processing_meta?: unknown;
   deleted_at?: string | null;
 };
+
+function getCaseStatusesForFilter(filter: CaseListStatusFilter) {
+  if (filter === "pending") return ["draft"];
+  if (filter === "in_review") return ["processing"];
+  if (filter === "completed") return ["completed", "accepted"];
+  if (filter === "failed") return ["failed", "rejected"];
+  return null;
+}
+
+function readCaseStatusFilter(value: string | null): CaseListStatusFilter {
+  if (value === "pending" || value === "in_review" || value === "completed" || value === "failed") {
+    return value;
+  }
+  return "all";
+}
+
+function readCaseSortMode(value: string | null): CaseListSortMode {
+  if (value === "oldest" || value === "name") return value;
+  return "recent";
+}
 type PreparedUploadFile = {
   originalName: string;
   contentType: string;
@@ -97,6 +120,10 @@ type StoredCaseFileIdentity = {
   size_bytes: number | null;
   storage_bucket: string | null;
   storage_path: string | null;
+};
+type WebFormData = {
+  get(name: string): FormDataEntryValue | null;
+  getAll(name: string): FormDataEntryValue[];
 };
 
 function nowMs() {
@@ -282,6 +309,14 @@ function parseJsonField<T>(value: FormDataEntryValue | null, fieldName: string):
   return JSON.parse(value) as T;
 }
 
+function parseOptionalJsonField<T>(value: FormDataEntryValue | null): T | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  return JSON.parse(value) as T;
+}
+
 function parseComparisonOptions(value: FormDataEntryValue | null) {
   if (typeof value !== "string") {
     return DEFAULT_COMPARISON_OPTIONS;
@@ -411,14 +446,32 @@ async function getUploadFingerprint(files: PreparedUploadFile[]) {
   return `upload-set-sha256-v1:${await sha256Hex(getUploadContentSignature(files))}`;
 }
 
-function getUploadDuplicateMeta(files: PreparedUploadFile[], uploadFingerprint: string | null) {
+function getUploadDuplicateMeta(
+  files: PreparedUploadFile[],
+  uploadFingerprint: string | null,
+  options?: { duplicateRunId?: string | null }
+) {
   if (!uploadFingerprint) return {};
 
+  const uploadContentSignature = getUploadContentSignature(files);
+  const uploadLegacySignature = getLegacyUploadSignature(files);
   return {
-    uploadFingerprint,
+    uploadFingerprint: options?.duplicateRunId
+      ? `${uploadFingerprint}:test-copy:${options.duplicateRunId}`
+      : uploadFingerprint,
     uploadFingerprintVersion: "upload-set-sha256-v1",
-    uploadContentSignature: getUploadContentSignature(files),
-    uploadLegacySignature: getLegacyUploadSignature(files),
+    ...(options?.duplicateRunId
+      ? {
+          duplicateUploadMode: "test-copy",
+          duplicateUploadRunId: options.duplicateRunId,
+          originalUploadFingerprint: uploadFingerprint,
+          originalUploadContentSignature: uploadContentSignature,
+          originalUploadLegacySignature: uploadLegacySignature,
+        }
+      : {
+          uploadContentSignature,
+          uploadLegacySignature,
+        }),
     uploadFileFingerprints: files.map((file) => ({
       name: file.originalName,
       sizeBytes: file.sizeBytes,
@@ -438,6 +491,15 @@ function readStringMeta(value: unknown, key: string) {
   const record = toRecord(value);
   const raw = record[key];
   return typeof raw === "string" && raw.trim().length > 0 ? raw : null;
+}
+
+function readBooleanFormValue(value: unknown) {
+  return typeof value === "string" && /^(?:1|true|yes)$/i.test(value.trim());
+}
+
+function isDuplicateTestCopy(value: unknown) {
+  const record = toRecord(value);
+  return record.duplicateUploadMode === "test-copy";
 }
 
 function isDuplicateUploadConstraintError(error: unknown) {
@@ -495,7 +557,7 @@ async function fetchAllOwnerCaseCandidates(
     if (!data || data.length < pageSize) break;
   }
 
-  return rows.filter((row) => !isCaseRecycled(row.processing_meta));
+  return rows.filter((row) => !isCaseRecycled(row.processing_meta) && !isDuplicateTestCopy(row.processing_meta));
 }
 
 function chunk<T>(values: T[], size: number) {
@@ -923,6 +985,93 @@ function mapCaseRow(
   };
 }
 
+async function fetchLegacyCaseListRows(params: {
+  supabase: ReturnType<typeof createSupabaseAdminClient>;
+  userId: string;
+  scope: CaseListScope;
+  statusValues: string[] | null;
+  searchQuery: string;
+  sortMode: CaseListSortMode;
+}) {
+  const pageSize = 1000;
+  const rows: CaseListRow[] = [];
+  const searchTokens = params.searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
+
+  for (let offset = 0; ; offset += pageSize) {
+    let query = params.supabase
+      .from("packet_cases")
+      .select(LIST_COLUMNS_WITHOUT_RECYCLE_BIN)
+      .eq("owner_user_id", params.userId);
+
+    if (params.statusValues) {
+      query = query.in("status", params.statusValues);
+    }
+
+    if (params.sortMode === "name") {
+      query = query.order("display_name", { ascending: true }).order("id", { ascending: true });
+    } else {
+      query = query.order("created_at", { ascending: params.sortMode === "oldest" }).order("id", { ascending: false });
+    }
+
+    const result = await query.range(offset, offset + pageSize - 1);
+    if (result.error) {
+      throw result.error;
+    }
+
+    rows.push(
+      ...((result.data ?? []) as Omit<CaseListRow, "deleted_at">[]).map((row) => ({
+        ...row,
+        deleted_at: getRecycleBinDeletedAt(row.processing_meta),
+      }))
+    );
+
+    if (!result.data || result.data.length < pageSize) break;
+  }
+
+  const searchedRows = searchTokens.length
+    ? rows.filter((row) => {
+        const searchable = [
+          row.display_name,
+          row.buyer_name,
+          row.po_number,
+          row.invoice_number,
+          row.slug,
+        ]
+          .filter((value): value is string => Boolean(value))
+          .join(" ")
+          .toLowerCase();
+        return searchTokens.every((token) => searchable.includes(token));
+      })
+    : rows;
+
+  const scopedRows =
+    params.scope === "deleted"
+      ? searchedRows
+          .filter((row) => isCaseRecycled(row.processing_meta))
+          .sort((a, b) => {
+            const aTime = new Date(a.deleted_at ?? 0).getTime();
+            const bTime = new Date(b.deleted_at ?? 0).getTime();
+            return bTime - aTime || b.id.localeCompare(a.id);
+          })
+      : searchedRows.filter((row) => !isCaseRecycled(row.processing_meta));
+
+  if (params.scope === "active" && params.sortMode === "name") {
+    return [...scopedRows].sort((a, b) => a.display_name.localeCompare(b.display_name) || a.id.localeCompare(b.id));
+  }
+  if (params.scope === "active" && params.sortMode === "oldest") {
+    return [...scopedRows].sort(
+      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime() || a.id.localeCompare(b.id)
+    );
+  }
+  if (params.scope === "active") {
+    return [...scopedRows].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime() || b.id.localeCompare(a.id)
+    );
+  }
+
+  return scopedRows;
+}
+
 export async function GET(request: Request) {
   const startedAt = nowMs();
   const timing: CaseListTiming = {};
@@ -948,6 +1097,9 @@ export async function GET(request: Request) {
     const scope = requestedScope === "deleted" ? "deleted" : "active";
     const cursor = decodeCaseListCursor(url.searchParams.get("cursor"));
     const searchQuery = normalizeCaseSearchQuery(url.searchParams.get("q"));
+    const statusFilter = readCaseStatusFilter(url.searchParams.get("status"));
+    const sortMode = readCaseSortMode(url.searchParams.get("sort"));
+    const statusValues = getCaseStatusesForFilter(statusFilter);
     const limit =
       Number.isFinite(requestedLimit) && requestedLimit > 0
         ? Math.min(Math.floor(requestedLimit), MAX_CASE_LIST_LIMIT)
@@ -972,16 +1124,26 @@ export async function GET(request: Request) {
 
       if (scope === "deleted") {
         query = query.not("deleted_at", "is", null);
+        if (statusValues) {
+          query = query.in("status", statusValues);
+        }
         if (cursor) {
           query = query.or(`deleted_at.lt.${cursor.sortValue},and(deleted_at.eq.${cursor.sortValue},id.lt.${cursor.id})`);
         }
         query = query.order("deleted_at", { ascending: false }).order("id", { ascending: false });
       } else {
         query = query.is("deleted_at", null);
+        if (statusValues) {
+          query = query.in("status", statusValues);
+        }
         if (cursor) {
           query = query.or(`created_at.lt.${cursor.sortValue},and(created_at.eq.${cursor.sortValue},id.lt.${cursor.id})`);
         }
-        query = query.order("created_at", { ascending: false }).order("id", { ascending: false });
+        if (sortMode === "name") {
+          query = query.order("display_name", { ascending: true }).order("id", { ascending: true });
+        } else {
+          query = query.order("created_at", { ascending: sortMode === "oldest" }).order("id", { ascending: false });
+        }
       }
 
       if (searchQuery) {
@@ -999,7 +1161,7 @@ export async function GET(request: Request) {
       totalCount = usePageNumbers ? (result.count ?? 0) : null;
       data = result.data as CaseListRow[];
     } catch (error) {
-      if (searchQuery && isMissingSearchTextColumn(error)) {
+      if (searchQuery && isMissingSearchTextColumn(error) && !isRecycleBinSchemaMissing(error)) {
         const queryStartedAt = nowMs();
         const searchPattern = `%${escapePostgrestOrValue(escapeIlikePattern(searchQuery))}%`;
         let fallbackSearchQuery = supabase
@@ -1009,6 +1171,9 @@ export async function GET(request: Request) {
 
         if (scope === "deleted") {
           fallbackSearchQuery = fallbackSearchQuery.not("deleted_at", "is", null);
+          if (statusValues) {
+            fallbackSearchQuery = fallbackSearchQuery.in("status", statusValues);
+          }
           if (cursor) {
             fallbackSearchQuery = fallbackSearchQuery.or(
               `deleted_at.lt.${cursor.sortValue},and(deleted_at.eq.${cursor.sortValue},id.lt.${cursor.id})`
@@ -1019,14 +1184,23 @@ export async function GET(request: Request) {
             .order("id", { ascending: false });
         } else {
           fallbackSearchQuery = fallbackSearchQuery.is("deleted_at", null);
+          if (statusValues) {
+            fallbackSearchQuery = fallbackSearchQuery.in("status", statusValues);
+          }
           if (cursor) {
             fallbackSearchQuery = fallbackSearchQuery.or(
               `created_at.lt.${cursor.sortValue},and(created_at.eq.${cursor.sortValue},id.lt.${cursor.id})`
             );
           }
-          fallbackSearchQuery = fallbackSearchQuery
-            .order("created_at", { ascending: false })
-            .order("id", { ascending: false });
+          if (sortMode === "name") {
+            fallbackSearchQuery = fallbackSearchQuery
+              .order("display_name", { ascending: true })
+              .order("id", { ascending: true });
+          } else {
+            fallbackSearchQuery = fallbackSearchQuery
+              .order("created_at", { ascending: sortMode === "oldest" })
+              .order("id", { ascending: false });
+          }
         }
 
         fallbackSearchQuery = fallbackSearchQuery.or(
@@ -1055,45 +1229,23 @@ export async function GET(request: Request) {
         }
 
         const queryStartedAt = nowMs();
-        const fallbackLimit =
-          usePageNumbers && rangeEnd !== null
-            ? Math.min(rangeEnd + limit + 1, 1000)
-            : limit + 1;
-        const fallback = await supabase
-          .from("packet_cases")
-          .select(LIST_COLUMNS_WITHOUT_RECYCLE_BIN)
-          .eq("owner_user_id", user.id)
-          .order("created_at", { ascending: false })
-          .order("id", { ascending: false })
-          .limit(fallbackLimit);
+        const legacyRows = await fetchLegacyCaseListRows({
+          supabase,
+          userId: user.id,
+          scope,
+          statusValues,
+          searchQuery,
+          sortMode,
+        });
         timing.caseQuery = (timing.caseQuery ?? 0) + nowMs() - queryStartedAt;
 
-        if (fallback.error) {
-          throw fallback.error;
-        }
-
-        const rows = (fallback.data ?? []).map((row) => ({
-          ...row,
-          deleted_at: getRecycleBinDeletedAt(row.processing_meta),
-        }));
-
-        const filteredRows =
-          scope === "deleted"
-            ? rows
-                .filter((row) => isCaseRecycled(row.processing_meta))
-                .sort((a, b) => {
-                  const aTime = new Date(a.deleted_at ?? 0).getTime();
-                  const bTime = new Date(b.deleted_at ?? 0).getTime();
-                  return bTime - aTime;
-                })
-            : rows.filter((row) => !isCaseRecycled(row.processing_meta));
-
         if (usePageNumbers && rangeStart !== null && rangeEnd !== null) {
-          data = filteredRows.slice(rangeStart, rangeEnd + 1);
-          const hasAnotherFetchedRow = filteredRows.length > rangeEnd + 1;
-          totalCount = hasAnotherFetchedRow ? rangeEnd + 2 : filteredRows.length;
+          data = legacyRows.slice(rangeStart, rangeEnd + 1);
+          totalCount = legacyRows.length;
         } else {
-          data = filteredRows;
+          const cursorIndex = cursor ? legacyRows.findIndex((row) => row.id === cursor.id) : -1;
+          const startIndex = cursorIndex >= 0 ? cursorIndex + 1 : 0;
+          data = legacyRows.slice(startIndex, startIndex + limit + 1);
           totalCount = null;
         }
       }
@@ -1178,21 +1330,28 @@ export async function POST(request: Request) {
     }
 
     supabase = createSupabaseAdminClient();
-    const formData = await request.formData();
+    const formData = (await request.formData()) as unknown as WebFormData;
     const mode = typeof formData.get("mode") === "string" ? formData.get("mode") : null;
+    const allowDuplicateUpload = readBooleanFormValue(formData.getAll("allowDuplicate")[0]);
     const files = formData.getAll("files").filter(isFileEntry);
     const preparedFiles = await prepareUploadFiles(files);
+    appendPacketUploadAiLog(
+      `[packet-upload-ai-flow] case-create mode=${mode ?? "processed"}; files=${preparedFiles.length}; allow_duplicate=${allowDuplicateUpload}`
+    );
     const uploadFingerprint = await getUploadFingerprint(preparedFiles);
-    const duplicateCase = await findDuplicateCaseForUpload({
-      supabase,
-      ownerUserId: user.id,
-      files: preparedFiles,
-      uploadFingerprint,
-    });
-    if (duplicateCase) {
-      return duplicateCaseResponse(request, duplicateCase);
+    if (!allowDuplicateUpload) {
+      const duplicateCase = await findDuplicateCaseForUpload({
+        supabase,
+        ownerUserId: user.id,
+        files: preparedFiles,
+        uploadFingerprint,
+      });
+      if (duplicateCase) {
+        return duplicateCaseResponse(request, duplicateCase);
+      }
     }
-    const uploadDuplicateMeta = getUploadDuplicateMeta(preparedFiles, uploadFingerprint);
+    const duplicateRunId = allowDuplicateUpload ? crypto.randomUUID() : null;
+    const uploadDuplicateMeta = getUploadDuplicateMeta(preparedFiles, uploadFingerprint, { duplicateRunId });
     const uploadGroups = parseUploadGroups(formData.get("uploadGroups"));
 
     if (mode === "draft") {
@@ -1307,6 +1466,7 @@ export async function POST(request: Request) {
       fieldConfiguration
     );
     const comparisonOptions = parseComparisonOptions(formData.get("comparisonOptions"));
+    const packetAiUsage = parseOptionalJsonField<Record<string, unknown>>(formData.get("packetAiUsage"));
     if (!documents.length) {
       return jsonWithCors(request, 
         { error: "No processed documents were provided to save." },
@@ -1366,6 +1526,7 @@ export async function POST(request: Request) {
         termsComplianceChecklist: termsCompliance.checklist,
         termsComplianceMismatchMode: TERMS_COMPLIANCE_MISMATCH_MODE,
         uploadGroups,
+        ...(packetAiUsage ? { packetAiUsage } : {}),
         ...uploadDuplicateMeta,
       },
     };

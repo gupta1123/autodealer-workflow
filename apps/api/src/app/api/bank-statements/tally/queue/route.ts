@@ -17,8 +17,6 @@ import { queueTallyMasterSyncCommand } from "@/lib/tally/master-sync";
 
 export const runtime = "nodejs";
 
-const NON_PARTY_TALLY_FALLBACK_LEDGER = "Suspense";
-
 type QueuePayload = {
   connectionId?: string;
   transactionIds?: string[];
@@ -97,6 +95,7 @@ type TransactionStatusSummaryRow = {
 type TallyLedgerRow = {
   tally_name: string;
   parent_name: string | null;
+  raw_payload?: Record<string, unknown> | null;
 };
 
 type QueueConnectionRow = {
@@ -202,6 +201,17 @@ function normalizeAdvanceAdjustments(value: unknown) {
 function isSuspenseLedger(value?: string | null) {
   const normalized = normalizeName(value);
   return normalized === "suspense" || normalized === "suspenseac" || normalized === "suspenseaccount";
+}
+
+function toNullableBoolean(value: unknown) {
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return null;
+
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return null;
+  if (["yes", "true", "1", "enabled", "enable"].includes(normalized)) return true;
+  if (["no", "false", "0", "disabled", "disable"].includes(normalized)) return false;
+  return null;
 }
 
 function normalizeReferenceNumber(value?: string | null) {
@@ -327,7 +337,7 @@ export async function POST(request: Request) {
       ? await getLocalTallyConnection(submittedConnectionId, user.id)
       : await supabase
           .from("tally_connections")
-          .select("id, owner_user_id, last_company_name")
+          .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_heartbeat_at")
           .eq("id", submittedConnectionId)
           .eq("owner_user_id", user.id)
           .maybeSingle()
@@ -348,13 +358,12 @@ export async function POST(request: Request) {
         : null
       : await supabase
           .from("tally_connections")
-          .select("id, owner_user_id, last_company_name")
+          .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_heartbeat_at")
+          .eq("id", submittedConnectionId)
           .eq("owner_user_id", user.id)
           .in("status", ["company_loaded", "tally_reachable", "bridge_connected"])
           .eq("last_tally_reachable", true)
           .gte("last_heartbeat_at", liveHeartbeatCutoff)
-          .order("last_heartbeat_at", { ascending: false })
-          .limit(1)
           .maybeSingle()
           .then(({ data, error }) => {
             if (error) throw error;
@@ -363,7 +372,7 @@ export async function POST(request: Request) {
     if (!liveConnection) {
       return jsonWithCors(
         request,
-        { error: "No active Tally bridge connection found. Refresh the connection and try again." },
+        { error: "The selected Tally bridge connection is not active. Refresh that connection and try again." },
         { status: 400 }
       );
     }
@@ -518,19 +527,19 @@ export async function POST(request: Request) {
 
     if (existingCommandError) throw existingCommandError;
 
-    const activeCommandIds = new Set(
+    const blockingCommandIds = new Set(
       ((existingCommandRows ?? []) as unknown as ExistingCommandRow[])
-        .filter((row) => row.status === "queued" || row.status === "claimed")
+        .filter((row) => row.status === "queued" || row.status === "claimed" || row.status === "succeeded")
         .map((row) => row.id)
     );
     const blockedFingerprints = new Set(
       postingLogs
-        .filter((row) => row.status === "posted" || (row.command_id && activeCommandIds.has(row.command_id)))
+        .filter((row) => row.status === "posted" || (row.command_id && blockingCommandIds.has(row.command_id)))
         .map((row) => row.fingerprint)
     );
     const blockedReferences = new Set(
       postingLogs
-        .filter((row) => row.status === "posted" || (row.command_id && activeCommandIds.has(row.command_id)))
+        .filter((row) => row.status === "posted" || (row.command_id && blockingCommandIds.has(row.command_id)))
         .map((row) => normalizeReferenceNumber(row.reference_number))
         .filter(Boolean)
     );
@@ -540,6 +549,7 @@ export async function POST(request: Request) {
       missingAccount: 0,
       missingBankLedger: 0,
       missingCounterpartyLedger: 0,
+      billWiseNotEnabled: 0,
       ledgerNotSynced: 0,
       bankLedgerNotSynced: 0,
       counterpartyLedgerNotSynced: 0,
@@ -556,10 +566,11 @@ export async function POST(request: Request) {
         })).masters.map((ledger) => ({
           tally_name: ledger.tally_name,
           parent_name: ledger.parent_name,
+          raw_payload: ledger.raw_payload,
         }))
       : await supabase
           .from("tally_masters")
-          .select("tally_name, parent_name")
+          .select("tally_name, parent_name, raw_payload")
           .eq("owner_user_id", user.id)
           .eq("connection_id", connectionId)
           .eq("master_type", "ledger")
@@ -578,6 +589,15 @@ export async function POST(request: Request) {
         normalizeName(ledger.tally_name),
         ledger.parent_name ?? "",
       ])
+    );
+    const ledgerBillWiseByName = new Map(
+      (ledgerRows as unknown as TallyLedgerRow[]).map((ledger) => {
+        const raw = ledger.raw_payload && typeof ledger.raw_payload === "object" ? ledger.raw_payload : {};
+        return [
+          normalizeName(ledger.tally_name),
+          toNullableBoolean(raw.isBillWiseOn) ?? toNullableBoolean(raw.maintainBalancesBillByBill),
+        ] as const;
+      })
     );
 
     function ledgerExists(ledgerName: string) {
@@ -607,37 +627,46 @@ export async function POST(request: Request) {
       return isPartyParent(ledgerParentByName.get(normalizeName(ledgerName)) || "");
     }
 
-    const commandInputs = transactions.map((transaction) => {
-        const selectedLedger = ledgerSelectionByTransactionId.get(transaction.id);
-        const createLedgerName = selectedLedger?.createLedgerName || "";
-        const legacyFallback = requestedTransactionIds.length === 1 ? toText(body.counterpartyLedgerName, 500) : "";
-        const storedAiLedgerName =
-          transaction.suggested_ledger_name &&
-          hasAiStoredLedgerSuggestion(transaction) &&
-          Number(transaction.suggestion_confidence ?? 0) >= 0.85 &&
-          !isSuspenseLedger(transaction.suggested_ledger_name)
-            ? transaction.suggested_ledger_name
-            : "";
-        const confirmedLedgerName =
-          transaction.confirmed_ledger_name && !(isSuspenseLedger(transaction.confirmed_ledger_name) && storedAiLedgerName)
-            ? transaction.confirmed_ledger_name
-            : "";
-        const counterpartyLedgerName =
-          createLedgerName ||
-          selectedLedger?.counterpartyLedgerName ||
-          confirmedLedgerName ||
-          storedAiLedgerName ||
-          legacyFallback;
+    function isSundryDebtorLedger(ledgerName: string) {
+      const parent = normalizeName(ledgerParentByName.get(normalizeName(ledgerName)) || "");
+      return parent.includes("sundry debtor");
+    }
 
-        return {
-          transaction,
-          counterpartyLedgerName,
-          createLedgerName,
-          createLedgerParentName: selectedLedger?.createLedgerParentName || "Sundry Creditors",
-          billAllocations: selectedLedger?.billAllocations ?? [],
-          advanceAdjustments: selectedLedger?.advanceAdjustments ?? [],
-        };
-      });
+    function billWiseIsEnabled(ledgerName: string) {
+      return ledgerBillWiseByName.get(normalizeName(ledgerName)) === true;
+    }
+
+    const commandInputs = transactions.map((transaction) => {
+      const selectedLedger = ledgerSelectionByTransactionId.get(transaction.id);
+      const createLedgerName = selectedLedger?.createLedgerName || "";
+      const legacyFallback = requestedTransactionIds.length === 1 ? toText(body.counterpartyLedgerName, 500) : "";
+      const storedAiLedgerName =
+        transaction.suggested_ledger_name &&
+        hasAiStoredLedgerSuggestion(transaction) &&
+        Number(transaction.suggestion_confidence ?? 0) >= 0.85 &&
+        !isSuspenseLedger(transaction.suggested_ledger_name)
+          ? transaction.suggested_ledger_name
+          : "";
+      const confirmedLedgerName =
+        transaction.confirmed_ledger_name && !(isSuspenseLedger(transaction.confirmed_ledger_name) && storedAiLedgerName)
+          ? transaction.confirmed_ledger_name
+          : "";
+      const counterpartyLedgerName =
+        createLedgerName ||
+        selectedLedger?.counterpartyLedgerName ||
+        confirmedLedgerName ||
+        storedAiLedgerName ||
+        legacyFallback;
+
+      return {
+        transaction,
+        counterpartyLedgerName,
+        createLedgerName,
+        createLedgerParentName: selectedLedger?.createLedgerParentName || "Sundry Creditors",
+        billAllocations: selectedLedger?.billAllocations ?? [],
+        advanceAdjustments: selectedLedger?.advanceAdjustments ?? [],
+      };
+    });
 
     const queuedCreateLedgerKeys = new Set<string>();
     const commands: TallyCommandInsert[] = commandInputs.flatMap(
@@ -682,16 +711,16 @@ export async function POST(request: Request) {
           return [];
         }
         const originalVoucherType = getVoucherType(transaction);
+        if (originalVoucherType === "Receipt" && isSundryDebtorLedger(counterpartyLedgerName) && !billWiseIsEnabled(counterpartyLedgerName)) {
+          skipped.billWiseNotEnabled += 1;
+          return [];
+        }
         const counterpartyIsPartyLedger = shouldCreateCounterpartyLedger
           ? isPartyParent(createLedgerParentName)
           : isPartyLedger(counterpartyLedgerName);
-        const usesTallyFallbackLedger =
-          !counterpartyIsPartyLedger &&
-          (originalVoucherType === "Payment" || originalVoucherType === "Receipt") &&
-          ledgerExists(NON_PARTY_TALLY_FALLBACK_LEDGER);
-        const tallyCounterpartyLedgerName = usesTallyFallbackLedger
-          ? NON_PARTY_TALLY_FALLBACK_LEDGER
-          : counterpartyLedgerName;
+        const voucherCounterpartyIsPartyLedger =
+          counterpartyIsPartyLedger || billAllocations.length > 0 || advanceAdjustments.length > 0;
+        const tallyCounterpartyLedgerName = counterpartyLedgerName;
         const statementImport = transaction.statement_import_id
           ? importsById.get(transaction.statement_import_id)
           : null;
@@ -736,8 +765,8 @@ export async function POST(request: Request) {
             bankLedgerName,
             counterpartyLedgerName: tallyCounterpartyLedgerName,
             matchedLedgerName: counterpartyLedgerName,
-            counterpartyIsPartyLedger: usesTallyFallbackLedger ? true : counterpartyIsPartyLedger,
-            postingFallbackReason: usesTallyFallbackLedger ? "non_party_bank_adjustment" : null,
+            counterpartyIsPartyLedger: voucherCounterpartyIsPartyLedger,
+            postingFallbackReason: null,
             bankLedgerEntryIsDebit: bankEntryIsDebit(transaction),
             amount,
             narration: transaction.description,
@@ -750,7 +779,7 @@ export async function POST(request: Request) {
           },
         });
 
-        if (advanceAdjustments.length > 0 && counterpartyIsPartyLedger && !usesTallyFallbackLedger) {
+        if (advanceAdjustments.length > 0 && voucherCounterpartyIsPartyLedger) {
           nextCommands.push({
             connection_id: connectionId,
             owner_user_id: user.id,

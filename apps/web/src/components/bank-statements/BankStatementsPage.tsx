@@ -1299,7 +1299,7 @@ function getSelectedLedger(transaction: ReviewTransaction, ledgerMasters: TallyM
   return findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
 }
 
-function isCustomerReceiptTransaction(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
+function isSundryDebtorReceiptTransaction(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
   const credit = parseNumber(transaction.creditAmount) ?? 0;
   if (credit <= 0) return false;
   if (!transaction.selectedLedgerName.trim() || isSuspenseLedgerName(transaction.selectedLedgerName)) return false;
@@ -1309,7 +1309,21 @@ function isCustomerReceiptTransaction(transaction: ReviewTransaction, ledgerMast
   const text = `${transaction.transactionType} ${transaction.category} ${transaction.description}`.toLowerCase();
   if (/\brefund|reversal|failed|chargeback|internal transfer|self transfer|own account\b/.test(text)) return false;
   const isSundryDebtor = /sundry\s+debtors/i.test(parent) || ledger?.ledgerType === "customer";
-  return isSundryDebtor && ledger?.billWiseEnabled !== false;
+  return isSundryDebtor;
+}
+
+function getBillWiseBlockReason(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
+  if (!isSundryDebtorReceiptTransaction(transaction, ledgerMasters)) return "";
+  const ledger = getSelectedLedger(transaction, ledgerMasters);
+  if (ledger?.billWiseEnabled === true) return "";
+  if (ledger?.billWiseEnabled === false) {
+    return "Bill-wise is disabled for this customer ledger in Tally. Enable bill-wise details and sync ledgers again.";
+  }
+  return "Bill-wise status is not synced for this customer ledger. Sync Tally ledgers before posting this receipt.";
+}
+
+function isCustomerReceiptTransaction(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
+  return isSundryDebtorReceiptTransaction(transaction, ledgerMasters) && !getBillWiseBlockReason(transaction, ledgerMasters);
 }
 
 function getBillAllocationLabel(draft?: BillAllocationDraft | null) {
@@ -1690,12 +1704,14 @@ function transactionQueueKey(transaction: {
   debitAmount?: string | number | null;
   creditAmount?: string | number | null;
 }) {
+  const normalizedDebit = parseNumber(transaction.debitAmount);
+  const normalizedCredit = parseNumber(transaction.creditAmount);
   return [
     transaction.transactionDate,
     transaction.referenceNumber || "",
     transaction.description,
-    String(transaction.debitAmount ?? ""),
-    String(transaction.creditAmount ?? ""),
+    normalizedDebit === null ? "" : normalizedDebit.toFixed(2),
+    normalizedCredit === null ? "" : normalizedCredit.toFixed(2),
   ].join("|");
 }
 
@@ -1887,13 +1903,18 @@ export function BankStatementsPage() {
     () => queueableReviewTransactions.filter((transaction) => isCustomerReceiptTransaction(transaction, ledgerMasters)),
     [ledgerMasters, queueableReviewTransactions]
   );
+  const billAllocationReviewTransactions = useMemo(
+    () => queueableReviewTransactions.filter((transaction) => isSundryDebtorReceiptTransaction(transaction, ledgerMasters)),
+    [ledgerMasters, queueableReviewTransactions]
+  );
   const blockingBillAllocationCount = useMemo(
     () =>
-      pendingBillEligibleTransactions.filter((transaction) => {
+      billAllocationReviewTransactions.filter((transaction) => {
+        if (getBillWiseBlockReason(transaction, ledgerMasters)) return true;
         const draft = billAllocationsByTransactionId[transaction.id];
         return !draft || draft.status === "cannot_match_yet" || draft.status === "needs_review" || draft.status === "stale_data";
       }).length,
-    [billAllocationsByTransactionId, pendingBillEligibleTransactions]
+    [billAllocationReviewTransactions, billAllocationsByTransactionId, ledgerMasters]
   );
   const filteredTransactions = useMemo(() => {
     const normalizedSearch = normalizeName(reviewSearch);
@@ -2590,7 +2611,7 @@ export function BankStatementsPage() {
       showToast("error", "Select a Tally connection before matching pending bills.");
       return;
     }
-    if (pendingBillEligibleTransactions.length === 0) {
+    if (billAllocationReviewTransactions.length === 0) {
       showToast("info", "No eligible customer receipt rows were found. Confirm a Sundry Debtors ledger with bill-wise enabled.");
       return;
     }
@@ -2607,6 +2628,29 @@ export function BankStatementsPage() {
 
       const nextDrafts: Record<string, BillAllocationDraft> = {};
       for (const transaction of queueableReviewTransactions) {
+        const billWiseBlockReason = getBillWiseBlockReason(transaction, ledgerMasters);
+        if (billWiseBlockReason) {
+          nextDrafts[transaction.id] = {
+            status: "cannot_match_yet",
+            caseType: "bill_wise_not_enabled",
+            caseLabel: "Cannot Match Yet",
+            reason: billWiseBlockReason,
+            receiptAmount: parseNumber(transaction.creditAmount) ?? 0,
+            totalAllocatedAmount: 0,
+            newAdvanceAmount: 0,
+            totalExistingAdvanceAdjustmentAmount: 0,
+            unallocatedAmount: parseNumber(transaction.creditAmount) ?? 0,
+            allocations: [],
+            advanceAdjustments: [],
+            applyExistingAdvances: false,
+            candidateBills: [],
+            existingAdvances: [],
+            requiresUserReview: true,
+            isEligibleForPosting: false,
+          };
+          continue;
+        }
+
         if (!isCustomerReceiptTransaction(transaction, ledgerMasters)) {
           nextDrafts[transaction.id] = {
             status: "not_applicable",
@@ -3957,13 +4001,13 @@ export function BankStatementsPage() {
                       matchingBills ||
                       tallyPostingInProgress ||
                       Boolean(tallyPostingStatus) ||
-                      pendingBillEligibleTransactions.length === 0
+                      billAllocationReviewTransactions.length === 0
                     }
                     type="button"
                     variant="outline"
                   >
                     {matchingBills ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                    Match Pending Bills ({pendingBillEligibleTransactions.length})
+                    Match Pending Bills ({billAllocationReviewTransactions.length})
                   </Button>
                   <Button
                     className="bg-[#4b3828] text-white hover:bg-[#38291d]"

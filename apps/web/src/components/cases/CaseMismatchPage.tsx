@@ -6,11 +6,9 @@ import {
   ArrowLeft,
   Check,
   CheckCircle2,
-  ChevronRight,
-  FileText,
+  ChevronDown,
   Loader2,
   ShieldAlert,
-  Sparkles,
   X,
 } from "lucide-react";
 
@@ -34,6 +32,11 @@ import {
   type MismatchDecision,
   type SavedCaseDetail,
 } from "@/lib/case-persistence";
+import {
+  DEFAULT_COMPARISON_FIELD_GROUPS,
+  fetchComparisonGroups,
+  type ComparisonFieldGroup,
+} from "@/lib/comparison-groups";
 
 type LoadState = "loading" | "ready" | "error";
 type MismatchRecord = SavedCaseDetail["mismatches"][number];
@@ -120,7 +123,7 @@ function getIssueDescription(fieldName: string) {
     case TERMS_COMPLIANCE_FIELD:
       return "A visible terms and conditions clause was assessed against the packet and needs correction or review.";
     case "taxAmount":
-      return "The invoice tax amount and PO tax amount do not match.";
+      return "The document failed a GST tax calculation check. Review expected tax against the extracted taxable and tax amounts.";
     case "totalAmount":
       return "The invoice total and PO total do not match.";
     default:
@@ -135,23 +138,52 @@ function formatMismatchValue(fieldName: string, value: unknown, documentTitle: s
 
   const unitMatch = value.match(/^([^:]+): invoice unit (.+) differs from PO unit (.+)$/i);
   if (fieldName === "lineItems.unitMismatch" && unitMatch) {
-    const [, line, invoiceUnit, poUnit] = unitMatch;
+    const [, , invoiceUnit, poUnit] = unitMatch;
     const isPo = /purchase order|po\b/i.test(documentTitle);
-    return `${line}: ${isPo ? `PO unit ${poUnit}` : `Invoice unit ${invoiceUnit}`}`;
+    return isPo ? poUnit : invoiceUnit;
   }
 
   const rateMatch = value.match(/^([^:]+): invoice rate (.+) differs from PO rate (.+)$/i);
   if (fieldName === "lineItems.rateMismatch" && rateMatch) {
-    const [, line, invoiceRate, poRate] = rateMatch;
+    const [, , invoiceRate, poRate] = rateMatch;
     const isPo = /purchase order|po\b/i.test(documentTitle);
-    return `${line}: ${isPo ? `PO rate ${poRate}` : `Invoice rate ${invoiceRate}`}`;
+    return isPo ? poRate : invoiceRate;
   }
 
   const quantityMatch = value.match(/^([^:]+): invoice quantity (.+) exceeds PO quantity (.+)$/i);
   if (fieldName === "lineItems.quantityExceeded" && quantityMatch) {
-    const [, line, invoiceQuantity, poQuantity] = quantityMatch;
+    const [, , invoiceQuantity, poQuantity] = quantityMatch;
     const isPo = /purchase order|po\b/i.test(documentTitle);
-    return `${line}: ${isPo ? `PO quantity ${poQuantity}` : `Invoice quantity ${invoiceQuantity}`}`;
+    return isPo ? poQuantity : invoiceQuantity;
+  }
+
+  const detailMatch = value.match(/^[^:]+:\s*(.+)$/);
+  const detail = detailMatch?.[1]?.trim();
+  if (detail) {
+    if (fieldName === "lineItems.unitMismatch") {
+      const unitValue = detail.match(/^(?:(?:amended\s+)?purchase order|po|tax invoice|invoice|e-way bill|delivery challan|lorry receipt)\s+unit\s+(.+)$/i);
+      if (unitValue?.[1]) return unitValue[1];
+    }
+
+    if (fieldName === "lineItems.rateMismatch") {
+      const rateValue = detail.match(/^(?:(?:amended\s+)?purchase order|po|tax invoice|invoice|e-way bill|delivery challan|lorry receipt)\s+(?:net\s+)?rate\s+(.+)$/i);
+      if (rateValue?.[1]) return rateValue[1];
+    }
+
+    if (fieldName === "lineItems.quantityExceeded" || fieldName === "lineItems.quantityMismatch") {
+      const quantityValue = detail.match(/^(?:(?:amended\s+)?purchase order|po|tax invoice|invoice|e-way bill|delivery challan|lorry receipt)\s+quantity\s+(.+)$/i);
+      if (quantityValue?.[1]) return quantityValue[1];
+    }
+
+    if (fieldName === "lineItems.hsnSacMismatch") {
+      const hsnValue = detail.match(/^(?:(?:amended\s+)?purchase order|po|tax invoice|invoice|e-way bill|delivery challan|lorry receipt)\s+HSN\/SAC\s+(.+)$/i);
+      if (hsnValue?.[1]) return hsnValue[1];
+    }
+
+    if (fieldName === "lineItems.amountMismatch") {
+      const amountValue = detail.match(/^(?:(?:amended\s+)?purchase order|po|tax invoice|invoice|e-way bill|delivery challan|lorry receipt)\s+line amount\s+(.+)$/i);
+      if (amountValue?.[1]) return amountValue[1];
+    }
   }
 
   return displayValue(value);
@@ -224,8 +256,236 @@ type MismatchEvidence = {
   contextRows: DocumentContextRow[];
 };
 
+type ParsedTaxValidationIssue = {
+  lineLabel: string | null;
+  condition: string | null;
+  rule: string | null;
+  taxableAmount: number | null;
+  expectedTax: number | null;
+  actualTax: number | null;
+  difference: number | null;
+  summary: string;
+};
+
+type MismatchGroupSection = {
+  key: string;
+  label: string;
+  mismatches: MismatchRecord[];
+  pending: number;
+  accepted: number;
+  rejected: number;
+};
+
+const LINE_ITEM_GROUP_KEY = "line_items";
+const TERMS_GROUP_KEY = "terms_compliance";
+const OTHER_GROUP_KEY = "other";
+
 function uniqueStrings(values: string[]) {
   return Array.from(new Set(values.filter(Boolean)));
+}
+
+function getResolutionCounts(mismatches: MismatchRecord[]) {
+  return {
+    pending: mismatches.filter((mismatch) => mismatch.resolutionStatus === "pending").length,
+    accepted: mismatches.filter((mismatch) => mismatch.resolutionStatus === "accepted").length,
+    rejected: mismatches.filter((mismatch) => mismatch.resolutionStatus === "rejected").length,
+  };
+}
+
+function getGroupKeyForMismatch(fieldName: string, comparisonGroups: ComparisonFieldGroup[]) {
+  if (isLineItemMismatchField(fieldName)) return LINE_ITEM_GROUP_KEY;
+  if (fieldName === TERMS_COMPLIANCE_FIELD) return TERMS_GROUP_KEY;
+
+  const group = comparisonGroups.find(
+    (entry) => entry.enabled !== false && entry.fields.includes(fieldName)
+  );
+  return group?.groupKey ?? OTHER_GROUP_KEY;
+}
+
+function buildMismatchGroupSections(
+  mismatches: MismatchRecord[],
+  comparisonGroups: ComparisonFieldGroup[]
+): MismatchGroupSection[] {
+  const configuredGroups: Array<{ key: string; label: string; sortOrder: number }> = [
+    { key: LINE_ITEM_GROUP_KEY, label: "Line items", sortOrder: 0 },
+    ...comparisonGroups
+      .filter((group) => group.enabled !== false)
+      .map((group) => ({ key: group.groupKey, label: group.label, sortOrder: group.sortOrder })),
+    { key: TERMS_GROUP_KEY, label: "Terms compliance", sortOrder: 900 },
+    { key: OTHER_GROUP_KEY, label: "Other fields", sortOrder: 1000 },
+  ];
+
+  const byKey = new Map<string, MismatchRecord[]>();
+  for (const mismatch of mismatches) {
+    const key = getGroupKeyForMismatch(mismatch.fieldName, comparisonGroups);
+    byKey.set(key, [...(byKey.get(key) ?? []), mismatch]);
+  }
+
+  return configuredGroups
+    .map((group) => {
+      const groupMismatches = byKey.get(group.key) ?? [];
+      const counts = getResolutionCounts(groupMismatches);
+      return {
+        key: group.key,
+        label: group.label,
+        mismatches: groupMismatches,
+        ...counts,
+      };
+    })
+    .filter((group) => group.mismatches.length > 0)
+    .sort((a, b) => {
+      const sortA = configuredGroups.find((group) => group.key === a.key)?.sortOrder ?? 999;
+      const sortB = configuredGroups.find((group) => group.key === b.key)?.sortOrder ?? 999;
+      return sortA - sortB;
+    });
+}
+
+function getLineItemLabel(mismatch: MismatchRecord) {
+  if (!isLineItemMismatchField(mismatch.fieldName)) return getFieldLabel(mismatch.fieldName);
+  const firstValue = mismatch.values?.find((entry) => hasDisplayableValue(entry.value))?.value;
+  const valueText = typeof firstValue === "string" ? firstValue : "";
+  const lineMatch = valueText.match(/^([^:]{1,40}):/);
+  if (lineMatch?.[1]) {
+    const prefix = lineMatch[1].trim();
+    if (/^\d+$/.test(prefix)) return `Line ${prefix}`;
+    return prefix.replace(/\*+/g, "").trim();
+  }
+  return "Line item";
+}
+
+function parseAmountFromText(value: string, label: string) {
+  const pattern = new RegExp(`${label}\\s+(?:INR\\s*)?(-?[\\d,]+(?:\\.\\d+)?)`, "i");
+  const match = value.match(pattern);
+  if (!match?.[1]) return null;
+  const parsed = Number(match[1].replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatTaxAmount(value: number | null) {
+  if (value === null) return "-";
+  return `INR ${value.toLocaleString("en-IN", {
+    maximumFractionDigits: 2,
+    minimumFractionDigits: Number.isInteger(value) ? 0 : 2,
+  })}`;
+}
+
+function parseTaxValidationIssue(value: unknown): ParsedTaxValidationIssue | null {
+  if (typeof value !== "string" || !/expected tax|actual tax/i.test(value)) {
+    return null;
+  }
+
+  const text = value.replace(/\s+/g, " ").trim();
+  const lineMatch = text.match(/^Line\s+(\d+):/i);
+  const segments = text
+    .split(";")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  const expectedSegment =
+    segments.find((segment) => /\bexpected\b/i.test(segment) && !/expected tax/i.test(segment)) ?? null;
+  const conditionSegment =
+    segments.find((segment) => segment !== expectedSegment && !/taxable|expected tax|actual tax/i.test(segment)) ??
+    null;
+  const ruleText = expectedSegment?.replace(/^Line\s+\d+:\s*/i, "").match(/expected\s+(.+)$/i)?.[1] ?? null;
+  const taxableAmount = parseAmountFromText(text, "taxable");
+  const expectedTax = parseAmountFromText(text, "expected tax");
+  const actualTax = parseAmountFromText(text, "actual tax");
+  const difference = expectedTax !== null && actualTax !== null ? actualTax - expectedTax : null;
+  const lineLabel = lineMatch?.[1] ? `Line ${lineMatch[1]}` : null;
+  const differenceText =
+    difference === null || Math.abs(difference) < 0.005
+      ? ""
+      : ` ${formatTaxAmount(Math.abs(difference))} ${difference < 0 ? "short" : "extra"}.`;
+
+  return {
+    lineLabel,
+    condition: conditionSegment?.replace(/^Line\s+\d+:\s*/i, "") ?? null,
+    rule: ruleText,
+    taxableAmount,
+    expectedTax,
+    actualTax,
+    difference,
+    summary:
+      expectedTax !== null && actualTax !== null
+        ? `${lineLabel ? `${lineLabel}: ` : ""}tax should be ${formatTaxAmount(expectedTax)}, but extracted tax is ${formatTaxAmount(actualTax)}.${differenceText}`
+        : text,
+  };
+}
+
+function getIssueDisplayTitle(mismatch: MismatchRecord, evidence: MismatchEvidence[]) {
+  if (mismatch.fieldName === "taxAmount" && isSingleDocumentIssue(mismatch, evidence)) {
+    const parsed = parseTaxValidationIssue(evidence[0]?.value);
+    if (parsed?.actualTax === 0 && parsed.lineLabel) return "Line tax missing";
+    if (parsed?.difference != null && parsed.difference < 0) return "Tax shortfall";
+    if (parsed?.difference != null && parsed.difference > 0) return "Tax excess";
+    return "Tax validation";
+  }
+
+  return getFieldLabel(mismatch.fieldName);
+}
+
+function isSingleDocumentIssue(mismatch: MismatchRecord, evidence: MismatchEvidence[]) {
+  const documentIds = uniqueStrings(
+    evidence.map((entry) => entry.docId || entry.document?.id || entry.document?.clientDocumentId || "")
+  );
+  return evidence.length <= 1 || getValueCount(mismatch) <= 1 || documentIds.length <= 1;
+}
+
+function getIssueModeLabel(mismatch: MismatchRecord, evidence: MismatchEvidence[]) {
+  if (isSingleDocumentIssue(mismatch, evidence)) {
+    return isLineItemMismatchField(mismatch.fieldName) ? "Line exception" : "Validation issue";
+  }
+  return "Document mismatch";
+}
+
+function getReviewerHint(mismatch: MismatchRecord, evidence?: MismatchEvidence[]) {
+  if (evidence && isSingleDocumentIssue(mismatch, evidence)) {
+    if (mismatch.fieldName === "taxAmount") {
+      return "This is a tax validation issue inside one document, not a mismatch between documents. Check taxable amount, GST rate, and extracted tax before deciding.";
+    }
+    if (isLineItemMismatchField(mismatch.fieldName)) {
+      return "This line needs attention because the system could not fully reconcile it with the related document line.";
+    }
+    return "This issue was found inside one document. Use the source/page and context below to decide whether it is a real problem or extraction noise.";
+  }
+
+  const values = (mismatch.values ?? [])
+    .map((entry) => String(entry.value ?? "").trim())
+    .filter(Boolean);
+  const uniqueValues = uniqueStrings(values);
+
+  if (
+    uniqueValues.length === 2 &&
+    uniqueValues[0].length === uniqueValues[1].length &&
+    uniqueValues[0].length <= 24
+  ) {
+    const diffCount = uniqueValues[0]
+      .split("")
+      .filter((char, index) => char !== uniqueValues[1][index]).length;
+    if (diffCount > 0 && diffCount <= 2) {
+      return `Only ${diffCount === 1 ? "one character differs" : `${diffCount} characters differ`} - likely OCR, typing, or formatting. Check the source before treating it as a business mismatch.`;
+    }
+  }
+
+  if (mismatch.fieldName === "lineItems.unmatchedInvoiceLine") {
+    return "Invoice has a line that was not matched to the order. Check whether it is an extra charge, duplicate extraction, or missing PO line.";
+  }
+  if (mismatch.fieldName === "lineItems.unmatchedDocumentLine" || mismatch.fieldName === "lineItems.uninvoicedPoLine") {
+    return "A line exists in one document but not the other. This is usually more important than a small field typo.";
+  }
+  if (mismatch.fieldName === "lineItems.rateMismatch" || mismatch.fieldName === "lineItems.amountMismatch") {
+    return "Commercial value differs between documents. Confirm rate, quantity, and tax basis before approving.";
+  }
+  if (mismatch.fieldName === "lineItems.unitMismatch") {
+    return "Matched item, but units differ. Confirm whether the units are equivalent or if extraction used the wrong unit.";
+  }
+  if (mismatch.fieldName === "taxAmount") {
+    return "Tax discrepancy can come from GST type, rate, taxable value, or OCR. Verify tax calculation first.";
+  }
+  if (mismatch.fieldName === "vehicleNumber") {
+    return "Vehicle number differences are often OCR-sensitive, but they affect dispatch traceability.";
+  }
+
+  return mismatch.analysis || getIssueDescription(mismatch.fieldName);
 }
 
 function getContextFieldsForMismatch(fieldName: string) {
@@ -248,7 +508,20 @@ function getDocumentSourceLabel(document?: SavedCaseDetail["documents"][number])
   return [sourceHint, sourceFileName]
     .filter((value): value is string => Boolean(value && value.trim()))
     .filter((value, index, values) => values.indexOf(value) === index)
-    .join(" · ") || "Uploaded document";
+    .join(" - ") || "Uploaded document";
+}
+
+function getCompactSourceLabel(document?: SavedCaseDetail["documents"][number]) {
+  if (!document) return "Document not found";
+  const sourceLabel = getDocumentSourceLabel(document);
+  const pageMatch = sourceLabel.match(/\bpages?\s+\d+(?:\s*-\s*\d+)?/i);
+  const fileName = document.sourceFileName?.trim();
+
+  if (fileName && pageMatch?.[0]) {
+    return `${fileName} (${pageMatch[0].toLowerCase()})`;
+  }
+
+  return fileName || document.title || sourceLabel;
 }
 
 function getEvidenceDocumentRole(document?: SavedCaseDetail["documents"][number]) {
@@ -324,6 +597,32 @@ function buildMismatchEvidence(
       contextRows: buildDocumentContextRows(document, mismatch.fieldName, entry.value),
     };
   });
+}
+
+function getIssueListDetail(mismatch: MismatchRecord, evidence: MismatchEvidence[]) {
+  if (isSingleDocumentIssue(mismatch, evidence)) {
+    const sourceLabel = getCompactSourceLabel(evidence[0]?.document);
+    const issueType = getIssueModeLabel(mismatch, evidence);
+    const parsedTaxIssue =
+      mismatch.fieldName === "taxAmount" ? parseTaxValidationIssue(evidence[0]?.value) : null;
+    if (parsedTaxIssue && parsedTaxIssue.expectedTax !== null && parsedTaxIssue.actualTax !== null) {
+      return `${formatTaxAmount(parsedTaxIssue.actualTax)} vs ${formatTaxAmount(parsedTaxIssue.expectedTax)} - ${sourceLabel}`;
+    }
+    return sourceLabel ? `${issueType} - ${sourceLabel}` : issueType;
+  }
+
+  const count = getValueCount(mismatch);
+  return `${count} value${count === 1 ? "" : "s"} disagree`;
+}
+
+function getDocumentRoleSummary(evidence: MismatchEvidence[]) {
+  return uniqueStrings(evidence.map((entry) => getEvidenceDocumentRole(entry.document))).join(" vs ");
+}
+
+function getSingleIssueRows(evidence: MismatchEvidence[], fieldName: string) {
+  return (
+    evidence[0]?.contextRows.filter((row) => !row.emphasis && row.key !== fieldName).slice(0, 6) ?? []
+  );
 }
 
 function MismatchReviewSkeleton() {
@@ -413,6 +712,12 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
   const [decisionStatus, setDecisionStatus] = useState<"idle" | "updating" | "error">("idle");
   const [decisionError, setDecisionError] = useState<string | null>(null);
   const [selectedMismatchIds, setSelectedMismatchIds] = useState<Set<string>>(() => new Set());
+  const [comparisonGroups, setComparisonGroups] = useState<ComparisonFieldGroup[]>(
+    () => DEFAULT_COMPARISON_FIELD_GROUPS
+  );
+  const [expandedGroupKeys, setExpandedGroupKeys] = useState<Set<string>>(
+    () => new Set([LINE_ITEM_GROUP_KEY])
+  );
 
   useEffect(() => {
     let active = true;
@@ -433,6 +738,26 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
       active = false;
     };
   }, [caseId]);
+
+  useEffect(() => {
+    let active = true;
+
+    fetchComparisonGroups()
+      .then((groups) => {
+        if (active) {
+          setComparisonGroups(groups);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setComparisonGroups(DEFAULT_COMPARISON_FIELD_GROUPS);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const visibleMismatches = useMemo(
     () =>
@@ -470,11 +795,36 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
     return visibleMismatches.find((mismatch) => mismatch.id === activeMismatchId) ?? null;
   }, [activeMismatchId, visibleMismatches]);
 
+  const mismatchGroups = useMemo(
+    () => buildMismatchGroupSections(visibleMismatches, comparisonGroups),
+    [visibleMismatches, comparisonGroups]
+  );
+  const activeGroupKey = activeMismatch
+    ? getGroupKeyForMismatch(activeMismatch.fieldName, comparisonGroups)
+    : null;
+  const activeGroup = activeGroupKey
+    ? mismatchGroups.find((group) => group.key === activeGroupKey) ?? null
+    : null;
+
   const activeFieldLabel = activeMismatch ? getFieldLabel(activeMismatch.fieldName) : "";
   const activeEvidence = useMemo(
     () => (activeMismatch ? buildMismatchEvidence(activeMismatch, documentLookup) : []),
     [activeMismatch, documentLookup]
   );
+  const activeIsSingleDocumentIssue = activeMismatch
+    ? isSingleDocumentIssue(activeMismatch, activeEvidence)
+    : false;
+  const activeIssueDisplayTitle = activeMismatch ? getIssueDisplayTitle(activeMismatch, activeEvidence) : "";
+  const activeTaxValidationIssue =
+    activeMismatch?.fieldName === "taxAmount" && activeIsSingleDocumentIssue
+      ? parseTaxValidationIssue(activeEvidence[0]?.value)
+      : null;
+  const activeIssueModeLabel = activeMismatch ? getIssueModeLabel(activeMismatch, activeEvidence) : "";
+  const activeIssueHint = activeMismatch ? getReviewerHint(activeMismatch, activeEvidence) : "";
+  const activeDocumentSummary = activeEvidence.length > 0 ? getDocumentRoleSummary(activeEvidence) : "";
+  const activeSingleIssueRows = activeMismatch
+    ? getSingleIssueRows(activeEvidence, activeMismatch.fieldName)
+    : [];
   const isCaseFinal = detail?.case.status === "accepted" || detail?.case.status === "rejected";
   const isActiveMismatchPending = activeMismatch?.resolutionStatus === "pending";
   const pendingMismatchCount = visibleMismatches.filter(
@@ -504,6 +854,28 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
       return next.size === current.size ? current : next;
     });
   }, [pendingVisibleMismatchIds]);
+
+  useEffect(() => {
+    if (!activeGroupKey) return;
+    setExpandedGroupKeys((current) => {
+      if (current.has(activeGroupKey)) return current;
+      const next = new Set(current);
+      next.add(activeGroupKey);
+      return next;
+    });
+  }, [activeGroupKey]);
+
+  function handleToggleGroup(groupKey: string) {
+    setExpandedGroupKeys((current) => {
+      const next = new Set(current);
+      if (next.has(groupKey)) {
+        next.delete(groupKey);
+      } else {
+        next.add(groupKey);
+      }
+      return next;
+    });
+  }
 
   function handleToggleSelectedMismatch(mismatchId: string) {
     setSelectedMismatchIds((current) => {
@@ -594,7 +966,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
               {status === "loading" ? (
                 <Skeleton className="h-5 w-52 max-w-[55vw] bg-slate-100" />
               ) : (
-                <h1 className="truncate text-lg font-semibold tracking-tight text-slate-900">
+                <h1 className="truncate text-lg font-medium tracking-tight text-slate-900">
                   {detail?.case.displayName}
                 </h1>
               )}
@@ -638,7 +1010,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
             <div className="mx-auto flex max-w-2xl items-start gap-4 rounded-xl border border-red-200 bg-white p-6 shadow-sm">
               <ShieldAlert className="h-6 w-6 shrink-0 text-red-500" />
               <div>
-                <h3 className="text-lg font-semibold text-slate-900">Unable to load review</h3>
+                <h3 className="text-lg font-medium text-slate-900">Unable to load review</h3>
                 <p className="mt-1 text-sm text-slate-500">{error}</p>
               </div>
             </div>
@@ -649,14 +1021,13 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
         {status === "ready" && detail && (
           <div className="flex flex-1 flex-col lg:flex-row min-h-0 overflow-hidden">
 
-            {/* Sidebar / Mobile Tabs */}
-            <aside className="flex flex-col shrink-0 border-b border-slate-200 bg-white lg:w-80 lg:border-b-0 lg:border-r z-0">
+            {/* Grouped issue navigation */}
+            <aside className="flex shrink-0 flex-col border-b border-slate-200 bg-white lg:w-[340px] lg:border-b-0 lg:border-r">
 
               {/* Desktop Only: Case Meta Summary */}
-              <div className="hidden lg:block p-5 border-b border-slate-100">
+              <div className="hidden">
                 <div className="flex items-center gap-2 mb-4">
-                  <Sparkles className="h-4 w-4 text-slate-400" />
-                  <h2 className="text-sm font-semibold text-slate-800">Case Summary</h2>
+                  <h2 className="text-sm font-medium text-slate-800">Case Summary</h2>
                 </div>
                 <div className="space-y-3">
                   <div>
@@ -678,70 +1049,128 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                 </div>
               </div>
 
-              {/* Mismatches List / Tabs */}
-              <div className="flex-1 overflow-hidden flex flex-col bg-slate-50/50 lg:bg-white">
-                <div className="px-4 py-3 lg:px-5 lg:py-4 border-b border-slate-100 flex items-center justify-between bg-white">
-                  <h3 className="text-sm font-semibold text-slate-900">Issues to resolve</h3>
+              <div className="flex-1 overflow-hidden bg-white">
+                <div className="border-b border-slate-100 px-4 py-3 lg:px-5">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-medium text-slate-900">Review groups</h3>
+                      <p className="mt-0.5 text-xs text-slate-500">
+                        {detail.documents.length} documents - {visibleMismatches.length} issues
+                      </p>
+                    </div>
+                    <div className="text-right text-xs text-slate-500">
+                      <div>Pending {pendingMismatchCount}</div>
+                      <div>
+                        Accepted {acceptedMismatchCount} - Rejected {rejectedMismatchCount}
+                      </div>
+                    </div>
+                  </div>
                 </div>
 
                 {visibleMismatches.length === 0 ? (
-                  <div className="p-5 text-sm text-slate-500">
-                    No conflicting values found.
-                  </div>
+                  <div className="p-5 text-sm text-slate-500">No conflicting values found.</div>
                 ) : (
-                  <div className="flex gap-2 p-3 overflow-x-auto lg:p-0 lg:flex-col lg:overflow-y-auto lg:block hide-scrollbar [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none][scrollbar-width:none]">
-                    {visibleMismatches.map((mismatch) => {
-                      const isActive = activeMismatchId === mismatch.id;
-                      const fieldLabel = getFieldLabel(mismatch.fieldName);
-                      const isPending = mismatch.resolutionStatus === "pending";
-                      const isSelected = selectedMismatchIds.has(mismatch.id);
+                  <div className="flex h-full gap-2 overflow-x-auto p-3 lg:block lg:space-y-1 lg:overflow-y-auto lg:p-4">
+                    {mismatchGroups.map((group) => {
+                      const isExpanded = expandedGroupKeys.has(group.key);
+                      const isActiveGroup = activeGroupKey === group.key;
 
                       return (
-                        <div
-                          key={mismatch.id}
-                          className={`group relative flex items-center shrink-0 lg:w-full text-left transition-all ${isActive
-                              ? "bg-amber-100 text-amber-900 lg:bg-amber-50/50 lg:text-slate-900 lg:border-l-[3px] lg:border-amber-500"
-                              : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 lg:bg-transparent lg:border-0 lg:border-l-[3px] lg:border-transparent lg:hover:bg-slate-50"
-                            } rounded-full lg:rounded-none px-4 py-2 lg:px-5 lg:py-3`}
-                        >
-                          {isPending && !isCaseFinal && (
-                            <input
-                              aria-label={`Select ${fieldLabel}`}
-                              checked={isSelected}
-                              className="mr-2 h-4 w-4 shrink-0 rounded border-slate-300 accent-emerald-600"
-                              onChange={(event) => {
-                                event.stopPropagation();
-                                handleToggleSelectedMismatch(mismatch.id);
-                              }}
-                              onClick={(event) => event.stopPropagation()}
-                              type="checkbox"
-                            />
-                          )}
+                        <section key={group.key} className="min-w-[260px] shrink-0 lg:min-w-0">
                           <button
-                            className="flex min-w-0 flex-1 items-center text-left"
-                            onClick={() => setActiveMismatchId(mismatch.id)}
+                            className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition ${
+                              isActiveGroup ? "bg-slate-100" : "hover:bg-slate-50"
+                            }`}
+                            onClick={() => handleToggleGroup(group.key)}
                             type="button"
                           >
-                            <div className="flex-1 min-w-0">
-                              <p className={`text-sm truncate ${isActive ? "font-semibold" : "font-medium"}`}>
-                                {fieldLabel}
-                              </p>
-                              <div className="mt-0.5 hidden items-center gap-2 lg:flex">
-                                <p className="text-xs text-slate-500 group-hover:text-slate-600">
-                                  {getValueCount(mismatch)} value{getValueCount(mismatch) === 1 ? "" : "s"} found
-                                </p>
-                                <span
-                                  className={`inline-flex rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${getMismatchResolutionClassName(mismatch.resolutionStatus)}`}
-                                >
-                                  {getMismatchResolutionLabel(mismatch.resolutionStatus)}
-                                </span>
-                              </div>
-                            </div>
-                            {isActive && (
-                              <ChevronRight className="hidden lg:block h-4 w-4 text-amber-500 shrink-0 ml-3" />
-                            )}
+                            <span
+                              className={`h-2 w-2 shrink-0 rounded-full ${
+                                group.pending > 0 ? "bg-amber-500" : "bg-emerald-500"
+                              }`}
+                            />
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-sm font-medium text-slate-950">
+                                {group.label}
+                              </span>
+                              <span className="mt-0.5 block text-xs text-slate-500">
+                                {group.pending > 0 ? `${group.pending} to review` : "All matched"}
+                              </span>
+                            </span>
+                            <span className="shrink-0 text-xs text-slate-500">
+                              {group.mismatches.length}
+                            </span>
+                            <ChevronDown
+                              className={`h-4 w-4 shrink-0 text-slate-400 transition ${
+                                isExpanded ? "rotate-180" : ""
+                              }`}
+                            />
                           </button>
-                        </div>
+
+                          {isExpanded ? (
+                            <div className="mt-1 space-y-1 pl-5">
+                              {group.mismatches.map((mismatch) => {
+                                const isActive = activeMismatchId === mismatch.id;
+                                const isPending = mismatch.resolutionStatus === "pending";
+                                const isSelected = selectedMismatchIds.has(mismatch.id);
+                                const itemLabel = isLineItemMismatchField(mismatch.fieldName)
+                                  ? getLineItemLabel(mismatch)
+                                  : null;
+                                const mismatchEvidence = buildMismatchEvidence(mismatch, documentLookup);
+                                const issueLabel = getIssueDisplayTitle(mismatch, mismatchEvidence);
+                                const issueDetail = getIssueListDetail(mismatch, mismatchEvidence);
+
+                                return (
+                                  <div
+                                    key={mismatch.id}
+                                    className={`flex items-center gap-2 rounded-lg px-2.5 py-2 transition ${
+                                      isActive ? "bg-[#eef2ff]" : "hover:bg-slate-50"
+                                    }`}
+                                  >
+                                    {isPending && !isCaseFinal ? (
+                                      <input
+                                        aria-label={`Select ${issueLabel}`}
+                                        checked={isSelected}
+                                        className="h-4 w-4 shrink-0 rounded border-slate-300 accent-emerald-600"
+                                        onChange={(event) => {
+                                          event.stopPropagation();
+                                          handleToggleSelectedMismatch(mismatch.id);
+                                        }}
+                                        onClick={(event) => event.stopPropagation()}
+                                        type="checkbox"
+                                      />
+                                    ) : (
+                                      <span
+                                        className={`h-2 w-2 shrink-0 rounded-full ${
+                                          mismatch.resolutionStatus === "accepted"
+                                            ? "bg-emerald-500"
+                                            : "bg-rose-500"
+                                        }`}
+                                      />
+                                    )}
+                                    <button
+                                      className="min-w-0 flex-1 text-left"
+                                      onClick={() => setActiveMismatchId(mismatch.id)}
+                                      type="button"
+                                    >
+                                      {itemLabel ? (
+                                        <span className="block truncate text-xs text-slate-500">
+                                          {itemLabel}
+                                        </span>
+                                      ) : null}
+                                      <span className="block truncate text-sm font-medium text-slate-900">
+                                        {issueLabel}
+                                      </span>
+                                      <span className="block truncate text-xs text-slate-500">
+                                        {issueDetail}
+                                      </span>
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ) : null}
+                        </section>
                       );
                     })}
                   </div>
@@ -752,108 +1181,223 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
             {/* Main Detail Content */}
             <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
               <div className="flex-1 overflow-y-auto">
-                <div className="mx-auto max-w-5xl p-4 sm:p-6 lg:p-8">
+                <div className="mx-auto max-w-4xl p-3 sm:p-4 lg:p-5">
                   {visibleMismatches.length === 0 ? (
                     <div className="flex flex-col items-center justify-center rounded-2xl bg-white border border-slate-200 p-12 text-center shadow-sm mt-8">
                       <div className="h-16 w-16 rounded-full bg-emerald-100 flex items-center justify-center mb-4">
                         <CheckCircle2 className="h-8 w-8 text-emerald-600" />
                       </div>
-                      <h2 className="text-2xl font-bold text-slate-900">All clear</h2>
+                      <h2 className="text-2xl font-medium text-slate-900">All clear</h2>
                       <p className="mt-2 text-slate-500">
                         No value conflicts were found across the documents in this case.
                       </p>
                     </div>
                   ) : activeMismatch ? (
-                    <div className="space-y-6">
+                    <article className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+                      <div className="border-b border-slate-100 px-4 py-3 sm:px-5">
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                          <div className="min-w-0">
+                            <div className="mb-1 flex flex-wrap items-center gap-1.5 text-xs text-slate-600">
+                              <span>{activeGroup?.label ?? "Review group"}</span>
+                              <span className="text-slate-300">/</span>
+                              <span>{activeIssueModeLabel}</span>
+                              {activeDocumentSummary ? (
+                                <>
+                                  <span className="text-slate-300">/</span>
+                                  <span>{activeDocumentSummary}</span>
+                                </>
+                              ) : null}
+                              <span className="hidden">
+                                {activeEvidence
+                                  .map((evidence) => getEvidenceDocumentRole(evidence.document))
+                                  .filter((value, index, values) => values.indexOf(value) === index)
+                                  .join(" ↔ ") || "Documents involved"}
+                              </span>
+                            </div>
+                            <h2 className="text-lg font-medium tracking-tight text-slate-950 sm:text-xl">
+                              {activeIssueDisplayTitle}
+                            </h2>
+                          </div>
+                          <Badge
+                            variant="outline"
+                            className={`w-fit rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getMismatchResolutionClassName(activeMismatch.resolutionStatus)}`}
+                          >
+                            {getMismatchResolutionLabel(activeMismatch.resolutionStatus)}
+                          </Badge>
+                        </div>
 
-                    {/* Header for Active Issue */}
-                    <div>
-                      <div className="flex flex-wrap items-center gap-3">
-                        <h2 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
-                          {activeFieldLabel}
-                        </h2>
-                        <Badge
-                          variant="outline"
-                          className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${getMismatchResolutionClassName(activeMismatch.resolutionStatus)}`}
-                        >
-                          {getMismatchResolutionLabel(activeMismatch.resolutionStatus)}
-                        </Badge>
+                        {activeIssueHint ? (
+                          <div className="mt-3 rounded-lg bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-700">
+                            {activeIssueHint}
+                          </div>
+                        ) : null}
                       </div>
-                      <p className="mt-1 text-sm text-slate-500">
-                        {getIssueDescription(activeMismatch.fieldName)}
-                      </p>
-                    </div>
 
-                    <section>
-                      <div className="mb-3 flex items-center justify-between gap-3">
-                        <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-900">
-                          <FileText className="h-4 w-4 text-slate-400" />
-                          Documents involved
-                        </h3>
-                        <span className="text-xs font-medium text-slate-500">
-                          {activeEvidence.length} document{activeEvidence.length === 1 ? "" : "s"}
-                        </span>
-                      </div>
-
-                      <div className="grid gap-4 lg:grid-cols-2">
-                        {activeEvidence.map((evidence) => {
-                          const sourceLabel = getDocumentSourceLabel(evidence.document);
-                          const documentRole = getEvidenceDocumentRole(evidence.document);
-
-                          return (
-                            <article
-                              key={evidence.key}
-                              className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm"
-                            >
-                              <div className="border-b border-slate-100 bg-slate-50 px-4 py-3">
-                                <div className="flex items-start justify-between gap-3">
-                                  <div className="min-w-0">
-                                    <h4 className="truncate text-sm font-semibold text-slate-900" title={sourceLabel}>
-                                      {sourceLabel}
-                                    </h4>
-                                  </div>
-                                  <Badge
-                                    variant="outline"
-                                    className="shrink-0 rounded-full border-slate-200 bg-white px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-slate-600"
-                                  >
-                                    {documentRole}
-                                  </Badge>
-                                </div>
-                              </div>
-
-                              <div className="space-y-4 p-4">
-                                <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2.5">
-                                  <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-700">
-                                    Reported value
-                                  </p>
-                                  <div className="mt-1 break-words text-sm font-semibold text-slate-950">
-                                    {formatMismatchValue(activeMismatch.fieldName, evidence.value, documentRole)}
-                                  </div>
-                                </div>
-
-                                <dl className="divide-y divide-slate-100 rounded-md border border-slate-100">
-                                  {evidence.contextRows.map((row) => (
-                                    <div
-                                      key={row.key}
-                                      className={row.emphasis ? "grid gap-1 bg-slate-50 px-3 py-2.5" : "grid gap-1 px-3 py-2.5"}
-                                    >
-                                      <dt className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-                                        {row.label}
-                                      </dt>
-                                      <dd className="break-words text-sm font-medium text-slate-900">
-                                        {displayValue(row.value)}
-                                      </dd>
+                      {activeIsSingleDocumentIssue ? (
+                        <div className="space-y-3 p-4 sm:p-5">
+                          <div className="rounded-lg border border-red-100 bg-red-50/70 p-3">
+                            <div className="text-xs font-medium text-red-700">
+                              {activeTaxValidationIssue ? "Tax check failed" : "Issue found"}
+                            </div>
+                            <div className="mt-1.5 text-sm leading-5 text-red-950">
+                              {activeTaxValidationIssue
+                                ? activeTaxValidationIssue.summary
+                                : formatMismatchValue(
+                                    activeMismatch.fieldName,
+                                    activeEvidence[0]?.value,
+                                    getEvidenceDocumentRole(activeEvidence[0]?.document)
+                                  )}
+                            </div>
+                            {activeTaxValidationIssue ? (
+                              <>
+                                <div className="mt-3 grid gap-2 sm:grid-cols-4">
+                                  <div className="rounded-md bg-white/80 px-2.5 py-2">
+                                    <div className="text-[10px] font-medium text-red-700/70">Taxable</div>
+                                    <div className="mt-0.5 text-sm text-red-950">
+                                      {formatTaxAmount(activeTaxValidationIssue.taxableAmount)}
                                     </div>
-                                  ))}
-                                </dl>
-                              </div>
-                            </article>
-                          );
-                        })}
-                      </div>
-                    </section>
+                                  </div>
+                                  <div className="rounded-md bg-white/80 px-2.5 py-2">
+                                    <div className="text-[10px] font-medium text-red-700/70">Expected tax</div>
+                                    <div className="mt-0.5 text-sm text-red-950">
+                                      {formatTaxAmount(activeTaxValidationIssue.expectedTax)}
+                                    </div>
+                                  </div>
+                                  <div className="rounded-md bg-white/80 px-2.5 py-2">
+                                    <div className="text-[10px] font-medium text-red-700/70">Extracted tax</div>
+                                    <div className="mt-0.5 text-sm text-red-950">
+                                      {formatTaxAmount(activeTaxValidationIssue.actualTax)}
+                                    </div>
+                                  </div>
+                                  <div className="rounded-md bg-white/80 px-2.5 py-2">
+                                    <div className="text-[10px] font-medium text-red-700/70">Difference</div>
+                                    <div className="mt-0.5 text-sm text-red-950">
+                                      {activeTaxValidationIssue.difference === null
+                                        ? "-"
+                                        : `${formatTaxAmount(Math.abs(activeTaxValidationIssue.difference))} ${
+                                            activeTaxValidationIssue.difference < 0 ? "short" : "extra"
+                                          }`}
+                                    </div>
+                                  </div>
+                                </div>
+                                {(activeTaxValidationIssue.rule || activeTaxValidationIssue.condition) && (
+                                  <div className="mt-2 rounded-md bg-white/70 px-2.5 py-1.5 text-[11px] leading-4 text-red-900/80">
+                                    {activeTaxValidationIssue.condition ? (
+                                      <span>{activeTaxValidationIssue.condition}. </span>
+                                    ) : null}
+                                    {activeTaxValidationIssue.rule ? (
+                                      <span>Expected rule: {activeTaxValidationIssue.rule}.</span>
+                                    ) : null}
+                                  </div>
+                                )}
+                              </>
+                            ) : null}
+                          </div>
 
-                    </div>
+                          <div className="grid gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm sm:grid-cols-2">
+                            <div className="min-w-0">
+                              <span className="mr-2 text-xs font-medium text-slate-500">Document</span>
+                              <span className="text-slate-900">
+                                {getEvidenceDocumentRole(activeEvidence[0]?.document)}
+                              </span>
+                            </div>
+                            <div className="min-w-0">
+                              <span className="mr-2 text-xs font-medium text-slate-500">Source</span>
+                              <span
+                                className="inline-block max-w-full truncate align-bottom text-slate-900"
+                                title={getDocumentSourceLabel(activeEvidence[0]?.document)}
+                              >
+                                {getCompactSourceLabel(activeEvidence[0]?.document)}
+                              </span>
+                            </div>
+                          </div>
+
+                          {activeSingleIssueRows.length > 0 ? (
+                            <div className="rounded-lg border border-slate-200 bg-white">
+                              <div className="border-b border-slate-100 px-3 py-2 text-xs font-medium text-slate-500">
+                                Useful context
+                              </div>
+                              <div className="divide-y divide-slate-100">
+                                {activeSingleIssueRows.map((row) => (
+                                  <div key={row.key} className="grid gap-2 px-3 py-2 text-xs sm:grid-cols-[180px_1fr]">
+                                    <div className="text-slate-500">{row.label}</div>
+                                    <div className="text-slate-900">{displayValue(row.value)}</div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <div className="overflow-x-auto p-5 sm:p-6">
+                          <table className="w-full min-w-[640px] border-collapse text-left text-sm">
+                            <thead>
+                              <tr className="border-b border-slate-200 text-xs font-medium tracking-wide text-slate-500">
+                                <th className="w-44 px-3 py-3">Field</th>
+                                {activeEvidence.map((evidence) => (
+                                  <th key={evidence.key} className="px-3 py-3">
+                                    <div className="max-w-[220px] truncate">
+                                      {getEvidenceDocumentRole(evidence.document)}
+                                    </div>
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <tr className="border-b border-red-100 bg-red-50/70">
+                                <td className="border-l-4 border-red-500 px-3 py-3 font-medium text-slate-700">
+                                  {activeFieldLabel}
+                                </td>
+                                {activeEvidence.map((evidence) => (
+                                  <td key={evidence.key} className="px-3 py-3 font-medium text-red-900">
+                                    {formatMismatchValue(
+                                      activeMismatch.fieldName,
+                                      evidence.value,
+                                      getEvidenceDocumentRole(evidence.document)
+                                    )}
+                                    <div className="mt-1 max-w-[220px] truncate text-xs font-normal text-red-700/70">
+                                      {getDocumentSourceLabel(evidence.document)}
+                                    </div>
+                                  </td>
+                                ))}
+                              </tr>
+                              {uniqueStrings(
+                                activeEvidence.flatMap((evidence) =>
+                                  evidence.contextRows
+                                    .filter((row) => !row.emphasis && row.key !== activeMismatch.fieldName)
+                                    .map((row) => row.key)
+                                )
+                              )
+                                .slice(0, 5)
+                                .map((contextKey) => {
+                                  const label =
+                                    activeEvidence
+                                      .flatMap((evidence) => evidence.contextRows)
+                                      .find((row) => row.key === contextKey)?.label ?? getFieldLabel(contextKey);
+
+                                  return (
+                                    <tr key={contextKey} className="border-b border-slate-100">
+                                      <td className="px-3 py-3 font-medium text-slate-600">{label}</td>
+                                      {activeEvidence.map((evidence) => {
+                                        const row = evidence.contextRows.find((entry) => entry.key === contextKey);
+                                        return (
+                                          <td key={`${evidence.key}-${contextKey}`} className="px-3 py-3 text-slate-800">
+                                            {row ? displayValue(row.value) : <span className="text-slate-300">-</span>}
+                                          </td>
+                                        );
+                                      })}
+                                    </tr>
+                                  );
+                                })}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+
+                      <div className="border-t border-slate-100 px-4 py-2.5 text-xs text-slate-500 sm:px-5">
+                        Deciding: <span className="font-medium text-slate-800">{activeIssueDisplayTitle}</span>
+                      </div>
+                    </article>
                   ) : (
                     <div className="flex h-[400px] items-center justify-center text-center text-sm text-slate-500">
                       Select an issue from the list to review conflicting values.
@@ -868,16 +1412,16 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                     <div className="min-w-0">
 	                      <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500">
 	                        <span>
-	                          Pending <span className="font-semibold text-slate-800">{pendingMismatchCount}</span>
+	                          Pending <span className="font-medium text-slate-800">{pendingMismatchCount}</span>
                         </span>
                         <span>
-                          Accepted <span className="font-semibold text-emerald-700">{acceptedMismatchCount}</span>
+                          Accepted <span className="font-medium text-emerald-700">{acceptedMismatchCount}</span>
                         </span>
 	                        <span>
-	                          Rejected <span className="font-semibold text-rose-700">{rejectedMismatchCount}</span>
+	                          Rejected <span className="font-medium text-rose-700">{rejectedMismatchCount}</span>
 	                        </span>
 	                        <span>
-	                          Selected <span className="font-semibold text-slate-800">{selectedPendingMismatchIds.length}</span>
+	                          Selected <span className="font-medium text-slate-800">{selectedPendingMismatchIds.length}</span>
 	                        </span>
 	                      </div>
                       {decisionStatus === "error" && decisionError && (
@@ -979,7 +1523,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                       ) : (
                         <Badge
                           variant="outline"
-                          className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide ${getMismatchResolutionClassName(activeMismatch.resolutionStatus)}`}
+                          className={`rounded-full border px-2.5 py-1 text-[11px] font-medium uppercase tracking-wide ${getMismatchResolutionClassName(activeMismatch.resolutionStatus)}`}
                         >
                           {getMismatchResolutionLabel(activeMismatch.resolutionStatus)}
                         </Badge>

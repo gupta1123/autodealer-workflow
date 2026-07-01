@@ -104,10 +104,10 @@ function RecycleBinTableSkeleton() {
       <Table className="w-full text-sm">
         <TableHeader>
           <TableRow className="border-b border-[#f1f5f9] hover:bg-transparent">
-            <TableHead className="h-10 pl-4 md:pl-6 font-bold text-[#94a3b8] text-[11px] uppercase tracking-wider">Document</TableHead>
-            <TableHead className="h-10 font-bold text-[#94a3b8] text-[11px] uppercase tracking-wider">Receiver</TableHead>
-            <TableHead className="h-10 font-bold text-[#94a3b8] text-[11px] uppercase tracking-wider">Expires</TableHead>
-            <TableHead className="h-10 font-bold text-[#94a3b8] text-[11px] uppercase tracking-wider text-right pr-4 md:pr-6">Actions</TableHead>
+            <TableHead className="h-10 pl-4 md:pl-6 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider">Document</TableHead>
+            <TableHead className="h-10 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider">Receiver</TableHead>
+            <TableHead className="h-10 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider">Expires</TableHead>
+            <TableHead className="h-10 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider text-right pr-4 md:pr-6">Actions</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -255,8 +255,8 @@ export function RecycleBinPage() {
                 <Trash2 className="w-7 h-7" />
               </div>
               <div>
-                <h1 className="text-2xl font-extrabold text-[#0f172a] tracking-tight">Recycle Bin</h1>
-                <div className="text-sm font-semibold text-[#94a3b8] mt-0.5">
+                <h1 className="text-2xl font-medium text-[#0f172a] tracking-tight">Recycle Bin</h1>
+                <div className="text-sm font-medium text-[#94a3b8] mt-0.5">
                   {status === "loading" ? (
                     <Skeleton className="mt-1 h-3.5 w-60 bg-slate-100" />
                   ) : (
@@ -299,7 +299,7 @@ export function RecycleBinPage() {
               <div className="m-8 rounded-2xl border border-red-200 bg-red-50 p-6 text-sm text-red-700 flex items-start shadow-sm">
                 <Trash className="mr-3 h-5 w-5 text-red-500 shrink-0 mt-0.5" />
                 <div>
-                  <div className="font-bold text-base mb-1">Failed to load recycle bin</div>
+                  <div className="font-medium text-base mb-1">Failed to load recycle bin</div>
                   <div>{error}</div>
                 </div>
               </div>
@@ -310,7 +310,7 @@ export function RecycleBinPage() {
                 <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-full bg-[#f8fafc] border border-[#e2e8f0] shadow-sm">
                   <Trash2 className="h-8 w-8 text-[#cbd5e1]" />
                 </div>
-                <h3 className="text-lg font-bold text-[#0f172a]">Recycle Bin is Empty</h3>
+                <h3 className="text-lg font-medium text-[#0f172a]">Recycle Bin is Empty</h3>
                 <p className="mt-2 text-sm font-medium text-[#64748b] max-w-sm">
                   Items you delete will appear here for 30 days before being permanently removed.
                 </p>
@@ -320,14 +320,14 @@ export function RecycleBinPage() {
             {status === "ready" && totalCount === 0 && debouncedQuery && (
               <div className="flex flex-col items-center justify-center py-24 text-center px-4">
                 <Search className="h-10 w-10 text-[#e2e8f0] mb-4" />
-                <h3 className="text-base font-bold text-[#0f172a]">No matches found</h3>
+                <h3 className="text-base font-medium text-[#0f172a]">No matches found</h3>
                 <p className="mt-1 text-sm font-medium text-[#64748b]">
                   We couldn&apos;t find any deleted items matching &quot;{debouncedQuery}&quot;.
                 </p>
                 <Button
                   variant="link"
                   onClick={() => setQuery("")}
-                  className="mt-2 text-[#4f46e5] font-bold"
+                  className="mt-2 text-[#4f46e5] font-medium"
                 >
                   Clear search
                 </Button>
@@ -349,7 +349,7 @@ export function RecycleBinPage() {
                         <div className="min-w-0 flex-1">
                           <Link
                             href={`/cases/${item.id}`}
-                            className="block truncate text-sm font-bold text-[#0f172a] hover:text-[#4f46e5]" title={item.displayName || "Unnamed Document"}
+                            className="block truncate text-sm font-medium text-[#0f172a] hover:text-[#4f46e5]" title={item.displayName || "Unnamed Document"}
                           >
                             {item.displayName || "Unnamed Document"}
                           </Link>
@@ -359,7 +359,7 @@ export function RecycleBinPage() {
                         </div>
                       </div>
 
-                      <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5 text-[11px] font-semibold text-[#94a3b8]">
+                      <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5 text-[11px] font-medium text-[#94a3b8]">
                         <span className="truncate max-w-[140px]" title={item.receiverName || "Receiver pending"}>{item.receiverName || "Receiver pending"}</span>
                         <span className="flex items-center gap-1 shrink-0">
                           <Clock className="h-3 w-3" />
@@ -398,10 +398,10 @@ export function RecycleBinPage() {
                   <Table className="w-full text-sm">
                     <TableHeader>
                       <TableRow className="border-b border-[#f1f5f9] hover:bg-transparent">
-                        <TableHead className="h-10 pl-4 md:pl-6 font-bold text-[#94a3b8] text-[11px] uppercase tracking-wider">Document</TableHead>
-                        <TableHead className="h-10 font-bold text-[#94a3b8] text-[11px] uppercase tracking-wider">Receiver</TableHead>
-                        <TableHead className="h-10 font-bold text-[#94a3b8] text-[11px] uppercase tracking-wider">Expires</TableHead>
-                        <TableHead className="h-10 font-bold text-[#94a3b8] text-[11px] uppercase tracking-wider text-right pr-4 md:pr-6">Actions</TableHead>
+                        <TableHead className="h-10 pl-4 md:pl-6 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider">Document</TableHead>
+                        <TableHead className="h-10 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider">Receiver</TableHead>
+                        <TableHead className="h-10 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider">Expires</TableHead>
+                        <TableHead className="h-10 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider text-right pr-4 md:pr-6">Actions</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
@@ -418,7 +418,7 @@ export function RecycleBinPage() {
                               <div className="min-w-0">
                                 <Link
                                   href={`/cases/${item.id}`}
-                                  className="font-semibold text-[#0f172a] text-[13px] transition-colors hover:text-[#4f46e5] truncate block max-w-[200px] xl:max-w-[300px]" title={item.displayName || "Unnamed Document"}
+                                  className="font-medium text-[#0f172a] text-[13px] transition-colors hover:text-[#4f46e5] truncate block max-w-[200px] xl:max-w-[300px]" title={item.displayName || "Unnamed Document"}
                                 >
                                   {item.displayName || "Unnamed Document"}
                                 </Link>
@@ -479,7 +479,7 @@ export function RecycleBinPage() {
             )}
 
             {status === "ready" && totalCount > 0 && (
-              <div className="flex flex-col gap-3 border-t border-[#f1f5f9] px-6 pb-2 pt-4 text-sm font-semibold text-[#94a3b8] md:flex-row md:items-center md:justify-between md:px-8">
+              <div className="flex flex-col gap-3 border-t border-[#f1f5f9] px-6 pb-2 pt-4 text-sm font-medium text-[#94a3b8] md:flex-row md:items-center md:justify-between md:px-8">
                 <div>
                   Showing {pageStart}-{pageEnd} of {totalCount}
                 </div>
@@ -488,7 +488,7 @@ export function RecycleBinPage() {
                     type="button"
                     variant="outline"
                     size="sm"
-                    className="h-8 border-[#e2e8f0] bg-white px-2 font-bold text-[#64748b] hover:bg-[#f8fafc]"
+                    className="h-8 border-[#e2e8f0] bg-white px-2 font-medium text-[#64748b] hover:bg-[#f8fafc]"
                     disabled={currentPage <= 1}
                     onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}
                     aria-label="Previous page"
@@ -508,8 +508,8 @@ export function RecycleBinPage() {
                           size="sm"
                           className={
                             page === currentPage
-                              ? "h-8 min-w-8 bg-[#0f172a] px-2 font-bold text-white hover:bg-[#1e293b]"
-                              : "h-8 min-w-8 border-[#e2e8f0] bg-white px-2 font-bold text-[#64748b] hover:bg-[#f8fafc]"
+                              ? "h-8 min-w-8 bg-[#0f172a] px-2 font-medium text-white hover:bg-[#1e293b]"
+                              : "h-8 min-w-8 border-[#e2e8f0] bg-white px-2 font-medium text-[#64748b] hover:bg-[#f8fafc]"
                           }
                           onClick={() => setCurrentPage(page)}
                         >
@@ -522,7 +522,7 @@ export function RecycleBinPage() {
                     type="button"
                     variant="outline"
                     size="sm"
-                    className="h-8 border-[#e2e8f0] bg-white px-2 font-bold text-[#64748b] hover:bg-[#f8fafc]"
+                    className="h-8 border-[#e2e8f0] bg-white px-2 font-medium text-[#64748b] hover:bg-[#f8fafc]"
                     disabled={currentPage >= totalPages}
                     onClick={() => setCurrentPage((page) => Math.min(totalPages, page + 1))}
                     aria-label="Next page"

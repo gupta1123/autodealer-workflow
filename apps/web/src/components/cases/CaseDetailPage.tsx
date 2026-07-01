@@ -3,7 +3,6 @@
 import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
 import {
   ArrowLeft,
   CheckCircle2,
@@ -32,7 +31,6 @@ import { AppShell } from "@/components/dashboard/AppShell";
 import { AnalysisOptionsDialog } from "@/components/workspace/AnalysisOptionsDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   getComparisonModeLabel,
@@ -354,15 +352,29 @@ function getOrderedDocumentEntries(
   });
 }
 
-function formatDateTime(value: string) {
-  return new Date(value).toLocaleString("en-US", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
+function getCompactDocumentType(documentType: string) {
+  if (/purchase order/i.test(documentType)) return "PO";
+  if (/tax invoice|invoice/i.test(documentType)) return "Invoice";
+  if (/e-?way/i.test(documentType)) return "E-Way";
+  return documentType.replace(/\s+document$/i, "");
+}
+
+function getPacketDocumentLabels(documents: SavedCaseDetail["documents"]) {
+  const labels = documents.map((document) => getCompactDocumentType(document.documentType || "Document"));
+  return Array.from(new Set(labels));
+}
+
+function getMissingPacketDocumentLabels(documents: SavedCaseDetail["documents"]) {
+  const documentTypes = documents.map((document) => document.documentType.toLowerCase());
+  const hasPo = documentTypes.some((type) => type.includes("purchase order"));
+  const hasInvoice = documentTypes.some((type) => type.includes("invoice"));
+  const hasEWay = documentTypes.some((type) => type.includes("e-way") || type.includes("eway"));
+
+  return [
+    !hasPo ? "PO" : "",
+    !hasInvoice ? "Invoice" : "",
+    !hasEWay ? "E-Way" : "",
+  ].filter(Boolean);
 }
 
 function normalizeText(value: string | null | undefined) {
@@ -370,10 +382,25 @@ function normalizeText(value: string | null | undefined) {
 }
 
 function displayValue(value: unknown) {
-  if (value === null || value === undefined || value === "") return "—";
+  if (value === null || value === undefined || value === "") return "-";
   if (Array.isArray(value)) return value.join(", ");
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
+}
+function getDocumentIndexDetails(document: SavedCaseDetail["documents"][number]) {
+  const type = document.documentType || "Document";
+  const sourcePage = getDocumentSourcePage(document);
+  const fileName =
+    document.sourceFileName ||
+    document.sourceHint?.replace(/^pages?\s+\d+\s*[-:]\s*/i, "").trim() ||
+    document.title ||
+    "Source file";
+
+  return {
+    type,
+    fileName,
+    pageLabel: `Page ${sourcePage}`,
+  };
 }
 
 function parseDisplayNumber(value: unknown) {
@@ -447,10 +474,6 @@ function getDocumentSourcePage(document?: SavedCaseDetail["documents"][number] |
   return Number.isFinite(page) && page > 0 ? Math.round(page) : 1;
 }
 
-function formatCaseSubject(category: string) {
-  return /packet$/i.test(category.trim()) ? category.trim() : `${category} Packet`;
-}
-
 function getCaseStatusLabel(status: string) {
   if (status === "draft") return "Draft";
   if (status === "accepted") return "Accepted";
@@ -508,7 +531,7 @@ function getFriendlyAnalysisStage(stage: string | null, status: "idle" | "proces
 
 function CaseDetailSkeleton() {
   return (
-    <div className="flex min-h-[calc(100vh-4rem)] flex-1 flex-col overflow-hidden bg-[#fafafa]">
+    <div className="flex min-h-[calc(100vh-4rem)] flex-1 flex-col overflow-hidden bg-[#fafafa] tracking-normal">
       <header className="flex h-14 sm:h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-3 sm:px-6">
         <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-4">
           <Skeleton className="h-8 w-8 shrink-0 rounded-lg bg-slate-100" />
@@ -764,9 +787,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   const pendingMismatchCount = visibleMismatches.filter(
     (mismatch) => mismatch.resolutionStatus === "pending"
   ).length;
-  const acceptedMismatchCount = visibleMismatches.filter(
-    (mismatch) => mismatch.resolutionStatus === "accepted"
-  ).length;
   const rejectedMismatchCount = visibleMismatches.filter(
     (mismatch) => mismatch.resolutionStatus === "rejected"
   ).length;
@@ -776,49 +796,116 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     }
 
     const documentLabel = `${detail.documents.length} document${detail.documents.length === 1 ? "" : "s"}`;
+    const documentLabels = getPacketDocumentLabels(detail.documents);
+    const missingDocumentLabels = getMissingPacketDocumentLabels(detail.documents);
+    const docsFact =
+      documentLabels.length > 0
+        ? `${detail.documents.length} ${detail.documents.length === 1 ? "document" : "documents"}`
+        : "No extracted docs";
+    const facts = [
+      { label: "Docs", value: docsFact },
+      { label: "Receiver", value: detail.case.receiverName || "-" },
+    ];
+
+    if (detail.case.status === "processing") {
+      return {
+        tone: "amber" as const,
+        title: "Processing",
+        description: `Checking ${documentLabel}.`,
+        actionHint: "Wait for extraction and reconciliation to finish.",
+        buttonLabel: null,
+        action: null,
+        badgeLabel: "Running",
+        showConfidence: false,
+        showBadge: true,
+        facts,
+      };
+    }
+
+    if (detail.case.status === "failed") {
+      return {
+        tone: "rose" as const,
+        title: "Failed",
+        description: "Could not complete analysis.",
+        actionHint: "Retry analysis after checking the uploaded files.",
+        buttonLabel: "Retry Analysis",
+        action: "retry" as const,
+        badgeLabel: "Failed",
+        showConfidence: false,
+        showBadge: true,
+        facts,
+      };
+    }
 
     if (detail.case.status === "accepted") {
       return {
         tone: "emerald" as const,
-        title: "Case Accepted",
+        title: "Approved",
         description:
           visibleMismatches.length === 0
-            ? `${documentLabel} checked. Key extracted values match across this case.`
-            : `All ${visibleMismatches.length} issue${visibleMismatches.length === 1 ? "" : "s"} were reviewed and accepted across ${documentLabel}.`,
+            ? `${documentLabel} verified. No pending action.`
+            : `${visibleMismatches.length} reviewed issue${visibleMismatches.length === 1 ? "" : "s"} accepted.`,
+        actionHint: "This case is cleared.",
         buttonLabel:
           visibleMismatches.length > 0
             ? `View ${visibleMismatches.length} Reviewed Issue${visibleMismatches.length === 1 ? "" : "s"}`
             : null,
+        action: visibleMismatches.length > 0 ? "review" as const : null,
         badgeLabel: "Accepted",
-        showConfidence: visibleMismatches.length === 0,
+        showConfidence: false,
+        showBadge: false,
+        facts,
       };
     }
 
     if (detail.case.status === "rejected") {
       return {
         tone: "rose" as const,
-        title: "Case Rejected",
+        title: "Blocked",
         description:
           rejectedMismatchCount > 0
-            ? `${rejectedMismatchCount} issue${rejectedMismatchCount === 1 ? "" : "s"} were rejected across ${documentLabel}.`
-            : `This case was rejected after review across ${documentLabel}.`,
+            ? `${rejectedMismatchCount} rejected issue${rejectedMismatchCount === 1 ? "" : "s"} blocked this case.`
+            : `Rejected after review across ${documentLabel}.`,
+        actionHint: "Open the review trail before taking further action.",
         buttonLabel:
           visibleMismatches.length > 0
             ? `View ${visibleMismatches.length} Reviewed Issue${visibleMismatches.length === 1 ? "" : "s"}`
             : null,
+        action: visibleMismatches.length > 0 ? "review" as const : null,
         badgeLabel: "Rejected",
         showConfidence: false,
+        showBadge: false,
+        facts,
+      };
+    }
+
+    if (missingDocumentLabels.length > 0 && visibleMismatches.length === 0) {
+      return {
+        tone: "amber" as const,
+        title: "Missing Documents",
+        description: `Missing ${missingDocumentLabels.join(", ")} from this packet.`,
+        actionHint: "Upload the missing document before approving.",
+        buttonLabel: null,
+        action: null,
+        badgeLabel: "Incomplete",
+        showConfidence: false,
+        showBadge: true,
+        facts: [{ label: "Missing", value: missingDocumentLabels.join(", ") }, ...facts],
       };
     }
 
     if (visibleMismatches.length === 0) {
       return {
         tone: "emerald" as const,
-        title: "Data Reconciled",
-        description: `${documentLabel} checked. Key extracted values match across this case.`,
-        buttonLabel: null,
+        title: "Ready to Approve",
+        description: `${documentLabel} matched. No issues found.`,
+        actionHint: "Approve this case and move on.",
+        buttonLabel: "Approve Case",
+        action: "approve" as const,
         badgeLabel: "Clear",
-        showConfidence: true,
+        showConfidence: false,
+        showBadge: false,
+        facts,
       };
     }
 
@@ -826,20 +913,28 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       return {
         tone: "amber" as const,
         title: "Review In Progress",
-        description: `${pendingMismatchCount} of ${visibleMismatches.length} issue${visibleMismatches.length === 1 ? "" : "s"} still need review across ${documentLabel}.`,
+        description: `${pendingMismatchCount} of ${visibleMismatches.length} issue${visibleMismatches.length === 1 ? "" : "s"} still need review.`,
+        actionHint: "Finish the remaining decisions.",
         buttonLabel: `Review ${pendingMismatchCount} Pending Issue${pendingMismatchCount === 1 ? "" : "s"}`,
+        action: "review" as const,
         badgeLabel: "Pending",
         showConfidence: false,
+        showBadge: true,
+        facts,
       };
     }
 
     return {
       tone: "rose" as const,
-      title: "Discrepancies Found",
-      description: `${visibleMismatches.length} issue${visibleMismatches.length === 1 ? "" : "s"} found across ${documentLabel}. Review is recommended.`,
+      title: "Needs Review",
+      description: `${visibleMismatches.length} issue${visibleMismatches.length === 1 ? "" : "s"} found across ${documentLabel}.`,
+      actionHint: "Review the mismatches before accepting.",
       buttonLabel: `Review ${visibleMismatches.length} Issue${visibleMismatches.length === 1 ? "" : "s"}`,
+      action: "review" as const,
       badgeLabel: "Needs review",
       showConfidence: false,
+      showBadge: false,
+      facts,
     };
   }, [detail, pendingMismatchCount, rejectedMismatchCount, visibleMismatches.length]);
 
@@ -1167,12 +1262,12 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   if (status === "error") {
     return (
       <AppShell>
-        <div className="flex flex-1 items-center justify-center bg-slate-50/50 p-6 min-h-[calc(100vh-4rem)]">
+        <div className="flex flex-1 items-center justify-center bg-slate-50/50 p-6 min-h-[calc(100vh-4rem)] tracking-normal">
           <div className="w-full max-w-md flex flex-col items-center text-center bg-white p-8 rounded-3xl shadow-sm border border-slate-200">
             <div className="flex h-16 w-16 items-center justify-center rounded-full bg-red-50 mb-4">
               <ShieldAlert className="h-8 w-8 text-red-500" />
             </div>
-            <h3 className="text-xl font-semibold text-slate-900">Unable to load case</h3>
+            <h3 className="text-xl font-medium text-slate-900">Unable to load case</h3>
             <p className="mt-2 text-sm text-slate-600 leading-relaxed">{error}</p>
             <Button asChild variant="outline" className="mt-8 rounded-xl w-full">
               <Link href="/cases">Return to Cases</Link>
@@ -1200,16 +1295,16 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
     return (
       <AppShell>
-        <div className="flex flex-1 flex-col bg-[#f7f7f5] animate-in fade-in duration-500 min-h-[calc(100vh-4rem)]">
+        <div className="flex flex-1 flex-col bg-[#f7f7f5] animate-in fade-in duration-500 min-h-[calc(100vh-4rem)] tracking-normal">
           <header className="flex h-14 sm:h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 sm:px-6">
             <div className="flex items-center gap-3 sm:gap-4 w-full">
               <Link href="/cases" className="text-slate-400 hover:text-slate-800 transition-colors shrink-0">
                 <ArrowLeft className="h-5 w-5" />
               </Link>
-              <h1 className="text-base sm:text-lg font-semibold text-slate-900 truncate pr-2">
+              <h1 className="text-base sm:text-lg font-medium text-slate-900 truncate pr-2">
                 {detail.case.displayName}
               </h1>
-              <Badge variant="outline" className={`ml-auto rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider shrink-0 ${getCaseStatusClassName(detail.case.status)}`}>
+              <Badge variant="outline" className={`ml-auto rounded-full px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-wider shrink-0 ${getCaseStatusClassName(detail.case.status)}`}>
                 {getCaseStatusLabel(detail.case.status)}
               </Badge>
             </div>
@@ -1227,10 +1322,10 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
               </div>
 
               <div className="max-w-2xl space-y-4">
-                <div className="text-xs font-bold uppercase tracking-[0.3em] text-[#8a7f72]">
+                <div className="text-xs font-medium uppercase tracking-[0.3em] text-[#8a7f72]">
                   {canRetry ? "Analysis failed" : "Case created"}
                 </div>
-                <h2 className="text-4xl font-extrabold tracking-tight text-[#1a1a1a] sm:text-5xl">
+                <h2 className="text-4xl font-medium tracking-tight text-[#1a1a1a] sm:text-5xl">
                   {canRetry ? "Analysis failed" : "Ready to analyze"}
                 </h2>
                 <p className="mx-auto text-base font-medium leading-relaxed text-[#5a5046]">
@@ -1239,13 +1334,13 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                     : `This case has ${readyCount} document${readyCount === 1 ? "" : "s"} ready. Add any missing documents, then analyze to extract fields and check mismatches.`}
                 </p>
 
-                <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-[#e5ddd0] bg-white px-4 py-2 text-sm font-bold text-[#5a5046] shadow-sm">
+                <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-[#e5ddd0] bg-white px-4 py-2 text-sm font-medium text-[#5a5046] shadow-sm">
                   <Folder className="h-4 w-4 text-[#8a7f72]" />
                   {detail.case.displayName}
                 </div>
 
                 {draftFileStatus === "saving" && (
-                  <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-[#c9ead2] bg-[#eaf7ee] px-4 py-2 text-sm font-bold text-[#15803d] shadow-sm">
+                  <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-[#c9ead2] bg-[#eaf7ee] px-4 py-2 text-sm font-medium text-[#15803d] shadow-sm">
                     <Loader2 className="h-4 w-4 animate-spin" />
                     Adding documents to case...
                   </div>
@@ -1253,7 +1348,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
                 {isAnalyzing && (
                   <div className="mx-auto mt-4 w-full max-w-md space-y-3 text-left">
-                    <div className="flex items-center justify-between text-sm font-semibold text-[#5a5046]">
+                    <div className="flex items-center justify-between text-sm font-medium text-[#5a5046]">
                       <span>{stageLabel}</span>
                       <span>{analysisProgress}%</span>
                     </div>
@@ -1267,7 +1362,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 )}
 
                 {((analysisStatus === "error" && analysisError) || draftFileError) && (
-                  <div className="mx-auto mt-4 max-w-2xl rounded-2xl border border-red-200 bg-red-50 px-5 py-4 text-sm font-bold text-red-700 shadow-sm">
+                  <div className="mx-auto mt-4 max-w-2xl rounded-2xl border border-red-200 bg-red-50 px-5 py-4 text-sm font-medium text-red-700 shadow-sm">
                     {draftFileError || analysisError}
                   </div>
                 )}
@@ -1275,8 +1370,8 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
               <div className="w-full max-w-3xl rounded-[2rem] border border-[#e5ddd0] bg-white p-6 shadow-sm">
                 <div className="flex items-center justify-between gap-4">
-                  <h3 className="text-left text-base font-bold text-[#1a1a1a]">Documents in this case</h3>
-                  <div className="text-[11px] font-bold uppercase tracking-[0.25em] text-[#8a7f72]">
+                  <h3 className="text-left text-base font-medium text-[#1a1a1a]">Documents in this case</h3>
+                  <div className="text-[11px] font-medium uppercase tracking-[0.25em] text-[#8a7f72]">
                     {readyCount} document{readyCount === 1 ? "" : "s"}
                   </div>
                 </div>
@@ -1288,7 +1383,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                       title={file.originalName}
                     >
                       <FileText className="h-6 w-6" />
-                      <span className="absolute -right-1.5 -top-1.5 rounded-full bg-[#1a1a1a] px-1.5 py-0.5 text-[10px] font-bold text-white">
+                      <span className="absolute -right-1.5 -top-1.5 rounded-full bg-[#1a1a1a] px-1.5 py-0.5 text-[10px] font-medium text-white">
                         {index + 1}
                       </span>
                     </div>
@@ -1296,7 +1391,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 </div>
               </div>
 
-              <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#8a7f72]">
+              <div className="text-[10px] font-medium uppercase tracking-[0.2em] text-[#8a7f72]">
                 Mode: {getComparisonModeLabel(comparisonOptions)}
               </div>
 
@@ -1314,7 +1409,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                   <Button
                     variant="outline"
                     disabled={draftFileStatus === "saving"}
-                    className="rounded-2xl px-6 py-6 text-base font-bold border-[#e5ddd0] text-[#5a5046] bg-white hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-transform hover:scale-[1.02]"
+                    className="rounded-2xl px-6 py-6 text-base font-medium border-[#e5ddd0] text-[#5a5046] bg-white hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-transform hover:scale-[1.02]"
                     onClick={() => draftFileInputRef.current?.click()}
                   >
                     <Plus className="mr-2 h-5 w-5 text-[#8a7f72]" />
@@ -1324,7 +1419,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                   <Button
                     type="button"
                     disabled={detail.files.length === 0 || draftFileStatus === "saving"}
-                    className="flex-1 rounded-2xl bg-[#1a1a1a] px-8 py-6 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] transition-transform hover:scale-[1.02]"
+                    className="flex-1 rounded-2xl bg-[#1a1a1a] px-8 py-6 text-base font-medium text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] transition-transform hover:scale-[1.02]"
                     onClick={() => {
                       setPendingAnalysisMode("standard");
                       setAnalysisOptionsOpen(true);
@@ -1338,7 +1433,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                     type="button"
                     disabled={detail.files.length === 0 || draftFileStatus === "saving"}
                     variant="outline"
-                    className="rounded-2xl border-emerald-200 bg-emerald-50 px-6 py-6 text-base font-bold text-emerald-800 shadow-sm transition-transform hover:scale-[1.02] hover:bg-emerald-100 hover:text-emerald-900"
+                    className="rounded-2xl border-emerald-200 bg-emerald-50 px-6 py-6 text-base font-medium text-emerald-800 shadow-sm transition-transform hover:scale-[1.02] hover:bg-emerald-100 hover:text-emerald-900"
                     onClick={() => {
                       setPendingAnalysisMode("smart_split");
                       setAnalysisOptionsOpen(true);
@@ -1373,7 +1468,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   return (
     <AppShell>
       <div
-        className={`relative flex min-h-[calc(100vh-4rem)] flex-1 flex-col overflow-hidden bg-[#fafafa] animate-in fade-in duration-300 ${
+        className={`relative flex min-h-[calc(100vh-4rem)] flex-1 flex-col overflow-hidden bg-[#fafafa] tracking-normal animate-in fade-in duration-300 ${
           showActions ? "pb-28 md:pb-0" : ""
         }`}
       >
@@ -1386,7 +1481,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
             </Link>
             <div className="w-px h-6 bg-slate-200 shrink-0"></div>
             <div className="min-w-0 flex flex-col justify-center">
-              <h1 className="text-xs sm:text-base font-bold text-slate-900 truncate">
+              <h1 className="text-xs sm:text-base font-medium text-slate-900 truncate">
                 {detail?.case.displayName}
               </h1>
             </div>
@@ -1394,7 +1489,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
           {/* Action Area (Desktop) */}
           <div className="hidden md:flex items-center gap-3 shrink-0">
-            <Badge variant="outline" className={`rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wider ${getCaseStatusClassName(detail?.case.status || "")}`}>
+            <Badge variant="outline" className={`rounded-full px-3 py-1 text-xs font-medium uppercase tracking-wider ${getCaseStatusClassName(detail?.case.status || "")}`}>
               {getCaseStatusLabel(detail?.case.status || "")}
             </Badge>
             {showActions ? (
@@ -1472,7 +1567,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 )}
               </div>
               <h3
-                className={`text-[11px] font-extrabold uppercase tracking-tight ${
+                className={`text-[11px] font-medium uppercase tracking-tight ${
                   reviewSummary.tone === "emerald"
                     ? "text-emerald-900"
                     : reviewSummary.tone === "amber"
@@ -1488,7 +1583,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 asChild
                 size="sm"
                 variant="ghost"
-                className={`h-8 text-[10px] text-white rounded-lg px-4 shrink-0 font-bold uppercase tracking-wider shadow-sm ${
+                className={`h-8 text-[10px] text-white rounded-lg px-4 shrink-0 font-medium uppercase tracking-wider shadow-sm ${
                   reviewSummary.tone === "emerald"
                     ? "bg-emerald-600 hover:bg-emerald-700"
                     : reviewSummary.tone === "amber"
@@ -1506,14 +1601,13 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
         <div className="flex flex-1 min-h-0 relative">
 
           {/* Left Sidebar (Desktop only) */}
-          <aside className="hidden w-[20rem] shrink-0 overflow-hidden border-r border-slate-200 bg-[#fafafa] md:flex md:flex-col xl:w-[22rem]">
-            <ScrollArea className="min-w-0 flex-1">
-              <div className="min-w-0 space-y-5 p-5">
+          <aside className="hidden h-full max-h-[calc(100vh-4rem)] min-h-0 w-[20rem] shrink-0 overflow-hidden border-r border-slate-200 bg-[#fafafa] md:flex md:flex-col xl:w-[22rem]">
+            <div className="min-w-0 shrink-0 p-5 pb-4">
 
-                {/* Unified AI Summary & Metadata Card */}
+                {/* Decision Summary Card */}
                 {detail && reviewSummary && (
                   <div
-                    className={`flex w-full max-w-full flex-col overflow-hidden rounded-2xl border shadow-sm ${
+                    className={`flex w-full max-w-full flex-col overflow-hidden rounded-2xl border bg-white shadow-sm ${
                       reviewSummary.tone === "emerald"
                         ? "border-emerald-200"
                         : reviewSummary.tone === "amber"
@@ -1522,62 +1616,82 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                     }`}
                   >
 
-                    {/* Status Header Area */}
                     <div
                       className={`p-5 ${
                         reviewSummary.tone === "emerald"
-                          ? "bg-emerald-50/50"
+                          ? "bg-emerald-50/70"
                           : reviewSummary.tone === "amber"
-                            ? "bg-amber-50/50"
-                            : "bg-rose-50/50"
+                            ? "bg-amber-50/70"
+                            : "bg-rose-50/70"
                       }`}
                     >
-                      <div className="flex items-center gap-2 mb-3">
-                        <div
-                          className={`rounded-full p-1.5 shadow-sm ${
-                            reviewSummary.tone === "emerald"
-                              ? "bg-emerald-100 text-emerald-600"
-                              : reviewSummary.tone === "amber"
-                                ? "bg-amber-100 text-amber-600"
-                                : "bg-rose-100 text-rose-600"
-                          }`}
-                        >
-                          {reviewSummary.tone === "emerald" ? (
-                            <CheckCircle2 className="h-4 w-4" />
-                          ) : (
-                            <TriangleAlert className="h-4 w-4" />
-                          )}
+                      <div className="mb-3 flex items-start justify-between gap-3">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <div
+                            className={`rounded-full p-1.5 shadow-sm ${
+                              reviewSummary.tone === "emerald"
+                                ? "bg-emerald-100 text-emerald-600"
+                                : reviewSummary.tone === "amber"
+                                  ? "bg-amber-100 text-amber-600"
+                                  : "bg-rose-100 text-rose-600"
+                            }`}
+                          >
+                            {reviewSummary.tone === "emerald" ? (
+                              <CheckCircle2 className="h-4 w-4" />
+                            ) : reviewSummary.title === "Processing" ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <TriangleAlert className="h-4 w-4" />
+                            )}
+                          </div>
+                          <h3
+                            className={`truncate text-base font-medium ${
+                              reviewSummary.tone === "emerald"
+                                ? "text-emerald-950"
+                                : reviewSummary.tone === "amber"
+                                  ? "text-amber-950"
+                                  : "text-rose-950"
+                            }`}
+                          >
+                            {reviewSummary.title}
+                          </h3>
                         </div>
-                        <h3
-                          className={`text-sm font-bold ${
-                            reviewSummary.tone === "emerald"
-                              ? "text-emerald-900"
-                              : reviewSummary.tone === "amber"
-                                ? "text-amber-900"
-                                : "text-rose-900"
-                          }`}
-                        >
-                          {reviewSummary.title}
-                        </h3>
+                        {reviewSummary.showBadge ? (
+                          <span
+                            className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-medium uppercase tracking-wider ${
+                              reviewSummary.tone === "emerald"
+                                ? "bg-emerald-100 text-emerald-700"
+                                : reviewSummary.tone === "amber"
+                                  ? "bg-amber-100 text-amber-700"
+                                  : "bg-rose-100 text-rose-700"
+                            }`}
+                          >
+                            {reviewSummary.badgeLabel}
+                          </span>
+                        ) : null}
                       </div>
 
                       <p
-                        className={`text-sm leading-relaxed break-words ${
+                        className={`text-sm font-medium leading-snug ${
                           reviewSummary.tone === "emerald"
-                            ? "text-emerald-700"
+                            ? "text-emerald-800"
                             : reviewSummary.tone === "amber"
-                              ? "text-amber-700"
-                              : "text-rose-700"
+                              ? "text-amber-800"
+                              : "text-rose-800"
                         }`}
                       >
                         {reviewSummary.description}
                       </p>
+                      {reviewSummary.action !== "approve" && reviewSummary.actionHint ? (
+                        <p className="mt-2 text-xs font-medium leading-snug text-slate-600">
+                          {reviewSummary.actionHint}
+                        </p>
+                      ) : null}
 
-                      {/* Mismatches Action Button */}
-                      {reviewSummary.buttonLabel && (
+                      {reviewSummary.buttonLabel && reviewSummary.action === "review" && (
                         <Button
                           asChild
-                          className={`w-full mt-4 text-white shadow-sm font-semibold h-10 ${
+                          className={`mt-4 h-10 w-full text-white shadow-sm font-medium ${
                             reviewSummary.tone === "emerald"
                               ? "bg-emerald-600 hover:bg-emerald-700"
                               : reviewSummary.tone === "amber"
@@ -1586,75 +1700,105 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                           }`}
                         >
                           <Link href={`/cases/${caseId}/mismatches`}>
-                            <TriangleAlert className="h-4 w-4 mr-2" />
+                            <TriangleAlert className="mr-2 h-4 w-4" />
                             {reviewSummary.buttonLabel}
                           </Link>
                         </Button>
                       )}
 
+                      {reviewSummary.buttonLabel && reviewSummary.action === "approve" && showActions && (
+                        <Button
+                          className="mt-4 h-10 w-full bg-emerald-600 font-medium text-white shadow-sm hover:bg-emerald-700"
+                          disabled={decisionStatus === "updating"}
+                          onClick={() => handleCaseDecision("accepted")}
+                        >
+                          {decisionStatus === "updating" ? (
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <Check className="mr-2 h-4 w-4" />
+                          )}
+                          {reviewSummary.buttonLabel}
+                        </Button>
+                      )}
+
+                      {reviewSummary.buttonLabel && reviewSummary.action === "retry" && (
+                        <Button
+                          className="mt-4 h-10 w-full bg-rose-600 font-medium text-white shadow-sm hover:bg-rose-700"
+                          onClick={() => {
+                            setPendingAnalysisMode("standard");
+                            setAnalysisOptionsOpen(true);
+                          }}
+                        >
+                          <Play className="mr-2 h-4 w-4 fill-white" />
+                          {reviewSummary.buttonLabel}
+                        </Button>
+                      )}
+
                       {reviewSummary.showConfidence && (
-                        <div className="mt-4 flex items-center justify-center gap-2 text-xs font-semibold text-emerald-600 bg-emerald-100/50 py-2 rounded-lg border border-emerald-100">
+                        <div className="mt-4 flex items-center justify-center gap-2 rounded-lg border border-emerald-100 bg-emerald-100/60 py-2 text-xs font-medium text-emerald-700">
                           <Sparkles className="h-3.5 w-3.5" /> High Confidence
                         </div>
                       )}
                     </div>
 
-                    {/* Metadata Grid */}
-                    <div className="border-t border-slate-100 bg-white p-5">
-                      <div className="grid grid-cols-1 gap-4 text-sm">
-                        <div>
-                          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Subject</span>
-                          <span className="text-slate-900 font-medium leading-snug break-words">{formatCaseSubject(detail.case.category)}</span>
-                        </div>
-                        <div>
-                          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Uploaded</span>
-                          <span className="text-slate-900 font-medium leading-snug break-words">{formatDateTime(detail.case.createdAt)}</span>
-                        </div>
-
-                        <div>
-                          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400 block mb-1">Receiver</span>
-                          <span className="text-slate-900 font-medium leading-snug break-words">{detail.case.receiverName || "—"}</span>
-                        </div>
+                    <div className="border-t border-slate-100 bg-white p-4">
+                      <div className="grid grid-cols-1 gap-2">
+                        {reviewSummary.facts.map((fact) => (
+                          <div
+                            key={`${fact.label}-${fact.value}`}
+                            className="flex min-w-0 items-center justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2"
+                          >
+                            <span className="shrink-0 text-[10px] font-medium uppercase tracking-widest text-slate-400">
+                              {fact.label}
+                            </span>
+                            <span className="min-w-0 truncate text-right text-xs font-medium text-slate-800" title={fact.value}>
+                              {fact.value}
+                            </span>
+                          </div>
+                        ))}
                       </div>
                     </div>
                   </div>
                 )}
 
-                {/* Documents List */}
-                <div>
-                  <div className="flex items-center justify-between mb-3 px-1">
-                    <h3 className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">Documents in Packet</h3>
-                    <span className="rounded-full bg-slate-200/50 px-2 py-0.5 text-[10px] font-bold text-slate-500">{detail?.documents.length}</span>
+            </div>
+
+            {/* Documents List */}
+            <div className="flex min-h-0 flex-1 flex-col border-t border-slate-200 px-5 pb-5 pt-4">
+                  <div className="mb-3 flex shrink-0 items-center justify-between px-1">
+                    <h3 className="text-[11px] font-medium text-slate-500 uppercase tracking-widest">Documents in Packet</h3>
+                    <span className="rounded-full bg-slate-200/50 px-2 py-0.5 text-[10px] font-medium text-slate-500">{detail?.documents.length}</span>
                   </div>
-                  <div className="space-y-1.5">
+                  <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
                     {detail?.documents.map((doc) => {
                       const isActive = activeDocumentId === doc.id;
+                      const documentIndex = getDocumentIndexDetails(doc);
                       return (
                         <button
                           key={doc.id}
                           onClick={() => setActiveDocumentId(doc.id)}
-                          className={`flex w-full min-w-0 items-center gap-3 overflow-hidden rounded-xl px-3 py-3 text-left transition-all ${isActive ? 'bg-white shadow-sm border border-slate-200 ring-1 ring-slate-200' : 'hover:bg-slate-200/50 border border-transparent'
+                          className={`flex w-full min-w-0 items-start gap-3 rounded-xl px-3 py-3 text-left transition-all ${isActive ? 'bg-white shadow-sm border border-slate-200 ring-1 ring-slate-200' : 'hover:bg-slate-200/50 border border-transparent'
                             }`}
                         >
-                          <div className={`shrink-0 h-8 w-8 rounded-lg flex items-center justify-center ${isActive ? 'bg-indigo-50 text-indigo-600' : 'bg-white text-slate-400 border border-slate-200'}`}>
+                          <div className={`mt-0.5 shrink-0 h-8 w-8 rounded-lg flex items-center justify-center ${isActive ? 'bg-indigo-50 text-indigo-600' : 'bg-white text-slate-400 border border-slate-200'}`}>
                             <FileText className="h-4 w-4" />
                           </div>
-                          <div className="min-w-0 flex-1 overflow-hidden">
-                            <p className={`line-clamp-2 break-words text-sm font-bold leading-snug ${isActive ? 'text-slate-900' : 'text-slate-600'}`}>
-                              {doc.title}
+                          <div className="min-w-0 flex-1">
+                            <p className={`whitespace-normal text-sm font-medium leading-snug [overflow-wrap:anywhere] ${isActive ? 'text-slate-950' : 'text-slate-700'}`}>
+                              {documentIndex.type}
                             </p>
-                            <p className="mt-1 truncate text-[10px] font-medium uppercase tracking-wider text-slate-400">
-                              {doc.documentType}{doc.pageCount && doc.pageCount > 1 ? ` · ${doc.pageCount} pages` : ""}
+                            <p className={`mt-1 truncate text-xs font-medium leading-snug ${isActive ? 'text-slate-700' : 'text-slate-500'}`} title={documentIndex.fileName}>
+                              {documentIndex.fileName}
+                            </p>
+                            <p className="mt-1 line-clamp-1 text-[10px] font-medium uppercase tracking-wider text-slate-400 [overflow-wrap:anywhere]">
+                              {documentIndex.pageLabel}
                             </p>
                           </div>
                         </button>
                       );
                     })}
                   </div>
-                </div>
-
-              </div>
-            </ScrollArea>
+            </div>
           </aside>
 
           {/* Right Main Area (Document Viewer Card) */}
@@ -1665,6 +1809,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
               <div className="flex overflow-x-auto gap-2 snap-x scrollbar-hide py-0.5 px-0.5">
                 {detail?.documents.map((doc) => {
                   const isActive = activeDocumentId === doc.id;
+                  const documentIndex = getDocumentIndexDetails(doc);
                   return (
                       <button
                         key={doc.id}
@@ -1673,10 +1818,11 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                         ? 'bg-[#1a1a1a] border-slate-900 shadow-md text-white' 
                         : 'bg-[#f0ece6] border-[#e5ddd0] text-[#5a5046]'
                         }`}
-                      style={{ minWidth: '130px' }}
+                      style={{ minWidth: '160px' }}
                     >
-                      <p className="font-bold text-[11px] truncate w-full">{doc.title}</p>
-                      <p className={`text-[9px] font-bold opacity-60 truncate w-full uppercase tracking-tighter mt-0.5 ${isActive ? 'text-white' : 'text-[#8a7f72]'}`}>{doc.documentType}{doc.pageCount && doc.pageCount > 1 ? ` · ${doc.pageCount}p` : ""}</p>
+                      <p className="w-full truncate text-[11px] font-medium">{documentIndex.type}</p>
+                      <p className={`mt-0.5 w-full truncate text-[9px] font-medium opacity-70 ${isActive ? 'text-white' : 'text-[#8a7f72]'}`}>{documentIndex.fileName}</p>
+                      <p className={`mt-0.5 w-full truncate text-[8px] font-medium uppercase tracking-wider opacity-60 ${isActive ? 'text-white' : 'text-[#8a7f72]'}`}>{documentIndex.pageLabel}</p>
                     </button>
                   )
                 })}
@@ -1687,17 +1833,17 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
             <div className="flex flex-col flex-1 bg-white sm:border border-slate-200 sm:rounded-2xl shadow-sm overflow-hidden mb-2 sm:mb-0">
 
               {/* Card Header (Tabs & Title) */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-2 sm:p-4 border-b border-slate-100 bg-white shrink-0">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-2 sm:p-3 border-b border-slate-100 bg-white shrink-0">
 
                 {/* Left Side: Title & Badge (Desktop Only) */}
                 <div className="hidden sm:flex items-center gap-3">
                   <div className="flex items-center gap-2">
                     {activeTab === 'preview' ? <Eye className="h-5 w-5 text-slate-500" /> : <Database className="h-5 w-5 text-slate-500" />}
-                    <h2 className="text-base font-bold text-slate-900">
+                    <h2 className="text-base font-medium text-slate-900">
                       {activeTab === 'preview' ? 'Preview' : 'Extracted Data'}
                     </h2>
                   </div>
-                  <Badge variant="outline" className="rounded-full px-2.5 py-0.5 text-[10px] uppercase font-bold text-slate-500 bg-slate-50 border-slate-200">
+                  <Badge variant="outline" className="rounded-full px-2.5 py-0.5 text-[10px] uppercase font-medium text-slate-500 bg-slate-50 border-slate-200">
                     {activeTab === 'preview' ? activeSourceLabel : 'View'}
                   </Badge>
                 </div>
@@ -1706,14 +1852,14 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 <div className="flex items-center justify-between sm:justify-end w-full sm:w-auto gap-3">
 
                   {/* Segmented Control */}
-                  <div className="flex items-center bg-[#f0ece6] p-1.5 rounded-xl w-full sm:w-auto border border-[#e5ddd0]">
+                  <div className="flex items-center bg-[#f0ece6] p-1 rounded-xl w-full sm:w-auto border border-[#e5ddd0]">
                     {DETAIL_TABS.map((tab) => {
                       const isActive = activeTab === tab.id;
                       return (
                         <button
                           key={tab.id}
                           onClick={() => setActiveTab(tab.id)}
-                          className={`flex-1 sm:flex-none flex items-center justify-center gap-2 px-3.5 py-2 rounded-lg text-[11px] sm:text-sm font-bold transition-all ${isActive
+                          className={`flex-1 sm:flex-none flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[11px] sm:text-xs font-medium transition-all ${isActive
                               ? 'bg-[#1a1a1a] text-white shadow-md'
                               : 'text-[#5a5046] hover:bg-[#e5ddd0]/30'
                             }`}
@@ -1796,7 +1942,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                               </button>
                             </>
                           )}
-                          <div className="text-white text-[10px] sm:text-xs font-semibold px-2 flex items-center gap-1">
+                          <div className="text-white text-[10px] sm:text-xs font-medium px-2 flex items-center gap-1">
                             {Math.min(previewPageIndex + 1, previewPageCount)} <span className="opacity-50">/ {previewPageCount}</span>
                           </div>
                           {previewPageCount > 1 && (
@@ -1854,21 +2000,21 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                 {/* 2. Data View */}
                 {activeTab === 'data' && (
                   <div className="absolute inset-0 overflow-y-auto">
-                    <div className="p-4 sm:p-8 max-w-5xl mx-auto pb-8 space-y-6">
+                    <div className="mx-auto max-w-5xl space-y-3 p-3 pb-5 sm:p-4">
                       {(activeFieldDataCount > 0 || activeDocumentLineItems.length > 0) && (
-                        <div className="flex flex-col gap-3 rounded-xl border border-slate-100 bg-white p-3 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+                        <div className="flex flex-col gap-2 rounded-xl border border-slate-100 bg-white px-3 py-2 shadow-sm sm:flex-row sm:items-center sm:justify-between">
                           <div>
-                            <div className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                            <div className="text-[10px] font-medium uppercase tracking-wider text-slate-400">
                               Data View
                             </div>
-                            <div className="text-sm font-semibold text-slate-700">
+                            <div className="text-xs font-medium text-slate-700">
                               {activeDocument?.title ?? "Selected document"}
                             </div>
                           </div>
-                          <div className="inline-flex rounded-xl border border-slate-200 bg-slate-50 p-1">
+                          <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-0.5">
                             <button
                               type="button"
-                              className={`rounded-lg px-3 py-2 text-xs font-bold transition-colors ${
+                              className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
                                 activeDataView === "fields"
                                   ? "bg-white text-slate-950 shadow-sm"
                                   : "text-slate-500 hover:text-slate-800"
@@ -1880,7 +2026,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                             <button
                               type="button"
                               disabled={activeDocumentLineItems.length === 0}
-                              className={`rounded-lg px-3 py-2 text-xs font-bold transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
+                              className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
                                 activeDataView === "lineItems"
                                   ? "bg-white text-slate-950 shadow-sm"
                                   : "text-slate-500 hover:text-slate-800"
@@ -1898,20 +2044,20 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                           No specific fields extracted for this document type.
                         </div>
                       ) : activeDataView === "fields" && activeFieldDataCount > 0 ? (
-                        <div className="space-y-4">
+                        <div className="space-y-3">
                           {(activeTermsChecklistRows.length > 0 || unmatchedTermsIssues.length > 0) && (
                             <div className="overflow-hidden rounded-xl border border-slate-100 bg-white shadow-sm">
-                              <div className="flex flex-col gap-3 border-b border-slate-100 px-4 py-4 sm:flex-row sm:items-start sm:justify-between sm:px-5">
+                              <div className="flex flex-col gap-2 border-b border-slate-100 px-4 py-3 sm:flex-row sm:items-start sm:justify-between">
                                 <div>
-                                  <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                                  <div className="text-xs font-medium uppercase tracking-wider text-slate-500">
                                     Terms & Conditions Compliance Checklist
                                   </div>
-                                  <div className="mt-1 text-sm font-medium text-slate-700">
+                                  <div className="mt-1 text-xs font-medium text-slate-700">
                                     {activeTermsChecklistRows.length} clause{activeTermsChecklistRows.length === 1 ? "" : "s"} extracted from this document.
                                   </div>
                                 </div>
                                 <div
-                                  className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-bold ${
+                                  className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium ${
                                     activeTermsIssues.length > 0
                                       ? "border-amber-200 bg-amber-50 text-amber-700"
                                       : "border-emerald-200 bg-emerald-50 text-emerald-700"
@@ -1935,17 +2081,17 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                                   return (
                                     <div
                                       key={row.key}
-                                      className="grid gap-3 px-4 py-4 sm:grid-cols-[10rem_minmax(0,1fr)_auto] sm:px-5"
+                                      className="grid gap-2 px-4 py-3 sm:grid-cols-[9rem_minmax(0,1fr)_auto]"
                                     >
-                                      <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                                      <div className="text-[11px] font-medium uppercase tracking-wider text-slate-500">
                                         {row.label}
                                       </div>
                                       <div className="min-w-0">
-                                        <div className="whitespace-pre-wrap break-words text-sm font-medium leading-relaxed text-slate-900">
+                                        <div className="whitespace-pre-wrap break-words text-xs font-medium leading-snug text-slate-900">
                                           {row.value}
                                         </div>
                                         {row.detail ? (
-                                          <div className="mt-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                          <div className="mt-2 text-xs font-medium uppercase tracking-wide text-slate-500">
                                             {row.detail}
                                           </div>
                                         ) : null}
@@ -1961,7 +2107,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                                         ) : null}
                                       </div>
                                       <div
-                                        className={`inline-flex h-fit w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-bold ${row.status.className}`}
+                                        className={`inline-flex h-fit w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium ${row.status.className}`}
                                       >
                                         <StatusIcon className="h-3.5 w-3.5" />
                                         {row.status.label}
@@ -1982,16 +2128,16 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                                   return (
                                     <div
                                       key={issue.id}
-                                      className="grid gap-3 px-4 py-4 sm:grid-cols-[10rem_minmax(0,1fr)_auto] sm:px-5"
+                                      className="grid gap-2 px-4 py-3 sm:grid-cols-[9rem_minmax(0,1fr)_auto]"
                                     >
-                                      <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                                      <div className="text-[11px] font-medium uppercase tracking-wider text-slate-500">
                                         Review Item
                                       </div>
-                                      <div className="min-w-0 whitespace-pre-wrap break-words text-sm font-medium leading-relaxed text-slate-900">
+                                      <div className="min-w-0 whitespace-pre-wrap break-words text-xs font-medium leading-snug text-slate-900">
                                         {issueText}
                                       </div>
                                       <div
-                                        className={`inline-flex h-fit w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-bold ${status.className}`}
+                                        className={`inline-flex h-fit w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium ${status.className}`}
                                       >
                                         <StatusIcon className="h-3.5 w-3.5" />
                                         {status.label}
@@ -2009,13 +2155,13 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                                 const currentValue = typeof value === "string" ? value : displayValue(value);
 
                                 return (
-                                  <div key={key} className={`flex flex-col bg-white p-3 transition-colors hover:bg-slate-50/50 sm:flex-row sm:items-start sm:p-5 ${index !== activeDocumentFieldEntries.length - 1 ? 'border-b border-slate-100' : ''}`}>
-                                    <div className="mb-1 w-full pr-4 sm:mb-0 sm:w-1/3">
-                                      <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-slate-500 sm:text-sm sm:normal-case sm:tracking-normal">
+                                  <div key={key} className={`flex flex-col bg-white px-3 py-2.5 transition-colors hover:bg-slate-50/50 sm:grid sm:grid-cols-[13rem_minmax(0,1fr)] sm:items-start sm:gap-4 sm:px-4 sm:py-3 ${index !== activeDocumentFieldEntries.length - 1 ? 'border-b border-slate-100' : ''}`}>
+                                    <div className="mb-1 w-full pr-4 sm:mb-0">
+                                      <div className="flex items-center gap-2 text-[11px] font-medium text-slate-500">
                                         {getDocumentFieldLabel(activeDocument?.documentType, key)}
                                       </div>
                                     </div>
-                                    <div className="w-full break-words text-base font-medium text-slate-900 sm:w-2/3 sm:text-sm">
+                                    <div className="w-full break-words text-sm font-medium leading-snug text-slate-900">
                                       {currentValue || <span className="font-normal italic text-slate-300">Not detected</span>}
                                     </div>
                                   </div>
@@ -2032,11 +2178,11 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
                       {activeDataView === "lineItems" && activeDocumentLineItems.length > 0 && (
                         <div className="rounded-xl border border-slate-100 bg-white shadow-sm">
-                          <div className="flex flex-col gap-1 border-b border-slate-100 px-4 py-3 sm:px-5">
-                            <div className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                          <div className="flex flex-col gap-1 border-b border-slate-100 px-4 py-2.5">
+                            <div className="text-xs font-medium uppercase tracking-wider text-slate-500">
                               Line Items
                             </div>
-                            <div className="text-sm font-medium text-slate-700">
+                            <div className="text-xs font-medium text-slate-700">
                               {activeDocumentLineItems.length} row{activeDocumentLineItems.length === 1 ? "" : "s"} extracted from the document table.
                             </div>
                           </div>
@@ -2047,7 +2193,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                                   {activeDocumentLineItemColumns.map((column) => (
                                     <th
                                       key={column.key}
-                                      className={`border-b border-slate-100 px-3 py-2 font-bold ${column.className ?? ""}`}
+                                      className={`border-b border-slate-100 px-3 py-2 font-medium ${column.className ?? ""}`}
                                     >
                                       {column.label}
                                     </th>
@@ -2101,14 +2247,14 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           >
             <Button
               variant="outline"
-              className="flex-1 rounded-xl text-rose-600 hover:bg-rose-50 hover:text-rose-700 border-slate-200 shadow-sm h-12 font-semibold"
+              className="flex-1 rounded-xl text-rose-600 hover:bg-rose-50 hover:text-rose-700 border-slate-200 shadow-sm h-12 font-medium"
               disabled={decisionStatus === "updating"}
               onClick={() => handleCaseDecision("rejected")}
             >
               <X className="h-5 w-5 mr-2" /> Reject
             </Button>
             <Button
-              className="flex-1 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm h-12 font-semibold"
+              className="flex-1 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm h-12 font-medium"
               disabled={decisionStatus === "updating"}
               onClick={() => handleCaseDecision("accepted")}
             >

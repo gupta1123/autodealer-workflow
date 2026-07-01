@@ -640,14 +640,14 @@ function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) {
           buildLedgerEntryXml({
             ledgerName: counterpartyLedgerName,
             amount,
-            isDebit: false,
+            isDebit: true,
             isPartyLedger: counterpartyIsPartyLedger,
-            billAllocations: buildBillAllocationsXml({ allocations: billAllocations, isDebit: false }),
+            billAllocations: buildBillAllocationsXml({ allocations: billAllocations, isDebit: true }),
           }),
           buildLedgerEntryXml({
             ledgerName: bankLedgerName,
             amount,
-            isDebit: true,
+            isDebit: false,
             bankAllocation,
           }),
         ]
@@ -966,6 +966,8 @@ function toMaster(block, tagName) {
       reservedName: getAttribute(block, "RESERVEDNAME"),
       taxType: getTagText(block, "TAXTYPE"),
       gstDutyHead: getTagText(block, "GSTDUTYHEAD"),
+      isBillWiseOn: getTagText(block, "ISBILLWISEON"),
+      maintainBalancesBillByBill: getTagText(block, "MAINTAINBALANCESBILLBYBILL"),
     },
   };
 }
@@ -1155,7 +1157,7 @@ async function collectTallyMasters(config, commandPayload = {}) {
       collectionName: "Autodealer Ledgers Sync",
       tallyType: "Ledger",
       fetchFields:
-        "Name,Parent,GUID,PartyGSTIN,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,TaxType,GSTDutyHead,RateOfTaxCalculation",
+        "Name,Parent,GUID,PartyGSTIN,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,TaxType,GSTDutyHead,RateOfTaxCalculation,IsBillWiseOn,MaintainBalancesBillByBill",
       companyName,
     }),
     exportTallyCollection(tallyUrl, {

@@ -127,6 +127,17 @@ export function toNullableNumber(value: unknown) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function toNullableBoolean(value: unknown) {
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return null;
+
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return null;
+  if (["yes", "true", "1", "enabled", "enable"].includes(normalized)) return true;
+  if (["no", "false", "0", "disabled", "disable"].includes(normalized)) return false;
+  return null;
+}
+
 export function normalizeMasterKey(input: {
   masterType: TallyMasterType;
   name: string;
@@ -178,6 +189,9 @@ export function serializeTallyMaster(row: TallyMasterRow) {
     ifscCode: typeof raw.ifscCode === "string" ? raw.ifscCode : null,
     branchName: typeof raw.branchName === "string" ? raw.branchName : null,
     accountHolderName: typeof raw.accountHolderName === "string" ? raw.accountHolderName : null,
+    billWiseEnabled:
+      toNullableBoolean(raw.isBillWiseOn) ??
+      toNullableBoolean(raw.maintainBalancesBillByBill),
     hsnCode: row.hsn_code,
     unitName: row.unit_name,
     taxRate: row.tax_rate,
