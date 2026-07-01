@@ -203,17 +203,6 @@ function isSuspenseLedger(value?: string | null) {
   return normalized === "suspense" || normalized === "suspenseac" || normalized === "suspenseaccount";
 }
 
-function toNullableBoolean(value: unknown) {
-  if (typeof value === "boolean") return value;
-  if (typeof value !== "string") return null;
-
-  const normalized = value.trim().toLowerCase();
-  if (!normalized) return null;
-  if (["yes", "true", "1", "enabled", "enable"].includes(normalized)) return true;
-  if (["no", "false", "0", "disabled", "disable"].includes(normalized)) return false;
-  return null;
-}
-
 function normalizeReferenceNumber(value?: string | null) {
   const normalized = String(value ?? "")
     .toUpperCase()
@@ -549,7 +538,6 @@ export async function POST(request: Request) {
       missingAccount: 0,
       missingBankLedger: 0,
       missingCounterpartyLedger: 0,
-      billWiseNotEnabled: 0,
       ledgerNotSynced: 0,
       bankLedgerNotSynced: 0,
       counterpartyLedgerNotSynced: 0,
@@ -590,16 +578,6 @@ export async function POST(request: Request) {
         ledger.parent_name ?? "",
       ])
     );
-    const ledgerBillWiseByName = new Map(
-      (ledgerRows as unknown as TallyLedgerRow[]).map((ledger) => {
-        const raw = ledger.raw_payload && typeof ledger.raw_payload === "object" ? ledger.raw_payload : {};
-        return [
-          normalizeName(ledger.tally_name),
-          toNullableBoolean(raw.isBillWiseOn) ?? toNullableBoolean(raw.maintainBalancesBillByBill),
-        ] as const;
-      })
-    );
-
     function ledgerExists(ledgerName: string) {
       return syncedLedgerNames.has(normalizeName(ledgerName));
     }
@@ -625,15 +603,6 @@ export async function POST(request: Request) {
 
     function isPartyLedger(ledgerName: string) {
       return isPartyParent(ledgerParentByName.get(normalizeName(ledgerName)) || "");
-    }
-
-    function isSundryDebtorLedger(ledgerName: string) {
-      const parent = normalizeName(ledgerParentByName.get(normalizeName(ledgerName)) || "");
-      return parent.includes("sundry debtor");
-    }
-
-    function billWiseIsEnabled(ledgerName: string) {
-      return ledgerBillWiseByName.get(normalizeName(ledgerName)) === true;
     }
 
     const commandInputs = transactions.map((transaction) => {
@@ -711,10 +680,6 @@ export async function POST(request: Request) {
           return [];
         }
         const originalVoucherType = getVoucherType(transaction);
-        if (originalVoucherType === "Receipt" && isSundryDebtorLedger(counterpartyLedgerName) && !billWiseIsEnabled(counterpartyLedgerName)) {
-          skipped.billWiseNotEnabled += 1;
-          return [];
-        }
         const counterpartyIsPartyLedger = shouldCreateCounterpartyLedger
           ? isPartyParent(createLedgerParentName)
           : isPartyLedger(counterpartyLedgerName);

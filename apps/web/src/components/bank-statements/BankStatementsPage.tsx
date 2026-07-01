@@ -1312,18 +1312,9 @@ function isSundryDebtorReceiptTransaction(transaction: ReviewTransaction, ledger
   return isSundryDebtor;
 }
 
-function getBillWiseBlockReason(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
-  if (!isSundryDebtorReceiptTransaction(transaction, ledgerMasters)) return "";
-  const ledger = getSelectedLedger(transaction, ledgerMasters);
-  if (ledger?.billWiseEnabled === true) return "";
-  if (ledger?.billWiseEnabled === false) {
-    return "Bill-wise is disabled for this customer ledger in Tally. Enable bill-wise details and sync ledgers again.";
-  }
-  return "Bill-wise status is not synced for this customer ledger. Sync Tally ledgers before posting this receipt.";
-}
-
 function isCustomerReceiptTransaction(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
-  return isSundryDebtorReceiptTransaction(transaction, ledgerMasters) && !getBillWiseBlockReason(transaction, ledgerMasters);
+  if (!isSundryDebtorReceiptTransaction(transaction, ledgerMasters)) return false;
+  return getSelectedLedger(transaction, ledgerMasters)?.billWiseEnabled === true;
 }
 
 function getBillAllocationLabel(draft?: BillAllocationDraft | null) {
@@ -1904,17 +1895,16 @@ export function BankStatementsPage() {
     [ledgerMasters, queueableReviewTransactions]
   );
   const billAllocationReviewTransactions = useMemo(
-    () => queueableReviewTransactions.filter((transaction) => isSundryDebtorReceiptTransaction(transaction, ledgerMasters)),
+    () => queueableReviewTransactions.filter((transaction) => isCustomerReceiptTransaction(transaction, ledgerMasters)),
     [ledgerMasters, queueableReviewTransactions]
   );
   const blockingBillAllocationCount = useMemo(
     () =>
       billAllocationReviewTransactions.filter((transaction) => {
-        if (getBillWiseBlockReason(transaction, ledgerMasters)) return true;
         const draft = billAllocationsByTransactionId[transaction.id];
         return !draft || draft.status === "cannot_match_yet" || draft.status === "needs_review" || draft.status === "stale_data";
       }).length,
-    [billAllocationReviewTransactions, billAllocationsByTransactionId, ledgerMasters]
+    [billAllocationReviewTransactions, billAllocationsByTransactionId]
   );
   const filteredTransactions = useMemo(() => {
     const normalizedSearch = normalizeName(reviewSearch);
@@ -2628,29 +2618,6 @@ export function BankStatementsPage() {
 
       const nextDrafts: Record<string, BillAllocationDraft> = {};
       for (const transaction of queueableReviewTransactions) {
-        const billWiseBlockReason = getBillWiseBlockReason(transaction, ledgerMasters);
-        if (billWiseBlockReason) {
-          nextDrafts[transaction.id] = {
-            status: "cannot_match_yet",
-            caseType: "bill_wise_not_enabled",
-            caseLabel: "Cannot Match Yet",
-            reason: billWiseBlockReason,
-            receiptAmount: parseNumber(transaction.creditAmount) ?? 0,
-            totalAllocatedAmount: 0,
-            newAdvanceAmount: 0,
-            totalExistingAdvanceAdjustmentAmount: 0,
-            unallocatedAmount: parseNumber(transaction.creditAmount) ?? 0,
-            allocations: [],
-            advanceAdjustments: [],
-            applyExistingAdvances: false,
-            candidateBills: [],
-            existingAdvances: [],
-            requiresUserReview: true,
-            isEligibleForPosting: false,
-          };
-          continue;
-        }
-
         if (!isCustomerReceiptTransaction(transaction, ledgerMasters)) {
           nextDrafts[transaction.id] = {
             status: "not_applicable",
