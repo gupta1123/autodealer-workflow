@@ -1340,6 +1340,75 @@ function getBillAllocationClass(draft?: BillAllocationDraft | null) {
   return "border-blue-200 bg-blue-50 text-blue-800";
 }
 
+function getBillAllocationTableSummary(draft?: BillAllocationDraft | null) {
+  if (!draft || draft.status === "not_applicable") {
+    return {
+      primary: "-",
+      secondary: "",
+      tertiary: "",
+      title: "",
+    };
+  }
+
+  if (draft.status !== "ready_to_post") {
+    return {
+      primary: "-",
+      secondary: "",
+      tertiary: "",
+      title: "",
+    };
+  }
+
+  const billLines = draft.allocations.filter((line) => line.referenceType === "Agst Ref");
+  const advanceLines = draft.allocations.filter((line) => line.referenceType === "Advance");
+  const firstBill = billLines[0] ?? null;
+  const billAmount = billLines.reduce((sum, line) => sum + line.allocatedAmount, 0);
+  const advanceAmount = advanceLines.reduce((sum, line) => sum + line.allocatedAmount, 0);
+  const extraBillCount = Math.max(0, billLines.length - 1);
+  const secondaryParts: string[] = [];
+
+  if (firstBill) {
+    const pending = firstBill.previousPendingAmount
+      ? ` of ${formatCurrencyAmount(firstBill.previousPendingAmount)}`
+      : "";
+    secondaryParts.push(`${firstBill.referenceName} ${formatCurrencyAmount(firstBill.allocatedAmount)}${pending}`);
+    if (extraBillCount > 0) secondaryParts.push(`+${extraBillCount} more`);
+  }
+  if (advanceAmount > 0) {
+    secondaryParts.push(`New adv ${formatCurrencyAmount(advanceAmount)}`);
+  }
+  if (secondaryParts.length === 0 && billAmount === 0) {
+    secondaryParts.push("No pending bill");
+  }
+
+  const detailLines = [
+    `Receipt: ${formatCurrencyAmount(draft.receiptAmount)}`,
+    ...draft.allocations.map((line) => {
+      const after =
+        line.pendingAmountAfterAllocation !== null && line.pendingAmountAfterAllocation !== undefined
+          ? `, after ${formatCurrencyAmount(line.pendingAmountAfterAllocation)}`
+          : "";
+      return `${line.referenceType}: ${line.referenceName} ${formatCurrencyAmount(line.allocatedAmount)}${after}`;
+    }),
+    ...(draft.applyExistingAdvances
+      ? draft.advanceAdjustments.map(
+          (adjustment) =>
+            `Old advance: ${adjustment.advanceReferenceName} -> ${adjustment.billReferenceName} ${formatCurrencyAmount(adjustment.amount)}`
+        )
+      : []),
+  ];
+
+  return {
+    primary: draft.caseLabel || getBillAllocationLabel(draft),
+    secondary: secondaryParts.join(" · "),
+    tertiary:
+      draft.applyExistingAdvances && draft.totalExistingAdvanceAdjustmentAmount > 0
+        ? `Old advance journal ${formatCurrencyAmount(draft.totalExistingAdvanceAdjustmentAmount)}`
+        : "",
+    title: detailLines.join("\n"),
+  };
+}
+
 function normalizeReferenceToken(value?: string | null) {
   return String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
@@ -3293,7 +3362,7 @@ export function BankStatementsPage() {
                     className="overflow-x-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
                     onScroll={syncReviewTableScroll}
                   >
-                    <div className="h-2 min-w-[1260px]" />
+                    <div className="h-2 min-w-[1420px]" />
                   </div>
                 </div>
 
@@ -3302,7 +3371,7 @@ export function BankStatementsPage() {
                   className="overflow-x-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]"
                   onScroll={syncReviewTableScroll}
                 >
-                  <table className="w-full min-w-[1260px] border-collapse text-left">
+                  <table className="w-full min-w-[1420px] border-collapse text-left">
                     <thead>
                       <tr className="border-b border-[#eee5da] bg-[#fbf7f1] text-[10px] font-black uppercase tracking-[0.14em] text-[#8a7f72]">
                         <th className="w-32 px-3 py-3">Date</th>
@@ -3312,7 +3381,7 @@ export function BankStatementsPage() {
                         <th className="w-36 px-3 py-3 text-right">Withdrawal (Dr)</th>
                         <th className="w-36 px-3 py-3 text-right">Deposit (Cr)</th>
                         <th className="w-72 px-3 py-3">Tally ledger</th>
-                        <th className="w-44 px-3 py-3">Bill Allocation</th>
+                        <th className="w-80 px-3 py-3">Bill Allocation</th>
                         <th className="w-32 px-3 py-3">Status</th>
                         <th className="w-20 px-3 py-3 text-right">Actions</th>
                       </tr>
@@ -3343,6 +3412,8 @@ export function BankStatementsPage() {
                           const isEditingLedger = editingLedgerIds.has(transaction.id);
                           const showLedgerSelect = isEditingLedger;
                           const billAllocation = billAllocationsByTransactionId[transaction.id];
+                          const billAllocationSummary = getBillAllocationTableSummary(billAllocation);
+                          const showBillAllocationSummary = billAllocation?.status === "ready_to_post";
 
                           return (
                             <tr key={transaction.id} className="align-middle text-sm text-[#2b241d] hover:bg-[#fffaf4]">
@@ -3409,21 +3480,36 @@ export function BankStatementsPage() {
                                 )}
                               </td>
                               <td className="px-3 py-3">
-                                <button
-                                  className="flex max-w-full flex-col gap-1 rounded-md px-1 py-1 text-left transition hover:bg-[#f6efe6]"
-                                  onClick={() => setBillAllocationReviewTransactionId(transaction.id)}
-                                  title="Review bill allocation"
-                                  type="button"
-                                >
-                                  <Badge className={getBillAllocationClass(billAllocation)} variant="outline">
-                                    {getBillAllocationLabel(billAllocation)}
-                                  </Badge>
-                                  {billAllocation?.caseLabel && billAllocation.status === "ready_to_post" ? (
-                                    <span className="truncate text-[11px] font-semibold text-[#8a7f72]" title={billAllocation.reason}>
-                                      {billAllocation.caseLabel}
+                                {showBillAllocationSummary ? (
+                                  <button
+                                    className="group flex max-w-full flex-col gap-1 rounded-md px-2 py-1.5 text-left transition hover:bg-[#f6efe6]"
+                                    onClick={() => setBillAllocationReviewTransactionId(transaction.id)}
+                                    title={`${billAllocationSummary.title}\n\nClick to review or edit allocation.`}
+                                    type="button"
+                                  >
+                                    <div className="flex max-w-full items-center gap-2">
+                                      <Badge className={getBillAllocationClass(billAllocation)} variant="outline">
+                                        {getBillAllocationLabel(billAllocation)}
+                                      </Badge>
+                                      <span className="truncate text-[11px] font-black text-[#4b4036]">
+                                        {billAllocationSummary.primary}
+                                      </span>
+                                    </div>
+                                    <span className="block max-w-[270px] truncate text-[11px] font-semibold text-[#6f6256]">
+                                      {billAllocationSummary.secondary}
                                     </span>
-                                  ) : null}
-                                </button>
+                                    {billAllocationSummary.tertiary ? (
+                                      <span className="block max-w-[270px] truncate text-[10px] font-bold text-[#7c5f3f]">
+                                        {billAllocationSummary.tertiary}
+                                      </span>
+                                    ) : null}
+                                    <span className="text-[10px] font-bold text-[#9a8d7f] opacity-0 transition group-hover:opacity-100">
+                                      Click to review or edit
+                                    </span>
+                                  </button>
+                                ) : (
+                                  <span className="text-xs font-bold text-[#b3a79a]">-</span>
+                                )}
                               </td>
                               <td className="px-3 py-3">
                                 <Badge className={getReviewStatusClass(transaction)} variant="outline">
