@@ -32,6 +32,10 @@ import {
   readStoredLineItems,
   stripStoredLineItems,
 } from "@/lib/line-items";
+import {
+  resolvePacketIntelligence,
+  type PacketDuplicateReference,
+} from "@/lib/packet-intelligence";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import {
   getLegacyHiddenTermsReviewCount,
@@ -93,6 +97,15 @@ type CaseMismatchRow = {
 type CaseMismatchWithResolutionRow = CaseMismatchRow & {
   resolution_status: string | null;
   resolved_at: string | null;
+};
+
+type DuplicateCaseCandidateRow = {
+  id: string;
+  display_name: string;
+  status: string;
+  created_at: string;
+  upload_count: number | null;
+  processing_meta?: unknown;
 };
 
 function sanitizeExtractedFields(
@@ -281,6 +294,76 @@ function serializeError(error: unknown) {
   }
 
   return String(error ?? "Unknown error");
+}
+
+function readRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function readMetaString(value: unknown, key: string) {
+  const raw = readRecord(value)[key];
+  return typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : null;
+}
+
+function getUploadFingerprintCandidates(processingMeta: unknown) {
+  const values = [
+    readMetaString(processingMeta, "uploadFingerprint"),
+    readMetaString(processingMeta, "originalUploadFingerprint"),
+  ].filter((value): value is string => Boolean(value));
+  const candidates = new Set<string>();
+
+  for (const value of values) {
+    candidates.add(value);
+    const testCopyIndex = value.indexOf(":test-copy:");
+    if (testCopyIndex > 0) {
+      candidates.add(value.slice(0, testCopyIndex));
+    }
+  }
+
+  return candidates;
+}
+
+async function fetchDuplicateCaseReferencesForDetail(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  params: {
+    ownerUserId: string;
+    caseId: string;
+    uploadCount: number;
+    processingMeta: unknown;
+  }
+): Promise<PacketDuplicateReference[]> {
+  const currentFingerprints = getUploadFingerprintCandidates(params.processingMeta);
+  if (currentFingerprints.size === 0 || params.uploadCount <= 0) {
+    return [];
+  }
+
+  const { data, error } = await supabase
+    .from("packet_cases")
+    .select("id, display_name, status, created_at, upload_count, processing_meta")
+    .eq("owner_user_id", params.ownerUserId)
+    .eq("upload_count", params.uploadCount)
+    .neq("id", params.caseId)
+    .order("created_at", { ascending: false })
+    .limit(25);
+
+  if (error) {
+    throw error;
+  }
+
+  return ((data ?? []) as DuplicateCaseCandidateRow[])
+    .filter((row) => !isCaseRecycled(row.processing_meta))
+    .filter((row) => {
+      const rowFingerprints = getUploadFingerprintCandidates(row.processing_meta);
+      return Array.from(rowFingerprints).some((fingerprint) => currentFingerprints.has(fingerprint));
+    })
+    .map((row) => ({
+      id: row.id,
+      displayName: row.display_name,
+      status: row.status,
+      createdAt: row.created_at,
+    }));
 }
 
 async function fetchCaseMismatches(
@@ -591,17 +674,36 @@ export async function GET(
 
       return supportingDocuments.length >= 2;
     });
+    const mappedCase = mapCaseRow(
+      caseRow,
+      caseSummaryDocuments,
+      filteredMismatches.length,
+      fieldConfiguration
+    );
+    let duplicateCases: PacketDuplicateReference[] = [];
+    try {
+      duplicateCases = await fetchDuplicateCaseReferencesForDetail(supabase, {
+        ownerUserId: user.id,
+        caseId: caseRow.id,
+        uploadCount: caseRow.upload_count,
+        processingMeta: mappedCase.processingMeta,
+      });
+    } catch (duplicateLookupError) {
+      console.warn("Failed to resolve duplicate packet references", duplicateLookupError);
+    }
+    const packetIntelligence = resolvePacketIntelligence({
+      documents: sanitizedDocuments,
+      mismatches: filteredMismatches,
+      processingMeta: mappedCase.processingMeta,
+      duplicateCases,
+    });
 
     return jsonWithCors(request, {
-      case: mapCaseRow(
-        caseRow,
-        caseSummaryDocuments,
-        filteredMismatches.length,
-        fieldConfiguration
-      ),
+      case: mappedCase,
       files: filesWithUrls,
       documents: sanitizedDocuments,
       mismatches: filteredMismatches,
+      packetIntelligence,
     });
   } catch (error) {
     return jsonWithCors(request, 

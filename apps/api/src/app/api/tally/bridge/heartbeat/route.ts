@@ -1,21 +1,13 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { isLocalDbMode } from "@/lib/local/mode";
-import {
-  createLocalTallyCommand,
-  listLocalTallyCommands,
-  listLocalTallyMasters,
-  updateLocalTallyHeartbeat,
-} from "@/lib/local/tally-store";
+import { updateLocalTallyHeartbeat } from "@/lib/local/tally-store";
 import {
   hashSecret,
   serializeTallyConnectionStatus,
   type TallyConnectionRow,
   type TallyConnectionStatus,
 } from "@/lib/tally/connections";
-import { queueTallyMasterSyncCommand } from "@/lib/tally/master-sync";
-
-const LOCAL_MASTER_SYNC_STALE_MS = 24 * 60 * 60 * 1000;
 
 const CONNECTION_SELECT = [
   "id",
@@ -69,90 +61,28 @@ function resolveStatus(input: {
   return "bridge_connected";
 }
 
-function isStaleTimestamp(value: unknown) {
-  if (typeof value !== "string") return true;
-  const time = new Date(value).getTime();
-  return !Number.isFinite(time) || Date.now() - time > LOCAL_MASTER_SYNC_STALE_MS;
-}
+async function getLatestSyncedCompanyName(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  connection: TallyConnectionRow
+) {
+  try {
+    const { data } = await supabase
+      .from("tally_master_sync_runs")
+      .select("company_name")
+      .eq("owner_user_id", connection.owner_user_id)
+      .eq("connection_id", connection.id)
+      .order("created_at", { ascending: false })
+      .limit(10);
 
-async function queueLocalMasterSyncIfNeeded(input: {
-  connection: TallyConnectionRow;
-  companyName: string | null;
-}) {
-  const { masters, latestSync } = await listLocalTallyMasters({
-    connectionId: input.connection.id,
-    ownerUserId: input.connection.owner_user_id,
-    masterType: "ledger",
-    limit: 1,
-  });
-  const [pendingCommand] = await listLocalTallyCommands({
-    connectionId: input.connection.id,
-    ownerUserId: input.connection.owner_user_id,
-    limit: 20,
-  }).then((commands) =>
-    commands.filter(
-      (command) =>
-        command.command_type === "sync_masters" &&
-        (command.status === "queued" || command.status === "claimed")
-    )
-  );
-
-  const completedAt =
-    latestSync && typeof latestSync === "object" && "completed_at" in latestSync
-      ? latestSync.completed_at
-      : null;
-  const needsSync =
-    masters.length === 0 ||
-    !completedAt ||
-    isStaleTimestamp(completedAt);
-
-  if (!needsSync) {
-    return {
-      shouldSync: false,
-      queued: false,
-      pending: false,
-      reason: "fresh",
-      activeLedgerCount: masters.length,
-      latestSyncCompletedAt: typeof completedAt === "string" ? completedAt : null,
-      command: null,
-    };
+    for (const row of data ?? []) {
+      const companyName = toNullableText((row as { company_name?: unknown }).company_name);
+      if (companyName) return companyName;
+    }
+  } catch {
+    return null;
   }
 
-  if (pendingCommand) {
-    return {
-      shouldSync: true,
-      queued: false,
-      pending: true,
-      reason: "sync_already_pending",
-      activeLedgerCount: masters.length,
-      latestSyncCompletedAt: typeof completedAt === "string" ? completedAt : null,
-      command: pendingCommand,
-    };
-  }
-
-  const reason = masters.length === 0 ? "no_synced_ledgers" : "stale_sync";
-  const command = await createLocalTallyCommand({
-    connectionId: input.connection.id,
-    ownerUserId: input.connection.owner_user_id,
-    commandType: "sync_masters",
-    priority: 15,
-    payload: {
-      companyName: input.companyName,
-      requestedMasterTypes: ["ledger", "group", "voucher_type", "gst_ledger", "tax_ledger"],
-      mode: "ledger_accuracy",
-      reason,
-    },
-  });
-
-  return {
-    shouldSync: true,
-    queued: true,
-    pending: false,
-    reason,
-    activeLedgerCount: masters.length,
-    latestSyncCompletedAt: typeof completedAt === "string" ? completedAt : null,
-    command,
-  };
+  return null;
 }
 
 export function OPTIONS(request: Request) {
@@ -196,17 +126,8 @@ export async function POST(request: Request) {
         return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
       }
 
-      let masterSync = null;
-      if (companyLoaded) {
-        masterSync = await queueLocalMasterSyncIfNeeded({
-          connection,
-          companyName,
-        });
-      }
-
       return jsonWithCors(request, {
         connection: serializeTallyConnectionStatus(connection),
-        masterSync,
       });
     }
 
@@ -228,6 +149,10 @@ export async function POST(request: Request) {
     }
 
     const now = new Date().toISOString();
+    const resolvedCompanyName =
+      companyName ??
+      connection.last_company_name ??
+      (companyLoaded ? await getLatestSyncedCompanyName(supabase, connection) : null);
 
     const { data: updatedData, error: updateError } = await supabase
       .from("tally_connections")
@@ -239,7 +164,7 @@ export async function POST(request: Request) {
         last_tested_at: now,
         last_tally_reachable: tallyReachable,
         last_company_loaded: companyLoaded,
-        last_company_name: companyName,
+        last_company_name: resolvedCompanyName,
         last_error: errorMessage,
       })
       .eq("id", connection.id)
@@ -259,31 +184,13 @@ export async function POST(request: Request) {
         status,
         tallyReachable,
         companyLoaded,
-        companyName,
+        companyName: resolvedCompanyName,
+        heartbeatCompanyName: companyName,
       },
     });
 
-    let masterSync = null;
-    if (companyLoaded) {
-      try {
-        masterSync = await queueTallyMasterSyncCommand({
-          supabase,
-          connectionId: connection.id,
-          ownerUserId: connection.owner_user_id,
-          companyName,
-          reason:
-            connection.last_company_loaded === true
-              ? "stale_sync"
-              : "bridge_connected",
-        });
-      } catch (syncError) {
-        console.error("Error queueing automatic Tally master sync:", syncError);
-      }
-    }
-
     return jsonWithCors(request, {
       connection: serializeTallyConnectionStatus(updatedData as unknown as TallyConnectionRow),
-      masterSync,
     });
   } catch (error) {
     console.error("Error in POST /api/tally/bridge/heartbeat:", error);

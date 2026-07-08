@@ -7,6 +7,7 @@ import type {
   QueuedUpload,
 } from "@/types/pipeline";
 import { apiFetch } from "@/lib/api-client";
+import type { PacketIntelligence } from "@/lib/packet-intelligence";
 import { getQueuedUploadFiles, serializeQueuedUploadGroups } from "@/lib/upload-groups";
 
 export type SavedCaseRecord = {
@@ -78,6 +79,7 @@ export type SavedCaseDetail = {
   files: SavedCaseFile[];
   documents: SavedCaseDocument[];
   mismatches: SavedCaseMismatch[];
+  packetIntelligence?: PacketIntelligence | null;
 };
 
 export type SavedAnalysisJob = {
@@ -765,6 +767,7 @@ export async function fetchCaseDetail(caseId: string): Promise<CaseDetailRespons
     files: payload.files,
     documents: payload.documents,
     mismatches: payload.mismatches,
+    packetIntelligence: payload.packetIntelligence ?? null,
   };
 }
 

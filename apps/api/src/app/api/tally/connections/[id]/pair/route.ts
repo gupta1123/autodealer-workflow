@@ -47,6 +47,19 @@ function readPairingCode(value: unknown) {
   return value.trim();
 }
 
+function toNullableText(value: unknown) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed.slice(0, 500) : null;
+}
+
+function toNullableBoolean(value: unknown) {
+  return typeof value === "boolean" ? value : null;
+}
+
 async function logConnectionEvent(
   connectionId: string,
   ownerUserId: string,
@@ -172,6 +185,9 @@ export async function POST(
     }
 
     const bridgeToken = createBridgeToken();
+    const companyName = toNullableText(body.companyName);
+    const tallyReachable = toNullableBoolean(body.tallyReachable);
+    const companyLoaded = toNullableBoolean(body.companyLoaded);
     const { data: updatedData, error: updateError } = await supabase
       .from("tally_connections")
       .update({
@@ -184,6 +200,9 @@ export async function POST(
         bridge_version: normalizeMetadata(body.bridgeVersion, "unknown"),
         bridge_machine_id: normalizeMetadata(body.bridgeMachineId, "unknown"),
         last_heartbeat_at: new Date().toISOString(),
+        last_tally_reachable: tallyReachable ?? connection.last_tally_reachable,
+        last_company_loaded: companyLoaded ?? connection.last_company_loaded,
+        last_company_name: companyName ?? connection.last_company_name,
         last_error: null,
       })
       .eq("id", connection.id)
@@ -205,6 +224,9 @@ export async function POST(
         bridgeName: updatedConnection.bridge_name,
         bridgeVersion: updatedConnection.bridge_version,
         bridgeMachineId: updatedConnection.bridge_machine_id,
+        companyName,
+        tallyReachable,
+        companyLoaded,
       }
     );
 

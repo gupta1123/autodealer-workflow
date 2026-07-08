@@ -27,6 +27,8 @@ function serializeImport(row: Record<string, unknown>) {
       ? String(row.extracted_account_holder_name)
       : null,
     extractedIfscCode: row.extracted_ifsc_code ? String(row.extracted_ifsc_code) : null,
+    statementPeriodStart: row.statement_period_start ? String(row.statement_period_start) : null,
+    statementPeriodEnd: row.statement_period_end ? String(row.statement_period_end) : null,
     importedTransactionCount: Number(row.imported_transaction_count ?? 0),
     duplicateTransactionCount: Number(row.duplicate_transaction_count ?? 0),
     createdAt: String(row.created_at ?? ""),
@@ -55,7 +57,6 @@ function serializePreviewTransaction(row: Record<string, unknown>) {
           : null,
     suggestionReason: row.suggestion_reason ? String(row.suggestion_reason) : null,
     confirmedLedgerName: row.confirmed_ledger_name ? String(row.confirmed_ledger_name) : null,
-    rawPayload: readRecord(row.raw_payload),
   };
 }
 
@@ -122,22 +123,11 @@ export async function GET(
         : storedPreviewTransactions;
     const analysis = readRecord(processingMeta.analysis);
     const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
-    const ledgerMatching = readRecord(analysis.ledgerMatching);
-    const ledgerMatchingStatus = typeof ledgerMatching.status === "string" ? ledgerMatching.status : "";
-    const ledgerMatchingCompleted = ledgerMatchingStatus === "completed";
     const jobStatus = typeof jobRow?.status === "string" ? jobRow.status : "";
     const jobIsTerminal = ["succeeded", "failed", "cancelled"].includes(jobStatus);
     const processing =
       !jobIsTerminal &&
       (importRow.status === "processing" || analysisStatus === "queued" || analysisStatus === "processing");
-    const readyStatus = ["ready_to_review", "ready_to_confirm", "needs_account_selection"].includes(importRow.status);
-    const waitingForLedgerMatching =
-      readyStatus &&
-      transactions.length > 0 &&
-      analysisStatus === "completed" &&
-      Boolean(ledgerMatchingStatus) &&
-      jobStatus !== "succeeded" &&
-      !ledgerMatchingCompleted;
 
     if (!jobRow && processing) {
       const { data: repairedJobRow, error: repairJobError } = await supabase
@@ -157,14 +147,11 @@ export async function GET(
       jobRow = repairedJobRow;
     }
 
-    const effectiveProcessing = processing || waitingForLedgerMatching;
-    const visibleTransactions = effectiveProcessing ? [] : transactions;
-
     const requiresManualExtraction =
       importRow.status === "manual_review_required" ||
       importRow.status === "failed" ||
       Boolean(previewMeta.requiresManualExtraction) ||
-      (!effectiveProcessing && transactions.length === 0);
+      (!processing && transactions.length === 0);
     const account = {
       bankName:
         typeof previewAccount.bankName === "string"
@@ -204,29 +191,25 @@ export async function GET(
       import: serializeImport(importRow as Record<string, unknown>),
       account,
       candidates: Array.isArray(previewMeta.candidates) ? candidates : candidates.map(serializeAccount),
-      transactions: visibleTransactions,
+      transactions,
       requiresManualExtraction,
       extractionSource: previewMeta.extractionSource ?? processingMeta.extractionSource ?? null,
       extractionError: previewMeta.extractionError ?? processingMeta.extractionError ?? null,
       extractionDiagnostics: previewMeta.extractionDiagnostics ?? processingMeta.extractionDiagnostics ?? null,
-      processing: effectiveProcessing,
+      processing,
       job: jobRow
         ? {
             id: jobRow.id,
-            status: effectiveProcessing && jobRow.status === "succeeded" ? "processing" : jobRow.status,
-            progress: waitingForLedgerMatching ? 95 : jobRow.progress,
-            stage: waitingForLedgerMatching ? "Matching Tally ledgers" : jobRow.stage,
+            status: jobRow.status,
+            progress: jobRow.progress,
+            stage: jobRow.stage,
             error: jobRow.error,
           }
         : {
             id: String(importRow.id),
-            status: analysisStatus || (effectiveProcessing ? "processing" : "completed"),
-            progress: waitingForLedgerMatching ? 95 : Number(analysis.progress ?? (effectiveProcessing ? 5 : 100)),
-            stage: waitingForLedgerMatching
-              ? "Matching Tally ledgers"
-              : typeof analysis.stage === "string"
-                ? analysis.stage
-                : null,
+            status: analysisStatus || (processing ? "processing" : "completed"),
+            progress: Number(analysis.progress ?? (processing ? 5 : 100)),
+            stage: typeof analysis.stage === "string" ? analysis.stage : null,
             error: typeof analysis.error === "string" ? analysis.error : null,
           },
     });

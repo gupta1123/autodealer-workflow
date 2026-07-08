@@ -8,12 +8,7 @@ import { promisify } from "node:util";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import sharp from "sharp";
 
-import {
-  callOpenRouter,
-  getLedgerMatchingModel,
-  getQualityExtractionModel,
-  getQualityExtractionReasoning,
-} from "@/lib/processing/openrouter";
+import { callOpenRouter, getQualityExtractionModel, getQualityExtractionReasoning } from "@/lib/processing/openrouter";
 
 export const BANK_STATEMENT_BUCKET = "bank-statement-files";
 const execFileAsync = promisify(execFile);
@@ -349,6 +344,63 @@ function detectCategory(description: string, debitAmount: number | null, creditA
   return "unknown";
 }
 
+function toMoneyNumber(value?: number | null) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function roundMoney(value: number) {
+  return Number(value.toFixed(2));
+}
+
+function sameMoney(left: number, right: number) {
+  return Math.abs(left - right) < 0.01;
+}
+
+function correctTransactionsFromRunningBalance(transactions: ParsedBankTransaction[]) {
+  let previousBalance: number | null = null;
+
+  return transactions.map((transaction) => {
+    const balance = toMoneyNumber(transaction.balanceAmount);
+    const debit = toMoneyNumber(transaction.debitAmount);
+    const credit = toMoneyNumber(transaction.creditAmount);
+    const amount = Math.max(debit && debit > 0 ? debit : 0, credit && credit > 0 ? credit : 0);
+    let next = transaction;
+
+    if (previousBalance !== null && balance !== null && amount > 0) {
+      const delta = roundMoney(balance - previousBalance);
+      const expectedAmount = roundMoney(Math.abs(delta));
+      const hasDirectionMismatch =
+        (delta > 0 && (!credit || !sameMoney(credit, expectedAmount) || (debit ?? 0) > 0)) ||
+        (delta < 0 && (!debit || !sameMoney(debit, expectedAmount) || (credit ?? 0) > 0));
+
+      if (!sameMoney(delta, 0) && sameMoney(expectedAmount, amount) && hasDirectionMismatch) {
+        const correctedDebit = delta < 0 ? expectedAmount : null;
+        const correctedCredit = delta > 0 ? expectedAmount : null;
+        next = {
+          ...transaction,
+          debitAmount: correctedDebit,
+          creditAmount: correctedCredit,
+          category: detectCategory(transaction.description, correctedDebit, correctedCredit),
+          confidence: Math.max(transaction.confidence ?? 0, 0.9),
+          rawPayload: {
+            ...(transaction.rawPayload ?? {}),
+            balanceCorrection: {
+              previousBalance,
+              balanceAmount: balance,
+              delta,
+              originalDebitAmount: debit,
+              originalCreditAmount: credit,
+            },
+          },
+        };
+      }
+    }
+
+    if (balance !== null) previousBalance = balance;
+    return next;
+  });
+}
+
 function detectDebitCreditMarker(row: Record<string, string>) {
   const marker = readColumn(row, [
     "dr cr",
@@ -520,9 +572,8 @@ export async function classifyBankTransactionsForTallyWithAI(params: {
         content:
           "You are classifying Indian business bank statement transactions for Tally Prime accounting. Return only valid JSON. " +
           "Do not invent existing ledgers. You may use an existing ledger only if it appears in the provided tallyLedgerNames list, matching case-insensitively. " +
-          "Before recommending suspense, compare the counterpartyName and description against tallyLedgerNames for normal Indian bank narration variations: OCR mistakes, spelling mistakes, phonetic spelling variants, missing spaces, joined words, split words, singular/plural, legal suffixes (Pvt, Private, Ltd, Limited, LLP), generic suffixes (Enterprise, Enterprises, Company, Co, Traders, Trading), trailing initials, and abbreviations such as Co/Company, Ind/Industries, Engrs/Engg/Engineers/Engineering, Mech/Mechanical, Supply/Supplies/Supplier. " +
-          "Treat common Indian party-name variants as the same root name when context supports it: Bharat/Bharath/Bharta/Bhartha, Maharaj/Maharaja/Maha Raj, Rajaguru/Raja Guru, Shree/Shri/Sri, Ganesh/Ganeshh, Steel/Steels, Supply/Supplies/Supplier, Engineer/Engineers/Engineering/Engg/Engrs. " +
-          "Examples: 'Bharath Steel Pvt Ltd' should match a provided ledger named 'Bharat' when that is the only Bharat-like ledger; 'Quali Mech Engrs' should match 'QUALIMECH ENGINEERS'; 'Maha RAJ Engineerings' should match 'Maharaja Engg'; 'Maharaj Industires' should match 'Maharaj Industries'; 'Office Supply CO' should match 'Office Supplies'; 'Pushpak Steels IND' should match 'Pushpak Steel Industries'; 'Raja Guru Enterprises' should match 'RAJAGURU R' when that is the only clear Rajaguru ledger. " +
+          "Before recommending suspense, compare the counterpartyName and description against tallyLedgerNames for normal Indian bank narration variations: spelling mistakes, missing spaces, joined words, singular/plural, legal suffixes (Pvt, Private, Ltd, Limited, LLP), generic suffixes (Enterprise, Enterprises, Company, Co, Traders, Trading), trailing initials, and abbreviations such as Co/Company, Ind/Industries, Engrs/Engg/Engineers/Engineering, Mech/Mechanical, Supply/Supplies/Supplier. " +
+          "Examples: 'Quali Mech Engrs' should match a provided ledger named 'QUALIMECH ENGINEERS'; 'Maharaj Industires' should match 'Maharaj Industries'; 'Office Supply CO' should match 'Office Supplies'; 'Pushpak Steels IND' should match 'Pushpak Steel Industries'; 'Raja Guru Enterprises' should match 'RAJAGURU R' when that is the only clear Rajaguru ledger. " +
           "If exactly one provided Tally ledger is the clear party match, recommend use_existing_ledger with that exact ledger name and confidence at least 0.90. " +
           "If two or more provided ledgers are plausible party matches, recommend use_suspense when a Suspense ledger exists. " +
           "For a named customer/vendor/business party with no clear existing ledger, recommend use_suspense when a Suspense ledger exists; do not recommend creating a new party ledger during import. " +
@@ -559,7 +610,7 @@ export async function classifyBankTransactionsForTallyWithAI(params: {
     {
       expectJson: true,
       jsonMode: true,
-      model: getLedgerMatchingModel(),
+      model: getQualityExtractionModel(),
       reasoning: getQualityExtractionReasoning(),
       maxTokens: 8192,
     }
@@ -881,7 +932,9 @@ export function parseBankStatementText(text: string) {
     },
     statementPeriodStart: parseDate(period?.[1]) ?? null,
     statementPeriodEnd: parseDate(period?.[2]) ?? null,
-    transactions: tableTransactions.concat(labeledTransactions).concat(fixedWidthTransactions),
+    transactions: correctTransactionsFromRunningBalance(
+      tableTransactions.concat(labeledTransactions).concat(fixedWidthTransactions)
+    ),
   };
 }
 
@@ -1210,10 +1263,10 @@ function normalizeAiBankStatement(value: unknown): ParsedBankStatement & {
   diagnostics: NonNullable<BankStatementExtractionResult["extractionDiagnostics"]>;
 } {
   if (Array.isArray(value)) {
-    const transactions = value.flatMap((row, index) => {
+    const transactions = correctTransactionsFromRunningBalance(value.flatMap((row, index) => {
       const transaction = normalizeAiTransaction(row, index + 1);
       return transaction ? [transaction] : [];
-    });
+    }));
     return {
       ...emptyParsedBankStatement(),
       transactions,
@@ -1232,10 +1285,10 @@ function normalizeAiBankStatement(value: unknown): ParsedBankStatement & {
     ? (parsed.account as Record<string, unknown>)
     : parsed;
   const rawTransactions = collectAiTransactions(parsed);
-  const transactions = rawTransactions.flatMap((row, index) => {
+  const transactions = correctTransactionsFromRunningBalance(rawTransactions.flatMap((row, index) => {
         const transaction = normalizeAiTransaction(row, index + 1);
         return transaction ? [transaction] : [];
-      });
+      }));
 
   return {
     account: {

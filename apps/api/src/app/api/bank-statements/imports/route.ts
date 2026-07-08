@@ -18,6 +18,10 @@ function readJsonField<T>(value: FormDataEntryValue | null, fallback: T): T {
   }
 }
 
+function readTextField(value: FormDataEntryValue | null) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
 function serializeImport(row: Record<string, unknown>) {
   return {
     id: String(row.id),
@@ -113,9 +117,19 @@ export async function POST(request: Request) {
     }
 
     const manualAccount = readJsonField<BankAccountInput>(formData.get("account"), {});
-    const connectionId = typeof formData.get("connectionId") === "string"
-      ? String(formData.get("connectionId")).trim()
-      : "";
+    const connectionId = readTextField(formData.get("connectionId"));
+    const companyName = readTextField(formData.get("companyName"));
+    const financialYear = readTextField(formData.get("financialYear"));
+    const bankLedgerName = readTextField(formData.get("bankLedgerName"));
+    const syncBeforeAnalysis = readTextField(formData.get("syncBeforeAnalysis")) !== "false";
+
+    if (!connectionId) {
+      return jsonWithCors(request, { error: "Select a Tally company before upload." }, { status: 400 });
+    }
+    if (!bankLedgerName) {
+      return jsonWithCors(request, { error: "Select the Tally bank ledger before upload." }, { status: 400 });
+    }
+
     const bytes = new Uint8Array(await file.arrayBuffer());
     const storagePath = buildStoragePath(user.id, file.name || "bank-statement");
     const supabase = createSupabaseAdminClient();
@@ -135,18 +149,29 @@ export async function POST(request: Request) {
       mime_type: file.type || null,
       size_bytes: file.size,
       status: "processing",
+      statement_period_start: null,
+      statement_period_end: null,
       processing_meta: {
         source: "bank_statement_upload",
+        tallyLedgerName: bankLedgerName,
+        selectedContext: {
+          connectionId,
+          companyName,
+          financialYear,
+          bankLedgerName,
+          syncBeforeAnalysis,
+        },
         analysis: {
           status: "queued",
           progress: 5,
           stage: "Statement uploaded",
           error: null,
           connectionId,
+          companyName,
+          financialYear,
+          bankLedgerName,
+          syncBeforeAnalysis,
           manualAccount,
-          ledgerMatching: {
-            status: "queued",
-          },
           startedAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         },

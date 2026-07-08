@@ -28,6 +28,7 @@ import {
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
+import { PacketIntelligencePanel } from "@/components/cases/PacketIntelligencePanel";
 import { AnalysisOptionsDialog } from "@/components/workspace/AnalysisOptionsDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -1761,6 +1762,14 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                   </div>
                 )}
 
+                {detail?.packetIntelligence ? (
+                  <PacketIntelligencePanel
+                    packetIntelligence={detail.packetIntelligence}
+                    className="mt-3"
+                    density="sidebar"
+                  />
+                ) : null}
+
             </div>
 
             {/* Documents List */}
@@ -1803,6 +1812,14 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
           {/* Right Main Area (Document Viewer Card) */}
           <main className="flex-1 flex flex-col min-w-0 bg-[#fafafa] pt-2.5 px-2.5 pb-0 sm:p-4 md:p-6 lg:p-8 relative">
+
+            {detail?.packetIntelligence ? (
+              <PacketIntelligencePanel
+                packetIntelligence={detail.packetIntelligence}
+                className="mb-3 md:hidden"
+                density="sidebar"
+              />
+            ) : null}
 
             {/* Mobile Document Selector (Horizontal scroll) */}
             <div className="md:hidden bg-white border border-[#e5ddd0] rounded-xl mb-3 p-1.5 shrink-0 z-10 relative overflow-hidden shadow-sm">

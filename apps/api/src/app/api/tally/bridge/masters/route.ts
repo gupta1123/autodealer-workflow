@@ -1,7 +1,5 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
-import { isLocalDbMode } from "@/lib/local/mode";
-import { syncLocalTallyMasters } from "@/lib/local/tally-store";
 import { hashSecret, type TallyConnectionRow } from "@/lib/tally/connections";
 import {
   MASTER_TYPES,
@@ -69,31 +67,6 @@ export async function POST(request: Request) {
       return jsonWithCors(request, { error: "Connection id and bridge token are required." }, { status: 400 });
     }
 
-    const mastersPayload = body.masters && typeof body.masters === "object" ? body.masters : {};
-
-    if (isLocalDbMode()) {
-      const localSync = await syncLocalTallyMasters({
-        connectionId,
-        token,
-        companyName: toNullableText(body.companyName, 240),
-        bridgeVersion: toNullableText(body.bridgeVersion, 80),
-        masters: mastersPayload as Record<string, TallyMasterInput[]>,
-        masterTypesByPayloadKey: MASTER_INPUT_KEYS,
-      });
-
-      if (localSync.unauthorized || !localSync.result) {
-        return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
-      }
-
-      return jsonWithCors(request, {
-        syncRunId: localSync.result.syncRunId,
-        totals: localSync.result.totals,
-        accepted: localSync.result.accepted,
-        masters: localSync.result.masters.slice(0, 50).map(serializeTallyMaster),
-        supportedTypes: MASTER_TYPES,
-      });
-    }
-
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_connections")
@@ -111,7 +84,9 @@ export async function POST(request: Request) {
       return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
     }
 
+    const mastersPayload = body.masters && typeof body.masters === "object" ? body.masters : {};
     const now = new Date().toISOString();
+    const companyName = toNullableText(body.companyName, 240);
     const rows: Array<Record<string, unknown>> = [];
     const totals: Record<string, number> = {};
     const syncedTypes = new Set<TallyMasterType>();
@@ -143,7 +118,7 @@ export async function POST(request: Request) {
         connection_id: connection.id,
         owner_user_id: connection.owner_user_id,
         status: "completed",
-        company_name: toNullableText(body.companyName, 240),
+        company_name: companyName,
         bridge_version: toNullableText(body.bridgeVersion, 80),
         totals,
         completed_at: now,
@@ -156,6 +131,18 @@ export async function POST(request: Request) {
     }
 
     const syncRunId = (syncRun as { id: string }).id;
+
+    if (companyName) {
+      await supabase
+        .from("tally_connections")
+        .update({
+          last_company_name: companyName,
+          last_company_loaded: true,
+          last_tally_reachable: true,
+          last_tested_at: now,
+        })
+        .eq("id", connection.id);
+    }
 
     if (syncedTypes.size > 0) {
       await supabase
@@ -198,7 +185,7 @@ export async function POST(request: Request) {
       payload: {
         totals,
         syncRunId,
-        companyName: toNullableText(body.companyName, 240),
+        companyName,
       },
     });
 

@@ -38,7 +38,7 @@ type PostedTransactionRow = {
 };
 
 type PostedLogRow = {
-  reference_number: string | null;
+  fingerprint: string;
   tally_voucher_id: string | null;
   tally_posted_at: string | null;
 };
@@ -86,12 +86,24 @@ type DraftTransactionRow = {
   tally_status?: string;
 };
 
+function isSupabaseConnectivityError(error: unknown) {
+  const text = [
+    error instanceof Error ? error.message : "",
+    typeof error === "object" && error && "details" in error ? String((error as { details?: unknown }).details ?? "") : "",
+    typeof error === "object" && error && "cause" in error ? String((error as { cause?: unknown }).cause ?? "") : "",
+  ].join("\n");
+
+  return /fetch failed|ConnectTimeoutError|UND_ERR_CONNECT_TIMEOUT|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(text);
+}
+
 function serializeImport(row: Record<string, unknown>) {
   return {
     id: String(row.id),
     bankAccountId: row.bank_account_id ? String(row.bank_account_id) : null,
     originalFileName: String(row.original_file_name ?? ""),
     status: String(row.status ?? ""),
+    statementPeriodStart: row.statement_period_start ? String(row.statement_period_start) : null,
+    statementPeriodEnd: row.statement_period_end ? String(row.statement_period_end) : null,
     importedTransactionCount: Number(row.imported_transaction_count ?? 0),
     duplicateTransactionCount: Number(row.duplicate_transaction_count ?? 0),
     createdAt: String(row.created_at ?? ""),
@@ -100,13 +112,6 @@ function serializeImport(row: Record<string, unknown>) {
 
 function toText(value: unknown) {
   return String(value ?? "").trim();
-}
-
-function normalizeReferenceNumber(value: unknown) {
-  const normalized = String(value ?? "")
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "");
-  return normalized.length >= 3 ? normalized : null;
 }
 
 function toTransaction(value: unknown): ParsedBankTransaction | null {
@@ -152,6 +157,13 @@ function toTransaction(value: unknown): ParsedBankTransaction | null {
         ? (row.rawPayload as Record<string, unknown>)
         : {},
   };
+}
+
+function latestRowTransactionDate(rows: Array<{ transaction_date: string }>) {
+  return rows
+    .map((row) => row.transaction_date)
+    .sort()
+    .at(-1);
 }
 
 function checkpointDate(value: unknown) {
@@ -210,6 +222,22 @@ function readTransactionCheckpointMarker(value: unknown): TransactionCheckpointM
   };
 }
 
+function buildTransactionCheckpointMarker(row: DraftTransactionRow): TransactionCheckpointMarker {
+  return {
+    transactionDate: row.transaction_date,
+    valueDate: row.value_date,
+    description: row.description,
+    referenceNumber: row.reference_number,
+    debitAmount: normalizeCheckpointAmount(row.debit_amount),
+    creditAmount: normalizeCheckpointAmount(row.credit_amount),
+    balanceAmount: normalizeCheckpointAmount(row.balance_amount),
+    transactionType: row.transaction_type,
+    category: row.category,
+    counterpartyName: row.counterparty_name,
+    fingerprint: row.fingerprint,
+  };
+}
+
 function transactionMatchesCheckpoint(row: DraftTransactionRow, marker: TransactionCheckpointMarker) {
   if (marker.fingerprint && row.fingerprint === marker.fingerprint) return true;
   if (row.transaction_date !== marker.transactionDate) return false;
@@ -237,22 +265,28 @@ function rowsAfterImportCheckpoint(
     };
   }
 
+  if (!marker) {
+    return {
+      markerFound: null as boolean | null,
+      rows,
+      skippedCount: 0,
+    };
+  }
+
   if (marker && !hasPostingAmount({ debit_amount: marker.debitAmount, credit_amount: marker.creditAmount })) {
-    const nextRows = rows.filter((row) => row.transaction_date >= markerDate);
     return {
       markerFound: false,
-      rows: nextRows,
-      skippedCount: rows.length - nextRows.length,
+      rows,
+      skippedCount: 0,
     };
   }
 
   const sameDateRowExists = rows.some((row) => row.transaction_date === markerDate);
   if (!sameDateRowExists) {
-    const nextRows = rows.filter((row) => row.transaction_date > markerDate);
     return {
       markerFound: null as boolean | null,
-      rows: nextRows,
-      skippedCount: rows.length - nextRows.length,
+      rows,
+      skippedCount: 0,
     };
   }
 
@@ -268,12 +302,18 @@ function rowsAfterImportCheckpoint(
     };
   }
 
-  const nextRows = rows.filter((row) => row.transaction_date >= markerDate);
   return {
     markerFound: false,
-    rows: nextRows,
-    skippedCount: rows.length - nextRows.length,
+    rows,
+    skippedCount: 0,
   };
+}
+
+function latestTransactionRow(rows: DraftTransactionRow[]) {
+  return rows.reduce<DraftTransactionRow | null>((latest, row) => {
+    if (!latest) return row;
+    return row.transaction_date >= latest.transaction_date ? row : latest;
+  }, null);
 }
 
 function getTransactionAmount(row: {
@@ -446,14 +486,14 @@ export async function POST(
       })
     );
     const rows = Array.from(rowsByFingerprint.values());
-    const lastPostedTransactionDate = checkpointDate(accountRow.last_tally_posted_transaction_at);
-    const lastPostedTransactionMarker = readTransactionCheckpointMarker(
+    const lastImportedTransactionDate = checkpointDate(accountRow.last_imported_transaction_at);
+    const lastImportedTransactionMarker = readTransactionCheckpointMarker(
       accountRow.last_imported_transaction_marker
     );
     const checkpointResult = rowsAfterImportCheckpoint(
       rows,
-      lastPostedTransactionMarker,
-      lastPostedTransactionDate
+      lastImportedTransactionMarker,
+      lastImportedTransactionDate
     );
     const rowsAfterCheckpoint = checkpointResult.rows;
 
@@ -501,22 +541,14 @@ export async function POST(
     }
 
     const submittedFingerprints = rows.map((row) => row.fingerprint);
-    const submittedReferenceNumbers = Array.from(
-      new Set(
-        rowsAfterCheckpoint.flatMap((row) => {
-          const normalizedReference = normalizeReferenceNumber(row.reference_number);
-          return normalizedReference ? [normalizedReference] : [];
-        })
-      )
-    );
-    const submittedReferenceSet = new Set(submittedReferenceNumbers);
-    const { data: postedLogData, error: postedLogReadError } = submittedReferenceNumbers.length
+    const { data: postedLogData, error: postedLogReadError } = submittedFingerprints.length
       ? await supabase
           .from("bank_transaction_posting_log")
-          .select("reference_number, tally_voucher_id, tally_posted_at")
+          .select("fingerprint, tally_voucher_id, tally_posted_at")
           .eq("owner_user_id", user.id)
           .eq("bank_account_id", accountId)
           .eq("status", "posted")
+          .in("fingerprint", submittedFingerprints)
       : { data: [], error: null };
 
     if (postedLogReadError) throw postedLogReadError;
@@ -538,33 +570,18 @@ export async function POST(
       )
     );
     const existingQueueableRows = ((existingTransactionData ?? []) as ExistingTransactionRow[]).filter(
-      (row) => row.id && row.fingerprint && (row.tally_status === "pending" || row.tally_status === "failed")
+      (row) =>
+        row.id &&
+        row.fingerprint &&
+        ["pending", "failed", "missing_in_tally", "verification_failed"].includes(row.tally_status || "")
     );
     const submittedRowsByFingerprint = new Map(rows.map((row) => [row.fingerprint, row]));
-    const postedByReference = new Map<string, PostedLogRow>();
-    for (const row of (postedLogData ?? []) as unknown as PostedLogRow[]) {
-      const referenceKeys = [
-        normalizeReferenceNumber(row.reference_number),
-        normalizeReferenceNumber(row.tally_voucher_id),
-      ].filter((value): value is string => Boolean(value));
-      for (const referenceKey of referenceKeys) {
-        if (submittedReferenceSet.has(referenceKey) && !postedByReference.has(referenceKey)) {
-          postedByReference.set(referenceKey, row);
-        }
-      }
-    }
-    const alreadyPostedRows = rowsAfterCheckpoint.filter((row) => {
-      const referenceKey = normalizeReferenceNumber(row.reference_number);
-      return Boolean(referenceKey && postedByReference.has(referenceKey));
-    });
-    const alreadyPresentTransactionCount = alreadyPostedRows.length + checkpointResult.skippedCount;
-    const alreadyPostedReferences = Array.from(
-      new Set(alreadyPostedRows.flatMap((row) => (row.reference_number ? [row.reference_number] : [])))
+    const postedByFingerprint = new Map(
+      ((postedLogData ?? []) as unknown as PostedLogRow[]).map((row) => [row.fingerprint, row])
     );
     const snapshotRows = rowsAfterCheckpoint.flatMap((row) => {
       if (existingFingerprints.has(row.fingerprint)) return [];
-      const referenceKey = normalizeReferenceNumber(row.reference_number);
-      const postedLog = referenceKey ? postedByReference.get(referenceKey) : null;
+      const postedLog = postedByFingerprint.get(row.fingerprint);
       if (!postedLog) return [row];
       return [
         {
@@ -632,12 +649,30 @@ export async function POST(
       if (updateError) throw updateError;
     }
 
-    const accountUpdatePromise = supabase
-      .from("bank_accounts")
-      .select("*")
-      .eq("id", accountId)
-      .eq("owner_user_id", user.id)
-      .single();
+    const latestAcceptedRow = latestTransactionRow(rowsAfterCheckpoint);
+    const latestAcceptedDate = latestAcceptedRow?.transaction_date ?? latestRowTransactionDate(rowsAfterCheckpoint);
+    const latestAcceptedMarker = latestAcceptedRow ? buildTransactionCheckpointMarker(latestAcceptedRow) : null;
+    const accountUpdate = latestAcceptedDate
+      ? {
+          last_imported_transaction_at: `${latestAcceptedDate}T00:00:00.000Z`,
+          last_imported_transaction_marker: latestAcceptedMarker,
+        }
+      : {};
+
+    const accountUpdatePromise = latestAcceptedDate
+      ? supabase
+          .from("bank_accounts")
+          .update(accountUpdate)
+          .eq("id", accountId)
+          .eq("owner_user_id", user.id)
+          .select("*")
+          .single()
+      : supabase
+          .from("bank_accounts")
+          .select("*")
+          .eq("id", accountId)
+          .eq("owner_user_id", user.id)
+          .single();
 
     const [{ data: updatedAccount, error: accountUpdateError }, { data: updatedImport, error: importUpdateError }] =
       await Promise.all([
@@ -656,16 +691,14 @@ export async function POST(
               confirmedAt: new Date().toISOString(),
               confirmedTransactionCount: transactions.length,
               ignoredNonPostingRowCount: submittedTransactions.length - transactions.length,
-              importedAfterTransactionDate: lastPostedTransactionDate,
-              importedAfterTransactionMarker: lastPostedTransactionMarker,
-              checkpointSource: "last_tally_posted_transaction_at",
+              importedAfterTransactionDate: lastImportedTransactionDate,
+              importedAfterTransactionMarker: lastImportedTransactionMarker,
               checkpointMarkerFound: checkpointResult.markerFound,
               skippedByCheckpointCount: checkpointResult.skippedCount,
               existingTransactionCount: existingFingerprints.size,
               existingQueueableTransactionCount: existingQueueableRows.length,
               appendCompletedAt: new Date().toISOString(),
-              alreadyPostedTransactionCount: alreadyPresentTransactionCount,
-              alreadyPostedReferences,
+              alreadyPostedTransactionCount: postedByFingerprint.size,
             },
           })
           .eq("id", id)
@@ -713,11 +746,20 @@ export async function POST(
       skippedByCheckpointCount: checkpointResult.skippedCount,
       existingTransactionCount: existingFingerprints.size,
       existingQueueableTransactionCount: existingQueueableRows.length,
-      alreadyPostedTransactionCount: alreadyPresentTransactionCount,
-      alreadyPostedReferences,
+      alreadyPostedTransactionCount: postedByFingerprint.size,
     });
   } catch (error) {
     console.error("Error in POST /api/bank-statements/imports/[id]/confirm:", error);
+    if (isSupabaseConnectivityError(error)) {
+      return jsonWithCors(
+        request,
+        {
+          error:
+            "Could not reach Supabase while saving the bank statement. Please retry; existing entries will be handled as duplicates when the connection is back.",
+        },
+        { status: 503 }
+      );
+    }
     return jsonWithCors(
       request,
       { error: error instanceof Error ? error.message : "Internal server error" },

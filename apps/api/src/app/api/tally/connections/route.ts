@@ -1,6 +1,6 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
-import { isLocalDbMode, LOCAL_USER_ID } from "@/lib/local/mode";
+import { isLocalDbMode } from "@/lib/local/mode";
 import {
   createLocalTallyConnection,
   listLocalTallyConnections,
@@ -81,7 +81,7 @@ export function OPTIONS(request: Request) {
 export async function GET(request: Request) {
   try {
     const localMode = isLocalDbMode();
-    const user = localMode ? { id: LOCAL_USER_ID } : await requireRequestUser(request);
+    const user = localMode ? { id: "local-dev-user" } : await requireRequestUser(request);
     if (!user) {
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }
@@ -139,7 +139,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     const localMode = isLocalDbMode();
-    const user = localMode ? { id: LOCAL_USER_ID } : await requireRequestUser(request);
+    const user = localMode ? { id: "local-dev-user" } : await requireRequestUser(request);
     if (!user) {
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }

@@ -13,7 +13,6 @@ import {
   type TallyBridgeCommandRow,
   type TallyBridgeCommandType,
 } from "@/lib/tally/commands";
-import { queueTallyMasterSyncCommand } from "@/lib/tally/master-sync";
 import { toNullableText, toRequiredText, type TallyMasterRow } from "@/lib/tally/masters";
 
 function parseCommandType(value: unknown): TallyBridgeCommandType | null {
@@ -21,6 +20,21 @@ function parseCommandType(value: unknown): TallyBridgeCommandType | null {
   return TALLY_BRIDGE_COMMAND_TYPES.includes(value as TallyBridgeCommandType)
     ? (value as TallyBridgeCommandType)
     : null;
+}
+
+function uniqueTextValues(values: unknown[], maxLength: number) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const value of values) {
+    const text = toRequiredText(value).slice(0, maxLength).trim();
+    const key = text.toLowerCase();
+    if (!text || seen.has(key)) continue;
+    seen.add(key);
+    result.push(text);
+  }
+
+  return result;
 }
 
 async function requireConnection(ownerUserId: string, connectionId: string) {
@@ -163,20 +177,36 @@ export async function POST(
         });
       }
 
-      const syncDecision = await queueTallyMasterSyncCommand({
-        supabase: createSupabaseAdminClient(),
-        connectionId: id,
-        ownerUserId: user.id,
-        companyName,
-        requestedMasterTypes,
-        force: true,
-        priority: 10,
-        reason: "manual_sync",
+      const supabase = createSupabaseAdminClient();
+      const { data, error } = await supabase
+        .from("tally_bridge_commands")
+        .insert({
+          connection_id: id,
+          owner_user_id: user.id,
+          command_type: commandType,
+          status: "queued",
+          priority: 10,
+          payload,
+        })
+        .select("*")
+        .single();
+
+      if (error) throw error;
+
+      await supabase.from("tally_connection_events").insert({
+        connection_id: id,
+        owner_user_id: user.id,
+        event_type: "command_queued",
+        message: "Tally master sync queued for bridge.",
+        payload: {
+          commandType,
+          companyName,
+          requestedMasterTypes,
+        },
       });
 
       return jsonWithCors(request, {
-        command: syncDecision.command,
-        masterSync: syncDecision,
+        command: serializeTallyBridgeCommand(data as unknown as TallyBridgeCommandRow),
       });
     }
 
@@ -313,13 +343,20 @@ export async function POST(
     }
 
     if (commandType === "fetch_customer_open_bills") {
-      const ledgerName = toRequiredText(rawPayload.ledgerName).slice(0, 500);
-      if (!ledgerName) {
-        return jsonWithCors(request, { error: "Customer ledger name is required." }, { status: 400 });
+      const requestedLedgerNames = uniqueTextValues(
+        [
+          ...(Array.isArray(rawPayload.ledgerNames) ? rawPayload.ledgerNames : []),
+          rawPayload.ledgerName,
+        ],
+        500
+      );
+      if (requestedLedgerNames.length === 0) {
+        return jsonWithCors(request, { error: "Party ledger name is required." }, { status: 400 });
       }
 
       const payload = {
-        ledgerName,
+        ledgerName: requestedLedgerNames[0],
+        ledgerNames: requestedLedgerNames,
         companyName:
           toNullableText(rawPayload.companyName, 240) ??
           toNullableText(connection.last_company_name, 240),
@@ -331,7 +368,7 @@ export async function POST(
           ownerUserId: user.id,
           commandType,
           payload,
-          priority: 15,
+          priority: 25,
         });
 
         return jsonWithCors(request, {
@@ -347,7 +384,7 @@ export async function POST(
           owner_user_id: user.id,
           command_type: commandType,
           status: "queued",
-          priority: 15,
+          priority: 25,
           payload,
         })
         .select("*")
@@ -359,10 +396,91 @@ export async function POST(
         connection_id: id,
         owner_user_id: user.id,
         event_type: "command_queued",
-        message: "Customer open bill fetch queued for bridge.",
+        message: "Party open bill fetch queued for bridge.",
         payload: {
           commandType,
-          ledgerName,
+          ledgerNames: requestedLedgerNames,
+        },
+      });
+
+      return jsonWithCors(request, {
+        command: serializeTallyBridgeCommand(data as unknown as TallyBridgeCommandRow),
+      });
+    }
+
+    if (commandType === "verify_bank_transaction") {
+      const voucherDate = toRequiredText(rawPayload.voucherDate).slice(0, 20);
+      const bankLedgerName = toRequiredText(rawPayload.bankLedgerName).slice(0, 500);
+      const amount = Number(String(rawPayload.amount ?? "").replace(/,/g, ""));
+
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(voucherDate)) {
+        return jsonWithCors(request, { error: "A valid voucher date is required." }, { status: 400 });
+      }
+      if (!bankLedgerName) {
+        return jsonWithCors(request, { error: "Bank ledger name is required." }, { status: 400 });
+      }
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return jsonWithCors(request, { error: "A positive transaction amount is required." }, { status: 400 });
+      }
+
+      const payload = {
+        companyName:
+          toNullableText(rawPayload.companyName, 240) ??
+          toNullableText(connection.last_company_name, 240),
+        voucherDate,
+        bankLedgerName,
+        amount,
+        counterpartyLedgerName: toNullableText(rawPayload.counterpartyLedgerName, 500),
+        matchedLedgerName: toNullableText(rawPayload.matchedLedgerName, 500),
+        narration: toNullableText(rawPayload.narration, 2000),
+        referenceNumber: toNullableText(rawPayload.referenceNumber, 500),
+        transactionType: toNullableText(rawPayload.transactionType, 120),
+        category: toNullableText(rawPayload.category, 120),
+        counterpartyName: toNullableText(rawPayload.counterpartyName, 500),
+        expectedDirection: "outgoing",
+        source: "bank_statement_review_check",
+      };
+
+      if (isLocalDbMode()) {
+        const command = await createLocalTallyCommand({
+          connectionId: id,
+          ownerUserId: user.id,
+          commandType,
+          payload,
+          priority: 20,
+        });
+
+        return jsonWithCors(request, {
+          command: serializeTallyBridgeCommand(command),
+        });
+      }
+
+      const supabase = createSupabaseAdminClient();
+      const { data, error } = await supabase
+        .from("tally_bridge_commands")
+        .insert({
+          connection_id: id,
+          owner_user_id: user.id,
+          command_type: commandType,
+          status: "queued",
+          priority: 20,
+          payload,
+        })
+        .select("*")
+        .single();
+
+      if (error) throw error;
+
+      await supabase.from("tally_connection_events").insert({
+        connection_id: id,
+        owner_user_id: user.id,
+        event_type: "command_queued",
+        message: "Outgoing bank transaction verification queued for bridge.",
+        payload: {
+          commandType,
+          bankLedgerName,
+          amount,
+          voucherDate,
         },
       });
 

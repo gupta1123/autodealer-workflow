@@ -4,13 +4,11 @@ import { useEffect, useState } from "react";
 import {
   Check,
   Loader2,
-  Plus,
-  Trash2,
+  Search,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
 import { apiFetch } from "@/lib/api-client";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   DEFAULT_COMPARISON_FIELD_GROUPS,
@@ -133,6 +131,36 @@ function serializeComparisonGroups(groups: ComparisonFieldGroup[]) {
 const AVAILABLE_GROUP_FIELDS = FIELD_DEFINITIONS.filter(
   (field) => !HIDDEN_SETTING_FIELD_KEYS.has(field.key)
 );
+const AVAILABLE_GROUP_FIELD_KEYS = new Set(AVAILABLE_GROUP_FIELDS.map((field) => field.key));
+
+function getFirstGroupFieldDocType(fieldKey: string) {
+  return AVAILABLE_DOC_TYPES.find((docType) => getConfigurableFields(docType).includes(fieldKey as FieldKey));
+}
+
+const GROUP_FIELD_SECTIONS = AVAILABLE_DOC_TYPES.map((docType) => ({
+  docType,
+  fields: getConfigurableFields(docType).filter(
+    (fieldKey) =>
+      AVAILABLE_GROUP_FIELD_KEYS.has(fieldKey) && getFirstGroupFieldDocType(fieldKey) === docType
+  ),
+})).filter((section) => section.fields.length > 0);
+
+function SwitchControl({ checked }: { checked: boolean }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={`relative inline-flex h-[19px] w-8 shrink-0 rounded-full transition ${
+        checked ? "bg-[#3d6b4a]" : "bg-[#d8d4c9]"
+      }`}
+    >
+      <span
+        className={`absolute top-0.5 h-[15px] w-[15px] rounded-full bg-white transition ${
+          checked ? "left-[15px]" : "left-0.5"
+        }`}
+      />
+    </span>
+  );
+}
 
 async function getResponseError(response: Response) {
   try {
@@ -169,6 +197,8 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [banner, setBanner] = useState<BannerState>(null);
+  const [docSearch, setDocSearch] = useState("");
+  const [groupFieldSearch, setGroupFieldSearch] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -270,6 +300,25 @@ export default function SettingsPage() {
   );
   const selectedGroup =
     comparisonGroups.find((group) => group.groupKey === selectedGroupKey) ?? comparisonGroups[0] ?? null;
+  const enabledGroupCount = comparisonGroups.filter((group) => group.enabled).length;
+  const filteredDocTypes = AVAILABLE_DOC_TYPES.filter((docType) =>
+    docType.toLowerCase().includes(docSearch.trim().toLowerCase())
+  );
+  const normalizedGroupFieldSearch = groupFieldSearch.trim().toLowerCase();
+  const filteredGroupFieldSections = GROUP_FIELD_SECTIONS.map((section) => ({
+    ...section,
+    fields: section.fields.filter((fieldKey) => {
+      if (!normalizedGroupFieldSearch) {
+        return true;
+      }
+
+      return (
+        section.docType.toLowerCase().includes(normalizedGroupFieldSearch) ||
+        fieldKey.toLowerCase().includes(normalizedGroupFieldSearch) ||
+        (FIELD_LABELS[fieldKey] ?? "").toLowerCase().includes(normalizedGroupFieldSearch)
+      );
+    }),
+  })).filter((section) => section.fields.length > 0);
 
   function handleToggleDocType(docType: string) {
     setBanner(null);
@@ -462,22 +511,28 @@ export default function SettingsPage() {
 
   return (
     <AppShell>
-      <div className="min-h-screen bg-[#f7f7f5] text-[#1a1a1a]">
-        <div className="mx-auto max-w-[1400px] px-4 py-8 sm:px-8">
-          <header className="mb-8 flex items-center justify-between">
-            <h1 className="text-2xl font-bold tracking-tight">Document Field and Type Settings</h1>
-            <div className="flex gap-3">
+      <div className="min-h-screen bg-[#faf9f6] text-[#20201c]">
+        <div className="mx-auto max-w-[1180px] px-4 py-8 sm:px-8">
+          <header className="mb-7 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <p className="text-[11px] font-medium uppercase tracking-[0.22em] text-[#9b8f82]">
+                Settings
+              </p>
+              <h1 className="mt-1 text-[26px] font-medium tracking-tight">Review rules</h1>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
               <Button
-                className="font-bold text-[#8a7f72]"
+                className="h-10 rounded-lg px-4 font-medium text-[#6f6256]"
                 disabled={loading || saving}
                 onClick={handleResetDefaults}
                 type="button"
                 variant="ghost"
               >
-                Reset to defaults
+                Reset defaults
               </Button>
               <Button
-                className="rounded-xl bg-[#1a1a1a] px-8 font-bold text-white shadow-lg shadow-[#1a1a1a]/20"
+                className="h-10 rounded-lg bg-[#20201c] px-5 font-medium text-white shadow-sm hover:bg-[#111]"
                 disabled={loading || saving || !hasUnsavedChanges}
                 onClick={handleSave}
                 type="button"
@@ -485,299 +540,327 @@ export default function SettingsPage() {
                 {saving ? (
                   <>
                     <Loader2 className="h-4 w-4 animate-spin" />
-                    Saving...
+                    Saving
                   </>
                 ) : (
-                  "Save settings"
+                  "Save changes"
                 )}
               </Button>
             </div>
           </header>
 
+          <div className="mb-6 grid gap-3 md:grid-cols-3">
+            {[
+              {
+                label: "Documents",
+                value: `${enabledDocTypeCount}/${AVAILABLE_DOC_TYPES.length} enabled`,
+              },
+              {
+                label: "Fields",
+                value: `${enabledFieldCount}/${totalFieldCount} active`,
+              },
+              {
+                label: "Review groups",
+                value: `${enabledGroupCount}/${comparisonGroups.length} enabled`,
+              },
+            ].map((item) => (
+              <div
+                key={item.label}
+                className="rounded-[10px] border border-[#e8e5de] bg-white px-5 py-4"
+              >
+                <div className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#9b8f82]">
+                  {item.label}
+                </div>
+                <div className="mt-1 text-[22px] font-medium tracking-tight text-[#20201c]">
+                  {item.value}
+                </div>
+              </div>
+            ))}
+          </div>
+
           {banner ? (
             <div
-              className={`mb-6 rounded-2xl border px-4 py-3 text-sm font-medium ${
+              className={`mb-4 rounded-xl border px-4 py-3 text-sm font-medium ${
                 banner.tone === "success"
-                  ? "border-[#10b981]/20 bg-[#ecfdf5] text-[#047857]"
-                  : "border-[#ef4444]/20 bg-[#fff1f2] text-[#b91c1c]"
+                  ? "border-[#10b981]/25 bg-[#ecfdf5] text-[#047857]"
+                  : "border-[#ef4444]/25 bg-[#fff1f2] text-[#b91c1c]"
               }`}
             >
               {banner.text}
             </div>
           ) : null}
 
-          <div className="mb-4 inline-flex rounded-xl border border-[#e5ddd0] bg-white p-1 shadow-sm">
+          <div className="mb-5 inline-flex rounded-[9px] bg-[#f3f0e8] p-[3px]">
             <button
-              className={`rounded-lg px-4 py-2 text-sm font-bold transition ${
+              className={`rounded-[7px] px-4 py-2 text-sm font-medium transition ${
                 activeTab === "documents"
-                  ? "bg-[#1a1a1a] text-white"
-                  : "text-[#8a7f72] hover:bg-[#f3eee7] hover:text-[#1a1a1a]"
+                  ? "bg-white text-[#20201c] shadow-sm"
+                  : "text-[#6b6a60] hover:text-[#20201c]"
               }`}
               onClick={() => setActiveTab("documents")}
               type="button"
             >
-              Document fields
+              Documents & fields
             </button>
             <button
-              className={`rounded-lg px-4 py-2 text-sm font-bold transition ${
+              className={`rounded-[7px] px-4 py-2 text-sm font-medium transition ${
                 activeTab === "groups"
-                  ? "bg-[#1a1a1a] text-white"
-                  : "text-[#8a7f72] hover:bg-[#f3eee7] hover:text-[#1a1a1a]"
+                  ? "bg-white text-[#20201c] shadow-sm"
+                  : "text-[#6b6a60] hover:text-[#20201c]"
               }`}
               onClick={() => setActiveTab("groups")}
               type="button"
             >
-              Comparison groups
+              Review groups
             </button>
           </div>
 
-          <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm">
-            <div className="flex h-[calc(100vh-220px)] flex-col md:flex-row">
+          <div>
+            <div className="flex flex-col gap-5 md:flex-row md:items-start">
               {activeTab === "documents" ? (
                 <>
-                <aside className="w-full overflow-y-auto border-r border-[#e5ddd0] bg-[#fafafa]/50 p-4 md:w-80">
-                  <div className="mb-4 px-2 text-[10px] font-bold uppercase tracking-widest text-[#8a7f72]">
-                    DOCUMENT TYPES
-                  </div>
+                  <aside className="w-full shrink-0 rounded-[10px] border border-[#e8e5de] bg-white p-2.5 md:w-[270px]">
+                    <label className="mb-2 flex items-center gap-2 rounded-lg bg-[#f3f0e8] px-3 py-2">
+                      <Search className="h-4 w-4 shrink-0 text-[#9c9a8e]" />
+                      <input
+                        className="w-full bg-transparent text-[13px] text-[#20201c] outline-none placeholder:text-[#9c9a8e]"
+                        onChange={(event) => setDocSearch(event.target.value)}
+                        placeholder="Search documents"
+                        type="search"
+                        value={docSearch}
+                      />
+                    </label>
 
-                  <div className="space-y-2">
-                    {AVAILABLE_DOC_TYPES.map((docType) => {
-                      const docFields = getConfigurableFields(docType);
-                      const docEnabledFieldCount = docFields.filter(
-                        (fieldKey) => fieldEnabled[docType]?.[fieldKey] ?? true
-                      ).length;
-                      const isSelected = selectedDocType === docType;
-                      const isEnabled = docTypeEnabled[docType] ?? true;
+                    <div className="max-h-[560px] space-y-1 overflow-y-auto">
+                      {filteredDocTypes.map((docType) => {
+                        const docFields = getConfigurableFields(docType);
+                        const docEnabledFieldCount = docFields.filter(
+                          (fieldKey) => fieldEnabled[docType]?.[fieldKey] ?? true
+                        ).length;
+                        const isSelected = selectedDocType === docType;
+                        const isEnabled = docTypeEnabled[docType] ?? true;
 
-                      return (
-                        <button
-                          key={docType}
-                          onClick={() => setSelectedDocType(docType)}
-                          type="button"
-                          className={`w-full rounded-xl p-3 text-left transition-all ${
-                            isSelected
-                              ? "bg-[#10b981]/10 ring-1 ring-[#10b981]/30"
-                              : "hover:bg-[#f0ece6]"
-                          }`}
-                        >
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="min-w-0">
-                              <div
-                                className={`text-sm font-bold ${
-                                  isSelected ? "text-[#065f46]" : "text-[#1a1a1a]"
-                                }`}
-                              >
-                                {docType}
+                        return (
+                          <button
+                            key={docType}
+                            className={`w-full rounded-lg px-2 py-2.5 text-left transition ${
+                              isSelected
+                                ? "bg-[#e9f2ea] text-[#20201c]"
+                                : "text-[#20201c] hover:bg-[#f3f0e8]"
+                            }`}
+                            onClick={() => setSelectedDocType(docType)}
+                            type="button"
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="truncate text-sm font-medium">{docType}</div>
+                                <div className="mt-0.5 text-[11px] font-normal text-[#8a7f72]">
+                                  {docEnabledFieldCount}/{docFields.length} fields active
+                                </div>
                               </div>
-                              <div
-                                className={`mt-1 text-[11px] font-medium leading-tight ${
-                                  isSelected ? "text-[#065f46]/70" : "text-[#8a7f72]"
-                                }`}
+                              <span
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  handleToggleDocType(docType);
+                                }}
                               >
-                                {docEnabledFieldCount} of {docFields.length} checks on
-                              </div>
+                                <SwitchControl checked={isEnabled} />
+                              </span>
                             </div>
-
-                            <Badge
-                              className={
-                                isEnabled
-                                  ? "border-[#10b981]/20 bg-[#ecfdf5] text-[#047857]"
-                                  : "border-[#e5ddd0] bg-white text-[#8a7f72]"
-                              }
-                              variant="outline"
-                            >
-                              {isEnabled ? "On" : "Off"}
-                            </Badge>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </aside>
-
-                <main className="flex-1 overflow-y-auto p-6 sm:p-8">
-                  {loading ? (
-                    <div className="space-y-4">
-                      <div className="h-14 animate-pulse rounded-2xl bg-[#f3eee7]" />
-                      <div className="grid gap-4 md:grid-cols-3">
-                        <div className="h-24 animate-pulse rounded-2xl bg-[#f3eee7]" />
-                        <div className="h-24 animate-pulse rounded-2xl bg-[#f3eee7]" />
-                        <div className="h-24 animate-pulse rounded-2xl bg-[#f3eee7]" />
-                      </div>
-                      <div className="grid gap-4 lg:grid-cols-2">
-                        {Array.from({ length: 6 }).map((_, index) => (
-                          <div key={index} className="h-24 animate-pulse rounded-2xl bg-[#f3eee7]" />
-                        ))}
-                      </div>
+                          </button>
+                        );
+                      })}
+                      {filteredDocTypes.length === 0 ? (
+                        <div className="rounded-lg border border-dashed border-[#d8d4c9] p-4 text-sm text-[#6b6a60]">
+                          No document types found.
+                        </div>
+                      ) : null}
                     </div>
-                  ) : (
-                    <>
-                      <div className="mb-8 flex flex-col gap-4 rounded-2xl border border-[#e5ddd0] bg-[#fafafa] p-4 lg:flex-row lg:items-center lg:justify-between">
-                        <label className="flex items-start gap-3">
-                          <input
-                            checked={selectedDocTypeEnabled}
-                            className="mt-1 h-4 w-4 rounded border-[#d8ccbc] accent-[#10b981]"
-                            onChange={() => handleToggleDocType(selectedDocType)}
-                            type="checkbox"
-                          />
-                          <div>
-                            <div className="text-sm font-bold text-[#1a1a1a]">
-                              Use this document type in case checks
-                            </div>
-                            <div className="mt-0.5 text-[11px] font-medium text-[#8a7f72]">
-                              If turned off, this document type will not affect extraction output,
-                              comparison, or mismatch results.
-                            </div>
-                          </div>
-                        </label>
+                  </aside>
 
-                        <div className="flex flex-wrap gap-2">
-                          <Button
-                            className="rounded-xl border-[#e5ddd0] bg-white text-[#1a1a1a] hover:bg-[#f3eee7]"
-                            onClick={() => handleSetAllFields(selectedDocType, true)}
-                            type="button"
-                            variant="outline"
-                          >
-                            Enable all fields
-                          </Button>
-                          <Button
-                            className="rounded-xl border-[#e5ddd0] bg-white text-[#1a1a1a] hover:bg-[#f3eee7]"
-                            onClick={() => handleSetAllFields(selectedDocType, false)}
-                            type="button"
-                            variant="outline"
-                          >
-                            Disable all fields
-                          </Button>
+                  <main className="min-w-0 flex-1">
+                    {loading ? (
+                      <div className="space-y-3">
+                        <div className="h-16 animate-pulse rounded-xl bg-[#f3eee7]" />
+                        <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                          {Array.from({ length: 12 }).map((_, index) => (
+                            <div key={index} className="h-12 animate-pulse rounded-lg bg-[#f3eee7]" />
+                          ))}
                         </div>
                       </div>
+                    ) : (
+                      <>
+                        <div className="mb-5 rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5">
+                          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                            <div>
+                              <h2 className="text-lg font-medium tracking-tight">{selectedDocType}</h2>
+                              <p className="mt-1 text-[13px] leading-5 text-[#6b6a60]">
+                                Include this document type in extraction and reconciliation.
+                              </p>
+                            </div>
 
-                      {selectedDocTypeEnabled ? null : (
-                        <div className="mb-6 rounded-2xl border border-[#f59e0b]/20 bg-[#fff7e6] px-4 py-3 text-sm font-medium text-[#a16207]">
-                          This document type is off. Its fields stay visible here so you can adjust
-                          them, but the case workflow will ignore this document until you enable it
-                          again.
+                            <div className="flex flex-wrap items-center gap-2">
+                              <button
+                                aria-pressed={selectedDocTypeEnabled}
+                                className="flex items-center gap-2 rounded-full border border-[#bdd8c2] bg-[#e9f2ea] px-3 py-1.5 text-[12px] font-medium text-[#3d6b4a] transition"
+                                onClick={() => handleToggleDocType(selectedDocType)}
+                                type="button"
+                              >
+                                <SwitchControl checked={selectedDocTypeEnabled} />
+                                {selectedDocTypeEnabled ? "Included" : "Excluded"}
+                              </button>
+                            </div>
+                          </div>
                         </div>
-                      )}
 
-                      <div className="space-y-10">
-                        <section>
-                          <div className="mb-4">
-                            <h3 className="text-[11px] font-black uppercase tracking-[0.2em] text-[#8a7f72]">
-                              PRIORITY CHECKS
-                            </h3>
-                            <p className="mt-0.5 text-[11px] font-medium uppercase tracking-wide text-[#b5aaa0]">
-                              High-signal fields for quick case validation
-                            </p>
+                        <div className="rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5">
+                          <div className="mb-4 flex flex-wrap justify-end gap-2">
+                              <Button
+                                className="h-8 rounded-lg border-[#d8d4c9] bg-white px-3 text-xs font-medium text-[#20201c] hover:bg-[#f3f0e8]"
+                                onClick={() => handleSetAllFields(selectedDocType, true)}
+                                type="button"
+                                variant="outline"
+                              >
+                                Enable all
+                              </Button>
+                              <Button
+                                className="h-8 rounded-lg border-[#d8d4c9] bg-white px-3 text-xs font-medium text-[#20201c] hover:bg-[#f3f0e8]"
+                                onClick={() => handleSetAllFields(selectedDocType, false)}
+                                type="button"
+                                variant="outline"
+                              >
+                                Disable all
+                              </Button>
                           </div>
 
-                          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-                            {selectedPriorityFields.map((fieldKey) => {
-                              const isEnabled = selectedFieldMap[fieldKey] ?? true;
+                        {selectedDocTypeEnabled ? null : (
+                          <div className="mb-4 rounded-lg border border-[#f59e0b]/25 bg-[#fff7e6] px-3 py-2 text-sm font-medium text-[#a16207]">
+                            Excluded documents are ignored by the workflow until included again.
+                          </div>
+                        )}
 
-                              return (
-                                <button
-                                  key={fieldKey}
-                                  aria-pressed={isEnabled}
-                                  className={`rounded-xl border p-4 text-left transition-all ${
-                                    isEnabled
-                                      ? "border-[#10b981]/30 bg-[#ecfdf5]"
-                                      : "border-[#e5ddd0] bg-white"
-                                  } ${selectedDocTypeEnabled ? "hover:bg-[#fafafa]" : "opacity-70"}`}
-                                  disabled={!selectedDocTypeEnabled}
-                                  onClick={() => handleToggleField(selectedDocType, fieldKey)}
-                                  type="button"
-                                >
-                                  <div className="flex items-start justify-between gap-4">
-                                    <div className="text-sm font-bold text-[#1a1a1a]">
-                                      {FIELD_LABELS[fieldKey]}
-                                    </div>
-                                    <div
-                                      className={`flex h-6 w-6 items-center justify-center rounded-md border ${
+                        <div className="space-y-5">
+                          <section>
+                            <div className="mb-2 flex items-end justify-between gap-3">
+                              <div>
+                                <h3 className="text-[11px] font-medium uppercase tracking-[0.2em] text-[#8a7f72]">
+                                  Essential fields
+                                </h3>
+                                <p className="text-xs font-medium text-[#9b8f82]">
+                                  Used most often for reconciliation.
+                                </p>
+                              </div>
+                              <span className="text-xs font-medium text-[#8a7f72]">
+                                {
+                                  selectedPriorityFields.filter(
+                                    (fieldKey) => selectedFieldMap[fieldKey] ?? true
+                                  ).length
+                                }
+                                /{selectedPriorityFields.length} active
+                              </span>
+                            </div>
+
+                            <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+                              {selectedPriorityFields.map((fieldKey) => {
+                                const isEnabled = selectedFieldMap[fieldKey] ?? true;
+
+                                return (
+                                  <button
+                                    key={fieldKey}
+                                    aria-pressed={isEnabled}
+                                    className={`flex min-h-10 items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition ${
+                                      isEnabled
+                                        ? "border-[#e8e5de] bg-white"
+                                        : "border-[#e5ddd0] bg-white"
+                                    } ${selectedDocTypeEnabled ? "hover:bg-[#fafafa]" : "opacity-60"}`}
+                                    disabled={!selectedDocTypeEnabled}
+                                    onClick={() => handleToggleField(selectedDocType, fieldKey)}
+                                    type="button"
+                                  >
+                                    <span
+                                      className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
                                         isEnabled
-                                          ? "border-[#10b981] bg-[#10b981] text-white"
-                                          : "border-[#d8ccbc] bg-white text-transparent"
+                                          ? "border-[#3d6b4a] bg-[#3d6b4a] text-white"
+                                          : "border-[#d8d4c9] bg-white text-transparent"
                                       }`}
                                     >
-                                      <Check className="h-4 w-4" />
-                                    </div>
-                                  </div>
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </section>
-
-                        <section>
-                          <div className="mb-4">
-                            <h3 className="text-[11px] font-black uppercase tracking-[0.2em] text-[#8a7f72]">
-                              OTHER CHECKS
-                            </h3>
-                            <p className="mt-0.5 text-[11px] font-medium uppercase tracking-wide text-[#b5aaa0]">
-                              Additional fields available for this document type
-                            </p>
-                          </div>
-
-                          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-                            {selectedStandardFields.map((fieldKey) => {
-                              const isEnabled = selectedFieldMap[fieldKey] ?? true;
-
-                              return (
-                                <button
-                                  key={fieldKey}
-                                  aria-pressed={isEnabled}
-                                  className={`rounded-xl border p-4 text-left transition-all ${
-                                    isEnabled
-                                      ? "border-[#10b981]/30 bg-[#ecfdf5]"
-                                      : "border-[#e5ddd0] bg-white"
-                                  } ${selectedDocTypeEnabled ? "hover:bg-[#fafafa]" : "opacity-70"}`}
-                                  disabled={!selectedDocTypeEnabled}
-                                  onClick={() => handleToggleField(selectedDocType, fieldKey)}
-                                  type="button"
-                                >
-                                  <div className="flex items-start justify-between gap-4">
-                                    <div className="text-sm font-bold text-[#1a1a1a]">
+                                      <Check className="h-3 w-3" />
+                                    </span>
+                                    <span className="min-w-0 truncate text-[13px] text-[#20201c]">
                                       {FIELD_LABELS[fieldKey]}
-                                    </div>
-                                    <div
-                                      className={`flex h-6 w-6 items-center justify-center rounded-md border ${
+                                    </span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </section>
+
+                          <section>
+                            <div className="mb-2 flex items-end justify-between gap-3">
+                              <div>
+                                <h3 className="text-[11px] font-medium uppercase tracking-[0.2em] text-[#8a7f72]">
+                                  Optional fields
+                                </h3>
+                                <p className="text-xs font-medium text-[#9b8f82]">
+                                  Extra signals available for this document type.
+                                </p>
+                              </div>
+                              <span className="text-xs font-medium text-[#8a7f72]">
+                                {
+                                  selectedStandardFields.filter(
+                                    (fieldKey) => selectedFieldMap[fieldKey] ?? true
+                                  ).length
+                                }
+                                /{selectedStandardFields.length} active
+                              </span>
+                            </div>
+
+                            <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+                              {selectedStandardFields.map((fieldKey) => {
+                                const isEnabled = selectedFieldMap[fieldKey] ?? true;
+
+                                return (
+                                  <button
+                                    key={fieldKey}
+                                    aria-pressed={isEnabled}
+                                    className={`flex min-h-10 items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition ${
+                                      isEnabled
+                                        ? "border-[#e8e5de] bg-white"
+                                        : "border-[#e5ddd0] bg-white"
+                                    } ${selectedDocTypeEnabled ? "hover:bg-[#fafafa]" : "opacity-60"}`}
+                                    disabled={!selectedDocTypeEnabled}
+                                    onClick={() => handleToggleField(selectedDocType, fieldKey)}
+                                    type="button"
+                                  >
+                                    <span
+                                      className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
                                         isEnabled
-                                          ? "border-[#10b981] bg-[#10b981] text-white"
-                                          : "border-[#d8ccbc] bg-white text-transparent"
+                                          ? "border-[#3d6b4a] bg-[#3d6b4a] text-white"
+                                          : "border-[#d8d4c9] bg-white text-transparent"
                                       }`}
                                     >
-                                      <Check className="h-4 w-4" />
-                                    </div>
-                                  </div>
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </section>
-                      </div>
-                    </>
-                  )}
-                </main>
+                                      <Check className="h-3 w-3" />
+                                    </span>
+                                    <span className="min-w-0 truncate text-[13px] text-[#20201c]">
+                                      {FIELD_LABELS[fieldKey]}
+                                    </span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </section>
+                        </div>
+                        </div>
+                      </>
+                    )}
+                  </main>
                 </>
               ) : (
                 <>
-                  <aside className="w-full overflow-y-auto border-r border-[#e5ddd0] bg-[#fafafa]/50 p-4 md:w-80">
-                    <div className="mb-4 flex items-center justify-between gap-3 px-2">
-                      <div className="text-[10px] font-bold uppercase tracking-widest text-[#8a7f72]">
-                        GROUPS
-                      </div>
-                      <Button
-                        className="h-8 rounded-lg bg-[#1a1a1a] px-3 text-xs font-bold text-white"
-                        onClick={handleAddGroup}
-                        type="button"
-                      >
-                        <Plus className="h-3.5 w-3.5" />
-                        Add
-                      </Button>
-                    </div>
-
-                    <div className="space-y-2">
+                  <aside className="w-full shrink-0 md:w-[270px]">
+                    <div className="max-h-[calc(100vh-260px)] space-y-2 overflow-y-auto pr-1">
                       {comparisonGroups.length === 0 ? (
-                        <div className="rounded-xl border border-dashed border-[#d8ccbc] bg-white p-4 text-sm font-medium text-[#8a7f72]">
+                        <div className="rounded-[10px] border border-dashed border-[#d8d4c9] bg-white p-4 text-sm text-[#6b6a60]">
                           No groups configured.
                         </div>
                       ) : (
@@ -787,162 +870,208 @@ export default function SettingsPage() {
                           return (
                             <button
                               key={group.groupKey}
-                              className={`w-full rounded-xl p-3 text-left transition-all ${
+                              className={`w-full rounded-[10px] border px-3.5 py-3 text-left transition ${
                                 isSelected
-                                  ? "bg-[#10b981]/10 ring-1 ring-[#10b981]/30"
-                                  : "hover:bg-[#f0ece6]"
+                                  ? "border-[#bdd8c2] bg-[#e9f2ea] text-[#20201c]"
+                                  : "border-[#e8e5de] bg-white text-[#20201c] hover:bg-[#f3f0e8]"
                               }`}
                               onClick={() => setSelectedGroupKey(group.groupKey)}
                               type="button"
                             >
-                              <div className="flex items-start justify-between gap-3">
+                              <div className="flex items-center justify-between gap-3">
                                 <div className="min-w-0">
-                                  <div
-                                    className={`truncate text-sm font-bold ${
-                                      isSelected ? "text-[#065f46]" : "text-[#1a1a1a]"
-                                    }`}
-                                  >
-                                    {group.label}
-                                  </div>
-                                  <div
-                                    className={`mt-1 text-[11px] font-medium leading-tight ${
-                                      isSelected ? "text-[#065f46]/70" : "text-[#8a7f72]"
-                                    }`}
-                                  >
+                                  <div className="truncate text-sm font-medium">{group.label}</div>
+                                  <div className="mt-0.5 text-[11.5px] font-normal text-[#9c9a8e]">
                                     {group.fields.length} field{group.fields.length === 1 ? "" : "s"}
                                   </div>
                                 </div>
-                                <Badge
-                                  className={
-                                    group.enabled
-                                      ? "border-[#10b981]/20 bg-[#ecfdf5] text-[#047857]"
-                                      : "border-[#e5ddd0] bg-white text-[#8a7f72]"
-                                  }
-                                  variant="outline"
+                                <span
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    handleUpdateGroup(group.groupKey, {
+                                      enabled: !group.enabled,
+                                    });
+                                  }}
                                 >
-                                  {group.enabled ? "On" : "Off"}
-                                </Badge>
+                                  <SwitchControl checked={group.enabled} />
+                                </span>
                               </div>
                             </button>
                           );
                         })
                       )}
+                      <button
+                        className="w-full rounded-[10px] border border-dashed border-[#d8d4c9] bg-transparent px-4 py-3 text-center text-sm text-[#6b6a60] transition hover:border-[#9c9a8e] hover:text-[#20201c]"
+                        onClick={handleAddGroup}
+                        type="button"
+                      >
+                        + Add review group
+                      </button>
                     </div>
                   </aside>
 
-                  <main className="flex-1 overflow-y-auto p-6 sm:p-8">
+                  <main className="min-w-0 flex-1 rounded-[10px] border border-[#e8e5de] bg-white p-6">
                     {loading ? (
-                      <div className="space-y-4">
-                        <div className="h-14 animate-pulse rounded-2xl bg-[#f3eee7]" />
-                        <div className="grid gap-4 lg:grid-cols-2">
-                          {Array.from({ length: 8 }).map((_, index) => (
-                            <div key={index} className="h-16 animate-pulse rounded-2xl bg-[#f3eee7]" />
+                      <div className="space-y-3">
+                        <div className="h-16 animate-pulse rounded-xl bg-[#f3eee7]" />
+                        <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                          {Array.from({ length: 12 }).map((_, index) => (
+                            <div key={index} className="h-12 animate-pulse rounded-lg bg-[#f3eee7]" />
                           ))}
                         </div>
                       </div>
                     ) : selectedGroup ? (
-                      <div className="space-y-6">
-                        <div className="rounded-2xl border border-[#e5ddd0] bg-[#fafafa] p-4">
-                          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-                            <label className="flex-1">
-                              <div className="mb-1 text-[11px] font-black uppercase tracking-[0.2em] text-[#8a7f72]">
-                                Group name
-                              </div>
-                              <input
-                                className="w-full rounded-xl border border-[#d8ccbc] bg-white px-3 py-2 text-sm font-bold outline-none transition focus:border-[#10b981] focus:ring-2 focus:ring-[#10b981]/20"
-                                onChange={(event) =>
-                                  handleRenameGroup(selectedGroup.groupKey, event.target.value)
-                                }
-                                value={selectedGroup.label}
-                              />
-                            </label>
-
-                            <div className="flex flex-wrap gap-2">
-                              <Button
-                                className="rounded-xl border-[#e5ddd0] bg-white text-[#1a1a1a] hover:bg-[#f3eee7]"
-                                onClick={() =>
-                                  handleUpdateGroup(selectedGroup.groupKey, {
-                                    enabled: !selectedGroup.enabled,
-                                  })
-                                }
-                                type="button"
-                                variant="outline"
-                              >
-                                {selectedGroup.enabled ? "Disable group" : "Enable group"}
-                              </Button>
-                              <Button
-                                className="rounded-xl border-rose-200 bg-white text-rose-700 hover:bg-rose-50 hover:text-rose-800"
-                                onClick={() => handleDeleteGroup(selectedGroup.groupKey)}
-                                type="button"
-                                variant="outline"
-                              >
-                                <Trash2 className="h-4 w-4" />
-                                Delete
-                              </Button>
+                      <div>
+                        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                          <label className="min-w-0 flex-1">
+                            <div className="mb-1.5 text-[11px] font-medium tracking-[0.06em] text-[#8a7f72]">
+                              Group name
                             </div>
+                            <input
+                              className="h-10 w-full rounded-lg border border-[#d8d4c9] bg-white px-3.5 text-base font-medium text-[#20201c] outline-none transition focus:border-[#3d6b4a]"
+                              onChange={(event) =>
+                                handleRenameGroup(selectedGroup.groupKey, event.target.value)
+                              }
+                              value={selectedGroup.label}
+                            />
+                            <p className="mt-2 text-[12.5px] leading-5 text-[#6b6a60]">
+                              Reviewers will see these related fields together whenever any one of them shows a mismatch.
+                            </p>
+                          </label>
+
+                          <div className="flex shrink-0 items-center gap-4 pt-7">
+                            <button
+                              className={`rounded-full border px-4 py-2 text-xs font-medium transition ${
+                                selectedGroup.enabled
+                                  ? "border-[#bdd8c2] bg-[#e9f2ea] text-[#3d6b4a]"
+                                  : "border-[#e7c3bb] bg-[#fbeeec] text-[#a3402f]"
+                              }`}
+                              onClick={() =>
+                                handleUpdateGroup(selectedGroup.groupKey, {
+                                  enabled: !selectedGroup.enabled,
+                                })
+                              }
+                              type="button"
+                            >
+                              {selectedGroup.enabled ? "Enabled" : "Disabled"}
+                            </button>
+                            <button
+                              className="text-sm font-medium text-[#a3402f] transition hover:text-[#7f281d]"
+                              onClick={() => handleDeleteGroup(selectedGroup.groupKey)}
+                              type="button"
+                            >
+                              Delete
+                            </button>
                           </div>
                         </div>
 
-                        <section>
-                          <div className="mb-4">
-                            <h3 className="text-[11px] font-black uppercase tracking-[0.2em] text-[#8a7f72]">
-                              FIELDS IN THIS GROUP
+                        <div className="mt-4 rounded-lg bg-[#f3f0e8] p-3">
+                          {selectedGroup.fields.length > 0 ? (
+                            <div className="flex flex-wrap gap-2">
+                              {selectedGroup.fields.map((fieldKey) => (
+                                <span
+                                  key={fieldKey}
+                                  className="max-w-full truncate rounded-full border border-[#e8e5de] bg-white px-3 py-1.5 text-xs text-[#20201c]"
+                                >
+                                  {FIELD_LABELS[fieldKey as FieldKey] ?? fieldKey}
+                                </span>
+                              ))}
+                            </div>
+                          ) : (
+                            <span className="text-[12.5px] text-[#9c9a8e]">
+                              No fields selected yet. Pick from the list below.
+                            </span>
+                          )}
+                        </div>
+
+                        <section className="mt-5">
+                          <div className="mb-3">
+                            <h3 className="text-[11px] font-medium tracking-[0.06em] text-[#8a7f72]">
+                              Fields in group
                             </h3>
-                            <p className="mt-0.5 text-[11px] font-medium uppercase tracking-wide text-[#b5aaa0]">
-                              These fields appear together on the mismatch review screen
+                            <p className="mt-1 text-[12.5px] leading-5 text-[#6b6a60]">
+                              Pick every field that should be reviewed as one issue family, across all documents.
                             </p>
                           </div>
 
-                          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-                            {AVAILABLE_GROUP_FIELDS.map((field) => {
-                              const isSelected = selectedGroup.fields.includes(field.key);
+                          <label className="mb-3 flex max-w-md items-center gap-2 rounded-lg bg-[#f3f0e8] px-3 py-2">
+                            <Search className="h-4 w-4 shrink-0 text-[#9c9a8e]" />
+                            <input
+                              className="w-full bg-transparent text-[13px] text-[#20201c] outline-none placeholder:text-[#9c9a8e]"
+                              onChange={(event) => setGroupFieldSearch(event.target.value)}
+                              placeholder="Search fields"
+                              type="search"
+                              value={groupFieldSearch}
+                            />
+                          </label>
 
-                              return (
-                                <button
-                                  key={field.key}
-                                  aria-pressed={isSelected}
-                                  className={`rounded-xl border p-4 text-left transition-all ${
-                                    isSelected
-                                      ? "border-[#10b981]/30 bg-[#ecfdf5]"
-                                      : "border-[#e5ddd0] bg-white hover:bg-[#fafafa]"
-                                  }`}
-                                  onClick={() => handleToggleGroupField(selectedGroup.groupKey, field.key)}
-                                  type="button"
-                                >
-                                  <div className="flex items-start justify-between gap-4">
-                                    <div>
-                                      <div className="text-sm font-bold text-[#1a1a1a]">
-                                        {FIELD_LABELS[field.key]}
-                                      </div>
-                                      <div className="mt-1 text-[11px] font-medium text-[#8a7f72]">
-                                        {field.key}
-                                      </div>
-                                    </div>
-                                    <div
-                                      className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-md border ${
-                                        isSelected
-                                          ? "border-[#10b981] bg-[#10b981] text-white"
-                                          : "border-[#d8ccbc] bg-white text-transparent"
-                                      }`}
+                          <div className="max-h-[400px] overflow-y-auto rounded-lg border border-[#e8e5de]">
+                            {filteredGroupFieldSections.map((section) => (
+                              <div key={section.docType}>
+                                <div className="sticky top-0 z-10 bg-[#f3f0e8] px-4 py-2.5 text-[11px] font-medium tracking-[0.06em] text-[#9c9a8e]">
+                                  {section.docType}
+                                </div>
+                                {section.fields.map((fieldKey) => {
+                                  const isSelected = selectedGroup.fields.includes(fieldKey);
+                                  const otherGroup = comparisonGroups.find(
+                                    (group) =>
+                                      group.groupKey !== selectedGroup.groupKey &&
+                                      group.fields.includes(fieldKey)
+                                  );
+
+                                  return (
+                                    <button
+                                      key={`${section.docType}-${fieldKey}`}
+                                      aria-pressed={isSelected}
+                                      className="flex w-full items-center gap-3 border-t border-[#e8e5de] px-4 py-2.5 text-left transition hover:bg-[#f3f0e8]"
+                                      onClick={() =>
+                                        handleToggleGroupField(selectedGroup.groupKey, fieldKey)
+                                      }
+                                      type="button"
                                     >
-                                      <Check className="h-4 w-4" />
-                                    </div>
-                                  </div>
-                                </button>
-                              );
-                            })}
+                                      <span
+                                        className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
+                                          isSelected
+                                            ? "border-[#3d6b4a] bg-[#3d6b4a] text-white"
+                                            : "border-[#d8d4c9] bg-white text-transparent"
+                                        }`}
+                                      >
+                                        <Check className="h-3 w-3" />
+                                      </span>
+                                      <span className="min-w-0 flex-1 truncate text-[13px] text-[#20201c]">
+                                        {FIELD_LABELS[fieldKey]}
+                                        {otherGroup ? (
+                                          <span className="text-[#9c9a8e]">
+                                            {" "}
+                                            - in {otherGroup.label}
+                                          </span>
+                                        ) : null}
+                                      </span>
+                                      <span className="shrink-0 font-mono text-[11px] text-[#9c9a8e]">
+                                        {fieldKey}
+                                      </span>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            ))}
+                            {filteredGroupFieldSections.length === 0 ? (
+                              <div className="px-4 py-8 text-center text-sm text-[#6b6a60]">
+                                No fields found.
+                              </div>
+                            ) : null}
                           </div>
                         </section>
                       </div>
                     ) : (
-                      <div className="flex h-full items-center justify-center rounded-2xl border border-dashed border-[#d8ccbc] bg-[#fafafa] text-sm font-medium text-[#8a7f72]">
+                      <div className="flex h-full items-center justify-center rounded-xl border border-dashed border-[#d8ccbc] bg-[#fbfaf8] text-sm font-medium text-[#8a7f72]">
                         Create a group to start.
                       </div>
                     )}
                   </main>
                 </>
               )}
-              </div>
+            </div>
           </div>
         </div>
       </div>

@@ -24,10 +24,7 @@ type BankTransactionRow = {
   suggestion_reason: string | null;
   confirmed_ledger_name: string | null;
   ledger_mapping_source: string | null;
-  raw_payload?: unknown;
   tally_status: string;
-  tally_voucher_id: string | null;
-  tally_posted_at: string | null;
 };
 
 function toNumber(value: unknown) {
@@ -43,30 +40,9 @@ function normalizeLedgerName(value?: string | null) {
   return String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function normalizeReferenceNumber(value?: string | null) {
-  const normalized = String(value ?? "")
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "");
-  return normalized.length >= 3 ? normalized : "";
-}
-
 function isSuspenseLedger(value?: string | null) {
   const normalized = normalizeLedgerName(value);
   return normalized === "suspense" || normalized === "suspenseac" || normalized === "suspenseaccount";
-}
-
-function hasAiStoredLedgerSuggestion(row: BankTransactionRow) {
-  const rawPayload = row.raw_payload;
-  if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) return false;
-  const ledgerMatch = (rawPayload as { ledgerMatch?: unknown }).ledgerMatch;
-  if (ledgerMatch && typeof ledgerMatch === "object" && !Array.isArray(ledgerMatch)) {
-    return (ledgerMatch as { source?: unknown }).source === "ai_match";
-  }
-  const aiLedgerRecommendation = (rawPayload as { aiLedgerRecommendation?: unknown }).aiLedgerRecommendation;
-  if (!aiLedgerRecommendation || typeof aiLedgerRecommendation !== "object" || Array.isArray(aiLedgerRecommendation)) {
-    return false;
-  }
-  return (aiLedgerRecommendation as { action?: unknown }).action === "use_existing_ledger";
 }
 
 function serializeTransaction(row: BankTransactionRow, suggestion?: Awaited<ReturnType<typeof suggestBankLedgerForTransaction>>) {
@@ -79,9 +55,7 @@ function serializeTransaction(row: BankTransactionRow, suggestion?: Awaited<Retu
       ? row.confirmed_ledger_name
       : null;
   const storedSuggestedLedgerName =
-    row.suggested_ledger_name &&
-    hasAiStoredLedgerSuggestion(row) &&
-    !(isSuspenseLedger(row.suggested_ledger_name) && strongSuggestedLedger)
+    row.suggested_ledger_name && !(isSuspenseLedger(row.suggested_ledger_name) && strongSuggestedLedger)
       ? row.suggested_ledger_name
       : null;
   const suggestedLedgerName = confirmedLedgerName || strongSuggestedLedger || storedSuggestedLedgerName || suggestion?.ledgerName || null;
@@ -109,8 +83,6 @@ function serializeTransaction(row: BankTransactionRow, suggestion?: Awaited<Retu
     confirmedLedgerName: confirmedLedgerName || (strongSuggestedLedger ? null : row.confirmed_ledger_name),
     ledgerMappingSource: row.ledger_mapping_source || suggestion?.mappingSource || null,
     tallyStatus: row.tally_status,
-    tallyVoucherId: row.tally_voucher_id,
-    tallyPostedAt: row.tally_posted_at,
     needsLedgerConfirmation: !suggestedLedgerName || (suggestionConfidence ?? 0) < 0.85,
   };
 }
@@ -162,7 +134,7 @@ export async function GET(request: Request) {
     }
 
     if (status === "queueable") {
-      builder = builder.in("tally_status", ["pending", "failed"]);
+      builder = builder.in("tally_status", ["pending", "failed", "missing_in_tally", "verification_failed"]);
     } else if (status) {
       builder = builder.eq("tally_status", status);
     }
@@ -171,52 +143,22 @@ export async function GET(request: Request) {
     if (error) throw error;
 
     const allRows = (data ?? []) as unknown as BankTransactionRow[];
-    let rows = status === "queueable" ? allRows.filter(hasPostingAmount) : allRows;
-
-    if (status === "queueable" && rows.length > 0) {
-      const references = Array.from(
-        new Set(rows.map((row) => normalizeReferenceNumber(row.reference_number)).filter(Boolean))
-      );
-      const { data: postedLogRows, error: postedLogError } = references.length
-        ? await supabase
-            .from("bank_transaction_posting_log")
-            .select("reference_number, tally_voucher_id")
-            .eq("owner_user_id", user.id)
-            .eq("bank_account_id", accountId)
-            .eq("status", "posted")
-        : { data: [], error: null };
-
-      if (postedLogError) throw postedLogError;
-
-      const postedReferences = new Set(
-        ((postedLogRows ?? []) as Array<{ reference_number: string | null; tally_voucher_id: string | null }>).flatMap(
-          (row) =>
-            [normalizeReferenceNumber(row.reference_number), normalizeReferenceNumber(row.tally_voucher_id)].filter(
-              Boolean
-            )
-        )
-      );
-      rows = rows.filter((row) => !postedReferences.has(normalizeReferenceNumber(row.reference_number)));
-    }
-
-    const suggestions =
-      status === "queueable"
-        ? rows.map(() => undefined)
-        : await Promise.all(
-            rows.map((row) =>
-              suggestBankLedgerForTransaction({
-                supabase,
-                ownerUserId: user.id,
-                connectionId,
-                accountId,
-                transaction: {
-                  description: row.description,
-                  category: row.category,
-                  counterpartyName: row.counterparty_name,
-                },
-              })
-            )
-          );
+    const rows = status === "queueable" ? allRows.filter(hasPostingAmount) : allRows;
+    const suggestions = await Promise.all(
+      rows.map((row) =>
+        suggestBankLedgerForTransaction({
+          supabase,
+          ownerUserId: user.id,
+          connectionId,
+          accountId,
+          transaction: {
+            description: row.description,
+            category: row.category,
+            counterpartyName: row.counterparty_name,
+          },
+        })
+      )
+    );
 
     return jsonWithCors(request, {
       transactions: rows.map((row, index) => serializeTransaction(row, suggestions[index])),

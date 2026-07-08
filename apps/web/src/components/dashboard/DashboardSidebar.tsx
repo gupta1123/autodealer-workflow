@@ -7,6 +7,8 @@ import {
   LayoutDashboard,
   FolderOpen,
   FileStack,
+  FileText,
+  Landmark,
   Trash2,
   LogOut,
   ChevronsUpDown,
@@ -21,6 +23,8 @@ const PRIMARY_NAV = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/workspace", label: "Add Case", icon: FileStack },
   { href: "/cases", label: "All Cases", icon: FolderOpen },
+  { href: "/tally-prime", label: "Bank Statements", icon: Landmark },
+  { href: "/collections", label: "Cash Discounts", icon: FileText },
   { href: "/recycle-bin", label: "Recycle Bin", icon: Trash2 },
 ];
 

@@ -5,6 +5,10 @@ import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-servi
 import { serializeFieldsWithLineItems } from "@/lib/line-items";
 import { mergePersistedStructuredData } from "@/lib/persisted-structured-data";
 import {
+  splitAnalyzedCaseIntoShipmentCases,
+  type CaseFileRowForSplit,
+} from "@/lib/processing/case-splitting";
+import {
   assessCaseTermsComplianceDetailed,
   enrichProcessedDocuments,
   processStoredCaseFiles,
@@ -85,7 +89,7 @@ export async function POST(
 
   const { data: caseRow, error: caseError } = await supabase
     .from("packet_cases")
-    .select("id, upload_count, processing_meta")
+    .select("id, owner_user_id, upload_count, processing_meta")
     .eq("id", job.case_id)
     .single();
 
@@ -239,7 +243,7 @@ export async function POST(
 
     const [
       { data: existingDocuments, error: existingDocumentsError },
-      { count: uploadCount, error: countError },
+      { data: storedCaseFiles, error: caseFilesError },
       { error: documentDeleteError },
       { error: mismatchDeleteError },
     ] = await Promise.all([
@@ -249,14 +253,15 @@ export async function POST(
         .eq("case_id", job.case_id),
       supabase
         .from("packet_case_files")
-        .select("id", { count: "exact", head: true })
-        .eq("case_id", job.case_id),
+        .select("id, original_name, storage_bucket, storage_path, mime_type, size_bytes, created_at")
+        .eq("case_id", job.case_id)
+        .order("created_at", { ascending: true }),
       supabase.from("packet_documents").delete().eq("case_id", job.case_id),
       supabase.from("packet_mismatches").delete().eq("case_id", job.case_id),
     ]);
 
     if (existingDocumentsError) throw existingDocumentsError;
-    if (countError) throw countError;
+    if (caseFilesError) throw caseFilesError;
     if (documentDeleteError) throw documentDeleteError;
     if (mismatchDeleteError) throw mismatchDeleteError;
 
@@ -281,6 +286,53 @@ export async function POST(
       progress: 96,
     });
     await assertCurrentRun();
+
+    const existingMeta =
+      caseRow.processing_meta && typeof caseRow.processing_meta === "object"
+        ? (caseRow.processing_meta as Record<string, unknown>)
+        : {};
+
+    const splitResult = await splitAnalyzedCaseIntoShipmentCases({
+      supabase,
+      caseId: job.case_id,
+      ownerUserId: caseRow.owner_user_id,
+      existingMeta,
+      documents,
+      comparisonOptions: processed.comparisonOptions,
+      analysisMode,
+      fieldConfiguration,
+      caseFiles: (storedCaseFiles ?? []) as CaseFileRowForSplit[],
+      extractionReview: extractionReview.review,
+    });
+
+    if (splitResult) {
+      await deleteDuplicateAnalysisRows(job.case_id);
+      await assertCurrentRun();
+
+      await updateCurrentJob({
+        status: "succeeded",
+        progress: 100,
+        stage: "Completed",
+        error: null,
+        result: {
+          summary: splitResult.primary.summary,
+          analysisMode,
+          documentCount: splitResult.primary.documents.length,
+          mismatchCount: splitResult.primary.mismatches.length,
+          verificationGroupCount: splitResult.primary.verificationGroups.length,
+          splitResult: {
+            strategy: splitResult.strategy,
+            shipmentCount: splitResult.shipmentCount,
+            primaryCaseId: splitResult.primary.caseId,
+            childCaseIds: splitResult.children.map((child) => child.caseId),
+          },
+          extractionReview: extractionReview.review,
+        },
+        finished_at: new Date().toISOString(),
+      });
+
+      return jsonWithCors(request, { ok: true, splitResult: true });
+    }
 
     const baseVerified = verifyProcessedDocuments(documents, processed.comparisonOptions);
     const termsCompliance = await assessCaseTermsComplianceDetailed(documents);
@@ -327,11 +379,6 @@ export async function POST(
     await deleteDuplicateAnalysisRows(job.case_id);
     await assertCurrentRun();
 
-    const existingMeta =
-      caseRow.processing_meta && typeof caseRow.processing_meta === "object"
-        ? (caseRow.processing_meta as Record<string, unknown>)
-        : {};
-
     const { error: updateCaseError } = await supabase
       .from("packet_cases")
       .update({
@@ -342,7 +389,7 @@ export async function POST(
         invoice_number: summary.invoiceNumber || null,
         status: "completed",
         risk_score: summary.riskScore,
-        upload_count: uploadCount ?? caseRow.upload_count,
+        upload_count: storedCaseFiles?.length ?? caseRow.upload_count,
         document_count: documents.length,
         mismatch_count: verified.mismatches.length,
         processing_meta: {

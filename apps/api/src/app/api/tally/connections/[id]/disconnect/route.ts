@@ -44,7 +44,6 @@ function disconnectedUpdatePayload() {
     last_tested_at: null,
     last_tally_reachable: null,
     last_company_loaded: null,
-    last_company_name: null,
     last_error: "Disconnected by user.",
   };
 }

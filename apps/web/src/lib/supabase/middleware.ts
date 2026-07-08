@@ -1,6 +1,8 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
+import { createSupabaseFetch } from "./fetch";
+
 function isLocalDbMode() {
   return process.env.LOCAL_DB_MODE === "true" || process.env.NEXT_PUBLIC_LOCAL_DB_MODE === "true";
 }
@@ -19,6 +21,15 @@ export async function updateSession(request: NextRequest) {
     });
   }
 
+  const pathname = request.nextUrl.pathname;
+  const isAuthRoute = pathname.startsWith("/login") || pathname.startsWith("/auth");
+
+  if (isAuthRoute) {
+    return NextResponse.next({
+      request,
+    });
+  }
+
   let response = NextResponse.next({
     request,
   });
@@ -30,6 +41,9 @@ export async function updateSession(request: NextRequest) {
       process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
     ),
     {
+      global: {
+        fetch: createSupabaseFetch(),
+      },
       cookies: {
         getAll() {
           return request.cookies.getAll();
@@ -49,25 +63,17 @@ export async function updateSession(request: NextRequest) {
 
   const {
     data: { user },
-  } = await supabase.auth.getUser();
+  } = await supabase.auth.getUser().catch((error) => {
+    console.error("Supabase auth session check failed:", error);
+    return { data: { user: null } };
+  });
 
-  const pathname = request.nextUrl.pathname;
-  const isAuthRoute = pathname.startsWith("/login") || pathname.startsWith("/auth");
-
-  if (!user && !isAuthRoute) {
+  if (!user) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
     if (pathname !== "/") {
       url.searchParams.set("next", pathname);
     }
-    return NextResponse.redirect(url);
-  }
-
-  if (user && pathname === "/login") {
-    const next = request.nextUrl.searchParams.get("next");
-    const url = request.nextUrl.clone();
-    url.pathname = next && next.startsWith("/") ? next : "/";
-    url.search = "";
     return NextResponse.redirect(url);
   }
 

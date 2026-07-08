@@ -4,7 +4,8 @@ export type TallyBridgeCommandType =
   | "sync_masters"
   | "post_bank_voucher"
   | "fetch_customer_open_bills"
-  | "adjust_customer_advance";
+  | "create_debit_note"
+  | "verify_bank_transaction";
 
 export type TallyBridgeCommandStatus =
   | "queued"
@@ -39,7 +40,8 @@ export const TALLY_BRIDGE_COMMAND_TYPES: TallyBridgeCommandType[] = [
   "sync_masters",
   "post_bank_voucher",
   "fetch_customer_open_bills",
-  "adjust_customer_advance",
+  "create_debit_note",
+  "verify_bank_transaction",
 ];
 
 export function serializeTallyBridgeCommand(row: TallyBridgeCommandRow) {

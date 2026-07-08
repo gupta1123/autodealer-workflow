@@ -30,6 +30,10 @@ export type TallyMasterInput = {
   ifscCode?: unknown;
   branchName?: unknown;
   accountHolderName?: unknown;
+  email?: unknown;
+  phone?: unknown;
+  contactPerson?: unknown;
+  address?: unknown;
   hsnCode?: unknown;
   unitName?: unknown;
   taxRate?: unknown;
@@ -127,17 +131,6 @@ export function toNullableNumber(value: unknown) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function toNullableBoolean(value: unknown) {
-  if (typeof value === "boolean") return value;
-  if (typeof value !== "string") return null;
-
-  const normalized = value.trim().toLowerCase();
-  if (!normalized) return null;
-  if (["yes", "true", "1", "enabled", "enable"].includes(normalized)) return true;
-  if (["no", "false", "0", "disabled", "disable"].includes(normalized)) return false;
-  return null;
-}
-
 export function normalizeMasterKey(input: {
   masterType: TallyMasterType;
   name: string;
@@ -189,9 +182,17 @@ export function serializeTallyMaster(row: TallyMasterRow) {
     ifscCode: typeof raw.ifscCode === "string" ? raw.ifscCode : null,
     branchName: typeof raw.branchName === "string" ? raw.branchName : null,
     accountHolderName: typeof raw.accountHolderName === "string" ? raw.accountHolderName : null,
-    billWiseEnabled:
-      toNullableBoolean(raw.isBillWiseOn) ??
-      toNullableBoolean(raw.maintainBalancesBillByBill),
+    email: typeof raw.email === "string" ? raw.email : null,
+    phone: typeof raw.phone === "string" ? raw.phone : null,
+    contactPerson: typeof raw.contactPerson === "string" ? raw.contactPerson : null,
+    address: typeof raw.address === "string" ? raw.address : null,
+    billWiseEnabled: typeof raw.billWiseEnabled === "boolean" ? raw.billWiseEnabled : null,
+    ledgerType:
+      row.master_type === "ledger" && typeof row.parent_name === "string" && /sundry\s+debtors/i.test(row.parent_name)
+        ? "customer"
+        : row.master_type === "ledger" && typeof row.parent_name === "string" && /sundry\s+creditors/i.test(row.parent_name)
+          ? "supplier"
+          : "other",
     hsnCode: row.hsn_code,
     unitName: row.unit_name,
     taxRate: row.tax_rate,
