@@ -182,7 +182,12 @@ function RadialProgress({ value, color }: { value: number; color: string }) {
 
 function VolumeChart({ cases }: { cases: SavedCaseRecord[] }) {
   const volumeData = useMemo(() => {
-    const days = [];
+    const days: Array<{
+      date: Date;
+      label: string;
+      localString: string;
+      count: number;
+    }> = [];
     const now = new Date();
     
     for (let i = 14; i >= 0; i--) {
@@ -413,7 +418,12 @@ export function DashboardHome() {
 
   const metrics = useMemo(() => {
     // 1. Generate local date strings for the last 15 days
-    const days = [];
+    const days: Array<{
+      localString: string;
+      caseCount: number;
+      docCount: number;
+      issueCount: number;
+    }> = [];
     const now = new Date();
     for (let i = 14; i >= 0; i--) {
       const d = new Date(now);
@@ -696,7 +706,7 @@ export function DashboardHome() {
                   item.buyerName.toLowerCase().replace(/[^a-z0-9]/g, "") !== item.receiverName.toLowerCase().replace(/[^a-z0-9]/g, "");
 
                 const cleanCategory = (() => {
-                  let cat = item.category || "";
+                  const cat = item.category || "";
                   const partner = item.buyerName || item.receiverName || "";
                   if (partner && cat.toLowerCase().includes(partner.toLowerCase())) {
                     return "Document Verification Packet";
@@ -791,4 +801,3 @@ export function DashboardHome() {
     </AppShell>
   );
 }
-
