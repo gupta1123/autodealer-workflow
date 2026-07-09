@@ -1,6 +1,7 @@
 export type TallyBridgeCommandType =
   | "alter_ledger"
   | "create_ledger"
+  | "fetch_bank_ledgers"
   | "sync_masters"
   | "post_bank_voucher"
   | "fetch_customer_open_bills"
@@ -37,6 +38,7 @@ export type TallyBridgeCommandRow = {
 export const TALLY_BRIDGE_COMMAND_TYPES: TallyBridgeCommandType[] = [
   "alter_ledger",
   "create_ledger",
+  "fetch_bank_ledgers",
   "sync_masters",
   "post_bank_voucher",
   "fetch_customer_open_bills",

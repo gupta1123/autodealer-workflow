@@ -60,6 +60,14 @@ type CompanyOption = {
   lastSyncAt: string | null;
   lastHeartbeatAt: string | null;
   lastError: string | null;
+  bankLedgers?: LocalBankLedger[];
+};
+
+type LocalBankLedger = {
+  name: string;
+  parent?: string | null;
+  bankName?: string | null;
+  bankAccountNumber?: string | null;
 };
 
 function uniqueCompanyOptions(options: CompanyOption[]) {
@@ -95,6 +103,13 @@ type TallyCommand = {
   status: string;
   result: Record<string, unknown> | null;
   error: string | null;
+};
+
+type BankLedgerFetchResult = {
+  companyName?: string | null;
+  bankLedgers?: LocalBankLedger[] | null;
+  byCompany?: Record<string, LocalBankLedger[] | null> | null;
+  errors?: Array<{ companyName?: string | null; error?: string | null }> | null;
 };
 
 type DraftAccount = {
@@ -1917,6 +1932,60 @@ async function readError(response: Response) {
   return `${message} ${JSON.stringify(payload.diagnostics)}`;
 }
 
+function normalizeFetchedBankLedger(value: unknown): LocalBankLedger | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  const name = typeof row.name === "string" ? row.name.trim() : "";
+  if (!name) return null;
+
+  return {
+    name,
+    parent: typeof row.parent === "string" && row.parent.trim() ? row.parent.trim() : "Bank Accounts",
+    bankName: typeof row.bankName === "string" && row.bankName.trim() ? row.bankName.trim() : null,
+    bankAccountNumber:
+      typeof row.bankAccountNumber === "string" && row.bankAccountNumber.trim()
+        ? row.bankAccountNumber.trim()
+        : null,
+  };
+}
+
+function normalizeFetchedBankLedgers(values: unknown) {
+  if (!Array.isArray(values)) return [];
+  const seen = new Set<string>();
+  const ledgers: LocalBankLedger[] = [];
+
+  for (const value of values) {
+    const ledger = normalizeFetchedBankLedger(value);
+    const key = ledger?.name.trim().toLowerCase();
+    if (!ledger || !key || seen.has(key)) continue;
+    seen.add(key);
+    ledgers.push(ledger);
+  }
+
+  return ledgers;
+}
+
+function normalizeFetchedBankLedgersByCompany(
+  result: BankLedgerFetchResult | null | undefined,
+  requestedCompanyNames: string[]
+) {
+  const next: Record<string, LocalBankLedger[]> = {};
+  const byCompany = result?.byCompany && typeof result.byCompany === "object" ? result.byCompany : {};
+
+  for (const [companyName, ledgers] of Object.entries(byCompany)) {
+    const normalizedName = companyName.trim();
+    if (!normalizedName) continue;
+    next[normalizedName] = normalizeFetchedBankLedgers(ledgers);
+  }
+
+  const fallbackCompanyName = result?.companyName || requestedCompanyNames[0];
+  if (fallbackCompanyName && !next[fallbackCompanyName]) {
+    next[fallbackCompanyName] = normalizeFetchedBankLedgers(result?.bankLedgers);
+  }
+
+  return next;
+}
+
 export function BankStatementsPage() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1930,15 +1999,18 @@ export function BankStatementsPage() {
   const [connections, setConnections] = useState<TallyConnection[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState<string>("");
   const [tallyConnectionId, setTallyConnectionId] = useState("");
+  const [selectedCompanyId, setSelectedCompanyId] = useState("");
   const [bankLedgerName, setBankLedgerName] = useState("");
   const [syncBeforeAnalysis, setSyncBeforeAnalysis] = useState(true);
   const [ledgerMasters, setLedgerMasters] = useState<TallyMaster[]>([]);
+  const [tallyBankLedgersByCompany, setTallyBankLedgersByCompany] = useState<Record<string, LocalBankLedger[]>>({});
   const [transactions, setTransactions] = useState<ReviewTransaction[]>([]);
   const [editingLedgerIds, setEditingLedgerIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
   const [matchingBills, setMatchingBills] = useState(false);
   const [syncingMasters, setSyncingMasters] = useState(false);
+  const [loadingBankLedgers, setLoadingBankLedgers] = useState(false);
   const [refreshingConnections, setRefreshingConnections] = useState(false);
   const [banner, setBanner] = useState<{ tone: MessageTone; text: string } | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
@@ -1956,6 +2028,7 @@ export function BankStatementsPage() {
   const [billAllocationReviewTransactionId, setBillAllocationReviewTransactionId] = useState<string | null>(null);
   const [outgoingReviewTransactionId, setOutgoingReviewTransactionId] = useState<string | null>(null);
   const ledgerLoadSeqRef = useRef(0);
+  const bankLedgerLoadKeyRef = useRef("");
   const initialSummaryLoadStartedRef = useRef(false);
 
   const validTransactions = useMemo(
@@ -1977,8 +2050,11 @@ export function BankStatementsPage() {
     [connections, tallyConnectionId]
   );
   const selectedCompany = useMemo(
-    () => companies.find((company) => company.connectionId === tallyConnectionId) ?? null,
-    [companies, tallyConnectionId]
+    () =>
+      companies.find((company) => company.id === selectedCompanyId) ??
+      companies.find((company) => company.connectionId === tallyConnectionId) ??
+      null,
+    [companies, selectedCompanyId, tallyConnectionId]
   );
   const companyOptions = useMemo(() => {
     if (companies.length > 0) return uniqueCompanyOptions(companies);
@@ -1998,8 +2074,18 @@ export function BankStatementsPage() {
     })));
   }, [companies, visibleConnections]);
   const commandConnection = useMemo<TallyConnection | null>(() => {
-    if (selectedConnection) return selectedConnection;
     if (!selectedCompany) return null;
+    if (selectedConnection) {
+      return {
+        ...selectedConnection,
+        displayName: selectedCompany.companyName,
+        lastCompanyName: selectedCompany.companyName,
+        status: selectedCompany.status || selectedConnection.status,
+        bridgeConnected: selectedCompany.bridgeConnected || selectedConnection.bridgeConnected,
+        heartbeatStale: selectedConnection.heartbeatStale,
+        updatedAt: selectedCompany.lastHeartbeatAt ?? selectedConnection.updatedAt,
+      };
+    }
     return {
       id: selectedCompany.connectionId,
       displayName: selectedCompany.companyName,
@@ -2018,8 +2104,35 @@ export function BankStatementsPage() {
       ? selectedCompany.companyLoaded || selectedCompany.tallyReachable
       : selectedConnection?.status === "company_loaded" || selectedConnection?.status === "tally_reachable";
   const bankLedgerOptions = useMemo(() => {
-    return ledgerMasters.filter(isBankLedgerMaster);
-  }, [ledgerMasters]);
+    const hasFetchedBankLedgers = selectedCompanyName
+      ? Object.prototype.hasOwnProperty.call(tallyBankLedgersByCompany, selectedCompanyName)
+      : false;
+    const fetchedBankLedgers = selectedCompanyName ? tallyBankLedgersByCompany[selectedCompanyName] : undefined;
+    const sourceBankLedgers =
+      hasFetchedBankLedgers
+        ? fetchedBankLedgers ?? []
+        : selectedCompany?.bankLedgers ?? [];
+    const localBankLedgers = sourceBankLedgers.map((ledger) => ({
+      key: `local-bank-ledger:${selectedCompany?.id ?? ""}:${ledger.name}`,
+      name: ledger.name,
+      type: "ledger",
+      parent: ledger.parent ?? "Bank Accounts",
+      bankName: ledger.bankName ?? null,
+      bankAccountNumber: ledger.bankAccountNumber ?? null,
+      ifscCode: null,
+      accountHolderName: null,
+      billWiseEnabled: null,
+      ledgerType: "other",
+    } satisfies TallyMaster));
+    const merged = [...localBankLedgers, ...ledgerMasters.filter(isBankLedgerMaster)];
+    const seen = new Set<string>();
+    return merged.filter((ledger) => {
+      const key = ledger.name.trim().toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [ledgerMasters, selectedCompany, selectedCompanyName, tallyBankLedgersByCompany]);
   const uploadContextReady = Boolean(
     tallyConnectionId &&
     tallyConnected &&
@@ -2152,14 +2265,23 @@ export function BankStatementsPage() {
     const payload = (await response.json()) as { companies?: CompanyOption[]; selectedCompanyId?: string | null };
     const nextCompanies = uniqueCompanyOptions(payload.companies ?? []);
     setCompanies(nextCompanies);
-    setTallyConnectionId((current) => {
-      if (current && nextCompanies.some((company) => company.connectionId === current)) {
+    setSelectedCompanyId((current) => {
+      if (current && nextCompanies.some((company) => company.id === current)) {
         return current;
       }
-      return nextCompanies[0]?.connectionId || payload.selectedCompanyId || current;
+      return payload.selectedCompanyId || nextCompanies[0]?.id || current;
+    });
+    setTallyConnectionId((current) => {
+      const selectedOption =
+        nextCompanies.find((company) => company.id === selectedCompanyId) ??
+        nextCompanies.find((company) => company.id === payload.selectedCompanyId) ??
+        nextCompanies[0];
+      if (selectedOption) return selectedOption.connectionId;
+      if (current && nextCompanies.some((company) => company.connectionId === current)) return current;
+      return current;
     });
     return nextCompanies;
-  }, []);
+  }, [selectedCompanyId]);
 
   const loadLedgerMasters = useCallback(async (connectionId: string) => {
     const loadSeq = ledgerLoadSeqRef.current + 1;
@@ -2187,12 +2309,24 @@ export function BankStatementsPage() {
     return masters;
   }, []);
 
-  const waitForCommand = useCallback(async (connectionId: string, commandId: string) => {
-    for (let attempt = 0; attempt < 45; attempt += 1) {
-      await wait(2000);
-      const response = await apiFetch(`/api/tally/connections/${connectionId}/commands`, {
-        cache: "no-store",
-      });
+  const waitForCommand = useCallback(
+    async (
+      connectionId: string,
+      commandId: string,
+      options?: { attempts?: number; intervalMs?: number }
+    ) => {
+    const attempts = options?.attempts ?? 45;
+    const intervalMs = options?.intervalMs ?? 2000;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      await wait(intervalMs);
+      const response = await apiFetch(
+        `/api/tally/connections/${connectionId}/commands?${new URLSearchParams({
+          ids: commandId,
+          limit: "1",
+        }).toString()}`,
+        { cache: "no-store" }
+      );
       if (!response.ok) {
         throw new Error(await readError(response));
       }
@@ -2206,6 +2340,85 @@ export function BankStatementsPage() {
 
     return null;
   }, []);
+
+  async function fetchTallyBankLedgersForCompanies(
+    connectionId: string,
+    companyNames: string[],
+    options?: { quiet?: boolean }
+  ) {
+    const cleanCompanyNames = Array.from(
+      new Set(companyNames.map((name) => name.trim()).filter(Boolean))
+    );
+    if (!connectionId || cleanCompanyNames.length === 0) return null;
+
+    try {
+      setLoadingBankLedgers(true);
+      const response = await apiFetch(`/api/tally/connections/${connectionId}/commands`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          commandType: "fetch_bank_ledgers",
+          payload: {
+            companyName: cleanCompanyNames[0],
+            companyNames: cleanCompanyNames,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(await readError(response));
+      }
+
+      const payload = (await response.json()) as { command?: TallyCommand };
+      const command = payload.command;
+      if (!command?.id) {
+        throw new Error("Tally bank ledger fetch was queued, but no command id was returned.");
+      }
+
+      const completedCommand = await waitForCommand(connectionId, command.id, {
+        attempts: 14,
+        intervalMs: 2000,
+      });
+      if (!completedCommand || completedCommand.status !== "succeeded") {
+        if (!options?.quiet) {
+          setBanner({
+            tone: "info",
+            text: "Could not read bank accounts from Tally yet. Open the company in Tally and refresh.",
+          });
+        }
+        return null;
+      }
+
+      const byCompany = normalizeFetchedBankLedgersByCompany(
+        completedCommand.result as BankLedgerFetchResult,
+        cleanCompanyNames
+      );
+      setTallyBankLedgersByCompany((current) => ({
+        ...current,
+        ...byCompany,
+      }));
+
+      if (!options?.quiet) {
+        const count = Object.values(byCompany).reduce((total, ledgers) => total + ledgers.length, 0);
+        setBanner({
+          tone: "success",
+          text: count > 0 ? "Bank accounts refreshed from Tally." : "No Tally bank accounts were returned.",
+        });
+      }
+
+      return byCompany;
+    } catch (error) {
+      if (!options?.quiet) {
+        setBanner({
+          tone: "error",
+          text: error instanceof Error ? error.message : "Could not fetch Tally bank accounts.",
+        });
+      }
+      return null;
+    } finally {
+      setLoadingBankLedgers(false);
+    }
+  }
 
   const clearStatementReview = useCallback(() => {
     setPreview(null);
@@ -2302,10 +2515,9 @@ export function BankStatementsPage() {
       const preferredConnection = getRelevantTallyConnections(loadedConnections)[0];
       const preferredCompany = loadedCompanies[0];
       const nextConnectionId = tallyConnectionId || preferredCompany?.connectionId || preferredConnection?.id || "";
+      const nextCompanyId = selectedCompanyId || preferredCompany?.id || "";
+      setSelectedCompanyId(nextCompanyId);
       setTallyConnectionId(nextConnectionId);
-      if (nextConnectionId) {
-        await loadLedgerMasters(nextConnectionId);
-      }
     }
 
     loadSummary().catch(() => {
@@ -2317,13 +2529,29 @@ export function BankStatementsPage() {
     return () => {
       cancelled = true;
     };
-  }, [loadCompanyOptions, loadLedgerMasters, loadTallyConnections, tallyConnectionId]);
+  }, [loadCompanyOptions, loadLedgerMasters, loadTallyConnections, selectedCompanyId, tallyConnectionId]);
+
+  useEffect(() => {
+    const connectionId = companyOptions[0]?.connectionId || tallyConnectionId;
+    const companyNames = companyOptions.map((company) => company.companyName).filter(Boolean);
+    const key = `${connectionId}::${companyNames.join("|")}`;
+    if (!connectionId || companyNames.length === 0 || bankLedgerLoadKeyRef.current === key) return;
+
+    bankLedgerLoadKeyRef.current = key;
+    void fetchTallyBankLedgersForCompanies(connectionId, companyNames, { quiet: true });
+  }, [companyOptions, tallyConnectionId]);
 
   useEffect(() => {
     let cancelled = false;
 
     if (!tallyConnectionId) {
       setLedgerMasters([]);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (transactions.length === 0 || ledgerMasters.length > 0) {
       return () => {
         cancelled = true;
       };
@@ -2336,22 +2564,28 @@ export function BankStatementsPage() {
     return () => {
       cancelled = true;
     };
-  }, [loadLedgerMasters, tallyConnectionId]);
+  }, [ledgerMasters.length, loadLedgerMasters, tallyConnectionId, transactions.length]);
 
   useEffect(() => {
     if (visibleConnections.length === 0 && companies.length === 0) {
       setTallyConnectionId("");
+      setSelectedCompanyId("");
       return;
     }
 
     const currentExists =
       visibleConnections.some((connection) => connection.id === tallyConnectionId) ||
       companies.some((company) => company.connectionId === tallyConnectionId);
+    const currentCompanyExists = !selectedCompanyId || companies.some((company) => company.id === selectedCompanyId);
 
     if (!currentExists) {
-      setTallyConnectionId(companies[0]?.connectionId || visibleConnections[0]?.id || "");
+      const fallbackCompany = companies[0] ?? null;
+      setSelectedCompanyId(fallbackCompany?.id || "");
+      setTallyConnectionId(fallbackCompany?.connectionId || visibleConnections[0]?.id || "");
+    } else if (!currentCompanyExists) {
+      setSelectedCompanyId(companies.find((company) => company.connectionId === tallyConnectionId)?.id || companies[0]?.id || "");
     }
-  }, [companies, tallyConnectionId, visibleConnections]);
+  }, [companies, selectedCompanyId, tallyConnectionId, visibleConnections]);
 
   useEffect(() => {
     if (ledgerMasters.length === 0) return;
@@ -2483,8 +2717,13 @@ export function BankStatementsPage() {
       const preferredConnection = getRelevantTallyConnections(loadedConnections)[0];
       const preferredCompany = loadedCompanies[0];
       const nextConnectionId = preferredCompany?.connectionId || preferredConnection?.id || "";
+      const nextCompanyId = preferredCompany?.id || "";
       if (nextConnectionId) {
+        setSelectedCompanyId(nextCompanyId);
         setTallyConnectionId(nextConnectionId);
+        const companyNames = loadedCompanies.map((company) => company.companyName).filter(Boolean);
+        bankLedgerLoadKeyRef.current = "";
+        await fetchTallyBankLedgersForCompanies(nextConnectionId, companyNames, { quiet: true });
         await loadLedgerMasters(nextConnectionId).catch(() => setLedgerMasters([]));
       }
       showToast("success", "Tally connection refreshed.");
@@ -2495,19 +2734,23 @@ export function BankStatementsPage() {
     }
   }
 
-  function updateStatementContext(nextConnectionId: string) {
-    if (nextConnectionId === tallyConnectionId) return;
+  function updateStatementContext(nextCompanyId: string) {
+    const nextCompany = companyOptions.find((company) => company.id === nextCompanyId) ?? null;
+    const nextConnectionId = nextCompany?.connectionId || nextCompanyId;
+    if (nextCompanyId === selectedCompanyId && nextConnectionId === tallyConnectionId) return;
+    setSelectedCompanyId(nextCompanyId);
     setTallyConnectionId(nextConnectionId);
     setBankLedgerName("");
     setSelectedAccountId("");
     setAccount(EMPTY_ACCOUNT);
     setLedgerMasters([]);
     clearStatementReview();
-    void loadLedgerMasters(nextConnectionId).catch(() => setLedgerMasters([]));
   }
 
   function applyTallyBankLedgerSelection(ledgerName: string) {
-    const ledger = ledgerMasters.find((item) => item.name === ledgerName);
+    const ledger =
+      bankLedgerOptions.find((item) => item.name === ledgerName) ??
+      ledgerMasters.find((item) => item.name === ledgerName);
     const mappedAccount = accounts.find((item) => item.tallyLedgerName === ledgerName);
     const ledgerAccountNumber =
       mappedAccount?.accountNumber?.trim() || ledger?.bankAccountNumber?.trim() || "";
@@ -2683,7 +2926,7 @@ export function BankStatementsPage() {
         body: JSON.stringify({
           commandType: "sync_masters",
           payload: {
-            companyName: connection.lastCompanyName,
+            companyName: selectedCompanyName || connection.lastCompanyName,
             requestedMasterTypes: ["ledger", "group", "voucher_type", "gst_ledger", "tax_ledger"],
           },
         }),
@@ -2734,6 +2977,14 @@ export function BankStatementsPage() {
   }
 
   async function handleSyncLedgerMasters() {
+    if (tallyConnectionId && companyOptions.length > 0) {
+      bankLedgerLoadKeyRef.current = "";
+      await fetchTallyBankLedgersForCompanies(
+        tallyConnectionId,
+        companyOptions.map((company) => company.companyName),
+        { quiet: false }
+      );
+    }
     await syncCompanyData();
   }
 
@@ -2753,7 +3004,7 @@ export function BankStatementsPage() {
         payload: {
           ledgerName: requestedLedgerNames[0],
           ledgerNames: requestedLedgerNames,
-          companyName: connection.lastCompanyName,
+          companyName: selectedCompanyName || connection.lastCompanyName,
         },
       }),
     });
@@ -2887,7 +3138,7 @@ export function BankStatementsPage() {
           body: JSON.stringify({
             commandType: "verify_bank_transaction",
             payload: {
-              companyName: connection.lastCompanyName,
+              companyName: selectedCompanyName || connection.lastCompanyName,
               voucherDate: transaction.transactionDate,
               bankLedgerName,
               amount: parseNumber(transaction.debitAmount) ?? 0,
@@ -3385,11 +3636,11 @@ export function BankStatementsPage() {
                     <select
                       className="mt-1.5 h-11 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
                       onChange={(event) => updateStatementContext(event.target.value)}
-                      value={tallyConnectionId}
+                      value={selectedCompany?.id || selectedCompanyId}
                     >
                       {companyOptions.length === 0 ? <option value="">No connected Tally company</option> : null}
                       {companyOptions.map((company) => (
-                        <option key={company.connectionId} value={company.connectionId}>
+                        <option key={company.id} value={company.id}>
                           {formatCompanyOptionLabel(company)}
                         </option>
                       ))}
@@ -3402,10 +3653,10 @@ export function BankStatementsPage() {
                       <button
                         type="button"
                         onClick={handleSyncLedgerMasters}
-                        disabled={!tallyConnectionId || syncingMasters}
+                        disabled={!tallyConnectionId || syncingMasters || loadingBankLedgers}
                         className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-all disabled:cursor-not-allowed disabled:opacity-50"
                       >
-                        {syncingMasters ? (
+                        {syncingMasters || loadingBankLedgers ? (
                           <Loader2 className="h-3.5 w-3.5 animate-spin" />
                         ) : (
                           <RefreshCw className="h-3.5 w-3.5" />
@@ -3616,10 +3867,10 @@ export function BankStatementsPage() {
                     <button
                       type="button"
                       onClick={handleSyncLedgerMasters}
-                      disabled={!tallyConnectionId || syncingMasters}
+                      disabled={!tallyConnectionId || syncingMasters || loadingBankLedgers}
                       className="inline-flex h-8.5 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50 transition-all"
                     >
-                      {syncingMasters ? (
+                      {syncingMasters || loadingBankLedgers ? (
                         <Loader2 className="h-3.5 w-3.5 animate-spin" />
                       ) : (
                         <RefreshCw className="h-3.5 w-3.5" />
@@ -3714,10 +3965,10 @@ export function BankStatementsPage() {
                       <button
                         type="button"
                         onClick={handleSyncLedgerMasters}
-                        disabled={!tallyConnectionId || syncingMasters}
+                        disabled={!tallyConnectionId || syncingMasters || loadingBankLedgers}
                         className="inline-flex h-7 items-center gap-1 rounded-md border border-[#d8cbbb] bg-white px-2 text-[11px] font-bold text-[#6f4e2f] hover:bg-[#fbf7f1] disabled:cursor-not-allowed disabled:opacity-50"
                       >
-                        {syncingMasters ? (
+                        {syncingMasters || loadingBankLedgers ? (
                           <Loader2 className="h-3.5 w-3.5 animate-spin" />
                         ) : (
                           <RefreshCw className="h-3.5 w-3.5" />

@@ -210,6 +210,67 @@ export async function POST(
       });
     }
 
+    if (commandType === "fetch_bank_ledgers") {
+      const requestedCompanyNames = uniqueTextValues(
+        [
+          ...(Array.isArray(rawPayload.companyNames) ? rawPayload.companyNames : []),
+          rawPayload.companyName,
+          connection.last_company_name,
+        ],
+        240
+      );
+
+      const payload = {
+        companyName: requestedCompanyNames[0] ?? null,
+        companyNames: requestedCompanyNames,
+      };
+
+      if (isLocalDbMode()) {
+        const command = await createLocalTallyCommand({
+          connectionId: id,
+          ownerUserId: user.id,
+          commandType,
+          payload,
+          priority: 15,
+        });
+
+        return jsonWithCors(request, {
+          command: serializeTallyBridgeCommand(command),
+        });
+      }
+
+      const supabase = createSupabaseAdminClient();
+      const { data, error } = await supabase
+        .from("tally_bridge_commands")
+        .insert({
+          connection_id: id,
+          owner_user_id: user.id,
+          command_type: commandType,
+          status: "queued",
+          priority: 15,
+          payload,
+        })
+        .select("*")
+        .single();
+
+      if (error) throw error;
+
+      await supabase.from("tally_connection_events").insert({
+        connection_id: id,
+        owner_user_id: user.id,
+        event_type: "command_queued",
+        message: "Tally bank ledger fetch queued for bridge.",
+        payload: {
+          commandType,
+          companyNames: requestedCompanyNames,
+        },
+      });
+
+      return jsonWithCors(request, {
+        command: serializeTallyBridgeCommand(data as unknown as TallyBridgeCommandRow),
+      });
+    }
+
     if (commandType === "alter_ledger") {
       const masterKey = toRequiredText(rawPayload.masterKey).slice(0, 500);
       const newName = toRequiredText(rawPayload.newName).slice(0, 500);

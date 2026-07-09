@@ -356,6 +356,7 @@ export async function GET(request: Request) {
 
     const url = new URL(request.url);
     const connectionId = url.searchParams.get("connectionId")?.trim();
+    const requestedCompanyName = nullableText(url.searchParams.get("companyName"), 240);
 
     if (!connectionId) {
       return jsonWithCors(request, { error: "Tally company/connection is required." }, { status: 400 });
@@ -374,9 +375,9 @@ export async function GET(request: Request) {
       return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
     }
 
-    const companyName = !isGenericTallyLabel(connection.last_company_name)
+    const companyName = requestedCompanyName ?? (!isGenericTallyLabel(connection.last_company_name)
       ? connection.last_company_name
-      : connection.display_name;
+      : connection.display_name);
     const compatibleConnectionIds = new Set([connectionId]);
 
     if (connection.last_company_name) {

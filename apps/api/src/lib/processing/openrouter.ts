@@ -8,6 +8,13 @@ const OPENROUTER_QUALITY_MODEL =
   process.env.OPENROUTER_QUALITY_MODEL ||
   process.env.GEMINI_THINKING_MODEL ||
   "google/gemini-2.5-flash";
+const OPENROUTER_BANK_LEDGER_MODEL =
+  process.env.OPENROUTER_BANK_LEDGER_MODEL ||
+  "deepseek/deepseek-v4-pro";
+const OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS = Number(
+  process.env.OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS ?? 4096
+);
+const OPENROUTER_BANK_LEDGER_TIMEOUT_MS = Number(process.env.OPENROUTER_BANK_LEDGER_TIMEOUT_MS ?? 45_000);
 const OPENROUTER_REVIEW_MODEL =
   process.env.OPENROUTER_REVIEW_MODEL ||
   process.env.OPENROUTER_EXTRACTION_REVIEW_MODEL ||
@@ -177,6 +184,22 @@ export async function callOpenRouter(
 
 export function getQualityExtractionModel() {
   return OPENROUTER_QUALITY_MODEL;
+}
+
+export function getBankLedgerMatchingModel() {
+  return OPENROUTER_BANK_LEDGER_MODEL;
+}
+
+export function getBankLedgerMatchingMaxTokens() {
+  return normalizeMaxTokens(OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS);
+}
+
+export function getBankLedgerMatchingTimeoutMs() {
+  if (!Number.isFinite(OPENROUTER_BANK_LEDGER_TIMEOUT_MS) || OPENROUTER_BANK_LEDGER_TIMEOUT_MS <= 0) {
+    return undefined;
+  }
+
+  return OPENROUTER_BANK_LEDGER_TIMEOUT_MS;
 }
 
 function getConfiguredExtractionReviewProvider() {

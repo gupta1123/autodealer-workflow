@@ -1,5 +1,7 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { suggestBankLedgerForTransaction } from "@/lib/bank-statement-ledger-matching";
+import { getBankLedgerMatchingModel } from "@/lib/processing/openrouter";
 import {
   findBankAccountCandidates,
   maskAccountNumber,
@@ -64,6 +66,97 @@ function isPreviewTransactionArray(value: unknown) {
   return Array.isArray(value) ? (value as Array<Record<string, unknown>>) : [];
 }
 
+function toNumber(value: unknown) {
+  const parsed = Number(String(value ?? "").replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function hasAiLedgerRecommendation(row: Record<string, unknown>) {
+  const rawPayload = readRecord(row.raw_payload);
+  return Boolean(readRecord(rawPayload.aiLedgerRecommendation).model);
+}
+
+function readConnectionIdFromMeta(processingMeta: Record<string, unknown>) {
+  const selectedContext = readRecord(processingMeta.selectedContext);
+  const analysis = readRecord(processingMeta.analysis);
+  return typeof selectedContext.connectionId === "string"
+    ? selectedContext.connectionId
+    : typeof analysis.connectionId === "string"
+      ? analysis.connectionId
+      : null;
+}
+
+async function enrichPreviewRowsWithAiSuggestions(params: {
+  supabase: ReturnType<typeof createSupabaseAdminClient>;
+  ownerUserId: string;
+  connectionId: string | null;
+  importId: string;
+  rows: Array<Record<string, unknown>>;
+}) {
+  if (!params.connectionId || params.rows.length === 0 || params.rows.every(hasAiLedgerRecommendation)) {
+    return params.rows;
+  }
+
+  const enrichedRows = await Promise.all(
+    params.rows.map(async (row) => {
+      if (hasAiLedgerRecommendation(row)) return row;
+
+      const suggestion = await suggestBankLedgerForTransaction({
+        supabase: params.supabase,
+        ownerUserId: params.ownerUserId,
+        connectionId: params.connectionId,
+        accountId: String(row.bank_account_id ?? ""),
+        transaction: {
+          transactionDate: row.transaction_date ? String(row.transaction_date) : "",
+          valueDate: row.value_date ? String(row.value_date) : null,
+          description: String(row.description ?? ""),
+          referenceNumber: row.reference_number ? String(row.reference_number) : null,
+          debitAmount: toNumber(row.debit_amount),
+          creditAmount: toNumber(row.credit_amount),
+          balanceAmount: toNumber(row.balance_amount),
+          transactionType: row.transaction_type ? String(row.transaction_type) : undefined,
+          category: row.category ? String(row.category) : undefined,
+          counterpartyName: row.counterparty_name ? String(row.counterparty_name) : null,
+        },
+      });
+      const rawPayload = readRecord(row.raw_payload);
+      const aiLedgerRecommendation = {
+        matchType: suggestion.matchType ?? (suggestion.ledgerName ? "direct_match" : "suspense"),
+        action: suggestion.ledgerName ? "use_existing_ledger" : "use_suspense",
+        ledgerName: suggestion.ledgerName,
+        candidateLedgerNames: suggestion.candidateLedgerNames ?? [],
+        confidence: suggestion.confidence,
+        reason: suggestion.reason,
+        model: getBankLedgerMatchingModel(),
+        source: "import_preview_api",
+      };
+      const update = {
+        suggested_ledger_name: suggestion.ledgerName,
+        suggestion_confidence: suggestion.confidence,
+        suggestion_reason: suggestion.reason,
+        raw_payload: {
+          ...rawPayload,
+          aiLedgerRecommendation,
+        },
+      };
+
+      await params.supabase
+        .from("bank_statement_import_preview_transactions")
+        .update(update)
+        .eq("id", row.id)
+        .eq("owner_user_id", params.ownerUserId)
+        .eq("import_id", params.importId);
+
+      return {
+        ...row,
+        ...update,
+      };
+    })
+  );
+
+  return enrichedRows;
+}
+
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
@@ -116,7 +209,13 @@ export async function GET(
     const previewMeta = readRecord(processingMeta.preview);
     const previewAccount = readRecord(previewMeta.account);
     const storedPreviewTransactions = isPreviewTransactionArray(previewMeta.transactions);
-    const tablePreviewTransactions = (previewRows ?? []) as Array<Record<string, unknown>>;
+    const tablePreviewTransactions = await enrichPreviewRowsWithAiSuggestions({
+      supabase,
+      ownerUserId: user.id,
+      connectionId: readConnectionIdFromMeta(processingMeta),
+      importId: id,
+      rows: (previewRows ?? []) as Array<Record<string, unknown>>,
+    });
     const transactions =
       tablePreviewTransactions.length > 0
         ? tablePreviewTransactions.map((row) => serializePreviewTransaction(row))

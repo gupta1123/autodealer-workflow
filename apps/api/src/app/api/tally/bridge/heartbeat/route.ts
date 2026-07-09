@@ -50,6 +50,28 @@ function toNullableText(value: unknown) {
   return trimmed.length > 0 ? trimmed.slice(0, 500) : null;
 }
 
+function toCompanyNames(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const names: string[] = [];
+
+  for (const item of value) {
+    let name: unknown = item;
+    if (item && typeof item === "object") {
+      const row = item as Record<string, unknown>;
+      name = row.companyName ?? row.name;
+    }
+    const text = toNullableText(name);
+    if (!text) continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    names.push(text);
+  }
+
+  return names;
+}
+
 function resolveStatus(input: {
   tallyReachable: boolean;
   companyLoaded: boolean;
@@ -102,6 +124,7 @@ export async function POST(request: Request) {
     const tallyReachable = toBoolean(body.tallyReachable);
     const companyLoaded = toBoolean(body.companyLoaded);
     const companyName = toNullableText(body.companyName);
+    const companyNames = toCompanyNames(body.companies);
     const errorMessage = toNullableText(body.error);
     const status = resolveStatus({
       tallyReachable,
@@ -186,6 +209,7 @@ export async function POST(request: Request) {
         companyLoaded,
         companyName: resolvedCompanyName,
         heartbeatCompanyName: companyName,
+        companies: companyNames,
       },
     });
 

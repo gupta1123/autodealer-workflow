@@ -56,8 +56,34 @@ const OPENROUTER_MAX_RETRIES = Number(process.env.OPENROUTER_MAX_RETRIES ?? 2);
 const OPENROUTER_RETRY_BASE_MS = Number(process.env.OPENROUTER_RETRY_BASE_MS ?? 1200);
 const OPENROUTER_MAX_OUTPUT_TOKENS = Number(process.env.OPENROUTER_MAX_OUTPUT_TOKENS ?? 8192);
 const OPENROUTER_QUALITY_REASONING_TOKENS = Number(process.env.OPENROUTER_QUALITY_REASONING_TOKENS ?? 2000);
+const OPENROUTER_BANK_LEDGER_MODEL =
+  process.env.OPENROUTER_BANK_LEDGER_MODEL ||
+  "deepseek/deepseek-v4-pro";
+const OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS = Number(
+  process.env.OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS ?? 4096
+);
 const execFileAsync = promisify(execFile);
 const WORKER_IDLE_LOG_INTERVAL_MS = Number(process.env.WORKER_IDLE_LOG_INTERVAL_MS ?? 30_000);
+
+const BANK_LEDGER_MATCHING_SYSTEM_PROMPT = `You match Indian bank statement transactions to synced Tally ledgers.
+Your task is to recommend the correct existing Tally ledger for each bank transaction.
+This is ledger assignment only. Do not attempt invoice matching, voucher matching, invoice settlement, split allocation, or full bank reconciliation.
+Return only valid JSON. Do not return markdown, explanations outside JSON, or code fences.
+Choose only from the provided tallyLedgers list. Copy every selected ledger name exactly as provided.
+Never invent, modify, shorten, merge, or create a ledger. If no existing ledger is clearly correct, use suspense.
+Every transaction must produce exactly one result using its original index.
+Return this exact structure: {"matches":[{"index":0,"matchType":"direct_match","action":"use_existing_ledger","ledgerName":"Exact Ledger Name From tallyLedgers","candidateLedgerNames":[],"confidence":0.95,"reason":"Short reason"}]}.
+Allowed matchType values: direct_match, close_match, suspense.
+For direct_match, action must be "use_existing_ledger", ledgerName must be one exact name from tallyLedgers, candidateLedgerNames must be [], and confidence must be at least 0.90.
+For close_match, action must be "use_suspense", ledgerName must be null, candidateLedgerNames must contain at least two exact competing ledger names from tallyLedgers, and confidence must be 0.0.
+For suspense, action must be "use_suspense", ledgerName must be null, candidateLedgerNames must be [], and confidence must be 0.0.
+A shortened, OCR-damaged, misspelled, or incomplete party name can still be a direct match when it uniquely identifies one existing ledger.
+Ignore bank-system noise such as NEFT, RTGS, IMPS, UPI, NACH, ACH, ECS, CMS, CR, DR, payment, receipt, UTR, RRN, TXN, REF, beneficiary, account words, IFSC, bank, branch, dates, and reference numbers.
+Ignore case, spaces, punctuation, legal suffixes, and common spelling variants only when the full party root remains clearly the same.
+Do not remove meaningful descriptors such as Steel, Metals, Alloys, Traders, Transport, Logistics, Engineering, Fabrication, Electricals, Industries, Services, and Works when they differentiate parties.
+A named party ledger is preferred over a generic expense-category ledger when both are available.
+Select an expense, statutory, payroll, or bank-related ledger only when the narration explicitly supports that category and exactly one existing ledger clearly fits.
+Use suspense for generic narrations, only-reference rows, ambiguous merchants, self-transfers/reversals without a unique ledger, multiple plausible ledgers, best match below 0.90, or anything requiring guessing.`;
 
 function resolvePdfJsWorkerSrc() {
   const candidates = [
@@ -731,6 +757,185 @@ async function callOpenRouterForBankStatement(messages) {
   throw new Error(lastError);
 }
 
+async function callOpenRouterForLedgerMatching(messages) {
+  if (!OPENROUTER_API_KEY) {
+    throw new Error("OPENROUTER_API_KEY is not configured.");
+  }
+
+  let attempt = 0;
+  let lastError = "OpenRouter ledger matching request failed";
+  while (attempt <= OPENROUTER_MAX_RETRIES) {
+    try {
+      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": process.env.APP_BASE_URL || "http://localhost:3001",
+          "X-Title": "Autodealer Workflow Bank Ledger Matching",
+        },
+        body: JSON.stringify({
+          model: OPENROUTER_BANK_LEDGER_MODEL,
+          messages,
+          temperature: 0,
+          response_format: { type: "json_object" },
+          max_tokens:
+            Number.isFinite(OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS) && OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS > 0
+              ? Math.floor(OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS)
+              : undefined,
+        }),
+      });
+
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload?.error) {
+        const errorText =
+          payload?.error?.message ||
+          payload?.message ||
+          (response.ok ? "OpenRouter returned an error payload" : `OpenRouter request failed (${response.status})`);
+        lastError = errorText;
+        if (!isRetryableStatus(response.status) || isHardQuotaError(errorText) || attempt === OPENROUTER_MAX_RETRIES) {
+          throw new Error(errorText);
+        }
+        await sleep(OPENROUTER_RETRY_BASE_MS * Math.pow(2, attempt));
+        attempt += 1;
+        continue;
+      }
+
+      const message = payload?.choices?.[0]?.message?.content;
+      return Array.isArray(message) ? message.map((part) => part?.text || "").join("\n") : String(message || "");
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error ?? "Unknown error");
+      if (attempt === OPENROUTER_MAX_RETRIES) {
+        throw new Error(lastError);
+      }
+      await sleep(OPENROUTER_RETRY_BASE_MS * Math.pow(2, attempt));
+      attempt += 1;
+    }
+  }
+
+  throw new Error(lastError);
+}
+
+function findLedgerNameByNormalized(ledgerNames, ledgerName) {
+  const normalized = normalizeName(ledgerName);
+  if (!normalized) return null;
+  return ledgerNames.find((name) => normalizeName(name) === normalized) || null;
+}
+
+async function applyAiLedgerSuggestionsToPreviewRows({ ownerUserId, connectionId, rows }) {
+  if (!connectionId || rows.length === 0) return rows;
+
+  const { data: ledgerRows, error: ledgerError } = await supabase
+    .from("tally_masters")
+    .select("tally_name, parent_name")
+    .eq("owner_user_id", ownerUserId)
+    .eq("connection_id", connectionId)
+    .eq("master_type", "ledger")
+    .eq("is_active", true)
+    .limit(5000);
+
+  if (ledgerError) throw ledgerError;
+
+  const ledgers = (ledgerRows ?? []).flatMap((ledger) => {
+    const name = textCell(ledger?.tally_name);
+    return name ? [{ name, group: textCell(ledger?.parent_name) || null }] : [];
+  });
+  if (ledgers.length === 0) return rows;
+
+  const raw = await callOpenRouterForLedgerMatching([
+    { role: "system", content: BANK_LEDGER_MATCHING_SYSTEM_PROMPT },
+    {
+      role: "user",
+      content: JSON.stringify({
+        tallyLedgers: ledgers,
+        transactions: rows.map((row, index) => ({
+          index,
+          transactionDate: row.transaction_date,
+          description: row.description,
+          referenceNumber: row.reference_number,
+          debitAmount: row.debit_amount,
+          creditAmount: row.credit_amount,
+          transactionType: row.transaction_type,
+          category: row.category,
+          counterpartyName: row.counterparty_name,
+        })),
+      }),
+    },
+  ]);
+
+  const parsed = safeJsonParse(raw, {});
+  const matches = Array.isArray(parsed?.matches) ? parsed.matches : [];
+  const ledgerNames = ledgers.map((ledger) => ledger.name);
+  const matchByIndex = new Map(
+    matches
+      .filter((match) => match && typeof match === "object" && Number.isInteger(Number(match.index)))
+      .map((match) => [Number(match.index), match])
+  );
+
+  return rows.map((row, index) => {
+    const match = matchByIndex.get(index);
+    if (!match) return row;
+
+    const candidateLedgerNames = Array.isArray(match.candidateLedgerNames)
+      ? match.candidateLedgerNames
+          .map((name) => findLedgerNameByNormalized(ledgerNames, name))
+          .filter(Boolean)
+      : [];
+    const confidence = Math.max(0, Math.min(1, Number(match.confidence) || 0));
+    const reason = textCell(match.reason) || "AI ledger matching completed.";
+    const rawPayload = row.raw_payload && typeof row.raw_payload === "object" && !Array.isArray(row.raw_payload)
+      ? row.raw_payload
+      : {};
+
+    if (
+      match.matchType === "direct_match" &&
+      match.action === "use_existing_ledger" &&
+      confidence >= 0.9
+    ) {
+      const ledgerName = findLedgerNameByNormalized(ledgerNames, match.ledgerName);
+      if (ledgerName) {
+        return {
+          ...row,
+          suggested_ledger_name: ledgerName,
+          suggestion_confidence: confidence,
+          suggestion_reason: reason,
+          raw_payload: {
+            ...rawPayload,
+            aiLedgerRecommendation: {
+              matchType: "direct_match",
+              action: "use_existing_ledger",
+              ledgerName,
+              candidateLedgerNames: [],
+              confidence,
+              reason,
+              model: OPENROUTER_BANK_LEDGER_MODEL,
+            },
+          },
+        };
+      }
+    }
+
+    return {
+      ...row,
+      suggested_ledger_name: null,
+      suggestion_confidence: 0,
+      suggestion_reason: reason,
+      raw_payload: {
+        ...rawPayload,
+        aiLedgerRecommendation: {
+          matchType: match.matchType === "close_match" && candidateLedgerNames.length >= 2 ? "close_match" : "suspense",
+          action: "use_suspense",
+          ledgerName: null,
+          candidateLedgerNames,
+          confidence: 0,
+          reason,
+          model: OPENROUTER_BANK_LEDGER_MODEL,
+        },
+      },
+    };
+  });
+}
+
 async function extractBankStatementFromImages(fileName, images) {
   if (images.length === 0) {
     return {
@@ -747,7 +952,7 @@ async function extractBankStatementFromImages(fileName, images) {
       content:
         "Extract bank statement account details and transaction rows. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
         "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
-        "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
+        "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
         "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
         "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use numbers for amounts, with debit and credit as positive values in their own columns. Do not invent rows. Preserve narration text exactly enough for audit matching. " +
         "If a page contains only summary information and no ledger rows, extract account/period only and leave transactions empty.",
@@ -782,7 +987,7 @@ async function extractBankStatementFromPdfFile(fileName, mimeType, bytes) {
           text:
             "Extract bank statement account details and transaction rows from the attached PDF. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
             "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
-            "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
+            "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
             "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
             "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use numbers for amounts, with debit and credit as positive values in their own columns. Preserve multi-line narration text in the description. " +
             "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
@@ -803,7 +1008,7 @@ async function extractBankStatementFromText(fileName, pages) {
       content:
         "Extract bank statement account details and transaction rows from PDF text. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
         "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
-        "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
+        "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
         "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
         "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use numbers for amounts, with debit and credit as positive values in their own columns. Preserve multi-line narration text in the description. " +
         "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
@@ -887,7 +1092,7 @@ async function extractBankStatementFromTextBatch(fileName, pages) {
       content:
         "Extract bank statement account details and transaction rows from a batch of PDF text pages. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
         "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
-        "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
+        "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
         "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
         "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. " +
         "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
@@ -910,7 +1115,7 @@ async function extractBankStatementFromImageBatch(fileName, images, rangeLabel) 
       role: "system",
       content:
         "Extract bank statement account details and transaction rows from these rendered statement pages. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
-        "Dates must be ISO YYYY-MM-DD. Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, suggestedLedgerName, suggestionConfidence, suggestionReason, and confidence. " +
+        "Dates must be ISO YYYY-MM-DD. Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
         "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. counterpartyName must be only the party/vendor/customer name. " +
         "Ignore BALANCE FORWARD, OPENING BALANCE, CLOSING BALANCE, summary totals, page footers, and bank notices. Do not invent rows.",
     },
@@ -1358,6 +1563,24 @@ async function runBankStatementJob(job) {
       : candidateCount > 1
         ? "needs_account_selection"
         : "ready_to_review";
+  const processingMeta =
+    importRow.processing_meta && typeof importRow.processing_meta === "object" && !Array.isArray(importRow.processing_meta)
+      ? importRow.processing_meta
+      : {};
+  const selectedContext =
+    processingMeta.selectedContext && typeof processingMeta.selectedContext === "object" && !Array.isArray(processingMeta.selectedContext)
+      ? processingMeta.selectedContext
+      : {};
+  const analysisContext =
+    processingMeta.analysis && typeof processingMeta.analysis === "object" && !Array.isArray(processingMeta.analysis)
+      ? processingMeta.analysis
+      : {};
+  const tallyConnectionId =
+    typeof selectedContext.connectionId === "string"
+      ? selectedContext.connectionId
+      : typeof analysisContext.connectionId === "string"
+        ? analysisContext.connectionId
+        : null;
 
   await updateBankJob(job.id, { progress: 75, stage: "Saving preview rows" });
   await supabase
@@ -1372,17 +1595,27 @@ async function runBankStatementJob(job) {
     ...transaction,
     row_index: index + 1,
   }));
-  if (rows.length > 0) {
+  let previewRows = rows;
+  if (rows.length > 0 && tallyConnectionId) {
+    try {
+      await updateBankJob(job.id, { progress: 78, stage: "Matching Tally ledgers with AI" });
+      previewRows = await applyAiLedgerSuggestionsToPreviewRows({
+        ownerUserId: job.owner_user_id,
+        connectionId: tallyConnectionId,
+        rows,
+      });
+    } catch (error) {
+      console.warn("[worker] AI ledger matching failed for preview rows:", diagnosticError(error));
+    }
+  }
+
+  if (previewRows.length > 0) {
     const { error: previewInsertError } = await supabase
       .from("bank_statement_import_preview_transactions")
-      .insert(rows);
+      .insert(previewRows);
     if (previewInsertError) throw previewInsertError;
   }
 
-  const processingMeta =
-    importRow.processing_meta && typeof importRow.processing_meta === "object" && !Array.isArray(importRow.processing_meta)
-      ? importRow.processing_meta
-      : {};
   const previousAnalysis =
     processingMeta.analysis && typeof processingMeta.analysis === "object" && !Array.isArray(processingMeta.analysis)
       ? processingMeta.analysis
@@ -1411,7 +1644,7 @@ async function runBankStatementJob(job) {
         normalizedAccountNumber,
         maskedAccountNumber: maskAccountNumber(account.accountNumber),
         ifscCode: account.ifscCode,
-        previewTransactionCount: rows.length,
+        previewTransactionCount: previewRows.length,
         completedAt,
         analysis: {
           ...previousAnalysis,
@@ -1439,7 +1672,7 @@ async function runBankStatementJob(job) {
     error: null,
     result: {
       importId: job.import_id,
-      transactionCount: rows.length,
+      transactionCount: previewRows.length,
       status: finalStatus,
     },
     locked_at: null,

@@ -351,6 +351,7 @@ function chunkValues<T>(values: T[], size: number) {
 export function CollectionsDashboardPage() {
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
   const [selectedConnectionId, setSelectedConnectionId] = useState("");
+  const [selectedCompanyId, setSelectedCompanyId] = useState("");
   const [dashboard, setDashboard] = useState<DashboardPayload | null>(null);
   const [activeView, setActiveView] = useState<ActiveView>("needsAction");
   const [loading, setLoading] = useState(true);
@@ -370,8 +371,12 @@ export function CollectionsDashboardPage() {
   const lastLoadedConnectionRef = useRef("");
 
   const selectedCompany = useMemo(
-    () => companies.find((company) => company.connectionId === selectedConnectionId) ?? companies[0] ?? null,
-    [companies, selectedConnectionId]
+    () =>
+      companies.find((company) => company.id === selectedCompanyId) ??
+      companies.find((company) => company.connectionId === selectedConnectionId) ??
+      companies[0] ??
+      null,
+    [companies, selectedCompanyId, selectedConnectionId]
   );
 
   const loadCompanies = useCallback(async () => {
@@ -380,27 +385,36 @@ export function CollectionsDashboardPage() {
     const payload = (await response.json()) as { companies?: CompanyOption[]; selectedCompanyId?: string | null };
     const nextCompanies = uniqueCompanyOptions(payload.companies ?? []);
     setCompanies(nextCompanies);
-    setSelectedConnectionId((current) =>
-      nextCompanies.some((company) => company.connectionId === current)
+    setSelectedCompanyId((current) =>
+      current && nextCompanies.some((company) => company.id === current)
         ? current
-        : nextCompanies[0]?.connectionId || payload.selectedCompanyId || ""
+        : payload.selectedCompanyId || nextCompanies[0]?.id || ""
     );
+    setSelectedConnectionId((current) => {
+      const selectedOption =
+        nextCompanies.find((company) => company.id === selectedCompanyId) ??
+        nextCompanies.find((company) => company.id === payload.selectedCompanyId) ??
+        nextCompanies[0];
+      if (selectedOption) return selectedOption.connectionId;
+      return nextCompanies.some((company) => company.connectionId === current) ? current : "";
+    });
     return nextCompanies;
-  }, []);
+  }, [selectedCompanyId]);
 
   const loadDashboard = useCallback(
-    async (connectionId = selectedConnectionId) => {
+    async (connectionId = selectedConnectionId, companyName = selectedCompany?.companyName ?? "") => {
       if (!connectionId) {
         setDashboard(null);
         return;
       }
       const params = new URLSearchParams({ connectionId });
+      if (companyName) params.set("companyName", companyName);
       const response = await apiFetch(`/api/collections/dashboard?${params.toString()}`, { cache: "no-store" });
       const payload = (await response.json().catch(() => ({}))) as DashboardPayload;
       if (!response.ok) throw new Error(payload.error || `Request failed with status ${response.status}`);
       setDashboard(payload);
     },
-    [selectedConnectionId]
+    [selectedCompany?.companyName, selectedConnectionId]
   );
 
   const loadDebtorLedgers = useCallback(async (connectionId: string) => {
@@ -462,25 +476,31 @@ export function CollectionsDashboardPage() {
   );
 
   const refreshAll = useCallback(
-    async (options?: { quiet?: boolean }) => {
+    async (options?: { quiet?: boolean; refreshTally?: boolean }) => {
       try {
         if (!options?.quiet) setLoading(true);
         setMessage(null);
         const nextCompanies = await loadCompanies();
-        const connectionId = selectedConnectionId || nextCompanies[0]?.connectionId || "";
-        const company = nextCompanies.find((item) => item.connectionId === connectionId) ?? nextCompanies[0] ?? null;
-        if (connectionId) {
+        const company =
+          nextCompanies.find((item) => item.id === selectedCompanyId) ??
+          nextCompanies.find((item) => item.connectionId === selectedConnectionId) ??
+          nextCompanies[0] ??
+          null;
+        const connectionId = company?.connectionId || selectedConnectionId || "";
+        if (company) setSelectedCompanyId(company.id);
+        if (connectionId) setSelectedConnectionId(connectionId);
+        if (connectionId && options?.refreshTally !== false) {
           await refreshTallyOpenBills(connectionId, company?.companyName);
         }
-        await loadDashboard(connectionId);
-        lastLoadedConnectionRef.current = connectionId;
+        await loadDashboard(connectionId, company?.companyName);
+        lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
       } catch (error) {
         setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
       } finally {
         setLoading(false);
       }
     },
-    [loadCompanies, loadDashboard, refreshTallyOpenBills, selectedConnectionId]
+    [loadCompanies, loadDashboard, refreshTallyOpenBills, selectedCompanyId, selectedConnectionId]
   );
 
   async function createDefaultRule() {
@@ -559,7 +579,7 @@ export function CollectionsDashboardPage() {
       await createDebitNoteForProposal(proposal);
       if (selectedConnectionId) {
         await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
-        await loadDashboard(selectedConnectionId);
+        await loadDashboard(selectedConnectionId, selectedCompany?.companyName);
       } else {
         await loadDashboard();
       }
@@ -653,26 +673,26 @@ export function CollectionsDashboardPage() {
   useEffect(() => {
     if (initialLoadStartedRef.current) return;
     initialLoadStartedRef.current = true;
-    void refreshAll();
+    void refreshAll({ refreshTally: false });
   }, [refreshAll]);
 
   useEffect(() => {
     if (!selectedConnectionId) return;
-    if (lastLoadedConnectionRef.current === selectedConnectionId) return;
-    lastLoadedConnectionRef.current = selectedConnectionId;
-    const company = companies.find((item) => item.connectionId === selectedConnectionId) ?? null;
+    const company = selectedCompany;
+    const loadKey = `${selectedConnectionId}::${company?.companyName ?? ""}`;
+    if (lastLoadedConnectionRef.current === loadKey) return;
+    lastLoadedConnectionRef.current = loadKey;
     void (async () => {
       setLoading(true);
       try {
-        await refreshTallyOpenBills(selectedConnectionId, company?.companyName);
-        await loadDashboard(selectedConnectionId);
+        await loadDashboard(selectedConnectionId, company?.companyName);
       } catch (error) {
         setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
       } finally {
         setLoading(false);
       }
     })();
-  }, [companies, loadDashboard, refreshTallyOpenBills, selectedConnectionId]);
+  }, [loadDashboard, selectedCompany, selectedConnectionId]);
 
   const proposals = dashboard?.tabs?.debitNoteQueue ?? [];
   const rules = dashboard?.rules ?? [];
@@ -749,7 +769,7 @@ export function CollectionsDashboardPage() {
       }
       if (selectedConnectionId) {
         await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
-        await loadDashboard(selectedConnectionId);
+        await loadDashboard(selectedConnectionId, selectedCompany?.companyName);
       } else {
         await loadDashboard();
       }
@@ -791,12 +811,16 @@ export function CollectionsDashboardPage() {
             <span className="sr-only">Company</span>
             <select
               className="h-10 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
-              onChange={(event) => setSelectedConnectionId(event.target.value)}
-              value={selectedConnectionId}
+              onChange={(event) => {
+                const company = companies.find((item) => item.id === event.target.value) ?? null;
+                setSelectedCompanyId(event.target.value);
+                setSelectedConnectionId(company?.connectionId || "");
+              }}
+              value={selectedCompany?.id || selectedCompanyId}
             >
               {companies.length === 0 ? <option value="">No Tally company found</option> : null}
               {companies.map((company) => (
-                <option key={company.connectionId} value={company.connectionId}>
+                <option key={company.id} value={company.id}>
                   {formatCompanyOptionLabel(company)}
                 </option>
               ))}
