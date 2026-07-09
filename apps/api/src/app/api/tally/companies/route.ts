@@ -20,10 +20,30 @@ function inferFinancialYear() {
   return `${year}-${String((year + 1) % 100).padStart(2, "0")}`;
 }
 
+function isGenericTallyLabel(value: string | null | undefined) {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+
+  return (
+    !normalized ||
+    normalized === "tally" ||
+    normalized === "tally prime" ||
+    /^tally(?: prime)?\s*[-–]\s*(?:current year|\d{4}[-–]\d{2})$/.test(normalized)
+  );
+}
+
+function pickCompanyName(connection: TallyConnectionWithSync) {
+  const latestSync = connection.latestSync ?? null;
+  const names = [connection.last_company_name, latestSync?.company_name, connection.display_name];
+  return names.find((name) => !isGenericTallyLabel(name)) ?? names.find((name) => String(name ?? "").trim()) ?? "Tally Prime";
+}
+
 function serializeCompany(connection: TallyConnectionWithSync) {
   const status = serializeTallyConnectionStatus(connection);
   const latestSync = connection.latestSync ?? null;
-  const companyName = connection.last_company_name || latestSync?.company_name || connection.display_name;
+  const companyName = pickCompanyName(connection);
   const totals = latestSync?.totals && typeof latestSync.totals === "object" ? latestSync.totals : {};
   const bankAccountCount =
     typeof totals.bank_ledger === "number"
@@ -119,7 +139,7 @@ export async function GET(request: Request) {
 
     const companyEntries = connections.map((connection) => {
       const latestSync = latestSyncByConnection.get(connection.id) ?? null;
-      const hasSpecificName = Boolean(connection.last_company_name || latestSync?.company_name);
+      const hasSpecificName = !isGenericTallyLabel(connection.last_company_name) || !isGenericTallyLabel(latestSync?.company_name);
 
       return {
         company: serializeCompany({
@@ -142,12 +162,19 @@ export async function GET(request: Request) {
     const connectedCompanyEntries = companyEntries.filter(
       (entry) => entry.company.bridgeConnected && entry.company.tallyReachable && entry.company.companyLoaded
     );
-    const visibleCompanyEntries = connectedCompanyEntries.length > 0 ? connectedCompanyEntries : companyEntries;
+    const namedCompanyEntries = companyEntries.filter((entry) => entry.hasSpecificName);
+    const visibleCompanyEntries = namedCompanyEntries.length > 0 ? namedCompanyEntries : companyEntries;
+    const connectedCompanyIds = new Set(connectedCompanyEntries.map((entry) => entry.company.id));
+    visibleCompanyEntries.sort((a, b) => {
+      const connectedDiff = Number(connectedCompanyIds.has(b.company.id)) - Number(connectedCompanyIds.has(a.company.id));
+      if (connectedDiff !== 0) return connectedDiff;
+      return timestampValue(b.updatedAt) - timestampValue(a.updatedAt);
+    });
     const companies = visibleCompanyEntries.map((entry) => entry.company);
 
     return jsonWithCors(request, {
       companies,
-      selectedCompanyId: companies[0]?.id ?? null,
+      selectedCompanyId: connectedCompanyEntries[0]?.company.id ?? companies[0]?.id ?? null,
     });
   } catch (error) {
     console.error("Error in GET /api/tally/companies:", error);

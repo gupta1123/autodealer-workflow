@@ -46,6 +46,7 @@ type PostedLogRow = {
 type ExistingTransactionRow = {
   id: string;
   fingerprint: string | null;
+  statement_import_id: string | null;
   tally_status: string | null;
 };
 
@@ -556,7 +557,7 @@ export async function POST(
     const { data: existingTransactionData, error: existingTransactionReadError } = submittedFingerprints.length
       ? await supabase
           .from("bank_transactions")
-          .select("id, fingerprint, tally_status")
+          .select("id, fingerprint, statement_import_id, tally_status")
           .eq("owner_user_id", user.id)
           .eq("bank_account_id", accountId)
           .in("fingerprint", submittedFingerprints)
@@ -573,6 +574,7 @@ export async function POST(
       (row) =>
         row.id &&
         row.fingerprint &&
+        row.statement_import_id === id &&
         ["pending", "failed", "missing_in_tally", "verification_failed"].includes(row.tally_status || "")
     );
     const submittedRowsByFingerprint = new Map(rows.map((row) => [row.fingerprint, row]));

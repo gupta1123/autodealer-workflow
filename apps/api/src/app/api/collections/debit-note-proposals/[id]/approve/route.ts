@@ -18,6 +18,10 @@ function toTallyCompanyName(value: unknown) {
   return text && !/^tally prime$/i.test(text) ? text : null;
 }
 
+function isLiveConnection(row: { status?: string | null; last_tally_reachable?: boolean | null; last_company_loaded?: boolean | null }) {
+  return row.status === "company_loaded" || (row.last_tally_reachable === true && row.last_company_loaded === true);
+}
+
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
@@ -63,7 +67,7 @@ export async function POST(
 
     const { data: connection, error: connectionError } = await supabase
       .from("tally_connections")
-      .select("id, owner_user_id, last_company_name")
+      .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_company_loaded, last_heartbeat_at, updated_at")
       .eq("id", proposal.connection_id)
       .eq("owner_user_id", user.id)
       .maybeSingle();
@@ -73,9 +77,26 @@ export async function POST(
       return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
     }
 
+    let commandConnection = connection;
+    const proposalCompanyName = toTallyCompanyName(proposal.company_name) || toTallyCompanyName(connection.last_company_name);
+
+    if (proposalCompanyName) {
+      const { data: liveRows, error: liveError } = await supabase
+        .from("tally_connections")
+        .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_company_loaded, last_heartbeat_at, updated_at")
+        .eq("owner_user_id", user.id)
+        .eq("last_company_name", proposalCompanyName)
+        .order("last_heartbeat_at", { ascending: false, nullsFirst: false })
+        .order("updated_at", { ascending: false })
+        .limit(20);
+
+      if (liveError) throw liveError;
+      commandConnection = (liveRows ?? []).find(isLiveConnection) ?? connection;
+    }
+
     const commandPayload = {
       proposalId: proposal.id,
-      companyName: toTallyCompanyName(proposal.company_name) || toTallyCompanyName(connection.last_company_name),
+      companyName: proposalCompanyName,
       partyLedgerName: proposal.party_ledger_name,
       partyGstin: proposal.party_gstin,
       linkedInvoiceNumber: proposal.linked_invoice_number,
@@ -94,7 +115,7 @@ export async function POST(
     const { data: commandData, error: commandError } = await supabase
       .from("tally_bridge_commands")
       .insert({
-        connection_id: proposal.connection_id,
+        connection_id: commandConnection.id,
         owner_user_id: user.id,
         command_type: "create_debit_note",
         status: "queued",
@@ -112,6 +133,7 @@ export async function POST(
       .from("debit_note_proposals")
       .update({
         status: "queued_in_tally",
+        connection_id: commandConnection.id,
         approval_by: user.id,
         approved_at: now,
         tally_command_id: command.id,
@@ -126,7 +148,7 @@ export async function POST(
     if (updateError) throw updateError;
 
     await supabase.from("tally_connection_events").insert({
-      connection_id: proposal.connection_id,
+      connection_id: commandConnection.id,
       owner_user_id: user.id,
       event_type: "command_queued",
       message: "Debit note creation queued for bridge.",
@@ -134,6 +156,7 @@ export async function POST(
         commandType: "create_debit_note",
         proposalId: proposal.id,
         amount: commandPayload.amount,
+        commandConnectionId: commandConnection.id,
       },
     });
 

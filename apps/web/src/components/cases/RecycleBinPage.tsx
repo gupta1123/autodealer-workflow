@@ -10,6 +10,7 @@ import {
   FileText,
   RotateCcw,
   Search,
+  Sparkles,
   Trash,
   Trash2,
 } from "lucide-react";
@@ -240,23 +241,27 @@ export function RecycleBinPage() {
 
   return (
     <AppShell>
-      <div className="mx-auto max-w-[1500px] w-full px-4 sm:px-6 lg:px-8 py-8 animate-in fade-in duration-700 ease-out text-[#0f172a]">
+      <div className="mx-auto max-w-[1500px] w-full px-4 sm:px-6 lg:px-8 py-8 animate-in fade-in duration-700 ease-out text-[#1a1a1a]">
 
         {/* MAIN CONTAINER matching the image's white box UI */}
-        <div className="bg-white border border-[#e2e8f0] rounded-2xl shadow-[0_8px_30px_rgba(0,0,0,0.04)] overflow-hidden flex flex-col">
+        <div className="bg-white border border-[#e5ddd0] rounded-2xl shadow-[0_2px_8px_rgba(0,0,0,0.02)] overflow-hidden flex flex-col">
 
           {/* =========================================
               HEADER SECTION (Matches Image)
               ========================================= */}
-          <div className="p-6 md:p-8 border-b border-[#f1f5f9] flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
+          <div className="p-6 border-b border-[#e5ddd0] flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
 
             <div className="flex items-center gap-5">
-              <div className="w-14 h-14 bg-[#fef2f2] border border-[#fecaca] text-[#e11d48] rounded-2xl flex items-center justify-center shadow-sm">
-                <Trash2 className="w-7 h-7" />
+              <div className="w-12 h-12 bg-amber-50 border border-amber-250 text-amber-800 rounded-xl flex items-center justify-center shadow-sm">
+                <Trash2 className="w-6 h-6" />
               </div>
               <div>
-                <h1 className="text-2xl font-medium text-[#0f172a] tracking-tight">Recycle Bin</h1>
-                <div className="text-sm font-medium text-[#94a3b8] mt-0.5">
+                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200/50 text-[10px] font-bold uppercase tracking-wider text-amber-800">
+                  <Sparkles className="h-3 w-3 text-amber-600 animate-spin duration-3000" />
+                  System Cleanup
+                </div>
+                <h1 className="text-2xl font-black text-[#1a1a1a] tracking-tight mt-1.5">Recycle Bin</h1>
+                <div className="text-xs font-semibold text-slate-400 mt-1">
                   {status === "loading" ? (
                     <Skeleton className="mt-1 h-3.5 w-60 bg-slate-100" />
                   ) : (
@@ -271,14 +276,14 @@ export function RecycleBinPage() {
               SEARCH BAR (Matches Image)
               ========================================= */}
           <div className="p-6 md:px-8 md:py-6">
-            <div className="flex items-center px-4 py-2.5 border border-[#e2e8f0] rounded-xl bg-[#f8fafc] shadow-sm max-w-md">
-              <Search className="w-4 h-4 text-[#94a3b8] mr-3 shrink-0" />
+            <div className="flex items-center px-4 py-2.5 border border-[#e5ddd0] rounded-xl bg-[#faf8f4]/60 shadow-sm max-w-md focus-within:border-amber-500 transition-all">
+              <Search className="w-4 h-4 text-slate-400 mr-3 shrink-0" />
               <input
                 type="text"
                 placeholder="Search deleted items..."
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                className="w-full outline-none text-sm font-medium text-[#0f172a] placeholder:text-[#94a3b8] bg-transparent"
+                className="w-full outline-none text-xs font-semibold text-[#1a1a1a] placeholder:text-slate-400 bg-transparent"
               />
             </div>
           </div>
@@ -327,7 +332,7 @@ export function RecycleBinPage() {
                 <Button
                   variant="link"
                   onClick={() => setQuery("")}
-                  className="mt-2 text-[#4f46e5] font-medium"
+                  className="mt-2 text-amber-600 hover:text-amber-700 font-medium"
                 >
                   Clear search
                 </Button>
@@ -340,28 +345,28 @@ export function RecycleBinPage() {
                   {cases.map((item) => (
                     <div
                       key={item.id}
-                      className="rounded-xl border border-[#e2e8f0] bg-white p-3.5 shadow-sm"
+                      className="rounded-xl border border-[#e5ddd0] bg-white p-3.5 shadow-sm"
                     >
                       <div className="flex items-start gap-2.5">
-                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#e2e8f0] bg-[#f8fafc] text-[#64748b]">
+                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#e5ddd0] bg-[#faf8f4]/60 text-slate-500">
                           <FileText className="h-4 w-4" />
                         </div>
                         <div className="min-w-0 flex-1">
                           <Link
                             href={`/cases/${item.id}`}
-                            className="block truncate text-sm font-medium text-[#0f172a] hover:text-[#4f46e5]" title={item.displayName || "Unnamed Document"}
+                            className="block truncate text-sm font-extrabold text-[#1a1a1a] hover:text-amber-600 transition-colors" title={item.displayName || "Unnamed Document"}
                           >
                             {item.displayName || "Unnamed Document"}
                           </Link>
-                          <div className="mt-0.5 text-[11px] font-medium text-[#94a3b8]">
+                          <div className="mt-0.5 text-[11px] font-semibold text-slate-400">
                             {formatDateTime(item.deletedAt)} • by Admin
                           </div>
                         </div>
                       </div>
 
-                      <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5 text-[11px] font-medium text-[#94a3b8]">
+                      <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5 text-[11px] font-semibold text-slate-450">
                         <span className="truncate max-w-[140px]" title={item.receiverName || "Receiver pending"}>{item.receiverName || "Receiver pending"}</span>
-                        <span className="flex items-center gap-1 shrink-0">
+                        <span className="flex items-center gap-1 shrink-0 text-slate-500 font-bold">
                           <Clock className="h-3 w-3" />
                           {calculateDaysRemaining(item.deletedAt)}d left
                         </span>
@@ -370,20 +375,20 @@ export function RecycleBinPage() {
                       <div className="mt-2.5 flex items-center justify-end gap-2">
                         <Link
                           href={`/cases/${item.id}`}
-                          className="rounded-md border border-[#e2e8f0] p-1.5 text-[#64748b] transition-colors hover:bg-[#f8fafc] hover:text-[#0f172a]"
+                          className="rounded-lg border border-[#e5ddd0] p-1.5 text-slate-400 hover:text-slate-900 transition-colors hover:bg-slate-100"
                           aria-label="View"
                         >
                           <Eye className="h-3.5 w-3.5" />
                         </Link>
                         <button
-                          className="rounded-md border border-[#e0e7ff] p-1.5 text-[#4f46e5] transition-colors hover:bg-[#eef2ff]"
+                          className="rounded-lg border border-emerald-200 p-1.5 text-emerald-600 transition-colors hover:bg-emerald-50"
                           aria-label="Restore"
                           onClick={() => setPendingAction({ type: "restore", item })}
                         >
                           <RotateCcw className="h-3.5 w-3.5" />
                         </button>
                         <button
-                          className="rounded-md border border-[#fecaca] p-1.5 text-[#e11d48] transition-colors hover:bg-[#fef2f2]"
+                          className="rounded-lg border border-rose-200 p-1.5 text-rose-600 transition-colors hover:bg-rose-50"
                           aria-label="Delete Permanently"
                           onClick={() => setPendingAction({ type: "destroy", item })}
                         >
@@ -397,72 +402,72 @@ export function RecycleBinPage() {
                 <div className="hidden md:block">
                   <Table className="w-full text-sm">
                     <TableHeader>
-                      <TableRow className="border-b border-[#f1f5f9] hover:bg-transparent">
-                        <TableHead className="h-10 pl-4 md:pl-6 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider">Document</TableHead>
-                        <TableHead className="h-10 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider">Receiver</TableHead>
-                        <TableHead className="h-10 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider">Expires</TableHead>
-                        <TableHead className="h-10 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider text-right pr-4 md:pr-6">Actions</TableHead>
+                      <TableRow className="border-b border-[#e5ddd0] bg-[#fcfbfa] hover:bg-transparent">
+                        <TableHead className="h-10 pl-4 md:pl-6 font-bold text-slate-400 text-[10px] uppercase tracking-wider">Document</TableHead>
+                        <TableHead className="h-10 font-bold text-slate-400 text-[10px] uppercase tracking-wider">Receiver</TableHead>
+                        <TableHead className="h-10 font-bold text-slate-400 text-[10px] uppercase tracking-wider">Expires</TableHead>
+                        <TableHead className="h-10 font-bold text-slate-400 text-[10px] uppercase tracking-wider text-right pr-4 md:pr-6">Actions</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
                       {cases.map((item) => (
                         <TableRow
                           key={item.id}
-                          className="group border-[#f1f5f9] transition-colors hover:bg-[#f8fafc] h-11"
+                          className="group border-b border-[#e5ddd0] hover:bg-[#fcfbfa]/60 transition-colors h-11"
                         >
-                          <TableCell className="py-2 pl-4 md:pl-6">
+                          <TableCell className="py-2.5 pl-4 md:pl-6">
                             <div className="flex items-center gap-2.5">
-                              <div className="w-7 h-7 rounded-md bg-[#f1f5f9] border border-[#e2e8f0] text-[#64748b] flex items-center justify-center shrink-0">
+                              <div className="w-7 h-7 rounded-lg bg-[#faf8f4]/60 border border-[#e5ddd0] text-slate-500 flex items-center justify-center shrink-0">
                                 <FileText className="w-3.5 h-3.5" />
                               </div>
                               <div className="min-w-0">
                                 <Link
                                   href={`/cases/${item.id}`}
-                                  className="font-medium text-[#0f172a] text-[13px] transition-colors hover:text-[#4f46e5] truncate block max-w-[200px] xl:max-w-[300px]" title={item.displayName || "Unnamed Document"}
+                                  className="font-extrabold text-[#1a1a1a] text-[13px] transition-colors hover:text-amber-600 truncate block max-w-[200px] xl:max-w-[300px]" title={item.displayName || "Unnamed Document"}
                                 >
                                   {item.displayName || "Unnamed Document"}
                                 </Link>
-                                <div className="text-[11px] font-medium text-[#94a3b8] mt-px">
+                                <div className="text-[11px] font-semibold text-slate-400 mt-px">
                                   {formatDateTime(item.deletedAt)}
                                 </div>
                               </div>
                             </div>
                           </TableCell>
 
-                          <TableCell className="py-2">
+                          <TableCell className="py-2.5">
                             <div className="flex items-center gap-1.5">
-                              <div className="w-1.5 h-1.5 rounded-full bg-[#10b981] shrink-0" />
-                              <span className="text-[13px] font-medium text-[#64748b] truncate max-w-[140px]" title={item.receiverName || "Receiver pending"}>
+                              <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
+                              <span className="text-[13px] font-semibold text-slate-500 truncate max-w-[140px]" title={item.receiverName || "Receiver pending"}>
                                 {item.receiverName || "Receiver pending"}
                               </span>
                             </div>
                           </TableCell>
 
-                          <TableCell className="py-2">
-                            <div className="flex items-center gap-1 text-[13px] font-medium text-[#64748b]">
-                              <Clock className="w-3 h-3" />
+                          <TableCell className="py-2.5">
+                            <div className="flex items-center gap-1 text-[13px] font-bold text-slate-500">
+                              <Clock className="w-3 h-3 text-slate-400" />
                               {calculateDaysRemaining(item.deletedAt)}d
                             </div>
                           </TableCell>
 
-                          <TableCell className="pr-4 md:pr-6 py-2 text-right">
-                            <div className="flex items-center justify-end gap-2 text-[#94a3b8]">
+                          <TableCell className="pr-4 md:pr-6 py-2.5 text-right">
+                            <div className="flex items-center justify-end gap-2 text-slate-400">
                               <Link
                                 href={`/cases/${item.id}`}
-                                className="p-1 hover:text-[#0f172a] hover:bg-[#f1f5f9] rounded-md transition-colors"
+                                className="p-1.5 hover:text-slate-900 hover:bg-slate-100 rounded-xl transition-all"
                                 aria-label="View"
                               >
                                 <Eye className="w-3.5 h-3.5" />
                               </Link>
                               <button
-                                className="p-1 hover:text-[#4f46e5] hover:bg-[#eef2ff] rounded-md transition-colors"
+                                className="p-1.5 hover:text-emerald-700 hover:bg-emerald-50 border border-transparent hover:border-emerald-200 rounded-xl transition-all"
                                 aria-label="Restore"
                                 onClick={() => setPendingAction({ type: "restore", item })}
                               >
                                 <RotateCcw className="w-3.5 h-3.5" />
                               </button>
                               <button
-                                className="p-1 hover:text-[#e11d48] hover:bg-[#fef2f2] rounded-md transition-colors"
+                                className="p-1.5 hover:text-rose-700 hover:bg-rose-50 border border-transparent hover:border-rose-200 rounded-xl transition-all"
                                 aria-label="Delete Permanently"
                                 onClick={() => setPendingAction({ type: "destroy", item })}
                               >
@@ -479,7 +484,7 @@ export function RecycleBinPage() {
             )}
 
             {status === "ready" && totalCount > 0 && (
-              <div className="flex flex-col gap-3 border-t border-[#f1f5f9] px-6 pb-2 pt-4 text-sm font-medium text-[#94a3b8] md:flex-row md:items-center md:justify-between md:px-8">
+              <div className="flex flex-col gap-3 border-t border-[#e5ddd0] px-6 pb-2 pt-4 text-xs font-semibold text-slate-400 md:flex-row md:items-center md:justify-between md:px-8">
                 <div>
                   Showing {pageStart}-{pageEnd} of {totalCount}
                 </div>
@@ -488,7 +493,7 @@ export function RecycleBinPage() {
                     type="button"
                     variant="outline"
                     size="sm"
-                    className="h-8 border-[#e2e8f0] bg-white px-2 font-medium text-[#64748b] hover:bg-[#f8fafc]"
+                    className="h-8.5 w-8.5 rounded-xl border border-[#e5ddd0] bg-white px-2 font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
                     disabled={currentPage <= 1}
                     onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}
                     aria-label="Previous page"
@@ -500,7 +505,7 @@ export function RecycleBinPage() {
                     return (
                       <div key={page} className="flex items-center gap-1">
                         {previousPage && page - previousPage > 1 && (
-                          <span className="px-1 text-slate-300">...</span>
+                          <span className="px-1 text-slate-350">...</span>
                         )}
                         <Button
                           type="button"
@@ -508,8 +513,8 @@ export function RecycleBinPage() {
                           size="sm"
                           className={
                             page === currentPage
-                              ? "h-8 min-w-8 bg-[#0f172a] px-2 font-medium text-white hover:bg-[#1e293b]"
-                              : "h-8 min-w-8 border-[#e2e8f0] bg-white px-2 font-medium text-[#64748b] hover:bg-[#f8fafc]"
+                              ? "h-8.5 min-w-8.5 bg-[#2d2d2d] px-2 font-bold text-white hover:bg-[#1a1a1a] rounded-xl shadow-sm transition-all"
+                              : "h-8.5 min-w-8.5 border border-[#e5ddd0] bg-white px-2 font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] rounded-xl shadow-sm transition-all"
                           }
                           onClick={() => setCurrentPage(page)}
                         >
@@ -522,7 +527,7 @@ export function RecycleBinPage() {
                     type="button"
                     variant="outline"
                     size="sm"
-                    className="h-8 border-[#e2e8f0] bg-white px-2 font-medium text-[#64748b] hover:bg-[#f8fafc]"
+                    className="h-8.5 w-8.5 rounded-xl border border-[#e5ddd0] bg-white px-2 font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
                     disabled={currentPage >= totalPages}
                     onClick={() => setCurrentPage((page) => Math.min(totalPages, page + 1))}
                     aria-label="Next page"

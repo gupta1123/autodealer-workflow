@@ -36,6 +36,26 @@ function readRawText(raw: Record<string, unknown> | null | undefined, key: strin
   return toText(raw?.[key], maxLength) || null;
 }
 
+function statusPriority(status: string) {
+  const rank: Record<string, number> = {
+    created_in_tally: 60,
+    queued_in_tally: 50,
+    approved: 40,
+    pending_approval: 30,
+    draft: 20,
+    failed: 10,
+  };
+  return rank[status] ?? 0;
+}
+
+function pickBestExistingProposal(rows: DebitNoteProposalRow[]) {
+  return [...rows].sort((left, right) => {
+    const rankDiff = statusPriority(right.status) - statusPriority(left.status);
+    if (rankDiff !== 0) return rankDiff;
+    return Date.parse(String(right.updated_at ?? right.created_at ?? "")) - Date.parse(String(left.updated_at ?? left.created_at ?? ""));
+  })[0] ?? null;
+}
+
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
@@ -111,7 +131,7 @@ export async function POST(request: Request) {
     const supabase = createSupabaseAdminClient();
     const { data: connection, error: connectionError } = await supabase
       .from("tally_connections")
-      .select("id, owner_user_id, last_company_name")
+      .select("id, owner_user_id, last_company_name, display_name")
       .eq("id", connectionId)
       .eq("owner_user_id", user.id)
       .maybeSingle();
@@ -119,6 +139,46 @@ export async function POST(request: Request) {
     if (connectionError) throw connectionError;
     if (!connection) {
       return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
+    }
+
+    const companyName = toNullableText(body.companyName ?? body.company_name, 240) ?? connection.last_company_name;
+    const linkedInvoiceNumber = toNullableText(body.linkedInvoiceNumber ?? body.linked_invoice_number, 120);
+    const compatibleConnectionIds = new Set([connectionId]);
+
+    if (connection.last_company_name) {
+      const { data: companyConnectionRows, error: companyConnectionError } = await supabase
+        .from("tally_connections")
+        .select("id")
+        .eq("owner_user_id", user.id)
+        .eq("last_company_name", connection.last_company_name)
+        .limit(50);
+
+      if (companyConnectionError) throw companyConnectionError;
+      for (const row of companyConnectionRows ?? []) {
+        if (row.id) compatibleConnectionIds.add(String(row.id));
+      }
+    }
+
+    if (linkedInvoiceNumber) {
+      const { data: existingRows, error: existingError } = await supabase
+        .from("debit_note_proposals")
+        .select("*")
+        .eq("owner_user_id", user.id)
+        .in("connection_id", Array.from(compatibleConnectionIds))
+        .eq("party_ledger_name", partyLedgerName)
+        .eq("linked_invoice_number", linkedInvoiceNumber)
+        .eq("recoverable_amount", recoverableAmount)
+        .eq("status", "created_in_tally")
+        .limit(20);
+
+      if (existingError) throw existingError;
+      const existing = pickBestExistingProposal((existingRows ?? []) as unknown as DebitNoteProposalRow[]);
+      if (existing) {
+        return jsonWithCors(request, {
+          proposal: serializeDebitNoteProposal(existing),
+          duplicate: true,
+        });
+      }
     }
 
     const { data: ledgerData } = await supabase
@@ -147,7 +207,7 @@ export async function POST(request: Request) {
     const payload = {
       owner_user_id: user.id,
       connection_id: connectionId,
-      company_name: toNullableText(body.companyName ?? body.company_name, 240) ?? connection.last_company_name,
+      company_name: companyName,
       financial_year: toNullableText(body.financialYear ?? body.financial_year, 20),
       source_transaction_id: toNullableText(body.sourceTransactionId ?? body.source_transaction_id, 80),
       party_ledger_name: partyLedgerName,
@@ -156,7 +216,7 @@ export async function POST(request: Request) {
       party_phone: partyPhone,
       party_contact_person: partyContactPerson,
       party_address: partyAddress,
-      linked_invoice_number: toNullableText(body.linkedInvoiceNumber ?? body.linked_invoice_number, 120),
+      linked_invoice_number: linkedInvoiceNumber,
       linked_invoice_date: toDateText(body.linkedInvoiceDate ?? body.linked_invoice_date),
       original_invoice_amount: body.originalInvoiceAmount ?? body.original_invoice_amount ?? null,
       cash_discount_rule_id: toNullableText(body.cashDiscountRuleId ?? body.cash_discount_rule_id, 80),

@@ -1365,18 +1365,19 @@ export function WorkspacePage() {
   // =========================================================================
   if (pipelineStatus === "idle" && !caseDraftCreated) {
     return renderWithSidebar(
-      <div className="flex min-h-screen flex-col bg-[#f7f7f5] px-4 pb-20 text-[#1a1a1a] sm:px-6 md:pb-8">
+      <div className="flex min-h-screen flex-col bg-[#f7f7f5] px-4 pb-20 text-[#1a1a1a] sm:px-6 md:pb-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
         {/* Header Section */}
-        <div className="mx-auto w-full max-w-2xl pt-5 mb-5 border-b border-[#e5ddd0] pb-4">
-          <div className="flex items-center gap-3 sm:gap-4">
-            <div className="hidden sm:flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-[#f0ece6] text-[#1a1a1a] border border-[#e5ddd0] shadow-sm">
-              <UploadCloud className="h-6 w-6" />
-            </div>
-            <div className="flex flex-col min-w-0">
-              <h1 className="text-lg sm:text-xl font-bold text-[#1a1a1a]">Add case documents</h1>
-              <p className="text-xs sm:text-sm font-medium text-[#8a7f72] mt-0.5 leading-snug">Upload or scan the documents for one case.</p>
-            </div>
+        <div className="mx-auto w-full max-w-2xl pt-5 mb-8 border-b border-[#e5ddd0] pb-6">
+          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200/50 text-[10px] font-bold uppercase tracking-wider text-amber-800">
+            <Sparkles className="h-3 w-3 text-amber-600 animate-spin duration-3000" />
+            Dealer Document Intake
           </div>
+          <h1 className="text-3xl font-black tracking-tight text-[#1a1a1a] mt-2 flex items-center gap-2">
+            Add Case Documents
+          </h1>
+          <p className="text-xs font-semibold text-slate-500 mt-1">
+            Upload POs, tax invoices, waybills, and delivery receipts to compile a validation case.
+          </p>
         </div>
 
         {/* Centered Upload Card */}
@@ -1385,8 +1386,8 @@ export function WorkspacePage() {
           <div
             className={`w-full rounded-[2rem] border-2 border-dashed px-5 py-7 text-center shadow-sm transition-all sm:px-8 sm:py-8 ${
               isUploadDragActive
-                ? "border-[#22c55e] bg-[#f0fdf4] shadow-lg shadow-emerald-100 ring-4 ring-emerald-100"
-                : "border-[#e5ddd0] bg-white hover:border-[#d4c9b8] hover:shadow-md"
+                ? "border-amber-500 bg-amber-50/40 shadow-lg shadow-amber-100/50 ring-4 ring-amber-100"
+                : "border-[#e5ddd0] bg-white hover:border-[#cbd5e1] hover:shadow-md"
             }`}
             onDragEnter={handleUploadDragEnter}
             onDragOver={handleUploadDragOver}
@@ -1396,8 +1397,8 @@ export function WorkspacePage() {
             <div
               className={`mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-[1.25rem] border shadow-sm ${
                 isUploadDragActive
-                  ? "border-[#bbf7d0] bg-white text-[#15803d]"
-                  : "border-[#e5ddd0] bg-[#f0ece6] text-[#1a1a1a]"
+                  ? "border-amber-200 bg-white text-amber-700"
+                  : "border-[#e5ddd0] bg-[#f7f7f5] text-[#2d2d2d]"
               }`}
             >
               <UploadCloud className="h-7 w-7" />
@@ -1407,13 +1408,13 @@ export function WorkspacePage() {
               {isUploadDragActive ? "Drop files to add them" : "Upload case packet"}
             </h2>
             {isUploadDragActive ? (
-              <p className="mt-2 text-base font-semibold text-[#15803d]">
+              <p className="mt-2 text-base font-semibold text-amber-700">
                 Release to upload PDFs and images for this case.
               </p>
             ) : (
               <p className="mt-2 text-base font-medium text-[#5a5046]">
                 Drag and drop PDFs/images here, or{" "}
-                <label className="cursor-pointer font-bold text-[#15803d] hover:text-[#166534] hover:underline">
+                <label className="cursor-pointer font-bold text-amber-700 hover:text-amber-900 hover:underline">
                   click to browse
                   <input type="file" multiple accept={DOCUMENT_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
                 </label>
@@ -1438,7 +1439,7 @@ export function WorkspacePage() {
                   key={pill.label}
                   className={`rounded-full border px-3 py-1 text-xs font-bold uppercase tracking-wider ${
                     pill.accent
-                      ? "border-[#c9ead2] bg-[#eaf7ee] text-[#15803d]"
+                      ? "border-amber-200 bg-amber-50 text-amber-700"
                       : "border-[#e5ddd0] bg-[#faf8f4] text-[#5a5046]"
                   }`}
                 >
@@ -1447,11 +1448,9 @@ export function WorkspacePage() {
               ))}
             </div>
 
-
-
             {/* Action Buttons */}
             <div className="mx-auto mt-6 flex flex-wrap justify-center gap-3">
-              <Button className="rounded-xl bg-[#1a1a1a] px-5 py-5 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] transition-transform hover:scale-[1.02]" onClick={() => fileInputRef.current?.click()}>
+              <Button className="rounded-xl bg-[#2d2d2d] px-5 py-5 text-base font-bold text-white shadow-lg shadow-[#2d2d2d]/15 hover:bg-[#1a1a1a] transition-transform hover:scale-[1.02]" onClick={() => fileInputRef.current?.click()}>
                 <UploadCloud className="mr-2 h-5 w-5" /> Upload PDF/Image
                 <input ref={fileInputRef} type="file" multiple accept={DOCUMENT_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
               </Button>
@@ -1463,7 +1462,6 @@ export function WorkspacePage() {
                 <Camera className="mr-2 h-5 w-5 text-[#8a7f72]" /> Scan document
               </Button>
             </div>
-
 
           </div>
 
@@ -1488,7 +1486,7 @@ export function WorkspacePage() {
                 <Button
                   size="lg"
                   disabled={draftCaseStatus === "saving"}
-                  className="w-full rounded-2xl bg-[#1a1a1a] px-8 py-6 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] disabled:opacity-60 transition-transform hover:scale-[1.02]"
+                  className="w-full rounded-2xl bg-[#2d2d2d] px-8 py-6 text-base font-bold text-white shadow-lg shadow-[#2d2d2d]/15 hover:bg-[#1a1a1a] disabled:opacity-60 transition-transform hover:scale-[1.02]"
                   onClick={handleCreateCaseDraft}
                 >
                   {draftCaseStatus === "saving" ? (
@@ -1520,8 +1518,8 @@ export function WorkspacePage() {
       <>
         <section className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#f7f7f5]">
           <div className="absolute inset-0 -z-10">
-            <div className="absolute left-[12%] top-[14%] h-72 w-72 rounded-full bg-[#e5ddd0]/40 blur-3xl" />
-            <div className="absolute right-[12%] bottom-[14%] h-80 w-80 rounded-full bg-[#d4c9b8]/30 blur-3xl" />
+            <div className="absolute left-[12%] top-[14%] h-72 w-72 rounded-full bg-amber-50/40 blur-3xl" />
+            <div className="absolute right-[12%] bottom-[14%] h-80 w-80 rounded-full bg-amber-100/10 blur-3xl" />
           </div>
           <motion.div
             initial={{ opacity: 0, y: 24 }}
@@ -1529,14 +1527,14 @@ export function WorkspacePage() {
             transition={{ duration: 0.5, ease: "easeOut" }}
             className="relative z-10 mx-auto flex w-full max-w-4xl flex-col items-center gap-8 px-6 py-16 text-center"
           >
-            <div className="grid h-16 w-16 place-items-center rounded-[1.25rem] bg-[#eaf7ee] text-[#15803d] shadow-sm border border-[#c9ead2]">
+            <div className="grid h-16 w-16 place-items-center rounded-[1.25rem] bg-amber-50 text-amber-700 shadow-sm border border-amber-200/50">
               <CheckCircle2 className="h-8 w-8" />
             </div>
 
             <div className="space-y-4 max-w-2xl">
-              <div className="text-xs font-bold uppercase tracking-[0.3em] text-[#8a7f72]">Case created</div>
-              <h1 className="text-4xl font-extrabold tracking-tight text-[#1a1a1a] sm:text-5xl">
-                Ready to analyze
+              <div className="text-xs font-bold uppercase tracking-[0.3em] text-slate-400">Case created</div>
+              <h1 className="text-4xl font-black tracking-tight text-[#1a1a1a] sm:text-5xl">
+                Ready to Analyze
               </h1>
               <p className="mx-auto text-base font-medium leading-relaxed text-[#5a5046]">
                 This case has {queuedUploadLabel} ready. Add any missing documents, then analyze to extract fields and check mismatches.
@@ -1548,7 +1546,7 @@ export function WorkspacePage() {
                 </div>
               )}
               {draftCaseStatus === "saving" && (
-                <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-[#c9ead2] bg-[#eaf7ee] px-4 py-2 text-sm font-bold text-[#15803d] shadow-sm">
+                <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-4 py-2 text-sm font-bold text-amber-800 shadow-sm">
                   <Loader2 className="h-4 w-4 animate-spin" />
                   Adding documents to case...
                 </div>
@@ -1598,7 +1596,7 @@ export function WorkspacePage() {
               <Button
                 type="button"
                 disabled={!hasUploads || draftCaseStatus === "saving"}
-                className="flex-1 rounded-2xl bg-[#1a1a1a] px-8 py-6 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] transition-transform hover:scale-[1.02]"
+                className="flex-1 rounded-2xl bg-[#2d2d2d] px-8 py-6 text-base font-bold text-white shadow-lg shadow-[#2d2d2d]/15 hover:bg-[#1a1a1a] transition-transform hover:scale-[1.02]"
                 onClick={handleAnalyzeRequest}
               >
                 <Play className="mr-2 h-5 w-5 fill-white" />
@@ -1609,7 +1607,7 @@ export function WorkspacePage() {
                 type="button"
                 disabled={!hasUploads || draftCaseStatus === "saving"}
                 variant="outline"
-                className="rounded-2xl border-emerald-200 bg-emerald-50 px-6 py-6 text-base font-bold text-emerald-800 shadow-sm transition-transform hover:scale-[1.02] hover:bg-emerald-100 hover:text-emerald-900"
+                className="rounded-2xl border-amber-200 bg-amber-50 px-6 py-6 text-base font-bold text-amber-800 shadow-sm transition-transform hover:scale-[1.02] hover:bg-amber-100 hover:text-amber-900"
                 onClick={handleSmartSplitAnalyzeRequest}
               >
                 <Sparkles className="mr-2 h-5 w-5" />

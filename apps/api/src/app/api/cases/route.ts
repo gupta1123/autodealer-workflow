@@ -45,7 +45,7 @@ import type { CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
 
 const STORAGE_BUCKET = "packet-files";
 const DEFAULT_CASE_LIST_LIMIT = 25;
-const MAX_CASE_LIST_LIMIT = 100;
+const MAX_CASE_LIST_LIMIT = 500;
 const LIST_COLUMNS =
   "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at";
 const LIST_COLUMNS_WITHOUT_RECYCLE_BIN =

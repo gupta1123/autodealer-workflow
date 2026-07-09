@@ -378,6 +378,72 @@ export async function POST(
             console.error("Debit note PDF generation failed:", pdfError);
           }
         }
+      } else if (success && commandPayload.sourceProposal && typeof commandPayload.sourceProposal === "object") {
+        const sourceProposal = commandPayload.sourceProposal as Record<string, unknown>;
+        const { data: insertedProposal, error: insertProposalError } = await supabase
+          .from("debit_note_proposals")
+          .insert({
+            owner_user_id: connection.owner_user_id,
+            connection_id: connection.id,
+            company_name: toNullableText(commandPayload.companyName, 240) ?? connection.last_company_name,
+            financial_year: toNullableText(sourceProposal.financialYear, 20),
+            source_transaction_id: null,
+            party_ledger_name: toNullableText(commandPayload.partyLedgerName, 500) ?? "Unknown party",
+            party_gstin: toNullableText(commandPayload.partyGstin, 32),
+            party_email: toNullableText(sourceProposal.partyEmail, 320),
+            party_phone: toNullableText(sourceProposal.partyPhone, 80),
+            party_contact_person: toNullableText(sourceProposal.partyContactPerson, 240),
+            party_address: toNullableText(sourceProposal.partyAddress, 1000),
+            linked_invoice_number: toNullableText(commandPayload.linkedInvoiceNumber, 120),
+            linked_invoice_date: toNullableText(commandPayload.linkedInvoiceDate, 20),
+            original_invoice_amount: Number(sourceProposal.originalInvoiceAmount ?? 0) || null,
+            cash_discount_rule_id: toNullableText(sourceProposal.cashDiscountRuleId, 80),
+            cash_discount_rule_name: toNullableText(sourceProposal.cashDiscountRuleName, 160),
+            discount_deadline: toNullableText(sourceProposal.discountDeadline, 20),
+            receipt_date: toNullableText(sourceProposal.receiptDate, 20),
+            amount_received: Number(sourceProposal.amountReceived ?? 0) || null,
+            recoverable_amount: amount ?? 0,
+            reason_code: toNullableText(commandPayload.reasonCode, 80) ?? "cash_discount_expired",
+            narration: toNullableText(commandPayload.narration, 1000),
+            gst_mode: toNullableText(commandPayload.gstMode, 80) ?? "finance_review",
+            debit_note_date: voucherDate ?? now.slice(0, 10),
+            status: "created_in_tally",
+            approval_by: connection.owner_user_id,
+            approved_at: now,
+            tally_command_id: commandId,
+            tally_voucher_guid: voucherGuid,
+            tally_voucher_id: voucherId,
+            tally_voucher_number: voucherNumber,
+            tally_voucher_date: voucherDate,
+            tally_open_reference_name: openReferenceName,
+            remaining_recoverable_amount: amount,
+            created_in_tally_at: now,
+            last_synced_from_tally_at: now,
+            communication_status: "not_sent",
+            customer_snapshot: sourceProposal.customerSnapshot ?? {},
+            last_error: null,
+          })
+          .select("*")
+          .single();
+
+        if (insertProposalError) throw insertProposalError;
+
+        try {
+          const pdfReference = await uploadDebitNotePdf(
+            supabase as unknown as Parameters<typeof uploadDebitNotePdf>[0],
+            insertedProposal as unknown as DebitNoteProposalRow
+          );
+          await supabase
+            .from("debit_note_proposals")
+            .update({
+              tally_pdf_reference: pdfReference,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", (insertedProposal as { id: string }).id)
+            .eq("owner_user_id", connection.owner_user_id);
+        } catch (pdfError) {
+          console.error("Debit note PDF generation failed:", pdfError);
+        }
       }
     }
 

@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const BRIDGE_VERSION = "0.1.8";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
@@ -10,6 +11,7 @@ const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
 const CONFIG_DIR = path.join(os.homedir(), ".autodealer-tally-bridge");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+const CURRENT_FILE = fileURLToPath(import.meta.url);
 
 function parseArgs(argv) {
   const args = {};
@@ -77,6 +79,23 @@ function writeConfig(config) {
   fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 }
 
+function deleteConfig() {
+  if (fs.existsSync(CONFIG_PATH)) {
+    fs.rmSync(CONFIG_PATH, { force: true });
+  }
+}
+
+function rememberDetectedCompanyName(config, companyName) {
+  const normalized = typeof companyName === "string" && companyName.trim() ? companyName.trim() : null;
+  if (!normalized || config.companyName === normalized) {
+    return config;
+  }
+
+  config.companyName = normalized;
+  writeConfig(config);
+  return config;
+}
+
 function createMachineId() {
   return `${os.hostname()}-${os.platform()}-${os.arch()}`;
 }
@@ -132,6 +151,11 @@ function cleanXmlText(value) {
 function getTagText(block, tagName) {
   const match = block.match(new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "i"));
   return match ? cleanXmlText(match[1]) : null;
+}
+
+function getTagTexts(block, tagName) {
+  const matches = [...block.matchAll(new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "gi"))];
+  return matches.map((match) => cleanXmlText(match[1])).filter(Boolean);
 }
 
 function getAttribute(block, attributeName) {
@@ -314,6 +338,104 @@ function buildCreateLedgerXml(payload, fallbackCompanyName) {
   ].join("");
 }
 
+function buildDebitNoteXml(payload, fallbackCompanyName) {
+  const companyName = payload?.companyName || fallbackCompanyName;
+  const voucherDate = toIsoLikeDate(payload?.voucherDate);
+  const partyLedgerName = String(payload?.partyLedgerName || "").trim();
+  const recoveryLedgerName = String(payload?.recoveryLedgerName || "Cash Discount Reversal").trim();
+  const amount = toMoney(payload?.amount);
+  const referenceNumber = String(payload?.referenceNumber || "").trim();
+  const linkedInvoiceNumber = String(payload?.linkedInvoiceNumber || "").trim();
+  const debitNoteReferenceName = referenceNumber || `DN-CD-${linkedInvoiceNumber || Date.now()}`;
+  const narration = String(
+    payload?.narration ||
+      `Cash discount reversal${linkedInvoiceNumber ? ` against Sales Invoice ${linkedInvoiceNumber}` : ""}.`
+  ).trim();
+
+  if (!partyLedgerName) {
+    throw new Error("Debit note command requires partyLedgerName.");
+  }
+  if (!recoveryLedgerName) {
+    throw new Error("Debit note command requires recoveryLedgerName.");
+  }
+
+  const messages = [];
+  if (linkedInvoiceNumber) {
+    messages.push(
+      buildVoucherMessageXml({
+        voucherDate,
+        voucherType: "Journal",
+        referenceNumber: `ADJ-${debitNoteReferenceName}`.slice(0, 120),
+        narration: `Move recoverable short payment from ${linkedInvoiceNumber} to debit note ${debitNoteReferenceName}.`,
+        partyLedgerName,
+        entries: [
+          buildLedgerEntryXml({
+            ledgerName: partyLedgerName,
+            amount,
+            isDebit: false,
+            isPartyLedger: true,
+            billAllocations: buildBillAllocationsXml({
+              allocations: [
+                {
+                  referenceType: "Agst Ref",
+                  referenceName: linkedInvoiceNumber,
+                  amount,
+                },
+              ],
+              isDebit: false,
+            }),
+          }),
+          buildLedgerEntryXml({
+            ledgerName: recoveryLedgerName,
+            amount,
+            isDebit: true,
+          }),
+        ],
+      })
+    );
+  }
+
+  const debitNoteEntries = [
+    buildLedgerEntryXml({
+      ledgerName: partyLedgerName,
+      amount,
+      isDebit: true,
+      isPartyLedger: true,
+      billAllocations: buildBillAllocationsXml({
+        allocations: [
+          {
+            referenceType: "New Ref",
+            referenceName: debitNoteReferenceName,
+            amount,
+          },
+        ],
+        isDebit: true,
+      }),
+    }),
+    buildLedgerEntryXml({
+      ledgerName: recoveryLedgerName,
+      amount,
+      isDebit: false,
+    }),
+  ];
+  messages.push(
+    buildVoucherMessageXml({
+      voucherDate,
+      voucherType: "Debit Note",
+      referenceNumber,
+      narration,
+      entries: debitNoteEntries,
+      partyLedgerName,
+    })
+  );
+
+  return wrapVoucherMessagesXml({
+    companyName,
+    voucherDate,
+    messages,
+  });
+}
+
 function toIsoLikeDate(value) {
   const raw = String(value || "").trim();
   const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
@@ -384,7 +506,10 @@ function buildBankAllocationXml({ voucherDate, referenceNumber, amount, isDebit 
 }
 
 function normalizeBillAllocationType(value) {
-  return String(value || "").trim().toLowerCase() === "advance" ? "Advance" : "Agst Ref";
+  const normalized = String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+  if (normalized === "advance") return "Advance";
+  if (normalized === "new ref" || normalized === "newref") return "New Ref";
+  return "Agst Ref";
 }
 
 function buildBillAllocationsXml({ allocations, isDebit }) {
@@ -640,14 +765,14 @@ function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) {
           buildLedgerEntryXml({
             ledgerName: counterpartyLedgerName,
             amount,
-            isDebit: true,
+            isDebit: false,
             isPartyLedger: counterpartyIsPartyLedger,
-            billAllocations: buildBillAllocationsXml({ allocations: billAllocations, isDebit: true }),
+            billAllocations: buildBillAllocationsXml({ allocations: billAllocations, isDebit: false }),
           }),
           buildLedgerEntryXml({
             ledgerName: bankLedgerName,
             amount,
-            isDebit: false,
+            isDebit: true,
             bankAllocation,
           }),
         ]
@@ -667,6 +792,7 @@ function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) {
               amount,
               isDebit: true,
               isPartyLedger: counterpartyIsPartyLedger,
+              billAllocations: buildBillAllocationsXml({ allocations: billAllocations, isDebit: true }),
             }),
             buildLedgerEntryXml({
               ledgerName: bankLedgerName,
@@ -796,10 +922,31 @@ function parseExportResult(text, httpStatus) {
 function extractCompanyName(xml) {
   const currentCompany = xml.match(/<CURRENTCOMPANY[^>]*>([^<]+)<\/CURRENTCOMPANY>/i)?.[1];
   if (currentCompany) {
-    return currentCompany.trim();
+    return cleanXmlText(currentCompany);
+  }
+
+  for (const companyBlock of extractBlocks(xml, "COMPANY")) {
+    const name = getTagText(companyBlock, "NAME") || getAttribute(companyBlock, "NAME");
+    if (name) {
+      return name;
+    }
   }
 
   return null;
+}
+
+async function fetchActiveCompanyName(tallyUrl, companyName) {
+  try {
+    const xml = await exportTallyCollection(tallyUrl, {
+      collectionName: "Autodealer Active Company Probe",
+      tallyType: "Company",
+      fetchFields: "Name,Guid,StartingFrom,BooksFrom,FinancialYearFrom,CurrentPeriod,AlterID,MasterID",
+      companyName,
+    });
+    return extractCompanyName(xml);
+  } catch {
+    return null;
+  }
 }
 
 function parseTallyImportResult(text, httpStatus) {
@@ -843,6 +990,56 @@ function requireCreatedVoucher(outcome) {
 }
 
 async function postBankVoucher(tallyUrl, payload, companyName) {
+  const shouldCheckExisting =
+    payload?.preflightVerifyExisting !== false &&
+    /receipt/i.test(String(payload?.voucherType || ""));
+
+  if (shouldCheckExisting) {
+    const existingCheck = await verifyBankTransactionInTally(
+      { tallyUrl, companyName },
+      {
+        ...payload,
+        expectedDirection: "incoming",
+      }
+    );
+    const existingResult = existingCheck.result || {};
+
+    if (existingResult.verificationStatus === "found") {
+      return {
+        outcome: {
+          success: true,
+          result: {
+            alreadyInTally: true,
+            created: 0,
+            altered: 0,
+            voucherId: existingResult.voucherId,
+            voucherNumber: existingResult.voucherNumber,
+            voucherType: existingResult.voucherType,
+            voucherDate: existingResult.voucherDate,
+            duplicateCheck: existingResult,
+          },
+        },
+        xml: null,
+        retriedWithLegacyHeader: false,
+      };
+    }
+
+    if (existingResult.verificationStatus === "ambiguous") {
+      return {
+        outcome: {
+          success: false,
+          error: "Possible existing receipt found in Tally. Review before posting to avoid a duplicate.",
+          result: {
+            possibleDuplicateInTally: true,
+            duplicateCheck: existingResult,
+          },
+        },
+        xml: null,
+        retriedWithLegacyHeader: false,
+      };
+    }
+  }
+
   const primaryXml = buildBankVoucherXml(payload, companyName);
   const primaryOutcome = explainBankVoucherTallyError(
     requireCreatedVoucher(await invokeTallyXml(tallyUrl, primaryXml)),
@@ -854,6 +1051,13 @@ async function postBankVoucher(tallyUrl, payload, companyName) {
 
 async function postCustomerAdvanceAdjustment(tallyUrl, payload, companyName) {
   const xml = buildCustomerAdvanceAdjustmentXml(payload, companyName);
+  const outcome = requireCreatedVoucher(await invokeTallyXml(tallyUrl, xml));
+
+  return { outcome, xml };
+}
+
+async function postDebitNote(tallyUrl, payload, companyName) {
+  const xml = buildDebitNoteXml(payload, companyName);
   const outcome = requireCreatedVoucher(await invokeTallyXml(tallyUrl, xml));
 
   return { outcome, xml };
@@ -943,6 +1147,30 @@ function toMaster(block, tagName) {
     getTagText(block, "BANKACCOUNTNAME") ||
     getTagText(block, "BANKACCOUNTHOLDERNAME") ||
     getTagText(block, "ACCOUNTHOLDERNAME");
+  const email =
+    getTagText(block, "EMAIL") ||
+    getTagText(block, "EMAILID") ||
+    getTagText(block, "LEDGEREMAIL") ||
+    getTagText(block, "LEDGEREMAILID");
+  const phone =
+    getTagText(block, "LEDGERMOBILE") ||
+    getTagText(block, "MOBILE") ||
+    getTagText(block, "MOBILENO") ||
+    getTagText(block, "PHONENUMBER") ||
+    getTagText(block, "PHONE") ||
+    getTagText(block, "LEDGERPHONE");
+  const contactPerson =
+    getTagText(block, "CONTACTPERSON") ||
+    getTagText(block, "CONTACT") ||
+    getTagText(block, "ATTENTIONTO");
+  const address = [
+    ...getTagTexts(block, "ADDRESS"),
+    getTagText(block, "ADDRESS1"),
+    getTagText(block, "ADDRESS2"),
+    getTagText(block, "ADDRESS3"),
+    getTagText(block, "ADDRESS4"),
+    getTagText(block, "PINCODE"),
+  ].filter(Boolean).join(", ");
   const taxRate =
     getTagText(block, "RATEOFTAXCALCULATION") ||
     getTagText(block, "GSTTAXRATE") ||
@@ -958,6 +1186,10 @@ function toMaster(block, tagName) {
     ifscCode,
     branchName,
     accountHolderName,
+    email,
+    phone,
+    contactPerson,
+    address,
     hsnCode: getTagText(block, "GSTHSNCODE") || getTagText(block, "HSNCODE"),
     unitName: getTagText(block, "BASEUNITS") || getTagText(block, "ORIGINALBASEUNITS"),
     taxRate,
@@ -966,8 +1198,11 @@ function toMaster(block, tagName) {
       reservedName: getAttribute(block, "RESERVEDNAME"),
       taxType: getTagText(block, "TAXTYPE"),
       gstDutyHead: getTagText(block, "GSTDUTYHEAD"),
-      isBillWiseOn: getTagText(block, "ISBILLWISEON"),
-      maintainBalancesBillByBill: getTagText(block, "MAINTAINBALANCESBILLBYBILL"),
+      billWiseEnabled: /^yes$/i.test(getTagText(block, "ISBILLWISEON")),
+      email,
+      phone,
+      contactPerson,
+      address,
     },
   };
 }
@@ -995,9 +1230,14 @@ function parseMasterCollection(xml, tagName) {
 }
 
 function toVoucher(block) {
-  const ledgerNames = extractBlocks(block, "ALLLEDGERENTRIES.LIST")
-    .map((entry) => getTagText(entry, "LEDGERNAME"))
-    .filter(Boolean);
+  const ledgerEntries = extractBlocks(block, "ALLLEDGERENTRIES.LIST")
+    .map((entry) => ({
+      ledgerName: getTagText(entry, "LEDGERNAME"),
+      amount: parseTallyAmount(getTagText(entry, "AMOUNT")),
+      isDebit: /^yes$/i.test(getTagText(entry, "ISDEEMEDPOSITIVE") || ""),
+    }))
+    .filter((entry) => entry.ledgerName);
+  const ledgerNames = ledgerEntries.map((entry) => entry.ledgerName).filter(Boolean);
 
   return {
     date: getTagText(block, "DATE"),
@@ -1008,6 +1248,7 @@ function toVoucher(block) {
     narration: getTagText(block, "NARRATION"),
     partyLedgerName: getTagText(block, "PARTYLEDGERNAME"),
     ledgerNames,
+    ledgerEntries,
     masterId: getTagText(block, "MASTERID"),
     alterId: getTagText(block, "ALTERID"),
     isCancelled: getTagText(block, "ISCANCELLED"),
@@ -1017,6 +1258,187 @@ function toVoucher(block) {
 
 function parseVoucherCollection(xml) {
   return extractBlocks(xml, "VOUCHER").map(toVoucher);
+}
+
+function normalizeDateForCompare(value) {
+  const raw = String(value ?? "").trim();
+  if (/^\d{8}$/.test(raw)) return `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.slice(0, 10);
+  return parseTallyDate(raw);
+}
+
+function amountMatches(left, right) {
+  return Math.abs(Math.abs(Number(left ?? 0)) - Math.abs(Number(right ?? 0))) < 0.01;
+}
+
+function voucherHasLedger(voucher, ledgerName) {
+  const key = normalizeLooseName(ledgerName);
+  if (!key) return false;
+  return [
+    voucher.partyLedgerName,
+    ...voucher.ledgerNames,
+  ].some((name) => normalizeLooseName(name) === key);
+}
+
+function voucherHasLedgerAmount(voucher, ledgerName, amount) {
+  const key = normalizeLooseName(ledgerName);
+  if (!key) return false;
+  return voucher.ledgerEntries.some(
+    (entry) => normalizeLooseName(entry.ledgerName) === key && amountMatches(entry.amount, amount)
+  );
+}
+
+function voucherHasAnyAmount(voucher, amount) {
+  return voucher.ledgerEntries.some((entry) => amountMatches(entry.amount, amount));
+}
+
+function normalizedNeedle(value) {
+  return normalizeLooseName(value);
+}
+
+function voucherSearchText(voucher) {
+  return [
+    voucher.voucherNumber,
+    voucher.reference,
+    voucher.narration,
+    voucher.partyLedgerName,
+    ...voucher.ledgerNames,
+    voucher.rawPreview,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function scoreBankTransactionVoucher(voucher, payload) {
+  const voucherDate = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
+  const expectedDate = normalizeDateForCompare(payload.voucherDate);
+  const amount = Number(payload.amount ?? 0);
+  const bankLedgerName = String(payload.bankLedgerName || "").trim();
+  const counterpartyLedgerName = String(payload.counterpartyLedgerName || "").trim();
+  const referenceNumber = String(payload.referenceNumber || "").trim();
+  const text = voucherSearchText(voucher);
+  const normalizedText = normalizedNeedle(text);
+  const referenceHit =
+    referenceNumber &&
+    normalizedNeedle(referenceNumber).length >= 5 &&
+    normalizedText.includes(normalizedNeedle(referenceNumber));
+  const bankLedgerHit = voucherHasLedger(voucher, bankLedgerName);
+  const bankAmountHit = voucherHasLedgerAmount(voucher, bankLedgerName, amount);
+  const anyAmountHit = voucherHasAnyAmount(voucher, amount);
+  const partyHit = counterpartyLedgerName
+    ? voucherHasLedger(voucher, counterpartyLedgerName) ||
+      normalizedText.includes(normalizedNeedle(counterpartyLedgerName))
+    : false;
+  const dateHit = Boolean(expectedDate && voucherDate === expectedDate);
+  const expectedDirection = String(payload.expectedDirection || "").toLowerCase();
+  const likelyPaymentType =
+    expectedDirection === "incoming"
+      ? /receipt|journal|contra/i.test(String(voucher.voucherType || ""))
+      : /payment|journal|contra/i.test(String(voucher.voucherType || ""));
+
+  let score = 0;
+  if (dateHit) score += 45;
+  if (bankAmountHit) score += 35;
+  else if (bankLedgerHit && anyAmountHit) score += 25;
+  else if (anyAmountHit) score += 15;
+  if (referenceHit) score += 30;
+  if (partyHit) score += 20;
+  if (likelyPaymentType) score += 5;
+
+  const reasons = [];
+  if (dateHit) reasons.push("same date");
+  if (bankAmountHit) reasons.push("same bank ledger and amount");
+  else if (bankLedgerHit) reasons.push("same bank ledger");
+  else if (anyAmountHit) reasons.push("same amount");
+  if (referenceHit) reasons.push("same UTR/reference");
+  if (partyHit) reasons.push("same party ledger");
+
+  return {
+    score,
+    reasons,
+    dateHit,
+    bankAmountHit,
+    anyAmountHit,
+    referenceHit,
+    partyHit,
+  };
+}
+
+async function verifyBankTransactionInTally(config, commandPayload = {}) {
+  const companyName = commandPayload.companyName || config.companyName || null;
+  const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
+  const amount = Number(commandPayload.amount ?? 0);
+  const voucherDate = normalizeDateForCompare(commandPayload.voucherDate);
+  const bankLedgerName = String(commandPayload.bankLedgerName || "").trim();
+
+  if (!voucherDate) {
+    throw new Error("Bank transaction verification requires a valid date.");
+  }
+  if (!bankLedgerName) {
+    throw new Error("Bank transaction verification requires the bank ledger name.");
+  }
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error("Bank transaction verification requires a positive amount.");
+  }
+
+  const xml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Autodealer Bank Payment Verification",
+    tallyType: "Voucher",
+    fetchFields:
+      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive",
+    companyName,
+  });
+  const vouchers = parseVoucherCollection(xml).filter(
+    (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
+  );
+  const scoredMatches = vouchers
+    .map((voucher) => ({
+      voucher,
+      match: scoreBankTransactionVoucher(voucher, commandPayload),
+    }))
+    .filter(({ match }) => match.score >= 75 && match.dateHit && match.anyAmountHit)
+    .sort((left, right) => right.match.score - left.match.score);
+
+  const topMatch = scoredMatches[0] ?? null;
+  const secondMatch = scoredMatches[1] ?? null;
+  const verificationStatus = !topMatch
+    ? "missing"
+    : secondMatch && topMatch.match.score - secondMatch.match.score < 10
+      ? "ambiguous"
+      : "found";
+  const selectedVoucher = verificationStatus === "found" ? topMatch?.voucher : null;
+
+  return {
+    success: true,
+    result: {
+      verificationStatus,
+      scannedCount: vouchers.length,
+      matchCount: scoredMatches.length,
+      voucherId: selectedVoucher?.masterId || selectedVoucher?.voucherNumber || null,
+      voucherNumber: selectedVoucher?.voucherNumber || null,
+      voucherType: selectedVoucher?.voucherType || null,
+      voucherDate: selectedVoucher
+        ? normalizeDateForCompare(selectedVoucher.effectiveDate || selectedVoucher.date)
+        : null,
+      reason:
+        verificationStatus === "found"
+          ? `Found in Tally: ${topMatch.match.reasons.join(", ")}.`
+          : verificationStatus === "ambiguous"
+            ? "More than one Tally voucher looks like this bank transaction. Review manually."
+            : "No matching Tally voucher found for this bank transaction.",
+      matches: scoredMatches.slice(0, 5).map(({ voucher, match }) => ({
+        score: match.score,
+        reasons: match.reasons,
+        date: normalizeDateForCompare(voucher.effectiveDate || voucher.date),
+        voucherType: voucher.voucherType,
+        voucherNumber: voucher.voucherNumber,
+        reference: voucher.reference,
+        partyLedgerName: voucher.partyLedgerName,
+        ledgerNames: voucher.ledgerNames,
+        masterId: voucher.masterId,
+      })),
+    },
+  };
 }
 
 function parseTallyAmount(value) {
@@ -1064,6 +1486,34 @@ function normalizeLooseName(value) {
     .replace(/[^a-z0-9]/g, "");
 }
 
+function uniquePayloadLedgerNames(commandPayload = {}) {
+  const values = [
+    ...(Array.isArray(commandPayload.ledgerNames) ? commandPayload.ledgerNames : []),
+    commandPayload.ledgerName,
+  ];
+  const seen = new Set();
+  const ledgerNames = [];
+
+  for (const value of values) {
+    const ledgerName = String(value || "").trim();
+    const key = normalizeLooseName(ledgerName);
+    if (!ledgerName || !key || seen.has(key)) continue;
+    seen.add(key);
+    ledgerNames.push(ledgerName);
+  }
+
+  return ledgerNames;
+}
+
+function emptyOpenBillBucket(ledgerName) {
+  return {
+    ledgerName,
+    openBills: [],
+    existingAdvances: [],
+    rawCount: 0,
+  };
+}
+
 function toOpenBill(block, ledgerName) {
   const referenceName = getAttribute(block, "NAME") || getTagText(block, "NAME") || getTagText(block, "BILLREF");
   if (!referenceName) return null;
@@ -1105,32 +1555,54 @@ function toOpenBill(block, ledgerName) {
 }
 
 async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
-  const ledgerName = String(commandPayload.ledgerName || "").trim();
-  if (!ledgerName) {
-    throw new Error("Customer open bill fetch requires ledgerName.");
+  const ledgerNames = uniquePayloadLedgerNames(commandPayload);
+  if (ledgerNames.length === 0) {
+    throw new Error("Party open bill fetch requires ledgerName.");
   }
+  const requestedLedgerByKey = new Map(ledgerNames.map((ledgerName) => [normalizeLooseName(ledgerName), ledgerName]));
 
   const companyName = commandPayload.companyName || config.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const xml = await exportTallyCollection(tallyUrl, {
     collectionName: "Autodealer Customer Open Bills",
     tallyType: "Bill",
-    childOf: ledgerName,
     fetchFields:
       "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
     companyName,
   });
-  const parsed = extractBlocks(xml, "BILL")
-    .map((block) => toOpenBill(block, ledgerName))
-    .filter(Boolean);
+  const byLedger = Object.fromEntries(ledgerNames.map((ledgerName) => [ledgerName, emptyOpenBillBucket(ledgerName)]));
+
+  for (const block of extractBlocks(xml, "BILL")) {
+    const rowLedgerName = billLedgerName(block);
+    const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(rowLedgerName));
+    if (!requestedLedgerName) continue;
+
+    const entry = toOpenBill(block, requestedLedgerName);
+    if (!entry) continue;
+
+    const { kind, ...openBillEntry } = entry;
+    const bucket = byLedger[requestedLedgerName] || emptyOpenBillBucket(requestedLedgerName);
+    bucket.rawCount += 1;
+    if (kind === "advance") {
+      bucket.existingAdvances.push(openBillEntry);
+    } else {
+      bucket.openBills.push(openBillEntry);
+    }
+    byLedger[requestedLedgerName] = bucket;
+  }
+
+  const firstLedgerName = ledgerNames[0];
+  const firstLedgerBucket = byLedger[firstLedgerName] || emptyOpenBillBucket(firstLedgerName);
 
   return {
     success: true,
     result: {
-      ledgerName,
-      openBills: parsed.filter((entry) => entry.kind === "bill").map(({ kind, ...entry }) => entry),
-      existingAdvances: parsed.filter((entry) => entry.kind === "advance").map(({ kind, ...entry }) => entry),
-      rawCount: parsed.length,
+      ledgerName: firstLedgerName,
+      ledgerNames,
+      byLedger,
+      openBills: firstLedgerBucket.openBills,
+      existingAdvances: firstLedgerBucket.existingAdvances,
+      rawCount: Object.values(byLedger).reduce((total, bucket) => total + bucket.rawCount, 0),
     },
   };
 }
@@ -1157,7 +1629,7 @@ async function collectTallyMasters(config, commandPayload = {}) {
       collectionName: "Autodealer Ledgers Sync",
       tallyType: "Ledger",
       fetchFields:
-        "Name,Parent,GUID,PartyGSTIN,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,TaxType,GSTDutyHead,RateOfTaxCalculation,IsBillWiseOn,MaintainBalancesBillByBill",
+        "Name,Parent,GUID,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation",
       companyName,
     }),
     exportTallyCollection(tallyUrl, {
@@ -1221,13 +1693,19 @@ async function syncMastersFromTally(config, commandPayload = {}) {
     throw new Error(readiness.error || "Tally Prime is reachable, but no company is loaded.");
   }
 
+  const resolvedCompanyName = readiness.companyName || companyName || config.companyName || null;
+  rememberDetectedCompanyName(config, resolvedCompanyName);
+
   const masters = await collectTallyMasters(
     {
       ...config,
       tallyUrl,
-      companyName: companyName || readiness.companyName || config.companyName,
+      companyName: resolvedCompanyName,
     },
-    commandPayload
+    {
+      ...commandPayload,
+      companyName: commandPayload.companyName || resolvedCompanyName,
+    }
   );
 
   if (masters.ledgers.length === 0) {
@@ -1236,7 +1714,7 @@ async function syncMastersFromTally(config, commandPayload = {}) {
 
   const payload = {
     connectionId: config.connectionId,
-    companyName: companyName || readiness.companyName || config.companyName,
+    companyName: resolvedCompanyName,
     bridgeVersion: BRIDGE_VERSION,
     masters,
   };
@@ -1288,10 +1766,14 @@ async function testTally(tallyUrl, companyName) {
       };
     }
 
+    const companyLoaded = !lineError && status === "1";
+    const activeCompanyName =
+      responseCompanyName || (companyLoaded ? await fetchActiveCompanyName(normalizeTallyUrl(tallyUrl), companyName) : null);
+
     return {
       tallyReachable: true,
-      companyLoaded: !lineError && status === "1",
-      companyName: responseCompanyName ?? companyName ?? null,
+      companyLoaded,
+      companyName: activeCompanyName ?? companyName ?? null,
       error: lineError,
     };
   } catch (error) {
@@ -1411,14 +1893,49 @@ async function runCommand(config, command) {
     try {
       const outcome = await fetchCustomerOpenBillsFromTally(config, command.payload);
       await sendCommandResult(config, command, outcome);
+      const fetchedLedgerCount = Array.isArray(outcome.result?.ledgerNames) ? outcome.result.ledgerNames.length : 1;
       console.log(
-        `Command ${command.id} completed: fetched open bills for ${command.payload?.ledgerName || "customer"}.`
+        `Command ${command.id} completed: fetched open bills for ${fetchedLedgerCount} party ledger(s).`
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error ?? "Open bill fetch failed.");
       await sendCommandResult(config, command, {
         success: false,
         result: {},
+        error: message,
+      });
+      console.log(`Command ${command.id} failed: ${message}`);
+    }
+    return;
+  }
+
+  if (command.commandType === "verify_bank_transaction") {
+    try {
+      const outcome = await verifyBankTransactionInTally(config, command.payload);
+      await sendCommandResult(config, command, {
+        ...outcome,
+        result: {
+          ...(outcome.result || {}),
+          transactionId: command.payload?.transactionId,
+          sourceBankTransactionId: command.payload?.transactionId,
+        },
+      });
+      console.log(
+        outcome.result?.verificationStatus === "found"
+          ? `Command ${command.id} completed: outgoing bank payment found in Tally.`
+          : outcome.result?.verificationStatus === "ambiguous"
+            ? `Command ${command.id} completed: outgoing bank payment needs review.`
+            : `Command ${command.id} completed: outgoing bank payment missing in Tally.`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Bank transaction verification failed.");
+      await sendCommandResult(config, command, {
+        success: false,
+        result: {
+          commandPayload: command.payload ?? {},
+          transactionId: command.payload?.transactionId,
+          sourceBankTransactionId: command.payload?.transactionId,
+        },
         error: message,
       });
       console.log(`Command ${command.id} failed: ${message}`);
@@ -1440,15 +1957,17 @@ async function runCommand(config, command) {
         ...outcome,
         result: {
           ...(outcome.result || {}),
-          requestXml: previewXml(xml),
+          requestXml: xml ? previewXml(xml) : null,
           retriedWithLegacyHeader: posted.retriedWithLegacyHeader,
           transactionId: command.payload?.transactionId,
-          voucherId: command.payload?.referenceNumber || command.id,
+          voucherId: outcome.result?.voucherId || command.payload?.referenceNumber || command.id,
         },
       });
       console.log(
         outcome.success
-          ? `Command ${command.id} completed: bank voucher posted.`
+          ? outcome.result?.alreadyInTally
+            ? `Command ${command.id} completed: receipt already existed in Tally.`
+            : `Command ${command.id} completed: bank voucher posted.`
           : `Command ${command.id} failed: ${outcome.error || "Tally returned an error."}`
       );
       if (!outcome.success) {
@@ -1468,6 +1987,58 @@ async function runCommand(config, command) {
           requestXml: xml ? previewXml(xml) : null,
           commandPayload: command.payload ?? {},
           transactionId: command.payload?.transactionId,
+          voucherId: command.payload?.referenceNumber || command.id,
+        },
+      });
+      console.log(`Command ${command.id} failed: ${message}`);
+    }
+    return;
+  }
+
+  if (command.commandType === "create_debit_note") {
+    let xml = null;
+    try {
+      const posted = await postDebitNote(
+        config.tallyUrl,
+        command.payload,
+        config.companyName
+      );
+      xml = posted.xml;
+      const outcome = posted.outcome;
+      await sendCommandResult(config, command, {
+        ...outcome,
+        result: {
+          ...(outcome.result || {}),
+          requestXml: previewXml(xml),
+          proposalId: command.payload?.proposalId,
+          voucherId: command.payload?.referenceNumber || command.id,
+          voucherNumber: command.payload?.referenceNumber || command.id,
+          openReferenceName: command.payload?.referenceNumber || command.id,
+          voucherDate: command.payload?.voucherDate,
+        },
+      });
+      console.log(
+        outcome.success
+          ? `Command ${command.id} completed: debit note created.`
+          : `Command ${command.id} failed: ${outcome.error || "Tally returned an error."}`
+      );
+      if (!outcome.success) {
+        console.log(`Command ${command.id} Tally request XML: ${previewXml(xml)}`);
+      }
+    } catch (error) {
+      const message =
+        error?.name === "AbortError"
+          ? "Tally did not respond within 30 seconds while creating the debit note."
+          : error instanceof Error
+            ? error.message
+            : String(error ?? "Debit note creation failed.");
+      await sendCommandResult(config, command, {
+        success: false,
+        error: message,
+        result: {
+          requestXml: xml ? previewXml(xml) : null,
+          commandPayload: command.payload ?? {},
+          proposalId: command.payload?.proposalId,
           voucherId: command.payload?.referenceNumber || command.id,
         },
       });
@@ -1540,6 +2111,8 @@ async function pairBridge(args) {
   const bridgeName = args["bridge-name"] || os.hostname() || "Tally Bridge";
   const bridgeMachineId = args["bridge-machine-id"] || createMachineId();
   const companyName = args["company-name"] || null;
+  const readiness = await testTally(tallyUrl, companyName);
+  const detectedCompanyName = readiness.companyName || companyName;
 
   const response = await fetch(`${apiBase}/api/tally/connections/${connectionId}/pair`, {
     method: "POST",
@@ -1551,6 +2124,9 @@ async function pairBridge(args) {
       bridgeName,
       bridgeVersion: BRIDGE_VERSION,
       bridgeMachineId,
+      companyName: detectedCompanyName,
+      tallyReachable: readiness.tallyReachable,
+      companyLoaded: readiness.companyLoaded,
     }),
   });
   const payload = await readJsonResponse(response);
@@ -1564,7 +2140,7 @@ async function pairBridge(args) {
     connectionId,
     bridgeToken: payload.bridgeToken,
     tallyUrl,
-    companyName,
+    companyName: detectedCompanyName,
     bridgeName,
     bridgeVersion: BRIDGE_VERSION,
     bridgeMachineId,
@@ -1575,6 +2151,7 @@ async function pairBridge(args) {
 }
 
 async function sendHeartbeat(config, testResult) {
+  const companyName = testResult.companyName || config.companyName || null;
   const response = await fetch(`${config.apiBase}/api/tally/bridge/heartbeat`, {
     method: "POST",
     headers: {
@@ -1586,12 +2163,15 @@ async function sendHeartbeat(config, testResult) {
       tallyUrl: config.tallyUrl,
       bridgeVersion: BRIDGE_VERSION,
       ...testResult,
+      companyName,
     }),
   });
   const payload = await readJsonResponse(response);
 
   if (!response.ok) {
-    throw new Error(payload.error || `Heartbeat failed with HTTP ${response.status}.`);
+    const error = new Error(payload.error || `Heartbeat failed with HTTP ${response.status}.`);
+    error.status = response.status;
+    throw error;
   }
 
   return payload;
@@ -1599,7 +2179,8 @@ async function sendHeartbeat(config, testResult) {
 
 async function runOnce(config) {
   const result = await testTally(config.tallyUrl, config.companyName);
-  await sendHeartbeat(config, result);
+  rememberDetectedCompanyName(config, result.companyName);
+  const heartbeat = await sendHeartbeat(config, result);
   const company = result.companyName ? ` Company: ${result.companyName}.` : "";
   const error = result.error ? ` Error: ${result.error}` : "";
   console.log(
@@ -1614,6 +2195,13 @@ async function runOnce(config) {
   } catch (commandError) {
     console.error(commandError instanceof Error ? commandError.message : commandError);
   }
+
+  return {
+    result,
+    connection: heartbeat?.connection ?? null,
+    timestamp: new Date().toISOString(),
+    heartbeat,
+  };
 }
 
 async function startBridge(args) {
@@ -1668,6 +2256,134 @@ async function testBridge(args) {
     args["company-name"] || config.companyName
   );
   console.log(JSON.stringify(result, null, 2));
+}
+
+function emitLog(options, level, message) {
+  if (typeof options?.onLog === "function") {
+    options.onLog({
+      level,
+      message,
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
+  if (level === "error") {
+    console.error(message);
+    return;
+  }
+
+  console.log(message);
+}
+
+function createBridgeRunner(options = {}) {
+  const config = options.config ?? readConfig();
+  if (!config) {
+    throw new Error(`Bridge is not paired. Run pair first. Expected config at ${CONFIG_PATH}`);
+  }
+
+  const intervalMs = Number(options.intervalMs || DEFAULT_HEARTBEAT_INTERVAL_MS);
+  let timer = null;
+  let running = false;
+  let stopped = false;
+
+  const stop = (reason = "stopped", error = null) => {
+    if (stopped) return;
+    stopped = true;
+    if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+    if (typeof options.onStop === "function") {
+      options.onStop({ reason, error, timestamp: new Date().toISOString() });
+    }
+  };
+
+  const runSerially = async () => {
+    if (stopped) return;
+    if (running) {
+      emitLog(options, "info", "Previous bridge cycle is still running; skipping this heartbeat.");
+      return;
+    }
+
+    running = true;
+    try {
+      const cycle = await runOnce(config);
+      if (typeof options.onStatus === "function") {
+        options.onStatus(cycle);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Bridge cycle failed.");
+      emitLog(options, "error", message);
+      if (error?.status === 401 || /invalid bridge token/i.test(String(error?.message ?? ""))) {
+        deleteConfig();
+        stop("revoked", error);
+      }
+    } finally {
+      running = false;
+    }
+  };
+
+  return {
+    config,
+    get stopped() {
+      return stopped;
+    },
+    async start() {
+      emitLog(options, "info", `Starting Tally bridge for ${config.tallyUrl}`);
+      emitLog(options, "info", `Sending heartbeat every ${intervalMs} ms.`);
+      await runSerially();
+      if (!stopped) {
+        timer = setInterval(() => {
+          runSerially().catch((error) => {
+            emitLog(options, "error", error instanceof Error ? error.message : String(error));
+          });
+        }, intervalMs);
+      }
+    },
+    stop,
+    async runOnce() {
+      await runSerially();
+    },
+  };
+}
+
+async function disconnectBridge(args = {}) {
+  const config = readConfig();
+  if (!config) {
+    return {
+      disconnected: false,
+      localConfigDeleted: false,
+      reason: "not_paired",
+    };
+  }
+
+  let remote = null;
+  try {
+    const response = await fetch(`${config.apiBase}/api/tally/bridge/disconnect`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.bridgeToken}`,
+      },
+      body: JSON.stringify({
+        connectionId: args["connection-id"] || config.connectionId,
+      }),
+    });
+    remote = await readJsonResponse(response);
+  } catch (_error) {
+    // Local disconnect should succeed even if the API is unavailable.
+  } finally {
+    if (String(args["keep-config"] || "").toLowerCase() !== "true") {
+      deleteConfig();
+    }
+  }
+
+  return {
+    disconnected: true,
+    localConfigDeleted: String(args["keep-config"] || "").toLowerCase() !== "true",
+    remote,
+  };
 }
 
 async function syncMastersCli(args) {
@@ -2076,7 +2792,28 @@ async function main() {
   console.log("  node apps/tally-bridge/src/bridge.mjs test --tally-url http://localhost:9000 --company-name <name>");
 }
 
-main().catch((error) => {
-  console.error(formatCliError(error));
-  process.exit(1);
-});
+export {
+  BRIDGE_VERSION,
+  CONFIG_DIR,
+  CONFIG_PATH,
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_TALLY_URL,
+  createBridgeRunner,
+  deleteConfig,
+  disconnectBridge,
+  normalizeTallyUrl,
+  pairBridge,
+  readConfig,
+  runOnce,
+  startBridge,
+  testBridge,
+  testTally,
+  writeConfig,
+};
+
+if (process.argv[1] && path.resolve(process.argv[1]) === CURRENT_FILE) {
+  main().catch((error) => {
+    console.error(formatCliError(error));
+    process.exit(1);
+  });
+}

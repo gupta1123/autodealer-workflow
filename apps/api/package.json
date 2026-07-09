@@ -8,11 +8,15 @@
   },
   "scripts": {
     "dev": "next dev --turbopack --port 3001",
-    "build": "next build",
+    "build": "next build --turbopack",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "worker": "node ./worker/process-packet-jobs.mjs",
     "worker:local": "node --env-file=.env.local --env-file=.env.development.local ./worker/process-packet-jobs.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "20.17.6",
+    "typescript": "5.8.2"
   }
 }

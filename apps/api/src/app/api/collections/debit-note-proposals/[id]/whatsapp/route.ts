@@ -10,6 +10,13 @@ function isMissingTableError(error: unknown) {
   return /debit_note_proposals|relation .* does not exist|schema cache/i.test(message);
 }
 
+function getTenDigitPhone(value: unknown) {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  if (digits.length === 10) return digits;
+  if (digits.length === 12 && digits.startsWith("91")) return digits.slice(2);
+  return null;
+}
+
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
@@ -52,10 +59,16 @@ export async function POST(
       return jsonWithCors(request, { error: "Create the debit note in Tally before sending WhatsApp." }, { status: 409 });
     }
 
-    const recipientPhone = normalizeWhatsappPhone(body.recipientPhone ?? proposal.party_phone);
+    const enteredPhone = body.recipientPhone ? getTenDigitPhone(body.recipientPhone) : null;
+    if (body.recipientPhone && !enteredPhone) {
+      return jsonWithCors(request, { error: "Enter a valid 10-digit WhatsApp number." }, { status: 400 });
+    }
+
+    const recipientPhone = normalizeWhatsappPhone(enteredPhone ?? proposal.party_phone);
     if (!recipientPhone) {
       return jsonWithCors(request, { error: "Customer WhatsApp number is missing." }, { status: 400 });
     }
+    const shouldSavePhoneToTally = body.savePhoneToTally === true && Boolean(body.recipientPhone);
 
     const storedPdfUrl = await createDebitNotePdfSignedUrl(
       supabase as unknown as Parameters<typeof createDebitNotePdfSignedUrl>[0],
@@ -82,21 +95,51 @@ export async function POST(
     });
 
     const now = new Date().toISOString();
+    let phoneSaveCommandId: string | null = null;
+    if (shouldSavePhoneToTally && proposal.connection_id) {
+      const { data: commandData, error: commandError } = await supabase
+        .from("tally_bridge_commands")
+        .insert({
+          connection_id: proposal.connection_id,
+          owner_user_id: user.id,
+          command_type: "alter_ledger",
+          status: "queued",
+          payload: {
+            oldName: proposal.party_ledger_name,
+            newName: proposal.party_ledger_name,
+            phoneNumber: recipientPhone,
+            companyName: proposal.company_name,
+            reason: "cash_discount_whatsapp_phone_capture",
+          },
+        })
+        .select("id")
+        .single();
+
+      if (!commandError) {
+        phoneSaveCommandId = String(commandData?.id ?? "");
+      } else {
+        console.warn("Could not queue Tally phone update for debit note WhatsApp:", commandError);
+      }
+    }
+
     const { data: updatedData, error: updateError } = await supabase
       .from("debit_note_proposals")
       .update({
+        party_phone: recipientPhone,
         communication_status: "sent",
         communication_channel: "whatsapp",
         communication_recipient: recipientPhone,
         communication_sent_at: now,
         customer_snapshot: {
           ...(proposal.customer_snapshot ?? {}),
+          phone: recipientPhone,
           whatsapp: {
             provider: "msg91",
             senderNumber: config.senderNumber,
             templateName: config.templateName,
             templateMode: config.templateMode,
             sentAt: now,
+            phoneSaveCommandId,
             response: result.payload,
           },
         },
