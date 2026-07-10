@@ -13,7 +13,6 @@ import {
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
-import { PacketIntelligencePanel } from "@/components/cases/PacketIntelligencePanel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -1183,14 +1182,6 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
             <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
               <div className="flex-1 overflow-y-auto">
                 <div className="mx-auto max-w-4xl p-3 sm:p-4 lg:p-5">
-                  {detail.packetIntelligence ? (
-                    <PacketIntelligencePanel
-                      packetIntelligence={detail.packetIntelligence}
-                      className="mb-3"
-                      density="wide"
-                    />
-                  ) : null}
-
                   {visibleMismatches.length === 0 ? (
                     <div className="flex flex-col items-center justify-center rounded-2xl bg-white border border-slate-200 p-12 text-center shadow-sm mt-8">
                       <div className="h-16 w-16 rounded-full bg-emerald-100 flex items-center justify-center mb-4">

@@ -103,29 +103,6 @@
   padding: 0.5rem 0.625rem;
 }
 
-.sectionGroup {
-  margin-bottom: 1.25rem;
-}
-
-.sectionHeader {
-  font-size: 0.65rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: #8a7f72;
-  padding: 0.25rem 0.55rem;
-  margin: 0 0 0.35rem 0;
-  opacity: 0.7;
-}
-
-.desktopNav {
-  display: block;
-}
-
-.mobileNav {
-  display: none;
-}
-
 .navList {
   display: flex;
   flex-direction: column;
@@ -461,14 +438,6 @@
     display: none;
   }
 
-  .desktopNav {
-    display: none;
-  }
-
-  .mobileNav {
-    display: block;
-  }
-
   .navSection {
     padding: 0;
   }
@@ -476,22 +445,16 @@
   .navList {
     flex-direction: row;
     align-items: stretch;
-    justify-content: flex-start;
+    justify-content: space-between;
     gap: 0.25rem;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  .navList::-webkit-scrollbar {
-    display: none;
   }
 
   .navList > li,
   .mobileLogoutItem,
   .mobileLogoutItem form {
     display: flex;
-    flex: 0 0 auto;
-    min-width: 72px;
+    flex: 1 1 0;
+    min-width: 0;
   }
 
   .navItem {

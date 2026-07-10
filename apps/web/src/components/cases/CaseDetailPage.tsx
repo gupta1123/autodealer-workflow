@@ -28,7 +28,6 @@ import {
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
-import { PacketIntelligencePanel } from "@/components/cases/PacketIntelligencePanel";
 import { AnalysisOptionsDialog } from "@/components/workspace/AnalysisOptionsDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -107,6 +106,111 @@ type TermsComplianceChecklistItem = {
   reason: string;
   severity: "high" | "medium" | "low" | "none";
 };
+
+type CaseDetailDocument = SavedCaseDetail["documents"][number];
+
+type SplitSiblingCase = {
+  id: string;
+  displayName: string;
+  groupIndex: number;
+};
+
+type SplitAnalysisMeta = {
+  groupCount: number;
+  groupIndex: number;
+  sourceCaseId: string;
+  sourceFileNames: string[];
+  groupId: string;
+  siblingCases: SplitSiblingCase[];
+  note: string;
+};
+
+type SellerChainRoleSelectionMeta = {
+  primaryDocumentIds: string[];
+  contextDocumentIds: string[];
+  note: string;
+};
+
+function readStringArray(value: unknown) {
+  return Array.isArray(value)
+    ? value.map((entry) => String(entry ?? "").trim()).filter(Boolean)
+    : [];
+}
+
+function readSplitAnalysisMeta(processingMeta: unknown): SplitAnalysisMeta | null {
+  if (!processingMeta || typeof processingMeta !== "object" || Array.isArray(processingMeta)) {
+    return null;
+  }
+
+  const raw = (processingMeta as Record<string, unknown>).splitAnalysis;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+
+  const record = raw as Record<string, unknown>;
+  const groupCount = Number(record.groupCount);
+  const groupIndex = Number(record.groupIndex);
+  const sourceCaseId = String(record.sourceCaseId ?? "").trim();
+  const groupId = String(record.groupId ?? "").trim();
+  const note = String(record.note ?? "").trim();
+  if (!Number.isFinite(groupCount) || groupCount < 2 || !Number.isFinite(groupIndex) || groupIndex < 1) {
+    return null;
+  }
+
+  const siblingCases = Array.isArray(record.siblingCases)
+    ? record.siblingCases.flatMap((entry): SplitSiblingCase[] => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+        const sibling = entry as Record<string, unknown>;
+        const id = String(sibling.id ?? "").trim();
+        const displayName = String(sibling.displayName ?? "").trim();
+        const siblingGroupIndex = Number(sibling.groupIndex);
+        if (!id || !displayName || !Number.isFinite(siblingGroupIndex)) return [];
+        return [{ id, displayName, groupIndex: siblingGroupIndex }];
+      })
+    : [];
+
+  return {
+    groupCount,
+    groupIndex,
+    sourceCaseId,
+    sourceFileNames: readStringArray(record.sourceFileNames),
+    groupId,
+    siblingCases,
+    note: note || `This uploaded file was split into ${groupCount} separate cases during analysis.`,
+  };
+}
+
+function readSellerChainRoleSelectionMeta(processingMeta: unknown): SellerChainRoleSelectionMeta | null {
+  if (!processingMeta || typeof processingMeta !== "object" || Array.isArray(processingMeta)) {
+    return null;
+  }
+
+  const rawGroups = (processingMeta as Record<string, unknown>).verificationGroups;
+  if (!Array.isArray(rawGroups)) return null;
+
+  for (const group of rawGroups) {
+    if (!group || typeof group !== "object" || Array.isArray(group)) continue;
+    const roleSelection = (group as Record<string, unknown>).roleSelection;
+    if (!roleSelection || typeof roleSelection !== "object" || Array.isArray(roleSelection)) continue;
+
+    const record = roleSelection as Record<string, unknown>;
+    if (record.strategy !== "seller_chain") continue;
+
+    const primaryDocumentIds = readStringArray(record.primaryDocumentIds);
+    const contextDocumentIds = readStringArray(record.contextDocumentIds);
+    if (!primaryDocumentIds.length || !contextDocumentIds.length) continue;
+
+    return {
+      primaryDocumentIds,
+      contextDocumentIds,
+      note:
+        String(record.note ?? "").trim() ||
+        "Seller-chain role selection applied: Kalika-facing invoice was reconciled; upstream seller invoices were kept as context.",
+    };
+  }
+
+  return null;
+}
 
 function readTermsComplianceChecklist(processingMeta: unknown): TermsComplianceChecklistItem[] {
   if (!processingMeta || typeof processingMeta !== "object" || Array.isArray(processingMeta)) {
@@ -380,6 +484,169 @@ function getMissingPacketDocumentLabels(documents: SavedCaseDetail["documents"])
 
 function normalizeText(value: string | null | undefined) {
   return (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function normalizeInvoiceCopyValue(value: unknown) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .trim();
+}
+
+function getStringField(document: CaseDetailDocument, key: string) {
+  const value = document.extractedFields[key];
+  return value === null || value === undefined ? "" : String(value).trim();
+}
+
+function isInvoiceDocument(document: CaseDetailDocument) {
+  return /^(?:tax\s+)?invoice$/i.test(document.documentType.trim());
+}
+
+function getInvoiceDisplayIdentity(document: CaseDetailDocument) {
+  return normalizeInvoiceCopyValue(
+    getStringField(document, "invoiceNumber") ||
+      getStringField(document, "referenceInvoiceNumber")
+  );
+}
+
+function parseInvoiceAmount(value: unknown) {
+  const match = String(value ?? "").replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const parsed = Number(match[0]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getInvoiceAmount(document: CaseDetailDocument) {
+  return (
+    parseInvoiceAmount(getStringField(document, "totalAmount")) ??
+    parseInvoiceAmount(getStringField(document, "totalTaxableAmount")) ??
+    parseInvoiceAmount(getStringField(document, "subtotal"))
+  );
+}
+
+function invoiceAmountsMatch(left: CaseDetailDocument, right: CaseDetailDocument) {
+  const leftAmount = getInvoiceAmount(left);
+  const rightAmount = getInvoiceAmount(right);
+  if (leftAmount === null || rightAmount === null) return false;
+  return Math.abs(leftAmount - rightAmount) <= Math.max(1, Math.abs(rightAmount) * 0.001);
+}
+
+function normalizedInvoiceField(document: CaseDetailDocument, field: string) {
+  return normalizeInvoiceCopyValue(getStringField(document, field));
+}
+
+function invoicePartyNameMatches(left: string, right: string) {
+  return Boolean(
+    left &&
+      right &&
+      left.length >= 5 &&
+      right.length >= 5 &&
+      (left === right || left.includes(right) || right.includes(left))
+  );
+}
+
+function invoicePartySideMatches(
+  left: CaseDetailDocument,
+  right: CaseDetailDocument,
+  gstinField: string,
+  nameField: string
+) {
+  const leftGstin = normalizedInvoiceField(left, gstinField);
+  const rightGstin = normalizedInvoiceField(right, gstinField);
+  if (leftGstin && rightGstin) return leftGstin === rightGstin;
+
+  const leftName = normalizedInvoiceField(left, nameField);
+  const rightName = normalizedInvoiceField(right, nameField);
+  if (leftName && rightName) return invoicePartyNameMatches(leftName, rightName);
+
+  return null;
+}
+
+function hasInvoicePartySideEvidence(document: CaseDetailDocument, gstinField: string, nameField: string) {
+  return Boolean(normalizedInvoiceField(document, gstinField) || normalizedInvoiceField(document, nameField));
+}
+
+function invoicePartiesCompatible(left: CaseDetailDocument, right: CaseDetailDocument) {
+  const supplierMatch = invoicePartySideMatches(left, right, "supplierGstin", "vendorName");
+  if (supplierMatch === false) return false;
+
+  const buyerMatch = invoicePartySideMatches(left, right, "buyerGstin", "buyerName");
+  if (buyerMatch === false) return false;
+
+  const hasSupplierEvidence =
+    hasInvoicePartySideEvidence(left, "supplierGstin", "vendorName") ||
+    hasInvoicePartySideEvidence(right, "supplierGstin", "vendorName");
+  if (hasSupplierEvidence) return supplierMatch === true;
+
+  return buyerMatch === true;
+}
+
+function areDuplicateInvoiceDisplayCopies(left: CaseDetailDocument, right: CaseDetailDocument) {
+  if (!isInvoiceDocument(left) || !isInvoiceDocument(right)) return false;
+  const leftInvoice = getInvoiceDisplayIdentity(left);
+  const rightInvoice = getInvoiceDisplayIdentity(right);
+  if (!leftInvoice || !rightInvoice || leftInvoice !== rightInvoice) return false;
+
+  return invoiceAmountsMatch(left, right) && invoicePartiesCompatible(left, right);
+}
+
+function invoiceDisplayText(document: CaseDetailDocument) {
+  return [document.title, document.sourceHint, document.sourceFileName, document.markdown]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function getInvoiceCopyPreferenceRank(document: CaseDetailDocument) {
+  const text = invoiceDisplayText(document);
+  if (/\b(?:original|main)\s+copy\b|\b(?:original|main)\b/.test(text)) return 0;
+  if (/\b(?:duplicate|extra|copy)\b/.test(text)) return 2;
+  return 1;
+}
+
+function getInvoiceDisplayCompletenessScore(document: CaseDetailDocument) {
+  const fieldScore = Object.values(document.extractedFields).filter((value) => {
+    if (value === null || value === undefined) return false;
+    return String(value).trim().length > 0;
+  }).length;
+  const lineScore = (document.lineItems?.length ?? 0) * 5;
+  const textScore = Math.min(8, Math.floor((document.markdown?.trim().length ?? 0) / 500));
+  return fieldScore + lineScore + textScore;
+}
+
+function shouldPreferInvoiceDisplayCopy(candidate: CaseDetailDocument, current: CaseDetailDocument) {
+  const candidateRank = getInvoiceCopyPreferenceRank(candidate);
+  const currentRank = getInvoiceCopyPreferenceRank(current);
+  if (candidateRank !== currentRank) return candidateRank < currentRank;
+
+  const candidateScore = getInvoiceDisplayCompletenessScore(candidate);
+  const currentScore = getInvoiceDisplayCompletenessScore(current);
+  return candidateScore > currentScore;
+}
+
+function getDisplayDocuments(documents: CaseDetailDocument[]) {
+  const displayDocuments: CaseDetailDocument[] = [];
+
+  for (const document of documents) {
+    if (!isInvoiceDocument(document)) {
+      displayDocuments.push(document);
+      continue;
+    }
+
+    const existingIndex = displayDocuments.findIndex((candidate) =>
+      areDuplicateInvoiceDisplayCopies(candidate, document)
+    );
+    if (existingIndex === -1) {
+      displayDocuments.push(document);
+      continue;
+    }
+
+    if (shouldPreferInvoiceDisplayCopy(document, displayDocuments[existingIndex])) {
+      displayDocuments[existingIndex] = document;
+    }
+  }
+
+  return displayDocuments;
 }
 
 function displayValue(value: unknown) {
@@ -686,15 +953,20 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     setPreviewUrlError(null);
   }, [caseId]);
 
+  const displayDocuments = useMemo(
+    () => (detail ? getDisplayDocuments(detail.documents) : []),
+    [detail]
+  );
+
   useEffect(() => {
     if (!detail) return;
     setActiveDocumentId((current) => {
-      if (current && detail.documents.some((document) => document.id === current)) {
+      if (current && displayDocuments.some((document) => document.id === current)) {
         return current;
       }
-      return detail.documents[0]?.id ?? null;
+      return displayDocuments[0]?.id ?? detail.documents[0]?.id ?? null;
     });
-  }, [detail]);
+  }, [detail, displayDocuments]);
 
   useEffect(() => {
     if (!detail || detail.case.status !== "processing") {
@@ -772,8 +1044,12 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
   const activeDocument = useMemo(() => {
     if (!detail || !activeDocumentId) return null;
-    return detail.documents.find((document) => document.id === activeDocumentId) ?? null;
-  }, [detail, activeDocumentId]);
+    return (
+      detail.documents.find((document) => document.id === activeDocumentId) ??
+      displayDocuments[0] ??
+      null
+    );
+  }, [detail, activeDocumentId, displayDocuments]);
 
   const visibleMismatches = useMemo(
     () =>
@@ -1465,6 +1741,8 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   // ANALYZED STATE (Split Screen View)
   // =========================================
   const showActions = detail && detail.case.status !== "draft" && !isFinalDecision;
+  const splitAnalysisMeta = readSplitAnalysisMeta(detail?.case.processingMeta);
+  const sellerChainRoleMeta = readSellerChainRoleSelectionMeta(detail?.case.processingMeta);
 
   return (
     <AppShell>
@@ -1533,6 +1811,67 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
         {decisionStatus === "error" && decisionError && (
           <div className="bg-red-50 text-red-600 text-xs sm:text-sm p-3 text-center border-b border-red-100 font-medium z-10 relative shrink-0">
             {decisionError}
+          </div>
+        )}
+
+        {splitAnalysisMeta && (
+          <div className="relative z-10 shrink-0 border-b border-indigo-100 bg-indigo-50 px-4 py-3 text-indigo-950 sm:px-6">
+            <div className="mx-auto flex max-w-7xl flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex min-w-0 items-start gap-3">
+                <div className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-indigo-100 bg-white text-indigo-600 shadow-sm">
+                  <Sparkles className="h-4 w-4" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-sm font-medium leading-5">
+                    {splitAnalysisMeta.note}
+                  </p>
+                  <p className="mt-0.5 text-xs font-medium text-indigo-700">
+                    Case {splitAnalysisMeta.groupIndex} of {splitAnalysisMeta.groupCount}
+                    {splitAnalysisMeta.sourceFileNames.length
+                      ? ` from ${splitAnalysisMeta.sourceFileNames.join(", ")}`
+                      : ""}
+                  </p>
+                </div>
+              </div>
+              {splitAnalysisMeta.siblingCases.length > 0 && (
+                <div className="flex flex-wrap gap-2 pl-11 sm:justify-end sm:pl-0">
+                  {splitAnalysisMeta.siblingCases.map((sibling) => (
+                    <Button
+                      key={sibling.id}
+                      asChild
+                      size="sm"
+                      variant="outline"
+                      className="h-8 rounded-lg border-indigo-200 bg-white px-3 text-xs font-medium text-indigo-700 hover:bg-indigo-100 hover:text-indigo-800"
+                    >
+                      <Link href={`/cases/${sibling.id}`}>
+                        Case {sibling.groupIndex}
+                      </Link>
+                    </Button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {sellerChainRoleMeta && (
+          <div className="relative z-10 shrink-0 border-b border-amber-100 bg-amber-50 px-4 py-3 text-amber-950 sm:px-6">
+            <div className="mx-auto flex max-w-7xl items-start gap-3">
+              <div className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-amber-100 bg-white text-amber-600 shadow-sm">
+                <ShieldAlert className="h-4 w-4" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-sm font-medium leading-5">
+                  {sellerChainRoleMeta.note}
+                </p>
+                <p className="mt-0.5 text-xs font-medium text-amber-700">
+                  {sellerChainRoleMeta.primaryDocumentIds.length} reconciliation document
+                  {sellerChainRoleMeta.primaryDocumentIds.length === 1 ? "" : "s"};{" "}
+                  {sellerChainRoleMeta.contextDocumentIds.length} context document
+                  {sellerChainRoleMeta.contextDocumentIds.length === 1 ? "" : "s"}
+                </p>
+              </div>
+            </div>
           </div>
         )}
 
@@ -1762,24 +2101,16 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                   </div>
                 )}
 
-                {detail?.packetIntelligence ? (
-                  <PacketIntelligencePanel
-                    packetIntelligence={detail.packetIntelligence}
-                    className="mt-3"
-                    density="sidebar"
-                  />
-                ) : null}
-
             </div>
 
             {/* Documents List */}
             <div className="flex min-h-0 flex-1 flex-col border-t border-slate-200 px-5 pb-5 pt-4">
                   <div className="mb-3 flex shrink-0 items-center justify-between px-1">
                     <h3 className="text-[11px] font-medium text-slate-500 uppercase tracking-widest">Documents in Packet</h3>
-                    <span className="rounded-full bg-slate-200/50 px-2 py-0.5 text-[10px] font-medium text-slate-500">{detail?.documents.length}</span>
+                    <span className="rounded-full bg-slate-200/50 px-2 py-0.5 text-[10px] font-medium text-slate-500">{displayDocuments.length}</span>
                   </div>
                   <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
-                    {detail?.documents.map((doc) => {
+                    {displayDocuments.map((doc) => {
                       const isActive = activeDocumentId === doc.id;
                       const documentIndex = getDocumentIndexDetails(doc);
                       return (
@@ -1813,18 +2144,10 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           {/* Right Main Area (Document Viewer Card) */}
           <main className="flex-1 flex flex-col min-w-0 bg-[#fafafa] pt-2.5 px-2.5 pb-0 sm:p-4 md:p-6 lg:p-8 relative">
 
-            {detail?.packetIntelligence ? (
-              <PacketIntelligencePanel
-                packetIntelligence={detail.packetIntelligence}
-                className="mb-3 md:hidden"
-                density="sidebar"
-              />
-            ) : null}
-
             {/* Mobile Document Selector (Horizontal scroll) */}
             <div className="md:hidden bg-white border border-[#e5ddd0] rounded-xl mb-3 p-1.5 shrink-0 z-10 relative overflow-hidden shadow-sm">
               <div className="flex overflow-x-auto gap-2 snap-x scrollbar-hide py-0.5 px-0.5">
-                {detail?.documents.map((doc) => {
+                {displayDocuments.map((doc) => {
                   const isActive = activeDocumentId === doc.id;
                   const documentIndex = getDocumentIndexDetails(doc);
                   return (

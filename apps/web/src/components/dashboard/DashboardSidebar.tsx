@@ -7,50 +7,21 @@ import {
   LayoutDashboard,
   FolderOpen,
   FileStack,
-  FileText,
-  Landmark,
   Trash2,
   LogOut,
   ChevronsUpDown,
   Settings,
   ChevronLeft,
-  Receipt,
 } from "lucide-react";
 
 import styles from "./DashboardSidebar.module.css";
 
-/* ── Sectioned nav ───────────────────────────── */
-const SIDEBAR_SECTIONS = [
-  {
-    id: "main",
-    title: "Main",
-    items: [
-      { href: "/", label: "Dashboard", icon: LayoutDashboard },
-    ],
-  },
-  {
-    id: "cases",
-    title: "Cases",
-    items: [
-      { href: "/workspace", label: "Add Case", icon: FileStack },
-      { href: "/cases", label: "All Cases", icon: FolderOpen },
-    ],
-  },
-  {
-    id: "reconciliation",
-    title: "Reconciliation",
-    items: [
-      { href: "/tally-prime", label: "Bank Statements", icon: Landmark },
-      { href: "/collections", label: "Cash Discounts", icon: FileText },
-    ],
-  },
-  {
-    id: "system",
-    title: "System",
-    items: [
-      { href: "/recycle-bin", label: "Recycle Bin", icon: Trash2 },
-    ],
-  },
+/* ── Primary nav ─────────────────────────────── */
+const PRIMARY_NAV = [
+  { href: "/", label: "Dashboard", icon: LayoutDashboard },
+  { href: "/workspace", label: "Add Case", icon: FileStack },
+  { href: "/cases", label: "All Cases", icon: FolderOpen },
+  { href: "/recycle-bin", label: "Recycle Bin", icon: Trash2 },
 ];
 
 function isActivePath(pathname: string, href: string) {
@@ -102,39 +73,10 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
         </button>
       </div>
 
-      {/* ── DESKTOP SECTIONED NAVIGATION ── */}
-      <nav className={`${styles.navSection} ${styles.desktopNav}`}>
-        {SIDEBAR_SECTIONS.map((section) => (
-          <div key={section.id} className={styles.sectionGroup}>
-            {!collapsed && <h3 className={styles.sectionHeader}>{section.title}</h3>}
-            <ul className={styles.navList} role="list">
-              {section.items.map((item) => {
-                const active = isActivePath(pathname, item.href);
-                const Icon = item.icon;
-                return (
-                  <li key={item.href}>
-                    <Link
-                      href={item.href}
-                      className={`${styles.navItem} ${active ? styles.navItemActive : ""}`}
-                    >
-                      <div className={styles.navItemLeft}>
-                        {active && <div className={styles.activeBar} />}
-                        <Icon className={styles.navIcon} />
-                        <span className={styles.navTitle}>{item.label}</span>
-                      </div>
-                    </Link>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
-        ))}
-      </nav>
-
-      {/* ── MOBILE FLAT NAVIGATION ── */}
-      <nav className={`${styles.navSection} ${styles.mobileNav}`}>
+      {/* ── PRIMARY NAVIGATION ── */}
+      <nav className={styles.navSection}>
         <ul className={styles.navList} role="list">
-          {SIDEBAR_SECTIONS.flatMap((s) => s.items).map((item) => {
+          {PRIMARY_NAV.map((item) => {
             const active = isActivePath(pathname, item.href);
             const Icon = item.icon;
             return (

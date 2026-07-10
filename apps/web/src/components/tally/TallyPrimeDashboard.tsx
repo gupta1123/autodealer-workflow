@@ -12,7 +12,6 @@ import {
   PlugZap,
   RefreshCw,
   Server,
-  Sparkles,
   Terminal,
   TriangleAlert,
 } from "lucide-react";
@@ -43,13 +42,6 @@ type TallyConnection = {
   heartbeatStale?: boolean;
 };
 
-type CompanyOption = {
-  id: string;
-  connectionId: string;
-  companyName: string;
-  financialYear: string;
-};
-
 type ConnectionsResponse = {
   connections?: TallyConnection[];
   error?: string;
@@ -63,12 +55,6 @@ type CreateConnectionResponse = {
 
 type StatusResponse = {
   connection?: TallyConnection;
-  error?: string;
-};
-
-type CompaniesResponse = {
-  companies?: CompanyOption[];
-  selectedCompanyId?: string | null;
   error?: string;
 };
 
@@ -103,16 +89,11 @@ function getStatusTone(connection?: TallyConnection | null) {
   return "neutral";
 }
 
-const DEFAULT_BRIDGE_API_BASE_URL = "https://autodealer-workflow-465859fe2891.herokuapp.com";
-
 function getBridgeApiBaseUrl() {
-  const configuredBaseUrl = (
-    process.env.NEXT_PUBLIC_BRIDGE_API_BASE_URL ||
-    process.env.NEXT_PUBLIC_API_BASE_URL ||
-    ""
-  ).replace(/\/+$/, "");
+  const configuredBaseUrl = (process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/+$/, "");
   if (configuredBaseUrl) return configuredBaseUrl;
-  return DEFAULT_BRIDGE_API_BASE_URL;
+  if (typeof window !== "undefined") return window.location.origin;
+  return "http://localhost:3001";
 }
 
 function escapeCommandValue(value: string) {
@@ -130,10 +111,6 @@ function buildStartCommand(connection?: TallyConnection | null) {
     : "";
 
   return `npm.cmd run start${companyFlag}`;
-}
-
-function formatCompanyOptionLabel(company: CompanyOption) {
-  return [company.companyName, company.financialYear].filter(Boolean).join(" - ");
 }
 
 function buildConnectorConnectUrl(connection: TallyConnection, pairingCode: string) {
@@ -171,24 +148,20 @@ function StatusCard({
   detail: string;
 }) {
   return (
-    <div className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-all duration-300 hover:shadow-[0_4px_12px_rgba(0,0,0,0.03)]">
+    <div className="rounded-xl border border-[#e5ddd0] bg-white p-4">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">
+          <div className="text-[11px] font-black uppercase tracking-[0.18em] text-[#8a7f72]">
             {title}
           </div>
-          <div className="mt-2 text-base font-extrabold text-[#1a1a1a]">{value}</div>
-          <div className="mt-1 text-xs font-semibold text-slate-400 leading-snug">{detail}</div>
+          <div className="mt-2 text-sm font-bold text-[#1a1a1a]">{value}</div>
+          <div className="mt-1 text-xs font-medium text-[#8a7f72]">{detail}</div>
         </div>
-        <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border ${
-          ok ? "bg-emerald-50 border-emerald-100 text-emerald-600" : "bg-amber-50 border-amber-100 text-amber-600"
-        }`}>
-          {ok ? (
-            <CheckCircle2 className="h-4.5 w-4.5" />
-          ) : (
-            <TriangleAlert className="h-4.5 w-4.5" />
-          )}
-        </div>
+        {ok ? (
+          <CheckCircle2 className="h-5 w-5 text-[#059669]" />
+        ) : (
+          <TriangleAlert className="h-5 w-5 text-[#d97706]" />
+        )}
       </div>
     </div>
   );
@@ -204,23 +177,23 @@ function CommandBlock({
   onCopy: (value: string) => void;
 }) {
   return (
-    <div className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-sm">
+    <div className="rounded-xl border border-[#e3d6c6] bg-white p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-slate-400">
-          <Terminal className="h-4 w-4 text-slate-400" />
+        <div className="flex items-center gap-2 text-sm font-black text-[#1a1a1a]">
+          <Terminal className="h-4 w-4 text-[#8a7f72]" />
           {title}
         </div>
         <Button
-          className="h-8 rounded-xl border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
+          className="h-9 rounded-lg border-[#e5ddd0] bg-white px-3 text-[#1a1a1a] hover:bg-[#f3eee7]"
           onClick={() => onCopy(command)}
           type="button"
           variant="outline"
         >
-          <Clipboard className="h-3.5 w-3.5 mr-1" />
+          <Clipboard className="h-4 w-4" />
           Copy
         </Button>
       </div>
-      <code className="block overflow-x-auto whitespace-nowrap rounded-xl bg-[#2d2d2d] px-4 py-3 font-mono text-[11px] font-semibold text-[#f7f7f5] border border-black/10">
+      <code className="block overflow-x-auto whitespace-nowrap rounded-lg bg-[#1a1a1a] px-3 py-3 font-mono text-xs font-semibold text-white">
         {command}
       </code>
     </div>
@@ -242,21 +215,21 @@ function HubCard({
 }) {
   return (
     <button
-      className="group flex min-h-[190px] w-full flex-col justify-between rounded-2xl border border-[#e5ddd0] bg-white p-6 text-left shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-all duration-300 hover:-translate-y-1 hover:border-[#cbd5e1] hover:shadow-[0_8px_24px_rgba(0,0,0,0.04)] focus:outline-none focus:ring-2 focus:ring-[#1a1a1a]/10"
+      className="group flex min-h-[190px] w-full flex-col justify-between rounded-xl border border-[#e5ddd0] bg-white p-5 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-[#d8ccbc] hover:shadow-md focus:outline-none focus:ring-2 focus:ring-[#1a1a1a]/20"
       onClick={onClick}
       type="button"
     >
-      <div className="w-full">
+      <div>
         <div className="mb-5 flex items-center justify-between gap-3">
-          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-amber-50 border border-amber-100/50 text-amber-700 transition-colors group-hover:bg-amber-100/60">
+          <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-[#1a1a1a] text-white">
             {icon}
           </div>
-          <ArrowRight className="h-5 w-5 text-slate-400 transition-all duration-300 group-hover:translate-x-1 group-hover:text-[#1a1a1a]" />
+          <ArrowRight className="h-5 w-5 text-[#8a7f72] transition group-hover:translate-x-1 group-hover:text-[#1a1a1a]" />
         </div>
-        <h3 className="text-lg font-extrabold text-[#1a1a1a]">{title}</h3>
-        <p className="mt-2 text-xs font-semibold leading-relaxed text-slate-500">{description}</p>
+        <h3 className="text-lg font-black text-[#1a1a1a]">{title}</h3>
+        <p className="mt-2 max-w-md text-sm font-medium leading-6 text-[#756a5f]">{description}</p>
       </div>
-      <div className="mt-6 w-fit rounded-full border border-amber-250 bg-amber-50 px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-amber-800">
+      <div className="mt-6 w-fit rounded-full border border-[#e5ddd0] bg-[#fafafa] px-3 py-1 text-xs font-black uppercase tracking-[0.14em] text-[#8a7f72]">
         {status}
       </div>
     </button>
@@ -267,7 +240,6 @@ export function TallyPrimeDashboard() {
   const router = useRouter();
   const [view, setView] = useState<"home" | "connection">("home");
   const [connections, setConnections] = useState<TallyConnection[]>([]);
-  const [companies, setCompanies] = useState<CompanyOption[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [pairingCode, setPairingCode] = useState("");
   const [loading, setLoading] = useState(true);
@@ -278,11 +250,9 @@ export function TallyPrimeDashboard() {
 
   const selectedConnection =
     connections.find((connection) => connection.id === selectedId) ?? connections[0] ?? null;
-  const selectedCompany =
-    companies.find((company) => company.connectionId === selectedConnection?.id) ?? companies[0] ?? null;
   const statusTone = getStatusTone(selectedConnection);
   const connectorActive = Boolean(selectedConnection?.bridgeConnected);
-  const companyDetail = selectedCompany?.companyName || selectedConnection?.lastCompanyName
+  const companyDetail = selectedConnection?.lastCompanyName
     || (selectedConnection?.lastCompanyLoaded ? "Company loaded" : "Company not detected yet");
   const pairCommand = useMemo(() => {
     if (!selectedConnection || !pairingCode) return "";
@@ -311,15 +281,6 @@ export function TallyPrimeDashboard() {
           ? current
           : nextConnections[0]?.id || ""
       );
-
-      const companyResponse = await apiFetch("/api/tally/companies", {
-        method: "GET",
-        cache: "no-store",
-      });
-      if (companyResponse.ok) {
-        const companyPayload = (await companyResponse.json()) as CompaniesResponse;
-        setCompanies(companyPayload.companies ?? []);
-      }
     } catch (error) {
       setMessage({
         tone: "error",
@@ -493,45 +454,39 @@ export function TallyPrimeDashboard() {
 
   if (view === "home") {
     return (
-      <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
-        <div className="mb-8 border-b border-[#e5ddd0] pb-6">
-          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200/50 text-[10px] font-bold uppercase tracking-wider text-amber-800">
-            <Sparkles className="h-3 w-3 text-amber-600 animate-spin duration-3000" />
-            ERP Sync Bridge
-          </div>
-          <h1 className="text-3xl font-black tracking-tight text-[#1a1a1a] mt-2 flex items-center gap-2">
-            Tally Prime Integration
-          </h1>
-          <p className="text-xs font-semibold text-slate-500 mt-1">
-            Sync your dealer verification workflows directly with Tally Prime company ledgers.
+      <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto">
+        <div className="mb-6">
+          <h2 className="text-xl font-black tracking-tight text-[#1a1a1a]">Tally Prime</h2>
+          <p className="mt-1 max-w-2xl text-sm font-medium text-[#8a7f72]">
+            Choose what you want to work on.
           </p>
         </div>
 
         {message ? (
           <div
             className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${message.tone === "success"
-                ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-                : "border-red-200 bg-red-50 text-red-800"
+                ? "border-[#10b981]/20 bg-[#ecfdf5] text-[#047857]"
+                : "border-[#ef4444]/20 bg-[#fff1f2] text-[#b91c1c]"
               }`}
           >
             {message.text}
           </div>
         ) : null}
 
-        <div className="grid gap-5 md:grid-cols-2">
+        <div className="grid gap-4 md:grid-cols-2">
           <HubCard
-            description="Configure, test, or launch the Tally desktop sync connector."
-            icon={<Server className="h-5.5 w-5.5" />}
+            description="Set up or check the Tally connector."
+            icon={<Server className="h-5 w-5" />}
             onClick={() => setView("connection")}
-            status={loading ? "Checking..." : getStatusLabel(selectedConnection)}
+            status={loading ? "Checking" : getStatusLabel(selectedConnection)}
             title="Tally Connection"
           />
           <HubCard
-            description="Import, review, and post digitized bank statement entries."
-            icon={<FileText className="h-5.5 w-5.5" />}
+            description="Import, review, and post bank statement entries."
+            icon={<FileText className="h-5 w-5" />}
             onClick={() => router.push("/bank-statements")}
-            status="Open Ledgers"
-            title="Bank Statements"
+            status="Open"
+            title="Bank Statement"
           />
         </div>
       </div>
@@ -539,29 +494,64 @@ export function TallyPrimeDashboard() {
   }
 
   return (
-    <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
+    <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto">
       <div className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <button
-            className="mb-3 flex items-center gap-2 text-xs font-bold text-slate-400 hover:text-[#1a1a1a] transition-all"
+            className="mb-3 flex items-center gap-2 text-sm font-bold text-[#756a5f] hover:text-[#1a1a1a]"
             onClick={() => setView("home")}
             type="button"
           >
             <ArrowLeft className="h-4 w-4" />
-            Back to Tally Home
+            Back
           </button>
-          <h2 className="text-2xl font-black tracking-tight text-[#1a1a1a]">Tally Connection</h2>
-          <p className="mt-1 text-xs font-semibold text-slate-500">
-            Connect Tally Prime to sync workflows and post bank statement ledger entries.
+          <h2 className="text-xl font-black tracking-tight text-[#1a1a1a]">Tally Connection</h2>
+          <p className="mt-1 max-w-2xl text-sm font-medium text-[#8a7f72]">
+            Connect Tally Prime to post bank statement entries.
           </p>
+        </div>
+
+        <div className="flex flex-wrap gap-2">
+          <Button
+            className="rounded-xl border-[#e5ddd0] bg-white text-[#1a1a1a] hover:bg-[#f3eee7]"
+            disabled={loading}
+            onClick={() => void loadConnections()}
+            type="button"
+            variant="outline"
+          >
+            <RefreshCw className="h-4 w-4" />
+            Refresh
+          </Button>
+          {connectorActive ? (
+            <Button
+              className="rounded-xl border-[#fecaca] bg-white px-5 font-bold text-[#991b1b] hover:bg-[#fff1f2]"
+              disabled={disconnecting}
+              onClick={() => void disconnectConnector()}
+              type="button"
+              variant="outline"
+            >
+              {disconnecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+              Disconnect
+            </Button>
+          ) : (
+            <Button
+              className="rounded-xl bg-[#1a1a1a] px-5 font-bold text-white"
+              disabled={creating}
+              onClick={() => void connectConnector()}
+              type="button"
+            >
+              {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+              Connect
+            </Button>
+          )}
         </div>
       </div>
 
       {message ? (
         <div
           className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${message.tone === "success"
-              ? "border-emerald-255 bg-emerald-50 text-emerald-800"
-              : "border-red-255 bg-red-50 text-red-800"
+              ? "border-[#10b981]/20 bg-[#ecfdf5] text-[#047857]"
+              : "border-[#ef4444]/20 bg-[#fff1f2] text-[#b91c1c]"
             }`}
         >
           {message.text}
@@ -571,81 +561,71 @@ export function TallyPrimeDashboard() {
       {loading ? (
         <div className="grid gap-4 md:grid-cols-3">
           {Array.from({ length: 3 }).map((_, index) => (
-            <div key={index} className="h-28 animate-pulse rounded-2xl bg-white border border-[#e5ddd0]" />
+            <div key={index} className="h-28 animate-pulse rounded-xl bg-[#f3eee7]" />
           ))}
         </div>
       ) : selectedConnection ? (
         <div className="space-y-5">
-          <div className="rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
-            <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex items-start gap-4">
-                <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-amber-50 border border-amber-100/50 text-amber-700">
-                  <Server className="h-5.5 w-5.5" />
+          <div className="rounded-xl border border-[#e5ddd0] bg-white p-5 shadow-sm">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex items-start gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-[#1a1a1a] text-white">
+                  <Server className="h-5 w-5" />
                 </div>
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="text-base font-extrabold text-[#1a1a1a]">{selectedConnection.displayName}</h3>
+                    <h3 className="text-base font-black text-[#1a1a1a]">{selectedConnection.displayName}</h3>
                     <Badge
                       className={
                         statusTone === "success"
-                          ? "border-emerald-250 bg-emerald-50 text-emerald-800"
+                          ? "border-[#10b981]/20 bg-[#ecfdf5] text-[#047857]"
                           : statusTone === "error"
-                            ? "border-red-255 bg-red-55 text-red-855"
+                            ? "border-[#ef4444]/20 bg-[#fff1f2] text-[#b91c1c]"
                             : statusTone === "warning"
-                              ? "border-amber-250 bg-amber-50 text-amber-800"
-                              : "border-[#e5ddd0] bg-white text-slate-500"
+                              ? "border-[#f59e0b]/20 bg-[#fff7e6] text-[#a16207]"
+                              : "border-[#e5ddd0] bg-white text-[#8a7f72]"
                       }
                       variant="outline"
                     >
                       {getStatusLabel(selectedConnection)}
                     </Badge>
                   </div>
-                  <div className="mt-1 text-sm font-semibold text-slate-500">
-                    {selectedCompany ? formatCompanyOptionLabel(selectedCompany) : companyDetail}
+                  <div className="mt-1 text-sm font-medium text-[#8a7f72]">
+                    {companyDetail}
                   </div>
                 </div>
               </div>
 
-              <div className="flex flex-wrap gap-2.5">
+              <div className="flex flex-wrap gap-2">
                 <Button
-                  className="rounded-xl border-[#e5ddd0] bg-white text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
-                  disabled={loading}
-                  onClick={() => void loadConnections()}
-                  type="button"
-                  variant="outline"
-                >
-                  <RefreshCw className="h-3.5 w-3.5 mr-1" />
-                  Refresh
-                </Button>
-                <Button
-                  className="w-fit rounded-xl border-[#e5ddd0] bg-white text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
+                  className="w-fit rounded-xl border-[#e5ddd0] bg-white text-[#1a1a1a] hover:bg-[#f3eee7]"
                   disabled={testing}
                   onClick={() => void requestTest()}
                   type="button"
                   variant="outline"
                 >
-                  {testing ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <RefreshCw className="h-3.5 w-3.5 mr-1.5" />}
-                  Test Connection
+                  {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                  Test
                 </Button>
                 {connectorActive ? (
                   <Button
-                    className="w-fit rounded-xl border-red-250 bg-red-50 text-xs font-bold text-red-800 hover:bg-red-100 hover:text-red-900 shadow-sm transition-all"
+                    className="w-fit rounded-xl border-[#fecaca] bg-white text-[#991b1b] hover:bg-[#fff1f2]"
                     disabled={disconnecting}
                     onClick={() => void disconnectConnector()}
                     type="button"
                     variant="outline"
                   >
-                    {disconnecting ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <PlugZap className="h-3.5 w-3.5 mr-1.5" />}
+                    {disconnecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
                     Disconnect
                   </Button>
                 ) : (
                   <Button
-                    className="w-fit rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] text-xs font-bold text-white shadow-md transition-all"
+                    className="w-fit rounded-xl bg-[#1a1a1a] text-white"
                     disabled={creating}
                     onClick={() => void connectConnector()}
                     type="button"
                   >
-                    {creating ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <PlugZap className="h-3.5 w-3.5 mr-1.5" />}
+                    {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
                     Connect
                   </Button>
                 )}
@@ -673,25 +653,78 @@ export function TallyPrimeDashboard() {
               value={selectedConnection.lastCompanyLoaded ? "Loaded" : "Not detected"}
             />
           </div>
+
+          <section className="rounded-xl border border-[#e5ddd0] bg-[#fffaf2] p-5 shadow-sm">
+            <div className="mb-4">
+              <div className="text-[11px] font-black uppercase tracking-[0.18em] text-[#8a7f72]">
+                Connector
+              </div>
+              <h3 className="mt-2 text-base font-black text-[#1a1a1a]">One-click Tally bridge</h3>
+              <p className="mt-1 max-w-2xl text-sm font-medium text-[#6f6256]">
+                Use Connect on the computer where Tally Prime is installed. Keep the desktop connector running while posting entries.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              {connectorActive ? (
+                <Button
+                  className="rounded-xl border-[#fecaca] bg-white px-5 font-bold text-[#991b1b] hover:bg-[#fff1f2]"
+                  disabled={disconnecting}
+                  onClick={() => void disconnectConnector()}
+                  type="button"
+                  variant="outline"
+                >
+                  {disconnecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+                  Disconnect
+                </Button>
+              ) : (
+                <Button
+                  className="rounded-xl bg-[#1a1a1a] px-5 font-bold text-white"
+                  disabled={creating}
+                  onClick={() => void connectConnector()}
+                  type="button"
+                >
+                  {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+                  Connect
+                </Button>
+              )}
+            </div>
+
+            <details className="mt-5 rounded-xl border border-[#e3d6c6] bg-white p-4">
+              <summary className="cursor-pointer text-sm font-black text-[#1a1a1a]">
+                Advanced manual commands
+              </summary>
+              <div className="mt-4 space-y-3">
+                {pairCommand ? (
+                  <CommandBlock command={pairCommand} onCopy={(value) => void copyText(value)} title="1. Pair connector" />
+                ) : (
+                  <div className="rounded-xl border border-[#e3d6c6] bg-white px-4 py-3 text-sm font-semibold text-[#7c6f62]">
+                    Use Connect to create a fresh pairing code.
+                  </div>
+                )}
+                <CommandBlock command={startCommand} onCopy={(value) => void copyText(value)} title="2. Start connector" />
+              </div>
+            </details>
+          </section>
         </div>
       ) : (
-        <div className="flex min-h-[320px] items-center justify-center rounded-2xl border-2 border-dashed border-[#e5ddd0] bg-white p-8 text-center shadow-sm">
+        <div className="flex min-h-[320px] items-center justify-center rounded-xl border border-dashed border-[#d8ccbc] bg-[#fafafa] p-8 text-center">
           <div>
-            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-amber-50 border border-amber-200/50 text-amber-700">
-              <PlugZap className="h-6 w-6 animate-pulse" />
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-[#1a1a1a] text-white">
+              <PlugZap className="h-6 w-6" />
             </div>
-            <h3 className="mt-4 text-base font-extrabold text-[#1a1a1a]">No Tally connection found</h3>
-            <p className="mt-1.5 text-xs font-semibold text-slate-400 max-w-sm">
-              Bridge this workstation to start the Tally Prime desktop agent and sync ledgers.
+            <h3 className="mt-4 text-base font-black text-[#1a1a1a]">No Tally connection yet</h3>
+            <p className="mt-1 max-w-md text-sm font-medium text-[#8a7f72]">
+              Connect this computer to start the Tally desktop connector.
             </p>
             <Button
-              className="mt-6 rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] px-6 py-5 text-xs font-bold text-white shadow-md transition-all"
+              className="mt-5 rounded-xl bg-[#1a1a1a] px-5 font-bold text-white"
               disabled={creating}
               onClick={() => void connectConnector()}
               type="button"
             >
-              {creating ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <PlugZap className="h-3.5 w-3.5 mr-1.5" />}
-              Connect Bridge
+              {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+              Connect
             </Button>
           </div>
         </div>
