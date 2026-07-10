@@ -5,12 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const BRIDGE_VERSION = "0.1.8";
+const BRIDGE_VERSION = "0.1.12";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
 const CONFIG_DIR = path.join(os.homedir(), ".autodealer-tally-bridge");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+const DEFAULT_TALLY_DATA_ROOT = path.join(process.env.PUBLIC || "C:\\Users\\Public", "TallyPrime", "data");
 const CURRENT_FILE = fileURLToPath(import.meta.url);
 
 function parseArgs(argv) {
@@ -209,9 +210,12 @@ function buildTallyReadinessXml(companyName) {
   ].join("");
 }
 
-function buildCollectionExportXml({ collectionName, tallyType, fetchFields, companyName }) {
+function buildCollectionExportXml({ collectionName, tallyType, fetchFields, companyName, childOf }) {
   const companyVariable = companyName
     ? `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>`
+    : "";
+  const childOfFilter = childOf
+    ? `<ADD>CHILD OF : ${escapeXml(childOf)}</ADD>`
     : "";
 
   return [
@@ -232,7 +236,65 @@ function buildCollectionExportXml({ collectionName, tallyType, fetchFields, comp
     "<TDLMESSAGE>",
     `<COLLECTION NAME="${escapeXml(collectionName)}" ISMODIFY="No">`,
     `<TYPE>${escapeXml(tallyType)}</TYPE>`,
+    childOfFilter,
     `<FETCH>${escapeXml(fetchFields)}</FETCH>`,
+    "</COLLECTION>",
+    "</TDLMESSAGE>",
+    "</TDL>",
+    "</DESC>",
+    "</BODY>",
+    "</ENVELOPE>",
+  ].join("");
+}
+
+function buildBankLedgersExportXml(companyName) {
+  const companyVariable = companyName
+    ? `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>`
+    : "";
+  const nativeMethods = [
+    "Name",
+    "Parent",
+    "GUID",
+    "BankName",
+    "Bank",
+    "BankerName",
+    "BankAccountNumber",
+    "AccountNumber",
+    "BankAccountNo",
+    "BankAcNo",
+    "AcNumber",
+    "IFSCCODE",
+    "IFSCODE",
+    "IFSC",
+    "BankIFSCCODE",
+    "BranchName",
+    "BankBranchName",
+    "Branch",
+    "BankAccHolderName",
+    "BankAccountName",
+    "BankAccountHolderName",
+    "AccountHolderName",
+  ];
+
+  return [
+    "<ENVELOPE>",
+    "<HEADER>",
+    "<VERSION>1</VERSION>",
+    "<TALLYREQUEST>Export</TALLYREQUEST>",
+    "<TYPE>Collection</TYPE>",
+    "<ID>List of Ledgers</ID>",
+    "</HEADER>",
+    "<BODY>",
+    "<DESC>",
+    "<STATICVARIABLES>",
+    companyVariable,
+    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
+    "</STATICVARIABLES>",
+    "<TDL>",
+    "<TDLMESSAGE>",
+    '<COLLECTION NAME="List of Ledgers" ISMODIFY="Yes">',
+    "<ADD>CHILD OF : Bank Accounts</ADD>",
+    ...nativeMethods.map((method) => `<NATIVEMETHOD>${escapeXml(method)}</NATIVEMETHOD>`),
     "</COLLECTION>",
     "</TDLMESSAGE>",
     "</TDL>",
@@ -244,8 +306,9 @@ function buildCollectionExportXml({ collectionName, tallyType, fetchFields, comp
 
 function buildAlterLedgerXml(payload, fallbackCompanyName) {
   const oldName = payload?.oldName;
-  const newName = payload?.newName;
+  const newName = payload?.newName || oldName;
   const parentName = payload?.parentName;
+  const phoneNumber = payload?.phoneNumber || payload?.ledgerMobile || payload?.ledgerPhone;
   const companyName = payload?.companyName || fallbackCompanyName;
 
   if (!oldName || !newName) {
@@ -256,6 +319,13 @@ function buildAlterLedgerXml(payload, fallbackCompanyName) {
     ? `<SVCurrentCompany>${escapeXml(companyName)}</SVCurrentCompany>`
     : "";
   const parentBlock = parentName ? `<PARENT>${escapeXml(parentName)}</PARENT>` : "";
+  const phoneBlock = phoneNumber
+    ? [
+        `<LEDGERMOBILE>${escapeXml(phoneNumber)}</LEDGERMOBILE>`,
+        `<LEDGERPHONE>${escapeXml(phoneNumber)}</LEDGERPHONE>`,
+        `<PHONENUMBER>${escapeXml(phoneNumber)}</PHONENUMBER>`,
+      ].join("")
+    : "";
 
   return [
     "<ENVELOPE>",
@@ -275,6 +345,7 @@ function buildAlterLedgerXml(payload, fallbackCompanyName) {
     `<LEDGER NAME="${escapeXml(oldName)}" ACTION="Alter">`,
     `<NAME>${escapeXml(newName)}</NAME>`,
     parentBlock,
+    phoneBlock,
     "<LANGUAGENAME.LIST>",
     '<NAME.LIST TYPE="String">',
     `<NAME>${escapeXml(newName)}</NAME>`,
@@ -949,6 +1020,116 @@ async function fetchActiveCompanyName(tallyUrl, companyName) {
   }
 }
 
+async function fetchAvailableCompanyNames(tallyUrl) {
+  const apiNames = [];
+
+  try {
+    const xml = await exportTallyCollection(tallyUrl, {
+      collectionName: "Autodealer Available Companies",
+      tallyType: "Company",
+      fetchFields: "Name,Guid,StartingFrom,BooksFrom,FinancialYearFrom,CurrentPeriod,AlterID,MasterID",
+      companyName: null,
+    });
+    const seen = new Set();
+
+    for (const companyBlock of extractBlocks(xml, "COMPANY")) {
+      const name = getTagText(companyBlock, "NAME") || getAttribute(companyBlock, "NAME");
+      const normalized = typeof name === "string" ? name.trim() : "";
+      if (!normalized) continue;
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      apiNames.push(normalized);
+    }
+  } catch {
+    // Tally's HTTP API returns an empty Company collection when no company is loaded.
+  }
+
+  return mergeCompanyNames(apiNames);
+}
+
+function mergeCompanyNames(values) {
+  const seen = new Set();
+  const names = [];
+
+  for (const value of values) {
+    const normalized = typeof value === "string" ? value.trim() : "";
+    if (!normalized) continue;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    names.push(normalized);
+  }
+
+  return names;
+}
+
+function tallyDataRoots() {
+  return mergeCompanyNames([
+    process.env.KALIKA_TALLY_DATA_ROOT,
+    process.env.TALLY_DATA_ROOT,
+    process.env.TALLY_DATA_PATH,
+    DEFAULT_TALLY_DATA_ROOT,
+  ]);
+}
+
+function readLocalTallyCompanyNames() {
+  const names = [];
+
+  for (const dataRoot of tallyDataRoots()) {
+    try {
+      if (!fs.existsSync(dataRoot)) continue;
+      const entries = fs.readdirSync(dataRoot, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+        const companyDir = path.join(dataRoot, entry.name);
+        const companyName =
+          readTallyCompanyNameFromFile(path.join(companyDir, "Company.1800")) ||
+          readTallyCompanyNameFromFile(path.join(companyDir, "CmpSave.1800"));
+        if (companyName) {
+          names.push(companyName);
+        }
+      }
+    } catch {
+      // Local folder fallback is best-effort; heartbeat should still continue.
+    }
+  }
+
+  return mergeCompanyNames(names);
+}
+
+function readTallyCompanyNameFromFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const buffer = fs.readFileSync(filePath);
+    const candidates = [
+      ...extractReadableTallyStrings(buffer.toString("utf16le")),
+      ...extractReadableTallyStrings(buffer.toString("latin1")),
+    ];
+    return candidates.find(isLikelyTallyCompanyName) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function extractReadableTallyStrings(text) {
+  return [...String(text).matchAll(/[A-Za-z0-9][A-Za-z0-9 .&()/_-]{1,78}/g)]
+    .map((match) => match[0].replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+}
+
+function isLikelyTallyCompanyName(value) {
+  const normalized = String(value ?? "").trim();
+  const lower = normalized.toLowerCase();
+
+  if (!normalized || normalized.length < 2 || normalized.length > 80) return false;
+  if (/^\d+$/.test(normalized)) return false;
+  if (lower.includes("company features")) return false;
+  if (lower === "company" || lower === "tally" || lower === "tally prime") return false;
+  if (lower.startsWith("alter ") || lower.startsWith("create ")) return false;
+  return /[a-z]/i.test(normalized);
+}
+
 function parseTallyImportResult(text, httpStatus) {
   const lineError = getTagText(text, "LINEERROR");
   const statusText = getTagText(text, "STATUS");
@@ -1099,12 +1280,20 @@ function previewXml(xml) {
 }
 
 async function exportTallyCollection(tallyUrl, options) {
+  return exportTallyXml(
+    tallyUrl,
+    buildCollectionExportXml(options),
+    options.collectionName
+  );
+}
+
+async function exportTallyXml(tallyUrl, xml, label = "Tally export") {
   const response = await fetch(tallyUrl, {
     method: "POST",
     headers: {
       "Content-Type": "text/xml",
     },
-    body: buildCollectionExportXml(options),
+    body: xml,
   });
 
   const text = await response.text();
@@ -1112,7 +1301,7 @@ async function exportTallyCollection(tallyUrl, options) {
   if (!result.success) {
     throw new Error(
       result.error ||
-        `Tally export failed for ${options.collectionName} with HTTP ${response.status}.`
+        `Tally export failed for ${label} with HTTP ${response.status}.`
     );
   }
 
@@ -1196,6 +1385,11 @@ function toMaster(block, tagName) {
     raw: {
       tallyTag: tagName,
       reservedName: getAttribute(block, "RESERVEDNAME"),
+      bankName,
+      bankAccountNumber,
+      ifscCode,
+      branchName,
+      accountHolderName,
       taxType: getTagText(block, "TAXTYPE"),
       gstDutyHead: getTagText(block, "GSTDUTYHEAD"),
       billWiseEnabled: /^yes$/i.test(getTagText(block, "ISBILLWISEON")),
@@ -1620,6 +1814,73 @@ function isTaxLedger(master) {
   );
 }
 
+function toBankLedgerPayload(master) {
+  return {
+    name: master.name,
+    parent: master.parent || "Bank Accounts",
+    guid: master.guid || null,
+    bankName: master.bankName || null,
+    bankAccountNumber: master.bankAccountNumber || null,
+    ifscCode: master.ifscCode || null,
+    branchName: master.branchName || null,
+    accountHolderName: master.accountHolderName || null,
+  };
+}
+
+async function fetchBankLedgersFromTally(config, commandPayload = {}) {
+  const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
+  const companyNames = mergeCompanyNames([
+    ...(Array.isArray(commandPayload.companyNames) ? commandPayload.companyNames : []),
+    commandPayload.companyName,
+    config.companyName,
+  ]);
+  const targets = companyNames.length > 0 ? companyNames : [null];
+  const byCompany = {};
+  const errors = [];
+
+  for (const companyName of targets) {
+    const key = companyName || "Current company";
+    try {
+      const xml = await exportTallyXml(
+        tallyUrl,
+        buildBankLedgersExportXml(companyName),
+        `Bank ledgers for ${key}`
+      );
+      byCompany[key] = parseMasterCollection(xml, "LEDGER")
+        .filter(
+          (master) =>
+            !master.parent ||
+            normalizeLooseName(master.parent) === normalizeLooseName("Bank Accounts")
+        )
+        .map(toBankLedgerPayload);
+    } catch (error) {
+      errors.push({
+        companyName: key,
+        error: error instanceof Error ? error.message : String(error ?? "Could not fetch bank ledgers."),
+      });
+      byCompany[key] = [];
+    }
+  }
+
+  if (Object.values(byCompany).every((ledgers) => !Array.isArray(ledgers) || ledgers.length === 0) && errors.length === targets.length) {
+    throw new Error(errors[0]?.error || "Could not fetch bank ledgers from Tally.");
+  }
+
+  const firstCompanyName = targets[0] || "Current company";
+
+  return {
+    success: true,
+    result: {
+      source: "tally_bank_accounts_group",
+      companyName: firstCompanyName,
+      companyNames: targets.filter(Boolean),
+      bankLedgers: byCompany[firstCompanyName] || [],
+      byCompany,
+      errors,
+    },
+  };
+}
+
 async function collectTallyMasters(config, commandPayload = {}) {
   const companyName = commandPayload.companyName || config.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
@@ -1766,14 +2027,20 @@ async function testTally(tallyUrl, companyName) {
       };
     }
 
-    const companyLoaded = !lineError && status === "1";
+    const possibleCompanyLoaded = !lineError && status === "1";
     const activeCompanyName =
-      responseCompanyName || (companyLoaded ? await fetchActiveCompanyName(normalizeTallyUrl(tallyUrl), companyName) : null);
+      responseCompanyName ||
+      (possibleCompanyLoaded ? await fetchActiveCompanyName(normalizeTallyUrl(tallyUrl), companyName) : null);
+    const cmpLedgerCount = Number(getTagText(text, "LEDGER") ?? 0);
+    const hasExportedLedgerBlocks = /<DATA>[\s\S]*<LEDGER\b[^>]*(?:NAME|RESERVEDNAME)=/i.test(text);
+    const companyLoaded =
+      possibleCompanyLoaded &&
+      Boolean(responseCompanyName || activeCompanyName || cmpLedgerCount > 0 || hasExportedLedgerBlocks);
 
     return {
       tallyReachable: true,
       companyLoaded,
-      companyName: activeCompanyName ?? companyName ?? null,
+      companyName: companyLoaded ? activeCompanyName ?? companyName ?? null : null,
       error: lineError,
     };
   } catch (error) {
@@ -1847,6 +2114,27 @@ async function runCommand(config, command) {
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error ?? "Master sync failed.");
+      await sendCommandResult(config, command, {
+        success: false,
+        result: {},
+        error: message,
+      });
+      console.log(`Command ${command.id} failed: ${message}`);
+    }
+    return;
+  }
+
+  if (command.commandType === "fetch_bank_ledgers") {
+    try {
+      const outcome = await fetchBankLedgersFromTally(config, command.payload);
+      await sendCommandResult(config, command, outcome);
+      const count = Object.values(outcome.result?.byCompany || {}).reduce(
+        (total, ledgers) => total + (Array.isArray(ledgers) ? ledgers.length : 0),
+        0
+      );
+      console.log(`Command ${command.id} completed: fetched ${count} bank ledger(s).`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Bank ledger fetch failed.");
       await sendCommandResult(config, command, {
         success: false,
         result: {},
@@ -2150,7 +2438,7 @@ async function pairBridge(args) {
   console.log(`Config saved to ${CONFIG_PATH}`);
 }
 
-async function sendHeartbeat(config, testResult) {
+async function sendHeartbeat(config, testResult, availableCompanies = []) {
   const companyName = testResult.companyName || config.companyName || null;
   const response = await fetch(`${config.apiBase}/api/tally/bridge/heartbeat`, {
     method: "POST",
@@ -2164,6 +2452,7 @@ async function sendHeartbeat(config, testResult) {
       bridgeVersion: BRIDGE_VERSION,
       ...testResult,
       companyName,
+      companies: availableCompanies,
     }),
   });
   const payload = await readJsonResponse(response);
@@ -2180,11 +2469,13 @@ async function sendHeartbeat(config, testResult) {
 async function runOnce(config) {
   const result = await testTally(config.tallyUrl, config.companyName);
   rememberDetectedCompanyName(config, result.companyName);
-  const heartbeat = await sendHeartbeat(config, result);
+  const availableCompanies = result.tallyReachable ? await fetchAvailableCompanyNames(config.tallyUrl) : [];
+  const heartbeat = await sendHeartbeat(config, result, availableCompanies);
   const company = result.companyName ? ` Company: ${result.companyName}.` : "";
+  const companyList = availableCompanies.length > 0 ? ` Companies: ${availableCompanies.join(", ")}.` : "";
   const error = result.error ? ` Error: ${result.error}` : "";
   console.log(
-    `Heartbeat sent. Tally reachable: ${result.tallyReachable}. Company loaded: ${result.companyLoaded}.${company}${error}`
+    `Heartbeat sent. Tally reachable: ${result.tallyReachable}. Company loaded: ${result.companyLoaded}.${company}${companyList}${error}`
   );
 
   try {
@@ -2404,6 +2695,30 @@ async function syncMastersCli(args) {
     companyName: args["company-name"] || nextConfig.companyName,
     tallyUrl: nextConfig.tallyUrl,
   });
+
+  console.log(JSON.stringify(outcome.result, null, 2));
+}
+
+async function listBankLedgersCli(args) {
+  const config = readConfig();
+  if (!config && !args["tally-url"]) {
+    throw new Error(`Bridge is not paired. Run pair first or pass --tally-url. Expected config at ${CONFIG_PATH}`);
+  }
+
+  const companyNames = args["company-names"]
+    ? String(args["company-names"]).split(",").map((value) => value.trim()).filter(Boolean)
+    : [];
+  const outcome = await fetchBankLedgersFromTally(
+    {
+      ...(config || {}),
+      tallyUrl: normalizeTallyUrl(args["tally-url"] || config?.tallyUrl),
+      companyName: args["company-name"] || config?.companyName || null,
+    },
+    {
+      companyName: args["company-name"] || config?.companyName || null,
+      companyNames,
+    }
+  );
 
   console.log(JSON.stringify(outcome.result, null, 2));
 }
@@ -2749,6 +3064,11 @@ async function main() {
     return;
   }
 
+  if (command === "list-bank-ledgers") {
+    await listBankLedgersCli(args);
+    return;
+  }
+
   if (command === "validate-bank-voucher") {
     await validateBankVoucherCli(args);
     return;
@@ -2783,6 +3103,7 @@ async function main() {
   console.log("  node apps/tally-bridge/src/bridge.mjs pair --api-base <url> --connection-id <id> --pairing-code <code> --company-name <name>");
   console.log("  node apps/tally-bridge/src/bridge.mjs start --company-name <name>");
   console.log("  node apps/tally-bridge/src/bridge.mjs sync-masters --company-name <name>");
+  console.log("  node apps/tally-bridge/src/bridge.mjs list-bank-ledgers --company-name <name>");
   console.log("  node apps/tally-bridge/src/bridge.mjs validate-bank-voucher --payload-file <path>");
   console.log("  node apps/tally-bridge/src/bridge.mjs diagnose-bank-voucher --payload-file <path> --post true --output-dir ./tally-diagnostics");
   console.log("  node apps/tally-bridge/src/bridge.mjs diagnose-bank-voucher-dates --payload-file <path> --dates 2026-04-01,2026-06-03");

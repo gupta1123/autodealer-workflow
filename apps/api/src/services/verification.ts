@@ -74,6 +74,20 @@ const MULTI_INSTANCE_IDENTIFIER_FIELDS = new Set<FieldKey>([
   "fastagReference",
   "transactionReference",
 ]);
+const MULTI_INVOICE_PARTIAL_FIELDS = new Set<FieldKey>([
+  "invoiceNumber",
+  "vehicleNumber",
+  "subtotal",
+  "taxAmount",
+  "totalAmount",
+  "itemQuantity",
+]);
+const MULTI_INVOICE_AGGREGATE_FIELDS = new Set<FieldKey>([
+  "subtotal",
+  "taxAmount",
+  "totalAmount",
+  "itemQuantity",
+]);
 const EXPECTATION_FIELD_ALIASES: Partial<Record<FieldKey, FieldKey[]>> = {
   poNumber: ["poNumber", "referencePoNumber"],
   invoiceNumber: ["invoiceNumber", "referenceInvoiceNumber"],
@@ -114,11 +128,19 @@ export interface VerificationGroup {
   documentIds: string[];
   sourceFileNames: string[];
   referenceKeys: string[];
+  roleSelection?: VerificationRoleSelection;
 }
 
 export interface GroupedVerificationResult {
   groups: VerificationGroup[];
   mismatches: Omit<Mismatch, "analysis" | "fixPlan">[];
+}
+
+export interface VerificationRoleSelection {
+  strategy: "seller_chain";
+  primaryDocumentIds: string[];
+  contextDocumentIds: string[];
+  note: string;
 }
 
 function shouldExpectField(doc: CaseDoc, field: FieldKey) {
@@ -336,6 +358,447 @@ function shouldSuppressSplitWeighmentMismatch(
 
   const hasNonWeighmentValue = populated.some((entry) => entry.doc.type !== "Weighment Slip");
   return !hasNonWeighmentValue || context.aggregateMatches;
+}
+
+function normalizeDocReference(doc: CaseDoc, field: FieldKey, comparisonOptions: ComparisonOptions) {
+  return normalizeGroupValue(getComparableFieldValue(doc, field), comparisonOptions, field);
+}
+
+function getLineItemTaxAmount(line: CommercialLineItem) {
+  const direct = parseNumber(line.taxAmount);
+  if (direct !== null) return direct;
+
+  const componentAmounts = [line.cgstAmount, line.sgstAmount, line.igstAmount]
+    .map((value) => parseNumber(value))
+    .filter((value): value is number => value !== null);
+  return componentAmounts.length ? componentAmounts.reduce((sum, value) => sum + value, 0) : null;
+}
+
+function sumLineItemNumericValues(
+  lines: CommercialLineItem[] | undefined,
+  getValue: (line: CommercialLineItem) => number | null
+) {
+  let total = 0;
+  let count = 0;
+
+  for (const line of lines ?? []) {
+    const value = getValue(line);
+    if (value === null) continue;
+    total += value;
+    count += 1;
+  }
+
+  return count > 0 ? total : null;
+}
+
+function getLineItemAggregateValue(doc: CaseDoc, field: FieldKey): number | null {
+  if (field === "itemQuantity") {
+    return sumLineItemNumericValues(
+      doc.lineItems,
+      (line) => convertQuantityToBase(line.quantity, line.unit) ?? parseNumber(line.quantity)
+    );
+  }
+
+  if (field === "subtotal") {
+    return sumLineItemNumericValues(doc.lineItems, (line) =>
+      parseNumber(line.taxableAmount ?? line.lineTotal)
+    );
+  }
+
+  if (field === "taxAmount") {
+    return sumLineItemNumericValues(doc.lineItems, getLineItemTaxAmount);
+  }
+
+  if (field === "totalAmount") {
+    const lineTotal = sumLineItemNumericValues(doc.lineItems, (line) => parseNumber(line.lineTotal));
+    if (lineTotal !== null) return lineTotal;
+
+    const subtotal = getLineItemAggregateValue(doc, "subtotal");
+    const taxAmount = getLineItemAggregateValue(doc, "taxAmount");
+    return subtotal !== null && taxAmount !== null ? subtotal + taxAmount : null;
+  }
+
+  return null;
+}
+
+function getNumericDocumentFieldValue(doc: CaseDoc, field: FieldKey) {
+  if (field === "itemQuantity") {
+    return (
+      convertQuantityToBase(doc.fields.itemQuantity, doc.fields.unit) ??
+      parseNumber(doc.fields.itemQuantity) ??
+      getLineItemAggregateValue(doc, field)
+    );
+  }
+
+  if (MULTI_INVOICE_AGGREGATE_FIELDS.has(field)) {
+    return parseNumber(getComparableFieldValue(doc, field)) ?? getLineItemAggregateValue(doc, field);
+  }
+
+  return null;
+}
+
+type PartyIdentity = {
+  gstin: string | null;
+  name: string | null;
+};
+
+function getPartyIdentity(
+  doc: CaseDoc,
+  comparisonOptions: ComparisonOptions,
+  gstinField: "supplierGstin" | "buyerGstin",
+  nameField: "vendorName" | "buyerName"
+): PartyIdentity {
+  return {
+    gstin: normalizeGroupValue(doc.fields[gstinField], comparisonOptions, gstinField),
+    name: normalizeGroupValue(doc.fields[nameField], comparisonOptions, nameField),
+  };
+}
+
+function hasPartyIdentity(identity: PartyIdentity) {
+  return Boolean(identity.gstin || identity.name);
+}
+
+function partyIdentitiesMatch(left: PartyIdentity, right: PartyIdentity) {
+  if (left.gstin && right.gstin) return left.gstin === right.gstin;
+  if (left.name && right.name) return left.name === right.name || arePartyNamesEffectivelyEqual(left.name, right.name);
+  return false;
+}
+
+function partyIdentityMatchesAny(identity: PartyIdentity, candidates: PartyIdentity[]) {
+  return hasPartyIdentity(identity) && candidates.some((candidate) => partyIdentitiesMatch(identity, candidate));
+}
+
+function uniquePartyIdentities(identities: PartyIdentity[]) {
+  const unique: PartyIdentity[] = [];
+  for (const identity of identities) {
+    if (!hasPartyIdentity(identity)) continue;
+    if (unique.some((existing) => partyIdentitiesMatch(existing, identity))) continue;
+    unique.push(identity);
+  }
+  return unique;
+}
+
+function getInvoiceReference(doc: CaseDoc, comparisonOptions: ComparisonOptions) {
+  return normalizeDocReference(doc, "invoiceNumber", comparisonOptions);
+}
+
+function getSellerChainRoleSelection(
+  docs: CaseDoc[],
+  comparisonOptions: ComparisonOptions
+): VerificationRoleSelection | null {
+  const invoices = docs.filter((doc) => INVOICE_DOC_TYPES.has(doc.type));
+  if (invoices.length < 2) return null;
+
+  const purchaseDocs = docs.filter((doc) => PURCHASE_DOC_TYPES.has(doc.type));
+  if (!purchaseDocs.length) return null;
+
+  const purchaseBuyers = uniquePartyIdentities(
+    purchaseDocs.map((doc) => getPartyIdentity(doc, comparisonOptions, "buyerGstin", "buyerName"))
+  );
+  const purchaseVendors = uniquePartyIdentities(
+    purchaseDocs.map((doc) => getPartyIdentity(doc, comparisonOptions, "supplierGstin", "vendorName"))
+  );
+  if (!purchaseBuyers.length && !purchaseVendors.length) return null;
+
+  const primaryInvoices = invoices.filter((invoice) => {
+    const buyer = getPartyIdentity(invoice, comparisonOptions, "buyerGstin", "buyerName");
+    const supplier = getPartyIdentity(invoice, comparisonOptions, "supplierGstin", "vendorName");
+    const buyerIsFinalBuyer = partyIdentityMatchesAny(buyer, purchaseBuyers);
+    const buyerIsPoVendor = partyIdentityMatchesAny(buyer, purchaseVendors);
+    const supplierIsPoVendor = partyIdentityMatchesAny(supplier, purchaseVendors);
+    return buyerIsFinalBuyer || (supplierIsPoVendor && !buyerIsPoVendor);
+  });
+  if (!primaryInvoices.length) return null;
+
+  const primarySuppliers = uniquePartyIdentities([
+    ...purchaseVendors,
+    ...primaryInvoices.map((invoice) => getPartyIdentity(invoice, comparisonOptions, "supplierGstin", "vendorName")),
+  ]);
+
+  const upstreamInvoices = invoices.filter((invoice) => {
+    if (primaryInvoices.some((primary) => primary.id === invoice.id)) return false;
+    const buyer = getPartyIdentity(invoice, comparisonOptions, "buyerGstin", "buyerName");
+    const facesFinalBuyer = partyIdentityMatchesAny(buyer, purchaseBuyers);
+    return !facesFinalBuyer && partyIdentityMatchesAny(buyer, primarySuppliers);
+  });
+  if (!upstreamInvoices.length) return null;
+
+  const upstreamInvoiceRefs = new Set(
+    upstreamInvoices
+      .map((invoice) => getInvoiceReference(invoice, comparisonOptions))
+      .filter((value): value is string => Boolean(value))
+  );
+  const contextDocumentIds = new Set(upstreamInvoices.map((invoice) => invoice.id));
+
+  for (const doc of docs) {
+    if (contextDocumentIds.has(doc.id)) continue;
+    const reference = getInvoiceBranchReference(doc, comparisonOptions);
+    if (reference && upstreamInvoiceRefs.has(reference)) {
+      contextDocumentIds.add(doc.id);
+    }
+  }
+
+  return {
+    strategy: "seller_chain",
+    primaryDocumentIds: primaryInvoices.map((invoice) => invoice.id),
+    contextDocumentIds: [...contextDocumentIds],
+    note: "Seller-chain role selection applied: Kalika-facing invoice was reconciled; upstream seller invoices were kept as context.",
+  };
+}
+
+function documentsForRoleSelectedComparison(
+  docs: CaseDoc[],
+  roleSelection: VerificationRoleSelection | null
+) {
+  if (!roleSelection?.contextDocumentIds.length) return docs;
+  const contextIds = new Set(roleSelection.contextDocumentIds);
+  const comparableDocs = docs.filter((doc) => !contextIds.has(doc.id));
+  return comparableDocs.length >= 2 ? comparableDocs : docs;
+}
+
+function getSellerChainSourceDocumentIds(
+  sourceDocs: CaseDoc[],
+  comparisonOptions: ComparisonOptions
+) {
+  const roleSelection = getSellerChainRoleSelection(sourceDocs, comparisonOptions);
+  if (!roleSelection) return null;
+
+  const chainDocumentIds = new Set([
+    ...roleSelection.primaryDocumentIds,
+    ...roleSelection.contextDocumentIds,
+  ]);
+  const primaryInvoices = sourceDocs.filter((doc) => roleSelection.primaryDocumentIds.includes(doc.id));
+  const chainInvoiceRefs = new Set(
+    sourceDocs
+      .filter((doc) => chainDocumentIds.has(doc.id) && INVOICE_DOC_TYPES.has(doc.type))
+      .map((doc) => getInvoiceReference(doc, comparisonOptions))
+      .filter((value): value is string => Boolean(value))
+  );
+
+  for (const doc of sourceDocs) {
+    if (chainDocumentIds.has(doc.id)) continue;
+
+    if (PURCHASE_DOC_TYPES.has(doc.type)) {
+      const purchaseBuyer = getPartyIdentity(doc, comparisonOptions, "buyerGstin", "buyerName");
+      const purchaseVendor = getPartyIdentity(doc, comparisonOptions, "supplierGstin", "vendorName");
+      const anchorsPrimaryInvoice = primaryInvoices.some((invoice) => {
+        const invoiceBuyer = getPartyIdentity(invoice, comparisonOptions, "buyerGstin", "buyerName");
+        const invoiceSupplier = getPartyIdentity(invoice, comparisonOptions, "supplierGstin", "vendorName");
+        return partyIdentitiesMatch(invoiceBuyer, purchaseBuyer) || partyIdentitiesMatch(invoiceSupplier, purchaseVendor);
+      });
+      if (anchorsPrimaryInvoice) {
+        chainDocumentIds.add(doc.id);
+      }
+      continue;
+    }
+
+    const invoiceReference = getInvoiceBranchReference(doc, comparisonOptions);
+    if (invoiceReference && chainInvoiceRefs.has(invoiceReference)) {
+      chainDocumentIds.add(doc.id);
+    }
+  }
+
+  return chainDocumentIds;
+}
+
+function normalizedInvoicePartyField(doc: CaseDoc, field: FieldKey, comparisonOptions: ComparisonOptions) {
+  return normalizeGroupValue(doc.fields[field], comparisonOptions, field);
+}
+
+function invoicePartyValuesCompatible(left: CaseDoc, right: CaseDoc, comparisonOptions: ComparisonOptions) {
+  const partyFields: FieldKey[] = ["supplierGstin", "buyerGstin"];
+  return partyFields.every((field) => {
+    const leftValue = normalizedInvoicePartyField(left, field, comparisonOptions);
+    const rightValue = normalizedInvoicePartyField(right, field, comparisonOptions);
+    return !leftValue || !rightValue || leftValue === rightValue;
+  });
+}
+
+function invoiceNumericValuesCompatible(left: CaseDoc, right: CaseDoc) {
+  return [...MULTI_INVOICE_AGGREGATE_FIELDS].every((field) => {
+    const leftValue = getNumericDocumentFieldValue(left, field);
+    const rightValue = getNumericDocumentFieldValue(right, field);
+    return leftValue === null || rightValue === null || nearlyEqual(leftValue, rightValue);
+  });
+}
+
+function areInvoiceCopiesForAggregation(left: CaseDoc, right: CaseDoc, comparisonOptions: ComparisonOptions) {
+  const leftInvoiceNumber = normalizeDocReference(left, "invoiceNumber", comparisonOptions);
+  const rightInvoiceNumber = normalizeDocReference(right, "invoiceNumber", comparisonOptions);
+  return Boolean(
+    leftInvoiceNumber &&
+      rightInvoiceNumber &&
+      leftInvoiceNumber === rightInvoiceNumber &&
+      invoicePartyValuesCompatible(left, right, comparisonOptions) &&
+      invoiceNumericValuesCompatible(left, right)
+  );
+}
+
+function uniqueInvoiceDocumentsForAggregation(docs: CaseDoc[], comparisonOptions: ComparisonOptions) {
+  const uniqueInvoices: CaseDoc[] = [];
+
+  for (const doc of docs) {
+    if (!INVOICE_DOC_TYPES.has(doc.type)) continue;
+    if (uniqueInvoices.some((invoice) => areInvoiceCopiesForAggregation(invoice, doc, comparisonOptions))) continue;
+    uniqueInvoices.push(doc);
+  }
+
+  return uniqueInvoices;
+}
+
+function purchaseOrderReferences(docs: CaseDoc[], comparisonOptions: ComparisonOptions) {
+  return new Set(
+    docs
+      .filter((doc) => PURCHASE_DOC_TYPES.has(doc.type))
+      .map((doc) => normalizeDocReference(doc, "poNumber", comparisonOptions))
+      .filter((value): value is string => Boolean(value))
+  );
+}
+
+function invoicesBelongToPurchaseOrder(
+  invoices: CaseDoc[],
+  purchaseRefs: Set<string>,
+  comparisonOptions: ComparisonOptions
+) {
+  if (!purchaseRefs.size) return false;
+
+  let matchedInvoiceCount = 0;
+  for (const invoice of invoices) {
+    const invoicePo = normalizeDocReference(invoice, "poNumber", comparisonOptions);
+    if (!invoicePo) continue;
+    if (!purchaseRefs.has(invoicePo)) return false;
+    matchedInvoiceCount += 1;
+  }
+
+  return matchedInvoiceCount > 0;
+}
+
+function invoiceAggregateMatchesPurchaseOrder(
+  field: FieldKey,
+  invoices: CaseDoc[],
+  purchaseDocs: CaseDoc[]
+) {
+  if (!MULTI_INVOICE_AGGREGATE_FIELDS.has(field)) return false;
+
+  let invoiceTotal = 0;
+  let invoiceCount = 0;
+  for (const invoice of invoices) {
+    const value = getNumericDocumentFieldValue(invoice, field);
+    if (value === null) continue;
+    invoiceTotal += value;
+    invoiceCount += 1;
+  }
+
+  if (invoiceCount < 2) return false;
+
+  return purchaseDocs.some((purchaseDoc) => {
+    const purchaseValue = getNumericDocumentFieldValue(purchaseDoc, field);
+    return purchaseValue !== null && nearlyEqual(invoiceTotal, purchaseValue);
+  });
+}
+
+function getInvoiceBranchReference(doc: CaseDoc, comparisonOptions: ComparisonOptions) {
+  return normalizeGroupValue(doc.fields.referenceInvoiceNumber, comparisonOptions, "referenceInvoiceNumber") ??
+    normalizeDocReference(doc, "invoiceNumber", comparisonOptions);
+}
+
+function eWayBillsReferenceKnownInvoices(
+  eWayBills: CaseDoc[],
+  invoiceRefs: Set<string>,
+  comparisonOptions: ComparisonOptions
+) {
+  if (!eWayBills.length) return true;
+
+  let referencedCount = 0;
+  for (const eWayBill of eWayBills) {
+    const reference = getInvoiceBranchReference(eWayBill, comparisonOptions);
+    if (!reference) continue;
+    if (!invoiceRefs.has(reference)) return false;
+    referencedCount += 1;
+  }
+
+  return referencedCount > 0;
+}
+
+function branchValuesConsistentWithInvoice(
+  field: FieldKey,
+  invoices: CaseDoc[],
+  branchDocs: CaseDoc[],
+  comparisonOptions: ComparisonOptions
+) {
+  const invoicesByReference = new Map<string, CaseDoc[]>();
+  for (const invoice of invoices) {
+    const reference = normalizeDocReference(invoice, "invoiceNumber", comparisonOptions);
+    if (!reference) continue;
+    invoicesByReference.set(reference, [...(invoicesByReference.get(reference) ?? []), invoice]);
+  }
+
+  for (const branchDoc of branchDocs) {
+    const reference = getInvoiceBranchReference(branchDoc, comparisonOptions);
+    if (!reference) continue;
+
+    const matchingInvoices = invoicesByReference.get(reference) ?? [];
+    if (!matchingInvoices.length) return false;
+
+    if (MULTI_INVOICE_AGGREGATE_FIELDS.has(field)) {
+      const branchValue = getNumericDocumentFieldValue(branchDoc, field);
+      if (branchValue === null) continue;
+
+      const hasMatchingInvoiceValue = matchingInvoices.some((invoice) => {
+        const invoiceValue = getNumericDocumentFieldValue(invoice, field);
+        return invoiceValue !== null && nearlyEqual(branchValue, invoiceValue);
+      });
+      if (!hasMatchingInvoiceValue) return false;
+    }
+
+    if (field === "vehicleNumber") {
+      const branchVehicle = normalizeDocReference(branchDoc, "vehicleNumber", comparisonOptions);
+      if (!branchVehicle) continue;
+
+      const invoiceVehicles = matchingInvoices
+        .map((invoice) => normalizeDocReference(invoice, "vehicleNumber", comparisonOptions))
+        .filter((value): value is string => Boolean(value));
+      if (invoiceVehicles.length && !invoiceVehicles.includes(branchVehicle)) return false;
+    }
+  }
+
+  return true;
+}
+
+function shouldSuppressMultiInvoicePartialMismatch(
+  field: FieldKey,
+  docs: CaseDoc[],
+  entries: Array<{ doc: CaseDoc; docId: string; value: string | number | null | undefined }>,
+  comparisonOptions: ComparisonOptions
+) {
+  if (!MULTI_INVOICE_PARTIAL_FIELDS.has(field)) return false;
+
+  const populated = entries.filter((entry) => isComparableFieldValue(field, entry.value, comparisonOptions));
+  if (populated.length < 2) return false;
+
+  const purchaseDocs = docs.filter((doc) => PURCHASE_DOC_TYPES.has(doc.type));
+  if (!purchaseDocs.length) return false;
+
+  const uniqueInvoices = uniqueInvoiceDocumentsForAggregation(docs, comparisonOptions);
+  if (uniqueInvoices.length < 2) return false;
+
+  const purchaseRefs = purchaseOrderReferences(docs, comparisonOptions);
+  if (!invoicesBelongToPurchaseOrder(uniqueInvoices, purchaseRefs, comparisonOptions)) return false;
+
+  const aggregateMatches = [...MULTI_INVOICE_AGGREGATE_FIELDS].some((aggregateField) =>
+    invoiceAggregateMatchesPurchaseOrder(aggregateField, uniqueInvoices, purchaseDocs)
+  );
+  if (!aggregateMatches) return false;
+
+  const invoiceRefs = new Set(
+    uniqueInvoices
+      .map((invoice) => normalizeDocReference(invoice, "invoiceNumber", comparisonOptions))
+      .filter((value): value is string => Boolean(value))
+  );
+  const eWayBills = docs.filter((doc) => doc.type === "E-Way Bill");
+  if (!eWayBillsReferenceKnownInvoices(eWayBills, invoiceRefs, comparisonOptions)) return false;
+
+  return branchValuesConsistentWithInvoice(field, uniqueInvoices, eWayBills, comparisonOptions);
 }
 
 function normalizePartyName(value: string | number | null | undefined) {
@@ -583,9 +1046,14 @@ function getPacketReferenceKeys(doc: CaseDoc, comparisonOptions: ComparisonOptio
     "invoiceNumber"
   );
   if (isUsefulInvoiceReference(invoiceNumber)) {
-    keys.push(`invoice:${invoiceNumber}`);
-    keys.push(`document:${invoiceNumber}`);
-    if (vendorIdentity) keys.push(`invoice-party:${invoiceNumber}:${vendorIdentity}`);
+    if (vendorIdentity) {
+      keys.push(`invoice-party:${invoiceNumber}:${vendorIdentity}`);
+    } else if (poNumber) {
+      keys.push(`invoice-po:${invoiceNumber}:${poNumber}`);
+    } else {
+      keys.push(`invoice:${invoiceNumber}`);
+      keys.push(`document:${invoiceNumber}`);
+    }
   }
 
   const eWayBillNumber = normalizeGroupValue(doc.fields.eWayBillNumber, comparisonOptions, "eWayBillNumber");
@@ -667,6 +1135,7 @@ function isStrongDocumentReferenceKey(key: string) {
   return (
     key.startsWith("po:") ||
     key.startsWith("invoice:") ||
+    key.startsWith("invoice-po:") ||
     key.startsWith("invoice-party:") ||
     key.startsWith("document:") ||
     key.startsWith("delivery:") ||
@@ -678,6 +1147,7 @@ function isStrongDocumentReferenceKey(key: string) {
 function isFulfillmentDocumentReferenceKey(key: string) {
   return (
     key.startsWith("invoice:") ||
+    key.startsWith("invoice-po:") ||
     key.startsWith("invoice-party:") ||
     key.startsWith("document:") ||
     key.startsWith("delivery:") ||
@@ -839,7 +1309,8 @@ function packetReferenceLabel(doc: CaseDoc, comparisonOptions: ComparisonOptions
 function makeVerificationGroup(
   docs: CaseDoc[],
   comparisonOptions: ComparisonOptions,
-  groupIndex: number
+  groupIndex: number,
+  roleSelection: VerificationRoleSelection | null = null
 ): VerificationGroup {
   const sourceFileNames = [...new Set(docs.map((doc) => doc.sourceFileName).filter((value): value is string => Boolean(value)))];
   const referenceKeys = [...new Set(docs.flatMap((doc) => getPacketReferenceKeys(doc, comparisonOptions)))];
@@ -856,6 +1327,7 @@ function makeVerificationGroup(
     documentIds: docs.map((doc) => doc.id),
     sourceFileNames,
     referenceKeys,
+    ...(roleSelection ? { roleSelection } : {}),
   };
 }
 
@@ -903,6 +1375,15 @@ export function groupDocumentsForVerification(
 
   bySource.forEach((indices) => {
     const sourceDocs = indices.map((index) => docs[index]);
+    const sellerChainDocumentIds = getSellerChainSourceDocumentIds(sourceDocs, comparisonOptions);
+    if (sellerChainDocumentIds) {
+      const chainIndices = indices.filter((index) => sellerChainDocumentIds.has(docs[index].id));
+      if (chainIndices.length > 1) {
+        const [firstChainIndex, ...remainingChainIndices] = chainIndices;
+        remainingChainIndices.forEach((index) => union(firstChainIndex, index));
+      }
+    }
+
     for (let left = 0; left < indices.length; left += 1) {
       for (let right = left + 1; right < indices.length; right += 1) {
         const leftIndex = indices[left];
@@ -929,10 +1410,13 @@ export function groupDocumentsForVerification(
     grouped.set(root, [...(grouped.get(root) ?? []), doc]);
   });
 
-  return [...grouped.values()].map((groupDocs, index) => ({
-    group: makeVerificationGroup(groupDocs, comparisonOptions, index),
-    docs: groupDocs,
-  }));
+  return [...grouped.values()].map((groupDocs, index) => {
+    const roleSelection = getSellerChainRoleSelection(groupDocs, comparisonOptions);
+    return {
+      group: makeVerificationGroup(groupDocs, comparisonOptions, index, roleSelection),
+      docs: groupDocs,
+    };
+  });
 }
 
 function areFieldValuesEqual(
@@ -985,6 +1469,10 @@ function buildMismatch(
   }
 
   if (shouldSuppressSplitWeighmentMismatch(field, docs, comparableEntries, comparisonOptions)) {
+    return null;
+  }
+
+  if (shouldSuppressMultiInvoicePartialMismatch(field, docs, comparableEntries, comparisonOptions)) {
     return null;
   }
 
@@ -1999,8 +2487,9 @@ export function verifyGroupedCaseDocuments(
 ): GroupedVerificationResult {
   const groups = groupDocumentsForVerification(docs, comparisonOptions);
   const mismatches = groups.flatMap(({ docs: groupDocs, group }) => {
-    if (groupDocs.length < 2) return [];
-    return verifyCaseDocuments(groupDocs, comparisonOptions).map((mismatch) => ({
+    const comparisonDocs = documentsForRoleSelectedComparison(groupDocs, group.roleSelection ?? null);
+    if (comparisonDocs.length < 2) return [];
+    return verifyCaseDocuments(comparisonDocs, comparisonOptions).map((mismatch) => ({
       ...mismatch,
       id: `${group.groupId}-${mismatch.id}`,
     }));

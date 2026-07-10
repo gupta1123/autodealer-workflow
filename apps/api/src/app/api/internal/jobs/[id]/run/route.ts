@@ -5,10 +5,6 @@ import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-servi
 import { serializeFieldsWithLineItems } from "@/lib/line-items";
 import { mergePersistedStructuredData } from "@/lib/persisted-structured-data";
 import {
-  splitAnalyzedCaseIntoShipmentCases,
-  type CaseFileRowForSplit,
-} from "@/lib/processing/case-splitting";
-import {
   assessCaseTermsComplianceDetailed,
   enrichProcessedDocuments,
   processStoredCaseFiles,
@@ -17,11 +13,13 @@ import {
 } from "@/lib/processing/pipeline";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { TERMS_COMPLIANCE_MISMATCH_MODE } from "@/lib/terms-compliance";
-import type { CaseAnalysisMode } from "@/types/pipeline";
+import { groupDocumentsForVerification } from "@/services/verification";
+import type { CaseAnalysisMode, CaseDoc, Mismatch } from "@/types/pipeline";
 import { randomUUID } from "crypto";
 
 const WORKER_SECRET = process.env.WORKER_SECRET || "";
 const STALE_JOB_RUN_MESSAGE = "This processing run was superseded by another worker run.";
+const STORAGE_BUCKET = "packet-files";
 
 class StaleJobRunError extends Error {
   constructor(message = STALE_JOB_RUN_MESSAGE) {
@@ -53,6 +51,225 @@ function asNumber(value: unknown) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+type StoredCaseFileRow = {
+  id: string;
+  original_name: string;
+  storage_bucket: string | null;
+  storage_path: string;
+  mime_type: string | null;
+  size_bytes: number | null;
+};
+
+type PreparedCaseGroup = {
+  caseId: string;
+  groupIndex: number;
+  groupId: string;
+  sourceFileNames: string[];
+  documents: CaseDoc[];
+  mismatches: Mismatch[];
+  termsChecklist: unknown[];
+  verificationGroups: unknown[];
+  summary: ReturnType<typeof summarizeCase>;
+  displayName: string;
+};
+
+function sanitizeFileName(fileName: string) {
+  return (
+    fileName
+      .replace(/[/\\?%*:|"<>]/g, "-")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 180) || "upload"
+  );
+}
+
+function normalizeSourceFileName(value: string | null | undefined) {
+  return value?.trim().toLowerCase().replace(/\s+/g, " ") || "";
+}
+
+function stripUploadIdentityMeta(meta: Record<string, unknown>) {
+  const rest = { ...meta };
+  const uploadFingerprint = rest.uploadFingerprint;
+  [
+    "uploadFingerprint",
+    "uploadFingerprintVersion",
+    "uploadContentSignature",
+    "uploadLegacySignature",
+    "uploadFileFingerprints",
+    "duplicateUploadMode",
+    "duplicateUploadRunId",
+    "originalUploadFingerprint",
+    "originalUploadContentSignature",
+    "originalUploadLegacySignature",
+  ].forEach((key) => {
+    delete rest[key];
+  });
+  const originalFingerprint = typeof uploadFingerprint === "string" ? uploadFingerprint : null;
+  return {
+    meta: rest,
+    originalFingerprint,
+  };
+}
+
+function hasCaseAnchorDocument(documents: CaseDoc[]) {
+  return documents.some((document) => {
+    const fields = document.fields ?? {};
+    const hasReference = Boolean(
+      fields.invoiceNumber ||
+        fields.referenceInvoiceNumber ||
+        fields.poNumber ||
+        fields.referencePoNumber ||
+        fields.eWayBillNumber ||
+        fields.deliveryNoteNumber ||
+        fields.lorryReceiptNumber
+    );
+    const hasCommercialData = Boolean(
+      fields.totalAmount ||
+        fields.totalTaxableAmount ||
+        fields.subtotal ||
+        fields.itemQuantity ||
+        (document.lineItems?.length ?? 0) > 0
+    );
+    return (
+      ["Invoice", "Tax Invoice", "Purchase Order", "Amended Purchase Order", "E-Way Bill", "Delivery Note", "Delivery Challan"].includes(document.type) &&
+      (hasReference || hasCommercialData)
+    );
+  });
+}
+
+function groupsShareSourceFile(groups: Array<{ group: { sourceFileNames: string[] } }>) {
+  const counts = new Map<string, number>();
+  for (const { group } of groups) {
+    const names = new Set(group.sourceFileNames.map(normalizeSourceFileName).filter(Boolean));
+    names.forEach((name) => counts.set(name, (counts.get(name) ?? 0) + 1));
+  }
+  return Array.from(counts.values()).some((count) => count >= 2);
+}
+
+function shouldPersistAsSplitCases(groups: ReturnType<typeof groupDocumentsForVerification>) {
+  if (groups.length < 2 || !groupsShareSourceFile(groups)) return false;
+  const credibleGroups = groups.filter(({ docs }) => hasCaseAnchorDocument(docs));
+  return credibleGroups.length >= 2 && credibleGroups.length === groups.length;
+}
+
+function sourceRowsForGroup(files: StoredCaseFileRow[], sourceFileNames: string[]) {
+  const names = new Set(sourceFileNames.map(normalizeSourceFileName).filter(Boolean));
+  const matched = names.size
+    ? files.filter((file) => names.has(normalizeSourceFileName(file.original_name)))
+    : [];
+  return matched.length ? matched : files;
+}
+
+function filterMismatchesForDocuments(mismatches: Mismatch[], documents: CaseDoc[]) {
+  const documentIds = new Set(documents.map((document) => document.id));
+  return mismatches.filter((mismatch) => {
+    const values = mismatch.values ?? [];
+    return values.length === 0 || values.some((entry) => entry.docId && documentIds.has(entry.docId));
+  });
+}
+
+function buildSplitAnalysisMeta(params: {
+  current: PreparedCaseGroup;
+  groups: PreparedCaseGroup[];
+  sourceCaseId: string;
+}) {
+  return {
+    groupCount: params.groups.length,
+    groupIndex: params.current.groupIndex,
+    sourceCaseId: params.sourceCaseId,
+    sourceFileNames: params.current.sourceFileNames,
+    groupId: params.current.groupId,
+    siblingCases: params.groups
+      .filter((group) => group.caseId !== params.current.caseId)
+      .map((group) => ({
+        id: group.caseId,
+        displayName: group.displayName,
+        groupIndex: group.groupIndex,
+      })),
+    note: `This uploaded file was split into ${params.groups.length} separate cases during multi-doc analysis.`,
+  };
+}
+
+async function insertCaseDocumentsAndMismatches(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  caseId: string,
+  documents: CaseDoc[],
+  mismatches: Mismatch[]
+) {
+  const documentRows = documents.map((document) => ({
+    case_id: caseId,
+    client_document_id: document.id,
+    source_file_name: document.sourceFileName ?? document.sourceHint ?? null,
+    source_hint: document.sourceHint ?? null,
+    document_type: document.type,
+    title: document.title,
+    page_count: document.pages,
+    extracted_fields: serializeFieldsWithLineItems(document),
+    markdown: document.md ?? "",
+  }));
+
+  if (documentRows.length) {
+    const { error } = await supabase.from("packet_documents").insert(documentRows);
+    if (error) throw error;
+  }
+
+  if (mismatches.length) {
+    const mismatchRows = mismatches.map((mismatch) => ({
+      case_id: caseId,
+      client_mismatch_id: mismatch.id,
+      field_name: mismatch.field,
+      values_json: mismatch.values ?? [],
+      analysis: mismatch.analysis ?? null,
+      fix_plan: mismatch.fixPlan ?? null,
+    }));
+
+    const { error } = await supabase.from("packet_mismatches").insert(mismatchRows);
+    if (error) throw error;
+  }
+}
+
+async function copyCaseFilesForGroup(params: {
+  supabase: ReturnType<typeof createSupabaseAdminClient>;
+  files: StoredCaseFileRow[];
+  sourceFileNames: string[];
+  caseId: string;
+  uploadedFiles: Array<{ bucket: string; path: string }>;
+}) {
+  const sourceFiles = sourceRowsForGroup(params.files, params.sourceFileNames);
+  const fileRows = [];
+
+  for (const file of sourceFiles) {
+    const sourceBucket = file.storage_bucket || STORAGE_BUCKET;
+    const download = await params.supabase.storage.from(sourceBucket).download(file.storage_path);
+    if (download.error) throw download.error;
+
+    const bytes = new Uint8Array(await download.data.arrayBuffer());
+    const storagePath = `${params.caseId}/${Date.now()}-${randomUUID()}-${sanitizeFileName(file.original_name)}`;
+    const { error: uploadError } = await params.supabase.storage.from(STORAGE_BUCKET).upload(storagePath, bytes, {
+      contentType: file.mime_type ?? undefined,
+      upsert: false,
+    });
+    if (uploadError) throw uploadError;
+
+    params.uploadedFiles.push({ bucket: STORAGE_BUCKET, path: storagePath });
+    fileRows.push({
+      case_id: params.caseId,
+      original_name: file.original_name,
+      storage_bucket: STORAGE_BUCKET,
+      storage_path: storagePath,
+      mime_type: file.mime_type,
+      size_bytes: file.size_bytes,
+    });
+  }
+
+  if (fileRows.length) {
+    const { error } = await params.supabase.from("packet_case_files").insert(fileRows);
+    if (error) throw error;
+  }
+
+  return fileRows.length;
+}
+
 export async function POST(
   request: Request,
   context: { params: Promise<{ id: string }> }
@@ -64,6 +281,8 @@ export async function POST(
   const { id } = await context.params;
   const supabase = createSupabaseAdminClient();
   const now = new Date().toISOString();
+  const createdSiblingCaseIds: string[] = [];
+  const uploadedSiblingFiles: Array<{ bucket: string; path: string }> = [];
 
   const { data: job, error: jobError } = await supabase
     .from("packet_processing_jobs")
@@ -243,7 +462,7 @@ export async function POST(
 
     const [
       { data: existingDocuments, error: existingDocumentsError },
-      { data: storedCaseFiles, error: caseFilesError },
+      { data: caseFiles, error: caseFilesError },
       { error: documentDeleteError },
       { error: mismatchDeleteError },
     ] = await Promise.all([
@@ -253,9 +472,8 @@ export async function POST(
         .eq("case_id", job.case_id),
       supabase
         .from("packet_case_files")
-        .select("id, original_name, storage_bucket, storage_path, mime_type, size_bytes, created_at")
-        .eq("case_id", job.case_id)
-        .order("created_at", { ascending: true }),
+        .select("id, original_name, storage_bucket, storage_path, mime_type, size_bytes")
+        .eq("case_id", job.case_id),
       supabase.from("packet_documents").delete().eq("case_id", job.case_id),
       supabase.from("packet_mismatches").delete().eq("case_id", job.case_id),
     ]);
@@ -264,6 +482,8 @@ export async function POST(
     if (caseFilesError) throw caseFilesError;
     if (documentDeleteError) throw documentDeleteError;
     if (mismatchDeleteError) throw mismatchDeleteError;
+    const storedCaseFiles = (caseFiles ?? []) as StoredCaseFileRow[];
+    const uploadCount = storedCaseFiles.length || caseRow.upload_count;
 
     let documents = enrichProcessedDocuments(
       mergePersistedStructuredData(
@@ -292,21 +512,148 @@ export async function POST(
         ? (caseRow.processing_meta as Record<string, unknown>)
         : {};
 
-    const splitResult = await splitAnalyzedCaseIntoShipmentCases({
-      supabase,
-      caseId: job.case_id,
-      ownerUserId: caseRow.owner_user_id,
-      existingMeta,
-      documents,
-      comparisonOptions: processed.comparisonOptions,
-      analysisMode,
-      fieldConfiguration,
-      caseFiles: (storedCaseFiles ?? []) as CaseFileRowForSplit[],
-      extractionReview: extractionReview.review,
-    });
+    const verificationSplitGroups =
+      analysisMode === "smart_split"
+        ? groupDocumentsForVerification(documents, processed.comparisonOptions)
+        : [];
 
-    if (splitResult) {
-      await deleteDuplicateAnalysisRows(job.case_id);
+    if (analysisMode === "smart_split" && shouldPersistAsSplitCases(verificationSplitGroups)) {
+      const preparedGroups: PreparedCaseGroup[] = [];
+
+      for (let index = 0; index < verificationSplitGroups.length; index += 1) {
+        const splitGroup = verificationSplitGroups[index];
+        const groupDocuments = splitGroup.docs;
+        const groupBaseVerified = verifyProcessedDocuments(groupDocuments, processed.comparisonOptions);
+        const groupTermsCompliance = await assessCaseTermsComplianceDetailed(groupDocuments);
+        const groupMismatches = [
+          ...filterMismatchesForDocuments(groupBaseVerified.mismatches, groupDocuments),
+          ...filterMismatchesForDocuments(groupTermsCompliance.mismatches, groupDocuments),
+        ];
+        const groupSummary = summarizeCase(groupDocuments, groupMismatches, fieldConfiguration);
+        const groupDisplayName = await resolveCaseDisplayNameWithAI(groupDocuments, groupSummary);
+
+        preparedGroups.push({
+          caseId: index === 0 ? job.case_id : randomUUID(),
+          groupIndex: index + 1,
+          groupId: splitGroup.group.groupId,
+          sourceFileNames: splitGroup.group.sourceFileNames,
+          documents: groupDocuments,
+          mismatches: groupMismatches,
+          termsChecklist: groupTermsCompliance.checklist,
+          verificationGroups: groupBaseVerified.verificationGroups,
+          summary: groupSummary,
+          displayName: groupDisplayName,
+        });
+      }
+
+      const updateCaseFromGroup = async (group: PreparedCaseGroup, uploadCountForGroup: number) => {
+        const splitAnalysis = buildSplitAnalysisMeta({
+          current: group,
+          groups: preparedGroups,
+          sourceCaseId: job.case_id,
+        });
+
+        return supabase
+          .from("packet_cases")
+          .update({
+            slug: group.summary.slug,
+            display_name: group.displayName,
+            buyer_name: group.summary.buyerName || null,
+            po_number: group.summary.poNumber || null,
+            invoice_number: group.summary.invoiceNumber || null,
+            status: "completed",
+            risk_score: group.summary.riskScore,
+            upload_count: uploadCountForGroup,
+            document_count: group.documents.length,
+            mismatch_count: group.mismatches.length,
+            processing_meta: {
+              ...existingMeta,
+              draft: false,
+              analyzedAt: new Date().toISOString(),
+              caseCategory: group.summary.category,
+              packetCategory: group.summary.packetCategory,
+              documentTypes: group.summary.documentTypes,
+              missingDocumentGroups: group.summary.missingDocTypes,
+              paymentGap: group.summary.paymentGap,
+              analysisMode,
+              comparisonOptions: processed.comparisonOptions,
+              verificationGroups: group.verificationGroups,
+              termsComplianceChecklist: group.termsChecklist,
+              termsComplianceMismatchMode: TERMS_COMPLIANCE_MISMATCH_MODE,
+              extractionReview: extractionReview.review,
+              splitAnalysis,
+              lastProcessingError: null,
+            },
+          })
+          .eq("id", group.caseId);
+      };
+
+      const insertSiblingCase = async (group: PreparedCaseGroup) => {
+        const { meta: siblingBaseMeta, originalFingerprint } = stripUploadIdentityMeta(existingMeta);
+        const splitAnalysis = buildSplitAnalysisMeta({
+          current: group,
+          groups: preparedGroups,
+          sourceCaseId: job.case_id,
+        });
+        const sourceFileCount = sourceRowsForGroup(storedCaseFiles, group.sourceFileNames).length;
+
+        createdSiblingCaseIds.push(group.caseId);
+        const { error: caseInsertError } = await supabase.from("packet_cases").insert({
+          id: group.caseId,
+          owner_user_id: caseRow.owner_user_id,
+          slug: group.summary.slug,
+          display_name: group.displayName,
+          buyer_name: group.summary.buyerName || null,
+          po_number: group.summary.poNumber || null,
+          invoice_number: group.summary.invoiceNumber || null,
+          status: "completed",
+          risk_score: group.summary.riskScore,
+          upload_count: sourceFileCount,
+          document_count: group.documents.length,
+          mismatch_count: group.mismatches.length,
+          processing_meta: {
+            ...siblingBaseMeta,
+            ...(originalFingerprint ? { splitSourceUploadFingerprint: originalFingerprint } : {}),
+            draft: false,
+            analyzedAt: new Date().toISOString(),
+            caseCategory: group.summary.category,
+            packetCategory: group.summary.packetCategory,
+            documentTypes: group.summary.documentTypes,
+            missingDocumentGroups: group.summary.missingDocTypes,
+            paymentGap: group.summary.paymentGap,
+            analysisMode,
+            comparisonOptions: processed.comparisonOptions,
+            verificationGroups: group.verificationGroups,
+            termsComplianceChecklist: group.termsChecklist,
+            termsComplianceMismatchMode: TERMS_COMPLIANCE_MISMATCH_MODE,
+            extractionReview: extractionReview.review,
+            splitAnalysis,
+            lastProcessingError: null,
+          },
+        });
+
+        if (caseInsertError) throw caseInsertError;
+
+        await copyCaseFilesForGroup({
+          supabase,
+          files: storedCaseFiles,
+          sourceFileNames: group.sourceFileNames,
+          caseId: group.caseId,
+          uploadedFiles: uploadedSiblingFiles,
+        });
+        await insertCaseDocumentsAndMismatches(supabase, group.caseId, group.documents, group.mismatches);
+      };
+
+      const [primaryGroup, ...siblingGroups] = preparedGroups;
+      await insertCaseDocumentsAndMismatches(supabase, primaryGroup.caseId, primaryGroup.documents, primaryGroup.mismatches);
+      const { error: primaryUpdateError } = await updateCaseFromGroup(primaryGroup, uploadCount);
+      if (primaryUpdateError) throw primaryUpdateError;
+
+      for (const group of siblingGroups) {
+        await insertSiblingCase(group);
+      }
+
+      await Promise.all(preparedGroups.map((group) => deleteDuplicateAnalysisRows(group.caseId)));
       await assertCurrentRun();
 
       await updateCurrentJob({
@@ -315,23 +662,20 @@ export async function POST(
         stage: "Completed",
         error: null,
         result: {
-          summary: splitResult.primary.summary,
           analysisMode,
-          documentCount: splitResult.primary.documents.length,
-          mismatchCount: splitResult.primary.mismatches.length,
-          verificationGroupCount: splitResult.primary.verificationGroups.length,
-          splitResult: {
-            strategy: splitResult.strategy,
-            shipmentCount: splitResult.shipmentCount,
-            primaryCaseId: splitResult.primary.caseId,
-            childCaseIds: splitResult.children.map((child) => child.caseId),
+          documentCount: documents.length,
+          mismatchCount: preparedGroups.reduce((sum, group) => sum + group.mismatches.length, 0),
+          createdCaseIds: preparedGroups.map((group) => group.caseId),
+          splitAnalysis: {
+            groupCount: preparedGroups.length,
+            sourceCaseId: job.case_id,
           },
           extractionReview: extractionReview.review,
         },
         finished_at: new Date().toISOString(),
       });
 
-      return jsonWithCors(request, { ok: true, splitResult: true });
+      return jsonWithCors(request, { ok: true, caseIds: preparedGroups.map((group) => group.caseId) });
     }
 
     const baseVerified = verifyProcessedDocuments(documents, processed.comparisonOptions);
@@ -343,38 +687,7 @@ export async function POST(
     const summary = summarizeCase(documents, verified.mismatches, fieldConfiguration);
     const displayName = await resolveCaseDisplayNameWithAI(documents, summary);
 
-    const documentRows = documents.map((document) => ({
-      case_id: job.case_id,
-      client_document_id: document.id,
-      source_file_name: document.sourceFileName ?? document.sourceHint ?? null,
-      source_hint: document.sourceHint ?? null,
-      document_type: document.type,
-      title: document.title,
-      page_count: document.pages,
-      extracted_fields: serializeFieldsWithLineItems(document),
-      markdown: document.md ?? "",
-    }));
-
-    const { error: insertDocumentError } = await supabase.from("packet_documents").insert(documentRows);
-    if (insertDocumentError) {
-      throw insertDocumentError;
-    }
-
-    if (verified.mismatches.length > 0) {
-      const mismatchRows = verified.mismatches.map((mismatch) => ({
-        case_id: job.case_id,
-        client_mismatch_id: mismatch.id,
-        field_name: mismatch.field,
-        values_json: mismatch.values ?? [],
-        analysis: mismatch.analysis ?? null,
-        fix_plan: mismatch.fixPlan ?? null,
-      }));
-
-      const { error: insertMismatchError } = await supabase.from("packet_mismatches").insert(mismatchRows);
-      if (insertMismatchError) {
-        throw insertMismatchError;
-      }
-    }
+    await insertCaseDocumentsAndMismatches(supabase, job.case_id, documents, verified.mismatches);
 
     await deleteDuplicateAnalysisRows(job.case_id);
     await assertCurrentRun();
@@ -389,7 +702,7 @@ export async function POST(
         invoice_number: summary.invoiceNumber || null,
         status: "completed",
         risk_score: summary.riskScore,
-        upload_count: storedCaseFiles?.length ?? caseRow.upload_count,
+        upload_count: uploadCount ?? caseRow.upload_count,
         document_count: documents.length,
         mismatch_count: verified.mismatches.length,
         processing_meta: {
@@ -437,6 +750,25 @@ export async function POST(
     const message = toMessage(error);
     if (error instanceof StaleJobRunError) {
       return jsonWithCors(request, { ok: false, stale: true, error: message }, { status: 409 });
+    }
+
+    if (uploadedSiblingFiles.length > 0 || createdSiblingCaseIds.length > 0) {
+      try {
+        const filesByBucket = new Map<string, string[]>();
+        for (const file of uploadedSiblingFiles) {
+          filesByBucket.set(file.bucket, [...(filesByBucket.get(file.bucket) ?? []), file.path]);
+        }
+        for (const [bucket, paths] of filesByBucket.entries()) {
+          if (paths.length) {
+            await supabase.storage.from(bucket).remove(paths);
+          }
+        }
+        if (createdSiblingCaseIds.length) {
+          await supabase.from("packet_cases").delete().in("id", createdSiblingCaseIds);
+        }
+      } catch (cleanupError) {
+        console.warn("Failed to clean up partial split-analysis cases", cleanupError);
+      }
     }
 
     const shouldRetry = job.attempt_count < job.max_attempts;

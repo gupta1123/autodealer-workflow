@@ -84,6 +84,10 @@ export function PacketIntelligencePanel({
 }: PacketIntelligencePanelProps) {
   if (!packetIntelligence) return null;
 
+  // A confirmed single shipment does not change the reviewer workflow. Keep the
+  // document list in view and reserve this panel for packet-structure exceptions.
+  if (packetIntelligence.kind === "single_shipment") return null;
+
   const styles = TONE_STYLES[packetIntelligence.tone] ?? TONE_STYLES.neutral;
   const Icon = getPacketIcon(packetIntelligence.kind);
   const visibleChecks = getVisibleChecks(packetIntelligence.checks, density);

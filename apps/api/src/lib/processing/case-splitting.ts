@@ -16,6 +16,7 @@ import type { CaseAnalysisMode, CaseDoc, ComparisonOptions, FieldKey, Mismatch }
 const STORAGE_BUCKET = "packet-files";
 const SPLIT_STRATEGY = "shipment-groups-v1";
 const INVOICE_DOC_TYPES = new Set<CaseDoc["type"]>(["Invoice", "Tax Invoice"]);
+const KALIKA_PATTERN = /\bkalika\b|kalika\s+steel|kalika\s+alloys/i;
 
 export type CaseFileRowForSplit = {
   id: string;
@@ -103,6 +104,33 @@ function getSourceNames(documents: CaseDoc[]) {
     names.push(source);
   }
   return names;
+}
+
+function isKalikaFacingDocument(document: CaseDoc) {
+  return KALIKA_PATTERN.test(
+    [getField(document, "buyerName"), getField(document, "buyerGstin")].filter(Boolean).join(" ")
+  );
+}
+
+function hasInvoiceDocument(documents: CaseDoc[]) {
+  return documents.some(
+    (document) => INVOICE_DOC_TYPES.has(document.type) || Boolean(getInvoiceNumber(document))
+  );
+}
+
+function isKalikaFacingShipmentGroup(group: ShipmentGroup) {
+  return group.documents.some(
+    (document) =>
+      (INVOICE_DOC_TYPES.has(document.type) || Boolean(getInvoiceNumber(document))) &&
+      isKalikaFacingDocument(document)
+  );
+}
+
+function sharesSourceFile(left: ShipmentGroup, right: ShipmentGroup) {
+  const rightSources = new Set(right.sourceFileNames.map(normalizeSourceName).filter(Boolean));
+  return left.sourceFileNames
+    .map(normalizeSourceName)
+    .some((source) => source.length > 0 && rightSources.has(source));
 }
 
 function getInvoiceIdentity(document: CaseDoc) {
@@ -201,6 +229,55 @@ function unionGroups(parent: number[], left: number, right: number) {
   }
 }
 
+function toShipmentGroup(id: string, documents: CaseDoc[], groupIndex: number): ShipmentGroup {
+  const uniqueDocuments = Array.from(
+    new Map(documents.map((document) => [document.id, document])).values()
+  );
+  const invoiceKeys = getDistinctInvoiceKeys(uniqueDocuments);
+  return {
+    id: id || `shipment-${groupIndex + 1}`,
+    documents: uniqueDocuments,
+    sourceFileNames: getSourceNames(uniqueDocuments),
+    invoiceKeys,
+    shipmentKey: getShipmentKey(uniqueDocuments),
+  };
+}
+
+function attachSellerChainContextToPrimaryShipments(
+  groups: ShipmentGroup[],
+  documents: CaseDoc[]
+) {
+  if (!hasSellerChain(documents)) return groups;
+
+  const primaryIndexes = groups
+    .map((group, index) => (isKalikaFacingShipmentGroup(group) ? index : -1))
+    .filter((index) => index >= 0);
+
+  if (primaryIndexes.length < 2) return groups;
+
+  const attachedDocuments = new Map<number, CaseDoc[]>();
+  for (const index of primaryIndexes) {
+    attachedDocuments.set(index, [...groups[index].documents]);
+  }
+
+  for (let index = 0; index < groups.length; index += 1) {
+    if (primaryIndexes.includes(index)) continue;
+
+    const candidates = primaryIndexes.filter((primaryIndex) =>
+      sharesSourceFile(groups[index], groups[primaryIndex])
+    );
+
+    // Do not split a seller chain when context cannot be attached to exactly one
+    // Kalika-facing shipment. Keeping the original packet is safer than losing context.
+    if (candidates.length !== 1) return groups;
+    attachedDocuments.get(candidates[0])?.push(...groups[index].documents);
+  }
+
+  return primaryIndexes.map((index, groupIndex) =>
+    toShipmentGroup(groups[index].id, attachedDocuments.get(index) ?? groups[index].documents, groupIndex)
+  );
+}
+
 function buildShipmentGroups(documents: CaseDoc[], comparisonOptions: ComparisonOptions): ShipmentGroup[] {
   const verificationGroups = groupDocumentsForVerification(documents, comparisonOptions);
   const initialGroups = verificationGroups.map((entry, index) => ({
@@ -243,19 +320,11 @@ function buildShipmentGroups(documents: CaseDoc[], comparisonOptions: Comparison
     merged.set(root, [...(merged.get(root) ?? []), ...group.documents]);
   });
 
-  return Array.from(merged.entries()).map(([index, groupDocuments], groupIndex) => {
-    const uniqueDocuments = Array.from(
-      new Map(groupDocuments.map((document) => [document.id, document])).values()
-    );
-    const invoiceKeys = getDistinctInvoiceKeys(uniqueDocuments);
-    return {
-      id: initialGroups[index]?.id ?? `shipment-${groupIndex + 1}`,
-      documents: uniqueDocuments,
-      sourceFileNames: getSourceNames(uniqueDocuments),
-      invoiceKeys,
-      shipmentKey: getShipmentKey(uniqueDocuments),
-    };
-  });
+  const shipmentGroups = Array.from(merged.entries()).map(([index, groupDocuments], groupIndex) =>
+    toShipmentGroup(initialGroups[index]?.id ?? `shipment-${groupIndex + 1}`, groupDocuments, groupIndex)
+  );
+
+  return attachSellerChainContextToPrimaryShipments(shipmentGroups, documents);
 }
 
 function getSourceOrder(caseFiles: CaseFileRowForSplit[]) {
@@ -281,7 +350,12 @@ function sortGroupsBySourceOrder(groups: ShipmentGroup[], caseFiles: CaseFileRow
 
 function shouldSplitGroups(groups: ShipmentGroup[], documents: CaseDoc[]) {
   if (groups.length <= 1) return false;
-  if (hasSellerChain(documents)) return false;
+
+  // Seller-chain packets can split only after every upstream/context group has
+  // been attached to one Kalika-facing shipment by source-file evidence.
+  if (hasSellerChain(documents) && groups.some((group) => !isKalikaFacingShipmentGroup(group))) {
+    return false;
+  }
 
   const invoiceLedGroups = groups.filter((group) => group.invoiceKeys.length > 0);
   if (invoiceLedGroups.length < 2) return false;
