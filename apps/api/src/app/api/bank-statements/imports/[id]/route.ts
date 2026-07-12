@@ -33,7 +33,19 @@ function isBankLedgerMaster(row: Record<string, unknown>) {
 
 function bankLedgerAccountNumber(row: Record<string, unknown>) {
   const raw = readRecord(row.raw_payload);
-  return normalizeBankAccountNumber(raw.bankAccountNumber ?? raw.accountNumber ?? raw.account_number);
+  const explicitAccountNumber = normalizeBankAccountNumber(
+    raw.bankAccountNumber ?? raw.accountNumber ?? raw.account_number
+  );
+  if (explicitAccountNumber) return explicitAccountNumber;
+
+  const accountNumbersInName = Array.from(
+    new Set(
+      (String(row.tally_name ?? "").match(/\d{6,18}/g) ?? [])
+        .map(normalizeBankAccountNumber)
+        .filter(Boolean)
+    )
+  );
+  return accountNumbersInName.length === 1 ? accountNumbersInName[0] : "";
 }
 
 async function resolveStatementBankLedger(

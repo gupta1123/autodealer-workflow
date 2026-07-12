@@ -102,6 +102,13 @@ type TallyMaster = {
   parent?: string | null;
   type?: string | null;
   billWiseEnabled?: boolean | null;
+  phone?: string | null;
+};
+
+type WhatsappSendResult = {
+  phoneSaveCommandId?: string | null;
+  phoneSaveConnectionId?: string | null;
+  phoneSaveQueueError?: string | null;
 };
 
 type TallyCommand = {
@@ -109,6 +116,14 @@ type TallyCommand = {
   connectionId?: string;
   status: "queued" | "claimed" | "succeeded" | "failed" | "canceled";
   error?: string | null;
+};
+
+type LiveTallyConnection = {
+  id: string;
+  status: string;
+  lastCompanyName?: string | null;
+  companyLoaded?: boolean;
+  tallyReachable?: boolean;
 };
 
 type DashboardPayload = {
@@ -201,6 +216,10 @@ function isCreatedDebitNote(proposal: DebitNoteProposal) {
 function shortText(value?: string | null, fallback = "-") {
   const text = String(value ?? "").trim();
   return text || fallback;
+}
+
+function normalizeCompanyName(value?: string | null) {
+  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function calculateShortfall(proposal: DebitNoteProposal) {
@@ -353,6 +372,8 @@ export function CollectionsDashboardPage() {
   const [selectedConnectionId, setSelectedConnectionId] = useState("");
   const [selectedCompanyId, setSelectedCompanyId] = useState("");
   const [dashboard, setDashboard] = useState<DashboardPayload | null>(null);
+  const [liveTallyConnection, setLiveTallyConnection] = useState<LiveTallyConnection | null>(null);
+  const [checkingLiveTallyCompany, setCheckingLiveTallyCompany] = useState(true);
   const [activeView, setActiveView] = useState<ActiveView>("needsAction");
   const [loading, setLoading] = useState(true);
   const [savingRule, setSavingRule] = useState(false);
@@ -447,10 +468,59 @@ export function CollectionsDashboardPage() {
     throw new Error("Tally open-bill scan timed out. Keep the connector open and refresh again.");
   }, []);
 
+  const refreshLiveTallyCompany = useCallback(async (connectionId: string) => {
+    if (!connectionId) {
+      setLiveTallyConnection(null);
+      setCheckingLiveTallyCompany(false);
+      return null;
+    }
+    setCheckingLiveTallyCompany(true);
+    try {
+      const response = await apiFetch(`/api/tally/connections/${connectionId}/status`, { cache: "no-store" });
+      if (!response.ok) throw new Error(await readError(response));
+      const payload = (await response.json()) as { connection?: LiveTallyConnection };
+      const nextConnection = payload.connection ?? null;
+      setLiveTallyConnection(nextConnection);
+      return nextConnection;
+    } finally {
+      setCheckingLiveTallyCompany(false);
+    }
+  }, []);
+
+  const syncCurrentCompanyLedgers = useCallback(
+    async (connectionId: string, companyName?: string | null) => {
+      const response = await apiFetch(`/api/tally/connections/${connectionId}/commands`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          commandType: "sync_masters",
+          payload: {
+            companyName,
+            requestedMasterTypes: ["ledger"],
+          },
+        }),
+      });
+      if (!response.ok) throw new Error(await readError(response));
+      const payload = (await response.json()) as { command?: TallyCommand };
+      if (!payload.command?.id) throw new Error("Tally ledger sync could not be started.");
+      await pollCommand(connectionId, payload.command.id);
+    },
+    [pollCommand]
+  );
+
   const refreshTallyOpenBills = useCallback(
     async (connectionId: string, companyName?: string | null) => {
+      // Refresh the ledger list first. A connection may have previously synced a
+      // different company, in which case using its old debtor list would omit
+      // valid bills or query the wrong parties.
+      await syncCurrentCompanyLedgers(connectionId, companyName);
       const ledgerNames = await loadDebtorLedgers(connectionId);
       if (ledgerNames.length === 0) return;
+
+      // One page refresh can require several Tally commands when there are many
+      // customer ledgers. Keep those commands together so the dashboard can use
+      // this refresh as one consistent snapshot rather than mixing old chunks.
+      const scanId = crypto.randomUUID();
 
       for (const chunk of chunkValues(ledgerNames, 80)) {
         const response = await apiFetch(`/api/tally/connections/${connectionId}/commands`, {
@@ -462,6 +532,7 @@ export function CollectionsDashboardPage() {
               ledgerName: chunk[0],
               ledgerNames: chunk,
               companyName,
+              scanId,
             },
           }),
         });
@@ -472,7 +543,7 @@ export function CollectionsDashboardPage() {
         }
       }
     },
-    [loadDebtorLedgers, pollCommand]
+    [loadDebtorLedgers, pollCommand, syncCurrentCompanyLedgers]
   );
 
   const refreshAll = useCallback(
@@ -480,6 +551,7 @@ export function CollectionsDashboardPage() {
       try {
         if (!options?.quiet) setLoading(true);
         setMessage(null);
+        setDashboard(null);
         const nextCompanies = await loadCompanies();
         const company =
           nextCompanies.find((item) => item.id === selectedCompanyId) ??
@@ -489,6 +561,10 @@ export function CollectionsDashboardPage() {
         const connectionId = company?.connectionId || selectedConnectionId || "";
         if (company) setSelectedCompanyId(company.id);
         if (connectionId) setSelectedConnectionId(connectionId);
+        if (connectionId) await refreshLiveTallyCompany(connectionId);
+        // Set this before the asynchronous Tally scan so the selection effect
+        // does not start a second, overlapping scan for the same company.
+        lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
         if (connectionId && options?.refreshTally !== false) {
           await refreshTallyOpenBills(connectionId, company?.companyName);
         }
@@ -500,7 +576,7 @@ export function CollectionsDashboardPage() {
         setLoading(false);
       }
     },
-    [loadCompanies, loadDashboard, refreshTallyOpenBills, selectedCompanyId, selectedConnectionId]
+    [loadCompanies, loadDashboard, refreshLiveTallyCompany, refreshTallyOpenBills, selectedCompanyId, selectedConnectionId]
   );
 
   async function createDefaultRule() {
@@ -572,6 +648,10 @@ export function CollectionsDashboardPage() {
   }
 
   async function approveProposal(proposal: DebitNoteProposal) {
+    if (!tallyCompanyVerified) {
+      setMessage({ tone: "error", text: `Tally is open to ${activeTallyCompanyName || "another company"}. Switch it to ${selectedCompany?.companyName || "the selected company"}, refresh, then create the debit note.` });
+      return;
+    }
     const id = proposal.id;
     try {
       setApprovingId(id);
@@ -594,7 +674,7 @@ export function CollectionsDashboardPage() {
 
   async function sendWhatsappForProposal(
     proposal: DebitNoteProposal,
-    options?: { recipientPhone?: string; savePhoneToTally?: boolean }
+    options?: { recipientPhone?: string; savePhoneToTally?: boolean; connectionId?: string }
   ) {
     const response = await apiFetch(`/api/collections/debit-note-proposals/${proposal.id}/whatsapp`, {
       method: "POST",
@@ -602,6 +682,19 @@ export function CollectionsDashboardPage() {
       body: JSON.stringify(options ?? {}),
     });
     if (!response.ok) throw new Error(await readError(response));
+    return (await response.json().catch(() => ({}))) as WhatsappSendResult;
+  }
+
+  async function readTallyLedgerPhone(connectionId: string, ledgerName: string) {
+    const response = await apiFetch(`/api/tally/connections/${connectionId}/masters?type=ledger&limit=5000`, {
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error(await readError(response));
+    const payload = (await response.json()) as { masters?: TallyMaster[] };
+    const ledger = (payload.masters ?? []).find(
+      (master) => master.name.trim().toLowerCase() === ledgerName.trim().toLowerCase()
+    );
+    return ledger?.phone ?? null;
   }
 
   function openWhatsappDialog(proposalsToSend: DebitNoteProposal[]) {
@@ -632,25 +725,60 @@ export function CollectionsDashboardPage() {
     try {
       setWhatsappDialogSending(true);
       setBulkSendingWhatsapp(whatsappDialogProposals.length > 1);
+      const pendingTallyPhoneSaves: Array<{ ledgerName: string; phone: string; commandId: string; connectionId: string }> = [];
+      let requestedTallyPhoneSaves = 0;
+      let failedTallyPhoneQueues = 0;
       for (const proposal of whatsappDialogProposals) {
         setSendingWhatsappId(proposal.id);
         const phone = proposal.partyPhone ? undefined : getTenDigitPhone(whatsappPhoneInputs[proposal.id] ?? "");
-        await sendWhatsappForProposal(
+        const sendResult = await sendWhatsappForProposal(
           proposal,
           phone
             ? {
                 recipientPhone: phone,
                 savePhoneToTally: whatsappSaveToTally,
+                connectionId: selectedConnectionId,
               }
             : undefined
         );
+        if (phone && sendResult.phoneSaveCommandId && sendResult.phoneSaveConnectionId) {
+          requestedTallyPhoneSaves += 1;
+          pendingTallyPhoneSaves.push({
+            ledgerName: proposal.partyLedgerName,
+            phone,
+            commandId: sendResult.phoneSaveCommandId,
+            connectionId: sendResult.phoneSaveConnectionId,
+          });
+        } else if (phone && whatsappSaveToTally) {
+          requestedTallyPhoneSaves += 1;
+          failedTallyPhoneQueues += 1;
+        }
+      }
+
+      let verifiedTallyPhoneSaves = 0;
+      if (pendingTallyPhoneSaves.length > 0 && selectedConnectionId) {
+        for (const save of pendingTallyPhoneSaves) {
+          await pollCommand(save.connectionId, save.commandId);
+        }
+        await syncCurrentCompanyLedgers(selectedConnectionId, selectedCompany?.companyName);
+        for (const save of pendingTallyPhoneSaves) {
+          const storedPhone = await readTallyLedgerPhone(selectedConnectionId, save.ledgerName);
+          if (getTenDigitPhone(storedPhone ?? "") === save.phone) verifiedTallyPhoneSaves += 1;
+        }
       }
       setMessage({
         tone: "success",
-        text:
+        text: `${
           whatsappDialogProposals.length === 1
             ? "WhatsApp message sent."
-            : `${whatsappDialogProposals.length} WhatsApp messages sent.`,
+            : `${whatsappDialogProposals.length} WhatsApp messages sent.`
+        }${
+          requestedTallyPhoneSaves === 0
+            ? ""
+            : failedTallyPhoneQueues === 0 && verifiedTallyPhoneSaves === requestedTallyPhoneSaves
+              ? ` ${verifiedTallyPhoneSaves === 1 ? "Number was" : "Numbers were"} saved and verified in Tally.`
+              : ` ${requestedTallyPhoneSaves - verifiedTallyPhoneSaves} number${requestedTallyPhoneSaves - verifiedTallyPhoneSaves === 1 ? " was" : "s were"} not saved or verified in Tally.`
+        }`,
       });
       setWhatsappDialogProposals([]);
       setWhatsappPhoneInputs({});
@@ -673,8 +801,17 @@ export function CollectionsDashboardPage() {
   useEffect(() => {
     if (initialLoadStartedRef.current) return;
     initialLoadStartedRef.current = true;
-    void refreshAll({ refreshTally: false });
+    void refreshAll();
   }, [refreshAll]);
+
+  useEffect(() => {
+    if (!selectedConnectionId) {
+      setLiveTallyConnection(null);
+      setCheckingLiveTallyCompany(false);
+      return;
+    }
+    void refreshLiveTallyCompany(selectedConnectionId).catch(() => undefined);
+  }, [refreshLiveTallyCompany, selectedConnectionId]);
 
   useEffect(() => {
     if (!selectedConnectionId) return;
@@ -684,7 +821,11 @@ export function CollectionsDashboardPage() {
     lastLoadedConnectionRef.current = loadKey;
     void (async () => {
       setLoading(true);
+      setDashboard(null);
       try {
+        // A company switch must read a new live snapshot. Loading the old saved
+        // scan here can show bills belonging to the previously selected company.
+        await refreshTallyOpenBills(selectedConnectionId, company?.companyName);
         await loadDashboard(selectedConnectionId, company?.companyName);
       } catch (error) {
         setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
@@ -692,14 +833,24 @@ export function CollectionsDashboardPage() {
         setLoading(false);
       }
     })();
-  }, [loadDashboard, selectedCompany, selectedConnectionId]);
+  }, [loadDashboard, refreshTallyOpenBills, selectedCompany, selectedConnectionId]);
 
   const proposals = dashboard?.tabs?.debitNoteQueue ?? [];
   const rules = dashboard?.rules ?? [];
 
+  const activeTallyCompanyName = liveTallyConnection?.lastCompanyName?.trim() ?? "";
+  const tallyCompanyVerified = Boolean(
+    !checkingLiveTallyCompany &&
+      selectedCompany?.companyName &&
+      activeTallyCompanyName &&
+      liveTallyConnection?.tallyReachable === true &&
+      liveTallyConnection?.companyLoaded === true &&
+      normalizeCompanyName(selectedCompany.companyName) === normalizeCompanyName(activeTallyCompanyName)
+  );
+
   const pendingProposals = proposals.filter(isPendingDebitNote);
   const createdProposals = proposals.filter(isCreatedDebitNote);
-  const selectablePendingProposals = pendingProposals.filter(canCreateInTally);
+  const selectablePendingProposals = tallyCompanyVerified ? pendingProposals.filter(canCreateInTally) : [];
   const selectedPendingProposals = selectablePendingProposals.filter((proposal) => selectedPendingIds.has(proposal.id));
   const selectableCreatedProposals = createdProposals.filter((proposal) => proposal.communicationStatus !== "sent");
   const selectedCreatedProposals = selectableCreatedProposals.filter((proposal) => selectedCreatedIds.has(proposal.id));
@@ -710,7 +861,7 @@ export function CollectionsDashboardPage() {
   const pendingRecoverableTotal = sumRecoverable(pendingProposals);
   const createdRecoverableTotal = sumRecoverable(createdProposals);
   const activeRule = rules[0];
-  const companyReady = selectedCompany?.companyLoaded === true;
+  const companyReady = tallyCompanyVerified;
   const whatsappDialogMissingCount = whatsappDialogProposals.filter((proposal) => !proposal.partyPhone).length;
 
   function togglePendingSelection(id: string, checked: boolean) {
@@ -754,6 +905,10 @@ export function CollectionsDashboardPage() {
   }
 
   async function approveSelectedProposals() {
+    if (!tallyCompanyVerified) {
+      setMessage({ tone: "error", text: `Tally is open to ${activeTallyCompanyName || "another company"}. Switch it to ${selectedCompany?.companyName || "the selected company"}, refresh, then create debit notes.` });
+      return;
+    }
     if (selectedPendingProposals.length === 0) return;
     const confirmed = window.confirm(
       `Create ${selectedPendingProposals.length} debit note${selectedPendingProposals.length === 1 ? "" : "s"} in Tally?`
@@ -836,10 +991,12 @@ export function CollectionsDashboardPage() {
               }`}
             >
               {companyReady ? <CheckCircle2 className="h-3.5 w-3.5" /> : <TriangleAlert className="h-3.5 w-3.5" />}
-              {companyReady ? "Tally Ready" : "Sync Pending"}
+              {checkingLiveTallyCompany ? "Checking Tally" : companyReady ? "Tally company verified" : "Switch company in Tally"}
             </span>
             <span className="hidden h-4 w-px bg-[#e5ddd0] sm:block" />
-            <span className="whitespace-nowrap font-semibold">Heartbeat {formatDate(selectedCompany?.lastHeartbeatAt)}</span>
+            <span className="whitespace-nowrap font-semibold">
+              Kalika: {selectedCompany?.companyName || "Not selected"} · Tally: {checkingLiveTallyCompany ? "Checking…" : activeTallyCompanyName || "Not detected"}
+            </span>
           </div>
 
           <button
@@ -947,7 +1104,7 @@ export function CollectionsDashboardPage() {
                   <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
                     {pendingProposals.map((proposal) => {
                       const shortfall = calculateShortfall(proposal);
-                      const createEnabled = canCreateInTally(proposal);
+                      const createEnabled = tallyCompanyVerified && canCreateInTally(proposal);
                       const displayAmount = proposal.recoverableAmount;
                       const lateByDays = daysPast(proposal.discountDeadline);
 
@@ -1303,7 +1460,7 @@ export function CollectionsDashboardPage() {
                   onChange={(event) => setWhatsappSaveToTally(event.target.checked)}
                   type="checkbox"
                 />
-                <span>Save entered numbers to the matching customer ledgers in Tally too.</span>
+                <span>Also save entered numbers to the matching customer ledgers in Tally. We will verify each save before confirming it.</span>
               </label>
             ) : null}
 

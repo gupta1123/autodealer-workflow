@@ -81,7 +81,9 @@ export function toNullableText(value: unknown, maxLength = 500) {
 }
 
 export function toNumber(value: unknown, fallback = 0) {
-  const parsed = Number(String(value ?? "").replace(/,/g, ""));
+  const normalized = String(value ?? "").replace(/,/g, "").trim();
+  if (!normalized) return fallback;
+  const parsed = Number(normalized);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 

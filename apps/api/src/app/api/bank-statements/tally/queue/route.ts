@@ -615,7 +615,7 @@ export async function POST(request: Request) {
               transactionId: transaction.id,
               bankAccountId: account.id,
               fingerprint: transaction.fingerprint,
-              companyName: connection.last_company_name,
+              companyName: expectedCompanyName,
               voucherDate: transaction.transaction_date,
               bankLedgerName,
               counterpartyLedgerName: counterpartyLedgerName || null,
@@ -667,7 +667,7 @@ export async function POST(request: Request) {
             payload: {
               name: createLedgerName,
               parentName: createLedgerParentName,
-              companyName: connection.last_company_name,
+              companyName: expectedCompanyName,
               source: "bank_statement_queue",
             },
           });
@@ -683,7 +683,7 @@ export async function POST(request: Request) {
             transactionId: transaction.id,
             bankAccountId: account.id,
             fingerprint: transaction.fingerprint,
-            companyName: connection.last_company_name,
+            companyName: expectedCompanyName,
             voucherType: originalVoucherType,
             voucherDate: transaction.transaction_date,
             bankLedgerName,

@@ -59,6 +59,18 @@ function normalizeLedgerName(value: string | null | undefined) {
   return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+function commandCompanyName(command: TallyCommandRow) {
+  return nullableText(command.payload?.companyName, 240);
+}
+
+function commandScanId(command: TallyCommandRow) {
+  return nullableText(command.payload?.scanId, 120);
+}
+
+function belongsToCompany(command: TallyCommandRow, companyName: string | null) {
+  return normalizeLedgerName(commandCompanyName(command)) === normalizeLedgerName(companyName);
+}
+
 function isGenericTallyLabel(value: string | null | undefined) {
   const normalized = String(value ?? "")
     .trim()
@@ -378,20 +390,36 @@ export async function GET(request: Request) {
     const companyName = requestedCompanyName ?? (!isGenericTallyLabel(connection.last_company_name)
       ? connection.last_company_name
       : connection.display_name);
+    // A connector ID is a pairing instance, not a company identity. The same
+    // Tally company can be paired again many times, so collect every connector
+    // that has ever synced the selected company rather than trusting the latest
+    // heartbeat from the currently paired connector.
     const compatibleConnectionIds = new Set([connectionId]);
-
-    if (connection.last_company_name) {
-      const { data: companyConnectionRows, error: companyConnectionError } = await supabase
+    const [
+      { data: companyConnectionRows, error: companyConnectionError },
+      { data: companySyncRows, error: companySyncError },
+    ] = await Promise.all([
+      supabase
         .from("tally_connections")
         .select("id")
         .eq("owner_user_id", user.id)
-        .eq("last_company_name", connection.last_company_name)
-        .limit(50);
+        .eq("last_company_name", companyName)
+        .limit(200),
+      supabase
+        .from("tally_master_sync_runs")
+        .select("connection_id")
+        .eq("owner_user_id", user.id)
+        .eq("company_name", companyName)
+        .limit(500),
+    ]);
 
-      if (companyConnectionError) throw companyConnectionError;
-      for (const row of companyConnectionRows ?? []) {
-        if (row.id) compatibleConnectionIds.add(String(row.id));
-      }
+    if (companyConnectionError) throw companyConnectionError;
+    if (companySyncError) throw companySyncError;
+    for (const row of companyConnectionRows ?? []) {
+      if (row.id) compatibleConnectionIds.add(String(row.id));
+    }
+    for (const row of companySyncRows ?? []) {
+      if (row.connection_id) compatibleConnectionIds.add(String(row.connection_id));
     }
 
     const connectionIds = Array.from(compatibleConnectionIds);
@@ -419,7 +447,7 @@ export async function GET(request: Request) {
         .from("debit_note_proposals")
         .select("*")
         .eq("owner_user_id", user.id)
-        .in("connection_id", connectionIds)
+        .eq("company_name", companyName)
         .eq("status", "created_in_tally")
         .order("created_at", { ascending: false })
         .limit(100),
@@ -439,7 +467,7 @@ export async function GET(request: Request) {
         .eq("command_type", "fetch_customer_open_bills")
         .eq("status", "succeeded")
         .order("completed_at", { ascending: false })
-        .limit(20),
+        .limit(100),
       supabase
         .from("tally_bridge_commands")
         .select("id, connection_id, owner_user_id, payload, result, completed_at, created_at")
@@ -457,9 +485,13 @@ export async function GET(request: Request) {
     if (openBillCommandError) throw openBillCommandError;
     if (debitNoteCommandError) throw debitNoteCommandError;
 
-    let allProposalRows = (proposalRows ?? []) as unknown as DebitNoteProposalRow[];
+    const companyProposalRows = ((proposalRows ?? []) as unknown as DebitNoteProposalRow[]).filter(
+      (proposal) => normalizeLedgerName(proposal.company_name) === normalizeLedgerName(companyName)
+    );
+    let allProposalRows = companyProposalRows;
     const proposalCommandIds = new Set(allProposalRows.map((row) => row.tally_command_id).filter(Boolean));
     const missingCreatedRows = ((debitNoteCommandRows ?? []) as unknown as TallyCommandRow[])
+      .filter((command) => belongsToCompany(command, companyName))
       .filter((command) => !proposalCommandIds.has(command.id))
       .map((command) => debitNoteRowFromSucceededCommand(command, { last_company_name: connection.last_company_name }))
       .filter((row): row is NonNullable<typeof row> => Boolean(row));
@@ -493,7 +525,20 @@ export async function GET(request: Request) {
         })
       )
     );
-    const tallyOpenBills = ((openBillCommandRows ?? []) as unknown as TallyCommandRow[]).flatMap((row) =>
+    const companyOpenBillCommands = ((openBillCommandRows ?? []) as unknown as TallyCommandRow[]).filter((command) =>
+      belongsToCompany(command, companyName)
+    );
+    // A refresh can be split into chunks, all marked with the same scanId. Use
+    // only the newest complete refresh; never merge its results with a prior
+    // scan or a different Tally company.
+    const newestOpenBillCommand = companyOpenBillCommands[0] ?? null;
+    const newestScanId = newestOpenBillCommand ? commandScanId(newestOpenBillCommand) : null;
+    const latestOpenBillCommands = newestOpenBillCommand
+      ? newestScanId
+        ? companyOpenBillCommands.filter((command) => commandScanId(command) === newestScanId)
+        : [newestOpenBillCommand]
+      : [];
+    const tallyOpenBills = latestOpenBillCommands.flatMap((row) =>
       readTallyOpenBills(row.result)
     );
     const seenBillKeys = new Set<string>();

@@ -421,6 +421,7 @@ export async function POST(
         companyName:
           toNullableText(rawPayload.companyName, 240) ??
           toNullableText(connection.last_company_name, 240),
+        scanId: toNullableText(rawPayload.scanId, 120),
       };
 
       if (isLocalDbMode()) {

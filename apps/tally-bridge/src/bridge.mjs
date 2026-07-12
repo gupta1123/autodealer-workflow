@@ -1008,13 +1008,20 @@ function extractCompanyName(xml) {
 
 async function fetchActiveCompanyName(tallyUrl, companyName) {
   try {
-    const xml = await exportTallyCollection(tallyUrl, {
-      collectionName: "Autodealer Active Company Probe",
-      tallyType: "Company",
-      fetchFields: "Name,Guid,StartingFrom,BooksFrom,FinancialYearFrom,CurrentPeriod,AlterID,MasterID",
-      companyName,
-    });
-    return extractCompanyName(xml);
+    // `$$CurrentCompany` is the actual company active in the Tally UI. A
+    // Company collection can instead return the first loaded company, which
+    // makes multi-company verification incorrect.
+    const xml = await exportTallyXml(
+      tallyUrl,
+      [
+        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>",
+        "<TYPE>Function</TYPE><ID>$$CurrentCompany</ID></HEADER><BODY><DESC>",
+        "<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>",
+        "</DESC></BODY></ENVELOPE>",
+      ].join(""),
+      "Current company"
+    );
+    return getTagText(xml, "RESULT") || extractCompanyName(xml);
   } catch {
     return null;
   }
@@ -2028,9 +2035,9 @@ async function testTally(tallyUrl, companyName) {
     }
 
     const possibleCompanyLoaded = !lineError && status === "1";
-    const activeCompanyName =
-      responseCompanyName ||
-      (possibleCompanyLoaded ? await fetchActiveCompanyName(normalizeTallyUrl(tallyUrl), companyName) : null);
+    const activeCompanyName = possibleCompanyLoaded
+      ? await fetchActiveCompanyName(normalizeTallyUrl(tallyUrl), companyName)
+      : null;
     const cmpLedgerCount = Number(getTagText(text, "LEDGER") ?? 0);
     const hasExportedLedgerBlocks = /<DATA>[\s\S]*<LEDGER\b[^>]*(?:NAME|RESERVEDNAME)=/i.test(text);
     const companyLoaded =
@@ -2040,7 +2047,7 @@ async function testTally(tallyUrl, companyName) {
     return {
       tallyReachable: true,
       companyLoaded,
-      companyName: companyLoaded ? activeCompanyName ?? companyName ?? null : null,
+      companyName: companyLoaded ? activeCompanyName ?? responseCompanyName ?? companyName ?? null : null,
       error: lineError,
     };
   } catch (error) {
@@ -3019,6 +3026,7 @@ async function listVouchersCli(args) {
   const tallyUrl = normalizeTallyUrl(args["tally-url"] || config.tallyUrl);
   const companyName = args["company-name"] || config?.companyName || null;
   const limit = Math.max(1, Math.min(Number(args.limit || 20) || 20, 200));
+  const includeAll = String(args.all || "").toLowerCase() === "true" || String(args.all || "").toLowerCase() === "yes";
   const xml = await exportTallyCollection(tallyUrl, {
     collectionName: "Autodealer Voucher List",
     tallyType: "Voucher",
@@ -3033,7 +3041,7 @@ async function listVouchersCli(args) {
       ok: true,
       companyName,
       scannedCount: vouchers.length,
-      vouchers: vouchers.slice(-limit),
+      vouchers: includeAll ? vouchers : vouchers.slice(-limit),
     },
     null,
     2

@@ -680,6 +680,47 @@ function normalizeAiBankStatement(value) {
   };
 }
 
+function bankAccountNumberFromTallyLedger(ledger) {
+  const raw = ledger?.raw_payload && typeof ledger.raw_payload === "object" && !Array.isArray(ledger.raw_payload)
+    ? ledger.raw_payload
+    : {};
+  const explicit = textCell(raw.bankAccountNumber ?? raw.accountNumber ?? raw.account_number)
+    .replace(/[^a-zA-Z0-9]/g, "")
+    .toUpperCase();
+  if (explicit) return explicit;
+  const numbers = Array.from(new Set((textCell(ledger?.tally_name).match(/\d{6,18}/g) ?? [])));
+  return numbers.length === 1 ? numbers[0] : "";
+}
+
+async function getTallyBankAccountCandidates(ownerUserId, connectionId) {
+  if (!connectionId) return [];
+  const { data, error } = await supabase
+    .from("tally_masters")
+    .select("tally_name, parent_name, raw_payload")
+    .eq("owner_user_id", ownerUserId)
+    .eq("connection_id", connectionId)
+    .eq("master_type", "ledger")
+    .eq("is_active", true)
+    .limit(5000);
+  if (error) throw error;
+
+  return (data ?? []).flatMap((ledger) => {
+    const parent = textCell(ledger.parent_name).toLowerCase();
+    const accountNumber = bankAccountNumberFromTallyLedger(ledger);
+    if (!/\bbank\s+accounts?\b/.test(parent) || !accountNumber) return [];
+    return [{ ledgerName: textCell(ledger.tally_name), accountNumber }];
+  });
+}
+
+function bankAccountCandidateInstruction(candidates = []) {
+  if (candidates.length === 0) return "";
+  return (
+    " The verified Tally company has these posting bank ledgers: " +
+    JSON.stringify(candidates) +
+    ". Use this list only to validate the statement account. If the visible statement account number exactly matches one candidate, return that candidate's accountNumber and the bank name visible in its ledger name. Never choose a candidate from bank name alone, and never invent an account number."
+  );
+}
+
 function isRetryableStatus(status) {
   return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
@@ -936,7 +977,7 @@ async function applyAiLedgerSuggestionsToPreviewRows({ ownerUserId, connectionId
   });
 }
 
-async function extractBankStatementFromImages(fileName, images) {
+async function extractBankStatementFromImages(fileName, images, bankAccountCandidates = []) {
   if (images.length === 0) {
     return {
       account: { bankName: null, accountNumber: null, accountHolderName: null, ifscCode: null },
@@ -955,7 +996,8 @@ async function extractBankStatementFromImages(fileName, images) {
         "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
         "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
         "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use numbers for amounts, with debit and credit as positive values in their own columns. Do not invent rows. Preserve narration text exactly enough for audit matching. " +
-        "If a page contains only summary information and no ledger rows, extract account/period only and leave transactions empty.",
+        "If a page contains only summary information and no ledger rows, extract account/period only and leave transactions empty." +
+        bankAccountCandidateInstruction(bankAccountCandidates),
     },
     {
       role: "user",
@@ -969,7 +1011,7 @@ async function extractBankStatementFromImages(fileName, images) {
   return normalizeAiBankStatement(safeJsonParse(raw, {}));
 }
 
-async function extractBankStatementFromPdfFile(fileName, mimeType, bytes) {
+async function extractBankStatementFromPdfFile(fileName, mimeType, bytes, bankAccountCandidates = []) {
   const fileData = Buffer.from(bytes).toString("base64");
   const raw = await callOpenRouterForBankStatement([
     {
@@ -992,7 +1034,8 @@ async function extractBankStatementFromPdfFile(fileName, mimeType, bytes) {
             "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use numbers for amounts, with debit and credit as positive values in their own columns. Preserve multi-line narration text in the description. " +
             "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
             "Do not treat BALANCE FORWARD, page footers, insurance notices, reward-points sections, summary totals, or opening/closing balance-only lines as transactions. " +
-            "Do not invent rows or amounts. If the PDF contains only summary information and no ledger rows, extract account/period only and leave transactions empty.",
+            "Do not invent rows or amounts. If the PDF contains only summary information and no ledger rows, extract account/period only and leave transactions empty." +
+            bankAccountCandidateInstruction(bankAccountCandidates),
         },
       ],
     },
@@ -1001,7 +1044,7 @@ async function extractBankStatementFromPdfFile(fileName, mimeType, bytes) {
   return normalizeAiBankStatement(safeJsonParse(raw, {}));
 }
 
-async function extractBankStatementFromText(fileName, pages) {
+async function extractBankStatementFromText(fileName, pages, bankAccountCandidates = []) {
   const raw = await callOpenRouterForBankStatement([
     {
       role: "system",
@@ -1013,7 +1056,8 @@ async function extractBankStatementFromText(fileName, pages) {
         "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use numbers for amounts, with debit and credit as positive values in their own columns. Preserve multi-line narration text in the description. " +
         "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. " +
         "Do not treat BALANCE FORWARD, page footers, insurance notices, reward-points sections, summary totals, or opening/closing balance-only lines as transactions. " +
-        "Do not invent rows or amounts. If the text is only summary information and no ledger rows are present, extract account/period only and leave transactions empty.",
+        "Do not invent rows or amounts. If the text is only summary information and no ledger rows are present, extract account/period only and leave transactions empty." +
+        bankAccountCandidateInstruction(bankAccountCandidates),
     },
     {
       role: "user",
@@ -1296,7 +1340,7 @@ async function recoverSinglePages({ fileName, bytes, textPagesByNumber, failedBa
   };
 }
 
-async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, isImage, jobId }) {
+async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, isImage, jobId, bankAccountCandidates = [] }) {
   const diagnostics = {
     pipeline: null,
     pageCount: isImage ? 1 : null,
@@ -1331,14 +1375,14 @@ async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, 
     try {
       await updateBankJob(jobId, { progress: 45, stage: "Running single-shot AI extraction" });
       if (isPdf && hasUsableBankStatementText(textInfo.pages)) {
-        parsed = await extractBankStatementFromText(fileName, textInfo.pages);
+        parsed = await extractBankStatementFromText(fileName, textInfo.pages, bankAccountCandidates);
         extractionSource = "single_shot_ai_pdf_text";
       } else if (isPdf) {
-        parsed = await extractBankStatementFromPdfFile(fileName, mimeType || "application/pdf", bytes);
+        parsed = await extractBankStatementFromPdfFile(fileName, mimeType || "application/pdf", bytes, bankAccountCandidates);
         extractionSource = "single_shot_ai_pdf_file";
       } else if (isImage) {
         const image = await imageBytesToProviderDataUrl(bytes, mimeType || "image/jpeg", fileName);
-        parsed = await extractBankStatementFromImages(fileName, [image]);
+        parsed = await extractBankStatementFromImages(fileName, [image], bankAccountCandidates);
         extractionSource = "single_shot_ai_image";
       }
       diagnostics.singleShotRows = parsed?.transactions.length ?? 0;
@@ -1520,6 +1564,25 @@ async function runBankStatementJob(job) {
   if (bytes.byteLength === 0) {
     throw new Error(`Downloaded bank statement file "${fileName}" is empty.`);
   }
+  const processingMeta =
+    importRow.processing_meta && typeof importRow.processing_meta === "object" && !Array.isArray(importRow.processing_meta)
+      ? importRow.processing_meta
+      : {};
+  const selectedContext =
+    processingMeta.selectedContext && typeof processingMeta.selectedContext === "object" && !Array.isArray(processingMeta.selectedContext)
+      ? processingMeta.selectedContext
+      : {};
+  const analysisContext =
+    processingMeta.analysis && typeof processingMeta.analysis === "object" && !Array.isArray(processingMeta.analysis)
+      ? processingMeta.analysis
+      : {};
+  const tallyConnectionId =
+    typeof selectedContext.connectionId === "string"
+      ? selectedContext.connectionId
+      : typeof analysisContext.connectionId === "string"
+        ? analysisContext.connectionId
+        : null;
+  const bankAccountCandidates = await getTallyBankAccountCandidates(job.owner_user_id, tallyConnectionId);
   await updateBankJob(job.id, { progress: 30, stage: "Preparing pages for AI" });
   const isPdf = mimeType.includes("pdf") || /\.pdf$/i.test(fileName);
   const isImage = mimeType.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(fileName);
@@ -1530,6 +1593,7 @@ async function runBankStatementJob(job) {
     isPdf,
     isImage,
     jobId: job.id,
+    bankAccountCandidates,
   });
   const parsed = extraction.parsed ?? normalizeAiBankStatement({});
   const extractionSource = extraction.extractionSource;
@@ -1563,25 +1627,6 @@ async function runBankStatementJob(job) {
       : candidateCount > 1
         ? "needs_account_selection"
         : "ready_to_review";
-  const processingMeta =
-    importRow.processing_meta && typeof importRow.processing_meta === "object" && !Array.isArray(importRow.processing_meta)
-      ? importRow.processing_meta
-      : {};
-  const selectedContext =
-    processingMeta.selectedContext && typeof processingMeta.selectedContext === "object" && !Array.isArray(processingMeta.selectedContext)
-      ? processingMeta.selectedContext
-      : {};
-  const analysisContext =
-    processingMeta.analysis && typeof processingMeta.analysis === "object" && !Array.isArray(processingMeta.analysis)
-      ? processingMeta.analysis
-      : {};
-  const tallyConnectionId =
-    typeof selectedContext.connectionId === "string"
-      ? selectedContext.connectionId
-      : typeof analysisContext.connectionId === "string"
-        ? analysisContext.connectionId
-        : null;
-
   await updateBankJob(job.id, { progress: 75, stage: "Saving preview rows" });
   await supabase
     .from("bank_statement_import_preview_transactions")

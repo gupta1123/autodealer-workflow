@@ -886,6 +886,23 @@ function maskAccountNumber(value: string) {
   return `${"*".repeat(Math.max(0, normalized.length - 4))}${normalized.slice(-4)}`;
 }
 
+function normalizeBankAccountNumber(value?: string | null) {
+  return String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+}
+
+function getTallyBankLedgerAccountNumber(ledger: TallyMaster) {
+  const explicitAccountNumber = normalizeBankAccountNumber(ledger.bankAccountNumber);
+  if (explicitAccountNumber) return explicitAccountNumber;
+
+  // Some Tally ledgers carry the account identity only in their name, e.g.
+  // "Kotak Mahindra Bank - 6713098600". A single full numeric token is
+  // deterministic identity data, not a fuzzy/AI match.
+  const accountNumbersInName = Array.from(
+    new Set((ledger.name.match(/\d{6,18}/g) ?? []).map(normalizeBankAccountNumber).filter(Boolean))
+  );
+  return accountNumbersInName.length === 1 ? accountNumbersInName[0] : "";
+}
+
 function isBankLedgerMaster(ledger: TallyMaster) {
   const parent = String(ledger.parent ?? "").toLowerCase();
   const bankName = String(ledger.bankName ?? "").trim();
@@ -2042,6 +2059,8 @@ export function BankStatementsPage() {
   const ledgerLoadSeqRef = useRef(0);
   const bankLedgerLoadKeyRef = useRef("");
   const initialSummaryLoadStartedRef = useRef(false);
+  const tallyStatusStartedAtRef = useRef(Date.now());
+  const [checkingLiveTallyCompany, setCheckingLiveTallyCompany] = useState(true);
 
   const validTransactions = useMemo(
     () => transactions.filter(transactionIsValid),
@@ -2116,17 +2135,18 @@ export function BankStatementsPage() {
       ? selectedCompany.companyLoaded || selectedCompany.tallyReachable
       : selectedConnection?.status === "company_loaded" || selectedConnection?.status === "tally_reachable";
   const activeTallyCompanyName = selectedConnection?.lastCompanyName?.trim() || "";
+  const activeTallyCompanyFresh = !checkingLiveTallyCompany && Boolean(activeTallyCompanyName);
   const tallyCompanyContextVerified = Boolean(
     tallyConnected &&
       selectedCompanyName &&
-      activeTallyCompanyName &&
+      activeTallyCompanyFresh &&
       normalizeName(selectedCompanyName) === normalizeName(activeTallyCompanyName)
   );
   const tallyCompanyContextMismatch = Boolean(
     tallyConnected &&
       selectedCompanyName &&
-      activeTallyCompanyName &&
-      !tallyCompanyContextVerified
+      activeTallyCompanyFresh &&
+      normalizeName(selectedCompanyName) !== normalizeName(activeTallyCompanyName)
   );
   const bankLedgerOptions = useMemo(() => {
     const hasFetchedBankLedgers = selectedCompanyName
@@ -2158,6 +2178,29 @@ export function BankStatementsPage() {
       return true;
     });
   }, [ledgerMasters, selectedCompany, selectedCompanyName, tallyBankLedgersByCompany]);
+  const exactBankLedgerMatch = useMemo(() => {
+    const statementAccountNumber = normalizeBankAccountNumber(account.accountNumber);
+    if (!statementAccountNumber) return null;
+
+    const exactNames = Array.from(
+      new Set(
+        bankLedgerOptions
+          .filter((ledger) => getTallyBankLedgerAccountNumber(ledger) === statementAccountNumber)
+          .map((ledger) => ledger.name.trim())
+          .filter(Boolean)
+      )
+    );
+    return exactNames.length === 1 ? exactNames[0] : null;
+  }, [account.accountNumber, bankLedgerOptions]);
+
+  useEffect(() => {
+    if (!preview || bankLedgerName || bankLedgerChangeMode || !exactBankLedgerMatch) return;
+    setAccount((current) => ({ ...current, tallyLedgerName: exactBankLedgerMatch }));
+    setBankLedgerName(exactBankLedgerMatch);
+    setBankLedgerVerified(true);
+    setBankLedgerManuallyConfirmed(false);
+  }, [bankLedgerChangeMode, bankLedgerName, exactBankLedgerMatch, preview]);
+
   const uploadContextReady = Boolean(tallyCompanyContextVerified);
   const setupErrorMessage = !tallyConnectionId
     ? "Select the Tally company first."
@@ -2332,6 +2375,51 @@ export function BankStatementsPage() {
     return masters;
   }, []);
 
+  useEffect(() => {
+    if (!tallyConnectionId) {
+      setCheckingLiveTallyCompany(false);
+      return;
+    }
+
+    let cancelled = false;
+    let attempts = 0;
+    tallyStatusStartedAtRef.current = Date.now();
+    setCheckingLiveTallyCompany(true);
+
+    const pollLiveCompany = async () => {
+      try {
+        const response = await apiFetch(`/api/tally/connections/${tallyConnectionId}/status`, { cache: "no-store" });
+        if (!response.ok || cancelled) return false;
+        const payload = (await response.json()) as { connection?: TallyConnection };
+        const connection = payload.connection;
+        if (!connection) return false;
+        setConnections((current) => current.map((item) => (item.id === connection.id ? connection : item)));
+
+        const updatedAt = connection.updatedAt ? Date.parse(connection.updatedAt) : Number.NaN;
+        if (Number.isFinite(updatedAt) && updatedAt >= tallyStatusStartedAtRef.current - 1000) {
+          setCheckingLiveTallyCompany(false);
+          return true;
+        }
+      } catch {
+        // Do not present a stale company as the active Tally company.
+      }
+      return false;
+    };
+
+    void pollLiveCompany();
+    const timer = window.setInterval(() => {
+      attempts += 1;
+      void pollLiveCompany().then((fresh) => {
+        if (fresh || attempts >= 7) window.clearInterval(timer);
+      });
+    }, 3000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [tallyConnectionId]);
+
   const waitForCommand = useCallback(
     async (
       connectionId: string,
@@ -2376,46 +2464,14 @@ export function BankStatementsPage() {
 
     try {
       setLoadingBankLedgers(true);
-      const response = await apiFetch(`/api/tally/connections/${connectionId}/commands`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          commandType: "fetch_bank_ledgers",
-          payload: {
-            companyName: cleanCompanyNames[0],
-            companyNames: cleanCompanyNames,
-          },
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(await readError(response));
-      }
-
-      const payload = (await response.json()) as { command?: TallyCommand };
-      const command = payload.command;
-      if (!command?.id) {
-        throw new Error("Tally bank ledger fetch was queued, but no command id was returned.");
-      }
-
-      const completedCommand = await waitForCommand(connectionId, command.id, {
-        attempts: 14,
-        intervalMs: 2000,
-      });
-      if (!completedCommand || completedCommand.status !== "succeeded") {
-        if (!options?.quiet) {
-          setBanner({
-            tone: "info",
-            text: "Could not read bank accounts from Tally yet. Open the company in Tally and refresh.",
-          });
-        }
-        return null;
-      }
-
-      const byCompany = normalizeFetchedBankLedgersByCompany(
-        completedCommand.result as BankLedgerFetchResult,
-        cleanCompanyNames
-      );
+      const byCompany = Object.fromEntries(
+        cleanCompanyNames.map((companyName) => {
+          const company = companyOptions.find(
+            (option) => normalizeName(option.companyName) === normalizeName(companyName)
+          );
+          return [companyName, company?.bankLedgers ?? []];
+        })
+      ) as Record<string, LocalBankLedger[]>;
       setTallyBankLedgersByCompany((current) => ({
         ...current,
         ...byCompany,
@@ -2822,8 +2878,27 @@ export function BankStatementsPage() {
   ) {
     // Only the API's exact-account resolution may automatically select a ledger.
     // In particular, never retain a ledger from the preceding statement.
-    const nextTallyLedgerName = payload.account.tallyLedgerName?.trim() || "";
-    const nextLedgerVerified = Boolean(payload.bankLedgerResolution?.verified && nextTallyLedgerName);
+    const statementAccountNumber = normalizeBankAccountNumber(payload.account.accountNumber);
+    const bankLedgersForExactMatch = [...bankLedgerOptions, ...ledgerMastersForReview.filter(isBankLedgerMaster)];
+    const exactLiveLedgerNames = Array.from(
+      new Set(
+        bankLedgersForExactMatch
+          .filter(
+            (ledger) =>
+              statementAccountNumber &&
+              getTallyBankLedgerAccountNumber(ledger) === statementAccountNumber
+          )
+          .map((ledger) => ledger.name.trim())
+          .filter(Boolean)
+      )
+    );
+    // The live Tally response is a fallback for local/offline bridge mode. It
+    // still requires one exact account-number match; AI never guesses a bank ledger.
+    const liveExactLedgerName = exactLiveLedgerNames.length === 1 ? exactLiveLedgerNames[0] : "";
+    const nextTallyLedgerName = liveExactLedgerName || payload.account.tallyLedgerName?.trim() || "";
+    const nextLedgerVerified = Boolean(
+      nextTallyLedgerName && (liveExactLedgerName || payload.bankLedgerResolution?.verified)
+    );
 
     setPreview(payload);
     setAccount({
@@ -3441,6 +3516,7 @@ export function BankStatementsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           connectionId: tallyConnectionId,
+          companyName: selectedCompanyName,
           accountId: confirmPayload.account.id,
           transactionIds: queueRows.map((transaction) => transaction.id),
           bankLedgerName,
@@ -3589,10 +3665,16 @@ export function BankStatementsPage() {
                 )}
                 <div className="min-w-0">
                   <div className="text-xs font-bold text-[#1a1a1a]">
-                    {!tallyConnected ? "Tally unavailable" : tallyCompanyContextVerified ? "Tally company verified" : "Switch company in Tally"}
+                    {!tallyConnected
+                      ? "Tally unavailable"
+                      : checkingLiveTallyCompany
+                        ? "Checking Tally company"
+                        : tallyCompanyContextVerified
+                          ? "Tally company verified"
+                          : "Switch company in Tally"}
                   </div>
                   <div className="truncate text-[11px] font-semibold text-slate-400 mt-0.5">
-                    Kalika: {selectedCompanyName || "Not selected"} - Tally: {activeTallyCompanyName || "Not detected"}
+                    Kalika: {selectedCompanyName || "Not selected"} - Tally: {checkingLiveTallyCompany ? "Checking..." : activeTallyCompanyName || "Not detected"}
                   </div>
                 </div>
               </div>
@@ -3617,8 +3699,8 @@ export function BankStatementsPage() {
                       setBanner({
                         tone: "info",
                         text: tallyConnected
-                          ? `In Tally Prime, switch to ${selectedCompanyName}, then refresh this page.`
-                          : "Open Tally Prime, load the selected company, then refresh this page.",
+                          ? "In Tally Prime: press F3 (Company), select the company for this workflow, then return here and refresh."
+                          : "Open Tally Prime, load the company for this workflow, then return here and refresh.",
                       });
                     }}
                     className="inline-flex h-8 items-center rounded-xl bg-[#2d2d2d] px-3.5 text-xs font-bold text-white hover:bg-[#1a1a1a] shadow-sm transition-all"

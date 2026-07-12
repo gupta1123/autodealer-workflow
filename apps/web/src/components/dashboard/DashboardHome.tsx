@@ -706,7 +706,7 @@ export function DashboardHome() {
                   item.buyerName.toLowerCase().replace(/[^a-z0-9]/g, "") !== item.receiverName.toLowerCase().replace(/[^a-z0-9]/g, "");
 
                 const cleanCategory = (() => {
-                  const cat = item.category || "";
+                  let cat = item.category || "";
                   const partner = item.buyerName || item.receiverName || "";
                   if (partner && cat.toLowerCase().includes(partner.toLowerCase())) {
                     return "Document Verification Packet";

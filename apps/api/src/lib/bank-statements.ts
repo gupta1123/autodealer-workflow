@@ -887,6 +887,12 @@ function extractAccountNumber(text: string) {
     .filter(Boolean);
 
   for (const line of lines) {
+    const statementAccountMatch = line.match(
+      /\baccount\s*:\s*[a-z][a-z .&'-]{1,80}?\s*[-:]\s*([a-z0-9x* -]{6,32})\b/i
+    );
+    const statementAccountCandidate = normalizeAccountNumber(statementAccountMatch?.[1]);
+    if (statementAccountCandidate) return statementAccountCandidate;
+
     const match = line.match(/\b(?:account\s*(?:no\.?|number)|a\/c\s*(?:no\.?|number)?)\s*[:\-]?\s*([A-Z0-9X* -]{6,32})\b/i);
     const candidate = normalizeAccountNumber(match?.[1]);
     if (candidate) return candidate;

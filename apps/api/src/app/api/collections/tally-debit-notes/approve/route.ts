@@ -8,6 +8,10 @@ function isLiveConnection(row: { status?: string | null; last_tally_reachable?: 
   return row.status === "company_loaded" || (row.last_tally_reachable === true && row.last_company_loaded === true);
 }
 
+function normalizeCompanyName(value: string | null | undefined) {
+  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
@@ -51,20 +55,15 @@ export async function POST(request: Request) {
     }
 
     const companyName = toNullableText(body.companyName ?? proposal.companyName, 240) ?? connection.last_company_name;
-    let commandConnection = connection;
-
-    if (companyName) {
-      const { data: liveRows, error: liveError } = await supabase
-        .from("tally_connections")
-        .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_company_loaded, last_heartbeat_at, updated_at")
-        .eq("owner_user_id", user.id)
-        .eq("last_company_name", companyName)
-        .order("last_heartbeat_at", { ascending: false, nullsFirst: false })
-        .order("updated_at", { ascending: false })
-        .limit(20);
-
-      if (liveError) throw liveError;
-      commandConnection = (liveRows ?? []).find(isLiveConnection) ?? connection;
+    if (!isLiveConnection(connection)) {
+      return jsonWithCors(request, { error: "The selected Tally connection is not live." }, { status: 409 });
+    }
+    if (!companyName || normalizeCompanyName(connection.last_company_name) !== normalizeCompanyName(companyName)) {
+      return jsonWithCors(
+        request,
+        { error: `Tally is currently open to ${connection.last_company_name || "another company"}. Switch it to ${companyName || "the selected company"}, refresh, then create the debit note.` },
+        { status: 409 }
+      );
     }
 
     const linkedInvoiceNumber = toNullableText(proposal.linkedInvoiceNumber, 120);
@@ -89,7 +88,7 @@ export async function POST(request: Request) {
     const { data: commandData, error: commandError } = await supabase
       .from("tally_bridge_commands")
       .insert({
-        connection_id: commandConnection.id,
+        connection_id: connection.id,
         owner_user_id: user.id,
         command_type: "create_debit_note",
         status: "queued",
@@ -102,7 +101,7 @@ export async function POST(request: Request) {
     if (commandError) throw commandError;
 
     await supabase.from("tally_connection_events").insert({
-      connection_id: commandConnection.id,
+      connection_id: connection.id,
       owner_user_id: user.id,
       event_type: "command_queued",
       message: "Debit note creation queued from Tally open-bill suggestion.",

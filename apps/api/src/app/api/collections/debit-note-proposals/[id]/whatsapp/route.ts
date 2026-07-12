@@ -69,6 +69,28 @@ export async function POST(
       return jsonWithCors(request, { error: "Customer WhatsApp number is missing." }, { status: 400 });
     }
     const shouldSavePhoneToTally = body.savePhoneToTally === true && Boolean(body.recipientPhone);
+    let tallySaveConnectionId = proposal.connection_id;
+
+    // A proposal can belong to a retired connector after the same company has
+    // been paired again. Always use the live connector supplied by the page for
+    // a new Tally ledger update, rather than queueing work for an old bridge.
+    if (shouldSavePhoneToTally && body.connectionId) {
+      const requestedConnectionId = toNullableText(body.connectionId, 80);
+      if (!requestedConnectionId) {
+        return jsonWithCors(request, { error: "The active Tally connection is invalid." }, { status: 400 });
+      }
+      const { data: requestedConnection, error: requestedConnectionError } = await supabase
+        .from("tally_connections")
+        .select("id")
+        .eq("id", requestedConnectionId)
+        .eq("owner_user_id", user.id)
+        .maybeSingle();
+      if (requestedConnectionError) throw requestedConnectionError;
+      if (!requestedConnection) {
+        return jsonWithCors(request, { error: "The active Tally connection was not found." }, { status: 404 });
+      }
+      tallySaveConnectionId = requestedConnection.id;
+    }
 
     const storedPdfUrl = await createDebitNotePdfSignedUrl(
       supabase as unknown as Parameters<typeof createDebitNotePdfSignedUrl>[0],
@@ -96,11 +118,12 @@ export async function POST(
 
     const now = new Date().toISOString();
     let phoneSaveCommandId: string | null = null;
-    if (shouldSavePhoneToTally && proposal.connection_id) {
+    let phoneSaveQueueError: string | null = null;
+    if (shouldSavePhoneToTally && tallySaveConnectionId) {
       const { data: commandData, error: commandError } = await supabase
         .from("tally_bridge_commands")
         .insert({
-          connection_id: proposal.connection_id,
+          connection_id: tallySaveConnectionId,
           owner_user_id: user.id,
           command_type: "alter_ledger",
           status: "queued",
@@ -118,6 +141,7 @@ export async function POST(
       if (!commandError) {
         phoneSaveCommandId = String(commandData?.id ?? "");
       } else {
+        phoneSaveQueueError = "The number could not be queued for saving in Tally.";
         console.warn("Could not queue Tally phone update for debit note WhatsApp:", commandError);
       }
     }
@@ -156,6 +180,9 @@ export async function POST(
     return jsonWithCors(request, {
       proposal: serializeDebitNoteProposal(updatedData as unknown as DebitNoteProposalRow),
       sent: true,
+      phoneSaveCommandId: phoneSaveCommandId || null,
+      phoneSaveConnectionId: phoneSaveCommandId ? tallySaveConnectionId : null,
+      phoneSaveQueueError,
     });
   } catch (error) {
     if (isMissingTableError(error)) {

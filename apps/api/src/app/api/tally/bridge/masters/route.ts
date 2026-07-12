@@ -132,17 +132,13 @@ export async function POST(request: Request) {
 
     const syncRunId = (syncRun as { id: string }).id;
 
-    if (companyName) {
-      await supabase
-        .from("tally_connections")
-        .update({
-          last_company_name: companyName,
-          last_company_loaded: true,
-          last_tally_reachable: true,
-          last_tested_at: now,
-        })
-        .eq("id", connection.id);
-    }
+    // This sync can explicitly read a company that is not currently open in
+    // Tally. Do not overwrite the heartbeat's active-company value here; doing
+    // so would make the UI believe a different company is live.
+    await supabase
+      .from("tally_connections")
+      .update({ last_tested_at: now })
+      .eq("id", connection.id);
 
     if (syncedTypes.size > 0) {
       await supabase
