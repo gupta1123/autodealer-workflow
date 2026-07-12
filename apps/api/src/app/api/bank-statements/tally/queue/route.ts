@@ -15,6 +15,7 @@ const NON_PARTY_TALLY_FALLBACK_LEDGER = "Suspense";
 
 type QueuePayload = {
   connectionId?: string;
+  companyName?: string;
   transactionIds?: string[];
   accountId?: string;
   bankLedgerName?: string;
@@ -270,9 +271,14 @@ export async function POST(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
+    const expectedCompanyName = toText(body.companyName, 240);
+    if (!expectedCompanyName) {
+      return jsonWithCors(request, { error: "Select the Tally company before sending entries." }, { status: 400 });
+    }
+
     const { data: submittedConnection, error: submittedConnectionError } = await supabase
       .from("tally_connections")
-      .select("id, owner_user_id, last_company_name")
+      .select("id, owner_user_id, status, last_company_name, last_heartbeat_at, last_tally_reachable")
       .eq("id", submittedConnectionId)
       .eq("owner_user_id", user.id)
       .maybeSingle();
@@ -282,30 +288,34 @@ export async function POST(request: Request) {
       return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
     }
 
-    const liveHeartbeatCutoff = new Date(Date.now() - 60_000).toISOString();
-    const { data: liveConnection, error: liveConnectionError } = await supabase
-      .from("tally_connections")
-      .select("id, owner_user_id, last_company_name")
-      .eq("owner_user_id", user.id)
-      .in("status", ["company_loaded", "tally_reachable", "bridge_connected"])
-      .eq("last_tally_reachable", true)
-      .gte("last_heartbeat_at", liveHeartbeatCutoff)
-      .order("last_heartbeat_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (liveConnectionError) throw liveConnectionError;
-    if (!liveConnection) {
+    const heartbeatAgeMs = submittedConnection.last_heartbeat_at
+      ? Date.now() - new Date(submittedConnection.last_heartbeat_at).getTime()
+      : Number.POSITIVE_INFINITY;
+    const connectionIsLive =
+      submittedConnection.last_tally_reachable === true &&
+      ["company_loaded", "tally_reachable", "bridge_connected"].includes(submittedConnection.status) &&
+      heartbeatAgeMs <= 60_000;
+    if (!connectionIsLive) {
       return jsonWithCors(
         request,
-        { error: "No active Tally bridge connection found. Refresh the connection and try again." },
+        { error: "The selected Tally connection is not live. Refresh the connection and try again." },
         { status: 400 }
       );
     }
 
-    const connection = liveConnection;
-    const connectionId = connection.id;
+    const activeCompanyName = toText(submittedConnection.last_company_name, 240);
+    if (!activeCompanyName || normalizeName(activeCompanyName) !== normalizeName(expectedCompanyName)) {
+      return jsonWithCors(
+        request,
+        {
+          error: `Tally is currently open to "${activeCompanyName || "no company"}". Switch Tally Prime to "${expectedCompanyName}", refresh Kalika, then try again.`,
+        },
+        { status: 409 }
+      );
+    }
 
+    const connection = submittedConnection;
+    const connectionId = connection.id;
     let query = supabase
       .from("bank_transactions")
       .select("*")

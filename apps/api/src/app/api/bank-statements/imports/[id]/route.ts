@@ -17,7 +17,101 @@ function readRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
-function serializeImport(row: Record<string, unknown>) {
+function normalizeBankAccountNumber(value: unknown) {
+  return String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+}
+
+function isBankLedgerMaster(row: Record<string, unknown>) {
+  const raw = readRecord(row.raw_payload);
+  const parentName = String(row.parent_name ?? "").toLowerCase();
+  return (
+    /\bbank\s+accounts?\b/.test(parentName) ||
+    Boolean(String(raw.bankName ?? raw.bank_name ?? "").trim()) ||
+    Boolean(String(raw.bankAccountNumber ?? raw.accountNumber ?? raw.account_number ?? "").trim())
+  );
+}
+
+function bankLedgerAccountNumber(row: Record<string, unknown>) {
+  const raw = readRecord(row.raw_payload);
+  return normalizeBankAccountNumber(raw.bankAccountNumber ?? raw.accountNumber ?? raw.account_number);
+}
+
+async function resolveStatementBankLedger(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  ownerUserId: string,
+  connectionId: string | null,
+  accountNumber: string | null,
+  savedCandidates: Array<{ accountNumber?: string | null; tallyLedgerName?: string | null }>,
+  legacyProvidedLedgerName: string | null | undefined
+) {
+  const legacyProvidedLedger = String(legacyProvidedLedgerName ?? "").trim();
+  const normalizedAccountNumber = normalizeBankAccountNumber(accountNumber);
+
+  // A saved mapping is safe only for the exact account extracted from this statement.
+  // Matching on the holder alone can route a different company account to its ledger.
+  const savedLedgers = Array.from(
+    new Set(
+      savedCandidates
+        .filter(
+          (candidate) =>
+            normalizedAccountNumber &&
+            normalizeBankAccountNumber(candidate.accountNumber) === normalizedAccountNumber
+        )
+        .map((candidate) => String(candidate.tallyLedgerName ?? "").trim())
+        .filter(Boolean)
+    )
+  );
+  if (savedLedgers.length === 1) {
+    return { ledgerName: savedLedgers[0], source: "saved_bank_account_mapping", requiresSelection: false, verified: true };
+  }
+  if (savedLedgers.length > 1) {
+    return { ledgerName: null, source: "ambiguous_saved_bank_account_mapping", requiresSelection: true, verified: false };
+  }
+
+  if (!connectionId || !normalizedAccountNumber) {
+    return {
+      ledgerName: legacyProvidedLedger || null,
+      source: legacyProvidedLedger ? "legacy_manual_selection" : connectionId ? "missing_statement_account_number" : "missing_tally_connection",
+      requiresSelection: !legacyProvidedLedger,
+      verified: false,
+    };
+  }
+
+  const { data, error } = await supabase
+    .from("tally_masters")
+    .select("tally_name, parent_name, raw_payload")
+    .eq("owner_user_id", ownerUserId)
+    .eq("connection_id", connectionId)
+    .eq("master_type", "ledger")
+    .eq("is_active", true)
+    .limit(5000);
+  if (error) throw error;
+
+  const exactLedgerNames = Array.from(
+    new Set(
+      ((data ?? []) as Array<Record<string, unknown>>)
+        .filter(isBankLedgerMaster)
+        .filter((ledger) => bankLedgerAccountNumber(ledger) === normalizedAccountNumber)
+        .map((ledger) => String(ledger.tally_name ?? "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  if (exactLedgerNames.length === 1) {
+    return { ledgerName: exactLedgerNames[0], source: "tally_bank_account_number", requiresSelection: false, verified: true };
+  }
+
+  return {
+    ledgerName: legacyProvidedLedger || null,
+    source: legacyProvidedLedger
+      ? "legacy_manual_selection"
+      : exactLedgerNames.length > 1
+        ? "ambiguous_tally_bank_account_number"
+        : "no_exact_tally_bank_account_match",
+    requiresSelection: !legacyProvidedLedger,
+    verified: false,
+  };
+}function serializeImport(row: Record<string, unknown>) {
   return {
     id: String(row.id),
     bankAccountId: row.bank_account_id ? String(row.bank_account_id) : null,
@@ -285,11 +379,21 @@ export async function GET(
           ifscCode: account.ifscCode,
         })
       : [];
+    const bankLedgerResolution = await resolveStatementBankLedger(
+      supabase,
+      user.id,
+      readConnectionIdFromMeta(processingMeta),
+      account.accountNumber,
+      candidates,
+      account.tallyLedgerName
+    );
+    account.tallyLedgerName = bankLedgerResolution.ledgerName;
 
     return jsonWithCors(request, {
       import: serializeImport(importRow as Record<string, unknown>),
       account,
       candidates: Array.isArray(previewMeta.candidates) ? candidates : candidates.map(serializeAccount),
+      bankLedgerResolution,
       transactions,
       requiresManualExtraction,
       extractionSource: previewMeta.extractionSource ?? processingMeta.extractionSource ?? null,

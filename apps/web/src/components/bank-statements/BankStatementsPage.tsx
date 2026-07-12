@@ -179,7 +179,15 @@ type ReviewTransaction = {
   ledgerSelectionTouched?: boolean;
 };
 
+type BankLedgerResolution = {
+  ledgerName: string | null;
+  source: string;
+  requiresSelection: boolean;
+  verified: boolean;
+};
+
 type PreviewResponse = {
+  bankLedgerResolution?: BankLedgerResolution;
   import: BankStatementImport;
   account: {
     bankName: string | null;
@@ -806,7 +814,7 @@ function formatAmount(value: string | number | null | undefined) {
 
 function formatCurrencyAmount(value: string | number | null | undefined) {
   const formatted = formatAmount(value);
-  return formatted ? `₹${formatted}` : "₹0";
+  return formatted ? `Rs. ${formatted}` : "Rs. 0";
 }
 
 function formatDataLabel(value?: string | null) {
@@ -1378,7 +1386,7 @@ function getBillAllocationLabel(draft?: BillAllocationDraft | null) {
       return "Bills + Advance";
     }
     if (draft.allocations.some((line) => line.referenceType === "Advance")) return "Advance";
-    return `Ready · ${draft.allocations.length} Bill${draft.allocations.length === 1 ? "" : "s"}`;
+    return `Ready - ${draft.allocations.length} Bill${draft.allocations.length === 1 ? "" : "s"}`;
   }
   if (draft.status === "needs_review") return "Needs Review";
   if (draft.status === "stale_data") return "Re-match Required";
@@ -1416,7 +1424,7 @@ function getOutgoingVerificationSubtext(draft?: OutgoingVerificationDraft | null
   if (draft.status === "checking") return "Checking Tally...";
   if (draft.status === "found") {
     const voucher = draft.voucherNumber ? `Voucher ${draft.voucherNumber}` : "Existing voucher found";
-    return draft.voucherDate ? `${voucher} · ${formatShortDate(draft.voucherDate)}` : voucher;
+    return draft.voucherDate ? `${voucher} - ${formatShortDate(draft.voucherDate)}` : voucher;
   }
   if (draft.status === "ambiguous") return "Review possible vouchers";
   if (draft.status === "missing") return "No existing payment found";
@@ -2001,6 +2009,10 @@ export function BankStatementsPage() {
   const [tallyConnectionId, setTallyConnectionId] = useState("");
   const [selectedCompanyId, setSelectedCompanyId] = useState("");
   const [bankLedgerName, setBankLedgerName] = useState("");
+  const [bankLedgerVerified, setBankLedgerVerified] = useState(false);
+  const [bankLedgerManuallyConfirmed, setBankLedgerManuallyConfirmed] = useState(false);
+  const [bankLedgerChangeMode, setBankLedgerChangeMode] = useState(false);
+  const [pendingBankLedgerName, setPendingBankLedgerName] = useState("");
   const [syncBeforeAnalysis, setSyncBeforeAnalysis] = useState(true);
   const [ledgerMasters, setLedgerMasters] = useState<TallyMaster[]>([]);
   const [tallyBankLedgersByCompany, setTallyBankLedgersByCompany] = useState<Record<string, LocalBankLedger[]>>({});
@@ -2103,6 +2115,19 @@ export function BankStatementsPage() {
     selectedCompany
       ? selectedCompany.companyLoaded || selectedCompany.tallyReachable
       : selectedConnection?.status === "company_loaded" || selectedConnection?.status === "tally_reachable";
+  const activeTallyCompanyName = selectedConnection?.lastCompanyName?.trim() || "";
+  const tallyCompanyContextVerified = Boolean(
+    tallyConnected &&
+      selectedCompanyName &&
+      activeTallyCompanyName &&
+      normalizeName(selectedCompanyName) === normalizeName(activeTallyCompanyName)
+  );
+  const tallyCompanyContextMismatch = Boolean(
+    tallyConnected &&
+      selectedCompanyName &&
+      activeTallyCompanyName &&
+      !tallyCompanyContextVerified
+  );
   const bankLedgerOptions = useMemo(() => {
     const hasFetchedBankLedgers = selectedCompanyName
       ? Object.prototype.hasOwnProperty.call(tallyBankLedgersByCompany, selectedCompanyName)
@@ -2133,18 +2158,16 @@ export function BankStatementsPage() {
       return true;
     });
   }, [ledgerMasters, selectedCompany, selectedCompanyName, tallyBankLedgersByCompany]);
-  const uploadContextReady = Boolean(
-    tallyConnectionId &&
-    tallyConnected &&
-    bankLedgerName.trim()
-  );
+  const uploadContextReady = Boolean(tallyCompanyContextVerified);
   const setupErrorMessage = !tallyConnectionId
     ? "Select the Tally company first."
     : !tallyConnected
       ? "Open Tally Prime, load the company, then refresh the connection."
-      : !bankLedgerName.trim()
-        ? "Select the Tally bank ledger."
-        : "";
+      : !activeTallyCompanyName
+        ? "Refresh Kalika to confirm the company currently open in Tally."
+        : !tallyCompanyContextVerified
+          ? `Tally is open to ${activeTallyCompanyName}. Switch Tally Prime to ${selectedCompanyName}, then refresh.`
+          : "";
   const missingLedgerCount = useMemo(
     () => validTransactions.filter((transaction) => !transaction.selectedLedgerName.trim()).length,
     [validTransactions]
@@ -2424,7 +2447,13 @@ export function BankStatementsPage() {
     setPreview(null);
     setTransactions([]);
     setFile(null);
+    setAccount(EMPTY_ACCOUNT);
+    setBankLedgerName("");
+    setBankLedgerVerified(false);
+    setBankLedgerManuallyConfirmed(false);
     setSelectedAccountId("");
+    setBankLedgerChangeMode(false);
+    setPendingBankLedgerName("");
     setEditingLedgerIds(new Set());
     setBanner(null);
     setTallyPostingStatus(null);
@@ -2434,7 +2463,6 @@ export function BankStatementsPage() {
     setBillAllocationReviewTransactionId(null);
     setOutgoingReviewTransactionId(null);
   }, []);
-
   const pollTallyPostingStatus = useCallback(async (connectionId: string, commandIds: string[]) => {
     for (let attempt = 0; attempt < 180; attempt += 1) {
       await wait(2000);
@@ -2513,7 +2541,7 @@ export function BankStatementsPage() {
         setAccounts(payload.accounts ?? []);
       }
       const preferredConnection = getRelevantTallyConnections(loadedConnections)[0];
-      const preferredCompany = loadedCompanies[0];
+      const preferredCompany = loadedCompanies.find((company) => company.id === selectedCompanyId) ?? loadedCompanies[0];
       const nextConnectionId = tallyConnectionId || preferredCompany?.connectionId || preferredConnection?.id || "";
       const nextCompanyId = selectedCompanyId || preferredCompany?.id || "";
       setSelectedCompanyId(nextCompanyId);
@@ -2707,6 +2735,14 @@ export function BankStatementsPage() {
     window.setTimeout(() => dismissToast(id), 5000);
   }
 
+  function requireVerifiedTallyCompany(action: string) {
+    if (tallyCompanyContextVerified) return true;
+    const detail = tallyCompanyContextMismatch
+      ? `Tally is open to ${activeTallyCompanyName}. Switch it to ${selectedCompanyName}, refresh Kalika, then ${action}.`
+      : "Refresh Kalika to verify the company currently open in Tally before continuing.";
+    showToast("error", detail);
+    return false;
+  }
   async function refreshTallyConnectionStatus() {
     try {
       setRefreshingConnections(true);
@@ -2715,7 +2751,7 @@ export function BankStatementsPage() {
         loadCompanyOptions(),
       ]);
       const preferredConnection = getRelevantTallyConnections(loadedConnections)[0];
-      const preferredCompany = loadedCompanies[0];
+      const preferredCompany = loadedCompanies.find((company) => company.id === selectedCompanyId) ?? loadedCompanies[0];
       const nextConnectionId = preferredCompany?.connectionId || preferredConnection?.id || "";
       const nextCompanyId = preferredCompany?.id || "";
       if (nextConnectionId) {
@@ -2741,6 +2777,8 @@ export function BankStatementsPage() {
     setSelectedCompanyId(nextCompanyId);
     setTallyConnectionId(nextConnectionId);
     setBankLedgerName("");
+    setBankLedgerChangeMode(false);
+    setPendingBankLedgerName("");
     setSelectedAccountId("");
     setAccount(EMPTY_ACCOUNT);
     setLedgerMasters([]);
@@ -2748,39 +2786,44 @@ export function BankStatementsPage() {
   }
 
   function applyTallyBankLedgerSelection(ledgerName: string) {
-    const ledger =
-      bankLedgerOptions.find((item) => item.name === ledgerName) ??
-      ledgerMasters.find((item) => item.name === ledgerName);
-    const mappedAccount = accounts.find((item) => item.tallyLedgerName === ledgerName);
-    const ledgerAccountNumber =
-      mappedAccount?.accountNumber?.trim() || ledger?.bankAccountNumber?.trim() || "";
-
-    setAccount((current) => ({
-      ...current,
-      tallyLedgerName: ledgerName,
-      bankName: mappedAccount?.bankName || ledger?.bankName || ledger?.name || current.bankName,
-      accountNumber: ledgerAccountNumber || current.accountNumber,
-      accountHolderName:
-        mappedAccount?.accountHolderName ||
-        ledger?.accountHolderName ||
-        ledger?.name ||
-        current.accountHolderName,
-      ifscCode: mappedAccount?.ifscCode || ledger?.ifscCode || current.ifscCode,
-    }));
+    // The statement account remains evidence from the uploaded file. A manual
+    // Tally choice must never overwrite it with the ledger's account details.
+    setAccount((current) => ({ ...current, tallyLedgerName: ledgerName }));
     setBankLedgerName(ledgerName);
+    setBankLedgerVerified(false);
+    setBankLedgerManuallyConfirmed(true);
+    setBankLedgerChangeMode(false);
+    setPendingBankLedgerName("");
+  }
+  function beginBankLedgerChange() {
+    setPendingBankLedgerName(bankLedgerName);
+    setBankLedgerChangeMode(true);
+  }
+
+  function cancelBankLedgerChange() {
+    setPendingBankLedgerName("");
+    setBankLedgerChangeMode(false);
+  }
+
+  function confirmBankLedgerChange() {
+    if (!pendingBankLedgerName.trim()) {
+      showToast("error", "Choose a Tally bank ledger first.");
+      return;
+    }
+
+    applyTallyBankLedgerSelection(pendingBankLedgerName);
+    showToast("success", "Bank ledger updated for this statement.");
   }
 
   function applyPreviewPayload(
     payload: PreviewResponse,
-    fallbackAccount = account,
+    fallbackAccount = EMPTY_ACCOUNT,
     ledgerMastersForReview = ledgerMasters
   ) {
-    const singleCandidate = payload.candidates.length === 1 ? payload.candidates[0] : null;
-    const nextTallyLedgerName =
-      singleCandidate?.tallyLedgerName ||
-      payload.account.tallyLedgerName ||
-      fallbackAccount.tallyLedgerName ||
-      bankLedgerName;
+    // Only the API's exact-account resolution may automatically select a ledger.
+    // In particular, never retain a ledger from the preceding statement.
+    const nextTallyLedgerName = payload.account.tallyLedgerName?.trim() || "";
+    const nextLedgerVerified = Boolean(payload.bankLedgerResolution?.verified && nextTallyLedgerName);
 
     setPreview(payload);
     setAccount({
@@ -2790,8 +2833,12 @@ export function BankStatementsPage() {
       ifscCode: payload.account.ifscCode ?? fallbackAccount.ifscCode,
       tallyLedgerName: nextTallyLedgerName,
     });
-    setSelectedAccountId(singleCandidate?.id || "");
-    setBankLedgerName(nextTallyLedgerName || bankLedgerName);
+    setSelectedAccountId("");
+    setBankLedgerName(nextTallyLedgerName);
+    setBankLedgerVerified(nextLedgerVerified);
+    setBankLedgerManuallyConfirmed(false);
+    setBankLedgerChangeMode(false);
+    setPendingBankLedgerName("");
     setTransactions(
       payload.transactions.map((transaction) => normalizeReviewTransaction(transaction, ledgerMastersForReview))
     );
@@ -2802,7 +2849,6 @@ export function BankStatementsPage() {
     setBillAllocationReviewTransactionId(null);
     setOutgoingReviewTransactionId(null);
   }
-
   async function pollImportUntilReady(importId: string, ledgerMastersForReview = ledgerMasters) {
     for (let attempt = 0; attempt < 120; attempt += 1) {
       await wait(2500);
@@ -2828,7 +2874,7 @@ export function BankStatementsPage() {
         throw new Error(payload.job.error || "Bank statement analysis failed.");
       }
 
-      applyPreviewPayload(payload, account, ledgerMastersForReview);
+      applyPreviewPayload(payload, EMPTY_ACCOUNT, ledgerMastersForReview);
       setBanner(getAnalysisCompleteMessage(payload));
       return payload;
     }
@@ -2849,12 +2895,8 @@ export function BankStatementsPage() {
       setBanner({ tone: "error", text: "Tally company is not ready. Open Tally Prime and refresh the connection." });
       return;
     }
-    if (!bankLedgerName.trim()) {
-      setBanner({ tone: "error", text: "Select the Tally bank ledger before upload." });
-      return;
-    }
-
     try {
+      clearStatementReview();
       setLoading(true);
       setBanner(null);
       setTallyPostingStatus(null);
@@ -2870,11 +2912,11 @@ export function BankStatementsPage() {
       }
       const formData = new FormData();
       formData.set("file", nextFile);
-      formData.set("account", JSON.stringify({ ...account, tallyLedgerName: bankLedgerName }));
+      formData.set("account", JSON.stringify(EMPTY_ACCOUNT));
       formData.set("connectionId", tallyConnectionId);
       formData.set("companyName", selectedCompanyName);
       formData.set("financialYear", selectedFinancialYear);
-      formData.set("bankLedgerName", bankLedgerName);
+      formData.set("bankLedgerName", "");
       formData.set("syncBeforeAnalysis", String(syncBeforeAnalysis));
 
       const response = await apiFetch("/api/bank-statements/imports", {
@@ -2898,7 +2940,7 @@ export function BankStatementsPage() {
         return;
       }
 
-      applyPreviewPayload(payload, account, ledgerMastersForReview);
+      applyPreviewPayload(payload, EMPTY_ACCOUNT, ledgerMastersForReview);
       setBanner(getAnalysisCompleteMessage(payload));
     } catch (error) {
       setBanner({
@@ -3287,6 +3329,10 @@ export function BankStatementsPage() {
       showToast("error", "Select the Tally bank ledger.");
       return;
     }
+    if (!bankLedgerVerified && !bankLedgerManuallyConfirmed) {
+      showToast("error", "Review the account mismatch and explicitly choose the intended Tally ledger before posting.");
+      return;
+    }
     if (validTransactions.length === 0) {
       showToast("error", "No valid rows are available to send.");
       return;
@@ -3543,12 +3589,10 @@ export function BankStatementsPage() {
                 )}
                 <div className="min-w-0">
                   <div className="text-xs font-bold text-[#1a1a1a]">
-                    {tallyConnected ? "Tally connected" : "Tally not connected"}
+                    {!tallyConnected ? "Tally unavailable" : tallyCompanyContextVerified ? "Tally company verified" : "Switch company in Tally"}
                   </div>
                   <div className="truncate text-[11px] font-semibold text-slate-400 mt-0.5">
-                    {selectedConnection?.lastCompanyName ||
-                      selectedConnection?.status?.replaceAll("_", " ") ||
-                      "Open Tally Bridge"}
+                    Kalika: {selectedCompanyName || "Not selected"} - Tally: {activeTallyCompanyName || "Not detected"}
                   </div>
                 </div>
               </div>
@@ -3566,13 +3610,20 @@ export function BankStatementsPage() {
                   )}
                   Refresh
                 </button>
-                {!tallyConnected ? (
+                {!tallyCompanyContextVerified ? (
                   <button
                     type="button"
-                    onClick={() => router.push("/tally-prime")}
+                    onClick={() => {
+                      setBanner({
+                        tone: "info",
+                        text: tallyConnected
+                          ? `In Tally Prime, switch to ${selectedCompanyName}, then refresh this page.`
+                          : "Open Tally Prime, load the selected company, then refresh this page.",
+                      });
+                    }}
                     className="inline-flex h-8 items-center rounded-xl bg-[#2d2d2d] px-3.5 text-xs font-bold text-white hover:bg-[#1a1a1a] shadow-sm transition-all"
                   >
-                    Retry connection
+                    {tallyConnected ? "Show switch steps" : "Connection steps"}
                   </button>
                 ) : null}
               </div>
@@ -3647,52 +3698,9 @@ export function BankStatementsPage() {
                     </select>
                   </label>
 
-                  <div className="rounded-xl border border-[#e5ddd0] bg-[#faf8f4]/60 p-4">
-                    <div className="mb-2.5 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                      <div className="text-xs font-bold text-[#5a5046]">Bank ledger</div>
-                      <button
-                        type="button"
-                        onClick={handleSyncLedgerMasters}
-                        disabled={!tallyConnectionId || syncingMasters || loadingBankLedgers}
-                        className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-all disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {syncingMasters || loadingBankLedgers ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <RefreshCw className="h-3.5 w-3.5" />
-                        )}
-                        Sync company data
-                      </button>
-                    </div>
-                    {bankLedgerName ? (
-                      <div className="flex min-w-0 items-center justify-between gap-2 rounded-xl border border-emerald-250 bg-emerald-50 px-4 py-2.5">
-                        <div className="min-w-0">
-                          <div className="truncate text-sm font-bold text-emerald-900" title={bankLedgerName}>
-                            {bankLedgerName}
-                          </div>
-                          <div className="text-[10px] font-bold uppercase tracking-wider text-emerald-700">Selected bank ledger</div>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setBankLedgerName("")}
-                          className="shrink-0 text-xs font-bold text-[#5a5046] hover:text-[#1a1a1a] underline"
-                        >
-                          Change
-                        </button>
-                      </div>
-                    ) : (
-                      <LedgerSearchSelect
-                        onChange={applyTallyBankLedgerSelection}
-                        options={bankLedgerOptions.map((ledger) => ledger.name)}
-                        placeholder={ledgerMasters.length > 0 && bankLedgerOptions.length === 0 ? "No bank account ledger found" : "Search Tally bank ledger"}
-                        value={bankLedgerName}
-                      />
-                    )}
-                  </div>
-
-                  <label className="flex items-center justify-between gap-3 rounded-xl border border-[#e5ddd0] bg-[#faf8f4]/60 px-4 py-3">
+                      <label className="flex items-center justify-between gap-3 rounded-xl border border-[#e5ddd0] bg-[#faf8f4]/60 px-4 py-3">
                     <span className="min-w-0">
-                      <span className="block text-xs font-bold text-[#1a1a1a]">Sync before analysis</span>
+                      <span className="block text-xs font-bold text-[#1a1a1a]">Sync current Tally company before analysis</span>
                     </span>
                     <input
                       checked={syncBeforeAnalysis}
@@ -3775,7 +3783,7 @@ export function BankStatementsPage() {
                     {loading ? <Loader2 className="h-6 w-6 animate-spin" /> : <UploadCloud className="h-6 w-6" />}
                   </div>
                   <div className="text-lg font-extrabold text-[#1a1a1a]">
-                    {loading ? "Analyzing..." : uploadContextReady ? "Upload statement" : "Select bank ledger"}
+                    {loading ? "Analyzing..." : uploadContextReady ? "Upload statement" : "Connect Tally company"}
                   </div>
                   <div className="text-xs font-semibold text-slate-400 mt-1">
                     Supports CSV, TXT, PDF or scanned statement images
@@ -3790,13 +3798,13 @@ export function BankStatementsPage() {
             </section>
           ) : (
             <section className="space-y-4">
-              <div className="rounded-2xl border border-[#e5ddd0] bg-white px-4 py-2.5 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+              <div className="rounded-2xl border border-[#e5ddd0] bg-white px-4 py-2 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
                 <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-                  <div className="grid min-w-0 flex-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                  <div className="grid min-w-0 flex-1 items-center gap-4 sm:grid-cols-2 xl:grid-cols-[0.72fr_0.9fr_1.45fr_auto_minmax(240px,1.35fr)]">
                     <div className="min-w-0">
                       <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Company</div>
                       <div className="mt-1 truncate text-sm font-extrabold text-[#1a1a1a]" title={selectedCompanyName}>
-                        {selectedCompanyName || "Not selected"} · {selectedFinancialYear}
+                        {selectedCompanyName || "Not selected"} - {selectedFinancialYear}
                       </div>
                     </div>
                     <div className="min-w-0">
@@ -3807,25 +3815,73 @@ export function BankStatementsPage() {
                           : "After analysis"}
                       </div>
                     </div>
-                    <div className="min-w-0 xl:col-span-2">
-                      <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Statement account</div>
+                    <div className="min-w-0">
+                      <div className="text-[9px] font-bold uppercase tracking-wider text-sky-700">Statement account</div>
                       <div className="mt-1 truncate text-sm font-extrabold text-[#1a1a1a]" title={`${account.bankName || ""} ${account.accountNumber || ""}`}>
-                        {account.bankName || "Bank not found"}
-                        {account.accountNumber ? ` · ${maskAccountNumber(account.accountNumber)}` : ""}
+                        {account.bankName || "Account not detected"}
+                        {account.accountNumber ? ` - ${maskAccountNumber(account.accountNumber)}` : ""}
                       </div>
-                      <div className="truncate text-xs font-semibold text-slate-400 mt-0.5">
+                      <div className="hidden 2xl:block truncate text-[10px] font-semibold text-slate-400 mt-0.5">
                         {account.accountHolderName || "Holder not found"}
-                        {account.ifscCode ? ` · ${account.ifscCode}` : ""}
+                        {account.ifscCode ? ` - ${account.ifscCode}` : ""}
                       </div>
                     </div>
+                    <div className="hidden xl:flex items-center justify-center px-0.5">
+                      <ArrowRight aria-label="Statement to Tally ledger" className={`h-3.5 w-3.5 ${bankLedgerVerified ? "text-emerald-600" : "text-amber-600"}`} />
+
+                    </div>
                     <div className="min-w-0">
-                      <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Tally ledger</div>
-                      <div className="mt-1 flex min-w-0 items-center gap-2">
-                        {bankLedgerName ? <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-700" /> : null}
-                        <div className="truncate text-sm font-extrabold text-[#1a1a1a]" title={bankLedgerName}>
-                          {bankLedgerName || "Not selected"}
-                        </div>
+                      <div className="text-[9px] font-bold uppercase tracking-wider text-emerald-700">
+                        {bankLedgerChangeMode ? "Replace Tally ledger" : "Tally posting ledger"}
                       </div>
+                      {bankLedgerChangeMode || !bankLedgerName ? (
+                        <div className="mt-1">
+                          <LedgerSearchSelect
+                            onChange={bankLedgerChangeMode ? setPendingBankLedgerName : applyTallyBankLedgerSelection}
+                            options={bankLedgerOptions.map((ledger) => ledger.name)}
+                            placeholder={ledgerMasters.length > 0 && bankLedgerOptions.length === 0 ? "No bank account ledger found" : "Search Tally bank ledger"}
+                            value={bankLedgerChangeMode ? pendingBankLedgerName : ""}
+                          />
+                          {bankLedgerChangeMode ? (
+                            <div className="mt-2 flex flex-wrap items-center gap-2">
+                              <button
+                                className="inline-flex h-7 items-center rounded-lg bg-[#2d2d2d] px-3 text-[10px] font-bold text-white transition hover:bg-[#1a1a1a]"
+                                onClick={confirmBankLedgerChange}
+                                type="button"
+                              >
+                                Use selected ledger
+                              </button>
+                              <button
+                                className="inline-flex h-7 items-center rounded-lg px-2 text-[10px] font-bold text-slate-500 transition hover:bg-slate-100 hover:text-[#1a1a1a]"
+                                onClick={cancelBankLedgerChange}
+                                type="button"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="mt-1 flex items-center gap-1.5 text-[10px] font-semibold text-amber-700">
+                              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                              Choose the intended ledger - no exact account match was found.
+                            </div>
+                          )}
+                        </div>                      ) : (
+                        <div className="mt-1 flex min-w-0 items-center gap-2">
+                          {bankLedgerVerified ? (
+                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-700" />
+                          ) : (
+                            <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-600" />
+                          )}
+                          <div className="min-w-0">
+                            <div className="truncate text-sm font-extrabold text-[#1a1a1a]" title={bankLedgerName}>
+                              {bankLedgerName}
+                            </div>
+                            <div className={`truncate text-[10px] font-bold ${bankLedgerVerified ? "text-emerald-700" : "text-amber-700"}`}>
+                              {bankLedgerVerified ? "Exact statement account match" : "Manual selection - review account numbers"}
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div className="flex shrink-0 flex-wrap items-center gap-2">
@@ -3844,7 +3900,11 @@ export function BankStatementsPage() {
                               ifscCode: candidate.ifscCode || account.ifscCode,
                               tallyLedgerName: candidate.tallyLedgerName || account.tallyLedgerName,
                             });
-                            if (candidate.tallyLedgerName) setBankLedgerName(candidate.tallyLedgerName);
+                            if (candidate.tallyLedgerName) {
+                              setBankLedgerName(candidate.tallyLedgerName);
+                              setBankLedgerVerified(false);
+                              setBankLedgerManuallyConfirmed(false);
+                            }
                           }
                         }}
                         className="h-8.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] outline-none focus:border-amber-500"
@@ -3857,17 +3917,19 @@ export function BankStatementsPage() {
                         ))}
                       </select>
                     ) : null}
-                    <button
-                      type="button"
-                      onClick={() => setBankLedgerName("")}
-                      className="inline-flex h-8.5 items-center rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-all"
-                    >
-                      Change ledger
-                    </button>
+                    {!bankLedgerChangeMode && bankLedgerName ? (
+                      <button
+                        type="button"
+                        onClick={beginBankLedgerChange}
+                        className="inline-flex h-8.5 items-center rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-all"
+                      >
+                        Change ledger
+                      </button>
+                    ) : null}
                     <button
                       type="button"
                       onClick={handleSyncLedgerMasters}
-                      disabled={!tallyConnectionId || syncingMasters || loadingBankLedgers}
+                      disabled={!tallyCompanyContextVerified || syncingMasters || loadingBankLedgers}
                       className="inline-flex h-8.5 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50 transition-all"
                     >
                       {syncingMasters || loadingBankLedgers ? (
@@ -3880,7 +3942,14 @@ export function BankStatementsPage() {
                   </div>
                 </div>
               </div>
-              <div className="hidden rounded-2xl border border-[#e3d6c6] bg-[#fffaf2] px-4 py-3 shadow-sm">
+              {bankLedgerName && !bankLedgerVerified ? (
+                <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                  <span>
+                    This ledger has no exact verified account-number match to the uploaded statement. Choose it deliberately before posting.
+                  </span>
+                </div>
+              ) : null}              <div className="hidden rounded-2xl border border-[#e3d6c6] bg-[#fffaf2] px-4 py-3 shadow-sm">
                 <div className="grid gap-3 md:grid-cols-4">
                   <div>
                     <div className="text-[10px] uppercase tracking-[0.16em] text-[#9a8d7f]">Company</div>
@@ -3893,7 +3962,7 @@ export function BankStatementsPage() {
                     <div className="mt-1 text-sm text-[#2b241d]">{selectedFinancialYear}</div>
                   </div>
                   <div>
-                    <div className="text-[10px] uppercase tracking-[0.16em] text-[#9a8d7f]">Bank ledger</div>
+                    <div className="text-[10px] uppercase tracking-[0.16em] text-[#9a8d7f]">Bank ledger (optional)</div>
                     <div className="mt-1 truncate text-sm text-[#2b241d]" title={bankLedgerName}>
                       {bankLedgerName || "Not selected"}
                     </div>
@@ -3918,12 +3987,12 @@ export function BankStatementsPage() {
                       <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
                       <div className="min-w-0">
                         <div className="truncate text-sm font-black text-[#2b241d]">
-                          {account.bankName || "Bank not found"}
-                          {account.accountNumber ? ` · ${maskAccountNumber(account.accountNumber)}` : ""}
+                          {account.bankName || "Account not detected"}
+                          {account.accountNumber ? ` - ${maskAccountNumber(account.accountNumber)}` : ""}
                         </div>
                         <div className="truncate text-xs font-semibold text-[#8a7f72]">
                           {account.accountHolderName || "Holder not found"}
-                          {account.ifscCode ? ` · ${account.ifscCode}` : ""}
+                          {account.ifscCode ? ` - ${account.ifscCode}` : ""}
                         </div>
                       </div>
                     </div>
@@ -3942,7 +4011,11 @@ export function BankStatementsPage() {
                               ifscCode: candidate.ifscCode || account.ifscCode,
                               tallyLedgerName: candidate.tallyLedgerName || account.tallyLedgerName,
                             });
-                            if (candidate.tallyLedgerName) setBankLedgerName(candidate.tallyLedgerName);
+                            if (candidate.tallyLedgerName) {
+                              setBankLedgerName(candidate.tallyLedgerName);
+                              setBankLedgerVerified(false);
+                              setBankLedgerManuallyConfirmed(false);
+                            }
                           }
                         }}
                         className="mt-3 h-9 w-full rounded-md border border-[#d8cbbb] bg-white px-3 text-sm font-medium outline-none focus:border-[#7c5f3f]"
@@ -3950,7 +4023,7 @@ export function BankStatementsPage() {
                         <option value="new">Use extracted account</option>
                         {preview.candidates.map((candidate) => (
                           <option key={candidate.id} value={candidate.id}>
-                            {candidate.accountHolderName || "Saved account"} · {candidate.accountNumberMasked}
+                            {candidate.accountHolderName || "Saved account"} - {candidate.accountNumberMasked}
                           </option>
                         ))}
                       </select>
@@ -3965,7 +4038,7 @@ export function BankStatementsPage() {
                       <button
                         type="button"
                         onClick={handleSyncLedgerMasters}
-                        disabled={!tallyConnectionId || syncingMasters || loadingBankLedgers}
+                        disabled={!tallyCompanyContextVerified || syncingMasters || loadingBankLedgers}
                         className="inline-flex h-7 items-center gap-1 rounded-md border border-[#d8cbbb] bg-white px-2 text-[11px] font-bold text-[#6f4e2f] hover:bg-[#fbf7f1] disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         {syncingMasters || loadingBankLedgers ? (
@@ -4739,7 +4812,7 @@ export function BankStatementsPage() {
                                     <div className="mt-1 text-xs font-semibold text-slate-400">
                                       {[match.voucherType, match.date ? formatShortDate(match.date) : null, match.reference]
                                         .filter(Boolean)
-                                        .join(" · ") || "Voucher details from Tally"}
+                                        .join(" - ") || "Voucher details from Tally"}
                                     </div>
                                   </div>
                                   {typeof match.score === "number" ? (
@@ -4868,7 +4941,8 @@ export function BankStatementsPage() {
                           matchingBills ||
                           tallyPostingInProgress ||
                           validTransactions.length === 0 ||
-                          blockingBillAllocationCount > 0
+                          blockingBillAllocationCount > 0 ||
+                          (!bankLedgerVerified && !bankLedgerManuallyConfirmed)
                         }
                       >
                         {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}

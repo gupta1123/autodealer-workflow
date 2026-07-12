@@ -126,10 +126,6 @@ export async function POST(request: Request) {
     if (!connectionId) {
       return jsonWithCors(request, { error: "Select a Tally company before upload." }, { status: 400 });
     }
-    if (!bankLedgerName) {
-      return jsonWithCors(request, { error: "Select the Tally bank ledger before upload." }, { status: 400 });
-    }
-
     const bytes = new Uint8Array(await file.arrayBuffer());
     const storagePath = buildStoragePath(user.id, file.name || "bank-statement");
     const supabase = createSupabaseAdminClient();
