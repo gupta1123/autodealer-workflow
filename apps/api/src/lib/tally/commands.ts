@@ -6,6 +6,7 @@ export type TallyBridgeCommandType =
   | "post_bank_voucher"
   | "fetch_customer_open_bills"
   | "create_debit_note"
+  | "export_debit_note_pdf"
   | "verify_bank_transaction";
 
 export type TallyBridgeCommandStatus =
@@ -43,6 +44,7 @@ export const TALLY_BRIDGE_COMMAND_TYPES: TallyBridgeCommandType[] = [
   "post_bank_voucher",
   "fetch_customer_open_bills",
   "create_debit_note",
+  "export_debit_note_pdf",
   "verify_bank_transaction",
 ];
 

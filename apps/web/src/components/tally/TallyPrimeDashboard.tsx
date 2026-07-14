@@ -106,6 +106,16 @@ function getStatusTone(connection?: TallyConnection | null) {
 const DEFAULT_BRIDGE_API_BASE_URL = "https://autodealer-workflow-465859fe2891.herokuapp.com";
 
 function getBridgeApiBaseUrl() {
+  // In local development the connector runs on the same workstation as this
+  // browser. Never fall back to the hosted API here: doing so pairs the
+  // desktop connector to a different connection record than localhost is
+  // displaying, leaving the UI permanently "Waiting for connector".
+  if (typeof window !== "undefined") {
+    const { hostname, origin } = window.location;
+    if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") {
+      return origin.replace(/\/+$/, "");
+    }
+  }
   const configuredBaseUrl = (
     process.env.NEXT_PUBLIC_BRIDGE_API_BASE_URL ||
     process.env.NEXT_PUBLIC_API_BASE_URL ||

@@ -70,6 +70,18 @@ export type DebitNoteProposalRow = {
   updated_at: string;
 };
 
+export type NativeTallyPdfEvidence = {
+  source: "tally_voucher_render";
+  status: "verified";
+  voucherId: string;
+  voucherNumber: string;
+  reference: string | null;
+  alterId: string | null;
+  sha256: string;
+  byteSize: number;
+  exportedAt: string;
+};
+
 export function toText(value: unknown, maxLength = 500) {
   if (value === null || value === undefined) return "";
   return String(value).trim().slice(0, maxLength);
@@ -90,6 +102,32 @@ export function toNumber(value: unknown, fallback = 0) {
 export function toDateText(value: unknown) {
   const text = toText(value, 20);
   return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
+}
+
+export function getNativeTallyPdfEvidence(snapshot: Record<string, unknown> | null | undefined) {
+  const candidate = snapshot?.nativeTallyPdf;
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+  const value = candidate as Record<string, unknown>;
+  const source = toText(value.source, 40);
+  const status = toText(value.status, 40);
+  const voucherId = toText(value.voucherId, 500);
+  const voucherNumber = toText(value.voucherNumber, 500);
+  const sha256 = toText(value.sha256, 128);
+  // The previous `tally_native` source was a blank, unbound VCH Print form.
+  // It is deliberately not trusted: a send is allowed only for the rendered
+  // document whose voucher fields were resolved and verified live from Tally.
+  if (source !== "tally_voucher_render" || status !== "verified" || !voucherId || !voucherNumber || !sha256) return null;
+  return {
+    source: "tally_voucher_render" as const,
+    status: "verified" as const,
+    voucherId,
+    voucherNumber,
+    reference: toNullableText(value.reference, 500),
+    alterId: toNullableText(value.alterId, 500),
+    sha256,
+    byteSize: toNumber(value.byteSize),
+    exportedAt: toText(value.exportedAt, 80),
+  } satisfies NativeTallyPdfEvidence;
 }
 
 export function serializeCashDiscountRule(row: CashDiscountRuleRow) {
@@ -117,6 +155,7 @@ export function serializeCashDiscountRule(row: CashDiscountRuleRow) {
 }
 
 export function serializeDebitNoteProposal(row: DebitNoteProposalRow) {
+  const nativeTallyPdf = getNativeTallyPdfEvidence(row.customer_snapshot);
   return {
     id: row.id,
     connectionId: row.connection_id,
@@ -129,6 +168,7 @@ export function serializeDebitNoteProposal(row: DebitNoteProposalRow) {
     partyPhone: row.party_phone ?? null,
     partyContactPerson: row.party_contact_person ?? null,
     partyAddress: row.party_address ?? null,
+    sourceSalesLedgerName: toNullableText(row.customer_snapshot?.sourceSalesLedgerName, 500),
     linkedInvoiceNumber: row.linked_invoice_number,
     linkedInvoiceDate: row.linked_invoice_date,
     originalInvoiceAmount: row.original_invoice_amount === null ? null : toNumber(row.original_invoice_amount),
@@ -163,6 +203,8 @@ export function serializeDebitNoteProposal(row: DebitNoteProposalRow) {
     communicationSentAt: row.communication_sent_at ?? null,
     customerSnapshot: row.customer_snapshot ?? {},
     tallyPdfReference: row.tally_pdf_reference,
+    nativeTallyPdf,
+    nativeTallyPdfVerified: Boolean(nativeTallyPdf && row.tally_pdf_reference),
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,

@@ -3,6 +3,7 @@ import { requireRequestUser } from "@/lib/api/request-auth";
 import {
   serializeDebitNoteProposal,
   toNumber,
+  toText,
   type DebitNoteProposalRow,
 } from "@/lib/collections";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -64,6 +65,14 @@ export async function POST(
     if (toNumber(proposal.recoverable_amount) <= 0) {
       return jsonWithCors(request, { error: "Recoverable amount must be greater than zero." }, { status: 400 });
     }
+    const salesLedgerName = toText(proposal.customer_snapshot?.sourceSalesLedgerName, 500);
+    if (!salesLedgerName) {
+      return jsonWithCors(
+        request,
+        { error: "The original invoice Sales ledger is not available for this saved proposal. Sync Tally and refresh to regenerate it safely." },
+        { status: 409 }
+      );
+    }
 
     const { data: connection, error: connectionError } = await supabase
       .from("tally_connections")
@@ -103,7 +112,8 @@ export async function POST(
       linkedInvoiceDate: proposal.linked_invoice_date,
       voucherDate: proposal.debit_note_date,
       amount: toNumber(proposal.recoverable_amount),
-      recoveryLedgerName: "Cash Discount Reversal",
+      adjustOriginalInvoice: false,
+      salesLedgerName,
       referenceNumber: proposal.linked_invoice_number
         ? `DN-CD-${proposal.linked_invoice_number}`.slice(0, 120)
         : `DN-CD-${proposal.id.slice(0, 8)}`,

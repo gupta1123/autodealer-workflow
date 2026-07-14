@@ -29,6 +29,7 @@ export async function POST(request: Request) {
       : body;
     const connectionId = toNullableText(body.connectionId ?? proposal.connectionId, 80);
     const partyLedgerName = toText(proposal.partyLedgerName, 500);
+    const salesLedgerName = toText(proposal.sourceSalesLedgerName, 500);
     const recoverableAmount = toNumber(proposal.recoverableAmount);
 
     if (!connectionId) {
@@ -36,6 +37,13 @@ export async function POST(request: Request) {
     }
     if (!partyLedgerName) {
       return jsonWithCors(request, { error: "Party ledger is required." }, { status: 400 });
+    }
+    if (!salesLedgerName) {
+      return jsonWithCors(
+        request,
+        { error: "The original invoice Sales ledger could not be verified. Sync Tally and refresh before creating this debit note." },
+        { status: 409 }
+      );
     }
     if (recoverableAmount <= 0) {
       return jsonWithCors(request, { error: "Recoverable amount must be greater than zero." }, { status: 400 });
@@ -75,8 +83,13 @@ export async function POST(request: Request) {
       linkedInvoiceDate: toNullableText(proposal.linkedInvoiceDate, 20),
       voucherDate: toNullableText(proposal.debitNoteDate, 20) ?? new Date().toISOString().slice(0, 10),
       amount: recoverableAmount,
-      recoveryLedgerName: "Cash Discount Reversal",
-      referenceNumber: linkedInvoiceNumber ? `DN-CD-${linkedInvoiceNumber}`.slice(0, 120) : `DN-CD-${Date.now()}`,
+      // The original open bill stays open. This is an additional charge for
+      // the missed discount, posted against the Sales ledger of that invoice.
+      adjustOriginalInvoice: false,
+      salesLedgerName,
+      referenceNumber:
+        toNullableText(proposal.referenceNumber, 120) ??
+        (linkedInvoiceNumber ? `DN-CD-${linkedInvoiceNumber}`.slice(0, 120) : `DN-CD-${Date.now()}`),
       narration:
         toNullableText(proposal.narration, 1000) ??
         `Cash discount recovery against invoice ${linkedInvoiceNumber ?? "-"}.`,

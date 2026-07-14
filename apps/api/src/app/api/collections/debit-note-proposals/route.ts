@@ -238,6 +238,7 @@ export async function POST(request: Request) {
       customer_snapshot: {
         ledgerName: ledger?.tally_name ?? partyLedgerName,
         parentName: ledger?.parent_name ?? null,
+        sourceSalesLedgerName: toNullableText(body.sourceSalesLedgerName ?? body.source_sales_ledger_name, 500),
         gstin: partyGstin,
         email: partyEmail,
         phone: partyPhone,

@@ -1,7 +1,7 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
-import { type DebitNoteProposalRow } from "@/lib/collections";
-import { uploadDebitNotePdf } from "@/lib/debit-notes/pdf";
+import { toNumber, type DebitNoteProposalRow } from "@/lib/collections";
+import { uploadNativeTallyDebitNotePdf } from "@/lib/debit-notes/pdf";
 import { isLocalDbMode } from "@/lib/local/mode";
 import { completeLocalTallyCommand } from "@/lib/local/tally-store";
 import { hashSecret, type TallyConnectionRow } from "@/lib/tally/connections";
@@ -59,7 +59,10 @@ export async function POST(
 
     const { commandId } = await context.params;
     const success = body.status === "succeeded" || body.success === true;
-    const result = body.result && typeof body.result === "object" ? body.result : {};
+    const rawResult = body.result && typeof body.result === "object" ? body.result as Record<string, unknown> : {};
+    const nativePdfBase64 = typeof rawResult.nativePdfBase64 === "string" ? rawResult.nativePdfBase64 : null;
+    const result = { ...rawResult };
+    delete result.nativePdfBase64;
     const errorMessage = success ? null : toNullableText(body.error, 2000) ?? "Tally command failed.";
 
     if (isLocalDbMode()) {
@@ -314,7 +317,11 @@ export async function POST(
       }
     }
 
-    if (command.command_type === "create_debit_note") {
+    const isNativeDebitNotePdfExport =
+      command.command_type === "export_debit_note_pdf" ||
+      (command.command_type === "create_debit_note" && commandPayload.operation === "export_native_pdf");
+
+    if (command.command_type === "create_debit_note" && !isNativeDebitNotePdfExport) {
       const proposalId = toNullableText(commandPayload.proposalId, 80);
       const voucherId =
         toNullableText((result as Record<string, unknown>).voucherId, 500) ??
@@ -331,14 +338,16 @@ export async function POST(
         toNullableText((result as Record<string, unknown>).openReferenceName, 500) ??
         toNullableText(commandPayload.referenceNumber, 500) ??
         voucherNumber;
-      const voucherDate = toNullableText(commandPayload.voucherDate, 20);
+      const voucherDate =
+        toNullableText((result as Record<string, unknown>).voucherDate, 20) ??
+        toNullableText(commandPayload.voucherDate, 20);
       const amount =
         typeof commandPayload.amount === "number"
           ? commandPayload.amount
           : Number(commandPayload.amount ?? 0) || null;
 
       if (proposalId) {
-        const { data: updatedProposal, error: proposalUpdateError } = await supabase
+        const { error: proposalUpdateError } = await supabase
           .from("debit_note_proposals")
           .update({
             status: success ? "created_in_tally" : "failed",
@@ -354,33 +363,16 @@ export async function POST(
             updated_at: now,
           })
           .eq("id", proposalId)
-          .eq("owner_user_id", connection.owner_user_id)
-          .select("*")
-          .maybeSingle();
+          .eq("owner_user_id", connection.owner_user_id);
 
         if (proposalUpdateError) throw proposalUpdateError;
 
-        if (success && updatedProposal) {
-          try {
-            const pdfReference = await uploadDebitNotePdf(
-              supabase as unknown as Parameters<typeof uploadDebitNotePdf>[0],
-              updatedProposal as unknown as DebitNoteProposalRow
-            );
-            await supabase
-              .from("debit_note_proposals")
-              .update({
-                tally_pdf_reference: pdfReference,
-                updated_at: new Date().toISOString(),
-              })
-              .eq("id", proposalId)
-              .eq("owner_user_id", connection.owner_user_id);
-          } catch (pdfError) {
-            console.error("Debit note PDF generation failed:", pdfError);
-          }
-        }
+        // A document must be a native Tally export. The previous implementation
+        // generated an application PDF here, which could not prove what was
+        // actually posted in Tally and is deliberately no longer used.
       } else if (success && commandPayload.sourceProposal && typeof commandPayload.sourceProposal === "object") {
         const sourceProposal = commandPayload.sourceProposal as Record<string, unknown>;
-        const { data: insertedProposal, error: insertProposalError } = await supabase
+        const { error: insertProposalError } = await supabase
           .from("debit_note_proposals")
           .insert({
             owner_user_id: connection.owner_user_id,
@@ -422,27 +414,130 @@ export async function POST(
             communication_status: "not_sent",
             customer_snapshot: sourceProposal.customerSnapshot ?? {},
             last_error: null,
-          })
-          .select("*")
-          .single();
+          });
 
         if (insertProposalError) throw insertProposalError;
 
-        try {
-          const pdfReference = await uploadDebitNotePdf(
-            supabase as unknown as Parameters<typeof uploadDebitNotePdf>[0],
-            insertedProposal as unknown as DebitNoteProposalRow
-          );
+      }
+    }
+
+    if (isNativeDebitNotePdfExport) {
+      const proposalId = toNullableText(commandPayload.proposalId, 80);
+      const failNativePdfExport = async (message: string) => {
+        await supabase
+          .from("tally_bridge_commands")
+          .update({ status: "failed", error: message, completed_at: new Date().toISOString() })
+          .eq("id", commandId)
+          .eq("connection_id", connection.id);
+        if (proposalId) {
           await supabase
             .from("debit_note_proposals")
-            .update({
-              tally_pdf_reference: pdfReference,
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", (insertedProposal as { id: string }).id)
+            .update({ last_error: message, updated_at: new Date().toISOString() })
+            .eq("id", proposalId)
             .eq("owner_user_id", connection.owner_user_id);
-        } catch (pdfError) {
-          console.error("Debit note PDF generation failed:", pdfError);
+        }
+      };
+
+      if (!success) {
+        if (proposalId) {
+          await supabase
+            .from("debit_note_proposals")
+            .update({ last_error: errorMessage ?? "Native Tally PDF export failed.", updated_at: new Date().toISOString() })
+            .eq("id", proposalId)
+            .eq("owner_user_id", connection.owner_user_id);
+        }
+      } else {
+        try {
+        if (!proposalId) throw new Error("Native Tally PDF export is missing its debit note proposal.");
+        if (!nativePdfBase64) throw new Error("The connector completed the export without returning a native Tally PDF.");
+
+        const pdf = Buffer.from(nativePdfBase64, "base64");
+        if (pdf.length === 0 || !pdf.subarray(0, 5).equals(Buffer.from("%PDF-"))) {
+          throw new Error("The connector returned an invalid native Tally PDF.");
+        }
+        const { data: proposalData, error: proposalError } = await supabase
+          .from("debit_note_proposals")
+          .select("*")
+          .eq("id", proposalId)
+          .eq("owner_user_id", connection.owner_user_id)
+          .maybeSingle();
+        if (proposalError) throw proposalError;
+        if (!proposalData) throw new Error("Debit note proposal was not found while attaching the native Tally PDF.");
+
+        const proposal = proposalData as unknown as DebitNoteProposalRow;
+        const voucherId = toNullableText(result.voucherId, 500);
+        const voucherNumber = toNullableText(result.voucherNumber, 500);
+        const voucherType = toNullableText(result.voucherType, 120);
+        const reference = toNullableText(result.voucherReference, 500) ?? toNullableText(result.openReferenceName, 500);
+        const partyLedgerName = toNullableText(result.partyLedgerName, 500);
+        const requestedReference = proposal.tally_open_reference_name || proposal.tally_voucher_number;
+
+        if (!voucherId || !voucherNumber || voucherType?.toLowerCase() !== "debit note") {
+          throw new Error("Tally did not verify an identifiable Debit Note before exporting its PDF.");
+        }
+        // Older debit notes stored their Kalika reference in tally_voucher_id.
+        // Treat only a numeric Tally MasterID as a previously verified identity;
+        // an older non-numeric value is repaired after the reference check below.
+        const existingVoucherId = proposal.tally_voucher_id?.trim();
+        if (existingVoucherId && /^\d+$/.test(existingVoucherId) && existingVoucherId !== voucherId.trim()) {
+          throw new Error("The exported Tally PDF belongs to a different Debit Note than the one created by Kalika.");
+        }
+        if (requestedReference && (!reference || requestedReference.trim().toLowerCase() !== reference.trim().toLowerCase())) {
+          throw new Error("The exported Tally PDF reference does not match the selected Debit Note.");
+        }
+        if (!partyLedgerName || partyLedgerName.trim().toLowerCase() !== proposal.party_ledger_name.trim().toLowerCase()) {
+          throw new Error("The exported Tally PDF customer does not match the selected Debit Note.");
+        }
+        if (Math.abs(toNumber(result.amount) - toNumber(proposal.recoverable_amount)) > 0.01) {
+          throw new Error("The exported Tally PDF amount does not match the selected Debit Note.");
+        }
+
+        const uploaded = await uploadNativeTallyDebitNotePdf(
+          supabase as unknown as Parameters<typeof uploadNativeTallyDebitNotePdf>[0],
+          proposal,
+          pdf
+        );
+        const connectorHash = toNullableText(result.nativePdfSha256, 128);
+        if (connectorHash && connectorHash.toLowerCase() !== uploaded.sha256.toLowerCase()) {
+          throw new Error("The native Tally PDF changed before it reached Kalika. Export was rejected.");
+        }
+        const nowForPdf = new Date().toISOString();
+        const snapshot = proposal.customer_snapshot && typeof proposal.customer_snapshot === "object"
+          ? proposal.customer_snapshot
+          : {};
+        const { error: proposalUpdateError } = await supabase
+          .from("debit_note_proposals")
+          .update({
+            tally_voucher_id: voucherId,
+            tally_voucher_guid: toNullableText(result.voucherGuid, 500) ?? proposal.tally_voucher_guid,
+            tally_voucher_number: voucherNumber,
+            tally_voucher_date: toNullableText(result.voucherDate, 20) ?? proposal.tally_voucher_date,
+            tally_open_reference_name: reference ?? requestedReference,
+            tally_pdf_reference: uploaded.reference,
+            customer_snapshot: {
+              ...snapshot,
+              nativeTallyPdf: {
+                source: "tally_voucher_render",
+                status: "verified",
+                voucherId,
+                voucherNumber,
+                reference: reference ?? null,
+                alterId: toNullableText(result.voucherAlterId, 500),
+                sha256: uploaded.sha256,
+                byteSize: uploaded.byteSize,
+                exportedAt: nowForPdf,
+              },
+            },
+            last_error: null,
+            updated_at: nowForPdf,
+          })
+          .eq("id", proposal.id)
+          .eq("owner_user_id", connection.owner_user_id);
+        if (proposalUpdateError) throw proposalUpdateError;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Native Tally PDF export could not be verified.";
+          await failNativePdfExport(message);
+          throw error;
         }
       }
     }

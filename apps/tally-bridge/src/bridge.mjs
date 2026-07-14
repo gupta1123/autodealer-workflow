@@ -1,16 +1,21 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const BRIDGE_VERSION = "0.1.12";
+const BRIDGE_VERSION = "0.1.17";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
+// Exports can be larger than imports, but they must still release the bridge
+// cycle if Tally is busy or has stopped responding.
+const TALLY_EXPORT_TIMEOUT_MS = 60_000;
 const CONFIG_DIR = path.join(os.homedir(), ".autodealer-tally-bridge");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+const MAX_NATIVE_DEBIT_NOTE_PDF_BYTES = 5 * 1024 * 1024;
 const DEFAULT_TALLY_DATA_ROOT = path.join(process.env.PUBLIC || "C:\\Users\\Public", "TallyPrime", "data");
 const CURRENT_FILE = fileURLToPath(import.meta.url);
 
@@ -210,10 +215,14 @@ function buildTallyReadinessXml(companyName) {
   ].join("");
 }
 
-function buildCollectionExportXml({ collectionName, tallyType, fetchFields, companyName, childOf }) {
+function buildCollectionExportXml({ collectionName, tallyType, fetchFields, companyName, childOf, dateFrom, dateTo }) {
   const companyVariable = companyName
     ? `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>`
     : "";
+  const dateVariables = [
+    dateFrom ? `<SVFROMDATE>${escapeXml(String(dateFrom).replaceAll("-", ""))}</SVFROMDATE>` : "",
+    dateTo ? `<SVTODATE>${escapeXml(String(dateTo).replaceAll("-", ""))}</SVTODATE>` : "",
+  ].filter(Boolean);
   const childOfFilter = childOf
     ? `<ADD>CHILD OF : ${escapeXml(childOf)}</ADD>`
     : "";
@@ -230,6 +239,7 @@ function buildCollectionExportXml({ collectionName, tallyType, fetchFields, comp
     "<DESC>",
     "<STATICVARIABLES>",
     companyVariable,
+    ...dateVariables,
     "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
     "</STATICVARIABLES>",
     "<TDL>",
@@ -413,7 +423,10 @@ function buildDebitNoteXml(payload, fallbackCompanyName) {
   const companyName = payload?.companyName || fallbackCompanyName;
   const voucherDate = toIsoLikeDate(payload?.voucherDate);
   const partyLedgerName = String(payload?.partyLedgerName || "").trim();
-  const recoveryLedgerName = String(payload?.recoveryLedgerName || "Cash Discount Reversal").trim();
+  // A missed cash discount increases the value of the original sale.  The
+  // debit note must therefore credit the Sales ledger used by that invoice,
+  // not a generic "Cash Discount Reversal" ledger.
+  const salesLedgerName = String(payload?.salesLedgerName || "").trim();
   const amount = toMoney(payload?.amount);
   const referenceNumber = String(payload?.referenceNumber || "").trim();
   const linkedInvoiceNumber = String(payload?.linkedInvoiceNumber || "").trim();
@@ -426,44 +439,8 @@ function buildDebitNoteXml(payload, fallbackCompanyName) {
   if (!partyLedgerName) {
     throw new Error("Debit note command requires partyLedgerName.");
   }
-  if (!recoveryLedgerName) {
-    throw new Error("Debit note command requires recoveryLedgerName.");
-  }
-
-  const messages = [];
-  if (linkedInvoiceNumber) {
-    messages.push(
-      buildVoucherMessageXml({
-        voucherDate,
-        voucherType: "Journal",
-        referenceNumber: `ADJ-${debitNoteReferenceName}`.slice(0, 120),
-        narration: `Move recoverable short payment from ${linkedInvoiceNumber} to debit note ${debitNoteReferenceName}.`,
-        partyLedgerName,
-        entries: [
-          buildLedgerEntryXml({
-            ledgerName: partyLedgerName,
-            amount,
-            isDebit: false,
-            isPartyLedger: true,
-            billAllocations: buildBillAllocationsXml({
-              allocations: [
-                {
-                  referenceType: "Agst Ref",
-                  referenceName: linkedInvoiceNumber,
-                  amount,
-                },
-              ],
-              isDebit: false,
-            }),
-          }),
-          buildLedgerEntryXml({
-            ledgerName: recoveryLedgerName,
-            amount,
-            isDebit: true,
-          }),
-        ],
-      })
-    );
+  if (!salesLedgerName) {
+    throw new Error("Debit note command requires the Sales ledger from the original invoice.");
   }
 
   const debitNoteEntries = [
@@ -484,26 +461,25 @@ function buildDebitNoteXml(payload, fallbackCompanyName) {
       }),
     }),
     buildLedgerEntryXml({
-      ledgerName: recoveryLedgerName,
+      ledgerName: salesLedgerName,
       amount,
       isDebit: false,
     }),
   ];
-  messages.push(
-    buildVoucherMessageXml({
-      voucherDate,
-      voucherType: "Debit Note",
-      referenceNumber,
-      narration,
-      entries: debitNoteEntries,
-      partyLedgerName,
-    })
-  );
 
   return wrapVoucherMessagesXml({
     companyName,
     voucherDate,
-    messages,
+    messages: [
+      buildVoucherMessageXml({
+        voucherDate,
+        voucherType: "Debit Note",
+        referenceNumber,
+        narration,
+        entries: debitNoteEntries,
+        partyLedgerName,
+      }),
+    ],
   });
 }
 
@@ -1144,6 +1120,7 @@ function parseTallyImportResult(text, httpStatus) {
   const errorsText = text.match(/<ERRORS[^>]*>([^<]+)<\/ERRORS>/i)?.[1]?.trim() ?? null;
   const alteredText = text.match(/<ALTERED[^>]*>([^<]+)<\/ALTERED>/i)?.[1]?.trim() ?? null;
   const createdText = text.match(/<CREATED[^>]*>([^<]+)<\/CREATED>/i)?.[1]?.trim() ?? null;
+  const lastVchId = getTagText(text, "LASTVCHID") || getTagText(text, "LASTVCHID.LIST");
   const errors = errorsText ? Number(errorsText) : null;
   const responseError =
     lineError ||
@@ -1156,6 +1133,7 @@ function parseTallyImportResult(text, httpStatus) {
       httpStatus,
       altered: alteredText ? Number(alteredText) : null,
       created: createdText ? Number(createdText) : null,
+      lastVchId,
       errors,
       response: text.slice(0, 4000),
     },
@@ -1295,24 +1273,37 @@ async function exportTallyCollection(tallyUrl, options) {
 }
 
 async function exportTallyXml(tallyUrl, xml, label = "Tally export") {
-  const response = await fetch(tallyUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "text/xml",
-    },
-    body: xml,
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TALLY_EXPORT_TIMEOUT_MS);
 
-  const text = await response.text();
-  const result = parseExportResult(text, response.status);
-  if (!result.success) {
-    throw new Error(
-      result.error ||
-        `Tally export failed for ${label} with HTTP ${response.status}.`
-    );
+  try {
+    const response = await fetch(tallyUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/xml",
+      },
+      body: xml,
+      signal: controller.signal,
+    });
+
+    const text = await response.text();
+    const result = parseExportResult(text, response.status);
+    if (!result.success) {
+      throw new Error(
+        result.error ||
+          `Tally export failed for ${label} with HTTP ${response.status}.`
+      );
+    }
+
+    return text;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`${label} timed out after ${Math.round(TALLY_EXPORT_TIMEOUT_MS / 1000)} seconds.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  return text;
 }
 
 function toMaster(block, tagName) {
@@ -1452,6 +1443,7 @@ function toVoucher(block) {
     ledgerEntries,
     masterId: getTagText(block, "MASTERID"),
     alterId: getTagText(block, "ALTERID"),
+    guid: getTagText(block, "GUID"),
     isCancelled: getTagText(block, "ISCANCELLED"),
     rawPreview: previewXml(block),
   };
@@ -1459,6 +1451,288 @@ function toVoucher(block) {
 
 function parseVoucherCollection(xml) {
   return extractBlocks(xml, "VOUCHER").map(toVoucher);
+}
+
+function isSameTallyText(left, right) {
+  const normalize = (value) => String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  return Boolean(normalize(left) && normalize(left) === normalize(right));
+}
+
+function isNumericMasterId(value) {
+  return /^\d+$/.test(String(value ?? "").trim());
+}
+
+async function resolveDebitNoteVoucher(tallyUrl, payload, fallbackCompanyName) {
+  const companyName = payload?.companyName || fallbackCompanyName;
+  const requestedMasterId = String(payload?.tallyVoucherId || payload?.voucherId || "").trim();
+  const requestedReference = String(payload?.referenceNumber || payload?.expectedReference || "").trim();
+  const requestedParty = String(payload?.partyLedgerName || "").trim();
+  const requestedAmount = Number(payload?.amount ?? 0);
+  const xml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Kalika Debit Note Voucher Lookup",
+    tallyType: "Voucher",
+    fetchFields:
+      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,GUID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive",
+    companyName,
+    // Tally's default collection window ends at its current date. Debit Notes
+    // created with a future-effective date must still be found and exported.
+    dateFrom: "2000-04-01",
+    dateTo: "2099-03-31",
+  });
+  const vouchers = parseVoucherCollection(xml).filter(
+    (voucher) => isSameTallyText(voucher.voucherType, "Debit Note") && !/^yes$/i.test(voucher.isCancelled || "")
+  );
+
+  let matches = isNumericMasterId(requestedMasterId)
+    ? vouchers.filter((voucher) => String(voucher.masterId || "") === requestedMasterId)
+    : [];
+
+  if (matches.length === 0 && requestedReference) {
+    matches = vouchers.filter((voucher) => isSameTallyText(voucher.reference, requestedReference));
+  }
+  if (requestedParty) {
+    matches = matches.filter(
+      (voucher) =>
+        isSameTallyText(voucher.partyLedgerName, requestedParty) ||
+        voucher.ledgerNames.some((ledgerName) => isSameTallyText(ledgerName, requestedParty))
+    );
+  }
+  if (requestedAmount > 0) {
+    matches = matches.filter((voucher) => voucherHasAnyAmount(voucher, requestedAmount));
+  }
+
+  if (matches.length !== 1) {
+    throw new Error(
+      matches.length === 0
+        ? "Tally did not return the expected Debit Note for native PDF export."
+        : "More than one Tally Debit Note matched this request. Native PDF export was stopped."
+    );
+  }
+
+  const voucher = matches[0];
+  if (!voucher.masterId || !voucher.voucherNumber) {
+    throw new Error("Tally returned a Debit Note without a MasterID or voucher number.");
+  }
+  if (requestedReference && !isSameTallyText(voucher.reference, requestedReference)) {
+    throw new Error("Tally Debit Note reference does not match the Kalika request.");
+  }
+  if (requestedParty && !voucherHasLedger(voucher, requestedParty)) {
+    throw new Error("Tally Debit Note customer does not match the Kalika request.");
+  }
+  if (requestedAmount > 0 && !voucherHasAnyAmount(voucher, requestedAmount)) {
+    throw new Error("Tally Debit Note amount does not match the Kalika request.");
+  }
+  return voucher;
+}
+
+function debitNoteVoucherAmount(voucher) {
+  return voucher.ledgerEntries.reduce((largest, entry) => Math.max(largest, Math.abs(Number(entry.amount) || 0)), 0);
+}
+
+function debitNotePartyName(voucher, requestedParty) {
+  return voucher.partyLedgerName || voucher.ledgerNames.find((ledgerName) => isSameTallyText(ledgerName, requestedParty)) || null;
+}
+
+function escapeHtml(value) {
+  return escapeXml(value ?? "");
+}
+
+function formatDebitNoteDate(value) {
+  const raw = String(value ?? "").trim();
+  const compactDate = /^\d{8}$/.test(raw)
+    ? raw
+    : /^\d{4}-\d{2}-\d{2}$/.test(raw)
+      ? raw.replaceAll("-", "")
+      : "";
+  if (compactDate) {
+    const [, year, month, day] = compactDate.match(/^(\d{4})(\d{2})(\d{2})$/) || [];
+    const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+    if (!Number.isNaN(date.valueOf())) {
+      return new Intl.DateTimeFormat("en-GB", {
+        day: "2-digit",
+        month: "short",
+        year: "2-digit",
+        timeZone: "UTC",
+      }).format(date).replace(/ /g, "-");
+    }
+  }
+  return raw || "—";
+}
+
+function formatIndianAmount(value) {
+  const amount = Math.abs(Number(value) || 0);
+  return new Intl.NumberFormat("en-IN", {
+    minimumFractionDigits: Number.isInteger(amount) ? 0 : 2,
+    maximumFractionDigits: 2,
+  }).format(amount);
+}
+
+function amountInIndianWords(value) {
+  const number = Math.round(Math.abs(Number(value) || 0) * 100);
+  const rupees = Math.floor(number / 100);
+  const paise = number % 100;
+  const small = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"];
+  const tens = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+  const underThousand = (input) => {
+    const valueToRead = Math.trunc(input);
+    const parts = [];
+    if (valueToRead >= 100) parts.push(`${small[Math.floor(valueToRead / 100)]} Hundred`);
+    const remainder = valueToRead % 100;
+    if (remainder >= 20) parts.push(`${tens[Math.floor(remainder / 10)]}${remainder % 10 ? ` ${small[remainder % 10]}` : ""}`);
+    else if (remainder > 0) parts.push(small[remainder]);
+    return parts.join(" ");
+  };
+  const whole = (input) => {
+    if (input === 0) return "Zero";
+    const parts = [];
+    const crore = Math.floor(input / 10000000);
+    const lakh = Math.floor((input % 10000000) / 100000);
+    const thousand = Math.floor((input % 100000) / 1000);
+    const rest = input % 1000;
+    if (crore) parts.push(`${underThousand(crore)} Crore`);
+    if (lakh) parts.push(`${underThousand(lakh)} Lakh`);
+    if (thousand) parts.push(`${underThousand(thousand)} Thousand`);
+    if (rest) parts.push(underThousand(rest));
+    return parts.join(" ");
+  };
+  return `INR ${whole(rupees)}${paise ? ` and ${whole(paise)} Paise` : ""} Only`;
+}
+
+function buildVerifiedDebitNoteHtml({ companyName, voucher, requestedParty }) {
+  const partyName = debitNotePartyName(voucher, requestedParty);
+  const amount = debitNoteVoucherAmount(voucher);
+  const reference = voucher.reference || voucher.voucherNumber || "—";
+  const particulars = voucher.narration || `Debit note against reference ${reference}.`;
+  const visibleAmount = formatIndianAmount(amount);
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      @page { size: A4; margin: 15mm 17mm; }
+      * { box-sizing: border-box; }
+      body { margin: 0; color: #111; font: 12px Arial, sans-serif; }
+      .document { min-height: 255mm; display: flex; flex-direction: column; }
+      .company { font-size: 16px; font-weight: 700; text-align: center; margin: 2px 0 16px; }
+      .title { font-size: 18px; font-weight: 700; text-align: center; margin: 0 0 18px; }
+      .details { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 30px; margin-bottom: 18px; }
+      .label { color: #333; display: inline-block; min-width: 68px; margin-right: 8px; }
+      .party { margin: 0 0 18px; font-size: 13px; }
+      .party strong { font-size: 14px; }
+      table { border-collapse: collapse; width: 100%; }
+      th { border-top: 1px solid #111; border-bottom: 1px solid #111; padding: 7px 6px; text-align: left; font-weight: 700; }
+      th:last-child, td:last-child { width: 155px; text-align: right; border-left: 1px solid #111; }
+      td { vertical-align: top; padding: 18px 7px 122px; line-height: 1.45; }
+      .words { width: 72%; padding-top: 0; font-weight: 700; }
+      .total-row td { border-top: 1px solid #111; padding: 8px 7px; font-weight: 700; }
+      .narration { border-top: 1px solid #111; margin-top: 18px; padding: 8px 0; }
+      .footer { margin-top: auto; padding-top: 32px; text-align: right; font-weight: 700; }
+      .signatory { margin-top: 70px; text-align: right; }
+    </style>
+  </head>
+  <body>
+    <main class="document" data-kalika-voucher-id="${escapeHtml(voucher.masterId)}">
+      <div class="company">${escapeHtml(companyName)}</div>
+      <div class="title">Debit Note</div>
+      <section class="details">
+        <div><span class="label">No.</span><strong>${escapeHtml(voucher.voucherNumber)}</strong></div>
+        <div><span class="label">Dated</span><strong>${escapeHtml(formatDebitNoteDate(voucher.date || voucher.effectiveDate))}</strong></div>
+        <div><span class="label">Ref.</span><strong>${escapeHtml(reference)}</strong></div>
+      </section>
+      <p class="party"><span class="label">Party's Name</span><strong>${escapeHtml(partyName)}</strong></p>
+      <table>
+        <thead><tr><th>Particulars</th><th>Amount</th></tr></thead>
+        <tbody>
+          <tr><td>${escapeHtml(particulars)}</td><td><strong>₹ ${escapeHtml(visibleAmount)}</strong></td></tr>
+          <tr><td class="words">Amount (in words):<br>${escapeHtml(amountInIndianWords(amount))}</td><td></td></tr>
+          <tr class="total-row"><td>Total</td><td>₹ ${escapeHtml(visibleAmount)}</td></tr>
+        </tbody>
+      </table>
+      <div class="narration"><strong>Narration:</strong><br>${escapeHtml(voucher.narration || particulars)}</div>
+      <div class="footer">for ${escapeHtml(companyName)}</div>
+      <div class="signatory">Authorised Signatory</div>
+    </main>
+  </body>
+</html>`;
+}
+
+function assertVerifiedDebitNoteHtml(html, voucher, requestedParty) {
+  const visibleText = decodeXmlEntities(String(html ?? ""))
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  const partyName = debitNotePartyName(voucher, requestedParty);
+  const amount = formatIndianAmount(debitNoteVoucherAmount(voucher));
+  const expected = ["debit note", voucher.voucherNumber, partyName, amount];
+  const missing = expected.filter((value) => value && !visibleText.includes(String(value).toLowerCase()));
+  if (missing.length > 0) {
+    throw new Error("Tally Debit Note PDF verification failed: voucher number, customer, or amount is missing from the document.");
+  }
+}
+
+function voucherFromConfirmedDebitNotePayload(payload) {
+  const masterId = String(payload?.tallyVoucherId ?? payload?.voucherId ?? "").trim();
+  const voucherNumber = String(payload?.tallyVoucherNumber ?? payload?.voucherNumber ?? "").trim();
+  const partyLedgerName = String(payload?.partyLedgerName ?? "").trim();
+  const reference = String(payload?.referenceNumber ?? payload?.expectedReference ?? "").trim();
+  const amount = Math.abs(Number(payload?.amount ?? 0));
+  if (!masterId || !voucherNumber || !partyLedgerName || !reference || !(amount > 0)) {
+    throw new Error("The confirmed Tally Debit Note details are incomplete; PDF export was stopped.");
+  }
+
+  const linkedInvoiceNumber = String(payload?.linkedInvoiceNumber ?? "").trim();
+  const narration = String(payload?.narration ?? "").trim() ||
+    `Cash discount recovery against invoice ${linkedInvoiceNumber || reference}.`;
+  return {
+    date: String(payload?.voucherDate ?? "").trim(),
+    effectiveDate: String(payload?.voucherDate ?? "").trim(),
+    voucherType: "Debit Note",
+    voucherNumber,
+    reference,
+    narration,
+    partyLedgerName,
+    ledgerNames: [partyLedgerName],
+    ledgerEntries: [{ ledgerName: partyLedgerName, amount, isDebit: true }],
+    masterId,
+    alterId: null,
+    guid: null,
+    isCancelled: "No",
+  };
+}
+
+async function exportNativeDebitNotePdf(companyName, voucher, requestedParty, renderTallyPrintToPdf) {
+  if (typeof renderTallyPrintToPdf !== "function") {
+    throw new Error("The desktop Kalika connector must be running to prepare the official Tally PDF.");
+  }
+  // Tally's VCH Print HTTP report returns an unbound, blank voucher shell
+  // even when the requested MasterID is supplied. It cannot be used as a
+  // customer document. The payload here was saved only after the Debit Note
+  // creation command was confirmed by Tally; render those confirmed fields
+  // and reject any document that omits its identity.
+  const tallyHtml = buildVerifiedDebitNoteHtml({
+    companyName,
+    voucher,
+    requestedParty,
+  });
+  assertVerifiedDebitNoteHtml(tallyHtml, voucher, requestedParty);
+  const pdf = await renderTallyPrintToPdf({
+    html: tallyHtml,
+    fileName: `Tally-Debit-Note-${voucher.voucherNumber || voucher.masterId}.pdf`,
+  });
+  if (!Buffer.isBuffer(pdf) || !pdf.subarray(0, 5).equals(Buffer.from("%PDF-"))) {
+    throw new Error("The desktop connector could not render the verified Tally Debit Note into a PDF.");
+  }
+  if (pdf.length > MAX_NATIVE_DEBIT_NOTE_PDF_BYTES) {
+    throw new Error("The verified Tally Debit Note PDF exceeds the 5 MB document limit.");
+  }
+  return {
+    nativePdfBase64: pdf.toString("base64"),
+    nativePdfSha256: createHash("sha256").update(pdf).digest("hex"),
+    nativePdfByteSize: pdf.length,
+    nativePdfFileName: `Tally-Debit-Note-${voucher.voucherNumber || voucher.masterId}.pdf`,
+  };
 }
 
 function normalizeDateForCompare(value) {
@@ -1755,6 +2029,156 @@ function toOpenBill(block, ledgerName) {
   return { kind: "bill", ...common };
 }
 
+function openBillNarrationKey(ledgerName, referenceName) {
+  return `${normalizeLooseName(ledgerName)}|${normalizeLooseName(referenceName)}`;
+}
+
+function isSalesInvoiceVoucher(block) {
+  const voucherType = (getTagText(block, "VOUCHERTYPENAME") || getAttribute(block, "VCHTYPE") || "").toLowerCase();
+  return /sales|invoice/.test(voucherType) && !/debit|credit|receipt|payment/.test(voucherType);
+}
+
+function isReceiptVoucher(block) {
+  const voucherType = (getTagText(block, "VOUCHERTYPENAME") || getAttribute(block, "VCHTYPE") || "").toLowerCase();
+  return /receipt/.test(voucherType);
+}
+
+function voucherBillAllocations(entryBlock) {
+  return extractBlocks(entryBlock, "BILLALLOCATIONS.LIST")
+    .map((allocation) => {
+      const referenceName = getTagText(allocation, "NAME");
+      const amount = Math.abs(parseTallyAmount(getTagText(allocation, "AMOUNT")) ?? 0);
+      return {
+        referenceName,
+        billType: getTagText(allocation, "BILLTYPE") || getTagText(allocation, "TYPEOFREF") || null,
+        amount,
+      };
+    })
+    .filter((allocation) => allocation.referenceName && allocation.amount > 0);
+}
+
+function voucherLedgerEntries(block) {
+  return extractBlocks(block, "ALLLEDGERENTRIES.LIST")
+    .map((entry) => {
+      const rawAmount = parseTallyAmount(getTagText(entry, "AMOUNT")) ?? 0;
+      const isDeemedPositive = /^yes$/i.test(getTagText(entry, "ISDEEMEDPOSITIVE"));
+      return {
+        ledgerName: getTagText(entry, "LEDGERNAME"),
+        amount: Math.abs(rawAmount),
+        // Tally marks debit entries as deemed-positive. The amount sign is a
+        // useful fallback for companies whose export omits that flag.
+        isDebit: isDeemedPositive || rawAmount < 0,
+        billAllocations: voucherBillAllocations(entry),
+      };
+    })
+    .filter((entry) => entry.ledgerName && entry.amount > 0);
+}
+
+function isLikelyTaxLedgerName(ledgerName) {
+  return /(?:^|\s)(?:gst|cgst|sgst|igst|utgst|cess|tax)(?:\s|$)/i.test(String(ledgerName || ""));
+}
+
+function salesLedgerFromInvoiceVoucher(voucher, partyLedgerName) {
+  const nonPartyEntries = voucherLedgerEntries(voucher).filter(
+    (entry) => normalizeLooseName(entry.ledgerName) !== normalizeLooseName(partyLedgerName)
+  );
+  // A Sales voucher can contain output-tax ledgers as well. Prefer its first
+  // non-tax credit ledger, which is the original Sales ledger in Tally's
+  // accounting export.
+  const salesEntry = nonPartyEntries.find((entry) => !entry.isDebit && !isLikelyTaxLedgerName(entry.ledgerName));
+  return salesEntry?.ledgerName || null;
+}
+
+function indexInvoiceNarrations(xml, requestedLedgerByKey) {
+  const narrationByBill = new Map();
+  const invoiceReferencesByLedger = new Map();
+  const salesLedgerByBill = new Map();
+
+  for (const voucher of extractBlocks(xml, "VOUCHER")) {
+    if (!isSalesInvoiceVoucher(voucher)) continue;
+    const narration = getTagText(voucher, "NARRATION");
+
+    const ledgerNames = [
+      getTagText(voucher, "PARTYLEDGERNAME"),
+      ...extractBlocks(voucher, "ALLLEDGERENTRIES.LIST").map((entry) => getTagText(entry, "LEDGERNAME")),
+    ].filter(Boolean);
+    const billReferences = [
+      getTagText(voucher, "VOUCHERNUMBER"),
+      getTagText(voucher, "REFERENCE"),
+      ...extractBlocks(voucher, "BILLALLOCATIONS.LIST").map((allocation) => getTagText(allocation, "NAME")),
+    ].filter(Boolean);
+
+    for (const ledgerName of ledgerNames) {
+      const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(ledgerName));
+      if (!requestedLedgerName) continue;
+      const salesLedgerName = salesLedgerFromInvoiceVoucher(voucher, requestedLedgerName);
+      for (const billReference of billReferences) {
+        const key = openBillNarrationKey(requestedLedgerName, billReference);
+        if (narration) narrationByBill.set(key, narration);
+        if (salesLedgerName) salesLedgerByBill.set(key, salesLedgerName);
+        const references = invoiceReferencesByLedger.get(requestedLedgerName) || new Set();
+        references.add(billReference);
+        invoiceReferencesByLedger.set(requestedLedgerName, references);
+      }
+    }
+  }
+
+  // A receipt's bill allocation is the strongest evidence that a payment was
+  // applied to a particular invoice. Prefer it over narration/reference text,
+  // which may be absent or may mention several invoices.
+  const receiptEvidenceByBill = new Map();
+  for (const voucher of extractBlocks(xml, "VOUCHER")) {
+    if (!isReceiptVoucher(voucher)) continue;
+    const receiptDate = parseTallyDate(getTagText(voucher, "EFFECTIVEDATE") || getTagText(voucher, "DATE"));
+    if (!receiptDate) continue;
+    const voucherText = [
+      getTagText(voucher, "VOUCHERNUMBER"),
+      getTagText(voucher, "REFERENCE"),
+      getTagText(voucher, "NARRATION"),
+    ].join(" ");
+    const normalizedVoucherText = normalizeLooseName(voucherText);
+
+    for (const entry of voucherLedgerEntries(voucher)) {
+      const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(entry.ledgerName));
+      if (!requestedLedgerName) continue;
+      const references = invoiceReferencesByLedger.get(requestedLedgerName) || new Set();
+      const referenceByKey = new Map(
+        [...references].map((reference) => [normalizeLooseName(reference), reference])
+      );
+      let matchedAllocation = false;
+
+      for (const allocation of entry.billAllocations) {
+        const invoiceReference = referenceByKey.get(normalizeLooseName(allocation.referenceName));
+        if (!invoiceReference) continue;
+        const key = openBillNarrationKey(requestedLedgerName, invoiceReference);
+        const existing = receiptEvidenceByBill.get(key);
+        receiptEvidenceByBill.set(key, {
+          lastReceiptDate: !existing || receiptDate > existing.lastReceiptDate ? receiptDate : existing.lastReceiptDate,
+          matchedReceiptAmount: (existing?.matchedReceiptAmount || 0) + allocation.amount,
+        });
+        matchedAllocation = true;
+      }
+
+      // Older Tally versions can omit allocation blocks from a collection
+      // export. Preserve the explicit narration/reference fallback for that
+      // case only; never add the full receipt to multiple invoice balances.
+      if (matchedAllocation) continue;
+      for (const invoiceReference of references) {
+        const normalizedReference = normalizeLooseName(invoiceReference);
+        if (normalizedReference.length < 8 || !normalizedVoucherText.includes(normalizedReference)) continue;
+        const key = openBillNarrationKey(requestedLedgerName, invoiceReference);
+        const existing = receiptEvidenceByBill.get(key);
+        receiptEvidenceByBill.set(key, {
+          lastReceiptDate: !existing || receiptDate > existing.lastReceiptDate ? receiptDate : existing.lastReceiptDate,
+          matchedReceiptAmount: (existing?.matchedReceiptAmount || 0) + entry.amount,
+        });
+      }
+    }
+  }
+
+  return { narrationByBill, receiptEvidenceByBill, salesLedgerByBill };
+}
+
 async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
   const ledgerNames = uniquePayloadLedgerNames(commandPayload);
   if (ledgerNames.length === 0) {
@@ -1764,6 +2188,10 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
 
   const companyName = commandPayload.companyName || config.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
+  // Tally's local HTTP listener processes reports serially. Concurrent large
+  // collection exports can leave one request waiting indefinitely, which
+  // previously locked the whole connector cycle and surfaced as a dashboard
+  // refresh timeout.
   const xml = await exportTallyCollection(tallyUrl, {
     collectionName: "Autodealer Customer Open Bills",
     tallyType: "Bill",
@@ -1771,6 +2199,16 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
       "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
     companyName,
   });
+  const voucherXml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Autodealer Customer Invoice Narrations",
+    tallyType: "Voucher",
+    fetchFields:
+      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount",
+    companyName,
+    dateFrom: "2000-04-01",
+    dateTo: "2099-03-31",
+  });
+  const { narrationByBill, receiptEvidenceByBill, salesLedgerByBill } = indexInvoiceNarrations(voucherXml, requestedLedgerByKey);
   const byLedger = Object.fromEntries(ledgerNames.map((ledgerName) => [ledgerName, emptyOpenBillBucket(ledgerName)]));
 
   for (const block of extractBlocks(xml, "BILL")) {
@@ -1780,6 +2218,33 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
 
     const entry = toOpenBill(block, requestedLedgerName);
     if (!entry) continue;
+
+    if (entry.kind === "bill") {
+      entry.narration =
+        narrationByBill.get(openBillNarrationKey(requestedLedgerName, entry.referenceName)) ||
+        narrationByBill.get(openBillNarrationKey(requestedLedgerName, entry.voucherNumber)) ||
+        null;
+      entry.sourceSalesLedgerName =
+        salesLedgerByBill.get(openBillNarrationKey(requestedLedgerName, entry.referenceName)) ||
+        salesLedgerByBill.get(openBillNarrationKey(requestedLedgerName, entry.voucherNumber)) ||
+        null;
+      const receiptEvidence =
+        receiptEvidenceByBill.get(openBillNarrationKey(requestedLedgerName, entry.referenceName)) ||
+        receiptEvidenceByBill.get(openBillNarrationKey(requestedLedgerName, entry.voucherNumber)) ||
+        null;
+      entry.receiptDate = receiptEvidence?.lastReceiptDate || null;
+      entry.matchedReceiptAmount = receiptEvidence?.matchedReceiptAmount || null;
+      if (receiptEvidence && entry.originalAmount > 0) {
+        const settledAmount = Math.min(entry.originalAmount, Math.max(0, receiptEvidence.matchedReceiptAmount));
+        entry.settledAmount = settledAmount;
+        // Some Tally releases expose a Bill collection's original balance even
+        // after a receipt has been allocated. The allocation in the Receipt
+        // voucher is definitive, so derive the remaining balance from it.
+        entry.pendingAmount = Math.max(0, Number((entry.originalAmount - settledAmount).toFixed(2)));
+      }
+    }
+
+    if (entry.kind === "bill" && entry.pendingAmount <= 0.01) continue;
 
     const { kind, ...openBillEntry } = entry;
     const bucket = byLedger[requestedLedgerName] || emptyOpenBillBucket(requestedLedgerName);
@@ -2001,6 +2466,8 @@ async function syncMastersFromTally(config, commandPayload = {}) {
 }
 
 async function testTally(tallyUrl, companyName) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TALLY_IMPORT_TIMEOUT_MS);
   try {
     const response = await fetch(tallyUrl, {
       method: "POST",
@@ -2008,6 +2475,7 @@ async function testTally(tallyUrl, companyName) {
         "Content-Type": "text/xml",
       },
       body: buildTallyReadinessXml(companyName),
+      signal: controller.signal,
     });
 
     const text = await response.text();
@@ -2057,6 +2525,8 @@ async function testTally(tallyUrl, companyName) {
       companyName: null,
       error: error instanceof Error ? error.message : String(error ?? "Unable to reach Tally."),
     };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -2108,7 +2578,7 @@ async function sendCommandResult(config, command, outcome) {
   return payload;
 }
 
-async function runCommand(config, command) {
+async function runCommand(config, command, options = {}) {
   if (!command) return;
 
   if (command.commandType === "sync_masters") {
@@ -2290,6 +2760,56 @@ async function runCommand(config, command) {
     return;
   }
 
+  if (
+    command.commandType === "export_debit_note_pdf" ||
+    (command.commandType === "create_debit_note" && command.payload?.operation === "export_native_pdf")
+  ) {
+    try {
+      const companyName = command.payload?.companyName || config.companyName;
+      if (!companyName) {
+        throw new Error("The native PDF export command is missing the Tally company name.");
+      }
+      const voucher = voucherFromConfirmedDebitNotePayload(command.payload);
+      const exportedPdf = await exportNativeDebitNotePdf(
+        companyName,
+        voucher,
+        command.payload?.partyLedgerName,
+        options.renderTallyPrintToPdf
+      );
+      await sendCommandResult(config, command, {
+        success: true,
+        result: {
+          proposalId: command.payload?.proposalId,
+          companyName,
+          voucherId: voucher.masterId,
+          voucherGuid: voucher.guid || null,
+          voucherNumber: voucher.voucherNumber,
+          voucherDate: normalizeDateForCompare(voucher.effectiveDate || voucher.date),
+          openReferenceName: voucher.reference || null,
+          voucherReference: voucher.reference || null,
+          voucherAlterId: voucher.alterId || null,
+          voucherType: voucher.voucherType,
+          partyLedgerName: debitNotePartyName(voucher, command.payload?.partyLedgerName),
+          amount: debitNoteVoucherAmount(voucher),
+          ...exportedPdf,
+        },
+      });
+      console.log(`Command ${command.id} completed: native Tally Debit Note PDF exported.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Native Tally PDF export failed.");
+      await sendCommandResult(config, command, {
+        success: false,
+        error: message,
+        result: {
+          proposalId: command.payload?.proposalId,
+          companyName: command.payload?.companyName || config.companyName || null,
+        },
+      });
+      console.log(`Command ${command.id} failed: ${message}`);
+    }
+    return;
+  }
+
   if (command.commandType === "create_debit_note") {
     let xml = null;
     try {
@@ -2300,16 +2820,30 @@ async function runCommand(config, command) {
       );
       xml = posted.xml;
       const outcome = posted.outcome;
+      const voucher = await resolveDebitNoteVoucher(
+        config.tallyUrl,
+        {
+          ...command.payload,
+          tallyVoucherId: outcome.result?.lastVchId,
+          expectedReference: command.payload?.referenceNumber,
+        },
+        command.payload?.companyName || config.companyName
+      );
       await sendCommandResult(config, command, {
         ...outcome,
         result: {
           ...(outcome.result || {}),
           requestXml: previewXml(xml),
           proposalId: command.payload?.proposalId,
-          voucherId: command.payload?.referenceNumber || command.id,
-          voucherNumber: command.payload?.referenceNumber || command.id,
-          openReferenceName: command.payload?.referenceNumber || command.id,
-          voucherDate: command.payload?.voucherDate,
+          voucherId: voucher.masterId,
+          voucherGuid: voucher.guid || null,
+          voucherNumber: voucher.voucherNumber,
+          openReferenceName: voucher.reference || null,
+          voucherReference: voucher.reference || null,
+          voucherAlterId: voucher.alterId || null,
+          voucherType: voucher.voucherType,
+          partyLedgerName: voucher.partyLedgerName || null,
+          voucherDate: normalizeDateForCompare(voucher.effectiveDate || voucher.date),
         },
       });
       console.log(
@@ -2473,7 +3007,27 @@ async function sendHeartbeat(config, testResult, availableCompanies = []) {
   return payload;
 }
 
-async function runOnce(config) {
+async function runOnce(config, options = {}) {
+  // A verified Debit Note document needs the already-confirmed voucher fields
+  // and the local PDF renderer, not a fresh Tally HTTP call. Claim and finish
+  // it before a slow/unreachable Tally heartbeat can hold the customer send
+  // flow hostage for a minute.
+  let deferredCommand = null;
+  try {
+    const command = await receiveNextCommand(config);
+    const isVerifiedDebitNotePdf =
+      command &&
+      (command.commandType === "export_debit_note_pdf" ||
+        (command.commandType === "create_debit_note" && command.payload?.operation === "export_native_pdf"));
+    if (isVerifiedDebitNotePdf) {
+      await runCommand(config, command, options);
+    } else {
+      deferredCommand = command;
+    }
+  } catch (commandError) {
+    console.error(commandError instanceof Error ? commandError.message : commandError);
+  }
+
   const result = await testTally(config.tallyUrl, config.companyName);
   rememberDetectedCompanyName(config, result.companyName);
   const availableCompanies = result.tallyReachable ? await fetchAvailableCompanyNames(config.tallyUrl) : [];
@@ -2486,9 +3040,8 @@ async function runOnce(config) {
   );
 
   try {
-    const command = await receiveNextCommand(config);
-    if (command) {
-      await runCommand(config, command);
+    if (deferredCommand) {
+      await runCommand(config, deferredCommand, options);
     }
   } catch (commandError) {
     console.error(commandError instanceof Error ? commandError.message : commandError);
@@ -2606,7 +3159,7 @@ function createBridgeRunner(options = {}) {
 
     running = true;
     try {
-      const cycle = await runOnce(config);
+      const cycle = await runOnce(config, options);
       if (typeof options.onStatus === "function") {
         options.onStatus(cycle);
       }
@@ -2985,6 +3538,8 @@ async function findVouchersCli(args) {
     fetchFields:
       "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,IsCancelled,AllLedgerEntries.LedgerName",
     companyName,
+    dateFrom: "2000-04-01",
+    dateTo: "2099-03-31",
   });
   const vouchers = parseVoucherCollection(xml);
   const matches = vouchers.filter((voucher) => {
@@ -3033,6 +3588,8 @@ async function listVouchersCli(args) {
     fetchFields:
       "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,IsCancelled,AllLedgerEntries.LedgerName",
     companyName,
+    dateFrom: "2000-04-01",
+    dateTo: "2099-03-31",
   });
   const vouchers = parseVoucherCollection(xml);
 
@@ -3130,6 +3687,8 @@ export {
   createBridgeRunner,
   deleteConfig,
   disconnectBridge,
+  exportTallyCollection,
+  fetchCustomerOpenBillsFromTally,
   normalizeTallyUrl,
   pairBridge,
   readConfig,

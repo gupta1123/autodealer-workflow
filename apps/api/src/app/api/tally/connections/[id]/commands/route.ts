@@ -37,11 +37,36 @@ function uniqueTextValues(values: unknown[], maxLength: number) {
   return result;
 }
 
+function normalizeCompanyName(value: string | null | undefined) {
+  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function activeTallyCompanyError(
+  connection: {
+    last_company_name: string | null;
+    last_tally_reachable: boolean | null;
+    last_company_loaded: boolean | null;
+  },
+  requestedCompanyName: string | null
+) {
+  const activeCompanyName = toNullableText(connection.last_company_name, 240);
+  if (connection.last_tally_reachable !== true || connection.last_company_loaded !== true || !activeCompanyName) {
+    return "Tally must be connected with an active company before reading company data.";
+  }
+  if (
+    requestedCompanyName &&
+    normalizeCompanyName(requestedCompanyName) !== normalizeCompanyName(activeCompanyName)
+  ) {
+    return `Tally is currently open to ${activeCompanyName}. Switch Tally to ${requestedCompanyName} before reading its data.`;
+  }
+  return null;
+}
+
 async function requireConnection(ownerUserId: string, connectionId: string) {
   const supabase = createSupabaseAdminClient();
   const { data, error } = await supabase
     .from("tally_connections")
-    .select("id, owner_user_id, status, last_company_name")
+    .select("id, owner_user_id, status, last_company_name, last_tally_reachable, last_company_loaded")
     .eq("id", connectionId)
     .eq("owner_user_id", ownerUserId)
     .maybeSingle();
@@ -154,6 +179,10 @@ export async function POST(
       const companyName =
         toNullableText(rawPayload.companyName, 240) ??
         toNullableText(connection.last_company_name, 240);
+      const liveCompanyError = activeTallyCompanyError(connection, companyName);
+      if (liveCompanyError) {
+        return jsonWithCors(request, { error: liveCompanyError }, { status: 409 });
+      }
       const requestedMasterTypes = Array.isArray(rawPayload.requestedMasterTypes)
         ? rawPayload.requestedMasterTypes.filter((value): value is string => typeof value === "string")
         : ["ledger", "group", "voucher_type", "gst_ledger", "tax_ledger"];
@@ -415,12 +444,18 @@ export async function POST(
         return jsonWithCors(request, { error: "Party ledger name is required." }, { status: 400 });
       }
 
+      const companyName =
+        toNullableText(rawPayload.companyName, 240) ??
+        toNullableText(connection.last_company_name, 240);
+      const liveCompanyError = activeTallyCompanyError(connection, companyName);
+      if (liveCompanyError) {
+        return jsonWithCors(request, { error: liveCompanyError }, { status: 409 });
+      }
+
       const payload = {
         ledgerName: requestedLedgerNames[0],
         ledgerNames: requestedLedgerNames,
-        companyName:
-          toNullableText(rawPayload.companyName, 240) ??
-          toNullableText(connection.last_company_name, 240),
+        companyName,
         scanId: toNullableText(rawPayload.scanId, 120),
       };
 

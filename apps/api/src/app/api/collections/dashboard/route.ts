@@ -1,13 +1,22 @@
+import { createHash } from "node:crypto";
+
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
-  serializeCashDiscountRule,
   serializeDebitNoteProposal,
   toNumber,
   toText,
-  type CashDiscountRuleRow,
   type DebitNoteProposalRow,
 } from "@/lib/collections";
+import {
+  analyseCashDiscountNarration,
+  currentCashDiscountEligibility,
+  reviewCashDiscountNarrationsWithAi,
+  unavailableCashDiscountAiReview,
+  type CashDiscountAiInput,
+  type CashDiscountAiReview,
+  type CashDiscountNarrationAnalysis,
+} from "@/lib/cash-discount-narration";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 type TallyLedgerRow = {
@@ -27,6 +36,10 @@ type OpenBillRow = {
   originalAmount?: number | string | null;
   pendingAmount?: number | string | null;
   sourceVoucherType?: string | null;
+  narration?: string | null;
+  receiptDate?: string | null;
+  matchedReceiptAmount?: number | string | null;
+  sourceSalesLedgerName?: string | null;
   status?: string | null;
 };
 
@@ -156,64 +169,80 @@ function dedupeDebitNoteProposals(proposals: DebitNoteProposalRow[]) {
   return Array.from(bestByKey.values()).sort((left, right) => proposalRank(right) - proposalRank(left));
 }
 
-function addDays(dateText: string, days: number) {
-  const date = new Date(`${dateText}T00:00:00.000Z`);
-  if (Number.isNaN(date.getTime())) return null;
-  date.setUTCDate(date.getUTCDate() + days);
-  return date.toISOString().slice(0, 10);
-}
-
 function todayText() {
   return new Date().toISOString().slice(0, 10);
-}
-
-function isAfterDate(left: string, right: string) {
-  return Date.parse(`${left}T00:00:00.000Z`) > Date.parse(`${right}T00:00:00.000Z`);
-}
-
-function moneyClose(left: number, right: number) {
-  return Math.abs(left - right) <= 1;
 }
 
 function serializeTallyCandidate(params: {
   bill: OpenBillRow;
   ledgerName: string;
   ledger?: TallyLedgerRow;
-  rule?: CashDiscountRuleRow;
   companyName: string | null;
   connectionId: string;
   financialYear: string | null;
   today: string;
-  issueType?: string;
-  expectedDiscount?: number;
-  canCreateDebitNote?: boolean;
+  analysis: CashDiscountNarrationAnalysis;
+  aiReview: CashDiscountAiReview;
+  stagedReversalAmount?: number;
+  alreadyCreatedReversalAmount?: number;
 }) {
   const originalAmount = toNumber(params.bill.originalAmount);
   const pendingAmount = toNumber(params.bill.pendingAmount);
   const invoiceDate = String(params.bill.invoiceDate ?? "").slice(0, 10);
-  const eligibilityDays = Math.trunc(toNumber(params.rule?.eligibility_days, 15));
-  const discountDeadline = invoiceDate ? addDays(invoiceDate, eligibilityDays) : null;
   const referenceName = toText(params.bill.referenceName ?? params.bill.voucherNumber, 240);
-  const ruleName = params.rule?.rule_name ?? "Standard 2% within 15 days";
   const raw = params.ledger?.raw_payload && typeof params.ledger.raw_payload === "object" ? params.ledger.raw_payload : {};
   const partyEmail = readRawText(raw, "email", 320);
   const partyPhone = readRawText(raw, "phone", 80);
   const partyContactPerson = readRawText(raw, "contactPerson", 240);
   const partyAddress = readRawText(raw, "address", 1000);
   const amountReceived = originalAmount > 0 ? Math.max(originalAmount - pendingAmount, 0) : null;
-  const issueType = params.issueType ?? "discount_shortfall";
-  const expectedDiscount =
-    params.expectedDiscount ?? Math.round((originalAmount * toNumber(params.rule?.discount_value, 2)) / 100);
-  const canCreateDebitNote = params.canCreateDebitNote ?? true;
+  const isUnpaidTierReversal = params.analysis.deterministicStatus === "unpaid_discount_tier_expired";
+  const isLateShortPayment = params.analysis.deterministicStatus === "late_short_payment";
+  const stagedReversalAmount = Math.max(
+    0,
+    toNumber(
+      params.stagedReversalAmount ??
+        (isLateShortPayment ? pendingAmount : params.analysis.reversalPlan?.totalReversalRequired)
+    )
+  );
+  const sourceSalesLedgerName = toText(params.bill.sourceSalesLedgerName, 500) || null;
+  // The source invoice is recorded net of the best narrated discount. A
+  // debit note therefore raises only the calculated reversal, never the
+  // original invoice's currently-unpaid balance.
+  // A partial receipt is reconciled against the invoice amount recorded in
+  // Tally, so the recoverable debit note is the actual remaining shortfall.
+  // Gross-up is only used for a fully unpaid invoice that was recorded net of
+  // its best narrated discount.
+  const expectedDiscount = isLateShortPayment ? pendingAmount : params.analysis.reversalPlan?.totalReversalRequired ?? stagedReversalAmount;
+  const recoverableAmount = stagedReversalAmount;
+  const aiConfirmed =
+    params.aiReview.decision === "confirmed" &&
+    params.aiReview.termsMatchDeterministic &&
+    (params.aiReview.confidence ?? 0) >= 0.8;
+  const canCreateDebitNote =
+    ["late_short_payment", "unpaid_discount_tier_expired"].includes(params.analysis.deterministicStatus) &&
+    recoverableAmount > 0 &&
+    Boolean(sourceSalesLedgerName) &&
+    aiConfirmed;
+  const termsLabel = params.analysis.termsLabel ?? "Narrated cash discount";
+  const sourceNarration = params.analysis.sourceNarration;
+  const reversalPlan = params.analysis.reversalPlan;
+  const referenceSuffix = isUnpaidTierReversal
+    ? `T${reversalPlan?.activeDiscount?.eligibilityDays ?? "FINAL"}`
+    : "SHORT";
+  const referenceNumber = `DN-CD-${referenceName || "INVOICE"}-${referenceSuffix}`.slice(0, 120);
+  const stagedNarration = reversalPlan
+    ? ` Tally invoice is treated as net after ${reversalPlan.initialDiscount.ratePercent}%: gross basis ₹${reversalPlan.grossInvoiceAmount.toLocaleString("en-IN")}; payable now ₹${reversalPlan.currentPayableAmount.toLocaleString("en-IN")}; cumulative reversal ₹${reversalPlan.totalReversalRequired.toLocaleString("en-IN")}; already created ₹${toNumber(params.alreadyCreatedReversalAmount).toLocaleString("en-IN")}.`
+    : "";
 
   return {
-    id: `tally:${Buffer.from(`${params.ledgerName}|${referenceName}|${pendingAmount.toFixed(2)}`).toString("base64url")}`,
+    id: `tally:${Buffer.from(`${params.ledgerName}|${referenceName}|${recoverableAmount.toFixed(2)}|${referenceSuffix}`).toString("base64url")}`,
     connectionId: params.connectionId,
     companyName: params.companyName,
     financialYear: params.financialYear,
     sourceTransactionId: null,
     sourceKind: "tally_open_bill",
-    issueType,
+    issueType: isUnpaidTierReversal ? "unpaid_discount_tier_reversal" : "discount_shortfall",
     expectedDiscount,
     canCreateDebitNote,
     partyLedgerName: params.ledgerName,
@@ -222,18 +251,21 @@ function serializeTallyCandidate(params: {
     partyPhone,
     partyContactPerson,
     partyAddress,
+    sourceSalesLedgerName,
     linkedInvoiceNumber: referenceName || params.bill.voucherNumber || null,
     linkedInvoiceDate: invoiceDate || null,
     originalInvoiceAmount: originalAmount || null,
-    cashDiscountRuleId: params.rule?.id ?? null,
-    cashDiscountRuleName: ruleName,
-    discountDeadline,
-    receiptDate: null,
+    cashDiscountRuleId: null,
+    cashDiscountRuleName: termsLabel,
+    discountDeadline: params.analysis.discountDeadline,
+    receiptDate: params.analysis.receiptDate,
     amountReceived,
-    recoverableAmount: issueType === "discount_shortfall" ? pendingAmount : expectedDiscount,
+    recoverableAmount,
     pendingAmount,
-    reasonCode: "cash_discount_expired",
-    narration: `Cash discount recovery against invoice ${referenceName || "-"}.`,
+    reasonCode: isUnpaidTierReversal ? "cash_discount_unpaid_tier_reversal" : "cash_discount_narration_expired",
+    referenceNumber,
+    adjustOriginalInvoice: false,
+    narration: `Cash discount recovery against invoice ${referenceName || "-"}. Terms: ${termsLabel}.${stagedNarration} Source narration: ${sourceNarration}`,
     gstMode: "finance_review",
     debitNoteDate: params.today,
     status: "pending_approval",
@@ -245,7 +277,20 @@ function serializeTallyCandidate(params: {
     tallyVoucherNumber: null,
     tallyVoucherDate: null,
     tallyOpenReferenceName: referenceName || null,
-    remainingRecoverableAmount: pendingAmount,
+    remainingRecoverableAmount: recoverableAmount,
+    cashDiscountAnalysis: {
+      sourceNarration,
+      terms: params.analysis.terms,
+      termsLabel,
+      finalEligibilityDays: params.analysis.finalEligibilityDays,
+      expectedDiscounts: params.analysis.expectedDiscounts,
+      reversalPlan,
+      receiptDate: params.analysis.receiptDate,
+      matchedReceiptAmount: params.analysis.matchedReceiptAmount,
+      deterministicStatus: params.analysis.deterministicStatus,
+      deterministicReason: params.analysis.deterministicReason,
+      aiReview: params.aiReview,
+    },
     createdInTallyAt: null,
     lastSyncedFromTallyAt: null,
     communicationStatus: "not_sent",
@@ -260,11 +305,117 @@ function serializeTallyCandidate(params: {
       phone: partyPhone,
       contactPerson: partyContactPerson,
       address: partyAddress,
+      sourceSalesLedgerName,
     },
     tallyPdfReference: null,
     lastError: null,
     createdAt: params.today,
     updatedAt: params.today,
+  };
+}
+
+type PaymentFollowUpKind =
+  | "discount_window_open"
+  | "full_payment_due"
+  | "payment_due"
+  | "payment_review";
+
+function isPaymentFollowUpStatus(status: CashDiscountNarrationAnalysis["deterministicStatus"]) {
+  return [
+    "no_narrated_terms",
+    "missing_invoice_date",
+    "within_eligibility_window",
+    "unpaid_discount_tier_expired",
+    "invoice_unpaid",
+    "receipt_date_not_found",
+    "receipt_amount_unverified",
+    "balance_does_not_match_narrated_discount",
+  ].includes(status);
+}
+
+function serializePaymentFollowUp(params: {
+  bill: OpenBillRow;
+  ledgerName: string;
+  ledger?: TallyLedgerRow;
+  analysis: CashDiscountNarrationAnalysis;
+  aiReview: CashDiscountAiReview | null;
+  today: string;
+  createdTierReversalAmount?: number;
+}) {
+  const originalInvoiceAmount = toNumber(params.bill.originalAmount);
+  const outstandingAmount = toNumber(params.bill.pendingAmount);
+  const amountReceived = Math.max(originalInvoiceAmount - outstandingAmount, 0);
+  const invoiceDate = String(params.bill.invoiceDate ?? "").slice(0, 10) || null;
+  const invoiceNumber = toText(params.bill.referenceName ?? params.bill.voucherNumber, 240) || null;
+  const raw = params.ledger?.raw_payload && typeof params.ledger.raw_payload === "object" ? params.ledger.raw_payload : {};
+  const currentDiscount = params.analysis.reversalPlan?.activeDiscount ?? currentCashDiscountEligibility({
+    terms: params.analysis.terms,
+    invoiceDate,
+    originalAmount: originalInvoiceAmount,
+    today: params.today,
+  });
+  const invoiceIsUnpaid = Math.abs(outstandingAmount - originalInvoiceAmount) <= 1;
+  const createdTierReversalAmount = Math.max(0, toNumber(params.createdTierReversalAmount));
+  const totalReversalRequired = params.analysis.reversalPlan?.totalReversalRequired ?? 0;
+  const pendingTierReversalAmount = Math.max(0, Math.round((totalReversalRequired - createdTierReversalAmount) * 100) / 100);
+
+  let kind: PaymentFollowUpKind = "payment_review";
+  let title = "Payment balance needs review";
+  let nextAction = params.analysis.deterministicReason;
+
+  if (params.analysis.deterministicStatus === "within_eligibility_window" && currentDiscount) {
+    kind = "discount_window_open";
+    title = invoiceIsUnpaid ? "Payment pending" : "Balance pending";
+    nextAction = invoiceIsUnpaid
+      ? `${currentDiscount.ratePercent}% cash discount (₹${currentDiscount.discountAmount.toLocaleString("en-IN")}) remains available until ${currentDiscount.discountDeadline}.`
+      : `Review the remaining balance before payment: ${currentDiscount.ratePercent}% cash discount remains available until ${currentDiscount.discountDeadline}.`;
+  } else if (params.analysis.deterministicStatus === "invoice_unpaid") {
+    kind = "full_payment_due";
+    title = "Full payment pending";
+    nextAction = `Collect the full outstanding amount. All narrated cash-discount windows ended on ${params.analysis.discountDeadline}.`;
+  } else if (params.analysis.deterministicStatus === "no_narrated_terms") {
+    kind = "payment_due";
+    title = invoiceIsUnpaid ? "Payment pending" : "Balance pending";
+      nextAction = "Collect the outstanding amount. The invoice narration contains no cash-discount terms.";
+  } else if (params.analysis.deterministicStatus === "unpaid_discount_tier_expired" && params.analysis.reversalPlan) {
+    kind = "full_payment_due";
+    title = pendingTierReversalAmount > 0 ? "Debit note required, then collect" : "Payment pending after debit note";
+    nextAction = pendingTierReversalAmount > 0
+      ? `Create the incremental debit note of ₹${pendingTierReversalAmount.toLocaleString("en-IN")}, then collect ₹${params.analysis.reversalPlan.currentPayableAmount.toLocaleString("en-IN")}.`
+      : `Collect ₹${params.analysis.reversalPlan.currentPayableAmount.toLocaleString("en-IN")}; the required tier reversal has already been created in Tally.`;
+  } else if (params.analysis.deterministicStatus === "missing_invoice_date") {
+    kind = "payment_review";
+    title = "Invoice date needed";
+    nextAction = "Confirm the invoice date before evaluating the narrated payment terms.";
+  }
+
+  return {
+    id: `follow-up:${Buffer.from(`${params.ledgerName}|${invoiceNumber ?? "-"}|${outstandingAmount.toFixed(2)}`).toString("base64url")}`,
+    kind,
+    title,
+    nextAction,
+    partyLedgerName: params.ledgerName,
+    partyGstin: params.ledger?.gstin ?? null,
+    partyPhone: readRawText(raw, "phone", 80),
+    partyEmail: readRawText(raw, "email", 320),
+    linkedInvoiceNumber: invoiceNumber,
+    linkedInvoiceDate: invoiceDate,
+    originalInvoiceAmount,
+    outstandingAmount,
+    amountReceived,
+    narration: params.analysis.sourceNarration,
+    termsLabel: params.analysis.termsLabel,
+    discountDeadline: params.analysis.discountDeadline,
+    currentDiscount,
+    paymentAmountIfPaidToday:
+      params.analysis.reversalPlan?.currentPayableAmount ?? (invoiceIsUnpaid && currentDiscount ? Math.max(originalInvoiceAmount - currentDiscount.discountAmount, 0) : null),
+    totalPayableAmount: params.analysis.reversalPlan?.currentPayableAmount ?? outstandingAmount,
+    createdTierReversalAmount,
+    pendingTierReversalAmount,
+    reversalPlan: params.analysis.reversalPlan,
+    deterministicStatus: params.analysis.deterministicStatus,
+    deterministicReason: params.analysis.deterministicReason,
+    aiReview: params.aiReview,
   };
 }
 
@@ -291,6 +442,110 @@ function candidateKey(candidate: { partyLedgerName: string; linkedInvoiceNumber:
     normalizeLedgerName(candidate.linkedInvoiceNumber),
     toNumber(candidate.recoverableAmount).toFixed(2),
   ].join("|");
+}
+
+function invoiceIdentityKey(partyLedgerName: string | null | undefined, linkedInvoiceNumber: string | null | undefined) {
+  return [normalizeLedgerName(partyLedgerName), normalizeLedgerName(linkedInvoiceNumber)].join("|");
+}
+
+function narrationReviewCacheKey(companyName: string | null, inputs: CashDiscountAiInput[]) {
+  const source = JSON.stringify({
+    version: 1,
+    companyName: normalizeLedgerName(companyName),
+    inputs: inputs.map((input) => ({
+      id: input.id,
+      invoiceReference: input.invoiceReference,
+      invoiceDate: input.invoiceDate,
+      originalAmount: input.originalAmount,
+      pendingAmount: input.pendingAmount,
+      receiptDate: input.receiptDate,
+      matchedReceiptAmount: input.matchedReceiptAmount,
+      sourceNarration: input.sourceNarration,
+      terms: input.deterministic.terms,
+      deterministicStatus: input.deterministic.deterministicStatus,
+      reversalPlan: input.deterministic.reversalPlan,
+    })),
+  });
+  return `cash-discount-narration-v1:${createHash("sha256").update(source).digest("hex")}`;
+}
+
+function isCashDiscountAiReview(value: unknown): value is CashDiscountAiReview {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<CashDiscountAiReview>;
+  return (
+    ["confirmed", "rejected", "manual_review", "unavailable"].includes(String(candidate.decision ?? "")) &&
+    typeof candidate.reason === "string" &&
+    Array.isArray(candidate.terms) &&
+    typeof candidate.termsMatchDeterministic === "boolean"
+  );
+}
+
+async function reviewNarratedCashDiscounts(params: {
+  supabase: ReturnType<typeof createSupabaseAdminClient>;
+  ownerUserId: string;
+  connectionId: string;
+  companyName: string | null;
+  inputs: CashDiscountAiInput[];
+}) {
+  const result = new Map<string, CashDiscountAiReview>();
+  if (params.inputs.length === 0) return result;
+
+  const cacheKey = narrationReviewCacheKey(params.companyName, params.inputs);
+  try {
+    const { data, error } = await params.supabase
+      .from("collections_analysis_cache")
+      .select("payload")
+      .eq("owner_user_id", params.ownerUserId)
+      .eq("connection_id", params.connectionId)
+      .eq("cache_key", cacheKey)
+      .gt("expires_at", new Date().toISOString())
+      .maybeSingle();
+    if (error) throw error;
+
+    const cachedPayload = data?.payload && typeof data.payload === "object"
+      ? (data.payload as { analyses?: Record<string, unknown> })
+      : null;
+    if (cachedPayload?.analyses) {
+      for (const input of params.inputs) {
+        const review = cachedPayload.analyses[input.id];
+        if (isCashDiscountAiReview(review)) result.set(input.id, review);
+      }
+      if (result.size === params.inputs.length) return result;
+      result.clear();
+    }
+  } catch (error) {
+    // The cache is an optimization only. Never fail a collections refresh if a
+    // legacy installation does not have this optional table yet.
+    console.warn("Cash-discount AI cache read skipped:", error);
+  }
+
+  try {
+    const reviewed = await reviewCashDiscountNarrationsWithAi(params.inputs);
+    for (const [id, review] of reviewed) result.set(id, review);
+
+    const analyses = Object.fromEntries(result.entries());
+    try {
+      const { error } = await params.supabase.from("collections_analysis_cache").upsert(
+        {
+          owner_user_id: params.ownerUserId,
+          connection_id: params.connectionId,
+          cache_key: cacheKey,
+          company_name: params.companyName,
+          payload: { analyses },
+          expires_at: new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString(),
+        },
+        { onConflict: "owner_user_id,connection_id,cache_key" }
+      );
+      if (error) throw error;
+    } catch (error) {
+      console.warn("Cash-discount AI cache write skipped:", error);
+    }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "AI review could not be completed.";
+    for (const input of params.inputs) result.set(input.id, unavailableCashDiscountAiReview(reason));
+  }
+
+  return result;
 }
 
 function debitNoteRowFromSucceededCommand(command: TallyCommandRow, connection: { last_company_name: string | null }) {
@@ -387,9 +642,31 @@ export async function GET(request: Request) {
       return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
     }
 
-    const companyName = requestedCompanyName ?? (!isGenericTallyLabel(connection.last_company_name)
+    const activeCompanyName = !isGenericTallyLabel(connection.last_company_name)
       ? connection.last_company_name
-      : connection.display_name);
+      : null;
+    if (
+      connection.last_tally_reachable !== true ||
+      connection.last_company_loaded !== true ||
+      !activeCompanyName
+    ) {
+      return jsonWithCors(
+        request,
+        { error: "Tally must be connected with an active company before Cash Discounts can be calculated." },
+        { status: 409 }
+      );
+    }
+
+    const companyName = requestedCompanyName ?? activeCompanyName;
+    if (normalizeLedgerName(companyName) !== normalizeLedgerName(activeCompanyName)) {
+      return jsonWithCors(
+        request,
+        {
+          error: `Tally is currently open to ${activeCompanyName}. Switch Tally to ${companyName} before calculating Cash Discounts.`,
+        },
+        { status: 409 }
+      );
+    }
     // A connector ID is a pairing instance, not a company identity. The same
     // Tally company can be paired again many times, so collect every connector
     // that has ever synced the selected company rather than trusting the latest
@@ -423,26 +700,12 @@ export async function GET(request: Request) {
     }
 
     const connectionIds = Array.from(compatibleConnectionIds);
-    const ruleConnectionFilter = [
-      ...connectionIds.map((id) => `connection_id.eq.${id}`),
-      "connection_id.is.null",
-    ].join(",");
-
     const [
-      { data: ruleRows, error: ruleError },
       { data: proposalRows, error: proposalError },
       { data: ledgerRows, error: ledgerError },
       { data: openBillCommandRows, error: openBillCommandError },
       { data: debitNoteCommandRows, error: debitNoteCommandError },
     ] = await Promise.all([
-      supabase
-        .from("cash_discount_rules")
-        .select("*")
-        .eq("owner_user_id", user.id)
-        .or(ruleConnectionFilter)
-        .eq("is_active", true)
-        .order("updated_at", { ascending: false })
-        .limit(20),
       supabase
         .from("debit_note_proposals")
         .select("*")
@@ -479,7 +742,6 @@ export async function GET(request: Request) {
         .limit(50),
     ]);
 
-    if (ruleError) throw ruleError;
     if (proposalError) throw proposalError;
     if (ledgerError) throw ledgerError;
     if (openBillCommandError) throw openBillCommandError;
@@ -513,18 +775,13 @@ export async function GET(request: Request) {
         proposalWithLedgerSnapshot(proposal, ledgerByName.get(normalizeLedgerName(proposal.party_ledger_name)))
       )
     );
-    const rules = (ruleRows ?? []) as unknown as CashDiscountRuleRow[];
-    const defaultRule = rules[0];
     const today = todayText();
-    const actedKeys = new Set(
-      createdProposals.map((proposal) =>
-        candidateKey({
-          partyLedgerName: proposal.party_ledger_name,
-          linkedInvoiceNumber: proposal.linked_invoice_number,
-          recoverableAmount: toNumber(proposal.recoverable_amount),
-        })
-      )
-    );
+    const createdReversalByInvoice = new Map<string, number>();
+    for (const proposal of createdProposals) {
+      if (!String(proposal.reason_code || "").startsWith("cash_discount_")) continue;
+      const key = invoiceIdentityKey(proposal.party_ledger_name, proposal.linked_invoice_number);
+      createdReversalByInvoice.set(key, (createdReversalByInvoice.get(key) ?? 0) + toNumber(proposal.recoverable_amount));
+    }
     const companyOpenBillCommands = ((openBillCommandRows ?? []) as unknown as TallyCommandRow[]).filter((command) =>
       belongsToCompany(command, companyName)
     );
@@ -542,44 +799,134 @@ export async function GET(request: Request) {
       readTallyOpenBills(row.result)
     );
     const seenBillKeys = new Set<string>();
-    const tallyCandidates = tallyOpenBills
-      .map(({ ledgerName, bill }) => {
+    const narrationReviewRows: Array<{
+      reviewId: string;
+      ledgerName: string;
+      bill: OpenBillRow;
+      analysis: CashDiscountNarrationAnalysis;
+    }> = [];
+
+    for (const { ledgerName, bill } of tallyOpenBills) {
         const billKey = `${normalizeLedgerName(ledgerName)}|${normalizeLedgerName(bill.referenceName)}|${normalizeLedgerName(bill.voucherNumber)}`;
-        if (seenBillKeys.has(billKey)) return null;
+        if (seenBillKeys.has(billKey)) continue;
         seenBillKeys.add(billKey);
         const originalAmount = toNumber(bill.originalAmount);
         const pendingAmount = toNumber(bill.pendingAmount);
-        const discountValue = toNumber(defaultRule?.discount_value, 2);
-        const expectedDiscount = Math.round((originalAmount * discountValue) / 100);
         const invoiceDate = String(bill.invoiceDate ?? "").slice(0, 10);
-        const deadline = invoiceDate ? addDays(invoiceDate, Math.trunc(toNumber(defaultRule?.eligibility_days, 15))) : null;
-        if (!ledgerName || bill.kind === "advance" || originalAmount <= 0 || pendingAmount <= 0) return null;
-        if (!deadline || !isAfterDate(today, deadline)) return null;
-
-        let issueType: "discount_shortfall" | "invoice_unpaid" | "partial_unpaid" | null = null;
-        if (moneyClose(pendingAmount, expectedDiscount)) {
-          issueType = "discount_shortfall";
-        } else if (moneyClose(pendingAmount, originalAmount)) {
-          issueType = "invoice_unpaid";
-        } else if (pendingAmount > expectedDiscount && pendingAmount < originalAmount) {
-          issueType = "partial_unpaid";
-        }
-        if (!issueType) return null;
-
-        const candidate = serializeTallyCandidate({
-          bill,
+        if (!ledgerName || bill.kind === "advance" || originalAmount <= 0 || pendingAmount <= 0) continue;
+        const analysis = analyseCashDiscountNarration({
+          narration: bill.narration,
+          invoiceDate,
+          originalAmount,
+          pendingAmount,
+          receiptDate: bill.receiptDate,
+          matchedReceiptAmount: toNumber(bill.matchedReceiptAmount, Number.NaN),
+          today,
+        });
+        narrationReviewRows.push({
+          reviewId: createHash("sha256").update(`${billKey}|${bill.narration ?? ""}|${originalAmount}|${pendingAmount}`).digest("hex").slice(0, 24),
           ledgerName,
-          ledger: ledgerByName.get(normalizeLedgerName(ledgerName)),
-          rule: defaultRule,
+          bill,
+          analysis,
+        });
+    }
+
+    const narratedDiscountRows = narrationReviewRows.filter((row) => row.analysis.terms.length > 0);
+    const aiReviewInputs: CashDiscountAiInput[] = narratedDiscountRows.map((row) => ({
+      id: row.reviewId,
+      invoiceReference: toText(row.bill.referenceName ?? row.bill.voucherNumber, 240) || row.reviewId,
+      invoiceDate: String(row.bill.invoiceDate ?? "").slice(0, 10) || null,
+      originalAmount: toNumber(row.bill.originalAmount),
+      pendingAmount: toNumber(row.bill.pendingAmount),
+      receiptDate: String(row.bill.receiptDate ?? "").slice(0, 10) || null,
+      matchedReceiptAmount: toNumber(row.bill.matchedReceiptAmount, Number.NaN),
+      sourceNarration: row.analysis.sourceNarration,
+      deterministic: row.analysis,
+    }));
+    const aiReviews = await reviewNarratedCashDiscounts({
+      supabase,
+      ownerUserId: user.id,
+      connectionId,
+      companyName,
+      inputs: aiReviewInputs,
+    });
+    const structuredNarrationAnalysis = narrationReviewRows.map((row) => ({
+      partyLedgerName: row.ledgerName,
+      linkedInvoiceNumber: toText(row.bill.referenceName ?? row.bill.voucherNumber, 240) || null,
+      linkedInvoiceDate: String(row.bill.invoiceDate ?? "").slice(0, 10) || null,
+      originalInvoiceAmount: toNumber(row.bill.originalAmount),
+      pendingAmount: toNumber(row.bill.pendingAmount),
+      analysis: {
+        sourceNarration: row.analysis.sourceNarration,
+        terms: row.analysis.terms,
+        termsLabel: row.analysis.termsLabel,
+        finalEligibilityDays: row.analysis.finalEligibilityDays,
+        discountDeadline: row.analysis.discountDeadline,
+        receiptDate: row.analysis.receiptDate,
+        matchedReceiptAmount: row.analysis.matchedReceiptAmount,
+        expectedDiscounts: row.analysis.expectedDiscounts,
+        reversalPlan: row.analysis.reversalPlan,
+        deterministicStatus: row.analysis.deterministicStatus,
+        deterministicReason: row.analysis.deterministicReason,
+        aiReview: row.analysis.terms.length > 0
+          ? aiReviews.get(row.reviewId) ?? unavailableCashDiscountAiReview("AI review is pending.")
+          : null,
+      },
+    }));
+    const paymentFollowUps = narrationReviewRows
+      .filter((row) => isPaymentFollowUpStatus(row.analysis.deterministicStatus))
+      .map((row) =>
+        serializePaymentFollowUp({
+          bill: row.bill,
+          ledgerName: row.ledgerName,
+          ledger: ledgerByName.get(normalizeLedgerName(row.ledgerName)),
+          analysis: row.analysis,
+          aiReview: row.analysis.terms.length > 0
+            ? aiReviews.get(row.reviewId) ?? unavailableCashDiscountAiReview("AI review is pending.")
+            : null,
+          today,
+          createdTierReversalAmount: createdReversalByInvoice.get(
+            invoiceIdentityKey(row.ledgerName, toText(row.bill.referenceName ?? row.bill.voucherNumber, 240) || null)
+          ),
+        })
+      )
+      .sort((left, right) => {
+        const leftDeadline = Date.parse(`${left.currentDiscount?.discountDeadline ?? left.discountDeadline ?? ""}T00:00:00.000Z`) || Number.MAX_SAFE_INTEGER;
+        const rightDeadline = Date.parse(`${right.currentDiscount?.discountDeadline ?? right.discountDeadline ?? ""}T00:00:00.000Z`) || Number.MAX_SAFE_INTEGER;
+        if (leftDeadline !== rightDeadline) return leftDeadline - rightDeadline;
+        return String(left.partyLedgerName).localeCompare(String(right.partyLedgerName));
+      });
+    const tallyCandidates = narratedDiscountRows
+      .filter((row) => ["late_short_payment", "unpaid_discount_tier_expired"].includes(row.analysis.deterministicStatus))
+      .map((row) => {
+        const aiReview = aiReviews.get(row.reviewId) ?? unavailableCashDiscountAiReview("AI review is pending.");
+        const invoiceNumber = toText(row.bill.referenceName ?? row.bill.voucherNumber, 240) || null;
+        const alreadyCreatedReversalAmount = createdReversalByInvoice.get(invoiceIdentityKey(row.ledgerName, invoiceNumber)) ?? 0;
+        const requiredReversalAmount =
+          row.analysis.deterministicStatus === "late_short_payment"
+            ? toNumber(row.bill.pendingAmount)
+            : toNumber(row.analysis.reversalPlan?.totalReversalRequired);
+        const stagedReversalAmount = Math.max(
+          0,
+          Math.round((requiredReversalAmount - alreadyCreatedReversalAmount) * 100) / 100
+        );
+        if (stagedReversalAmount <= 0.01) {
+          return null;
+        }
+        const candidate = serializeTallyCandidate({
+          bill: row.bill,
+          ledgerName: row.ledgerName,
+          ledger: ledgerByName.get(normalizeLedgerName(row.ledgerName)),
           companyName,
           connectionId,
           financialYear: null,
           today,
-          issueType,
-          expectedDiscount,
-          canCreateDebitNote: true,
+          analysis: row.analysis,
+          aiReview,
+          stagedReversalAmount,
+          alreadyCreatedReversalAmount,
         });
-        return actedKeys.has(candidateKey(candidate)) ? null : candidate;
+        return candidate;
       })
       .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate));
 
@@ -591,11 +938,10 @@ export async function GET(request: Request) {
     });
 
     const proposals = [...sortedTallyCandidates, ...createdProposals.map(serializeDebitNoteProposal)];
-    const debitNoteCandidates = sortedTallyCandidates.filter((row) => row.issueType === "discount_shortfall");
-    const unpaidInvoices = sortedTallyCandidates.filter((row) => row.issueType === "invoice_unpaid");
-    const partialUnpaid = sortedTallyCandidates.filter((row) => row.issueType === "partial_unpaid");
+    const debitNoteCandidates = sortedTallyCandidates;
     const recoverableAmount = debitNoteCandidates.reduce((sum, row) => sum + row.recoverableAmount, 0);
     const createdAmount = createdProposals.reduce((sum, row) => sum + toNumber(row.recoverable_amount), 0);
+    const paymentFollowUpAmount = paymentFollowUps.reduce((sum, row) => sum + row.totalPayableAmount, 0);
 
     return jsonWithCors(request, {
       setupRequired: false,
@@ -619,20 +965,25 @@ export async function GET(request: Request) {
         cdExpired: debitNoteCandidates.length,
         lateShortPayments: debitNoteCandidates.length,
         debitNotesPendingApproval: debitNoteCandidates.length,
-        unpaidInvoices: unpaidInvoices.length,
-        partialUnpaidInvoices: partialUnpaid.length,
+        narratedDiscountInvoices: narratedDiscountRows.length,
+        unpaidInvoices: paymentFollowUps.filter((row) => Math.abs(row.outstandingAmount - row.originalInvoiceAmount) <= 1).length,
+        partialUnpaidInvoices: paymentFollowUps.filter((row) => row.outstandingAmount < row.originalInvoiceAmount - 1).length,
+        paymentFollowUps: paymentFollowUps.length,
+        paymentFollowUpAmount,
         needsAttention: tallyCandidates.length,
         createdDebitNotes: createdProposals.length,
         createdDebitNoteAmount: createdAmount,
       },
       tabs: {
         overduePayments: [],
+        paymentFollowUps,
         cashDiscountTracker: proposals,
         debitNoteQueue: proposals,
       },
-      rules: rules.map(serializeCashDiscountRule),
+      narrationAnalysis: structuredNarrationAnalysis,
       notes: [
-        "Needs action is computed from the latest Tally open-bill scan.",
+        "Cash-discount terms are read only from each invoice's Tally narration; saved company-wide rules are not used.",
+        "AI verifies every invoice with narrated cash-discount terms. A debit note stays blocked unless the AI review agrees with the structured narration analysis.",
         "Created debit notes are kept as the Supabase audit trail after Tally confirms the action.",
       ],
     });
@@ -644,6 +995,7 @@ export async function GET(request: Request) {
         kpis: {},
         tabs: {
           overduePayments: [],
+          paymentFollowUps: [],
           cashDiscountTracker: [],
           debitNoteQueue: [],
         },

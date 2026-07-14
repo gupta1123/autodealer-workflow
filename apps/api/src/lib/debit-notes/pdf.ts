@@ -1,4 +1,5 @@
 import { toNumber, toText, type DebitNoteProposalRow } from "@/lib/collections";
+import { createHash } from "node:crypto";
 
 export const DEBIT_NOTE_PDF_BUCKET = "debit-note-pdfs";
 
@@ -76,6 +77,18 @@ function buildPdf(lines: string[]) {
 export function debitNotePdfFileName(proposal: DebitNoteProposalRow) {
   const voucherNumber = toText(proposal.tally_voucher_number, 120) || `debit-note-${proposal.id.slice(0, 8)}`;
   return `${voucherNumber.replace(/[^a-z0-9._-]+/gi, "-")}.pdf`;
+}
+
+export function nativeTallyDebitNotePdfFileName(proposal: DebitNoteProposalRow) {
+  const voucherNumber = toText(proposal.tally_voucher_number, 120) || "debit-note";
+  const reference = toText(proposal.tally_open_reference_name, 120);
+  const safe = ["tally-debit-note", voucherNumber, reference]
+    .filter(Boolean)
+    .join("-")
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return `${safe || `debit-note-${proposal.id.slice(0, 8)}`}.pdf`;
 }
 
 export function generateDebitNotePdf(proposal: DebitNoteProposalRow) {
@@ -158,6 +171,34 @@ export async function uploadDebitNotePdf(supabase: SupabaseAdminClient, proposal
   });
   if (error) throw error;
   return encodeDebitNotePdfReference(path);
+}
+
+export async function uploadNativeTallyDebitNotePdf(
+  supabase: SupabaseAdminClient,
+  proposal: DebitNoteProposalRow,
+  pdf: Buffer
+) {
+  if (!Buffer.isBuffer(pdf) || pdf.length < 5 || !pdf.subarray(0, 5).equals(Buffer.from("%PDF-"))) {
+    throw new Error("The connector did not return a valid PDF document from Tally.");
+  }
+  if (pdf.length > 5 * 1024 * 1024) {
+    throw new Error("The native Tally PDF exceeds the 5 MB document limit.");
+  }
+
+  await ensureDebitNotePdfBucket(supabase);
+  const fileName = nativeTallyDebitNotePdfFileName(proposal);
+  const path = `${proposal.owner_user_id}/${proposal.id}/native/${fileName}`;
+  const { error } = await supabase.storage.from(DEBIT_NOTE_PDF_BUCKET).upload(path, pdf, {
+    contentType: "application/pdf",
+    upsert: true,
+  });
+  if (error) throw error;
+
+  return {
+    reference: encodeDebitNotePdfReference(path),
+    sha256: createHash("sha256").update(pdf).digest("hex"),
+    byteSize: pdf.length,
+  };
 }
 
 export async function createDebitNotePdfSignedUrl(

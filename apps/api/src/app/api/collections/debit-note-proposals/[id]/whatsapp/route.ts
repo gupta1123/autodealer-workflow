@@ -1,6 +1,6 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
-import { serializeDebitNoteProposal, toNullableText, type DebitNoteProposalRow } from "@/lib/collections";
+import { getNativeTallyPdfEvidence, serializeDebitNoteProposal, toNullableText, type DebitNoteProposalRow } from "@/lib/collections";
 import { createDebitNotePdfSignedUrl } from "@/lib/debit-notes/pdf";
 import { sendDebitNoteWhatsapp, getMsg91WhatsappConfig, normalizeWhatsappPhone } from "@/lib/msg91/whatsapp";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -15,6 +15,11 @@ function getTenDigitPhone(value: unknown) {
   if (digits.length === 10) return digits;
   if (digits.length === 12 && digits.startsWith("91")) return digits.slice(2);
   return null;
+}
+
+function getSnapshotPhone(snapshot: unknown) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return null;
+  return getTenDigitPhone((snapshot as Record<string, unknown>).phone);
 }
 
 export function OPTIONS(request: Request) {
@@ -58,13 +63,28 @@ export async function POST(
     if (proposal.status !== "created_in_tally") {
       return jsonWithCors(request, { error: "Create the debit note in Tally before sending WhatsApp." }, { status: 409 });
     }
+    if (!proposal.tally_pdf_reference || !getNativeTallyPdfEvidence(proposal.customer_snapshot)) {
+      return jsonWithCors(
+        request,
+        {
+          error: "The official Tally PDF is not ready yet. Prepare and verify the Tally document before sending WhatsApp.",
+          nativePdfRequired: true,
+        },
+        { status: 409 }
+      );
+    }
 
     const enteredPhone = body.recipientPhone ? getTenDigitPhone(body.recipientPhone) : null;
     if (body.recipientPhone && !enteredPhone) {
       return jsonWithCors(request, { error: "Enter a valid 10-digit WhatsApp number." }, { status: 400 });
     }
 
-    const recipientPhone = normalizeWhatsappPhone(enteredPhone ?? proposal.party_phone);
+    // The dashboard can recover the current number from the synced Tally
+    // ledger before the legacy party_phone column is updated. The snapshot is
+    // therefore a safe persisted fallback after an explicit dialog value.
+    const recipientPhone = normalizeWhatsappPhone(
+      enteredPhone ?? getTenDigitPhone(proposal.party_phone) ?? getSnapshotPhone(proposal.customer_snapshot)
+    );
     if (!recipientPhone) {
       return jsonWithCors(request, { error: "Customer WhatsApp number is missing." }, { status: 400 });
     }
