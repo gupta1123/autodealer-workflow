@@ -4724,7 +4724,12 @@ export function BankStatementsPage() {
                               </td>
                               <td className="px-3 py-4">
                                 {tallyPresence?.status === "found" ? (
-                                  <div className="flex max-w-full flex-col gap-1 px-2 py-1.5 text-left">
+                                  <button
+                                    className="flex max-w-full flex-col gap-1 rounded-xl border border-transparent px-2 py-1.5 text-left transition hover:border-[#e5ddd0] hover:bg-[#faf8f4] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-200"
+                                    onClick={() => setOutgoingReviewTransactionId(transaction.id)}
+                                    title="View matching Tally voucher details"
+                                    type="button"
+                                  >
                                     <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider ${
                                       tallyPresence.duplicateInTally
                                         ? "border-amber-250 bg-amber-50 text-amber-800"
@@ -4739,7 +4744,7 @@ export function BankStatementsPage() {
                                           ? `Voucher ${tallyPresence.voucherNumber}`
                                           : "Unique live match"}
                                     </span>
-                                  </div>
+                                  </button>
                                 ) : outgoingPayment ? (
                                   <button
                                     className={`flex max-w-full flex-col gap-1 rounded-xl border border-transparent px-2 py-1.5 text-left transition ${
@@ -5198,7 +5203,29 @@ export function BankStatementsPage() {
                       </div>
 
                       <section className={outgoingReviewDraft?.matches?.length ? "mt-5" : "hidden"}>
-                        <h3 className="text-sm font-bold text-[#1a1a1a]">Possible vouchers</h3>
+                        <div className="flex flex-wrap items-end justify-between gap-2">
+                          <div>
+                            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                              Tally evidence
+                            </div>
+                            <h3 className="mt-1 text-sm font-bold text-[#1a1a1a]">
+                              {outgoingReviewDraft?.status === "found"
+                                ? outgoingReviewDraft.duplicateInTally
+                                  ? "Matching Tally vouchers"
+                                  : "Matched Tally voucher"
+                                : "Possible Tally vouchers"}
+                            </h3>
+                          </div>
+                          {outgoingReviewDraft?.status === "found" ? (
+                            <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${
+                              outgoingReviewDraft.duplicateInTally
+                                ? "border-amber-200 bg-amber-50 text-amber-800"
+                                : "border-emerald-200 bg-emerald-50 text-emerald-800"
+                            }`}>
+                              {outgoingReviewDraft.duplicateInTally ? "Posted with duplicates" : "Verified match"}
+                            </span>
+                          ) : null}
+                        </div>
                         <div className="mt-2 space-y-3">
                           {outgoingReviewDraft?.matches?.length ? (
                             outgoingReviewDraft.matches.map((match, index) => (
@@ -5209,7 +5236,11 @@ export function BankStatementsPage() {
                                 <div className="flex flex-wrap items-start justify-between gap-3">
                                   <div>
                                     <div className="text-sm font-bold text-[#1a1a1a]">
-                                      {match.voucherNumber || match.masterId || `Candidate ${index + 1}`}
+                                      {match.voucherNumber
+                                        ? `Voucher ${match.voucherNumber}`
+                                        : match.masterId
+                                          ? `Voucher ${match.masterId}`
+                                          : `Candidate ${index + 1}`}
                                     </div>
                                     <div className="mt-1 text-xs font-semibold text-slate-400">
                                       {[match.voucherType, match.date ? formatShortDate(match.date) : null, match.reference]
