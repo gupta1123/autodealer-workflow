@@ -11,8 +11,6 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 export const runtime = "nodejs";
 
-const NON_PARTY_TALLY_FALLBACK_LEDGER = "Suspense";
-
 type QueuePayload = {
   connectionId?: string;
   companyName?: string;
@@ -149,7 +147,23 @@ function billAllocationTotal(allocations: Array<{ amount: number }>) {
 
 function isSuspenseLedger(value?: string | null) {
   const normalized = normalizeName(value);
-  return normalized === "suspense" || normalized === "suspenseac" || normalized === "suspenseaccount";
+  return normalized.includes("suspense");
+}
+
+function findCompanySuspenseLedger(ledgers: TallyLedgerRow[]) {
+  const candidates = ledgers.filter(
+    (ledger) => isSuspenseLedger(ledger.tally_name) || isSuspenseLedger(ledger.parent_name)
+  );
+  return candidates.sort((left, right) => {
+    const rank = (ledger: TallyLedgerRow) => {
+      const name = normalizeName(ledger.tally_name);
+      if (name === "bankstatementsuspense") return 4;
+      if (name === "suspense") return 3;
+      if (name.includes("bankstatement") && name.includes("suspense")) return 2;
+      return name.includes("suspense") ? 1 : 0;
+    };
+    return rank(right) - rank(left);
+  })[0]?.tally_name || "";
 }
 
 function isValidTransactionDate(value: unknown) {
@@ -461,6 +475,21 @@ export async function POST(request: Request) {
       invalidDirection: 0,
       invalidBillAllocation: 0,
     };
+    type SkippedReason = keyof typeof skipped;
+    const skippedRows: Array<{
+      transactionId: string;
+      description: string;
+      reason: SkippedReason;
+    }> = [];
+    function skipTransaction(transaction: BankTransactionRow, reason: SkippedReason) {
+      skipped[reason] += 1;
+      skippedRows.push({
+        transactionId: transaction.id,
+        description: transaction.description,
+        reason,
+      });
+      return [] as TallyCommandInsert[];
+    }
 
     const { data: ledgerRows, error: ledgerError } = await supabase
       .from("tally_masters")
@@ -473,11 +502,14 @@ export async function POST(request: Request) {
 
     if (ledgerError) throw ledgerError;
 
+    const activeLedgers = (ledgerRows ?? []) as unknown as TallyLedgerRow[];
+    const companySuspenseLedgerName = findCompanySuspenseLedger(activeLedgers);
+
     const syncedLedgerNames = new Set(
-      ((ledgerRows ?? []) as unknown as TallyLedgerRow[]).map((ledger) => normalizeName(ledger.tally_name))
+      activeLedgers.map((ledger) => normalizeName(ledger.tally_name))
     );
     const ledgerParentByName = new Map(
-      ((ledgerRows ?? []) as unknown as TallyLedgerRow[]).map((ledger) => [
+      activeLedgers.map((ledger) => [
         normalizeName(ledger.tally_name),
         ledger.parent_name ?? "",
       ])
@@ -531,13 +563,17 @@ export async function POST(request: Request) {
           transaction.suggested_ledger_name && !(isSuspenseLedger(transaction.suggested_ledger_name) && strongSuggestedLedger)
             ? transaction.suggested_ledger_name
             : "";
-        const counterpartyLedgerName =
+        const selectedCounterpartyLedgerName =
           createLedgerName ||
           selectedLedger?.counterpartyLedgerName ||
           confirmedLedgerName ||
           strongSuggestedLedger ||
           (Number(transaction.suggestion_confidence ?? 0) >= 0.85 ? storedSuggestedLedgerName : "") ||
           legacyFallback;
+        const counterpartyLedgerName =
+          isSuspenseLedger(selectedCounterpartyLedgerName) && companySuspenseLedgerName
+            ? companySuspenseLedgerName
+            : selectedCounterpartyLedgerName;
 
         return {
           transaction,
@@ -553,45 +589,39 @@ export async function POST(request: Request) {
     const commands: TallyCommandInsert[] = commandInputs.flatMap(
       ({ transaction, suggestion, counterpartyLedgerName, createLedgerName, createLedgerParentName }) => {
         if (blockedFingerprints.has(transaction.fingerprint)) {
-          skipped.alreadyPostedOrActive += 1;
-          return [];
+          return skipTransaction(transaction, "alreadyPostedOrActive");
         }
         const account = accountsById.get(transaction.bank_account_id);
         const amount = getTransactionAmount(transaction);
         const bankLedgerName = toText(body.bankLedgerName, 500) || account?.tally_ledger_name || "";
         if (!account) {
-          skipped.missingAccount += 1;
-          return [];
+          return skipTransaction(transaction, "missingAccount");
         }
         if (!isValidTransactionDate(transaction.transaction_date)) {
-          skipped.invalidDate = (skipped.invalidDate ?? 0) + 1;
-          return [];
+          return skipTransaction(transaction, "invalidDate");
         }
         if (!bankLedgerName) {
-          skipped.missingBankLedger += 1;
-          return [];
+          return skipTransaction(transaction, "missingBankLedger");
         }
         const shouldCreateCounterpartyLedger = Boolean(createLedgerName) && !ledgerExists(createLedgerName);
         const bankLedgerIsSynced = ledgerExists(bankLedgerName);
         if (!bankLedgerIsSynced) {
-          if (!bankLedgerIsSynced) skipped.bankLedgerNotSynced += 1;
+          skipped.bankLedgerNotSynced += 1;
           skipped.ledgerNotSynced += 1;
+          skippedRows.push({ transactionId: transaction.id, description: transaction.description, reason: "bankLedgerNotSynced" });
           return [];
         }
         if (amount <= 0) {
-          skipped.invalidAmount += 1;
-          return [];
+          return skipTransaction(transaction, "invalidAmount");
         }
         const outgoingPayment = isOutgoingPayment(transaction);
         const incomingReceipt = isIncomingReceipt(transaction);
         if (!outgoingPayment && !incomingReceipt) {
-          skipped.invalidDirection += 1;
-          return [];
+          return skipTransaction(transaction, "invalidDirection");
         }
         const billAllocations = ledgerSelectionByTransactionId.get(transaction.id)?.billAllocations ?? [];
         if (incomingReceipt && billAllocations.length > 0 && Math.abs(billAllocationTotal(billAllocations) - amount) >= 0.005) {
-          skipped.invalidBillAllocation += 1;
-          return [];
+          return skipTransaction(transaction, "invalidBillAllocation");
         }
         const originalVoucherType = getVoucherType(transaction);
         const statementImport = transaction.statement_import_id
@@ -634,26 +664,18 @@ export async function POST(request: Request) {
         }
 
         if (!counterpartyLedgerName) {
-          skipped.missingCounterpartyLedger += 1;
-          return [];
+          return skipTransaction(transaction, "missingCounterpartyLedger");
         }
         const counterpartyLedgerIsReady = shouldCreateCounterpartyLedger || ledgerExists(counterpartyLedgerName);
         if (!counterpartyLedgerIsReady) {
           skipped.counterpartyLedgerNotSynced += 1;
           skipped.ledgerNotSynced += 1;
+          skippedRows.push({ transactionId: transaction.id, description: transaction.description, reason: "counterpartyLedgerNotSynced" });
           return [];
         }
         const counterpartyIsPartyLedger = shouldCreateCounterpartyLedger
           ? isPartyParent(createLedgerParentName)
           : isPartyLedger(counterpartyLedgerName);
-        const usesTallyFallbackLedger =
-          !counterpartyIsPartyLedger &&
-          (originalVoucherType === "Payment" || originalVoucherType === "Receipt") &&
-          ledgerExists(NON_PARTY_TALLY_FALLBACK_LEDGER);
-        const tallyCounterpartyLedgerName = usesTallyFallbackLedger
-          ? NON_PARTY_TALLY_FALLBACK_LEDGER
-          : counterpartyLedgerName;
-
         const nextCommands: TallyCommandInsert[] = [];
         const createLedgerKey = normalizeName(createLedgerName);
         if (shouldCreateCounterpartyLedger && createLedgerKey && !queuedCreateLedgerKeys.has(createLedgerKey)) {
@@ -687,10 +709,10 @@ export async function POST(request: Request) {
             voucherType: originalVoucherType,
             voucherDate: transaction.transaction_date,
             bankLedgerName,
-            counterpartyLedgerName: tallyCounterpartyLedgerName,
+            counterpartyLedgerName,
             matchedLedgerName: counterpartyLedgerName,
-            counterpartyIsPartyLedger: usesTallyFallbackLedger ? true : counterpartyIsPartyLedger,
-            postingFallbackReason: usesTallyFallbackLedger ? "non_party_bank_adjustment" : null,
+            counterpartyIsPartyLedger,
+            postingFallbackReason: isSuspenseLedger(counterpartyLedgerName) ? "unresolved_counterparty" : null,
             bankLedgerEntryIsDebit: bankEntryIsDebit(transaction),
             amount,
             narration: transaction.description,
@@ -711,6 +733,32 @@ export async function POST(request: Request) {
 
     const voucherCommands = commands.filter((command) => command.command_type === "post_bank_voucher");
     const verificationCommands = commands.filter((command) => command.command_type === "verify_bank_transaction");
+    const expectedReceiptCount = transactions.filter(isIncomingReceipt).length;
+    const expectedPaymentCheckCount = transactions.filter(isOutgoingPayment).length;
+
+    if (
+      voucherCommands.length !== expectedReceiptCount ||
+      verificationCommands.length !== expectedPaymentCheckCount
+    ) {
+      return jsonWithCors(
+        request,
+        {
+          error: `Tally preflight failed: ${voucherCommands.length} of ${expectedReceiptCount} receipt(s) and ${verificationCommands.length} of ${expectedPaymentCheckCount} payment check(s) were ready. Nothing was queued.`,
+          queuedCount: 0,
+          verificationCount: 0,
+          commands: [],
+          diagnostics: {
+            eligibleTransactionCount: transactions.length,
+            expectedReceiptCount,
+            expectedPaymentCheckCount,
+            companySuspenseLedgerName: companySuspenseLedgerName || null,
+            skipped,
+            skippedRows,
+          },
+        },
+        { status: 409 }
+      );
+    }
 
     if (voucherCommands.length === 0 && verificationCommands.length === 0) {
       return jsonWithCors(
@@ -721,7 +769,11 @@ export async function POST(request: Request) {
           commands: [],
           diagnostics: {
             eligibleTransactionCount: transactions.length,
+            expectedReceiptCount,
+            expectedPaymentCheckCount,
+            companySuspenseLedgerName: companySuspenseLedgerName || null,
             skipped,
+            skippedRows,
           },
         },
         { status: 400 }
@@ -930,6 +982,14 @@ export async function POST(request: Request) {
       verificationCount: verificationCommands.length,
       commandCount: commands.length,
       commands: createdCommands ?? [],
+      diagnostics: {
+        eligibleTransactionCount: transactions.length,
+        expectedReceiptCount,
+        expectedPaymentCheckCount,
+        companySuspenseLedgerName: companySuspenseLedgerName || null,
+        skipped,
+        skippedRows,
+      },
     });
   } catch (error) {
     console.error("Error in POST /api/bank-statements/tally/queue:", error);

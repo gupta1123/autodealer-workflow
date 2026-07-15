@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const BRIDGE_VERSION = "0.1.17";
+const BRIDGE_VERSION = "0.1.19";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
@@ -220,8 +220,8 @@ function buildCollectionExportXml({ collectionName, tallyType, fetchFields, comp
     ? `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>`
     : "";
   const dateVariables = [
-    dateFrom ? `<SVFROMDATE>${escapeXml(String(dateFrom).replaceAll("-", ""))}</SVFROMDATE>` : "",
-    dateTo ? `<SVTODATE>${escapeXml(String(dateTo).replaceAll("-", ""))}</SVTODATE>` : "",
+    dateFrom ? `<SVFROMDATE TYPE="Date">${escapeXml(String(dateFrom).replaceAll("-", ""))}</SVFROMDATE>` : "",
+    dateTo ? `<SVTODATE TYPE="Date">${escapeXml(String(dateTo).replaceAll("-", ""))}</SVTODATE>` : "",
   ].filter(Boolean);
   const childOfFilter = childOf
     ? `<ADD>CHILD OF : ${escapeXml(childOf)}</ADD>`
@@ -251,6 +251,41 @@ function buildCollectionExportXml({ collectionName, tallyType, fetchFields, comp
     "</COLLECTION>",
     "</TDLMESSAGE>",
     "</TDL>",
+    "</DESC>",
+    "</BODY>",
+    "</ENVELOPE>",
+  ].join("");
+}
+
+function buildLedgerBalanceExportXml({ companyName, ledgerName, dateFrom, dateTo }) {
+  const companyVariable = companyName
+    ? `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>`
+    : "";
+  const fromDate = String(dateFrom || dateTo || "").replaceAll("-", "");
+  const toDate = String(dateTo || dateFrom || "").replaceAll("-", "");
+
+  return [
+    "<ENVELOPE>",
+    "<HEADER>",
+    "<VERSION>1</VERSION>",
+    "<TALLYREQUEST>EXPORT</TALLYREQUEST>",
+    "<TYPE>OBJECT</TYPE>",
+    "<SUBTYPE>Ledger</SUBTYPE>",
+    `<ID TYPE="Name">${escapeXml(ledgerName)}</ID>`,
+    "</HEADER>",
+    "<BODY>",
+    "<DESC>",
+    "<STATICVARIABLES>",
+    companyVariable,
+    fromDate ? `<SVFROMDATE TYPE="Date">${escapeXml(fromDate)}</SVFROMDATE>` : "",
+    toDate ? `<SVTODATE TYPE="Date">${escapeXml(toDate)}</SVTODATE>` : "",
+    toDate ? `<SVCURRENTDATE TYPE="Date">${escapeXml(toDate)}</SVCURRENTDATE>` : "",
+    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
+    "</STATICVARIABLES>",
+    "<FETCHLIST>",
+    "<FETCH>Name</FETCH>",
+    "<FETCH>ClosingBalance</FETCH>",
+    "</FETCHLIST>",
     "</DESC>",
     "</BODY>",
     "</ENVELOPE>",
@@ -1430,6 +1465,13 @@ function toVoucher(block) {
     }))
     .filter((entry) => entry.ledgerName);
   const ledgerNames = ledgerEntries.map((entry) => entry.ledgerName).filter(Boolean);
+  const bankReferences = extractBlocks(block, "BANKALLOCATIONS.LIST")
+    .flatMap((entry) => [
+      getTagText(entry, "INSTRUMENTNUMBER"),
+      getTagText(entry, "TRANSACTIONNAME"),
+      getTagText(entry, "NAME"),
+    ])
+    .filter(Boolean);
 
   return {
     date: getTagText(block, "DATE"),
@@ -1441,6 +1483,7 @@ function toVoucher(block) {
     partyLedgerName: getTagText(block, "PARTYLEDGERNAME"),
     ledgerNames,
     ledgerEntries,
+    bankReferences,
     masterId: getTagText(block, "MASTERID"),
     alterId: getTagText(block, "ALTERID"),
     guid: getTagText(block, "GUID"),
@@ -1777,11 +1820,269 @@ function voucherSearchText(voucher) {
     voucher.reference,
     voucher.narration,
     voucher.partyLedgerName,
+    ...(voucher.bankReferences || []),
     ...voucher.ledgerNames,
     voucher.rawPreview,
   ]
     .filter(Boolean)
     .join(" ");
+}
+
+function normalizeExactReference(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function voucherHasExactReference(voucher, referenceNumber) {
+  const expected = normalizeExactReference(referenceNumber);
+  if (expected.length < 5) return false;
+  return [voucher.reference, ...(voucher.bankReferences || [])]
+    .some((value) => normalizeExactReference(value) === expected);
+}
+
+function getBankLedgerEntry(voucher, bankLedgerName, amount, expectedDirection) {
+  const bankKey = normalizeLooseName(bankLedgerName);
+  const incoming = String(expectedDirection || "").toLowerCase() === "incoming";
+  const outgoing = String(expectedDirection || "").toLowerCase() === "outgoing";
+  return voucher.ledgerEntries.find((entry) => {
+    if (normalizeLooseName(entry.ledgerName) !== bankKey || !amountMatches(entry.amount, amount)) {
+      return false;
+    }
+    if (incoming) return entry.isDebit === true;
+    if (outgoing) return entry.isDebit === false;
+    return false;
+  }) || null;
+}
+
+function validateStatementBalanceSequence(transactions) {
+  const rows = transactions.map((transaction) => ({
+    debit: Number(transaction.debitAmount || 0),
+    credit: Number(transaction.creditAmount || 0),
+    balance:
+      transaction.balanceAmount === null ||
+      transaction.balanceAmount === undefined ||
+      transaction.balanceAmount === ""
+        ? null
+        : Number(transaction.balanceAmount),
+  }));
+  if (rows.length === 0 || rows.some((row) => row.balance === null || !Number.isFinite(row.balance))) {
+    return { available: false, valid: false, reason: "Statement running balances were unavailable." };
+  }
+
+  const test = (orderedRows) => {
+    for (let index = 1; index < orderedRows.length; index += 1) {
+      const previous = orderedRows[index - 1];
+      const current = orderedRows[index];
+      const expected = previous.balance + current.credit - current.debit;
+      if (Math.abs(expected - current.balance) >= 0.01) return null;
+    }
+    const first = orderedRows[0];
+    return {
+      openingBalance: first.balance - first.credit + first.debit,
+      closingBalance: orderedRows.at(-1).balance,
+      movement: orderedRows.reduce((sum, row) => sum + row.credit - row.debit, 0),
+    };
+  };
+
+  const forward = test(rows);
+  const reversed = forward ? null : test([...rows].reverse());
+  const result = forward || reversed;
+  return result
+    ? { available: true, valid: true, order: forward ? "statement" : "reversed", ...result }
+    : { available: true, valid: false, reason: "Statement running balances do not follow the debit/credit sequence." };
+}
+
+async function fetchLedgerClosingBalance(tallyUrl, options) {
+  const xml = await exportTallyXml(
+    tallyUrl,
+    buildLedgerBalanceExportXml(options),
+    "Bank ledger closing balance"
+  );
+  return parseTallyAmount(getTagText(xml, "CLOSINGBALANCE"));
+}
+
+function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes) {
+  const voucherDate = normalizeDateForCompare(transaction.voucherDate);
+  const amount = Number(transaction.amount || 0);
+  const referenceNumber = String(transaction.referenceNumber || "").trim();
+  const counterpartyLedgerName = String(transaction.counterpartyLedgerName || "").trim();
+  const baseCandidates = vouchers.flatMap((voucher, index) => {
+    if (reservedVoucherIndexes.has(index)) return [];
+    const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
+    const bankEntry = getBankLedgerEntry(
+      voucher,
+      bankLedgerName,
+      amount,
+      transaction.expectedDirection
+    );
+    if (!voucherDate || date !== voucherDate || !bankEntry) return [];
+    return [{ voucher, index, bankEntry }];
+  });
+
+  const hasUsableReference = normalizeExactReference(referenceNumber).length >= 5;
+  let candidates = hasUsableReference
+    ? baseCandidates.filter(({ voucher }) => voucherHasExactReference(voucher, referenceNumber))
+    : baseCandidates;
+  const partyMatches = counterpartyLedgerName
+    ? candidates.filter(({ voucher }) => voucherHasLedger(voucher, counterpartyLedgerName))
+    : [];
+  if (candidates.length > 1 && partyMatches.length === 1) candidates = partyMatches;
+
+  return { candidates, baseCandidateCount: baseCandidates.length, hasUsableReference };
+}
+
+function serializeStrictVoucherMatch(candidate) {
+  const voucher = candidate.voucher;
+  return {
+    date: normalizeDateForCompare(voucher.effectiveDate || voucher.date),
+    voucherType: voucher.voucherType,
+    voucherNumber: voucher.voucherNumber,
+    reference: voucher.reference,
+    bankReferences: voucher.bankReferences || [],
+    partyLedgerName: voucher.partyLedgerName,
+    ledgerNames: voucher.ledgerNames,
+    masterId: voucher.masterId,
+  };
+}
+
+async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
+  const transactions = Array.isArray(commandPayload.transactions) ? commandPayload.transactions : [];
+  const companyName = commandPayload.companyName || config.companyName || null;
+  const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
+  const bankLedgerName = String(commandPayload.bankLedgerName || "").trim();
+  if (!bankLedgerName) throw new Error("Bank transaction verification requires the bank ledger name.");
+  if (transactions.length === 0) throw new Error("Bank transaction verification requires at least one row.");
+
+  const normalizedTransactions = transactions.map((transaction, index) => {
+    const voucherDate = normalizeDateForCompare(transaction.voucherDate);
+    const amount = Number(transaction.amount || 0);
+    const expectedDirection = String(transaction.expectedDirection || "").toLowerCase();
+    if (!voucherDate) throw new Error(`Bank statement row ${index + 1} requires a valid date.`);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      throw new Error(`Bank statement row ${index + 1} requires a positive amount.`);
+    }
+    if (!['incoming', 'outgoing'].includes(expectedDirection)) {
+      throw new Error(`Bank statement row ${index + 1} requires a debit/credit direction.`);
+    }
+    return { ...transaction, voucherDate, amount, expectedDirection };
+  });
+  const dates = normalizedTransactions.map((transaction) => transaction.voucherDate).sort();
+  const dateFrom = dates[0];
+  const dateTo = dates.at(-1);
+
+  const xml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Kalika Bank Statement Reconciliation",
+    tallyType: "Voucher",
+    fetchFields:
+      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
+    companyName,
+    dateFrom,
+    dateTo,
+  });
+  const vouchers = parseVoucherCollection(xml).filter(
+    (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
+  );
+  const reservedVoucherIndexes = new Set();
+  const results = normalizedTransactions.map((transaction) => {
+    const { candidates, baseCandidateCount, hasUsableReference } = strictBankTransactionCandidates(
+      vouchers,
+      transaction,
+      bankLedgerName,
+      reservedVoucherIndexes
+    );
+    // An exact bank reference is expected to identify one economic transaction.
+    // If Tally contains that same strict reference more than once, the statement
+    // row is unquestionably already posted; the extra vouchers are a Tally data
+    // quality issue, not a reason to post the bank row again.
+    const duplicateInTally = hasUsableReference && candidates.length > 1;
+    const verificationStatus = candidates.length === 1 || duplicateInTally
+      ? "found"
+      : candidates.length > 1
+        ? "ambiguous"
+        : "missing";
+    if (verificationStatus === "found") {
+      const indexesToReserve = duplicateInTally ? candidates.map((candidate) => candidate.index) : [candidates[0].index];
+      indexesToReserve.forEach((index) => reservedVoucherIndexes.add(index));
+    }
+    const selectedCandidate = verificationStatus === "found" ? candidates[0] : null;
+    return {
+      transactionId: transaction.transactionId || null,
+      verificationStatus,
+      matchCount: candidates.length,
+      duplicateInTally,
+      duplicateVoucherCount: duplicateInTally ? candidates.length : 0,
+      baseCandidateCount,
+      scannedCount: vouchers.length,
+      voucherId: selectedCandidate ? selectedCandidate.voucher.masterId || selectedCandidate.voucher.voucherNumber : null,
+      voucherNumber: selectedCandidate ? selectedCandidate.voucher.voucherNumber : null,
+      voucherDate: selectedCandidate
+        ? normalizeDateForCompare(selectedCandidate.voucher.effectiveDate || selectedCandidate.voucher.date)
+        : null,
+      reason: duplicateInTally
+        ? `${candidates.length} Tally vouchers have the same strict bank transaction reference. The statement row is already posted; review the duplicate Tally vouchers separately.`
+        : verificationStatus === "found"
+          ? "A unique Tally voucher matched the date, bank ledger, amount, direction and available reference."
+        : verificationStatus === "ambiguous"
+          ? "More than one same-date and same-amount voucher matched, but no reliable bank reference identifies one transaction. Review manually."
+          : hasUsableReference && baseCandidateCount > 0
+            ? "Date, amount and direction matched, but the exact UTR/reference did not."
+            : "No unused Tally voucher matched the date, selected bank ledger, amount and direction.",
+      matches: candidates.slice(0, 5).map(serializeStrictVoucherMatch),
+    };
+  });
+
+  const statementBalance = validateStatementBalanceSequence(normalizedTransactions);
+  const periodBankEntries = vouchers.flatMap((voucher) => voucher.ledgerEntries.filter(
+    (entry) => normalizeLooseName(entry.ledgerName) === normalizeLooseName(bankLedgerName)
+  ));
+  const tallyMovement = periodBankEntries.reduce((sum, entry) => sum - Number(entry.amount || 0), 0);
+  let tallyClosingBalance = null;
+  let balanceError = null;
+  try {
+    const rawTallyClosingBalance = await fetchLedgerClosingBalance(tallyUrl, {
+      companyName,
+      ledgerName: bankLedgerName,
+      dateFrom,
+      dateTo,
+    });
+    // Tally's internal amount sign is opposite to the bank statement view for
+    // asset bank ledgers: debit balances are negative internally.
+    tallyClosingBalance = Number.isFinite(rawTallyClosingBalance)
+      ? -Number(rawTallyClosingBalance)
+      : null;
+  } catch (error) {
+    balanceError = error instanceof Error ? error.message : String(error);
+  }
+  const derivedTallyOpeningBalance = Number.isFinite(tallyClosingBalance)
+    ? Number(tallyClosingBalance) - tallyMovement
+    : null;
+  const balancesMatch = statementBalance.valid && Number.isFinite(tallyClosingBalance)
+    ? Math.abs(statementBalance.openingBalance - derivedTallyOpeningBalance) < 0.01 &&
+      Math.abs(statementBalance.closingBalance - Number(tallyClosingBalance)) < 0.01
+    : null;
+
+  return {
+    success: true,
+    result: {
+      mode: "bank_statement_batch",
+      dateFrom,
+      dateTo,
+      bankLedgerName,
+      scannedCount: vouchers.length,
+      transactions: results,
+      balanceProof: {
+        available: statementBalance.available && Number.isFinite(tallyClosingBalance),
+        statementSequenceValid: statementBalance.valid,
+        statementOpeningBalance: statementBalance.valid ? statementBalance.openingBalance : null,
+        statementClosingBalance: statementBalance.valid ? statementBalance.closingBalance : null,
+        statementMovement: statementBalance.valid ? statementBalance.movement : null,
+        tallyOpeningBalance: derivedTallyOpeningBalance,
+        tallyClosingBalance,
+        tallyMovement,
+        balancesMatch,
+        warning: balanceError || (!statementBalance.valid ? statementBalance.reason : null),
+      },
+    },
+  };
 }
 
 function scoreBankTransactionVoucher(voucher, payload) {
@@ -1840,6 +2141,9 @@ function scoreBankTransactionVoucher(voucher, payload) {
 }
 
 async function verifyBankTransactionInTally(config, commandPayload = {}) {
+  if (Array.isArray(commandPayload.transactions)) {
+    return reconcileBankTransactionsInTally(config, commandPayload);
+  }
   const companyName = commandPayload.companyName || config.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const amount = Number(commandPayload.amount ?? 0);
@@ -1860,35 +2164,37 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
     collectionName: "Autodealer Bank Payment Verification",
     tallyType: "Voucher",
     fetchFields:
-      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive",
+      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
     companyName,
+    dateFrom: voucherDate,
+    dateTo: voucherDate,
   });
   const vouchers = parseVoucherCollection(xml).filter(
     (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
   );
-  const scoredMatches = vouchers
-    .map((voucher) => ({
-      voucher,
-      match: scoreBankTransactionVoucher(voucher, commandPayload),
-    }))
-    .filter(({ match }) => match.score >= 75 && match.dateHit && match.anyAmountHit)
-    .sort((left, right) => right.match.score - left.match.score);
-
-  const topMatch = scoredMatches[0] ?? null;
-  const secondMatch = scoredMatches[1] ?? null;
-  const verificationStatus = !topMatch
+  const strictResult = strictBankTransactionCandidates(
+    vouchers,
+    { ...commandPayload, voucherDate, amount },
+    bankLedgerName,
+    new Set()
+  );
+  const strictMatches = strictResult.candidates;
+  const duplicateInTally = strictResult.hasUsableReference && strictMatches.length > 1;
+  const verificationStatus = strictMatches.length === 0
     ? "missing"
-    : secondMatch && topMatch.match.score - secondMatch.match.score < 10
-      ? "ambiguous"
-      : "found";
-  const selectedVoucher = verificationStatus === "found" ? topMatch?.voucher : null;
+    : strictMatches.length === 1 || duplicateInTally
+      ? "found"
+      : "ambiguous";
+  const selectedVoucher = verificationStatus === "found" ? strictMatches[0].voucher : null;
 
   return {
     success: true,
     result: {
       verificationStatus,
       scannedCount: vouchers.length,
-      matchCount: scoredMatches.length,
+      matchCount: strictMatches.length,
+      duplicateInTally,
+      duplicateVoucherCount: duplicateInTally ? strictMatches.length : 0,
       voucherId: selectedVoucher?.masterId || selectedVoucher?.voucherNumber || null,
       voucherNumber: selectedVoucher?.voucherNumber || null,
       voucherType: selectedVoucher?.voucherType || null,
@@ -1896,22 +2202,16 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
         ? normalizeDateForCompare(selectedVoucher.effectiveDate || selectedVoucher.date)
         : null,
       reason:
-        verificationStatus === "found"
-          ? `Found in Tally: ${topMatch.match.reasons.join(", ")}.`
+        duplicateInTally
+          ? `${strictMatches.length} Tally vouchers have the same strict bank transaction reference. The bank row is already posted; review the duplicate Tally vouchers separately.`
+          : verificationStatus === "found"
+            ? "Found a unique strict match in Tally."
           : verificationStatus === "ambiguous"
-            ? "More than one Tally voucher looks like this bank transaction. Review manually."
-            : "No matching Tally voucher found for this bank transaction.",
-      matches: scoredMatches.slice(0, 5).map(({ voucher, match }) => ({
-        score: match.score,
-        reasons: match.reasons,
-        date: normalizeDateForCompare(voucher.effectiveDate || voucher.date),
-        voucherType: voucher.voucherType,
-        voucherNumber: voucher.voucherNumber,
-        reference: voucher.reference,
-        partyLedgerName: voucher.partyLedgerName,
-        ledgerNames: voucher.ledgerNames,
-        masterId: voucher.masterId,
-      })),
+            ? "More than one same-date and same-amount voucher matched, but no reliable bank reference identifies one transaction. Review manually."
+            : strictResult.hasUsableReference && strictResult.baseCandidateCount > 0
+              ? "Date, amount and direction matched, but the exact UTR/reference did not."
+              : "No matching Tally voucher found for this bank transaction.",
+      matches: strictMatches.slice(0, 5).map(serializeStrictVoucherMatch),
     },
   };
 }
@@ -3692,6 +3992,7 @@ export {
   normalizeTallyUrl,
   pairBridge,
   readConfig,
+  reconcileBankTransactionsInTally,
   runOnce,
   startBridge,
   testBridge,

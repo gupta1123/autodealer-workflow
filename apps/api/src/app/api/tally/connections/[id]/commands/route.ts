@@ -506,6 +506,92 @@ export async function POST(
     }
 
     if (commandType === "verify_bank_transaction") {
+      const rawTransactions = Array.isArray(rawPayload.transactions)
+        ? rawPayload.transactions.slice(0, 250)
+        : [];
+      const companyName =
+        toNullableText(rawPayload.companyName, 240) ??
+        toNullableText(connection.last_company_name, 240);
+      const liveCompanyError = activeTallyCompanyError(connection, companyName);
+      if (liveCompanyError) {
+        return jsonWithCors(request, { error: liveCompanyError }, { status: 409 });
+      }
+
+      if (rawTransactions.length > 0) {
+        const transactions = rawTransactions.flatMap((value, index) => {
+          if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+          const row = value as Record<string, unknown>;
+          const voucherDate = toRequiredText(row.voucherDate).slice(0, 20);
+          const amount = Number(String(row.amount ?? "").replace(/,/g, ""));
+          const expectedDirection = toRequiredText(row.expectedDirection).toLowerCase();
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(voucherDate)) {
+            throw new Error(`Bank statement row ${index + 1} requires a valid date.`);
+          }
+          if (!Number.isFinite(amount) || amount <= 0) {
+            throw new Error(`Bank statement row ${index + 1} requires a positive amount.`);
+          }
+          if (expectedDirection !== "incoming" && expectedDirection !== "outgoing") {
+            throw new Error(`Bank statement row ${index + 1} requires a debit/credit direction.`);
+          }
+          return [{
+            transactionId: toNullableText(row.transactionId, 200),
+            voucherDate,
+            amount,
+            debitAmount: Number(String(row.debitAmount ?? "0").replace(/,/g, "")) || 0,
+            creditAmount: Number(String(row.creditAmount ?? "0").replace(/,/g, "")) || 0,
+            balanceAmount: row.balanceAmount === null || row.balanceAmount === undefined || row.balanceAmount === ""
+              ? null
+              : Number(String(row.balanceAmount).replace(/,/g, "")),
+            expectedDirection,
+            counterpartyLedgerName: toNullableText(row.counterpartyLedgerName, 500),
+            narration: toNullableText(row.narration, 2000),
+            referenceNumber: toNullableText(row.referenceNumber, 500),
+          }];
+        });
+        const bankLedgerName = toRequiredText(rawPayload.bankLedgerName).slice(0, 500);
+        if (!bankLedgerName) {
+          return jsonWithCors(request, { error: "Bank ledger name is required." }, { status: 400 });
+        }
+        if (transactions.length !== rawTransactions.length) {
+          return jsonWithCors(request, { error: "Every bank statement row must be valid." }, { status: 400 });
+        }
+
+        const payload = {
+          companyName,
+          bankLedgerName,
+          transactions,
+          source: "bank_statement_batch_review_check",
+        };
+        if (isLocalDbMode()) {
+          const command = await createLocalTallyCommand({
+            connectionId: id,
+            ownerUserId: user.id,
+            commandType,
+            payload,
+            priority: 20,
+          });
+          return jsonWithCors(request, { command: serializeTallyBridgeCommand(command) });
+        }
+
+        const supabase = createSupabaseAdminClient();
+        const { data, error } = await supabase
+          .from("tally_bridge_commands")
+          .insert({
+            connection_id: id,
+            owner_user_id: user.id,
+            command_type: commandType,
+            status: "queued",
+            priority: 20,
+            payload,
+          })
+          .select("*")
+          .single();
+        if (error) throw error;
+        return jsonWithCors(request, {
+          command: serializeTallyBridgeCommand(data as unknown as TallyBridgeCommandRow),
+        });
+      }
+
       const voucherDate = toRequiredText(rawPayload.voucherDate).slice(0, 20);
       const bankLedgerName = toRequiredText(rawPayload.bankLedgerName).slice(0, 500);
       const amount = Number(String(rawPayload.amount ?? "").replace(/,/g, ""));
@@ -521,9 +607,7 @@ export async function POST(
       }
 
       const payload = {
-        companyName:
-          toNullableText(rawPayload.companyName, 240) ??
-          toNullableText(connection.last_company_name, 240),
+        companyName,
         voucherDate,
         bankLedgerName,
         amount,

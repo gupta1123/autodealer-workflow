@@ -21,6 +21,7 @@ type ConfirmPayload = {
   accountId?: string | null;
   account?: BankAccountInput;
   transactions?: ParsedBankTransaction[];
+  reconcileAgainstLiveTally?: boolean;
 };
 
 type PostedTransactionRow = {
@@ -358,6 +359,7 @@ export async function POST(
 
     const { id } = await context.params;
     const body = (await request.json().catch(() => ({}))) as ConfirmPayload;
+    const reconcileAgainstLiveTally = body.reconcileAgainstLiveTally === true;
     const submittedTransactions = (body.transactions ?? []).flatMap((value) => {
       const transaction = toTransaction(value);
       return transaction ? [transaction] : [];
@@ -496,7 +498,7 @@ export async function POST(
       lastImportedTransactionMarker,
       lastImportedTransactionDate
     );
-    const rowsAfterCheckpoint = checkpointResult.rows;
+    const rowsAfterCheckpoint = reconcileAgainstLiveTally ? rows : checkpointResult.rows;
 
     const { data: existingPostedRows, error: existingPostedError } = await supabase
       .from("bank_transactions")
@@ -510,7 +512,7 @@ export async function POST(
     if (existingPostedError) throw existingPostedError;
 
     const postedRows = (existingPostedRows ?? []) as unknown as PostedTransactionRow[];
-    if (postedRows.length > 0) {
+    if (!reconcileAgainstLiveTally && postedRows.length > 0) {
       const postedLogRows = postedRows.map((row) => ({
         owner_user_id: user.id,
         bank_account_id: accountId,
@@ -542,6 +544,15 @@ export async function POST(
     }
 
     const submittedFingerprints = rows.map((row) => row.fingerprint);
+    if (reconcileAgainstLiveTally && submittedFingerprints.length > 0) {
+      const { error: stalePostingLogError } = await supabase
+        .from("bank_transaction_posting_log")
+        .delete()
+        .eq("owner_user_id", user.id)
+        .eq("bank_account_id", accountId)
+        .in("fingerprint", submittedFingerprints);
+      if (stalePostingLogError) throw stalePostingLogError;
+    }
     const { data: postedLogData, error: postedLogReadError } = submittedFingerprints.length
       ? await supabase
           .from("bank_transaction_posting_log")
@@ -574,8 +585,8 @@ export async function POST(
       (row) =>
         row.id &&
         row.fingerprint &&
-        row.statement_import_id === id &&
-        ["pending", "failed", "missing_in_tally", "verification_failed"].includes(row.tally_status || "")
+        (reconcileAgainstLiveTally || row.statement_import_id === id) &&
+        (reconcileAgainstLiveTally || ["pending", "failed", "missing_in_tally", "verification_failed"].includes(row.tally_status || ""))
     );
     const submittedRowsByFingerprint = new Map(rows.map((row) => [row.fingerprint, row]));
     const postedByFingerprint = new Map(
@@ -642,6 +653,13 @@ export async function POST(
               suggestion_reason: matchingRow?.suggestion_reason ?? null,
               confirmed_ledger_name: matchingRow?.confirmed_ledger_name ?? null,
               ledger_mapping_source: matchingRow?.ledger_mapping_source ?? null,
+              ...(reconcileAgainstLiveTally
+                ? {
+                    tally_status: "pending",
+                    tally_voucher_id: null,
+                    tally_posted_at: null,
+                  }
+                : {}),
             })
             .eq("id", existingRow.id)
             .eq("owner_user_id", user.id);
@@ -701,6 +719,7 @@ export async function POST(
               existingQueueableTransactionCount: existingQueueableRows.length,
               appendCompletedAt: new Date().toISOString(),
               alreadyPostedTransactionCount: postedByFingerprint.size,
+              reconciledAgainstLiveTally: reconcileAgainstLiveTally,
             },
           })
           .eq("id", id)
