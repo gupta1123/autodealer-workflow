@@ -105,6 +105,35 @@ type TallyCommand = {
   error: string | null;
 };
 
+type TallyQueueJob = {
+  id: string;
+  status: string;
+  totalCount?: number;
+  processedCount?: number;
+  result?: TallyQueueResult | null;
+  error?: string | null;
+};
+
+type TallyQueueJobResponse = {
+  async?: boolean;
+  jobId?: string;
+  job?: TallyQueueJob;
+  result?: TallyQueueResult | null;
+  error?: string;
+};
+
+type TallyQueueResult = {
+  queuedCount?: number;
+  verificationCount?: number;
+  commands?: TallyCommand[];
+  diagnostics?: {
+    expectedReceiptCount?: number;
+    expectedPaymentCheckCount?: number;
+    companySuspenseLedgerName?: string | null;
+    skippedRows?: Array<{ transactionId?: string; description?: string; reason?: string }>;
+  };
+};
+
 type BankLedgerFetchResult = {
   companyName?: string | null;
   bankLedgers?: LocalBankLedger[] | null;
@@ -2699,6 +2728,37 @@ export function BankStatementsPage() {
     return null;
   }, []);
 
+  const pollTallyQueueJob = useCallback(async (jobId: string): Promise<TallyQueueResult> => {
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      const response = await apiFetch(`/api/bank-statements/tally/queue-jobs/${jobId}/run`, {
+        method: "POST",
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        throw new Error(await readError(response));
+      }
+
+      const payload = (await response.json()) as TallyQueueJobResponse;
+      const job = payload.job;
+      if (job?.status === "succeeded") {
+        return (payload.result ?? job.result ?? { queuedCount: 0, verificationCount: 0, commands: [] }) as TallyQueueResult;
+      }
+      if (job?.status === "failed" || job?.status === "cancelled") {
+        throw new Error(job.error || payload.error || "Tally queue job failed.");
+      }
+
+      const processed = Number(job?.processedCount ?? 0);
+      const total = Number(job?.totalCount ?? 0);
+      setBanner({
+        tone: "info",
+        text: total > 0 ? `Preparing Tally queue: ${Math.min(processed, total)} of ${total} transaction(s).` : "Preparing Tally queue.",
+      });
+      await wait(1200);
+    }
+
+    throw new Error("Tally queue preparation is still running. Keep the connector open and try refreshing in a moment.");
+  }, []);
+
   useEffect(() => {
     if (initialSummaryLoadStartedRef.current) return;
     initialSummaryLoadStartedRef.current = true;
@@ -3756,6 +3816,7 @@ export function BankStatementsPage() {
         body: JSON.stringify({
           connectionId: tallyConnectionId,
           companyName: selectedCompanyName,
+          async: true,
           accountId: confirmPayload.account.id,
           transactionIds: queueRows.map((transaction) => transaction.id),
           bankLedgerName,
@@ -3793,17 +3854,15 @@ export function BankStatementsPage() {
         throw new Error(await readError(queueResponse));
       }
 
-      const queuedPayload = (await queueResponse.json()) as {
-        queuedCount?: number;
-        verificationCount?: number;
-        commands?: TallyCommand[];
-        diagnostics?: {
-          expectedReceiptCount?: number;
-          expectedPaymentCheckCount?: number;
-          companySuspenseLedgerName?: string | null;
-          skippedRows?: Array<{ transactionId?: string; description?: string; reason?: string }>;
-        };
-      };
+      const queueResponsePayload = (await queueResponse.json()) as TallyQueueJobResponse & TallyQueueResult;
+      const queuedPayload = queueResponsePayload.jobId
+        ? await pollTallyQueueJob(queueResponsePayload.jobId)
+        : {
+            queuedCount: queueResponsePayload.queuedCount,
+            verificationCount: queueResponsePayload.verificationCount,
+            commands: queueResponsePayload.commands,
+            diagnostics: queueResponsePayload.diagnostics,
+          };
       const queuedCommands = queuedPayload.commands ?? [];
       const commandIds = queuedCommands.map((command) => command.id).filter(Boolean);
       const postingConnectionId =

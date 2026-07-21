@@ -58,6 +58,21 @@ function normalizeTallyUrl(value) {
   return (value || DEFAULT_TALLY_URL).replace(/\/+$/, "");
 }
 
+function formatTallyConnectivityError(tallyUrl, error) {
+  const target = normalizeTallyUrl(tallyUrl);
+  const baseMessage = error instanceof Error ? error.message : String(error ?? "Unable to reach Tally.");
+  const cause = error instanceof Error && error.cause instanceof Error ? error.cause : null;
+  const causeCode = cause && typeof cause.code === "string" ? cause.code : "";
+  const causeMessage = cause?.message || "";
+  const combined = `${baseMessage} ${causeMessage} ${causeCode}`.trim();
+
+  if (/fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EHOSTUNREACH|UND_ERR_CONNECT_TIMEOUT|AbortError/i.test(combined)) {
+    return `Unable to reach Tally at ${target}. Check the Tally server IP/hostname, port 9000, Windows firewall, and that this connector machine is on the same LAN or VPN.`;
+  }
+
+  return combined || `Unable to reach Tally at ${target}.`;
+}
+
 function readConfig() {
   if (!fs.existsSync(CONFIG_PATH)) {
     return null;
@@ -2823,7 +2838,7 @@ async function testTally(tallyUrl, companyName) {
       tallyReachable: false,
       companyLoaded: false,
       companyName: null,
-      error: error instanceof Error ? error.message : String(error ?? "Unable to reach Tally."),
+      error: formatTallyConnectivityError(tallyUrl, error),
     };
   } finally {
     clearTimeout(timeout);
@@ -3965,7 +3980,7 @@ async function main() {
   }
 
   console.log("Usage:");
-  console.log("  node apps/tally-bridge/src/bridge.mjs pair --api-base <url> --connection-id <id> --pairing-code <code> --company-name <name>");
+  console.log("  node apps/tally-bridge/src/bridge.mjs pair --api-base <url> --connection-id <id> --pairing-code <code> --tally-url http://localhost:9000 --company-name <name>");
   console.log("  node apps/tally-bridge/src/bridge.mjs start --company-name <name>");
   console.log("  node apps/tally-bridge/src/bridge.mjs sync-masters --company-name <name>");
   console.log("  node apps/tally-bridge/src/bridge.mjs list-bank-ledgers --company-name <name>");

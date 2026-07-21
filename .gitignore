@@ -1,47 +1,53 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
 
-# dependencies
-/node_modules
-/.pnp
-.pnp.*
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/versions
+# Dependencies and framework build output
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+dist/
+**/dist/
+build/
+**/build/
 
-# testing
-/coverage
-
-# next.js
-/.next/
-/out/
-apps/*/.next/
-apps/*/.netlify/
-
-# production
-/build
-
-# misc
-.DS_Store
-*.pem
-*.zip
-backup/
-exports/
+# Generated workflow, test, and installer output
+output/
+case-review-exports/
 tmp/
+installer/**/output/
+installer/**/payload/
+installer/**/payload-clean/
+installer/**/release/
+installer/**/.cache/
+*.zip
 
-# debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
+# Runtime and diagnostic logs
+*.log
+*.out.log
+*.err.log
 
-# env files (can opt-in for committing if needed)
-.env*
+# Local tooling state
+.agents/
+.codex/
+.codex-merge-backup/
+.codex-run-logs/
+.playwright-cli/
 
-# vercel
-.vercel
+# Local Tally runtime files
+tally.ini
+tallyhttp.log
+tdlfunc.log
 
-# typescript
+# OS/editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.tmp
 *.tsbuildinfo
-next-env.d.ts
+__pycache__/
+**/__pycache__/
+*.pyc

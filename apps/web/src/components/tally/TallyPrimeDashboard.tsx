@@ -20,6 +20,12 @@ import {
 import { apiFetch } from "@/lib/api-client";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+
+const DEFAULT_TALLY_URL = "http://localhost:9000";
+const DEFAULT_LAN_TALLY_URL = "http://192.168.1.10:9000";
+
+type TallySetupMode = "same_machine" | "lan_server";
 
 type TallyConnection = {
   id: string;
@@ -131,7 +137,8 @@ function escapeCommandValue(value: string) {
 
 function buildPairCommand(connection: TallyConnection, pairingCode: string) {
   const apiBaseUrl = getBridgeApiBaseUrl();
-  return `npm.cmd run pair -- --api-base "${apiBaseUrl}" --connection-id "${connection.id}" --pairing-code "${pairingCode}"`;
+  const tallyUrl = connection.tallyUrl || DEFAULT_TALLY_URL;
+  return `npm.cmd run pair -- --api-base "${apiBaseUrl}" --connection-id "${connection.id}" --pairing-code "${pairingCode}" --tally-url "${escapeCommandValue(tallyUrl)}"`;
 }
 
 function buildStartCommand(connection?: TallyConnection | null) {
@@ -151,10 +158,28 @@ function buildConnectorConnectUrl(connection: TallyConnection, pairingCode: stri
     apiBase: getBridgeApiBaseUrl(),
     connectionId: connection.id,
     pairingCode,
-    tallyUrl: connection.tallyUrl || "http://localhost:9000",
+    tallyUrl: connection.tallyUrl || DEFAULT_TALLY_URL,
   });
 
   return `kalika-tally://connect?${params.toString()}`;
+}
+
+function normalizeTallyUrlInput(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+  return withProtocol.replace(/\/+$/, "");
+}
+
+function getSetupModeForUrl(value?: string | null): TallySetupMode {
+  if (!value) return "same_machine";
+  try {
+    const url = new URL(normalizeTallyUrlInput(value));
+    const hostname = url.hostname.toLowerCase();
+    return hostname === "localhost" || hostname === "127.0.0.1" ? "same_machine" : "lan_server";
+  } catch {
+    return "lan_server";
+  }
 }
 
 function buildConnectorDisconnectUrl(connection: TallyConnection) {
@@ -284,6 +309,8 @@ export function TallyPrimeDashboard() {
   const [creating, setCreating] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [setupMode, setSetupMode] = useState<TallySetupMode>("same_machine");
+  const [tallyUrlInput, setTallyUrlInput] = useState("");
   const [message, setMessage] = useState<{ tone: "success" | "error"; text: string } | null>(null);
 
   const selectedConnection =
@@ -372,14 +399,27 @@ export function TallyPrimeDashboard() {
     try {
       setCreating(true);
       setMessage(null);
+      const tallyUrl = setupMode === "same_machine" ? DEFAULT_TALLY_URL : normalizeTallyUrlInput(tallyUrlInput);
+      if (!tallyUrl) {
+        throw new Error("Enter the Tally server URL or IP address.");
+      }
+      try {
+        const parsedTallyUrl = new URL(tallyUrl);
+        if (!["http:", "https:"].includes(parsedTallyUrl.protocol)) {
+          throw new Error("Unsupported protocol");
+        }
+      } catch {
+        throw new Error("Enter a valid Tally server URL.");
+      }
+
       const response = await apiFetch("/api/tally/connections", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          displayName: "Tally Prime",
-          tallyUrl: "http://localhost:9000",
+          displayName: setupMode === "same_machine" ? "Tally Prime" : "Tally Prime LAN",
+          tallyUrl,
         }),
       });
       if (!response.ok) {
@@ -493,6 +533,12 @@ export function TallyPrimeDashboard() {
   }, []);
 
   useEffect(() => {
+    const tallyUrl = selectedConnection?.tallyUrl || DEFAULT_TALLY_URL;
+    setTallyUrlInput(tallyUrl);
+    setSetupMode(getSetupModeForUrl(tallyUrl));
+  }, [selectedConnection?.id, selectedConnection?.tallyUrl]);
+
+  useEffect(() => {
     if (!selectedConnection) return;
     const timer = window.setInterval(() => {
       void refreshStatus(selectedConnection.id);
@@ -576,6 +622,71 @@ export function TallyPrimeDashboard() {
         >
           {message.text}
         </div>
+      ) : null}
+
+      {!connectorActive ? (
+        <section className="mb-5 rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+          <div className="mb-4">
+            <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">
+              Tally target
+            </div>
+            <h3 className="mt-2 text-base font-extrabold text-[#1a1a1a]">Connection location</h3>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <button
+              className={`rounded-2xl border p-4 text-left transition ${setupMode === "same_machine"
+                  ? "border-[#1a1a1a] bg-amber-50"
+                  : "border-[#e5ddd0] bg-white hover:bg-[#faf8f4]"
+                }`}
+              onClick={() => {
+                setSetupMode("same_machine");
+                setTallyUrlInput(DEFAULT_TALLY_URL);
+              }}
+              type="button"
+            >
+              <div className="text-sm font-extrabold text-[#1a1a1a]">Same machine</div>
+              <div className="mt-1 text-xs font-semibold leading-5 text-slate-500">
+                Tally and connector run on this computer.
+              </div>
+            </button>
+
+            <button
+              className={`rounded-2xl border p-4 text-left transition ${setupMode === "lan_server"
+                  ? "border-[#1a1a1a] bg-amber-50"
+                  : "border-[#e5ddd0] bg-white hover:bg-[#faf8f4]"
+                }`}
+              onClick={() => {
+                setSetupMode("lan_server");
+                setTallyUrlInput((current) => (getSetupModeForUrl(current) === "same_machine" ? "" : current));
+              }}
+              type="button"
+            >
+              <div className="text-sm font-extrabold text-[#1a1a1a]">LAN/server</div>
+              <div className="mt-1 text-xs font-semibold leading-5 text-slate-500">
+                Connector reaches Tally on a Gold LAN machine.
+              </div>
+            </button>
+          </div>
+
+          {setupMode === "lan_server" ? (
+            <div className="mt-4">
+              <label className="text-[9px] font-bold uppercase tracking-wider text-slate-400" htmlFor="tally-url">
+                Tally server URL
+              </label>
+              <Input
+                className="mt-2 h-11 rounded-xl border-[#d8ccbc] bg-white font-mono text-sm"
+                id="tally-url"
+                onChange={(event) => setTallyUrlInput(event.target.value)}
+                placeholder={DEFAULT_LAN_TALLY_URL}
+                value={tallyUrlInput}
+              />
+              <div className="mt-2 text-xs font-semibold leading-5 text-slate-500">
+                Use the Tally server IP or hostname reachable from the connector machine.
+              </div>
+            </div>
+          ) : null}
+        </section>
       ) : null}
 
       {loading ? (
