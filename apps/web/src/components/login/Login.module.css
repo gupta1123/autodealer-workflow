@@ -159,14 +159,14 @@
 }
 
 .docId {
-  font-family: "JetBrains Mono", "Courier New", monospace;
+  font-family: var(--font-app-mono);
   font-size: 0.625rem;
   color: #666666;
   letter-spacing: 0.04em;
 }
 
 .docBadge {
-  font-family: "JetBrains Mono", "Courier New", monospace;
+  font-family: var(--font-app-mono);
   font-size: 0.55rem;
   font-weight: 700;
   letter-spacing: 0.06em;
@@ -214,7 +214,7 @@
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  font-family: "JetBrains Mono", "Courier New", monospace;
+  font-family: var(--font-app-mono);
   font-size: 0.6rem;
   color: #666666;
   letter-spacing: 0.04em;
@@ -272,7 +272,7 @@
 .leftMeta {
   display: flex;
   gap: 1.25rem;
-  font-family: "JetBrains Mono", "Courier New", monospace;
+  font-family: var(--font-app-mono);
   font-size: 0.6rem;
   color: #555555;
   letter-spacing: 0.06em;
@@ -385,7 +385,7 @@
 }
 
 .fieldLabel {
-  font-family: "JetBrains Mono", "Courier New", monospace;
+  font-family: var(--font-app-mono);
   font-size: 0.625rem;
   font-weight: 600;
   letter-spacing: 0.07em;

@@ -70,6 +70,8 @@ type LocalBankLedger = {
   bankAccountNumber?: string | null;
 };
 
+const BANK_STATEMENT_COMPANY_SELECTION_KEY = "kalika.bankStatements.selectedCompany.v1";
+
 function uniqueCompanyOptions(options: CompanyOption[]) {
   const seen = new Set<string>();
   return options.filter((option) => {
@@ -80,8 +82,79 @@ function uniqueCompanyOptions(options: CompanyOption[]) {
   });
 }
 
+function sortCompanyOptions(options: CompanyOption[]) {
+  return [...options].sort((left, right) => {
+    const leftLiveRank = Number(left.bridgeConnected) + Number(left.tallyReachable) + Number(left.companyLoaded);
+    const rightLiveRank = Number(right.bridgeConnected) + Number(right.tallyReachable) + Number(right.companyLoaded);
+    if (leftLiveRank !== rightLiveRank) return rightLiveRank - leftLiveRank;
+
+    return new Date(right.lastHeartbeatAt ?? right.lastSyncAt ?? 0).getTime() -
+      new Date(left.lastHeartbeatAt ?? left.lastSyncAt ?? 0).getTime();
+  });
+}
+
 function formatCompanyOptionLabel(company: CompanyOption) {
   return [company.companyName, company.financialYear].filter(Boolean).join(" - ");
+}
+
+function readStoredCompanySelection(): CompanyOption | null {
+  if (typeof window === "undefined") return null;
+
+  try {
+    const raw = window.localStorage.getItem(BANK_STATEMENT_COMPANY_SELECTION_KEY);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<CompanyOption>;
+    const id = typeof value.id === "string" ? value.id.trim() : "";
+    const connectionId = typeof value.connectionId === "string" ? value.connectionId.trim() : "";
+    const companyName = typeof value.companyName === "string" ? value.companyName.trim() : "";
+    const financialYear = typeof value.financialYear === "string" ? value.financialYear.trim() : "Current year";
+
+    if (!id || !connectionId || !companyName) return null;
+
+    return {
+      id,
+      connectionId,
+      companyName,
+      financialYear,
+      status: typeof value.status === "string" ? value.status : "restoring",
+      bridgeConnected: false,
+      tallyReachable: false,
+      companyLoaded: false,
+      bankAccountCount: null,
+      lastSyncAt: null,
+      lastHeartbeatAt: null,
+      lastError: null,
+      bankLedgers: [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredCompanySelection(company: CompanyOption | null) {
+  if (typeof window === "undefined") return;
+
+  if (!company) {
+    window.localStorage.removeItem(BANK_STATEMENT_COMPANY_SELECTION_KEY);
+    return;
+  }
+
+  window.localStorage.setItem(
+    BANK_STATEMENT_COMPANY_SELECTION_KEY,
+    JSON.stringify({
+      id: company.id,
+      connectionId: company.connectionId,
+      companyName: company.companyName,
+      financialYear: company.financialYear,
+      status: company.status,
+    })
+  );
+}
+
+function findStoredCompanySelection(options: CompanyOption[]) {
+  const stored = readStoredCompanySelection();
+  if (!stored) return null;
+  return options.find((company) => company.id === stored.id) ?? null;
 }
 
 type TallyConnection = {
@@ -243,6 +316,19 @@ type PreviewResponse = {
     stage: string | null;
     error: string | null;
   } | null;
+};
+
+type DocumentPreviewKind = "csv" | "text" | "pdf" | "image" | "unsupported";
+
+type DocumentPreviewState = {
+  fileName: string;
+  kind: DocumentPreviewKind;
+  headers: string[];
+  rows: string[][];
+  totalRows: number;
+  textLines: string[];
+  objectUrl: string | null;
+  error: string | null;
 };
 
 type TallyMaster = {
@@ -2030,6 +2116,178 @@ function wait(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function isCsvFile(file: File) {
+  const name = file.name.toLowerCase();
+  return file.type === "text/csv" || name.endsWith(".csv");
+}
+
+function isTextFile(file: File) {
+  const name = file.name.toLowerCase();
+  return file.type.startsWith("text/") || name.endsWith(".txt");
+}
+
+function isPdfFile(file: File) {
+  return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+}
+
+function isImageFile(file: File) {
+  return file.type.startsWith("image/");
+}
+
+function parseCsvRows(text: string) {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let inQuotes = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const nextChar = text[index + 1];
+
+    if (char === "\"") {
+      if (inQuotes && nextChar === "\"") {
+        cell += "\"";
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === "," && !inQuotes) {
+      row.push(cell.trim());
+      cell = "";
+      continue;
+    }
+
+    if ((char === "\n" || char === "\r") && !inQuotes) {
+      row.push(cell.trim());
+      rows.push(row);
+      row = [];
+      cell = "";
+      if (char === "\r" && nextChar === "\n") {
+        index += 1;
+      }
+      continue;
+    }
+
+    cell += char;
+  }
+
+  if (inQuotes) {
+    throw new Error("The CSV has an unclosed quoted value.");
+  }
+
+  row.push(cell.trim());
+  rows.push(row);
+
+  return rows.filter((cells) => cells.some((value) => value.length > 0));
+}
+
+async function buildDocumentPreview(file: File): Promise<DocumentPreviewState> {
+  const basePreview = {
+    fileName: file.name,
+    headers: [],
+    rows: [],
+    totalRows: 0,
+    textLines: [],
+    objectUrl: null,
+  };
+
+  if (!isCsvFile(file)) {
+    if (isTextFile(file)) {
+      const text = await file.text();
+      const textLines = text
+        .split(/\r?\n/)
+        .map((line) => line.trimEnd())
+        .filter((line) => line.trim().length > 0);
+
+      return {
+        ...basePreview,
+        kind: "text",
+        textLines: textLines.slice(0, 20),
+        totalRows: textLines.length,
+        error: text.trim()
+          ? null
+          : "This text file is empty. Choose a bank statement file with readable content.",
+      };
+    }
+
+    if (isPdfFile(file)) {
+      return {
+        ...basePreview,
+        kind: "pdf",
+        objectUrl: URL.createObjectURL(file),
+        totalRows: 1,
+        error: file.size > 0 ? null : "This PDF is empty. Choose a valid bank statement PDF.",
+      };
+    }
+
+    if (isImageFile(file)) {
+      return {
+        ...basePreview,
+        kind: "image",
+        objectUrl: URL.createObjectURL(file),
+        totalRows: 1,
+        error: file.size > 0 ? null : "This image is empty. Choose a valid scanned bank statement image.",
+      };
+    }
+
+    return {
+      ...basePreview,
+      kind: "unsupported",
+      error: "This file type is not supported. Choose CSV, TXT, PDF, or a scanned statement image.",
+    };
+  }
+
+  const text = await file.text();
+  if (!text.trim()) {
+    return {
+      ...basePreview,
+      kind: "csv",
+      error: "This CSV is empty. Choose a bank statement CSV with headers and transaction rows.",
+    };
+  }
+
+  try {
+    const parsedRows = parseCsvRows(text);
+    const [headerRow, ...dataRows] = parsedRows;
+    const headers = (headerRow ?? []).map((header, index) => header || `Column ${index + 1}`);
+    const meaningfulRows = dataRows.filter((row) => row.some((value) => value.trim().length > 0));
+
+    if (headers.length < 2 || !headers.some((header) => header.trim().length > 0)) {
+      return {
+        ...basePreview,
+        kind: "csv",
+        error: "This CSV does not appear to have readable headers.",
+      };
+    }
+
+    if (meaningfulRows.length === 0) {
+      return {
+        ...basePreview,
+        kind: "csv",
+        error: "This CSV has headers but no transaction rows to preview.",
+      };
+    }
+
+    return {
+      ...basePreview,
+      kind: "csv",
+      headers: headers.slice(0, 8),
+      rows: meaningfulRows.slice(0, 6).map((row) => headers.slice(0, 8).map((_, index) => row[index] ?? "")),
+      totalRows: meaningfulRows.length,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ...basePreview,
+      kind: "csv",
+      error: error instanceof Error ? error.message : "This CSV could not be parsed.",
+    };
+  }
+}
+
 function getAnalysisCompleteMessage(payload: PreviewResponse) {
   const extractionIssue = payload.extractionError
     ? payload.extractionError
@@ -2124,18 +2382,23 @@ function normalizeFetchedBankLedgersByCompany(
 
 export function BankStatementsPage() {
   const router = useRouter();
+  const storedCompanySelection = useMemo(() => readStoredCompanySelection(), []);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [file, setFile] = useState<File | null>(null);
+  const [documentPreview, setDocumentPreview] = useState<DocumentPreviewState | null>(null);
+  const [documentPreviewLoading, setDocumentPreviewLoading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [account, setAccount] = useState<DraftAccount>(EMPTY_ACCOUNT);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [, setRecentImports] = useState<BankStatementImport[]>([]);
   const [accounts, setAccounts] = useState<BankAccount[]>([]);
-  const [companies, setCompanies] = useState<CompanyOption[]>([]);
+  const [companies, setCompanies] = useState<CompanyOption[]>(() =>
+    storedCompanySelection ? [storedCompanySelection] : []
+  );
   const [connections, setConnections] = useState<TallyConnection[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState<string>("");
-  const [tallyConnectionId, setTallyConnectionId] = useState("");
-  const [selectedCompanyId, setSelectedCompanyId] = useState("");
+  const [tallyConnectionId, setTallyConnectionId] = useState(storedCompanySelection?.connectionId ?? "");
+  const [selectedCompanyId, setSelectedCompanyId] = useState(storedCompanySelection?.id ?? "");
   const [bankLedgerName, setBankLedgerName] = useState("");
   const [bankLedgerVerified, setBankLedgerVerified] = useState(false);
   const [bankLedgerManuallyConfirmed, setBankLedgerManuallyConfirmed] = useState(false);
@@ -2179,6 +2442,15 @@ export function BankStatementsPage() {
     () => transactions.filter(transactionIsValid),
     [transactions]
   );
+
+  useEffect(() => {
+    const objectUrl = documentPreview?.objectUrl;
+    return () => {
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [documentPreview?.objectUrl]);
   const outgoingPaymentTransactions = useMemo(
     () => validTransactions.filter(isOutgoingPaymentRow),
     [validTransactions]
@@ -2192,15 +2464,22 @@ export function BankStatementsPage() {
     [connections, tallyConnectionId]
   );
   const selectedCompany = useMemo(
-    () =>
-      companies.find((company) => company.id === selectedCompanyId) ??
-      companies.find((company) => company.connectionId === tallyConnectionId) ??
-      null,
-    [companies, selectedCompanyId, tallyConnectionId]
+    () => companies.find((company) => company.id === selectedCompanyId) ?? null,
+    [companies, selectedCompanyId]
   );
+  useEffect(() => {
+    if (selectedCompany) {
+      writeStoredCompanySelection(selectedCompany);
+    } else if (!selectedCompanyId) {
+      writeStoredCompanySelection(null);
+    }
+  }, [selectedCompany, selectedCompanyId]);
   const companyOptions = useMemo(() => {
-    if (companies.length > 0) return uniqueCompanyOptions(companies);
-    return uniqueCompanyOptions(visibleConnections.map((connection) => ({
+    if (companies.length > 0) {
+      return uniqueCompanyOptions(sortCompanyOptions(companies));
+    }
+
+    return uniqueCompanyOptions(sortCompanyOptions(visibleConnections.map((connection) => ({
       id: connection.id,
       connectionId: connection.id,
       companyName: connection.lastCompanyName || connection.displayName,
@@ -2213,7 +2492,7 @@ export function BankStatementsPage() {
       lastSyncAt: null,
       lastHeartbeatAt: connection.updatedAt ?? null,
       lastError: null,
-    })));
+    }))));
   }, [companies, visibleConnections]);
   const commandConnection = useMemo<TallyConnection | null>(() => {
     if (!selectedCompany) return null;
@@ -2239,7 +2518,7 @@ export function BankStatementsPage() {
     };
   }, [selectedCompany, selectedConnection]);
   const selectedCompanyName =
-    selectedCompany?.companyName || selectedConnection?.lastCompanyName || "";
+    selectedCompany?.companyName || "";
   const selectedFinancialYear = selectedCompany?.financialYear || "Current year";
   const tallyConnected =
     selectedCompany
@@ -2322,6 +2601,61 @@ export function BankStatementsPage() {
         : !tallyCompanyContextVerified
           ? `Tally is open to ${activeTallyCompanyName}. Switch Tally Prime to ${selectedCompanyName}, then refresh.`
           : "";
+  const syncModeStatus = useMemo(() => {
+    const stateLabel = syncBeforeAnalysis ? "Sync before analysis: On" : "Sync before analysis: Off";
+    const readyText = syncBeforeAnalysis
+      ? "The current Tally company will be synced before analysis starts."
+      : "Analysis will use the existing selected-company data without a pre-analysis sync.";
+
+    if (!tallyConnectionId || !selectedCompanyName) {
+      return {
+        tone: "warning" as const,
+        title: stateLabel,
+        text: syncBeforeAnalysis
+          ? "Sync cannot run until you select a Tally company."
+          : "Select a Tally company before upload; no pre-analysis sync will run while this is off.",
+      };
+    }
+
+    if (!tallyConnected) {
+      return {
+        tone: "warning" as const,
+        title: stateLabel,
+        text: syncBeforeAnalysis
+          ? "Sync cannot run because the connector or Tally is not reachable. Open Tally Prime, load the company, then refresh."
+          : "Tally is not reachable. Open Tally Prime, load the company, then refresh before upload.",
+      };
+    }
+
+    if (!activeTallyCompanyName) {
+      return {
+        tone: "warning" as const,
+        title: stateLabel,
+        text: "Refresh Kalika to confirm the company currently open in Tally before upload.",
+      };
+    }
+
+    if (!tallyCompanyContextVerified) {
+      return {
+        tone: "warning" as const,
+        title: stateLabel,
+        text: `Tally is open to ${activeTallyCompanyName}. Switch Tally Prime to ${selectedCompanyName}, then refresh before analysis.`,
+      };
+    }
+
+    return {
+      tone: syncBeforeAnalysis ? ("success" as const) : ("info" as const),
+      title: stateLabel,
+      text: readyText,
+    };
+  }, [
+    activeTallyCompanyName,
+    selectedCompanyName,
+    syncBeforeAnalysis,
+    tallyCompanyContextVerified,
+    tallyConnected,
+    tallyConnectionId,
+  ]);
   const missingLedgerCount = useMemo(
     () => validTransactions.filter((transaction) => !transaction.selectedLedgerName.trim()).length,
     [validTransactions]
@@ -2474,17 +2808,16 @@ export function BankStatementsPage() {
     const payload = (await response.json()) as { companies?: CompanyOption[]; selectedCompanyId?: string | null };
     const nextCompanies = uniqueCompanyOptions(payload.companies ?? []);
     setCompanies(nextCompanies);
+    const storedCompany = findStoredCompanySelection(nextCompanies);
     setSelectedCompanyId((current) => {
       if (current && nextCompanies.some((company) => company.id === current)) {
         return current;
       }
-      return payload.selectedCompanyId || nextCompanies[0]?.id || current;
+      return storedCompany?.id ?? "";
     });
     setTallyConnectionId((current) => {
       const selectedOption =
-        nextCompanies.find((company) => company.id === selectedCompanyId) ??
-        nextCompanies.find((company) => company.id === payload.selectedCompanyId) ??
-        nextCompanies[0];
+        nextCompanies.find((company) => company.id === selectedCompanyId) ?? storedCompany ?? null;
       if (selectedOption) return selectedOption.connectionId;
       if (current && nextCompanies.some((company) => company.connectionId === current)) return current;
       return current;
@@ -2646,6 +2979,8 @@ export function BankStatementsPage() {
     setPreview(null);
     setTransactions([]);
     setFile(null);
+    setDocumentPreview(null);
+    setDocumentPreviewLoading(false);
     setAccount(EMPTY_ACCOUNT);
     setBankLedgerName("");
     setBankLedgerVerified(false);
@@ -2784,10 +3119,12 @@ export function BankStatementsPage() {
         setAccounts(payload.accounts ?? []);
       }
       const preferredConnection = getRelevantTallyConnections(loadedConnections)[0];
-      const preferredCompany = loadedCompanies.find((company) => company.id === selectedCompanyId) ?? loadedCompanies[0];
+      const restoredCompany = findStoredCompanySelection(loadedCompanies);
+      const preferredCompany = loadedCompanies.find((company) => company.id === selectedCompanyId) ?? restoredCompany;
       const nextConnectionId = tallyConnectionId || preferredCompany?.connectionId || preferredConnection?.id || "";
-      const nextCompanyId = selectedCompanyId || preferredCompany?.id || "";
-      setSelectedCompanyId(nextCompanyId);
+      setSelectedCompanyId((current) =>
+        current && loadedCompanies.some((company) => company.id === current) ? current : restoredCompany?.id ?? ""
+      );
       setTallyConnectionId(nextConnectionId);
     }
 
@@ -2850,11 +3187,10 @@ export function BankStatementsPage() {
     const currentCompanyExists = !selectedCompanyId || companies.some((company) => company.id === selectedCompanyId);
 
     if (!currentExists) {
-      const fallbackCompany = companies[0] ?? null;
-      setSelectedCompanyId(fallbackCompany?.id || "");
-      setTallyConnectionId(fallbackCompany?.connectionId || visibleConnections[0]?.id || "");
+      setSelectedCompanyId("");
+      setTallyConnectionId(visibleConnections[0]?.id || "");
     } else if (!currentCompanyExists) {
-      setSelectedCompanyId(companies.find((company) => company.connectionId === tallyConnectionId)?.id || companies[0]?.id || "");
+      setSelectedCompanyId("");
     }
   }, [companies, selectedCompanyId, tallyConnectionId, visibleConnections]);
 
@@ -3000,11 +3336,13 @@ export function BankStatementsPage() {
         loadCompanyOptions(),
       ]);
       const preferredConnection = getRelevantTallyConnections(loadedConnections)[0];
-      const preferredCompany = loadedCompanies.find((company) => company.id === selectedCompanyId) ?? loadedCompanies[0];
+      const restoredCompany = findStoredCompanySelection(loadedCompanies);
+      const preferredCompany = loadedCompanies.find((company) => company.id === selectedCompanyId) ?? restoredCompany;
       const nextConnectionId = preferredCompany?.connectionId || preferredConnection?.id || "";
-      const nextCompanyId = preferredCompany?.id || "";
       if (nextConnectionId) {
-        setSelectedCompanyId(nextCompanyId);
+        setSelectedCompanyId((current) =>
+          current && loadedCompanies.some((company) => company.id === current) ? current : restoredCompany?.id ?? ""
+        );
         setTallyConnectionId(nextConnectionId);
         const companyNames = loadedCompanies.map((company) => company.companyName).filter(Boolean);
         bankLedgerLoadKeyRef.current = "";
@@ -3020,6 +3358,19 @@ export function BankStatementsPage() {
   }
 
   function updateStatementContext(nextCompanyId: string) {
+    if (!nextCompanyId) {
+      if (!selectedCompanyId) return;
+      setSelectedCompanyId("");
+      setTallyConnectionId(visibleConnections[0]?.id || "");
+      setBankLedgerName("");
+      setBankLedgerChangeMode(false);
+      setPendingBankLedgerName("");
+      setSelectedAccountId("");
+      setAccount(EMPTY_ACCOUNT);
+      setLedgerMasters([]);
+      clearStatementReview();
+      return;
+    }
     const nextCompany = companyOptions.find((company) => company.id === nextCompanyId) ?? null;
     const nextConnectionId = nextCompany?.connectionId || nextCompanyId;
     if (nextCompanyId === selectedCompanyId && nextConnectionId === tallyConnectionId) return;
@@ -3152,6 +3503,19 @@ export function BankStatementsPage() {
     throw new Error("Bank statement analysis is still running. Please refresh in a moment.");
   }
 
+  async function handleSelectedStatementFile(nextFile: File) {
+    setDocumentPreviewLoading(true);
+    setBanner(null);
+    setStatementDoneSummary(null);
+    setTallyPostingStatus(null);
+    setFile(nextFile);
+    try {
+      setDocumentPreview(await buildDocumentPreview(nextFile));
+    } finally {
+      setDocumentPreviewLoading(false);
+    }
+  }
+
   async function analyzeFile(nextFile = file) {
     if (!nextFile) {
       setBanner({ tone: "error", text: "Select a bank statement file." });
@@ -3163,6 +3527,10 @@ export function BankStatementsPage() {
     }
     if (!tallyConnected) {
       setBanner({ tone: "error", text: "Tally company is not ready. Open Tally Prime and refresh the connection." });
+      return;
+    }
+    if (!tallyCompanyContextVerified) {
+      setBanner({ tone: "error", text: setupErrorMessage || "Refresh Kalika to verify the Tally company before upload." });
       return;
     }
     try {
@@ -3968,7 +4336,7 @@ export function BankStatementsPage() {
           </div>
         ))}
       </div>
-      <div className={`min-h-screen bg-[#f7f7f5] px-4 py-6 text-[#1a1a1a] sm:px-8 sm:py-8 ${preview ? "pb-40" : ""}`}>
+      <div className={`bank-statements-workflow min-h-screen bg-[#f7f7f5] px-4 py-6 text-[#1a1a1a] sm:px-8 sm:py-8 ${preview ? "pb-40" : ""}`}>
         <div className="mx-auto flex max-w-7xl flex-col gap-6">
           <header className={`flex flex-col gap-3 md:flex-row md:items-start md:justify-between border-b border-[#e5ddd0] ${preview ? "pb-3" : "pb-6"}`}>
             <div>
@@ -4007,7 +4375,9 @@ export function BankStatementsPage() {
                 )}
                 <div className="min-w-0">
                   <div className="text-xs font-bold text-[#1a1a1a]">
-                    {!tallyConnected
+                    {!selectedCompanyName
+                      ? "Select Tally company"
+                      : !tallyConnected
                       ? "Tally unavailable"
                       : checkingLiveTallyCompany
                         ? "Checking Tally company"
@@ -4111,9 +4481,11 @@ export function BankStatementsPage() {
                     <select
                       className="mt-1.5 h-11 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
                       onChange={(event) => updateStatementContext(event.target.value)}
-                      value={selectedCompany?.id || selectedCompanyId}
+                      value={selectedCompanyId}
                     >
-                      {companyOptions.length === 0 ? <option value="">No connected Tally company</option> : null}
+                      <option value="" disabled>
+                        {companyOptions.length === 0 ? "No connected Tally company" : "Select Tally company"}
+                      </option>
                       {companyOptions.map((company) => (
                         <option key={company.id} value={company.id}>
                           {formatCompanyOptionLabel(company)}
@@ -4122,27 +4494,64 @@ export function BankStatementsPage() {
                     </select>
                   </label>
 
-                      <label className="flex items-center justify-between gap-3 rounded-xl border border-[#e5ddd0] bg-[#faf8f4]/60 px-4 py-3">
-                    <span className="min-w-0">
-                      <span className="block text-xs font-bold text-[#1a1a1a]">Sync current Tally company before analysis</span>
+                  <label
+                    className={`block rounded-xl border px-4 py-3.5 transition ${
+                      syncBeforeAnalysis
+                        ? "border-amber-250 bg-[#fffaf2]"
+                        : "border-[#e5ddd0] bg-[#faf8f4]/55"
+                    }`}
+                    aria-describedby="bank-statement-sync-mode-status"
+                  >
+                    <span className="flex items-start justify-between gap-4">
+                      <span className="min-w-0">
+                        <span className="flex flex-wrap items-center gap-2">
+                          <span className="text-xs font-extrabold text-[#1a1a1a]">
+                            Sync current Tally company before analysis
+                          </span>
+                          <span
+                            className={`rounded-full px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide ${
+                              syncBeforeAnalysis
+                                ? "bg-amber-100 text-amber-800"
+                                : "bg-slate-100 text-slate-600"
+                            }`}
+                          >
+                            {syncBeforeAnalysis ? "On" : "Off"}
+                          </span>
+                        </span>
+                        <span
+                          id="bank-statement-sync-mode-status"
+                          className="mt-1.5 block text-xs font-semibold leading-5 text-[#6f6256]"
+                        >
+                          {syncModeStatus.tone === "warning"
+                            ? syncBeforeAnalysis
+                              ? "Sync will run after the selected Tally company is verified."
+                              : "Pre-analysis sync is off; verify the selected company before upload."
+                            : syncModeStatus.text}
+                        </span>
+                      </span>
+                      <input
+                        checked={syncBeforeAnalysis}
+                        className="mt-0.5 h-5 w-5 shrink-0 rounded border-[#e5ddd0] accent-amber-600 focus:ring-amber-500"
+                        onChange={(event) => setSyncBeforeAnalysis(event.target.checked)}
+                        type="checkbox"
+                      />
                     </span>
-                    <input
-                      checked={syncBeforeAnalysis}
-                      className="h-5 w-5 shrink-0 rounded border-[#e5ddd0] accent-amber-600 focus:ring-amber-500"
-                      onChange={(event) => setSyncBeforeAnalysis(event.target.checked)}
-                      type="checkbox"
-                    />
                   </label>
 
-                  {setupErrorMessage ? (
-                    <div className="rounded-xl border border-amber-250 bg-amber-50 px-3.5 py-2.5 text-xs font-bold text-amber-800">
-                      {setupErrorMessage}
+                  {syncModeStatus.tone === "warning" ? (
+                    <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs font-semibold text-amber-900">
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                      <span>
+                        <span className="block font-extrabold">{syncModeStatus.title}</span>
+                        <span className="mt-0.5 block leading-5">{syncModeStatus.text}</span>
+                      </span>
                     </div>
-                  ) : (
-                    <div className="rounded-xl border border-emerald-250 bg-emerald-50 px-3.5 py-2.5 text-xs font-bold text-emerald-800">
+                  ) : !documentPreview && !documentPreviewLoading ? (
+                    <div className="flex items-center gap-2 px-1 text-xs font-bold text-emerald-800">
+                      <CheckCircle2 className="h-4 w-4 shrink-0" />
                       Ready to upload.
                     </div>
-                  )}
+                  ) : null}
                 </div>
               </div>
 
@@ -4157,67 +4566,191 @@ export function BankStatementsPage() {
                   }}
                   onChange={(event) => {
                     const nextFile = event.target.files?.[0] ?? null;
-                    if (nextFile) void analyzeFile(nextFile);
+                    if (nextFile) void handleSelectedStatementFile(nextFile);
                   }}
                 />
-                <button
-                  type="button"
-                  aria-disabled={!uploadContextReady || loading}
-                  onClick={() => {
-                    if (!uploadContextReady) {
-                      setBanner({ tone: "error", text: setupErrorMessage || "Complete setup before upload." });
-                      return;
-                    }
-                    fileInputRef.current?.click();
-                  }}
-                  onDragEnter={(event) => {
-                    event.preventDefault();
-                    if (uploadContextReady) setDragActive(true);
-                  }}
-                  onDragOver={(event) => {
-                    event.preventDefault();
-                    if (uploadContextReady) setDragActive(true);
-                  }}
-                  onDragLeave={(event) => {
-                    event.preventDefault();
-                    setDragActive(false);
-                  }}
-                  onDrop={(event) => {
-                    event.preventDefault();
-                    setDragActive(false);
-                    const nextFile = event.dataTransfer.files?.[0] ?? null;
-                    if (!nextFile) return;
-                    if (!uploadContextReady) {
-                      setBanner({ tone: "error", text: setupErrorMessage || "Complete setup before upload." });
-                      return;
-                    }
-                    void analyzeFile(nextFile);
-                  }}
-                  className={`flex min-h-[420px] w-full flex-col items-center justify-center rounded-2xl border-2 border-dashed px-6 py-10 text-center transition-all duration-300 ${
-                    dragActive
-                      ? "border-amber-500 bg-amber-50/40"
-                      : uploadContextReady
-                        ? "border-amber-200 bg-amber-50/10 hover:border-amber-400 hover:bg-amber-50/30"
-                        : "border-[#e5ddd0] bg-white opacity-70 cursor-not-allowed"
-                  }`}
-                >
-                  <div className={`mb-5 flex h-14 w-14 items-center justify-center rounded-xl transition-colors ${
-                    uploadContextReady ? "bg-[#2d2d2d] text-white" : "bg-slate-100 text-slate-400"
-                  } shadow-sm`}>
-                    {loading ? <Loader2 className="h-6 w-6 animate-spin" /> : <UploadCloud className="h-6 w-6" />}
-                  </div>
-                  <div className="text-lg font-extrabold text-[#1a1a1a]">
-                    {loading ? "Analyzing..." : uploadContextReady ? "Upload statement" : "Connect Tally company"}
-                  </div>
-                  <div className="text-xs font-semibold text-slate-400 mt-1">
-                    Supports CSV, TXT, PDF or scanned statement images
-                  </div>
-                  {file ? (
-                    <div className="mt-5 rounded-full border border-amber-200 bg-amber-50 px-4 py-1.5 text-xs font-bold text-amber-800 shadow-sm animate-pulse">
-                      {file.name}
+                {!documentPreview && !documentPreviewLoading ? (
+                  <button
+                    type="button"
+                    aria-disabled={!uploadContextReady || loading}
+                    onClick={() => {
+                      if (!uploadContextReady) {
+                        setBanner({ tone: "error", text: setupErrorMessage || "Complete setup before upload." });
+                        return;
+                      }
+                      fileInputRef.current?.click();
+                    }}
+                    onDragEnter={(event) => {
+                      event.preventDefault();
+                      if (uploadContextReady) setDragActive(true);
+                    }}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      if (uploadContextReady) setDragActive(true);
+                    }}
+                    onDragLeave={(event) => {
+                      event.preventDefault();
+                      setDragActive(false);
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      setDragActive(false);
+                      const nextFile = event.dataTransfer.files?.[0] ?? null;
+                      if (!nextFile) return;
+                      if (!uploadContextReady) {
+                        setBanner({ tone: "error", text: setupErrorMessage || "Complete setup before upload." });
+                        return;
+                      }
+                      void handleSelectedStatementFile(nextFile);
+                    }}
+                    className={`flex min-h-[420px] w-full flex-col items-center justify-center rounded-2xl border-2 border-dashed px-6 py-10 text-center transition-all duration-300 ${
+                      dragActive
+                        ? "border-amber-500 bg-amber-50/40"
+                        : uploadContextReady
+                          ? "border-amber-200 bg-amber-50/10 hover:border-amber-400 hover:bg-amber-50/30"
+                          : "border-[#e5ddd0] bg-white opacity-70 cursor-not-allowed"
+                    }`}
+                  >
+                    <div className={`mb-5 flex h-14 w-14 items-center justify-center rounded-xl transition-colors ${
+                      uploadContextReady ? "bg-[#2d2d2d] text-white" : "bg-slate-100 text-slate-400"
+                    } shadow-sm`}>
+                      {loading ? <Loader2 className="h-6 w-6 animate-spin" /> : <UploadCloud className="h-6 w-6" />}
                     </div>
-                  ) : null}
-                </button>
+                    <div className="text-lg font-extrabold text-[#1a1a1a]">
+                      {loading ? "Analyzing..." : uploadContextReady ? "Upload statement" : "Connect Tally company"}
+                    </div>
+                    <div className="mt-1 text-xs font-semibold text-slate-400">
+                      Supports CSV, TXT, PDF or scanned statement images
+                    </div>
+                  </button>
+                ) : null}
+                {documentPreviewLoading ? (
+                  <div className="flex min-h-[420px] w-full flex-col items-center justify-center rounded-2xl border border-[#e5ddd0] bg-[#fffdf9] px-6 py-10 text-center">
+                    <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-xl bg-[#2d2d2d] text-white shadow-sm">
+                      <Loader2 className="h-6 w-6 animate-spin" />
+                    </div>
+                    <div className="text-lg font-extrabold text-[#1a1a1a]">Reading file...</div>
+                    <div className="mt-1 text-xs font-semibold text-slate-400">Preparing preview before analysis</div>
+                  </div>
+                ) : null}
+                {documentPreview ? (
+                  <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-[#fffdf9] shadow-[0_8px_24px_rgba(45,45,45,0.06)]">
+                    <div className="flex flex-col gap-4 border-b border-[#eee5d8] bg-[#fffaf2] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0">
+                        <div className="flex min-w-0 items-center gap-3">
+                          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#2d2d2d] text-white">
+                            <UploadCloud className="h-5 w-5" />
+                          </div>
+                          <div className="min-w-0">
+                            <div className="truncate text-sm font-extrabold text-[#1a1a1a]" title={documentPreview.fileName}>
+                              {documentPreview.fileName}
+                            </div>
+                            <div className="mt-0.5 text-xs font-semibold text-[#7a6c5f]">
+                              {documentPreview.error ? (
+                                "Preview needs attention"
+                              ) : documentPreview.kind === "csv" ? (
+                                `${documentPreview.totalRows} transaction row${documentPreview.totalRows === 1 ? "" : "s"} found. Showing ${documentPreview.rows.length}.`
+                              ) : documentPreview.kind === "text" ? (
+                                `${documentPreview.totalRows} readable line${documentPreview.totalRows === 1 ? "" : "s"} found. Showing ${documentPreview.textLines.length}.`
+                              ) : documentPreview.kind === "pdf" ? (
+                                "PDF selected. Review it below before analysis."
+                              ) : documentPreview.kind === "image" ? (
+                                "Image selected. Review it below before analysis."
+                              ) : (
+                                "Review the selected file before analysis."
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDocumentPreview(null);
+                            setFile(null);
+                            fileInputRef.current?.click();
+                          }}
+                          className="inline-flex h-8.5 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                        >
+                          Choose another
+                        </button>
+                        <button
+                          type="button"
+                          disabled={Boolean(documentPreview.error) || loading || !file}
+                          onClick={() => {
+                            if (file) void analyzeFile(file);
+                          }}
+                          className="inline-flex h-8.5 items-center justify-center rounded-xl bg-[#2d2d2d] px-3.5 text-xs font-bold text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Analyze file
+                        </button>
+                      </div>
+                    </div>
+                    {documentPreview.error ? (
+                      <div className="flex items-start gap-2 px-5 py-4 text-xs font-semibold text-rose-800">
+                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                        <span>{documentPreview.error}</span>
+                      </div>
+                    ) : documentPreview.kind === "csv" ? (
+                      <div className="max-h-[360px] overflow-auto bg-white">
+                        <table className="min-w-full border-collapse text-left text-xs">
+                          <thead className="sticky top-0 bg-[#f7f2ea] text-[#5a5046]">
+                            <tr>
+                              {documentPreview.headers.map((header, index) => (
+                                <th
+                                  key={`${header}-${index}`}
+                                  className="max-w-[180px] border-b border-[#e5ddd0] px-3 py-2 font-extrabold"
+                                  title={header}
+                                >
+                                  <span className="block truncate">{header}</span>
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody className="bg-white text-[#2b241d]">
+                            {documentPreview.rows.map((row, rowIndex) => (
+                              <tr key={`csv-row-${rowIndex}`} className="border-b border-[#f0e8dc] last:border-b-0">
+                                {row.map((value, cellIndex) => (
+                                  <td
+                                    key={`csv-cell-${rowIndex}-${cellIndex}`}
+                                    className="max-w-[180px] px-3 py-2 font-semibold"
+                                    title={value}
+                                  >
+                                    <span className="block truncate">{value || "-"}</span>
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : documentPreview.kind === "text" ? (
+                      <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap bg-white px-5 py-4 text-xs font-semibold leading-5 text-[#2b241d]">
+                        {documentPreview.textLines.join("\n")}
+                      </pre>
+                    ) : documentPreview.kind === "pdf" && documentPreview.objectUrl ? (
+                      <iframe
+                        src={documentPreview.objectUrl}
+                        title={`Preview of ${documentPreview.fileName}`}
+                        className="h-[460px] w-full bg-white"
+                      />
+                    ) : documentPreview.kind === "image" && documentPreview.objectUrl ? (
+                      <div className="flex max-h-[460px] items-center justify-center overflow-auto bg-white p-5">
+                        {/* eslint-disable-next-line @next/next/no-img-element -- Local object URLs cannot be optimized by next/image. */}
+                        <img
+                          src={documentPreview.objectUrl}
+                          alt={`Preview of ${documentPreview.fileName}`}
+                          className="max-h-[420px] max-w-full rounded-xl object-contain"
+                        />
+                      </div>
+                    ) : (
+                      <div className="px-5 py-4 text-xs font-semibold text-[#7a6c5f]">
+                        No preview is available for this file.
+                      </div>
+                    )}
+                  </div>
+                ) : null}
               </section>
             </section>
           ) : (

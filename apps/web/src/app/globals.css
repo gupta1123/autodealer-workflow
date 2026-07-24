@@ -44,8 +44,8 @@
 }
 
 :root {
-  --font-app-sans: var(--font-poppins), "Poppins", Arial, Helvetica, sans-serif;
-  --font-app-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --font-app-sans: "Poppins", Arial, Helvetica, sans-serif;
+  --font-app-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   --radius: 0.625rem;
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
@@ -130,4 +130,33 @@
     letter-spacing: 0;
     text-rendering: optimizeLegibility;
   }
+}
+
+.bank-statements-workflow :where(
+  button:not(:disabled):not([aria-disabled="true"]),
+  [role="button"]:not([aria-disabled="true"]),
+  a[href],
+  select:not(:disabled),
+  input[type="checkbox"]:not(:disabled),
+  input[type="radio"]:not(:disabled),
+  input[type="file"]:not(:disabled),
+  label:has(input[type="checkbox"]:not(:disabled)),
+  label:has(input[type="radio"]:not(:disabled))
+) {
+  cursor: pointer;
+}
+
+.bank-statements-workflow :where(
+  button:disabled,
+  button[aria-disabled="true"],
+  [role="button"][aria-disabled="true"],
+  select:disabled,
+  input:disabled,
+  .cursor-not-allowed
+) {
+  cursor: not-allowed;
+}
+
+.bank-statements-workflow :where(.cursor-default) {
+  cursor: default;
 }

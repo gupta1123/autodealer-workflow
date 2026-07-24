@@ -7,6 +7,7 @@ import {
 } from "@/lib/local/tally-store";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
+  createBridgeToken,
   createPairingCode,
   createPairingExpiry,
   hashSecret,
@@ -43,18 +44,12 @@ function connectionSortTime(connection: ReturnType<typeof serializeTallyConnecti
 
 function pickRelevantConnections(rows: TallyConnectionRow[]) {
   const serialized = rows.map(serializeTallyConnectionStatus);
-  const liveConnections = serialized.filter(
-    (connection) =>
-      connection.bridgeConnected &&
-      (connection.status === "company_loaded" ||
-        connection.status === "tally_reachable" ||
-        connection.status === "bridge_connected")
-  );
-  const source = liveConnections.length > 0 ? liveConnections : serialized;
-
-  return [...source]
+  // A user can legitimately have connectors on multiple Tally machines.
+  // Returning only the latest live row made a newly paired browser silently
+  // jump back to another machine's connector during its next refresh.
+  return [...serialized]
     .sort((left, right) => connectionSortTime(right) - connectionSortTime(left))
-    .slice(0, 1);
+    .slice(0, 12);
 }
 
 async function logConnectionEvent(
@@ -157,12 +152,14 @@ export async function POST(request: Request) {
         {
           connection: serializeTallyConnection(local.connection),
           pairingCode: local.pairingCode,
+          controlToken: local.controlToken,
         },
         { status: 201 }
       );
     }
 
     const pairingCode = createPairingCode();
+    const controlToken = createBridgeToken();
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_connections")
@@ -219,6 +216,7 @@ export async function POST(request: Request) {
       {
         connection: serializeTallyConnection(row),
         pairingCode,
+        controlToken,
       },
       { status: 201 }
     );

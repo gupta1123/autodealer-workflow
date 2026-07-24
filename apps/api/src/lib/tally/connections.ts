@@ -32,6 +32,15 @@ export type TallyConnectionRow = {
 
 const PAIRING_CODE_TTL_MINUTES = 10;
 
+export function connectorSupportsReliableActiveCompany(value: string | null | undefined) {
+  const match = String(value ?? "").trim().match(/^(\d+)\.(\d+)\.(\d+)$/);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  return major > 0 || minor > 1 || (minor === 1 && patch >= 20);
+}
+
 export function hashSecret(value: string) {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -75,19 +84,36 @@ export function serializeTallyConnectionStatus(row: TallyConnectionRow) {
     ? new Date(row.last_heartbeat_at).getTime()
     : 0;
   const bridgeStale = !lastHeartbeatAt || Date.now() - lastHeartbeatAt > 45_000;
+  const companyDetectionReliable = connectorSupportsReliableActiveCompany(row.bridge_version);
+  const connectorUpdateRequired =
+    !bridgeStale && Boolean(row.paired_at) && !companyDetectionReliable;
   const effectiveStatus: TallyConnectionStatus =
     row.status === "waiting_for_bridge" || row.status === "not_connected"
       ? row.status
+      : connectorUpdateRequired
+        ? "connection_error"
       : bridgeStale
         ? "waiting_for_bridge"
         : row.status;
 
   return {
     ...serializeTallyConnection(row),
+    // Reachability and active-company state are observations from a specific
+    // connector/Tally session. Once its heartbeat is stale they are no longer
+    // facts about the currently running instance.
+    lastCompanyName:
+      bridgeStale || !companyDetectionReliable ? null : row.last_company_name,
+    lastError: connectorUpdateRequired
+      ? "Connector update required. Reconnect using the latest Kalika Tally Connector."
+      : row.last_error,
     status: effectiveStatus,
-    bridgeConnected: !bridgeStale && Boolean(row.paired_at),
-    tallyReachable: row.last_tally_reachable === true,
-    companyLoaded: row.last_company_loaded === true,
+    bridgeConnected:
+      !bridgeStale && companyDetectionReliable && Boolean(row.paired_at),
+    tallyReachable:
+      !bridgeStale && companyDetectionReliable && row.last_tally_reachable === true,
+    companyLoaded:
+      !bridgeStale && companyDetectionReliable && row.last_company_loaded === true,
     heartbeatStale: Boolean(row.paired_at) && bridgeStale,
+    connectorUpdateRequired,
   };
 }

@@ -1,14 +1,22 @@
 import type { Metadata } from "next";
-import { Poppins } from "next/font/google";
 
+import "@fontsource/poppins/latin-400.css";
+import "@fontsource/poppins/devanagari-400.css";
+import "@fontsource/poppins/latin-500.css";
+import "@fontsource/poppins/devanagari-500.css";
+import "@fontsource/poppins/latin-600.css";
+import "@fontsource/poppins/devanagari-600.css";
+import "@fontsource/poppins/latin-700.css";
+import "@fontsource/poppins/devanagari-700.css";
+import "@fontsource/poppins/latin-800.css";
+import "@fontsource/poppins/devanagari-800.css";
+import "@fontsource/poppins/latin-900.css";
+import "@fontsource/poppins/devanagari-900.css";
+import "@fontsource/jetbrains-mono/latin-400.css";
+import "@fontsource/jetbrains-mono/latin-500.css";
+import "@fontsource/jetbrains-mono/latin-600.css";
+import "@fontsource/jetbrains-mono/latin-700.css";
 import "./globals.css";
-
-const poppins = Poppins({
-  subsets: ["latin", "devanagari"],
-  weight: ["400", "500", "600", "700", "800", "900"],
-  variable: "--font-poppins",
-  display: "swap",
-});
 
 export const metadata: Metadata = {
   title: "Procurement Packet Comparator",
@@ -22,9 +30,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={`${poppins.variable} ${poppins.className} antialiased`}>
-        {children}
-      </body>
+      <body className="antialiased">{children}</body>
     </html>
   );
 }

@@ -87,6 +87,7 @@ export async function createLocalTallyConnection(input: {
   const state = await readState();
   const createdAt = nowIso();
   const pairingCode = createPairingCode();
+  const controlToken = createBridgeToken();
   const row: LocalConnectionRow = {
     id: randomUUID(),
     owner_user_id: input.ownerUserId ?? LOCAL_USER_ID,
@@ -112,7 +113,7 @@ export async function createLocalTallyConnection(input: {
 
   state.connections.unshift(row);
   await writeState(state);
-  return { connection: publicConnection(row), pairingCode };
+  return { connection: publicConnection(row), pairingCode, controlToken };
 }
 
 export async function getLocalTallyConnection(connectionId: string, ownerUserId = LOCAL_USER_ID) {
@@ -129,6 +130,7 @@ export async function pairLocalTallyConnection(input: {
   bridgeName: string;
   bridgeVersion: string;
   bridgeMachineId: string;
+  controlToken: string;
 }) {
   const state = await readState();
   const row = state.connections.find((connection) => connection.id === input.connectionId);
@@ -152,7 +154,7 @@ export async function pairLocalTallyConnection(input: {
   const bridgeToken = createBridgeToken();
   const now = nowIso();
   row.status = "bridge_connected";
-  row.pairing_code_hash = null;
+  row.pairing_code_hash = hashSecret(input.controlToken);
   row.pairing_code_expires_at = null;
   row.paired_at = now;
   row.bridge_token_hash = hashSecret(bridgeToken);
@@ -182,6 +184,7 @@ export async function updateLocalTallyHeartbeat(input: {
   status: TallyConnectionStatus;
   tallyUrl?: string | null;
   bridgeVersion?: string | null;
+  bridgeMachineId: string;
   tallyReachable: boolean;
   companyLoaded: boolean;
   companyName?: string | null;
@@ -190,6 +193,12 @@ export async function updateLocalTallyHeartbeat(input: {
   const state = await readState();
   const row = state.connections.find((connection) => connection.id === input.connectionId);
   if (!row?.bridge_token_hash || hashSecret(input.token) !== row.bridge_token_hash) {
+    return null;
+  }
+  if (
+    !row.bridge_machine_id ||
+    row.bridge_machine_id !== input.bridgeMachineId
+  ) {
     return null;
   }
 
@@ -208,12 +217,19 @@ export async function updateLocalTallyHeartbeat(input: {
   return publicConnection(row);
 }
 
-export async function disconnectLocalTallyConnection(connectionId: string, ownerUserId = LOCAL_USER_ID) {
+export async function disconnectLocalTallyConnection(
+  connectionId: string,
+  ownerUserId = LOCAL_USER_ID,
+  controlToken = ""
+) {
   const state = await readState();
   const row = state.connections.find(
     (connection) => connection.id === connectionId && connection.owner_user_id === ownerUserId
   );
   if (!row) return null;
+  if (!row.pairing_code_hash || hashSecret(controlToken) !== row.pairing_code_hash) {
+    return null;
+  }
 
   row.status = "waiting_for_bridge";
   row.pairing_code_hash = null;

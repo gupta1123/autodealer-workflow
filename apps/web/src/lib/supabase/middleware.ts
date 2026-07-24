@@ -61,12 +61,26 @@ export async function updateSession(request: NextRequest) {
     }
   );
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser().catch((error) => {
-    console.error("Supabase auth session check failed:", error);
-    return { data: { user: null } };
-  });
+  let user;
+
+  try {
+    const result = await supabase.auth.getUser();
+    user = result.data.user;
+  } catch (error) {
+    console.error("Supabase auth service could not be reached:", error);
+
+    return new NextResponse(
+      "The authentication service is temporarily unreachable. Please refresh in a moment.",
+      {
+        status: 503,
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "no-store",
+          "Retry-After": "5",
+        },
+      }
+    );
+  }
 
   if (!user) {
     const url = request.nextUrl.clone();

@@ -4,6 +4,7 @@ import { isLocalDbMode } from "@/lib/local/mode";
 import { updateLocalTallyHeartbeat } from "@/lib/local/tally-store";
 import {
   hashSecret,
+  connectorSupportsReliableActiveCompany,
   serializeTallyConnectionStatus,
   type TallyConnectionRow,
   type TallyConnectionStatus,
@@ -50,15 +51,24 @@ function toNullableText(value: unknown) {
   return trimmed.length > 0 ? trimmed.slice(0, 500) : null;
 }
 
-function toCompanyNames(value: unknown) {
+function toCompanies(value: unknown, activeCompanyName: string | null) {
   if (!Array.isArray(value)) return [];
   const seen = new Set<string>();
-  const names: string[] = [];
+  const companies: Array<{
+    companyName: string;
+    guid: string | null;
+    financialYear: string | null;
+    financialYearStart: string | null;
+    booksFrom: string | null;
+    currentPeriod: string | null;
+    isActive: boolean;
+  }> = [];
 
   for (const item of value) {
     let name: unknown = item;
+    let row: Record<string, unknown> = {};
     if (item && typeof item === "object") {
-      const row = item as Record<string, unknown>;
+      row = item as Record<string, unknown>;
       name = row.companyName ?? row.name;
     }
     const text = toNullableText(name);
@@ -66,10 +76,32 @@ function toCompanyNames(value: unknown) {
     const key = text.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    names.push(text);
+    companies.push({
+      companyName: text,
+      guid: toNullableText(row.guid),
+      financialYear: toNullableText(row.financialYear),
+      financialYearStart: toNullableText(row.financialYearStart),
+      booksFrom: toNullableText(row.booksFrom),
+      currentPeriod: toNullableText(row.currentPeriod),
+      isActive:
+        key === activeCompanyName?.trim().toLowerCase() ||
+        (row.isActive === true && Boolean(activeCompanyName)),
+    });
   }
 
-  return names;
+  if (activeCompanyName && !seen.has(activeCompanyName.toLowerCase())) {
+    companies.unshift({
+      companyName: activeCompanyName,
+      guid: null,
+      financialYear: null,
+      financialYearStart: null,
+      booksFrom: null,
+      currentPeriod: null,
+      isActive: true,
+    });
+  }
+
+  return companies;
 }
 
 function resolveStatus(input: {
@@ -83,30 +115,6 @@ function resolveStatus(input: {
   return "bridge_connected";
 }
 
-async function getLatestSyncedCompanyName(
-  supabase: ReturnType<typeof createSupabaseAdminClient>,
-  connection: TallyConnectionRow
-) {
-  try {
-    const { data } = await supabase
-      .from("tally_master_sync_runs")
-      .select("company_name")
-      .eq("owner_user_id", connection.owner_user_id)
-      .eq("connection_id", connection.id)
-      .order("created_at", { ascending: false })
-      .limit(10);
-
-    for (const row of data ?? []) {
-      const companyName = toNullableText((row as { company_name?: unknown }).company_name);
-      if (companyName) return companyName;
-    }
-  } catch {
-    return null;
-  }
-
-  return null;
-}
-
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
@@ -116,16 +124,41 @@ export async function POST(request: Request) {
     const token = getBridgeToken(request);
     const body = await request.json().catch(() => ({}));
     const connectionId = typeof body.connectionId === "string" ? body.connectionId : "";
+    const bridgeVersion = toNullableText(body.bridgeVersion);
+    const bridgeMachineId = toNullableText(body.bridgeMachineId);
 
     if (!connectionId || !token) {
       return jsonWithCors(request, { error: "Connection id and bridge token are required." }, { status: 400 });
     }
 
+    if (
+      !connectorSupportsReliableActiveCompany(bridgeVersion) ||
+      !bridgeMachineId
+    ) {
+      return jsonWithCors(
+        request,
+        {
+          error:
+            "Connector update required. Install and reconnect using the latest Kalika Tally Connector.",
+        },
+        { status: 426 }
+      );
+    }
+
     const tallyReachable = toBoolean(body.tallyReachable);
-    const companyLoaded = toBoolean(body.companyLoaded);
-    const companyName = toNullableText(body.companyName);
-    const companyNames = toCompanyNames(body.companies);
-    const errorMessage = toNullableText(body.error);
+    const reliableActiveCompany = true;
+    const reportedCompanyLoaded = toBoolean(body.companyLoaded);
+    const companyName = reliableActiveCompany ? toNullableText(body.companyName) : null;
+    const companyLoaded = tallyReachable && reportedCompanyLoaded && Boolean(companyName);
+    const companies = toCompanies(body.companies, companyLoaded ? companyName : null);
+    const errorMessage =
+      toNullableText(body.error) ??
+      (tallyReachable && reportedCompanyLoaded && !reliableActiveCompany
+        ? "Connector update required before the active Tally company can be verified."
+        : null) ??
+      (tallyReachable && reportedCompanyLoaded && !companyName
+        ? "Tally responded but did not identify the active company."
+        : null);
     const status = resolveStatus({
       tallyReachable,
       companyLoaded,
@@ -138,10 +171,11 @@ export async function POST(request: Request) {
         token,
         status,
         tallyUrl: toNullableText(body.tallyUrl),
-        bridgeVersion: toNullableText(body.bridgeVersion),
+        bridgeVersion,
+        bridgeMachineId,
         tallyReachable,
         companyLoaded,
-        companyName,
+        companyName: companyLoaded ? companyName : null,
         error: errorMessage,
       });
 
@@ -171,18 +205,40 @@ export async function POST(request: Request) {
       return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
     }
 
+    if (
+      !connection.bridge_machine_id ||
+      connection.bridge_machine_id !== bridgeMachineId
+    ) {
+      await supabase.from("tally_connection_events").insert({
+        connection_id: connection.id,
+        owner_user_id: connection.owner_user_id,
+        event_type: "heartbeat_rejected",
+        message: "Heartbeat rejected because it came from a different connector installation.",
+        payload: {
+          pairedMachineId: connection.bridge_machine_id,
+          reportedMachineId: bridgeMachineId,
+          reportedBridgeVersion: bridgeVersion,
+        },
+      });
+      return jsonWithCors(
+        request,
+        {
+          error:
+            "This connection belongs to a different connector installation. Reconnect this machine.",
+        },
+        { status: 409 }
+      );
+    }
+
     const now = new Date().toISOString();
-    const resolvedCompanyName =
-      companyName ??
-      connection.last_company_name ??
-      (companyLoaded ? await getLatestSyncedCompanyName(supabase, connection) : null);
+    const resolvedCompanyName = companyLoaded ? companyName : null;
 
     const { data: updatedData, error: updateError } = await supabase
       .from("tally_connections")
       .update({
         status,
         tally_url: toNullableText(body.tallyUrl) ?? connection.tally_url,
-        bridge_version: toNullableText(body.bridgeVersion) ?? connection.bridge_version,
+        bridge_version: bridgeVersion,
         last_heartbeat_at: now,
         last_tested_at: now,
         last_tally_reachable: tallyReachable,
@@ -209,7 +265,9 @@ export async function POST(request: Request) {
         companyLoaded,
         companyName: resolvedCompanyName,
         heartbeatCompanyName: companyName,
-        companies: companyNames,
+        bridgeVersion,
+        bridgeMachineId,
+        companies,
       },
     });
 

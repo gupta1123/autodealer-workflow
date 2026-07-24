@@ -3,6 +3,7 @@ import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { isLocalDbMode } from "@/lib/local/mode";
 import { pairLocalTallyConnection } from "@/lib/local/tally-store";
 import {
+  connectorSupportsReliableActiveCompany,
   createBridgeToken,
   hashSecret,
   serializeTallyConnection,
@@ -89,9 +90,29 @@ export async function POST(
     const { id } = await context.params;
     const body = await request.json().catch(() => ({}));
     const pairingCode = readPairingCode(body.pairingCode);
+    const controlToken = readPairingCode(body.controlToken);
+    const bridgeVersion = normalizeMetadata(body.bridgeVersion, "unknown");
+    const bridgeMachineId = normalizeMetadata(body.bridgeMachineId, "unknown");
 
     if (!pairingCode) {
       return jsonWithCors(request, { error: "Pairing code is required." }, { status: 400 });
+    }
+    if (!controlToken) {
+      return jsonWithCors(request, { error: "Connection control token is required." }, { status: 400 });
+    }
+
+    if (
+      !connectorSupportsReliableActiveCompany(bridgeVersion) ||
+      bridgeMachineId === "unknown"
+    ) {
+      return jsonWithCors(
+        request,
+        {
+          error:
+            "This connector is outdated and cannot be paired safely. Install the latest Kalika Tally Connector and try again.",
+        },
+        { status: 426 }
+      );
     }
 
     if (isLocalDbMode()) {
@@ -99,8 +120,9 @@ export async function POST(
         connectionId: id,
         pairingCode,
         bridgeName: normalizeMetadata(body.bridgeName, "Tally Bridge"),
-        bridgeVersion: normalizeMetadata(body.bridgeVersion, "unknown"),
-        bridgeMachineId: normalizeMetadata(body.bridgeMachineId, "unknown"),
+        bridgeVersion,
+        bridgeMachineId,
+        controlToken,
       });
 
       if ("error" in result) {
@@ -187,22 +209,27 @@ export async function POST(
     const bridgeToken = createBridgeToken();
     const companyName = toNullableText(body.companyName);
     const tallyReachable = toNullableBoolean(body.tallyReachable);
-    const companyLoaded = toNullableBoolean(body.companyLoaded);
+    const reportedCompanyLoaded = toNullableBoolean(body.companyLoaded);
+    const companyLoaded =
+      tallyReachable === true && reportedCompanyLoaded === true && Boolean(companyName);
     const { data: updatedData, error: updateError } = await supabase
       .from("tally_connections")
       .update({
         status: "bridge_connected",
-        pairing_code_hash: null,
+        // Once pairing succeeds this field becomes the browser-only control
+        // token. Another browser signed into the same account can see the
+        // connection, but cannot disconnect this workstation.
+        pairing_code_hash: hashSecret(controlToken),
         pairing_code_expires_at: null,
         paired_at: new Date().toISOString(),
         bridge_token_hash: hashSecret(bridgeToken),
         bridge_name: normalizeMetadata(body.bridgeName, "Tally Bridge"),
-        bridge_version: normalizeMetadata(body.bridgeVersion, "unknown"),
-        bridge_machine_id: normalizeMetadata(body.bridgeMachineId, "unknown"),
+        bridge_version: bridgeVersion,
+        bridge_machine_id: bridgeMachineId,
         last_heartbeat_at: new Date().toISOString(),
-        last_tally_reachable: tallyReachable ?? connection.last_tally_reachable,
-        last_company_loaded: companyLoaded ?? connection.last_company_loaded,
-        last_company_name: companyName ?? connection.last_company_name,
+        last_tally_reachable: tallyReachable ?? false,
+        last_company_loaded: companyLoaded,
+        last_company_name: companyLoaded ? companyName : null,
         last_error: null,
       })
       .eq("id", connection.id)

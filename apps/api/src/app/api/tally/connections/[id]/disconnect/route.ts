@@ -4,6 +4,7 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { isLocalDbMode } from "@/lib/local/mode";
 import { disconnectLocalTallyConnection } from "@/lib/local/tally-store";
 import {
+  hashSecret,
   serializeTallyConnectionStatus,
   type TallyConnectionRow,
 } from "@/lib/tally/connections";
@@ -48,6 +49,10 @@ function disconnectedUpdatePayload() {
   };
 }
 
+function getControlToken(request: Request) {
+  return request.headers.get("x-tally-control-token")?.trim() ?? "";
+}
+
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
@@ -63,11 +68,23 @@ export async function POST(
     }
 
     const { id } = await context.params;
+    const controlToken = getControlToken(request);
+    if (!controlToken) {
+      return jsonWithCors(
+        request,
+        { error: "This browser does not control the selected Tally connection." },
+        { status: 403 }
+      );
+    }
 
     if (isLocalDbMode()) {
-      const connection = await disconnectLocalTallyConnection(id, user.id);
+      const connection = await disconnectLocalTallyConnection(id, user.id, controlToken);
       if (!connection) {
-        return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
+        return jsonWithCors(
+          request,
+          { error: "This browser cannot disconnect that Tally connection." },
+          { status: 403 }
+        );
       }
       return jsonWithCors(request, {
         connection: serializeTallyConnectionStatus(connection),
@@ -75,11 +92,49 @@ export async function POST(
     }
 
     const supabase = createSupabaseAdminClient();
+    const { data: existingData, error: existingError } = await supabase
+      .from("tally_connections")
+      .select(`${CONNECTION_SELECT}, pairing_code_hash`)
+      .eq("id", id)
+      .eq("owner_user_id", user.id)
+      .maybeSingle();
+
+    if (existingError) throw existingError;
+    if (!existingData) {
+      return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
+    }
+    const existing = existingData as unknown as TallyConnectionRow & {
+      pairing_code_hash: string | null;
+    };
+    if (
+      !existing.pairing_code_hash ||
+      hashSecret(controlToken) !== existing.pairing_code_hash
+    ) {
+      await supabase.from("tally_connection_events").insert({
+        connection_id: existing.id,
+        owner_user_id: user.id,
+        event_type: "disconnect_rejected",
+        message: "A different browser attempted to disconnect this Tally connection.",
+        payload: {
+          origin: request.headers.get("origin"),
+          referer: request.headers.get("referer"),
+          userAgent: request.headers.get("user-agent")?.slice(0, 500) ?? null,
+          forwardedFor: request.headers.get("x-forwarded-for")?.slice(0, 200) ?? null,
+        },
+      });
+      return jsonWithCors(
+        request,
+        { error: "This browser cannot disconnect that Tally connection." },
+        { status: 403 }
+      );
+    }
+
     const { data, error } = await supabase
       .from("tally_connections")
       .update(disconnectedUpdatePayload())
       .eq("id", id)
       .eq("owner_user_id", user.id)
+      .eq("pairing_code_hash", existing.pairing_code_hash)
       .select(CONNECTION_SELECT)
       .maybeSingle();
 
@@ -96,6 +151,10 @@ export async function POST(
       message: "Tally bridge disconnected by user.",
       payload: {
         source: "web",
+        origin: request.headers.get("origin"),
+        referer: request.headers.get("referer"),
+        userAgent: request.headers.get("user-agent")?.slice(0, 500) ?? null,
+        forwardedFor: request.headers.get("x-forwarded-for")?.slice(0, 200) ?? null,
       },
     });
 

@@ -1,19 +1,17 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
   ArrowRight,
   CheckCircle2,
-  Clipboard,
   FileText,
   Loader2,
   PlugZap,
   RefreshCw,
   Server,
   Sparkles,
-  Terminal,
   TriangleAlert,
 } from "lucide-react";
 
@@ -24,6 +22,9 @@ import { Input } from "@/components/ui/input";
 
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_LAN_TALLY_URL = "http://192.168.1.10:9000";
+const SELECTED_CONNECTION_STORAGE_KEY = "kalika:selected-tally-connection";
+const EXPECTED_MACHINE_STORAGE_PREFIX = "kalika:tally-connector-machine:";
+const CONNECTION_CONTROL_STORAGE_PREFIX = "kalika:tally-connection-control:";
 
 type TallySetupMode = "same_machine" | "lan_server";
 
@@ -54,6 +55,7 @@ type CompanyOption = {
   connectionId: string;
   companyName: string;
   financialYear: string;
+  isActive?: boolean;
 };
 
 type ConnectionsResponse = {
@@ -64,6 +66,7 @@ type ConnectionsResponse = {
 type CreateConnectionResponse = {
   connection?: TallyConnection;
   pairingCode?: string;
+  controlToken?: string;
   error?: string;
 };
 
@@ -131,33 +134,20 @@ function getBridgeApiBaseUrl() {
   return DEFAULT_BRIDGE_API_BASE_URL;
 }
 
-function escapeCommandValue(value: string) {
-  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-function buildPairCommand(connection: TallyConnection, pairingCode: string) {
-  const apiBaseUrl = getBridgeApiBaseUrl();
-  const tallyUrl = connection.tallyUrl || DEFAULT_TALLY_URL;
-  return `npm.cmd run pair -- --api-base "${apiBaseUrl}" --connection-id "${connection.id}" --pairing-code "${pairingCode}" --tally-url "${escapeCommandValue(tallyUrl)}"`;
-}
-
-function buildStartCommand(connection?: TallyConnection | null) {
-  const companyFlag = connection?.lastCompanyName
-    ? ` -- --company-name "${escapeCommandValue(connection.lastCompanyName)}"`
-    : "";
-
-  return `npm.cmd run start${companyFlag}`;
-}
-
 function formatCompanyOptionLabel(company: CompanyOption) {
   return [company.companyName, company.financialYear].filter(Boolean).join(" - ");
 }
 
-function buildConnectorConnectUrl(connection: TallyConnection, pairingCode: string) {
+function buildConnectorConnectUrl(
+  connection: TallyConnection,
+  pairingCode: string,
+  controlToken: string
+) {
   const params = new URLSearchParams({
     apiBase: getBridgeApiBaseUrl(),
     connectionId: connection.id,
     pairingCode,
+    controlToken,
     tallyUrl: connection.tallyUrl || DEFAULT_TALLY_URL,
   });
 
@@ -180,14 +170,6 @@ function getSetupModeForUrl(value?: string | null): TallySetupMode {
   } catch {
     return "lan_server";
   }
-}
-
-function buildConnectorDisconnectUrl(connection: TallyConnection) {
-  const params = new URLSearchParams({
-    connectionId: connection.id,
-  });
-
-  return `kalika-tally://disconnect?${params.toString()}`;
 }
 
 function openConnectorUrl(value: string) {
@@ -225,39 +207,6 @@ function StatusCard({
           )}
         </div>
       </div>
-    </div>
-  );
-}
-
-function CommandBlock({
-  title,
-  command,
-  onCopy,
-}: {
-  title: string;
-  command: string;
-  onCopy: (value: string) => void;
-}) {
-  return (
-    <div className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-sm">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-slate-400">
-          <Terminal className="h-4 w-4 text-slate-400" />
-          {title}
-        </div>
-        <Button
-          className="h-8 rounded-xl border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
-          onClick={() => onCopy(command)}
-          type="button"
-          variant="outline"
-        >
-          <Clipboard className="h-3.5 w-3.5 mr-1" />
-          Copy
-        </Button>
-      </div>
-      <code className="block overflow-x-auto whitespace-nowrap rounded-xl bg-[#2d2d2d] px-4 py-3 font-mono text-[11px] font-semibold text-[#f7f7f5] border border-black/10">
-        {command}
-      </code>
     </div>
   );
 }
@@ -304,7 +253,6 @@ export function TallyPrimeDashboard() {
   const [connections, setConnections] = useState<TallyConnection[]>([]);
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
   const [selectedId, setSelectedId] = useState("");
-  const [pairingCode, setPairingCode] = useState("");
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
@@ -312,21 +260,38 @@ export function TallyPrimeDashboard() {
   const [setupMode, setSetupMode] = useState<TallySetupMode>("same_machine");
   const [tallyUrlInput, setTallyUrlInput] = useState("");
   const [message, setMessage] = useState<{ tone: "success" | "error"; text: string } | null>(null);
+  const statusRefreshInFlight = useRef(false);
 
   const selectedConnection =
     connections.find((connection) => connection.id === selectedId) ?? connections[0] ?? null;
+  const selectedConnectionId = selectedConnection?.id ?? "";
+  const expectedMachineId =
+    typeof window !== "undefined" && selectedConnectionId
+      ? window.localStorage.getItem(`${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnectionId}`)
+      : null;
+  const connectionBelongsToThisBrowser =
+    !expectedMachineId ||
+    !selectedConnection?.bridgeMachineId ||
+    expectedMachineId === selectedConnection.bridgeMachineId;
   const selectedCompany =
-    companies.find((company) => company.connectionId === selectedConnection?.id) ?? companies[0] ?? null;
-  const statusTone = getStatusTone(selectedConnection);
-  const connectorActive = Boolean(selectedConnection?.bridgeConnected);
-  const companyDetail = selectedCompany?.companyName || selectedConnection?.lastCompanyName
-    || (selectedConnection?.lastCompanyLoaded ? "Company loaded" : "Company not detected yet");
-  const pairCommand = useMemo(() => {
-    if (!selectedConnection || !pairingCode) return "";
-    return buildPairCommand(selectedConnection, pairingCode);
-  }, [pairingCode, selectedConnection]);
-  const startCommand = useMemo(() => buildStartCommand(selectedConnection), [selectedConnection]);
-
+    connectionBelongsToThisBrowser ? companies.find(
+      (company) =>
+        company.connectionId === selectedConnection?.id &&
+        (company.isActive ||
+          company.companyName.trim().toLowerCase() ===
+            String(selectedConnection?.lastCompanyName ?? "").trim().toLowerCase())
+    ) ?? null : null;
+  const statusTone = connectionBelongsToThisBrowser ? getStatusTone(selectedConnection) : "error";
+  const connectorActive =
+    connectionBelongsToThisBrowser && Boolean(selectedConnection?.bridgeConnected);
+  const tallyReachable =
+    connectionBelongsToThisBrowser && selectedConnection?.tallyReachable === true;
+  const companyLoaded =
+    connectionBelongsToThisBrowser && selectedConnection?.companyLoaded === true;
+  const companyDetail = !connectionBelongsToThisBrowser
+    ? "Another connector replaced this connection. Reconnect this computer."
+    : selectedConnection?.lastCompanyName || selectedCompany?.companyName
+      || (selectedConnection?.companyLoaded ? "Company loaded" : "Company not detected yet");
   async function loadConnections(options?: { quiet?: boolean }) {
     try {
       if (!options?.quiet) {
@@ -343,11 +308,20 @@ export function TallyPrimeDashboard() {
       const payload = (await response.json()) as ConnectionsResponse;
       const nextConnections = payload.connections ?? [];
       setConnections(nextConnections);
-      setSelectedId((current) =>
-        nextConnections.some((connection) => connection.id === current)
-          ? current
-          : nextConnections[0]?.id || ""
-      );
+      setSelectedId((current) => {
+        const stored =
+          typeof window !== "undefined"
+            ? window.localStorage.getItem(SELECTED_CONNECTION_STORAGE_KEY) ?? ""
+            : "";
+        const preferred = current || stored;
+        const nextId = nextConnections.some((connection) => connection.id === preferred)
+          ? preferred
+          : nextConnections[0]?.id || "";
+        if (typeof window !== "undefined" && nextId) {
+          window.localStorage.setItem(SELECTED_CONNECTION_STORAGE_KEY, nextId);
+        }
+        return nextId;
+      });
 
       const companyResponse = await apiFetch("/api/tally/companies", {
         method: "GET",
@@ -368,8 +342,9 @@ export function TallyPrimeDashboard() {
   }
 
   const refreshStatus = useCallback(async (connectionId: string) => {
-    if (!connectionId) return;
+    if (!connectionId || statusRefreshInFlight.current) return;
 
+    statusRefreshInFlight.current = true;
     try {
       const response = await apiFetch(`/api/tally/connections/${connectionId}/status`, {
         method: "GET",
@@ -392,6 +367,8 @@ export function TallyPrimeDashboard() {
         tone: "error",
         text: error instanceof Error ? error.message : "Failed to refresh Tally status.",
       });
+    } finally {
+      statusRefreshInFlight.current = false;
     }
   }, []);
 
@@ -427,14 +404,27 @@ export function TallyPrimeDashboard() {
       }
 
       const payload = (await response.json()) as CreateConnectionResponse;
-      if (!payload.connection || !payload.pairingCode) {
+      if (!payload.connection || !payload.pairingCode || !payload.controlToken) {
         throw new Error("Connection created, but pairing details were missing.");
       }
 
       setConnections((current) => [payload.connection as TallyConnection, ...current]);
       setSelectedId(payload.connection.id);
-      setPairingCode(payload.pairingCode);
-      openConnectorUrl(buildConnectorConnectUrl(payload.connection, payload.pairingCode));
+      window.localStorage.setItem(SELECTED_CONNECTION_STORAGE_KEY, payload.connection.id);
+      window.localStorage.removeItem(
+        `${EXPECTED_MACHINE_STORAGE_PREFIX}${payload.connection.id}`
+      );
+      window.localStorage.setItem(
+        `${CONNECTION_CONTROL_STORAGE_PREFIX}${payload.connection.id}`,
+        payload.controlToken
+      );
+      openConnectorUrl(
+        buildConnectorConnectUrl(
+          payload.connection,
+          payload.pairingCode,
+          payload.controlToken
+        )
+      );
       setMessage({
         tone: "success",
         text: "Connector launch requested. Approve the browser prompt if it appears.",
@@ -456,9 +446,19 @@ export function TallyPrimeDashboard() {
     try {
       setDisconnecting(true);
       setMessage(null);
-      openConnectorUrl(buildConnectorDisconnectUrl(selectedConnection));
+      const controlToken = window.localStorage.getItem(
+        `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnection.id}`
+      );
+      if (!controlToken) {
+        throw new Error(
+          "This connection was created in another browser. Reconnect from this browser to manage it."
+        );
+      }
       const response = await apiFetch(`/api/tally/connections/${selectedConnection.id}/disconnect`, {
         method: "POST",
+        headers: {
+          "x-tally-control-token": controlToken,
+        },
       });
       if (!response.ok) {
         throw new Error(await readError(response));
@@ -472,7 +472,12 @@ export function TallyPrimeDashboard() {
           )
         );
       }
-      setPairingCode("");
+      window.localStorage.removeItem(
+        `${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnection.id}`
+      );
+      window.localStorage.removeItem(
+        `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnection.id}`
+      );
       setMessage({
         tone: "success",
         text: "Connector disconnected.",
@@ -523,11 +528,6 @@ export function TallyPrimeDashboard() {
     }
   }
 
-  async function copyText(value: string) {
-    await navigator.clipboard.writeText(value);
-    setMessage({ tone: "success", text: "Command copied." });
-  }
-
   useEffect(() => {
     void loadConnections();
   }, []);
@@ -539,13 +539,47 @@ export function TallyPrimeDashboard() {
   }, [selectedConnection?.id, selectedConnection?.tallyUrl]);
 
   useEffect(() => {
-    if (!selectedConnection) return;
+    if (!selectedConnectionId) return;
+    void refreshStatus(selectedConnectionId);
     const timer = window.setInterval(() => {
-      void refreshStatus(selectedConnection.id);
-    }, 10_000);
+      void refreshStatus(selectedConnectionId);
+    }, 15_000);
 
     return () => window.clearInterval(timer);
-  }, [refreshStatus, selectedConnection]);
+  }, [refreshStatus, selectedConnectionId]);
+
+  useEffect(() => {
+    if (!selectedConnection?.id) return;
+    window.localStorage.setItem(SELECTED_CONNECTION_STORAGE_KEY, selectedConnection.id);
+  }, [selectedConnection?.id]);
+
+  useEffect(() => {
+    if (
+      !selectedConnection?.id ||
+      !selectedConnection.bridgeConnected ||
+      !selectedConnection.bridgeMachineId
+    ) {
+      return;
+    }
+    const key = `${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnection.id}`;
+    if (!window.localStorage.getItem(key)) {
+      window.localStorage.setItem(key, selectedConnection.bridgeMachineId);
+    }
+  }, [
+    selectedConnection?.bridgeConnected,
+    selectedConnection?.bridgeMachineId,
+    selectedConnection?.id,
+  ]);
+
+  useEffect(() => {
+    if (
+      selectedConnection?.bridgeConnected &&
+      message?.tone === "success" &&
+      message.text.startsWith("Connector launch requested")
+    ) {
+      setMessage(null);
+    }
+  }, [message, selectedConnection?.bridgeConnected]);
 
   if (view === "home") {
     return (
@@ -718,11 +752,15 @@ export function TallyPrimeDashboard() {
                       }
                       variant="outline"
                     >
-                      {getStatusLabel(selectedConnection)}
+                      {connectionBelongsToThisBrowser
+                        ? getStatusLabel(selectedConnection)
+                        : "Reconnect required"}
                     </Badge>
                   </div>
                   <div className="mt-1 text-sm font-semibold text-slate-500">
-                    {selectedCompany ? formatCompanyOptionLabel(selectedCompany) : companyDetail}
+                    {selectedCompany?.financialYear
+                      ? formatCompanyOptionLabel(selectedCompany)
+                      : companyDetail}
                   </div>
                 </div>
               </div>
@@ -777,21 +815,27 @@ export function TallyPrimeDashboard() {
           <div className="grid gap-4 md:grid-cols-3">
             <StatusCard
               detail={`Last seen: ${formatTime(selectedConnection.lastHeartbeatAt)}`}
-              ok={Boolean(selectedConnection.bridgeConnected)}
+              ok={connectorActive}
               title="Connector"
-              value={selectedConnection.bridgeConnected ? "Connected" : "Waiting"}
+              value={connectorActive ? "Connected" : "Waiting"}
             />
             <StatusCard
               detail={`Last checked: ${formatTime(selectedConnection.lastTestedAt)}`}
-              ok={selectedConnection.lastTallyReachable === true}
+              ok={tallyReachable}
               title="Tally"
-              value={selectedConnection.lastTallyReachable ? "Reachable" : "Not reachable"}
+              value={tallyReachable ? "Reachable" : "Not reachable"}
             />
             <StatusCard
-              detail={selectedConnection.lastCompanyName || selectedConnection.lastError || companyDetail}
-              ok={selectedConnection.lastCompanyLoaded === true}
+              detail={
+                connectionBelongsToThisBrowser
+                  ? selectedConnection.lastCompanyName ||
+                    selectedConnection.lastError ||
+                    companyDetail
+                  : companyDetail
+              }
+              ok={companyLoaded}
               title="Company"
-              value={selectedConnection.lastCompanyLoaded ? "Loaded" : "Not detected"}
+              value={companyLoaded ? "Loaded" : "Not detected"}
             />
           </div>
         </div>
