@@ -331,6 +331,12 @@ type DocumentPreviewState = {
   error: string | null;
 };
 
+type ApiErrorPayload = {
+  error?: string;
+  code?: string;
+  diagnostics?: unknown;
+};
+
 type TallyMaster = {
   key: string;
   name: string;
@@ -953,8 +959,19 @@ function transactionHasPostingAmount(transaction: ReviewTransaction) {
   return Math.max(parseNumber(transaction.debitAmount) ?? 0, parseNumber(transaction.creditAmount) ?? 0) > 0;
 }
 
+function hasValidTransactionDate(value: string | null | undefined) {
+  const trimmed = String(value ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return false;
+  const date = new Date(`${trimmed}T00:00:00`);
+  return !Number.isNaN(date.getTime());
+}
+
 function transactionIsValid(transaction: ReviewTransaction) {
-  return Boolean(transaction.transactionDate && transaction.description.trim() && transactionHasPostingAmount(transaction));
+  return Boolean(
+    hasValidTransactionDate(transaction.transactionDate) &&
+    transaction.description.trim() &&
+    transactionHasPostingAmount(transaction)
+  );
 }
 
 function formatAmount(value: string | number | null | undefined) {
@@ -2316,14 +2333,19 @@ function getAnalysisCompleteMessage(payload: PreviewResponse) {
 }
 
 async function readError(response: Response) {
-  const payload = (await response.json().catch(() => ({}))) as {
-    error?: string;
-    diagnostics?: unknown;
-  };
+  const payload = (await response.json().catch(() => ({}))) as ApiErrorPayload;
   const message = payload.error || `Request failed with status ${response.status}`;
   if (!payload.diagnostics) return message;
 
   return `${message} ${JSON.stringify(payload.diagnostics)}`;
+}
+
+async function readApiErrorPayload(response: Response): Promise<ApiErrorPayload> {
+  const payload = (await response.json().catch(() => ({}))) as ApiErrorPayload;
+  return {
+    ...payload,
+    error: payload.error || `Request failed with status ${response.status}`,
+  };
 }
 
 function normalizeFetchedBankLedger(value: unknown): LocalBankLedger | null {
@@ -2398,6 +2420,9 @@ export function BankStatementsPage() {
   const [file, setFile] = useState<File | null>(null);
   const [documentPreview, setDocumentPreview] = useState<DocumentPreviewState | null>(null);
   const [documentPreviewLoading, setDocumentPreviewLoading] = useState(false);
+  const [statementPassword, setStatementPassword] = useState("");
+  const [statementPasswordRequired, setStatementPasswordRequired] = useState(false);
+  const [statementPasswordError, setStatementPasswordError] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [account, setAccount] = useState<DraftAccount>(EMPTY_ACCOUNT);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
@@ -2453,6 +2478,7 @@ export function BankStatementsPage() {
     () => transactions.filter(transactionIsValid),
     [transactions]
   );
+  const ignoredStatementRowCount = Math.max(0, transactions.length - validTransactions.length);
 
   useEffect(() => {
     const objectUrl = documentPreview?.objectUrl;
@@ -2750,7 +2776,7 @@ export function BankStatementsPage() {
     });
   }, [reviewDateFrom, reviewDateTo, reviewDirectionFilter, reviewSearch, reviewStatusFilter, validTransactions]);
   const visibleReviewTransactions = useMemo(
-    () => filteredTransactions.slice(0, rowsPerPage),
+    () => filteredTransactions.filter(transactionIsValid).slice(0, rowsPerPage),
     [filteredTransactions, rowsPerPage]
   );
   const tallyPostingInProgress = Boolean(tallyPostingStatus && !tallyPostingStatus.finished);
@@ -3520,6 +3546,9 @@ export function BankStatementsPage() {
     setBanner(null);
     setStatementDoneSummary(null);
     setTallyPostingStatus(null);
+    setStatementPassword("");
+    setStatementPasswordRequired(false);
+    setStatementPasswordError(null);
     setFile(nextFile);
     try {
       setDocumentPreview(await buildDocumentPreview(nextFile));
@@ -3532,6 +3561,9 @@ export function BankStatementsPage() {
     setFile(null);
     setDocumentPreview(null);
     setDocumentPreviewLoading(false);
+    setStatementPassword("");
+    setStatementPasswordRequired(false);
+    setStatementPasswordError(null);
     setDragActive(false);
     setBanner(null);
     if (fileInputRef.current) {
@@ -3556,10 +3588,17 @@ export function BankStatementsPage() {
       setBanner({ tone: "error", text: setupErrorMessage || "Refresh Kalika to verify the Tally company before upload." });
       return;
     }
+    if (statementPasswordRequired && isPdfFile(nextFile) && !statementPassword.trim()) {
+      const message = "Enter the statement password to continue.";
+      setStatementPasswordError(message);
+      setBanner({ tone: "error", text: message });
+      return;
+    }
     try {
       clearStatementReview();
       setLoading(true);
       setBanner(null);
+      setStatementPasswordError(null);
       setTallyPostingStatus(null);
       setStatementDoneSummary(null);
       setFile(nextFile);
@@ -3579,6 +3618,9 @@ export function BankStatementsPage() {
       formData.set("financialYear", selectedFinancialYear);
       formData.set("bankLedgerName", "");
       formData.set("syncBeforeAnalysis", String(syncBeforeAnalysis));
+      if (isPdfFile(nextFile) && statementPassword.trim()) {
+        formData.set("statementPassword", statementPassword);
+      }
 
       const response = await apiFetch("/api/bank-statements/imports", {
         method: "POST",
@@ -3586,10 +3628,30 @@ export function BankStatementsPage() {
       });
 
       if (!response.ok) {
-        throw new Error(await readError(response));
+        const payload = await readApiErrorPayload(response);
+        if (
+          payload.code === "BANK_STATEMENT_PASSWORD_REQUIRED" ||
+          payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT" ||
+          payload.code === "BANK_STATEMENT_PASSWORD_UNSUPPORTED"
+        ) {
+          setStatementPasswordRequired(payload.code !== "BANK_STATEMENT_PASSWORD_UNSUPPORTED");
+          setStatementPasswordError(payload.error ?? "This password-protected statement could not be opened.");
+          if (payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT") {
+            setStatementPassword("");
+          }
+          setBanner({
+            tone: "error",
+            text: payload.error ?? "This password-protected statement could not be opened.",
+          });
+          return;
+        }
+        throw new Error(payload.error || `Request failed with status ${response.status}`);
       }
 
       const payload = (await response.json()) as PreviewResponse;
+      setStatementPassword("");
+      setStatementPasswordRequired(false);
+      setStatementPasswordError(null);
       if (payload.processing) {
         setBanner({
           tone: "info",
@@ -4800,7 +4862,13 @@ export function BankStatementsPage() {
                         </button>
                         <button
                           type="button"
-                          disabled={Boolean(documentPreview.error) || loading || !file}
+                          disabled={
+                            Boolean(documentPreview.error) ||
+                            loading ||
+                            !file ||
+                            (statementPasswordRequired && !statementPassword.trim()) ||
+                            Boolean(statementPasswordError && !statementPasswordRequired)
+                          }
                           onClick={() => {
                             if (file) void analyzeFile(file);
                           }}
@@ -4837,6 +4905,41 @@ export function BankStatementsPage() {
                           </div>
                         </div>
                       </div>
+                      {documentPreview.kind === "pdf" && (statementPasswordRequired || statementPasswordError) ? (
+                        <div className="rounded-xl border border-amber-200 bg-white px-3 py-3">
+                          <label className="block">
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-amber-800">
+                              Statement password
+                            </span>
+                            {statementPasswordRequired ? (
+                              <input
+                                autoComplete="off"
+                                className="mt-2 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-sm font-semibold text-[#1a1a1a] outline-none transition placeholder:text-slate-300 focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
+                                onChange={(event) => {
+                                  setStatementPassword(event.target.value);
+                                  setStatementPasswordError(null);
+                                  setBanner(null);
+                                }}
+                                placeholder="Enter PDF password"
+                                type="password"
+                                value={statementPassword}
+                              />
+                            ) : null}
+                          </label>
+                          <div className={`mt-2 flex items-start gap-2 text-xs font-semibold ${statementPasswordError ? "text-amber-900" : "text-[#7a6c5f]"}`}>
+                            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                            <span>
+                              {statementPasswordError ||
+                                "Password is used only for this upload attempt and is not stored."}
+                            </span>
+                          </div>
+                          {statementPasswordRequired ? (
+                            <div className="mt-1 text-[11px] font-semibold text-[#7a6c5f]">
+                              The password is used only to unlock this PDF for analysis. It is not saved.
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
                     </div>
                     <div className="grid gap-4 bg-white p-4 xl:grid-cols-[minmax(0,1fr)_280px]">
                       <div className="overflow-hidden rounded-xl border border-[#e5ddd0] bg-white">
@@ -4916,8 +5019,14 @@ export function BankStatementsPage() {
                             },
                             {
                               label: "Bank statement selected",
-                              ready: Boolean(file && !documentPreview.error),
-                              detail: file ? formatFileSize(file.size) : "No file selected",
+                              ready: Boolean(file && !documentPreview.error && !statementPasswordError),
+                              detail: statementPasswordRequired
+                                ? "Password required"
+                                : statementPasswordError
+                                  ? "Needs attention"
+                                  : file
+                                    ? formatFileSize(file.size)
+                                    : "No file selected",
                             },
                             {
                               label: syncBeforeAnalysis ? "Sync enabled" : "Sync disabled",
@@ -4928,8 +5037,20 @@ export function BankStatementsPage() {
                             },
                             {
                               label: "Ready to analyze",
-                              ready: Boolean(tallyCompanyContextVerified && file && !documentPreview.error),
-                              detail: documentPreview.error ? "Fix preview issue" : "All required inputs set",
+                              ready: Boolean(
+                                tallyCompanyContextVerified &&
+                                  file &&
+                                  !documentPreview.error &&
+                                  !statementPasswordError &&
+                                  (!statementPasswordRequired || statementPassword.trim())
+                              ),
+                              detail: documentPreview.error
+                                ? "Fix preview issue"
+                                : statementPasswordRequired && !statementPassword.trim()
+                                  ? "Enter statement password"
+                                  : statementPasswordError
+                                    ? "Resolve password issue"
+                                    : "All required inputs set",
                             },
                           ].map((item) => (
                             <div key={item.label} className="flex items-start gap-2">
@@ -4955,9 +5076,9 @@ export function BankStatementsPage() {
             </section>
           ) : (
             <section className="space-y-4">
-              <div className="rounded-2xl border border-[#e5ddd0] bg-white px-4 py-2 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
-                <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-                  <div className="grid min-w-0 flex-1 items-center gap-4 sm:grid-cols-2 xl:grid-cols-[0.72fr_0.9fr_1.45fr_auto_minmax(240px,1.35fr)]">
+              <div className="rounded-2xl border border-[#e5ddd0] bg-white px-4 py-3 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+                <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.62fr)] xl:items-start">
+                  <div className="grid min-w-0 gap-4 sm:grid-cols-3">
                     <div className="min-w-0">
                       <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Company</div>
                       <div className="mt-1 truncate text-sm font-extrabold text-[#1a1a1a]" title={selectedCompanyName}>
@@ -4973,129 +5094,135 @@ export function BankStatementsPage() {
                       </div>
                     </div>
                     <div className="min-w-0">
-                      <div className="text-[9px] font-bold uppercase tracking-wider text-sky-700">Statement account</div>
+                      <div className="text-[10px] font-bold uppercase tracking-wider text-sky-700">Statement account</div>
                       <div className="mt-1 truncate text-sm font-extrabold text-[#1a1a1a]" title={`${account.bankName || ""} ${account.accountNumber || ""}`}>
                         {account.bankName || "Account not detected"}
                         {account.accountNumber ? ` - ${maskAccountNumber(account.accountNumber)}` : ""}
                       </div>
-                      <div className="hidden 2xl:block truncate text-[10px] font-semibold text-slate-400 mt-0.5">
+                      <div className="mt-0.5 truncate text-[10px] font-semibold text-slate-400">
                         {account.accountHolderName || "Holder not found"}
                         {account.ifscCode ? ` - ${account.ifscCode}` : ""}
                       </div>
                     </div>
-                    <div className="hidden xl:flex items-center justify-center px-0.5">
-                      <ArrowRight aria-label="Statement to Tally ledger" className={`h-3.5 w-3.5 ${bankLedgerVerified ? "text-emerald-600" : "text-amber-600"}`} />
+                  </div>
 
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-[9px] font-bold uppercase tracking-wider text-emerald-700">
-                        {bankLedgerChangeMode ? "Replace Tally ledger" : "Tally posting ledger"}
-                      </div>
-                      {bankLedgerChangeMode || !bankLedgerName ? (
-                        <div className="mt-1">
-                          <LedgerSearchSelect
-                            onChange={bankLedgerChangeMode ? setPendingBankLedgerName : applyTallyBankLedgerSelection}
-                            options={bankLedgerOptions.map((ledger) => ledger.name)}
-                            placeholder={ledgerMasters.length > 0 && bankLedgerOptions.length === 0 ? "No bank account ledger found" : "Search Tally bank ledger"}
-                            value={bankLedgerChangeMode ? pendingBankLedgerName : ""}
-                          />
-                          {bankLedgerChangeMode ? (
-                            <div className="mt-2 flex flex-wrap items-center gap-2">
-                              <button
-                                className="inline-flex h-7 items-center rounded-lg bg-[#2d2d2d] px-3 text-[10px] font-bold text-white transition hover:bg-[#1a1a1a]"
-                                onClick={confirmBankLedgerChange}
-                                type="button"
-                              >
-                                Use selected ledger
-                              </button>
-                              <button
-                                className="inline-flex h-7 items-center rounded-lg px-2 text-[10px] font-bold text-slate-500 transition hover:bg-slate-100 hover:text-[#1a1a1a]"
-                                onClick={cancelBankLedgerChange}
-                                type="button"
-                              >
-                                Cancel
-                              </button>
-                            </div>
-                          ) : (
-                            <div className="mt-1 flex items-center gap-1.5 text-[10px] font-semibold text-amber-700">
-                              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                              Choose the intended ledger - no exact account match was found.
-                            </div>
-                          )}
-                        </div>                      ) : (
-                        <div className="mt-1 flex min-w-0 items-center gap-2">
-                          {bankLedgerVerified ? (
-                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-700" />
-                          ) : (
-                            <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-600" />
-                          )}
-                          <div className="min-w-0">
-                            <div className="truncate text-sm font-extrabold text-[#1a1a1a]" title={bankLedgerName}>
-                              {bankLedgerName}
-                            </div>
-                            <div className={`truncate text-[10px] font-bold ${bankLedgerVerified ? "text-emerald-700" : "text-amber-700"}`}>
-                              {bankLedgerVerified ? "Exact statement account match" : "Manual selection - review account numbers"}
-                            </div>
+                  <div className="min-w-0 rounded-xl border border-[#f0e8dc] bg-[#fcfbfa] px-3 py-2.5">
+                    <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <ArrowRight aria-label="Statement to Tally ledger" className={`hidden h-3.5 w-3.5 shrink-0 xl:block ${bankLedgerVerified ? "text-emerald-600" : "text-amber-600"}`} />
+                          <div className="text-[10px] font-bold uppercase tracking-wider text-emerald-700">
+                            {bankLedgerChangeMode ? "Replace Tally ledger" : "Tally posting ledger"}
                           </div>
                         </div>
-                      )}
+                        {bankLedgerChangeMode || !bankLedgerName ? (
+                          <div className="mt-1.5">
+                            <LedgerSearchSelect
+                              onChange={bankLedgerChangeMode ? setPendingBankLedgerName : applyTallyBankLedgerSelection}
+                              options={bankLedgerOptions.map((ledger) => ledger.name)}
+                              placeholder={ledgerMasters.length > 0 && bankLedgerOptions.length === 0 ? "No bank account ledger found" : "Search Tally bank ledger"}
+                              value={bankLedgerChangeMode ? pendingBankLedgerName : ""}
+                            />
+                            {bankLedgerChangeMode ? (
+                              <div className="mt-2 flex flex-wrap items-center gap-2">
+                                <button
+                                  className="inline-flex h-7 items-center rounded-lg bg-[#2d2d2d] px-3 text-[10px] font-bold text-white transition hover:bg-[#1a1a1a]"
+                                  onClick={confirmBankLedgerChange}
+                                  type="button"
+                                >
+                                  Use selected ledger
+                                </button>
+                                <button
+                                  className="inline-flex h-7 items-center rounded-lg px-2 text-[10px] font-bold text-slate-500 transition hover:bg-slate-100 hover:text-[#1a1a1a]"
+                                  onClick={cancelBankLedgerChange}
+                                  type="button"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <div className="mt-1 flex items-start gap-1.5 text-[10px] font-semibold text-amber-700">
+                                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                                <span>Choose the intended ledger - no exact account match was found.</span>
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="mt-1.5 flex min-w-0 items-start gap-2">
+                            {bankLedgerVerified ? (
+                              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-700" />
+                            ) : (
+                              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />
+                            )}
+                            <div className="min-w-0">
+                              <div className="whitespace-normal break-words text-sm font-extrabold leading-5 text-[#1a1a1a]" title={bankLedgerName}>
+                                {bankLedgerName}
+                              </div>
+                              <div className={`text-[10px] font-bold leading-4 ${bankLedgerVerified ? "text-emerald-700" : "text-amber-700"}`}>
+                                {bankLedgerVerified ? "Exact statement account match" : "Manual selection - review account numbers"}
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex shrink-0 flex-wrap items-center gap-2 lg:justify-end">
+                        {preview.candidates.length > 1 ? (
+                          <select
+                            value={selectedAccountId || "new"}
+                            onChange={(event) => {
+                              const value = event.target.value;
+                              setSelectedAccountId(value === "new" ? "" : value);
+                              const candidate = preview.candidates.find((item) => item.id === value);
+                              if (candidate) {
+                                setAccount({
+                                  bankName: candidate.bankName || account.bankName,
+                                  accountNumber: candidate.accountNumber || account.accountNumber,
+                                  accountHolderName: candidate.accountHolderName || account.accountHolderName,
+                                  ifscCode: candidate.ifscCode || account.ifscCode,
+                                  tallyLedgerName: candidate.tallyLedgerName || account.tallyLedgerName,
+                                });
+                                if (candidate.tallyLedgerName) {
+                                  setBankLedgerName(candidate.tallyLedgerName);
+                                  setBankLedgerVerified(false);
+                                  setBankLedgerManuallyConfirmed(false);
+                                }
+                              }
+                            }}
+                            className="h-8.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] outline-none focus:border-amber-500"
+                          >
+                            <option value="new">Extracted account</option>
+                            {preview.candidates.map((candidate) => (
+                              <option key={candidate.id} value={candidate.id}>
+                                {candidate.accountHolderName || "Saved account"} - {candidate.accountNumberMasked}
+                              </option>
+                            ))}
+                          </select>
+                        ) : null}
+                        {!bankLedgerChangeMode && bankLedgerName ? (
+                          <button
+                            type="button"
+                            onClick={beginBankLedgerChange}
+                            className="inline-flex h-8.5 items-center rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                          >
+                            Change ledger
+                          </button>
+                        ) : null}
+                        <button
+                          type="button"
+                          onClick={handleSyncLedgerMasters}
+                          disabled={!tallyCompanyContextVerified || syncingMasters || loadingBankLedgers}
+                          className="inline-flex h-8.5 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {syncingMasters || loadingBankLedgers ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <RefreshCw className="h-3.5 w-3.5" />
+                          )}
+                          Sync
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                  <div className="flex shrink-0 flex-wrap items-center gap-2">
-                    {preview.candidates.length > 1 ? (
-                      <select
-                        value={selectedAccountId || "new"}
-                        onChange={(event) => {
-                          const value = event.target.value;
-                          setSelectedAccountId(value === "new" ? "" : value);
-                          const candidate = preview.candidates.find((item) => item.id === value);
-                          if (candidate) {
-                            setAccount({
-                              bankName: candidate.bankName || account.bankName,
-                              accountNumber: candidate.accountNumber || account.accountNumber,
-                              accountHolderName: candidate.accountHolderName || account.accountHolderName,
-                              ifscCode: candidate.ifscCode || account.ifscCode,
-                              tallyLedgerName: candidate.tallyLedgerName || account.tallyLedgerName,
-                            });
-                            if (candidate.tallyLedgerName) {
-                              setBankLedgerName(candidate.tallyLedgerName);
-                              setBankLedgerVerified(false);
-                              setBankLedgerManuallyConfirmed(false);
-                            }
-                          }
-                        }}
-                        className="h-8.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] outline-none focus:border-amber-500"
-                      >
-                        <option value="new">Extracted account</option>
-                        {preview.candidates.map((candidate) => (
-                          <option key={candidate.id} value={candidate.id}>
-                            {candidate.accountHolderName || "Saved account"} - {candidate.accountNumberMasked}
-                          </option>
-                        ))}
-                      </select>
-                    ) : null}
-                    {!bankLedgerChangeMode && bankLedgerName ? (
-                      <button
-                        type="button"
-                        onClick={beginBankLedgerChange}
-                        className="inline-flex h-8.5 items-center rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-all"
-                      >
-                        Change ledger
-                      </button>
-                    ) : null}
-                    <button
-                      type="button"
-                      onClick={handleSyncLedgerMasters}
-                      disabled={!tallyCompanyContextVerified || syncingMasters || loadingBankLedgers}
-                      className="inline-flex h-8.5 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50 transition-all"
-                    >
-                      {syncingMasters || loadingBankLedgers ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <RefreshCw className="h-3.5 w-3.5" />
-                      )}
-                      Sync
-                    </button>
                   </div>
                 </div>
               </div>
@@ -5106,7 +5233,79 @@ export function BankStatementsPage() {
                     This ledger has no exact verified account-number match to the uploaded statement. Choose it deliberately before posting.
                   </span>
                 </div>
-              ) : null}              <div className="hidden rounded-2xl border border-[#e3d6c6] bg-[#fffaf2] px-4 py-3 shadow-sm">
+              ) : null}
+              <section className="rounded-2xl border border-[#e5ddd0] bg-white p-4 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+                <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+                  <div>
+                    <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
+                      Transaction summary
+                    </div>
+                    <h2 className="mt-1 text-lg font-black text-[#1a1a1a]">
+                      {matchingBills
+                        ? "Checking statement against Tally"
+                        : uncheckedTallyPresenceCount > 0
+                          ? "Live Tally check pending"
+                        : statementReviewIssueCount > 0
+                          ? "Review needed before posting"
+                          : newReceiptCount > 0
+                            ? "Receipts ready to post"
+                            : "No new posting required"}
+                    </h2>
+                  </div>
+                  <div className="text-xs font-bold text-[#7a6c5f]">
+                    {filteredTransactions.length === validTransactions.length
+                      ? `${validTransactions.length} posting row${validTransactions.length === 1 ? "" : "s"} analyzed`
+                      : `${filteredTransactions.length} of ${validTransactions.length} posting row${validTransactions.length === 1 ? "" : "s"} shown`}
+                  </div>
+                </div>
+                <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                  {[
+                    {
+                      label: "Posting rows",
+                      value: validTransactions.length,
+                      detail: ignoredStatementRowCount === 0
+                        ? "Ready for review"
+                        : `${ignoredStatementRowCount} statement header/summary row${ignoredStatementRowCount === 1 ? "" : "s"} ignored`,
+                      className: "border-slate-200 bg-slate-50 text-slate-800",
+                    },
+                    {
+                      label: "Already in Tally",
+                      value: uncheckedTallyPresenceCount > 0 ? "-" : alreadyInTallyCount,
+                      detail: uncheckedTallyPresenceCount > 0 ? "Live check pending" : "Matched existing entries",
+                      className: "border-emerald-200 bg-emerald-50 text-emerald-800",
+                    },
+                    {
+                      label: "New receipts",
+                      value: uncheckedTallyPresenceCount > 0 ? "-" : newReceiptCount,
+                      detail: uncheckedTallyPresenceCount > 0 ? "Live check pending" : "Can be posted to Tally",
+                      className: "border-blue-200 bg-blue-50 text-blue-800",
+                    },
+                    {
+                      label: "Payments missing",
+                      value: uncheckedTallyPresenceCount > 0 ? "-" : missingOutgoingCount,
+                      detail: uncheckedTallyPresenceCount > 0 ? "Live check pending" : "Need payment verification",
+                      className: "border-rose-200 bg-rose-50 text-rose-800",
+                    },
+                    {
+                      label: "Needs review",
+                      value: uncheckedTallyPresenceCount > 0 ? "-" : statementReviewIssueCount,
+                      detail: uncheckedTallyPresenceCount > 0 ? "Run Tally check first" : "Manual attention items",
+                      className: statementReviewIssueCount > 0
+                        ? "border-amber-200 bg-amber-50 text-amber-900"
+                        : "border-emerald-200 bg-emerald-50 text-emerald-800",
+                    },
+                  ].map((item) => (
+                    <div key={item.label} className={`rounded-2xl border px-4 py-3 ${item.className}`}>
+                      <div className="text-[10px] font-black uppercase tracking-[0.14em] opacity-75">
+                        {item.label}
+                      </div>
+                      <div className="mt-2 text-2xl font-black leading-none">{item.value}</div>
+                      <div className="mt-2 text-[11px] font-bold leading-4 opacity-80">{item.detail}</div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+              <div className="hidden rounded-2xl border border-[#e3d6c6] bg-[#fffaf2] px-4 py-3 shadow-sm">
                 <div className="grid gap-3 md:grid-cols-4">
                   <div>
                     <div className="text-[10px] uppercase tracking-[0.16em] text-[#9a8d7f]">Company</div>
@@ -5256,7 +5455,7 @@ export function BankStatementsPage() {
                         ) : null}
                       </button>
                       <span className="text-xs font-bold text-slate-400">
-                        {transactions.length} transactions
+                        {validTransactions.length} transaction{validTransactions.length === 1 ? "" : "s"}
                       </span>
                     </div>
                     <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-xl border border-[#e5ddd0] bg-[#faf8f4]/70 px-3.5 py-2 text-[11px] font-bold">
@@ -5382,26 +5581,26 @@ export function BankStatementsPage() {
                 </div>
 
                 <div className="max-h-[calc(100vh-470px)] overflow-auto [scrollbar-gutter:stable]">
-                  <table className="w-full min-w-[1180px] table-fixed border-collapse text-left">
+                  <table className="w-full min-w-[1320px] table-fixed border-collapse text-left">
                     <thead className="sticky top-0 z-20">
                       <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-[10px] font-bold uppercase tracking-wider text-slate-400">
                         <th className="w-20 px-3 py-3.5">Date</th>
-                        <th className="w-[22%] px-3 py-3.5">Narration</th>
+                        <th className="w-[30%] px-3 py-3.5">Narration</th>
                         <th className="w-20 px-3 py-3.5">Type</th>
-                        <th className="w-28 px-3 py-3.5">Ref / UTR</th>
+                        <th className="w-40 px-3 py-3.5">Ref / UTR</th>
                         <th className="w-28 px-3 py-3.5 text-right">Withdrawal</th>
                         <th className="w-28 px-3 py-3.5 text-right">Deposit</th>
-                        <th className="w-[19%] px-3 py-3.5">Tally ledger</th>
+                        <th className="w-[24%] px-3 py-3.5">Tally ledger</th>
                         <th className="w-44 px-3 py-3.5">Tally action</th>
                         <th className="w-32 px-3 py-3.5">Status</th>
                         <th className="w-16 px-3 py-3.5 text-right"></th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
-                      {transactions.length === 0 ? (
+                      {validTransactions.length === 0 ? (
                         <tr>
                           <td colSpan={10} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
-                            No rows were extracted. Upload another file or add rows after extraction support improves.
+                            No posting rows were extracted. Upload another file or add rows after extraction support improves.
                           </td>
                         </tr>
                       ) : visibleReviewTransactions.length === 0 ? (
@@ -5456,11 +5655,11 @@ export function BankStatementsPage() {
                               <td className="px-3 py-4 text-xs font-bold text-slate-500">
                                 {formatShortDate(transaction.transactionDate)}
                               </td>
-                              <td className="px-3 py-4">
-                                <div className="truncate text-sm font-bold text-[#1a1a1a]" title={partyTitle}>
+                              <td className="px-3 py-4 align-top">
+                                <div className="whitespace-normal break-words text-sm font-bold leading-5 text-[#1a1a1a]" title={partyTitle}>
                                   {partyTitle}
                                 </div>
-                                <div className="mt-1 truncate text-xs font-semibold text-slate-400" title={transaction.description}>
+                                <div className="mt-1 whitespace-normal break-words text-xs font-semibold leading-5 text-slate-500" title={transaction.description}>
                                   {transaction.description || "Narration not found"}
                                 </div>
                               </td>
@@ -5475,11 +5674,11 @@ export function BankStatementsPage() {
                                   {direction}
                                 </span>
                               </td>
-                              <td className="px-3 py-4">
-                                <div className="truncate text-xs font-bold text-[#1a1a1a]" title={mode}>
+                              <td className="px-3 py-4 align-top">
+                                <div className="whitespace-normal break-words text-xs font-bold leading-5 text-[#1a1a1a]" title={mode}>
                                   {mode || "-"}
                                 </div>
-                                <div className="mt-1 truncate text-xs font-semibold text-slate-400" title={reference}>
+                                <div className="mt-1 whitespace-normal text-xs font-semibold leading-5 text-slate-500 [overflow-wrap:anywhere]" title={reference}>
                                   {reference || "-"}
                                 </div>
                               </td>
@@ -5489,7 +5688,7 @@ export function BankStatementsPage() {
                               <td className="px-3 py-4 text-right text-xs font-bold text-emerald-700">
                                 {credit || "-"}
                               </td>
-                              <td className="px-3 py-4">
+                              <td className="px-3 py-4 align-top">
                                 {showLedgerSelect ? (
                                   <LedgerReviewSelect
                                     ledgerMasters={ledgerMasters}
@@ -5505,10 +5704,10 @@ export function BankStatementsPage() {
                                   />
                                 ) : (
                                   <div className="block max-w-full text-left">
-                                    <span className="block truncate text-sm font-bold text-[#1a1a1a]" title={transaction.selectedLedgerName}>
+                                    <span className="block whitespace-normal break-words text-sm font-bold leading-5 text-[#1a1a1a]" title={transaction.selectedLedgerName}>
                                       {transaction.selectedLedgerName}
                                     </span>
-                                    <span className="mt-1 block truncate text-xs font-semibold text-slate-400">
+                                    <span className="mt-1 block whitespace-normal break-words text-xs font-semibold leading-5 text-slate-500">
                                       {getLedgerGroupLabel(transaction, ledgerMasters)}
                                     </span>
                                   </div>
@@ -5642,6 +5841,9 @@ export function BankStatementsPage() {
                   <div>
                     Showing {visibleReviewTransactions.length === 0 ? 0 : 1}-
                     {visibleReviewTransactions.length} of {filteredTransactions.length}
+                    {ignoredStatementRowCount > 0
+                      ? ` (${ignoredStatementRowCount} statement header/summary row${ignoredStatementRowCount === 1 ? "" : "s"} ignored)`
+                      : ""}
                   </div>
                 </div>
               </div>
@@ -6094,11 +6296,13 @@ export function BankStatementsPage() {
                 <div className="space-y-1.5">
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs font-bold">
                     <span className={newReceiptCount > 0 ? "text-blue-800" : "text-emerald-700"}>
-                      {uncheckedTallyPresenceCount > 0
-                        ? "Checking statement"
-                        : newReceiptCount > 0
-                          ? `${newReceiptCount} receipt${newReceiptCount === 1 ? "" : "s"} ready to post`
-                          : "Nothing to post"}
+                    {matchingBills
+                      ? "Checking statement"
+                      : uncheckedTallyPresenceCount > 0
+                        ? "Tally check pending"
+                      : newReceiptCount > 0
+                        ? `${newReceiptCount} receipt${newReceiptCount === 1 ? "" : "s"} ready to post`
+                        : "Nothing to post"}
                     </span>
                     {uncheckedTallyPresenceCount === 0 && statementReviewIssueCount > 0 ? (
                       <span className="font-semibold text-amber-700">

@@ -6,8 +6,27 @@ import {
   type BankAccountInput,
 } from "@/lib/bank-statements";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { execFile } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 export const runtime = "nodejs";
+
+type BankStatementPasswordErrorCode =
+  | "BANK_STATEMENT_PASSWORD_REQUIRED"
+  | "BANK_STATEMENT_PASSWORD_INCORRECT"
+  | "BANK_STATEMENT_PASSWORD_UNSUPPORTED";
+
+class BankStatementPasswordError extends Error {
+  code: BankStatementPasswordErrorCode;
+
+  constructor(code: BankStatementPasswordErrorCode, message: string) {
+    super(message);
+    this.name = "BankStatementPasswordError";
+    this.code = code;
+  }
+}
 
 function readJsonField<T>(value: FormDataEntryValue | null, fallback: T): T {
   if (typeof value !== "string" || !value.trim()) return fallback;
@@ -22,12 +41,151 @@ function readTextField(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function isPdfUpload(file: File) {
+  return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+}
+
+function execFileWithInput(command: string, args: string[], input: string) {
+  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const child = execFile(command, args, { encoding: "utf8" }, (error, stdout, stderr) => {
+      if (error) {
+        reject(Object.assign(error, { stdout, stderr }));
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+    child.stdin?.end(input);
+  });
+}
+
+async function unlockPdfIfNeeded(bytes: Uint8Array, password: string) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bank-statement-unlock-"));
+  const inputPath = path.join(tmpDir, "input.pdf");
+  const outputPath = path.join(tmpDir, "unlocked.pdf");
+  const script = `
+import json
+import sys
+from pathlib import Path
+
+try:
+    from PyPDF2 import PdfReader, PdfWriter
+except Exception:
+    print(json.dumps({"ok": False, "code": "unsupported"}))
+    sys.exit(0)
+
+input_path = Path(sys.argv[1])
+output_path = Path(sys.argv[2])
+password = sys.stdin.read()
+
+try:
+    reader = PdfReader(str(input_path))
+    if not reader.is_encrypted:
+        print(json.dumps({"ok": True, "encrypted": False}))
+        sys.exit(0)
+
+    if not password:
+        print(json.dumps({"ok": False, "code": "password_required"}))
+        sys.exit(0)
+
+    decrypt_result = reader.decrypt(password)
+    if not decrypt_result:
+        print(json.dumps({"ok": False, "code": "incorrect_password"}))
+        sys.exit(0)
+
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    with output_path.open("wb") as output_file:
+        writer.write(output_file)
+
+    print(json.dumps({"ok": True, "encrypted": True}))
+except Exception:
+    print(json.dumps({"ok": False, "code": "unsupported"}))
+`;
+
+  try {
+    fs.writeFileSync(inputPath, Buffer.from(bytes));
+    try {
+      const { stdout } = await execFileWithInput("pdfinfo", [inputPath], "");
+      if (/Encrypted:\s*no\b/i.test(stdout)) {
+        return bytes;
+      }
+      if (/Encrypted:\s*yes\b/i.test(stdout) && !password) {
+        throw new BankStatementPasswordError(
+          "BANK_STATEMENT_PASSWORD_REQUIRED",
+          "This bank statement is password protected. Enter the statement password to continue."
+        );
+      }
+    } catch (error) {
+      if (error instanceof BankStatementPasswordError) throw error;
+      const diagnostic = `${(error as { stderr?: unknown }).stderr ?? ""} ${(error as Error).message ?? ""}`;
+      if (/password|encrypted/i.test(diagnostic) && !password) {
+        throw new BankStatementPasswordError(
+          "BANK_STATEMENT_PASSWORD_REQUIRED",
+          "This bank statement is password protected. Enter the statement password to continue."
+        );
+      }
+    }
+
+    const { stdout } = await execFileWithInput("python3", ["-c", script, inputPath, outputPath], password);
+    const result = JSON.parse(stdout || "{}") as { ok?: boolean; encrypted?: boolean; code?: string };
+    if (result.ok && result.encrypted && fs.existsSync(outputPath)) {
+      return new Uint8Array(fs.readFileSync(outputPath));
+    }
+    if (result.ok) {
+      return bytes;
+    }
+    if (result.code === "password_required") {
+      throw new BankStatementPasswordError(
+        "BANK_STATEMENT_PASSWORD_REQUIRED",
+        "This bank statement is password protected. Enter the statement password to continue."
+      );
+    }
+    if (result.code === "incorrect_password") {
+      throw new BankStatementPasswordError(
+        "BANK_STATEMENT_PASSWORD_INCORRECT",
+        "The password did not unlock this statement. Check the password and try again."
+      );
+    }
+    throw new BankStatementPasswordError(
+      "BANK_STATEMENT_PASSWORD_UNSUPPORTED",
+      "This statement is password protected with an encryption type Kalika cannot unlock. Remove the password in your bank PDF viewer, export a new PDF, then upload it again."
+    );
+  } catch (error) {
+    if (error instanceof BankStatementPasswordError) throw error;
+    throw new BankStatementPasswordError(
+      "BANK_STATEMENT_PASSWORD_UNSUPPORTED",
+      "Kalika could not check this password-protected PDF on this server. Remove the password, export a new PDF, then upload it again."
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+function getEffectiveImportStatus(row: Record<string, unknown>) {
+  const rawStatus = String(row.status ?? "");
+  const meta = readRecord(row.processing_meta);
+  const analysis = readRecord(meta.analysis);
+  const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
+  const jobStatus = typeof meta.jobStatus === "string" ? meta.jobStatus : "";
+
+  if (
+    rawStatus === "processing" &&
+    (analysisStatus === "completed" || jobStatus === "completed")
+  ) {
+    const previewTransactionCount = Number(meta.previewTransactionCount ?? 0);
+    return previewTransactionCount > 0 ? "ready_to_review" : "manual_review_required";
+  }
+
+  return rawStatus;
+}
+
 function serializeImport(row: Record<string, unknown>) {
   return {
     id: String(row.id),
     bankAccountId: row.bank_account_id ? String(row.bank_account_id) : null,
     originalFileName: String(row.original_file_name ?? ""),
-    status: String(row.status ?? ""),
+    status: getEffectiveImportStatus(row),
     extractedBankName: row.extracted_bank_name ? String(row.extracted_bank_name) : null,
     extractedAccountNumber: row.extracted_account_number ? String(row.extracted_account_number) : null,
     extractedAccountHolderName: row.extracted_account_holder_name
@@ -122,15 +280,17 @@ export async function POST(request: Request) {
     const financialYear = readTextField(formData.get("financialYear"));
     const bankLedgerName = readTextField(formData.get("bankLedgerName"));
     const syncBeforeAnalysis = readTextField(formData.get("syncBeforeAnalysis")) !== "false";
+    const statementPassword = readTextField(formData.get("statementPassword"));
 
     if (!connectionId) {
       return jsonWithCors(request, { error: "Select a Tally company before upload." }, { status: 400 });
     }
     const bytes = new Uint8Array(await file.arrayBuffer());
+    const uploadBytes = isPdfUpload(file) ? await unlockPdfIfNeeded(bytes, statementPassword) : bytes;
     const storagePath = buildStoragePath(user.id, file.name || "bank-statement");
     const supabase = createSupabaseAdminClient();
 
-    const upload = await supabase.storage.from(BANK_STATEMENT_BUCKET).upload(storagePath, bytes, {
+    const upload = await supabase.storage.from(BANK_STATEMENT_BUCKET).upload(storagePath, uploadBytes, {
       contentType: file.type || "application/octet-stream",
       upsert: false,
     });
@@ -195,6 +355,13 @@ export async function POST(request: Request) {
 
     return jsonWithCors(request, serializePreviewFromMeta(createdImport as Record<string, unknown>));
   } catch (error) {
+    if (error instanceof BankStatementPasswordError) {
+      return jsonWithCors(
+        request,
+        { error: error.message, code: error.code },
+        { status: error.code === "BANK_STATEMENT_PASSWORD_REQUIRED" ? 423 : 400 }
+      );
+    }
     console.error("Error in POST /api/bank-statements/imports:", error);
     return jsonWithCors(
       request,

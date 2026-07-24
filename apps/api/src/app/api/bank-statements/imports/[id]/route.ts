@@ -123,12 +123,32 @@ async function resolveStatementBankLedger(
     requiresSelection: !legacyProvidedLedger,
     verified: false,
   };
-}function serializeImport(row: Record<string, unknown>) {
+}
+
+function getEffectiveImportStatus(row: Record<string, unknown>) {
+  const rawStatus = String(row.status ?? "");
+  const meta = readRecord(row.processing_meta);
+  const analysis = readRecord(meta.analysis);
+  const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
+  const jobStatus = typeof meta.jobStatus === "string" ? meta.jobStatus : "";
+
+  if (
+    rawStatus === "processing" &&
+    (analysisStatus === "completed" || jobStatus === "completed")
+  ) {
+    const previewTransactionCount = Number(meta.previewTransactionCount ?? 0);
+    return previewTransactionCount > 0 ? "ready_to_review" : "manual_review_required";
+  }
+
+  return rawStatus;
+}
+
+function serializeImport(row: Record<string, unknown>) {
   return {
     id: String(row.id),
     bankAccountId: row.bank_account_id ? String(row.bank_account_id) : null,
     originalFileName: String(row.original_file_name ?? ""),
-    status: String(row.status ?? ""),
+    status: getEffectiveImportStatus(row),
     extractedBankName: row.extracted_bank_name ? String(row.extracted_bank_name) : null,
     extractedAccountNumber: row.extracted_account_number ? String(row.extracted_account_number) : null,
     extractedAccountHolderName: row.extracted_account_holder_name
@@ -312,6 +332,7 @@ export async function GET(
     if (previewError) throw previewError;
 
     const processingMeta = readRecord(importRow.processing_meta);
+    const effectiveImportStatus = getEffectiveImportStatus(importRow as Record<string, unknown>);
     const previewMeta = readRecord(processingMeta.preview);
     const previewAccount = readRecord(previewMeta.account);
     const storedPreviewTransactions = isPreviewTransactionArray(previewMeta.transactions);
@@ -332,7 +353,7 @@ export async function GET(
     const jobIsTerminal = ["succeeded", "failed", "cancelled"].includes(jobStatus);
     const processing =
       !jobIsTerminal &&
-      (importRow.status === "processing" || analysisStatus === "queued" || analysisStatus === "processing");
+      (effectiveImportStatus === "processing" || analysisStatus === "queued" || analysisStatus === "processing");
 
     if (!jobRow && processing) {
       const { data: repairedJobRow, error: repairJobError } = await supabase
@@ -353,8 +374,8 @@ export async function GET(
     }
 
     const requiresManualExtraction =
-      importRow.status === "manual_review_required" ||
-      importRow.status === "failed" ||
+      effectiveImportStatus === "manual_review_required" ||
+      effectiveImportStatus === "failed" ||
       Boolean(previewMeta.requiresManualExtraction) ||
       (!processing && transactions.length === 0);
     const account = {
@@ -383,7 +404,7 @@ export async function GET(
     };
     const candidates = Array.isArray(previewMeta.candidates)
       ? previewMeta.candidates
-      : ["ready_to_review", "ready_to_confirm", "needs_account_selection"].includes(importRow.status)
+      : ["ready_to_review", "ready_to_confirm", "needs_account_selection"].includes(effectiveImportStatus)
       ? await findBankAccountCandidates(supabase, user.id, {
           bankName: account.bankName,
           accountNumber: account.accountNumber,

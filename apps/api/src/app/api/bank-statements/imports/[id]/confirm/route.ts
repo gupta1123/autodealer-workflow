@@ -98,12 +98,36 @@ function isSupabaseConnectivityError(error: unknown) {
   return /fetch failed|ConnectTimeoutError|UND_ERR_CONNECT_TIMEOUT|ECONNRESET|ETIMEDOUT|ENOTFOUND/i.test(text);
 }
 
+function readRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function getEffectiveImportStatus(row: Record<string, unknown>) {
+  const rawStatus = String(row.status ?? "");
+  const meta = readRecord(row.processing_meta);
+  const analysis = readRecord(meta.analysis);
+  const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
+  const jobStatus = typeof meta.jobStatus === "string" ? meta.jobStatus : "";
+
+  if (
+    rawStatus === "processing" &&
+    (analysisStatus === "completed" || jobStatus === "completed")
+  ) {
+    const previewTransactionCount = Number(meta.previewTransactionCount ?? 0);
+    return previewTransactionCount > 0 ? "ready_to_review" : "manual_review_required";
+  }
+
+  return rawStatus;
+}
+
 function serializeImport(row: Record<string, unknown>) {
   return {
     id: String(row.id),
     bankAccountId: row.bank_account_id ? String(row.bank_account_id) : null,
     originalFileName: String(row.original_file_name ?? ""),
-    status: String(row.status ?? ""),
+    status: getEffectiveImportStatus(row),
     statementPeriodStart: row.statement_period_start ? String(row.statement_period_start) : null,
     statementPeriodEnd: row.statement_period_end ? String(row.statement_period_end) : null,
     importedTransactionCount: Number(row.imported_transaction_count ?? 0),
