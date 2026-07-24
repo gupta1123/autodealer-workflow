@@ -2380,6 +2380,17 @@ function normalizeFetchedBankLedgersByCompany(
   return next;
 }
 
+function getPdfPreviewUrl(objectUrl: string) {
+  return `${objectUrl}#navpanes=0&view=Fit&zoom=page-fit`;
+}
+
+function formatFileSize(size: number | null | undefined) {
+  if (!size || size <= 0) return "Size unavailable";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export function BankStatementsPage() {
   const router = useRouter();
   const storedCompanySelection = useMemo(() => readStoredCompanySelection(), []);
@@ -2592,6 +2603,7 @@ export function BankStatementsPage() {
   }, [bankLedgerChangeMode, bankLedgerName, exactBankLedgerMatch, preview]);
 
   const uploadContextReady = Boolean(tallyCompanyContextVerified);
+  const workflowStep = preview ? 3 : documentPreview ? 1 : loading ? 2 : 0;
   const setupErrorMessage = !tallyConnectionId
     ? "Select the Tally company first."
     : !tallyConnected
@@ -3516,6 +3528,17 @@ export function BankStatementsPage() {
     }
   }
 
+  function clearSelectedStatementFile() {
+    setFile(null);
+    setDocumentPreview(null);
+    setDocumentPreviewLoading(false);
+    setDragActive(false);
+    setBanner(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
   async function analyzeFile(nextFile = file) {
     if (!nextFile) {
       setBanner({ tone: "error", text: "Select a bank statement file." });
@@ -4337,8 +4360,8 @@ export function BankStatementsPage() {
         ))}
       </div>
       <div className={`bank-statements-workflow min-h-screen bg-[#f7f7f5] px-4 py-6 text-[#1a1a1a] sm:px-8 sm:py-8 ${preview ? "pb-40" : ""}`}>
-        <div className="mx-auto flex max-w-7xl flex-col gap-6">
-          <header className={`flex flex-col gap-3 md:flex-row md:items-start md:justify-between border-b border-[#e5ddd0] ${preview ? "pb-3" : "pb-6"}`}>
+        <div className="mx-auto flex max-w-7xl flex-col gap-4">
+          <header className={`flex flex-col gap-3 md:flex-row md:items-start md:justify-between border-b border-[#e5ddd0] ${preview ? "pb-3" : "pb-4"}`}>
             <div>
               {!preview && (
                 <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200/50 text-[10px] font-bold uppercase tracking-wider text-amber-800 mb-2">
@@ -4346,7 +4369,7 @@ export function BankStatementsPage() {
                   ERP Reconciliation
                 </div>
               )}
-              <h1 className={`${preview ? "text-xl sm:text-2xl" : "text-3xl"} font-black tracking-tight text-[#1a1a1a] flex items-center gap-2`}>
+              <h1 className={`${preview ? "text-xl sm:text-2xl" : "text-2xl sm:text-[28px]"} font-black tracking-tight text-[#1a1a1a] flex items-center gap-2`}>
                 Bank Statements
                 {preview && (
                   <span
@@ -4424,6 +4447,40 @@ export function BankStatementsPage() {
             </div>
           </header>
 
+          {!preview ? (
+            <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-[#e5ddd0] bg-white px-3 py-2 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+              {["Upload statement", "Review file", "Analyze", "Match transactions"].map((step, index) => {
+                const complete = workflowStep > index;
+                const current = workflowStep === index;
+                return (
+                  <div
+                    key={step}
+                    className={`flex items-center gap-2 rounded-xl px-2.5 py-1.5 text-[11px] font-extrabold ${
+                      complete
+                        ? "bg-emerald-50 text-emerald-800"
+                        : current
+                          ? "bg-[#fff7e8] text-amber-900"
+                          : "text-slate-400"
+                    }`}
+                  >
+                    <span
+                      className={`grid h-5 w-5 place-items-center rounded-full text-[10px] ${
+                        complete
+                          ? "bg-emerald-600 text-white"
+                          : current
+                            ? "bg-amber-500 text-white"
+                            : "bg-slate-100 text-slate-400"
+                      }`}
+                    >
+                      {complete ? <CheckCircle2 className="h-3.5 w-3.5" /> : index + 1}
+                    </span>
+                    {step}
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+
           {banner && (!preview || banner.tone !== "success") && (
             <div
               className={`flex items-start gap-2 rounded-xl border px-4 py-3 text-sm font-semibold ${
@@ -4473,8 +4530,18 @@ export function BankStatementsPage() {
           ) : null}
 
           {!preview ? (
-            <section className="grid gap-6 lg:grid-cols-[0.95fr_1.05fr]">
-              <div className="rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+            <section
+              className={`grid gap-5 ${
+                documentPreview || documentPreviewLoading
+                  ? ""
+                  : "lg:grid-cols-[0.95fr_1.05fr]"
+              }`}
+            >
+              <div
+                className={`rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)] ${
+                  documentPreview || documentPreviewLoading ? "hidden" : ""
+                }`}
+              >
                 <div className="space-y-4">
                   <label className="block">
                     <span className="text-xs font-bold text-[#5a5046]">Company</span>
@@ -4506,7 +4573,9 @@ export function BankStatementsPage() {
                       <span className="min-w-0">
                         <span className="flex flex-wrap items-center gap-2">
                           <span className="text-xs font-extrabold text-[#1a1a1a]">
-                            Sync current Tally company before analysis
+                            {documentPreview || documentPreviewLoading
+                              ? "Sync before analysis"
+                              : "Sync current Tally company before analysis"}
                           </span>
                           <span
                             className={`rounded-full px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide ${
@@ -4531,10 +4600,22 @@ export function BankStatementsPage() {
                       </span>
                       <input
                         checked={syncBeforeAnalysis}
-                        className="mt-0.5 h-5 w-5 shrink-0 rounded border-[#e5ddd0] accent-amber-600 focus:ring-amber-500"
+                        className="sr-only"
                         onChange={(event) => setSyncBeforeAnalysis(event.target.checked)}
                         type="checkbox"
                       />
+                      <span
+                        aria-hidden="true"
+                        className={`mt-0.5 flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition ${
+                          syncBeforeAnalysis ? "bg-amber-500" : "bg-slate-300"
+                        }`}
+                      >
+                        <span
+                          className={`h-5 w-5 rounded-full bg-white shadow-sm transition ${
+                            syncBeforeAnalysis ? "translate-x-5" : "translate-x-0"
+                          }`}
+                        />
+                      </span>
                     </span>
                   </label>
 
@@ -4555,7 +4636,11 @@ export function BankStatementsPage() {
                 </div>
               </div>
 
-              <section className="rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+              <section
+                className={`rounded-2xl border border-[#e5ddd0] bg-white shadow-[0_2px_8px_rgba(0,0,0,0.02)] ${
+                  documentPreview || documentPreviewLoading ? "p-3 sm:p-4" : "p-6"
+                }`}
+              >
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -4635,45 +4720,83 @@ export function BankStatementsPage() {
                 ) : null}
                 {documentPreview ? (
                   <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-[#fffdf9] shadow-[0_8px_24px_rgba(45,45,45,0.06)]">
-                    <div className="flex flex-col gap-4 border-b border-[#eee5d8] bg-[#fffaf2] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-                      <div className="min-w-0">
-                        <div className="flex min-w-0 items-center gap-3">
-                          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#2d2d2d] text-white">
-                            <UploadCloud className="h-5 w-5" />
-                          </div>
-                          <div className="min-w-0">
-                            <div className="truncate text-sm font-extrabold text-[#1a1a1a]" title={documentPreview.fileName}>
-                              {documentPreview.fileName}
-                            </div>
-                            <div className="mt-0.5 text-xs font-semibold text-[#7a6c5f]">
-                              {documentPreview.error ? (
-                                "Preview needs attention"
-                              ) : documentPreview.kind === "csv" ? (
-                                `${documentPreview.totalRows} transaction row${documentPreview.totalRows === 1 ? "" : "s"} found. Showing ${documentPreview.rows.length}.`
-                              ) : documentPreview.kind === "text" ? (
-                                `${documentPreview.totalRows} readable line${documentPreview.totalRows === 1 ? "" : "s"} found. Showing ${documentPreview.textLines.length}.`
-                              ) : documentPreview.kind === "pdf" ? (
-                                "PDF selected. Review it below before analysis."
-                              ) : documentPreview.kind === "image" ? (
-                                "Image selected. Review it below before analysis."
-                              ) : (
-                                "Review the selected file before analysis."
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                      <div className="flex flex-wrap gap-2">
+                    <div className="grid gap-3 border-b border-[#eee5d8] bg-white px-4 py-3 lg:grid-cols-[minmax(220px,0.7fr)_minmax(240px,0.75fr)_auto] lg:items-end">
+                      <label className="block min-w-0">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-[#8b7a68]">Company</span>
+                        <select
+                          className="mt-1 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
+                          onChange={(event) => updateStatementContext(event.target.value)}
+                          value={selectedCompanyId}
+                        >
+                          <option value="" disabled>
+                            {companyOptions.length === 0 ? "No connected Tally company" : "Select Tally company"}
+                          </option>
+                          {companyOptions.map((company) => (
+                            <option key={company.id} value={company.id}>
+                              {formatCompanyOptionLabel(company)}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label
+                        className={`flex min-h-9 items-center justify-between gap-3 rounded-xl border px-3 py-2 transition ${
+                          syncBeforeAnalysis
+                            ? "border-amber-200 bg-[#fffaf2]"
+                            : "border-[#e5ddd0] bg-[#faf8f4]/55"
+                        }`}
+                        aria-describedby="bank-statement-sync-mode-status-preview"
+                      >
+                        <span className="min-w-0">
+                          <span className="flex flex-wrap items-center gap-2">
+                            <span className="text-xs font-extrabold text-[#1a1a1a]">Sync before analysis</span>
+                            <span
+                              className={`rounded-full px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide ${
+                                syncBeforeAnalysis
+                                  ? "bg-amber-100 text-amber-800"
+                                  : "bg-slate-100 text-slate-600"
+                              }`}
+                            >
+                              {syncBeforeAnalysis ? "On" : "Off"}
+                            </span>
+                          </span>
+                          <span
+                            id="bank-statement-sync-mode-status-preview"
+                            className="sr-only"
+                          >
+                            {syncModeStatus.text}
+                          </span>
+                        </span>
+                        <input
+                          checked={syncBeforeAnalysis}
+                          className="sr-only"
+                          onChange={(event) => setSyncBeforeAnalysis(event.target.checked)}
+                          type="checkbox"
+                        />
+                        <span
+                          aria-hidden="true"
+                          className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition ${
+                            syncBeforeAnalysis ? "bg-amber-500" : "bg-slate-300"
+                          }`}
+                        >
+                          <span
+                            className={`h-5 w-5 rounded-full bg-white shadow-sm transition ${
+                              syncBeforeAnalysis ? "translate-x-5" : "translate-x-0"
+                            }`}
+                          />
+                        </span>
+                      </label>
+
+                      <div className="flex flex-wrap gap-2 lg:justify-end">
                         <button
                           type="button"
                           onClick={() => {
-                            setDocumentPreview(null);
-                            setFile(null);
+                            clearSelectedStatementFile();
                             fileInputRef.current?.click();
                           }}
-                          className="inline-flex h-8.5 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                          className="inline-flex h-9 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
                         >
-                          Choose another
+                          Upload another
                         </button>
                         <button
                           type="button"
@@ -4681,74 +4804,151 @@ export function BankStatementsPage() {
                           onClick={() => {
                             if (file) void analyzeFile(file);
                           }}
-                          className="inline-flex h-8.5 items-center justify-center rounded-xl bg-[#2d2d2d] px-3.5 text-xs font-bold text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+                          className="inline-flex h-9 items-center justify-center rounded-xl bg-[#2d2d2d] px-4 text-xs font-bold text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           Analyze file
                         </button>
                       </div>
                     </div>
-                    {documentPreview.error ? (
-                      <div className="flex items-start gap-2 px-5 py-4 text-xs font-semibold text-rose-800">
-                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                        <span>{documentPreview.error}</span>
+
+                    <div className="grid gap-3 border-b border-[#eee5d8] bg-[#fffaf2] px-4 py-3">
+                      <div className="flex min-w-0 items-center gap-3">
+                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#2d2d2d] text-white">
+                          <UploadCloud className="h-4.5 w-4.5" />
+                        </div>
+                        <div className="min-w-0">
+                          <div className="truncate text-sm font-extrabold text-[#1a1a1a]" title={documentPreview.fileName}>
+                            {documentPreview.fileName}
+                          </div>
+                          <div className="mt-0.5 text-xs font-semibold text-[#7a6c5f]">
+                            {documentPreview.error ? (
+                              "Preview needs attention"
+                            ) : documentPreview.kind === "csv" ? (
+                              `${formatFileSize(file?.size)} - ${documentPreview.totalRows} transaction row${documentPreview.totalRows === 1 ? "" : "s"} found. Showing ${documentPreview.rows.length}.`
+                            ) : documentPreview.kind === "text" ? (
+                              `${formatFileSize(file?.size)} - ${documentPreview.totalRows} readable line${documentPreview.totalRows === 1 ? "" : "s"} found. Showing ${documentPreview.textLines.length}.`
+                            ) : documentPreview.kind === "pdf" ? (
+                              `${formatFileSize(file?.size)} - PDF selected. Review it below before analysis.`
+                            ) : documentPreview.kind === "image" ? (
+                              `${formatFileSize(file?.size)} - Image selected. Review it below before analysis.`
+                            ) : (
+                              "Review the selected file before analysis."
+                            )}
+                          </div>
+                        </div>
                       </div>
-                    ) : documentPreview.kind === "csv" ? (
-                      <div className="max-h-[360px] overflow-auto bg-white">
-                        <table className="min-w-full border-collapse text-left text-xs">
-                          <thead className="sticky top-0 bg-[#f7f2ea] text-[#5a5046]">
-                            <tr>
-                              {documentPreview.headers.map((header, index) => (
-                                <th
-                                  key={`${header}-${index}`}
-                                  className="max-w-[180px] border-b border-[#e5ddd0] px-3 py-2 font-extrabold"
-                                  title={header}
-                                >
-                                  <span className="block truncate">{header}</span>
-                                </th>
-                              ))}
-                            </tr>
-                          </thead>
-                          <tbody className="bg-white text-[#2b241d]">
-                            {documentPreview.rows.map((row, rowIndex) => (
-                              <tr key={`csv-row-${rowIndex}`} className="border-b border-[#f0e8dc] last:border-b-0">
-                                {row.map((value, cellIndex) => (
-                                  <td
-                                    key={`csv-cell-${rowIndex}-${cellIndex}`}
-                                    className="max-w-[180px] px-3 py-2 font-semibold"
-                                    title={value}
-                                  >
-                                    <span className="block truncate">{value || "-"}</span>
-                                  </td>
+                    </div>
+                    <div className="grid gap-4 bg-white p-4 xl:grid-cols-[minmax(0,1fr)_280px]">
+                      <div className="overflow-hidden rounded-xl border border-[#e5ddd0] bg-white">
+                        {documentPreview.error ? (
+                          <div className="flex items-start gap-2 px-5 py-4 text-xs font-semibold text-rose-800">
+                            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                            <span>{documentPreview.error}</span>
+                          </div>
+                        ) : documentPreview.kind === "csv" ? (
+                          <div className="max-h-[560px] overflow-auto bg-white">
+                            <table className="min-w-full border-collapse text-left text-xs">
+                              <thead className="sticky top-0 bg-[#f7f2ea] text-[#5a5046]">
+                                <tr>
+                                  {documentPreview.headers.map((header, index) => (
+                                    <th
+                                      key={`${header}-${index}`}
+                                      className="max-w-[220px] border-b border-[#e5ddd0] px-3 py-2 font-extrabold"
+                                      title={header}
+                                    >
+                                      <span className="block truncate">{header}</span>
+                                    </th>
+                                  ))}
+                                </tr>
+                              </thead>
+                              <tbody className="bg-white text-[#2b241d]">
+                                {documentPreview.rows.map((row, rowIndex) => (
+                                  <tr key={`csv-row-${rowIndex}`} className="border-b border-[#f0e8dc] last:border-b-0">
+                                    {row.map((value, cellIndex) => (
+                                      <td
+                                        key={`csv-cell-${rowIndex}-${cellIndex}`}
+                                        className="max-w-[220px] px-3 py-2 font-semibold"
+                                        title={value}
+                                      >
+                                        <span className="block truncate">{value || "-"}</span>
+                                      </td>
+                                    ))}
+                                  </tr>
                                 ))}
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : documentPreview.kind === "text" ? (
+                          <pre className="max-h-[560px] overflow-auto whitespace-pre-wrap bg-white px-5 py-4 text-xs font-semibold leading-5 text-[#2b241d]">
+                            {documentPreview.textLines.join("\n")}
+                          </pre>
+                        ) : documentPreview.kind === "pdf" && documentPreview.objectUrl ? (
+                          <iframe
+                            src={getPdfPreviewUrl(documentPreview.objectUrl)}
+                            title={`Preview of ${documentPreview.fileName}`}
+                            className="h-[680px] w-full bg-white"
+                          />
+                        ) : documentPreview.kind === "image" && documentPreview.objectUrl ? (
+                          <div className="flex max-h-[640px] items-center justify-center overflow-auto bg-white p-5">
+                            {/* eslint-disable-next-line @next/next/no-img-element -- Local object URLs cannot be optimized by next/image. */}
+                            <img
+                              src={documentPreview.objectUrl}
+                              alt={`Preview of ${documentPreview.fileName}`}
+                              className="max-h-[600px] max-w-full rounded-xl object-contain"
+                            />
+                          </div>
+                        ) : (
+                          <div className="px-5 py-4 text-xs font-semibold text-[#7a6c5f]">
+                            No preview is available for this file.
+                          </div>
+                        )}
                       </div>
-                    ) : documentPreview.kind === "text" ? (
-                      <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap bg-white px-5 py-4 text-xs font-semibold leading-5 text-[#2b241d]">
-                        {documentPreview.textLines.join("\n")}
-                      </pre>
-                    ) : documentPreview.kind === "pdf" && documentPreview.objectUrl ? (
-                      <iframe
-                        src={documentPreview.objectUrl}
-                        title={`Preview of ${documentPreview.fileName}`}
-                        className="h-[460px] w-full bg-white"
-                      />
-                    ) : documentPreview.kind === "image" && documentPreview.objectUrl ? (
-                      <div className="flex max-h-[460px] items-center justify-center overflow-auto bg-white p-5">
-                        {/* eslint-disable-next-line @next/next/no-img-element -- Local object URLs cannot be optimized by next/image. */}
-                        <img
-                          src={documentPreview.objectUrl}
-                          alt={`Preview of ${documentPreview.fileName}`}
-                          className="max-h-[420px] max-w-full rounded-xl object-contain"
-                        />
-                      </div>
-                    ) : (
-                      <div className="px-5 py-4 text-xs font-semibold text-[#7a6c5f]">
-                        No preview is available for this file.
-                      </div>
-                    )}
+                      <aside className="rounded-xl border border-[#e5ddd0] bg-[#fffdf9] p-4">
+                        <div className="text-xs font-extrabold uppercase tracking-wider text-[#8b7a68]">
+                          Analysis readiness
+                        </div>
+                        <div className="mt-3 space-y-3">
+                          {[
+                            {
+                              label: "Tally company verified",
+                              ready: tallyCompanyContextVerified,
+                              detail: selectedCompanyName || "Select a company",
+                            },
+                            {
+                              label: "Bank statement selected",
+                              ready: Boolean(file && !documentPreview.error),
+                              detail: file ? formatFileSize(file.size) : "No file selected",
+                            },
+                            {
+                              label: syncBeforeAnalysis ? "Sync enabled" : "Sync disabled",
+                              ready: syncModeStatus.tone !== "warning",
+                              detail: syncBeforeAnalysis
+                                ? "Will sync before analysis"
+                                : "Uses existing company data",
+                            },
+                            {
+                              label: "Ready to analyze",
+                              ready: Boolean(tallyCompanyContextVerified && file && !documentPreview.error),
+                              detail: documentPreview.error ? "Fix preview issue" : "All required inputs set",
+                            },
+                          ].map((item) => (
+                            <div key={item.label} className="flex items-start gap-2">
+                              {item.ready ? (
+                                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700" />
+                              ) : (
+                                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                              )}
+                              <div className="min-w-0">
+                                <div className="text-xs font-extrabold text-[#1a1a1a]">{item.label}</div>
+                                <div className="mt-0.5 text-[11px] font-semibold leading-4 text-[#7a6c5f]">
+                                  {item.detail}
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </aside>
+                    </div>
                   </div>
                 ) : null}
               </section>

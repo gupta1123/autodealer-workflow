@@ -79,6 +79,7 @@ export async function POST(
       .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_company_loaded, last_heartbeat_at, updated_at")
       .eq("id", proposal.connection_id)
       .eq("owner_user_id", user.id)
+      .is("revoked_at", null)
       .maybeSingle();
 
     if (connectionError) throw connectionError;
@@ -95,6 +96,7 @@ export async function POST(
         .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_company_loaded, last_heartbeat_at, updated_at")
         .eq("owner_user_id", user.id)
         .eq("last_company_name", proposalCompanyName)
+        .is("revoked_at", null)
         .order("last_heartbeat_at", { ascending: false, nullsFirst: false })
         .order("updated_at", { ascending: false })
         .limit(20);

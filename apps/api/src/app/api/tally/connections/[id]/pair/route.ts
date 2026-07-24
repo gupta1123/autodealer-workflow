@@ -6,31 +6,11 @@ import {
   connectorSupportsReliableActiveCompany,
   createBridgeToken,
   hashSecret,
+  isReliableInstallationId,
   serializeTallyConnection,
+  TALLY_CONNECTION_SELECT,
   type TallyConnectionRow,
 } from "@/lib/tally/connections";
-
-const CONNECTION_SELECT = [
-  "id",
-  "owner_user_id",
-  "display_name",
-  "status",
-  "tally_url",
-  "pairing_code_hash",
-  "pairing_code_expires_at",
-  "paired_at",
-  "bridge_name",
-  "bridge_version",
-  "bridge_machine_id",
-  "last_heartbeat_at",
-  "last_tested_at",
-  "last_tally_reachable",
-  "last_company_loaded",
-  "last_company_name",
-  "last_error",
-  "created_at",
-  "updated_at",
-].join(", ");
 
 function normalizeMetadata(value: unknown, fallback: string) {
   if (typeof value !== "string" || value.trim().length === 0) {
@@ -93,6 +73,7 @@ export async function POST(
     const controlToken = readPairingCode(body.controlToken);
     const bridgeVersion = normalizeMetadata(body.bridgeVersion, "unknown");
     const bridgeMachineId = normalizeMetadata(body.bridgeMachineId, "unknown");
+    const bridgeMachineName = normalizeMetadata(body.bridgeMachineName, "This computer");
 
     if (!pairingCode) {
       return jsonWithCors(request, { error: "Pairing code is required." }, { status: 400 });
@@ -103,7 +84,7 @@ export async function POST(
 
     if (
       !connectorSupportsReliableActiveCompany(bridgeVersion) ||
-      bridgeMachineId === "unknown"
+      !isReliableInstallationId(bridgeMachineId)
     ) {
       return jsonWithCors(
         request,
@@ -122,6 +103,7 @@ export async function POST(
         bridgeName: normalizeMetadata(body.bridgeName, "Tally Bridge"),
         bridgeVersion,
         bridgeMachineId,
+        bridgeMachineName,
         controlToken,
       });
 
@@ -138,8 +120,9 @@ export async function POST(
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_connections")
-      .select(CONNECTION_SELECT)
+      .select(TALLY_CONNECTION_SELECT)
       .eq("id", id)
+      .is("revoked_at", null)
       .maybeSingle();
 
     if (error) {
@@ -212,28 +195,81 @@ export async function POST(
     const reportedCompanyLoaded = toNullableBoolean(body.companyLoaded);
     const companyLoaded =
       tallyReachable === true && reportedCompanyLoaded === true && Boolean(companyName);
+    const pairedAt = new Date().toISOString();
+
+    const { data: supersededData, error: supersededReadError } = await supabase
+      .from("tally_connections")
+      .select("id")
+      .eq("owner_user_id", connection.owner_user_id)
+      .eq("installation_id", bridgeMachineId)
+      .is("revoked_at", null)
+      .not("bridge_token_hash", "is", null)
+      .neq("id", connection.id);
+
+    if (supersededReadError) throw supersededReadError;
+
+    const supersededIds = (supersededData ?? []).map((row) => String(row.id));
+    if (supersededIds.length > 0) {
+      const supersededReason =
+        "Superseded by a newer session from this connector installation.";
+      const { error: supersedeError } = await supabase
+        .from("tally_connections")
+        .update({
+          status: "waiting_for_bridge",
+          bridge_token_hash: null,
+          control_token_hash: null,
+          paired_at: null,
+          last_heartbeat_at: null,
+          last_tally_reachable: null,
+          last_company_loaded: null,
+          last_company_name: null,
+          revoked_at: pairedAt,
+          revoked_reason: supersededReason,
+          last_error: supersededReason,
+        })
+        .in("id", supersededIds);
+
+      if (supersedeError) throw supersedeError;
+
+      const { error: cancelError } = await supabase
+        .from("tally_bridge_commands")
+        .update({
+          status: "canceled",
+          error: "Connection session was superseded.",
+          completed_at: pairedAt,
+        })
+        .in("connection_id", supersededIds)
+        .in("status", ["queued", "claimed"]);
+
+      if (cancelError) throw cancelError;
+    }
+
     const { data: updatedData, error: updateError } = await supabase
       .from("tally_connections")
       .update({
         status: "bridge_connected",
-        // Once pairing succeeds this field becomes the browser-only control
-        // token. Another browser signed into the same account can see the
-        // connection, but cannot disconnect this workstation.
-        pairing_code_hash: hashSecret(controlToken),
+        pairing_code_hash: null,
         pairing_code_expires_at: null,
-        paired_at: new Date().toISOString(),
+        control_token_hash: hashSecret(controlToken),
+        paired_at: pairedAt,
         bridge_token_hash: hashSecret(bridgeToken),
         bridge_name: normalizeMetadata(body.bridgeName, "Tally Bridge"),
         bridge_version: bridgeVersion,
         bridge_machine_id: bridgeMachineId,
-        last_heartbeat_at: new Date().toISOString(),
+        bridge_machine_name: bridgeMachineName,
+        installation_id: bridgeMachineId,
+        revoked_at: null,
+        revoked_reason: null,
+        session_generation: Number(connection.session_generation ?? 0) + 1,
+        last_heartbeat_at: pairedAt,
         last_tally_reachable: tallyReachable ?? false,
         last_company_loaded: companyLoaded,
         last_company_name: companyLoaded ? companyName : null,
         last_error: null,
       })
       .eq("id", connection.id)
-      .select(CONNECTION_SELECT)
+      .is("revoked_at", null)
+      .select(TALLY_CONNECTION_SELECT)
       .single();
 
     if (updateError) {
@@ -251,6 +287,8 @@ export async function POST(
         bridgeName: updatedConnection.bridge_name,
         bridgeVersion: updatedConnection.bridge_version,
         bridgeMachineId: updatedConnection.bridge_machine_id,
+        bridgeMachineName: updatedConnection.bridge_machine_name,
+        supersededConnectionIds: supersededIds,
         companyName,
         tallyReachable,
         companyLoaded,

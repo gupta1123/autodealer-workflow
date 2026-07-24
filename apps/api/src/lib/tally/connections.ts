@@ -17,9 +17,16 @@ export type TallyConnectionRow = {
   pairing_code_hash: string | null;
   pairing_code_expires_at: string | null;
   paired_at: string | null;
+  bridge_token_hash: string | null;
   bridge_name: string | null;
   bridge_version: string | null;
   bridge_machine_id: string | null;
+  bridge_machine_name: string | null;
+  installation_id: string | null;
+  control_token_hash: string | null;
+  revoked_at: string | null;
+  revoked_reason: string | null;
+  session_generation: number;
   last_heartbeat_at: string | null;
   last_tested_at: string | null;
   last_tally_reachable: boolean | null;
@@ -32,13 +39,48 @@ export type TallyConnectionRow = {
 
 const PAIRING_CODE_TTL_MINUTES = 10;
 
+export const TALLY_CONNECTION_SELECT = [
+  "id",
+  "owner_user_id",
+  "display_name",
+  "status",
+  "tally_url",
+  "pairing_code_hash",
+  "pairing_code_expires_at",
+  "paired_at",
+  "bridge_token_hash",
+  "bridge_name",
+  "bridge_version",
+  "bridge_machine_id",
+  "bridge_machine_name",
+  "installation_id",
+  "control_token_hash",
+  "revoked_at",
+  "revoked_reason",
+  "session_generation",
+  "last_heartbeat_at",
+  "last_tested_at",
+  "last_tally_reachable",
+  "last_company_loaded",
+  "last_company_name",
+  "last_error",
+  "created_at",
+  "updated_at",
+].join(", ");
+
 export function connectorSupportsReliableActiveCompany(value: string | null | undefined) {
   const match = String(value ?? "").trim().match(/^(\d+)\.(\d+)\.(\d+)$/);
   if (!match) return false;
   const major = Number(match[1]);
   const minor = Number(match[2]);
   const patch = Number(match[3]);
-  return major > 0 || minor > 1 || (minor === 1 && patch >= 20);
+  return major > 0 || minor > 1 || (minor === 1 && patch >= 32);
+}
+
+export function isReliableInstallationId(value: string | null | undefined) {
+  return /-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(value ?? "").trim()
+  );
 }
 
 export function hashSecret(value: string) {
@@ -68,6 +110,11 @@ export function serializeTallyConnection(row: TallyConnectionRow) {
     bridgeName: row.bridge_name,
     bridgeVersion: row.bridge_version,
     bridgeMachineId: row.bridge_machine_id,
+    bridgeMachineName: row.bridge_machine_name,
+    installationId: row.installation_id,
+    revokedAt: row.revoked_at,
+    revokedReason: row.revoked_reason,
+    sessionGeneration: row.session_generation,
     lastHeartbeatAt: row.last_heartbeat_at,
     lastTestedAt: row.last_tested_at,
     lastTallyReachable: row.last_tally_reachable,
@@ -83,12 +130,15 @@ export function serializeTallyConnectionStatus(row: TallyConnectionRow) {
   const lastHeartbeatAt = row.last_heartbeat_at
     ? new Date(row.last_heartbeat_at).getTime()
     : 0;
+  const revoked = Boolean(row.revoked_at);
   const bridgeStale = !lastHeartbeatAt || Date.now() - lastHeartbeatAt > 45_000;
   const companyDetectionReliable = connectorSupportsReliableActiveCompany(row.bridge_version);
   const connectorUpdateRequired =
-    !bridgeStale && Boolean(row.paired_at) && !companyDetectionReliable;
+    !revoked && !bridgeStale && Boolean(row.paired_at) && !companyDetectionReliable;
   const effectiveStatus: TallyConnectionStatus =
-    row.status === "waiting_for_bridge" || row.status === "not_connected"
+    revoked
+      ? "waiting_for_bridge"
+      : row.status === "waiting_for_bridge" || row.status === "not_connected"
       ? row.status
       : connectorUpdateRequired
         ? "connection_error"
@@ -102,18 +152,21 @@ export function serializeTallyConnectionStatus(row: TallyConnectionRow) {
     // connector/Tally session. Once its heartbeat is stale they are no longer
     // facts about the currently running instance.
     lastCompanyName:
-      bridgeStale || !companyDetectionReliable ? null : row.last_company_name,
+      revoked || bridgeStale || !companyDetectionReliable ? null : row.last_company_name,
     lastError: connectorUpdateRequired
       ? "Connector update required. Reconnect using the latest Kalika Tally Connector."
+      : revoked
+        ? row.revoked_reason ?? "This connector session is no longer active."
       : row.last_error,
     status: effectiveStatus,
     bridgeConnected:
-      !bridgeStale && companyDetectionReliable && Boolean(row.paired_at),
+      !revoked && !bridgeStale && companyDetectionReliable && Boolean(row.paired_at),
     tallyReachable:
-      !bridgeStale && companyDetectionReliable && row.last_tally_reachable === true,
+      !revoked && !bridgeStale && companyDetectionReliable && row.last_tally_reachable === true,
     companyLoaded:
-      !bridgeStale && companyDetectionReliable && row.last_company_loaded === true,
-    heartbeatStale: Boolean(row.paired_at) && bridgeStale,
+      !revoked && !bridgeStale && companyDetectionReliable && row.last_company_loaded === true,
+    heartbeatStale: !revoked && Boolean(row.paired_at) && bridgeStale,
     connectorUpdateRequired,
+    revoked,
   };
 }

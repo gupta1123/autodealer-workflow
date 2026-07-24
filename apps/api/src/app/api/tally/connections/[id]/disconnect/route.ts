@@ -1,50 +1,30 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
-import { isLocalDbMode } from "@/lib/local/mode";
+import { isLocalDbMode, LOCAL_USER_ID } from "@/lib/local/mode";
 import { disconnectLocalTallyConnection } from "@/lib/local/tally-store";
 import {
   hashSecret,
   serializeTallyConnectionStatus,
+  TALLY_CONNECTION_SELECT,
   type TallyConnectionRow,
 } from "@/lib/tally/connections";
 
-const CONNECTION_SELECT = [
-  "id",
-  "owner_user_id",
-  "display_name",
-  "status",
-  "tally_url",
-  "pairing_code_hash",
-  "pairing_code_expires_at",
-  "paired_at",
-  "bridge_name",
-  "bridge_version",
-  "bridge_machine_id",
-  "last_heartbeat_at",
-  "last_tested_at",
-  "last_tally_reachable",
-  "last_company_loaded",
-  "last_company_name",
-  "last_error",
-  "created_at",
-  "updated_at",
-].join(", ");
-
-function disconnectedUpdatePayload() {
+function disconnectedUpdatePayload(disconnectedAt: string) {
   return {
     status: "waiting_for_bridge",
     pairing_code_hash: null,
     pairing_code_expires_at: null,
     bridge_token_hash: null,
+    control_token_hash: null,
     paired_at: null,
-    bridge_name: null,
-    bridge_version: null,
-    bridge_machine_id: null,
     last_heartbeat_at: null,
     last_tested_at: null,
     last_tally_reachable: null,
     last_company_loaded: null,
+    last_company_name: null,
+    revoked_at: disconnectedAt,
+    revoked_reason: "Disconnected by user.",
     last_error: "Disconnected by user.",
   };
 }
@@ -62,7 +42,8 @@ export async function POST(
   context: { params: Promise<{ id: string }> }
 ) {
   try {
-    const user = await requireRequestUser(request);
+    const localMode = isLocalDbMode();
+    const user = localMode ? { id: LOCAL_USER_ID } : await requireRequestUser(request);
     if (!user) {
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }
@@ -77,7 +58,7 @@ export async function POST(
       );
     }
 
-    if (isLocalDbMode()) {
+    if (localMode) {
       const connection = await disconnectLocalTallyConnection(id, user.id, controlToken);
       if (!connection) {
         return jsonWithCors(
@@ -94,21 +75,20 @@ export async function POST(
     const supabase = createSupabaseAdminClient();
     const { data: existingData, error: existingError } = await supabase
       .from("tally_connections")
-      .select(`${CONNECTION_SELECT}, pairing_code_hash`)
+      .select(TALLY_CONNECTION_SELECT)
       .eq("id", id)
       .eq("owner_user_id", user.id)
+      .is("revoked_at", null)
       .maybeSingle();
 
     if (existingError) throw existingError;
     if (!existingData) {
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
     }
-    const existing = existingData as unknown as TallyConnectionRow & {
-      pairing_code_hash: string | null;
-    };
+    const existing = existingData as unknown as TallyConnectionRow;
     if (
-      !existing.pairing_code_hash ||
-      hashSecret(controlToken) !== existing.pairing_code_hash
+      !existing.control_token_hash ||
+      hashSecret(controlToken) !== existing.control_token_hash
     ) {
       await supabase.from("tally_connection_events").insert({
         connection_id: existing.id,
@@ -129,13 +109,15 @@ export async function POST(
       );
     }
 
+    const disconnectedAt = new Date().toISOString();
     const { data, error } = await supabase
       .from("tally_connections")
-      .update(disconnectedUpdatePayload())
+      .update(disconnectedUpdatePayload(disconnectedAt))
       .eq("id", id)
       .eq("owner_user_id", user.id)
-      .eq("pairing_code_hash", existing.pairing_code_hash)
-      .select(CONNECTION_SELECT)
+      .eq("control_token_hash", existing.control_token_hash)
+      .is("revoked_at", null)
+      .select(TALLY_CONNECTION_SELECT)
       .maybeSingle();
 
     if (error) throw error;
@@ -144,6 +126,18 @@ export async function POST(
     }
 
     const connection = data as unknown as TallyConnectionRow;
+    const { error: cancelError } = await supabase
+      .from("tally_bridge_commands")
+      .update({
+        status: "canceled",
+        error: "Connection was disconnected.",
+        completed_at: disconnectedAt,
+      })
+      .eq("connection_id", connection.id)
+      .in("status", ["queued", "claimed"]);
+
+    if (cancelError) throw cancelError;
+
     await supabase.from("tally_connection_events").insert({
       connection_id: connection.id,
       owner_user_id: user.id,

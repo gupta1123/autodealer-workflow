@@ -3,7 +3,11 @@ import { isLocalDbMode, LOCAL_USER_ID } from "@/lib/local/mode";
 import { listLocalTallyConnections } from "@/lib/local/tally-store";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
-import { serializeTallyConnectionStatus, type TallyConnectionRow } from "@/lib/tally/connections";
+import {
+  serializeTallyConnectionStatus,
+  TALLY_CONNECTION_SELECT,
+  type TallyConnectionRow,
+} from "@/lib/tally/connections";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -372,30 +376,9 @@ export async function GET(request: Request) {
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_connections")
-      .select(
-        [
-          "id",
-          "owner_user_id",
-          "display_name",
-          "status",
-          "tally_url",
-          "pairing_code_hash",
-          "pairing_code_expires_at",
-          "paired_at",
-          "bridge_name",
-          "bridge_version",
-          "bridge_machine_id",
-          "last_heartbeat_at",
-          "last_tested_at",
-          "last_tally_reachable",
-          "last_company_loaded",
-          "last_company_name",
-          "last_error",
-          "created_at",
-          "updated_at",
-        ].join(", ")
-      )
+      .select(TALLY_CONNECTION_SELECT)
       .eq("owner_user_id", user.id)
+      .is("revoked_at", null)
       .order("updated_at", { ascending: false })
       .limit(20);
 

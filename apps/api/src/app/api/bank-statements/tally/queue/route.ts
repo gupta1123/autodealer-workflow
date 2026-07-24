@@ -310,6 +310,7 @@ export async function POST(request: Request) {
       .select("id, owner_user_id, status, last_company_name, last_heartbeat_at, last_tally_reachable")
       .eq("id", submittedConnectionId)
       .eq("owner_user_id", user.id)
+      .is("revoked_at", null)
       .maybeSingle();
 
     if (submittedConnectionError) throw submittedConnectionError;

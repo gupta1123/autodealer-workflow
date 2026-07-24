@@ -635,6 +635,7 @@ export async function GET(request: Request) {
       .select("id, owner_user_id, display_name, last_company_name, status, last_heartbeat_at, last_tally_reachable, last_company_loaded")
       .eq("id", connectionId)
       .eq("owner_user_id", user.id)
+      .is("revoked_at", null)
       .maybeSingle();
 
     if (connectionError) throw connectionError;

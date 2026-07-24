@@ -2,33 +2,15 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { isLocalDbMode } from "@/lib/local/mode";
 import { claimNextLocalTallyCommand } from "@/lib/local/tally-store";
-import { hashSecret, type TallyConnectionRow } from "@/lib/tally/connections";
+import {
+  hashSecret,
+  TALLY_CONNECTION_SELECT,
+  type TallyConnectionRow,
+} from "@/lib/tally/connections";
 import {
   serializeTallyBridgeCommand,
   type TallyBridgeCommandRow,
 } from "@/lib/tally/commands";
-
-const CONNECTION_SELECT = [
-  "id",
-  "owner_user_id",
-  "display_name",
-  "status",
-  "tally_url",
-  "pairing_code_hash",
-  "pairing_code_expires_at",
-  "paired_at",
-  "bridge_name",
-  "bridge_version",
-  "bridge_machine_id",
-  "last_heartbeat_at",
-  "last_tested_at",
-  "last_tally_reachable",
-  "last_company_loaded",
-  "last_company_name",
-  "last_error",
-  "created_at",
-  "updated_at",
-].join(", ");
 
 function getBridgeToken(request: Request) {
   const authorization = request.headers.get("authorization");
@@ -70,13 +52,20 @@ export async function GET(request: Request) {
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_connections")
-      .select(`${CONNECTION_SELECT}, bridge_token_hash`)
+      .select(TALLY_CONNECTION_SELECT)
       .eq("id", connectionId)
       .maybeSingle();
 
     if (error) throw error;
 
-    const connection = data as unknown as (TallyConnectionRow & { bridge_token_hash: string | null }) | null;
+    const connection = data as unknown as TallyConnectionRow | null;
+    if (connection?.revoked_at) {
+      return jsonWithCors(
+        request,
+        { error: "This connector session has been revoked. Reconnect this computer." },
+        { status: 409 }
+      );
+    }
     if (!connection?.bridge_token_hash || hashSecret(token) !== connection.bridge_token_hash) {
       return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
     }

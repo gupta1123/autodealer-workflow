@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const BRIDGE_VERSION = "0.1.23";
+const BRIDGE_VERSION = "0.1.32";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
@@ -3309,6 +3309,7 @@ async function pairBridge(args) {
   const tallyUrl = normalizeTallyUrl(args["tally-url"]);
   const bridgeName = args["bridge-name"] || os.hostname() || "Tally Bridge";
   const bridgeMachineId = args["bridge-machine-id"] || createMachineId();
+  const bridgeMachineName = os.hostname() || "This computer";
   const readiness = await testTally(tallyUrl);
   const detectedCompanyName = readiness.companyName;
 
@@ -3323,6 +3324,7 @@ async function pairBridge(args) {
       bridgeName,
       bridgeVersion: BRIDGE_VERSION,
       bridgeMachineId,
+      bridgeMachineName,
       companyName: detectedCompanyName,
       tallyReachable: readiness.tallyReachable,
       companyLoaded: readiness.companyLoaded,
@@ -3342,6 +3344,7 @@ async function pairBridge(args) {
     bridgeName,
     bridgeVersion: BRIDGE_VERSION,
     bridgeMachineId,
+    bridgeMachineName,
   });
 
   console.log("Tally bridge paired successfully.");
@@ -3360,6 +3363,7 @@ async function sendHeartbeat(config, testResult, availableCompanies = []) {
       tallyUrl: config.tallyUrl,
       bridgeVersion: BRIDGE_VERSION,
       bridgeMachineId: config.bridgeMachineId,
+      bridgeMachineName: config.bridgeMachineName || os.hostname() || "This computer",
       ...testResult,
       companyName: testResult.companyName ?? null,
       companies: availableCompanies,
@@ -3581,6 +3585,17 @@ async function disconnectBridge(args = {}) {
     };
   }
 
+  const requestedConnectionId = String(args["connection-id"] || "").trim();
+  if (requestedConnectionId && requestedConnectionId !== config.connectionId) {
+    return {
+      disconnected: false,
+      localConfigDeleted: false,
+      reason: "connection_mismatch",
+      activeConnectionId: config.connectionId,
+      requestedConnectionId,
+    };
+  }
+
   let remote = null;
   try {
     const response = await fetch(`${config.apiBase}/api/tally/bridge/disconnect`, {
@@ -3590,7 +3605,7 @@ async function disconnectBridge(args = {}) {
         Authorization: `Bearer ${config.bridgeToken}`,
       },
       body: JSON.stringify({
-        connectionId: args["connection-id"] || config.connectionId,
+        connectionId: config.connectionId,
       }),
     });
     remote = await readJsonResponse(response);

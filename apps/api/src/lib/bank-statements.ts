@@ -659,9 +659,7 @@ function parseCsvTransactions(text: string): ParsedBankTransaction[] {
     const normalized = splitDelimitedLine(line).map(normalizeHeader);
     return (
       normalized.some((value) => ["date", "transactiondate", "txndate", "postingdate", "valuedate"].includes(value)) &&
-      normalized.some((value) =>
-        ["description", "descriptionnarration", "narration", "particulars", "remarks"].includes(value)
-      )
+      normalized.some((value) => ["description", "narration", "particulars", "remarks"].includes(value))
     );
   });
 
@@ -675,15 +673,7 @@ function parseCsvTransactions(text: string): ParsedBankTransaction[] {
       readColumn(row, ["transactionDate", "date", "txn date", "posting date"])
     );
     const description = textCell(
-      readColumn(row, [
-        "description",
-        "description narration",
-        "description / narration",
-        "narration",
-        "particulars",
-        "remarks",
-        "transaction remarks",
-      ])
+      readColumn(row, ["description", "narration", "particulars", "remarks", "transaction remarks"])
     );
     if (!transactionDate || !description) return [];
 

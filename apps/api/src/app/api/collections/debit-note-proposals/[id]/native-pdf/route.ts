@@ -133,6 +133,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_company_loaded")
       .eq("id", connectionId)
       .eq("owner_user_id", user.id)
+      .is("revoked_at", null)
       .maybeSingle();
     if (connectionError) throw connectionError;
     if (!connection) return jsonWithCors(request, { error: "The active Tally connection was not found." }, { status: 404 });

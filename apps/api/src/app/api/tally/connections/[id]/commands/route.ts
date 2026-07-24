@@ -66,7 +66,7 @@ async function requireConnection(ownerUserId: string, connectionId: string) {
   const supabase = createSupabaseAdminClient();
   const { data, error } = await supabase
     .from("tally_connections")
-    .select("id, owner_user_id, status, last_company_name, last_tally_reachable, last_company_loaded")
+    .select("id, owner_user_id, status, last_company_name, last_tally_reachable, last_company_loaded, revoked_at")
     .eq("id", connectionId)
     .eq("owner_user_id", ownerUserId)
     .maybeSingle();
@@ -95,6 +95,13 @@ export async function GET(
       : await requireConnection(user.id, id);
     if (!connection) {
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
+    }
+    if (connection.revoked_at) {
+      return jsonWithCors(
+        request,
+        { error: "This Tally connection is no longer active. Reconnect this computer." },
+        { status: 409 }
+      );
     }
 
     const url = new URL(request.url);
@@ -163,6 +170,13 @@ export async function POST(
       : await requireConnection(user.id, id);
     if (!connection) {
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
+    }
+    if (connection.revoked_at) {
+      return jsonWithCors(
+        request,
+        { error: "This Tally connection is no longer active. Reconnect this computer." },
+        { status: 409 }
+      );
     }
 
     const body = await request.json().catch(() => ({}));

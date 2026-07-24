@@ -1,32 +1,13 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { isLocalDbMode } from "@/lib/local/mode";
+import { disconnectLocalTallyConnectionFromBridge } from "@/lib/local/tally-store";
 import {
   hashSecret,
   serializeTallyConnectionStatus,
+  TALLY_CONNECTION_SELECT,
   type TallyConnectionRow,
 } from "@/lib/tally/connections";
-
-const CONNECTION_SELECT = [
-  "id",
-  "owner_user_id",
-  "display_name",
-  "status",
-  "tally_url",
-  "pairing_code_hash",
-  "pairing_code_expires_at",
-  "paired_at",
-  "bridge_name",
-  "bridge_version",
-  "bridge_machine_id",
-  "last_heartbeat_at",
-  "last_tested_at",
-  "last_tally_reachable",
-  "last_company_loaded",
-  "last_company_name",
-  "last_error",
-  "created_at",
-  "updated_at",
-].join(", ");
 
 function getBridgeToken(request: Request) {
   const authorization = request.headers.get("authorization");
@@ -34,21 +15,21 @@ function getBridgeToken(request: Request) {
   return bearerMatch?.[1] ?? request.headers.get("x-bridge-token") ?? "";
 }
 
-function disconnectedUpdatePayload() {
+function disconnectedUpdatePayload(disconnectedAt: string) {
   return {
     status: "waiting_for_bridge",
     pairing_code_hash: null,
     pairing_code_expires_at: null,
     bridge_token_hash: null,
+    control_token_hash: null,
     paired_at: null,
-    bridge_name: null,
-    bridge_version: null,
-    bridge_machine_id: null,
     last_heartbeat_at: null,
     last_tested_at: null,
     last_tally_reachable: null,
     last_company_loaded: null,
     last_company_name: null,
+    revoked_at: disconnectedAt,
+    revoked_reason: "Disconnected by connector.",
     last_error: "Disconnected by connector.",
   };
 }
@@ -67,28 +48,59 @@ export async function POST(request: Request) {
       return jsonWithCors(request, { error: "Connection id and bridge token are required." }, { status: 400 });
     }
 
+    if (isLocalDbMode()) {
+      const connection = await disconnectLocalTallyConnectionFromBridge(connectionId, token);
+      if (!connection) {
+        return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
+      }
+      return jsonWithCors(request, {
+        connection: serializeTallyConnectionStatus(connection),
+      });
+    }
+
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_connections")
-      .select(`${CONNECTION_SELECT}, bridge_token_hash`)
+      .select(TALLY_CONNECTION_SELECT)
       .eq("id", connectionId)
       .maybeSingle();
 
     if (error) throw error;
 
-    const connection = data as unknown as (TallyConnectionRow & { bridge_token_hash: string | null }) | null;
+    const connection = data as unknown as TallyConnectionRow | null;
+    if (connection?.revoked_at) {
+      return jsonWithCors(
+        request,
+        { error: "This connector session is already revoked." },
+        { status: 409 }
+      );
+    }
     if (!connection?.bridge_token_hash || hashSecret(token) !== connection.bridge_token_hash) {
       return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
     }
 
+    const disconnectedAt = new Date().toISOString();
     const { data: updatedData, error: updateError } = await supabase
       .from("tally_connections")
-      .update(disconnectedUpdatePayload())
+      .update(disconnectedUpdatePayload(disconnectedAt))
       .eq("id", connection.id)
-      .select(CONNECTION_SELECT)
+      .is("revoked_at", null)
+      .select(TALLY_CONNECTION_SELECT)
       .single();
 
     if (updateError) throw updateError;
+
+    const { error: cancelError } = await supabase
+      .from("tally_bridge_commands")
+      .update({
+        status: "canceled",
+        error: "Connection was disconnected.",
+        completed_at: disconnectedAt,
+      })
+      .eq("connection_id", connection.id)
+      .in("status", ["queued", "claimed"]);
+
+    if (cancelError) throw cancelError;
 
     await supabase.from("tally_connection_events").insert({
       connection_id: connection.id,

@@ -55,6 +55,7 @@ export async function POST(request: Request) {
       .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_company_loaded, last_heartbeat_at, updated_at")
       .eq("id", connectionId)
       .eq("owner_user_id", user.id)
+      .is("revoked_at", null)
       .maybeSingle();
 
     if (connectionError) throw connectionError;
