@@ -72,7 +72,7 @@ Return only valid JSON. Do not return markdown, explanations outside JSON, or co
 Choose only from the provided tallyLedgers list. Copy every selected ledger name exactly as provided.
 Never invent, modify, shorten, merge, or create a ledger. If no existing ledger is clearly correct, use suspense.
 Every transaction must produce exactly one result using its original index.
-Return this exact structure: {"matches":[{"index":0,"matchType":"direct_match","action":"use_existing_ledger","ledgerName":"Exact Ledger Name From tallyLedgers","candidateLedgerNames":[],"confidence":0.95,"reason":"Short reason"}]}.
+Return this exact structure: {"matches":[{"index":0,"matchType":"direct_match","action":"use_existing_ledger","ledgerName":"Exact Ledger Name From tallyLedgers","candidateLedgerNames":[],"confidence":0.95,"bankPartyRoot":"party root extracted from narration","ledgerPartyRoot":"party root from selected ledger or null","rootComparison":"same_root | different_root | unclear","savedMappingDecision":"not_provided","reason":"Short reason"}]}.
 Allowed matchType values: direct_match, close_match, suspense.
 For direct_match, action must be "use_existing_ledger", ledgerName must be one exact name from tallyLedgers, candidateLedgerNames must be [], and confidence must be at least 0.90.
 For close_match, action must be "use_suspense", ledgerName must be null, candidateLedgerNames must contain at least two exact competing ledger names from tallyLedgers, and confidence must be 0.0.
@@ -81,6 +81,13 @@ A shortened, OCR-damaged, misspelled, or incomplete party name can still be a di
 Ignore bank-system noise such as NEFT, RTGS, IMPS, UPI, NACH, ACH, ECS, CMS, CR, DR, payment, receipt, UTR, RRN, TXN, REF, beneficiary, account words, IFSC, bank, branch, dates, and reference numbers.
 Ignore case, spaces, punctuation, legal suffixes, and common spelling variants only when the full party root remains clearly the same.
 Do not remove meaningful descriptors such as Steel, Metals, Alloys, Traders, Transport, Logistics, Engineering, Fabrication, Electricals, Industries, Services, and Works when they differentiate parties.
+Treat Trader, Traders, Trading, and Trade as the same trading descriptor when the party root is otherwise the same.
+If the narration says "Kamal Trading" and ledgers include "Kamal Traders" and "Kamal Steel", prefer "Kamal Traders" because the root and trading descriptor align.
+If the narration says only "Kamal" and ledgers include "Kamal Traders" and "Kamal Steel", use close_match because the descriptor is missing and both ledgers share the root.
+For every row, extract the bankPartyRoot from the narration after removing bank-system noise and legal suffixes.
+Use direct_match only when the bankPartyRoot and selected ledgerPartyRoot are the same party root or a safe spelling/OCR variant of the same party root.
+Generic business words such as traders, trading, steel, metal, transport, enterprise, company, industries, services, supplier, customer, payment, receipt, and private limited are not party roots by themselves.
+Names with different roots must not be matched even when one descriptor or one generic word overlaps.
 A named party ledger is preferred over a generic expense-category ledger when both are available.
 Select an expense, statutory, payroll, or bank-related ledger only when the narration explicitly supports that category and exactly one existing ledger clearly fits.
 Use suspense for generic narrations, only-reference rows, ambiguous merchants, self-transfers/reversals without a unique ledger, multiple plausible ledgers, best match below 0.90, or anything requiring guessing.`;

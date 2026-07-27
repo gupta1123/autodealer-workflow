@@ -35,6 +35,10 @@ type AiLedgerMatch = {
   candidateLedgerNames: string[];
   confidence: number;
   reason: string;
+  bankPartyRoot?: string | null;
+  ledgerPartyRoot?: string | null;
+  rootComparison?: string | null;
+  savedMappingDecision?: "not_provided" | "used" | "rejected" | "ignored" | "unclear" | null;
 };
 
 const BANK_LEDGER_MATCHING_SYSTEM_PROMPT = `You match Indian bank statement transactions to synced Tally ledgers.
@@ -59,6 +63,10 @@ Output format:
       "ledgerName": "Exact Ledger Name From tallyLedgers",
       "candidateLedgerNames": [],
       "confidence": 0.95,
+      "bankPartyRoot": "party root extracted from narration",
+      "ledgerPartyRoot": "party root from selected ledger or null",
+      "rootComparison": "same_root | different_root | unclear",
+      "savedMappingDecision": "not_provided",
       "reason": "Short reason"
     }
   ]
@@ -97,8 +105,28 @@ Do not use phonetic similarity alone as proof. It can support a direct match onl
 Preserve meaningful business descriptors:
 Do not remove descriptors such as Steel, Metals, Alloys, Traders, Transport, Logistics, Roadlines, Engineering, Fabrication, Electricals, Chemicals, Hardware, Fuel, Power, Construction, Enterprises, Industries, Agencies, Services, Works.
 These may differentiate different parties. Prefer the ledger with the closest matching full root and descriptor.
+Treat Trader, Traders, Trading, and Trade as the same trading descriptor when the party root is otherwise the same.
+If the narration says "Kamal Trading" and ledgers include "Kamal Traders" and "Kamal Steel", prefer "Kamal Traders" because the root and trading descriptor align.
+If the narration says only "Kamal" and ledgers include "Kamal Traders" and "Kamal Steel", use close_match because the descriptor is missing and both ledgers share the root.
 A named party ledger is preferred over a generic expense-category ledger when both are available.
 Never confuse different party roots based only on one shared word, partial string, or loose phonetic resemblance.
+
+Party-root validation:
+For every row, extract the bankPartyRoot from the narration after removing bank-system noise and legal suffixes.
+For any selected ledger, extract ledgerPartyRoot from the ledger name.
+Use direct_match only when bankPartyRoot and ledgerPartyRoot are the same party root or a safe spelling/OCR variant of the same party root.
+Generic business words such as traders, trading, steel, metal, transport, enterprise, company, industries, services, supplier, customer, payment, receipt, and private limited are not party roots by themselves.
+Names with different roots must not be matched even when one descriptor or one generic word overlaps.
+
+Saved mapping hint:
+The user input may include savedMapping. This is historical context only, not an automatic match.
+First evaluate the bank narration against current tallyLedgers using the direct_match, close_match, and suspense rules above.
+Use savedMapping only when no safer current-ledger match exists, the saved mapping ledger exists in tallyLedgers, and the saved mapping passes the same party-root validation.
+If savedMapping points to a different party root, set savedMappingDecision to "rejected" and do not select it.
+If savedMapping is selected after validation, set savedMappingDecision to "used".
+If savedMapping is absent, set savedMappingDecision to "not_provided".
+If savedMapping is present but not needed, set savedMappingDecision to "ignored".
+If savedMapping cannot be validated, set savedMappingDecision to "unclear" and use close_match or suspense.
 
 Transaction types to consider:
 The statement may include customer receipts, supplier payments, raw-material purchases, transport/freight/logistics, contractor/fabrication/repair/machinery/electrical payments, fuel/toll/travel/hotel/food/staff welfare, salaries/wages/incentives/advances/reimbursements, utilities, GST/TDS/PF/ESIC/professional tax/income tax/customs duty, bank charges/interest/cheque return/loan interest/OD interest, insurance/loan/EMI/fixed deposit, cash deposits/withdrawals, payment-gateway/card settlements, reversals, and transfers between company accounts.
@@ -130,38 +158,6 @@ Use suspense when no clear ledger exists or matching requires guessing.
 Never select a ledger when confidence is below 0.90.
 Never invent, alter, or create a ledger.
 Never guess between similar ledgers.`;
-
-function categoryLedgerCandidates(category?: string | null, description?: string | null) {
-  const text = `${category ?? ""} ${description ?? ""}`.toLowerCase();
-  if (/\batm\b|\bcash\s*withdrawal\b|\bcash\b/.test(text)) return ["Cash", "Cash in Hand", "Cash-in-Hand"];
-  if (/\binterest\b/.test(text)) return ["Interest Income", "Interest Received"];
-  if (/\bbank[_\s-]*charges\b|\bcharge|charges|fee\b/.test(text)) {
-    if (/\bgst\b/.test(text)) return ["Bank Charges GST", "Bank Charges", "Duties & Taxes"];
-    return ["Bank Charges", "Bank Charges GST"];
-  }
-  if (/\btax|tds|gst\b/.test(text)) return ["Duties & Taxes", "GST Payable", "TDS Payable"];
-  if (/\bsalary|wages\b/.test(text)) return ["Salary Payable", "Salary"];
-  return [];
-}
-
-function findLedgerByName(ledgers: TallyMasterRow[], candidates: string[]) {
-  for (const candidate of candidates) {
-    const normalizedCandidate = normalizeName(candidate);
-    const exact = ledgers.find((ledger) => normalizeName(ledger.tally_name) === normalizedCandidate);
-    if (exact) return exact.tally_name;
-  }
-
-  for (const candidate of candidates) {
-    const normalizedCandidate = normalizeName(candidate);
-    const partial = ledgers.find((ledger) => {
-      const normalizedLedger = normalizeName(ledger.tally_name);
-      return normalizedLedger.includes(normalizedCandidate) || normalizedCandidate.includes(normalizedLedger);
-    });
-    if (partial) return partial.tally_name;
-  }
-
-  return null;
-}
 
 function ledgerNameTokens(value?: string | null) {
   return normalizeName(value)
@@ -264,25 +260,6 @@ function ledgerNameSimilarity(left: string, right: string) {
   return Math.max(editScore, substringScore, coreScore, tokenScore);
 }
 
-function findCloseLedgerMatches(ledgers: TallyMasterRow[], candidateName?: string | null) {
-  const normalizedCandidate = normalizeName(candidateName);
-  if (!normalizedCandidate || compactLedgerName(normalizedCandidate).length < 5) return [];
-
-  const matches: Array<{ ledgerName: string; score: number }> = [];
-  for (const ledger of ledgers) {
-    const score = ledgerNameSimilarity(normalizedCandidate, ledger.tally_name);
-    if (score < 0.84) continue;
-    matches.push({ ledgerName: ledger.tally_name, score });
-  }
-
-  return matches.sort((left, right) => right.score - left.score || left.ledgerName.localeCompare(right.ledgerName));
-}
-
-function findUniqueCloseLedgerByName(ledgers: TallyMasterRow[], candidateName?: string | null) {
-  const matches = findCloseLedgerMatches(ledgers, candidateName);
-  return matches.length === 1 ? matches[0] : null;
-}
-
 function safeJsonParse<T>(raw: string, fallback: T): T {
   try {
     return JSON.parse(raw) as T;
@@ -305,6 +282,14 @@ function clampConfidence(value: unknown) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 0;
   return Math.max(0, Math.min(1, parsed));
+}
+
+function readSavedMappingDecision(value: unknown): AiLedgerMatch["savedMappingDecision"] {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (["not_provided", "used", "rejected", "ignored", "unclear"].includes(normalized)) {
+    return normalized as AiLedgerMatch["savedMappingDecision"];
+  }
+  return null;
 }
 
 function findLedgerByNormalizedName(ledgers: TallyMasterRow[], ledgerName?: string | null) {
@@ -344,6 +329,7 @@ async function aiMatchLedgerForTransaction(input: {
   ledgers: TallyMasterRow[];
   transaction: MatchableTransaction;
   counterpartyName: string | null;
+  savedMapping?: TallyMappingRow | null;
 }) {
   const candidateLedgers = shortlistLedgersForAi(input.ledgers, input.transaction, input.counterpartyName);
   if (candidateLedgers.length === 0) return null;
@@ -374,6 +360,13 @@ async function aiMatchLedgerForTransaction(input: {
             name: ledger.tally_name,
             group: ledger.parent_name ?? null,
           })),
+          savedMapping: input.savedMapping?.target_master_name
+            ? {
+                ledgerName: input.savedMapping.target_master_name,
+                sourceLabel: input.savedMapping.source_label,
+                notes: input.savedMapping.notes ?? null,
+              }
+            : null,
         }),
       },
     ],
@@ -393,6 +386,7 @@ async function aiMatchLedgerForTransaction(input: {
   if (!match) return null;
 
   const reason = String(match.reason ?? "").trim() || "AI ledger matching completed.";
+  const savedMappingDecision = readSavedMappingDecision(match.savedMappingDecision);
   const candidateLedgerNames = Array.isArray(match.candidateLedgerNames)
     ? match.candidateLedgerNames
         .map((name) => String(name ?? "").trim())
@@ -409,6 +403,7 @@ async function aiMatchLedgerForTransaction(input: {
         reason: "AI returned an unsafe ledger match, so the row was kept in suspense.",
         matchType: "suspense" as const,
         candidateLedgerNames: [],
+        savedMappingDecision,
       };
     }
 
@@ -418,6 +413,7 @@ async function aiMatchLedgerForTransaction(input: {
       reason,
       matchType: "direct_match" as const,
       candidateLedgerNames: [],
+      savedMappingDecision,
     };
   }
 
@@ -428,6 +424,7 @@ async function aiMatchLedgerForTransaction(input: {
       reason,
       matchType: "close_match" as const,
       candidateLedgerNames,
+      savedMappingDecision,
     };
   }
 
@@ -437,7 +434,29 @@ async function aiMatchLedgerForTransaction(input: {
     reason,
     matchType: "suspense" as const,
     candidateLedgerNames: [],
+    savedMappingDecision,
   };
+}
+
+async function deactivateRejectedSavedMapping(input: {
+  supabase: SupabaseClient;
+  ownerUserId: string;
+  savedMapping: TallyMappingRow;
+  reason: string | null;
+}) {
+  const note = `AI rejected saved bank narration mapping. ${input.reason ?? ""}`.trim().slice(0, 1000);
+  const { error } = await input.supabase
+    .from("tally_mapping_settings")
+    .update({
+      status: "inactive",
+      notes: note,
+    })
+    .eq("id", input.savedMapping.id)
+    .eq("owner_user_id", input.ownerUserId);
+
+  if (error) {
+    console.warn("Failed to deactivate rejected saved bank narration mapping:", error);
+  }
 }
 
 function sourceKeyForNarration(accountId: string, description: string) {
@@ -461,6 +480,7 @@ export async function suggestBankLedgerForTransaction(input: {
 }): Promise<BankLedgerSuggestion> {
   const counterpartyName = input.transaction.counterpartyName ?? extractCounterpartyName(input.transaction.description);
   const sourceKey = sourceKeyForNarration(input.accountId, input.transaction.description);
+  let savedMapping: TallyMappingRow | null = null;
 
   if (input.connectionId) {
     const { data: mappingRows, error: mappingError } = await input.supabase
@@ -475,16 +495,7 @@ export async function suggestBankLedgerForTransaction(input: {
 
     if (mappingError) throw mappingError;
 
-    const savedMapping = ((mappingRows ?? []) as unknown as TallyMappingRow[])[0];
-    if (savedMapping?.target_master_name) {
-      return {
-        counterpartyName,
-        ledgerName: savedMapping.target_master_name,
-        confidence: 0.99,
-        reason: "Saved narration mapping",
-        mappingSource: "saved_narration",
-      };
-    }
+    savedMapping = ((mappingRows ?? []) as unknown as TallyMappingRow[])[0] ?? null;
   }
 
   const { data: ledgerRows, error: ledgerError } = input.connectionId
@@ -501,74 +512,67 @@ export async function suggestBankLedgerForTransaction(input: {
   if (ledgerError) throw ledgerError;
 
   const ledgers = (ledgerRows ?? []) as unknown as TallyMasterRow[];
-  if (ledgers.length > 0) {
-    try {
-      const aiLedger = await aiMatchLedgerForTransaction({
-        ledgers,
-        transaction: input.transaction,
-        counterpartyName,
-      });
-      if (aiLedger) {
-        return {
-          counterpartyName,
-          ledgerName: aiLedger.ledgerName,
-          confidence: aiLedger.confidence,
-          reason: aiLedger.reason,
-          mappingSource: aiLedger.ledgerName ? "ai_match" : "none",
-          matchType: aiLedger.matchType,
-          candidateLedgerNames: aiLedger.candidateLedgerNames,
-        };
-      }
-    } catch (error) {
-      console.warn("AI ledger match failed; using deterministic fallback:", error);
-    }
-  }
-
-  const categoryCandidates = categoryLedgerCandidates(input.transaction.category, input.transaction.description);
-  const categoryLedgerName = findLedgerByName(ledgers, categoryCandidates);
-  if (categoryCandidates.length > 0) {
+  if (ledgers.length === 0) {
     return {
       counterpartyName,
-      ledgerName: categoryLedgerName,
-      confidence: categoryLedgerName ? 0.9 : 0.4,
-      reason: categoryLedgerName
-        ? "Matched standard bank transaction category"
-        : "Category detected, but no matching Tally ledger was synced",
-      mappingSource: categoryLedgerName ? "category" : "none",
+      ledgerName: null,
+      confidence: 0,
+      reason: "No synced active Tally ledgers were available for AI ledger matching.",
+      mappingSource: "none",
+      matchType: "suspense",
+      candidateLedgerNames: [],
     };
   }
 
-  if (counterpartyName) {
-    const normalizedCounterparty = normalizeName(counterpartyName);
-    const matchedLedger = ledgers.find((ledger) => normalizeName(ledger.tally_name) === normalizedCounterparty);
-    if (matchedLedger) {
-      return {
-        counterpartyName,
-        ledgerName: matchedLedger.tally_name,
-        confidence: 0.88,
-        reason: "Counterparty matched synced Tally ledger name",
-        mappingSource: "ledger_name",
-      };
-    }
+  try {
+    const aiLedger = await aiMatchLedgerForTransaction({
+      ledgers,
+      transaction: input.transaction,
+      counterpartyName,
+      savedMapping,
+    });
 
-    const closeLedger = findUniqueCloseLedgerByName(ledgers, counterpartyName);
-    if (closeLedger) {
+    if (aiLedger) {
+      if (savedMapping && aiLedger.savedMappingDecision === "rejected") {
+        await deactivateRejectedSavedMapping({
+          supabase: input.supabase,
+          ownerUserId: input.ownerUserId,
+          savedMapping,
+          reason: aiLedger.reason,
+        });
+      }
+
+      const normalizedSavedLedger = normalizeName(savedMapping?.target_master_name);
+      const normalizedAiLedger = normalizeName(aiLedger.ledgerName);
+      const mappingSource =
+        aiLedger.ledgerName && aiLedger.savedMappingDecision === "used" && normalizedAiLedger === normalizedSavedLedger
+          ? "saved_narration"
+          : aiLedger.ledgerName
+            ? "ai_match"
+            : "none";
+
       return {
         counterpartyName,
-        ledgerName: closeLedger.ledgerName,
-        confidence: Math.min(0.95, Math.max(0.86, closeLedger.score)),
-        reason: "One close Tally ledger match found",
-        mappingSource: "close_match",
+        ledgerName: aiLedger.ledgerName,
+        confidence: aiLedger.confidence,
+        reason: aiLedger.reason,
+        mappingSource,
+        matchType: aiLedger.matchType,
+        candidateLedgerNames: aiLedger.candidateLedgerNames,
       };
     }
+  } catch (error) {
+    console.warn("AI ledger match failed; keeping transaction in suspense:", error);
   }
 
   return {
     counterpartyName,
     ledgerName: null,
     confidence: 0,
-    reason: null,
+    reason: "AI ledger matching did not return a safe match, so the row was kept in suspense.",
     mappingSource: "none",
+    matchType: "suspense",
+    candidateLedgerNames: [],
   };
 }
 

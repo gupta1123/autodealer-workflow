@@ -47,14 +47,7 @@ function formatCompanyOptionLabel(company: CompanyOption) {
 type CashDiscountTerm = {
   ratePercent: number;
   eligibilityDays: number;
-};
-
-type CashDiscountAiReview = {
-  decision: "confirmed" | "rejected" | "manual_review" | "unavailable";
-  confidence: number | null;
-  reason: string;
-  terms: CashDiscountTerm[];
-  termsMatchDeterministic: boolean;
+  periodSource: "explicit" | "default";
 };
 
 type CashDiscountReversalPlan = {
@@ -67,6 +60,7 @@ type CashDiscountReversalPlan = {
 
 type CashDiscountAnalysis = {
   sourceNarration: string;
+  matchedCashDiscountContext: string | null;
   terms: CashDiscountTerm[];
   termsLabel: string | null;
   finalEligibilityDays: number | null;
@@ -77,7 +71,7 @@ type CashDiscountAnalysis = {
   deterministicStatus: string;
   deterministicReason: string;
   reversalPlan: CashDiscountReversalPlan | null;
-  aiReview: CashDiscountAiReview | null;
+  calculationVersion: string;
 };
 
 type NarrationAnalysisRow = {
@@ -104,11 +98,14 @@ type PaymentFollowUp = {
   outstandingAmount: number;
   amountReceived: number;
   narration: string;
+  matchedCashDiscountContext: string | null;
+  terms: CashDiscountTerm[];
   termsLabel: string | null;
   discountDeadline: string | null;
   currentDiscount: {
     ratePercent: number;
     eligibilityDays: number;
+    periodSource: "explicit" | "default";
     discountDeadline: string;
     discountAmount: number;
   } | null;
@@ -119,7 +116,7 @@ type PaymentFollowUp = {
   reversalPlan: CashDiscountReversalPlan | null;
   deterministicStatus: string;
   deterministicReason: string;
-  aiReview: CashDiscountAiReview | null;
+  calculationVersion: string;
 };
 
 type DebitNoteProposal = {
@@ -350,7 +347,7 @@ function issueLabel(proposal: DebitNoteProposal) {
 function conciseTermsLabel(proposal: DebitNoteProposal) {
   const terms = proposal.cashDiscountAnalysis?.terms ?? [];
   if (terms.length > 0) {
-    return `Terms: ${terms.map((term) => `${term.ratePercent}% / ${term.eligibilityDays}d`).join(" · ")}`;
+    return `Terms: ${terms.map((term) => `${term.ratePercent}% / ${term.eligibilityDays}d${term.periodSource === "default" ? " default" : ""}`).join(" · ")}`;
   }
   return proposal.cashDiscountAnalysis?.termsLabel || proposal.cashDiscountRuleName || "Cash discount terms";
 }
@@ -386,15 +383,6 @@ function createButtonLabel(proposal: DebitNoteProposal) {
   if (status === "failed") return "Retry";
   if (status === "approved" || status === "queued_in_tally") return "Queued";
   return "Create debit note";
-}
-
-function aiReviewLabel(proposal: DebitNoteProposal) {
-  const review = proposal.cashDiscountAnalysis?.aiReview;
-  if (!review) return null;
-  if (review.decision === "confirmed" && review.termsMatchDeterministic) return "Terms verified";
-  if (review.decision === "unavailable") return "AI review unavailable";
-  if (review.decision === "manual_review") return "AI needs review";
-  return "AI rejected";
 }
 
 function canCreateInTally(proposal: DebitNoteProposal) {
@@ -781,7 +769,9 @@ export function CollectionsDashboardPage() {
         connectionId: selectedConnectionId,
         companyName: selectedCompany?.companyName ?? proposal.companyName,
         proposal: {
-          ...proposal,
+          connectionId: proposal.connectionId,
+          partyLedgerName: proposal.partyLedgerName,
+          linkedInvoiceNumber: proposal.linkedInvoiceNumber,
           financialYear: selectedCompany?.financialYear ?? proposal.financialYear,
         },
       }),
@@ -1449,16 +1439,15 @@ export function CollectionsDashboardPage() {
                                     {conciseTermsLabel(proposal)}
                                   </span>
                                 ) : null}
-                                {proposal.cashDiscountAnalysis.aiReview ? (
-                                  <span
-                                    className={`rounded-full border px-2 py-0.5 text-[10px] font-bold ${
-                                      proposal.cashDiscountAnalysis.aiReview.decision === "confirmed" && proposal.cashDiscountAnalysis.aiReview.termsMatchDeterministic
-                                        ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                                        : "border-amber-200 bg-amber-50 text-amber-700"
-                                    }`}
-                                    title={proposal.cashDiscountAnalysis.aiReview.reason}
-                                  >
-                                    {aiReviewLabel(proposal)}
+                                <span
+                                  className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700"
+                                  title={proposal.cashDiscountAnalysis.deterministicReason}
+                                >
+                                  Deterministic
+                                </span>
+                                {proposal.cashDiscountAnalysis.terms.some((term) => term.periodSource === "default") ? (
+                                  <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-700">
+                                    Default period applied
                                   </span>
                                 ) : null}
                                 <details className="group relative">
@@ -1468,6 +1457,9 @@ export function CollectionsDashboardPage() {
                                   <div className="absolute left-0 top-6 z-20 w-72 rounded-xl border border-[#e5ddd0] bg-white p-3 text-[11px] font-medium leading-relaxed text-slate-600 shadow-xl">
                                     <div className="font-bold text-[#1a1a1a]">Narration</div>
                                     <div className="mt-0.5">{proposal.cashDiscountAnalysis.sourceNarration || "No narration returned by Tally."}</div>
+                                    <div className="mt-2 border-t border-[#eee7dc] pt-2">
+                                      Context: {proposal.cashDiscountAnalysis.matchedCashDiscountContext || "payment terms"}
+                                    </div>
                                     {proposal.cashDiscountAnalysis.receiptDate ? (
                                       <div className="mt-2 border-t border-[#eee7dc] pt-2">
                                         Receipt: {formatDate(proposal.cashDiscountAnalysis.receiptDate)}
@@ -1476,11 +1468,9 @@ export function CollectionsDashboardPage() {
                                           : ""}
                                       </div>
                                     ) : null}
-                                    {proposal.cashDiscountAnalysis.aiReview ? (
-                                      <div className="mt-2 border-t border-[#eee7dc] pt-2 text-slate-500">
-                                        {proposal.cashDiscountAnalysis.aiReview.reason}
-                                      </div>
-                                    ) : null}
+                                    <div className="mt-2 border-t border-[#eee7dc] pt-2 text-slate-500">
+                                      {proposal.cashDiscountAnalysis.deterministicReason}
+                                    </div>
                                   </div>
                                 </details>
                               </div>
@@ -1620,7 +1610,7 @@ export function CollectionsDashboardPage() {
                   </thead>
                   <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
                     {paymentFollowUps.map((followUp) => {
-                      const aiReviewed = followUp.aiReview?.decision === "confirmed" && followUp.aiReview.termsMatchDeterministic;
+                      const defaultPeriodApplied = followUp.terms.some((term) => term.periodSource === "default");
                       return (
                         <tr className="align-top transition-colors hover:bg-[#fcfbfa]/60" key={followUp.id}>
                           <td className="px-4 py-4">
@@ -1698,8 +1688,8 @@ export function CollectionsDashboardPage() {
                             <div className="text-sm font-semibold text-[#1a1a1a]">{followUp.title}</div>
                             <div className="mt-1 text-[11px] leading-relaxed text-slate-500">{followUp.nextAction}</div>
                             {followUp.termsLabel ? (
-                              <div className={`mt-1 text-[11px] font-semibold ${aiReviewed ? "text-emerald-700" : "text-slate-500"}`} title={followUp.aiReview?.reason}>
-                                {aiReviewed ? "AI verified the narrated terms" : "Narration terms read from Tally"}
+                              <div className="mt-1 text-[11px] font-semibold text-emerald-700" title={followUp.deterministicReason}>
+                                {defaultPeriodApplied ? "Deterministic terms · default period applied" : "Deterministic terms from Tally narration"}
                               </div>
                             ) : null}
                           </td>
@@ -1716,7 +1706,7 @@ export function CollectionsDashboardPage() {
               </div>
               <div className="divide-y divide-[#e5ddd0] lg:hidden">
                 {paymentFollowUps.map((followUp) => {
-                  const aiReviewed = followUp.aiReview?.decision === "confirmed" && followUp.aiReview.termsMatchDeterministic;
+                  const defaultPeriodApplied = followUp.terms.some((term) => term.periodSource === "default");
                   return (
                     <article className="p-4 sm:p-5" key={followUp.id}>
                       <div className="flex items-start justify-between gap-3">
@@ -1763,7 +1753,7 @@ export function CollectionsDashboardPage() {
                           <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Next follow-up</div>
                           <div className="mt-1 text-xs font-bold text-[#1a1a1a]">{followUp.title}</div>
                           <div className="mt-1 text-[11px] leading-relaxed text-slate-500">{followUp.nextAction}</div>
-                          {followUp.termsLabel ? <div className={`mt-1 text-[11px] font-semibold ${aiReviewed ? "text-emerald-700" : "text-slate-500"}`}>{aiReviewed ? "AI verified the narrated terms" : "Narration terms read from Tally"}</div> : null}
+                          {followUp.termsLabel ? <div className="mt-1 text-[11px] font-semibold text-emerald-700">{defaultPeriodApplied ? "Deterministic terms · default period applied" : "Deterministic terms from Tally narration"}</div> : null}
                         </div>
                       </div>
                     </article>
