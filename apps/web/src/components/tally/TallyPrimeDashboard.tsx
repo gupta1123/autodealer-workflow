@@ -75,6 +75,13 @@ type StatusResponse = {
   error?: string;
 };
 
+type DisconnectOthersResponse = {
+  connections?: TallyConnection[];
+  disconnectedCount?: number;
+  disconnectedConnectionIds?: string[];
+  error?: string;
+};
+
 type CompaniesResponse = {
   companies?: CompanyOption[];
   selectedCompanyId?: string | null;
@@ -82,7 +89,9 @@ type CompaniesResponse = {
 };
 
 async function readError(response: Response) {
-  const payload = (await response.json().catch(() => ({}))) as { error?: string };
+  const payload = (await response.json().catch(() => ({}))) as {
+    error?: string;
+  };
   return payload.error || `Request failed with status ${response.status}`;
 }
 
@@ -100,19 +109,25 @@ function getStatusLabel(connection?: TallyConnection | null) {
   if (connection.status === "tally_reachable") return "Tally reachable";
   if (connection.status === "bridge_connected") return "Connector connected";
   if (connection.status === "connection_error") return "Connection error";
-  if (connection.status === "waiting_for_bridge") return "Waiting for connector";
+  if (connection.status === "waiting_for_bridge")
+    return "Waiting for connector";
   return "Not connected";
 }
 
 function getStatusTone(connection?: TallyConnection | null) {
   if (!connection) return "neutral";
   if (connection.status === "company_loaded") return "success";
-  if (connection.status === "tally_reachable" || connection.status === "bridge_connected") return "warning";
+  if (
+    connection.status === "tally_reachable" ||
+    connection.status === "bridge_connected"
+  )
+    return "warning";
   if (connection.status === "connection_error") return "error";
   return "neutral";
 }
 
-const DEFAULT_BRIDGE_API_BASE_URL = "https://autodealer-workflow-465859fe2891.herokuapp.com";
+const DEFAULT_BRIDGE_API_BASE_URL =
+  "https://autodealer-workflow-465859fe2891.herokuapp.com";
 
 function getBridgeApiBaseUrl() {
   // In local development the connector runs on the same workstation as this
@@ -121,7 +136,11 @@ function getBridgeApiBaseUrl() {
   // displaying, leaving the UI permanently "Waiting for connector".
   if (typeof window !== "undefined") {
     const { hostname, origin } = window.location;
-    if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") {
+    if (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "::1"
+    ) {
       return origin.replace(/\/+$/, "");
     }
   }
@@ -135,13 +154,15 @@ function getBridgeApiBaseUrl() {
 }
 
 function formatCompanyOptionLabel(company: CompanyOption) {
-  return [company.companyName, company.financialYear].filter(Boolean).join(" - ");
+  return [company.companyName, company.financialYear]
+    .filter(Boolean)
+    .join(" - ");
 }
 
 function buildConnectorConnectUrl(
   connection: TallyConnection,
   pairingCode: string,
-  controlToken: string
+  controlToken: string,
 ) {
   const params = new URLSearchParams({
     apiBase: getBridgeApiBaseUrl(),
@@ -157,7 +178,9 @@ function buildConnectorConnectUrl(
 function normalizeTallyUrlInput(value: string) {
   const trimmed = value.trim();
   if (!trimmed) return "";
-  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+  const withProtocol = /^https?:\/\//i.test(trimmed)
+    ? trimmed
+    : `http://${trimmed}`;
   return withProtocol.replace(/\/+$/, "");
 }
 
@@ -166,7 +189,9 @@ function getSetupModeForUrl(value?: string | null): TallySetupMode {
   try {
     const url = new URL(normalizeTallyUrlInput(value));
     const hostname = url.hostname.toLowerCase();
-    return hostname === "localhost" || hostname === "127.0.0.1" ? "same_machine" : "lan_server";
+    return hostname === "localhost" || hostname === "127.0.0.1"
+      ? "same_machine"
+      : "lan_server";
   } catch {
     return "lan_server";
   }
@@ -194,12 +219,20 @@ function StatusCard({
           <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">
             {title}
           </div>
-          <div className="mt-2 text-base font-extrabold text-[#1a1a1a]">{value}</div>
-          <div className="mt-1 text-xs font-semibold text-slate-400 leading-snug">{detail}</div>
+          <div className="mt-2 text-base font-extrabold text-[#1a1a1a]">
+            {value}
+          </div>
+          <div className="mt-1 text-xs font-semibold text-slate-400 leading-snug">
+            {detail}
+          </div>
         </div>
-        <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border ${
-          ok ? "bg-emerald-50 border-emerald-100 text-emerald-600" : "bg-amber-50 border-amber-100 text-amber-600"
-        }`}>
+        <div
+          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border ${
+            ok
+              ? "bg-emerald-50 border-emerald-100 text-emerald-600"
+              : "bg-amber-50 border-amber-100 text-amber-600"
+          }`}
+        >
           {ok ? (
             <CheckCircle2 className="h-4.5 w-4.5" />
           ) : (
@@ -238,7 +271,9 @@ function HubCard({
           <ArrowRight className="h-5 w-5 text-slate-400 transition-all duration-300 group-hover:translate-x-1 group-hover:text-[#1a1a1a]" />
         </div>
         <h3 className="text-lg font-extrabold text-[#1a1a1a]">{title}</h3>
-        <p className="mt-2 text-xs font-semibold leading-relaxed text-slate-500">{description}</p>
+        <p className="mt-2 text-xs font-semibold leading-relaxed text-slate-500">
+          {description}
+        </p>
       </div>
       <div className="mt-6 w-fit rounded-full border border-amber-250 bg-amber-50 px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-amber-800">
         {status}
@@ -256,42 +291,76 @@ export function TallyPrimeDashboard() {
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
+  const [disconnectingOthers, setDisconnectingOthers] = useState(false);
   const [testing, setTesting] = useState(false);
   const [setupMode, setSetupMode] = useState<TallySetupMode>("same_machine");
   const [tallyUrlInput, setTallyUrlInput] = useState("");
-  const [message, setMessage] = useState<{ tone: "success" | "error"; text: string } | null>(null);
+  const [message, setMessage] = useState<{
+    tone: "success" | "error";
+    text: string;
+  } | null>(null);
   const statusRefreshInFlight = useRef(false);
 
   const selectedConnection =
-    connections.find((connection) => connection.id === selectedId) ?? connections[0] ?? null;
+    connections.find((connection) => connection.id === selectedId) ??
+    connections[0] ??
+    null;
   const selectedConnectionId = selectedConnection?.id ?? "";
   const expectedMachineId =
     typeof window !== "undefined" && selectedConnectionId
-      ? window.localStorage.getItem(`${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnectionId}`)
+      ? window.localStorage.getItem(
+          `${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnectionId}`,
+        )
+      : null;
+  const selectedControlToken =
+    typeof window !== "undefined" && selectedConnectionId
+      ? window.localStorage.getItem(
+          `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnectionId}`,
+        )
       : null;
   const connectionBelongsToThisBrowser =
-    !expectedMachineId ||
-    !selectedConnection?.bridgeMachineId ||
-    expectedMachineId === selectedConnection.bridgeMachineId;
-  const selectedCompany =
-    connectionBelongsToThisBrowser ? companies.find(
-      (company) =>
-        company.connectionId === selectedConnection?.id &&
-        (company.isActive ||
-          company.companyName.trim().toLowerCase() ===
-            String(selectedConnection?.lastCompanyName ?? "").trim().toLowerCase())
-    ) ?? null : null;
-  const statusTone = connectionBelongsToThisBrowser ? getStatusTone(selectedConnection) : "error";
+    !selectedConnection?.bridgeConnected ||
+    (Boolean(selectedControlToken) &&
+      (!expectedMachineId ||
+        !selectedConnection?.bridgeMachineId ||
+        expectedMachineId === selectedConnection.bridgeMachineId));
+  const selectedCompany = connectionBelongsToThisBrowser
+    ? (companies.find(
+        (company) =>
+          company.connectionId === selectedConnection?.id &&
+          (company.isActive ||
+            company.companyName.trim().toLowerCase() ===
+              String(selectedConnection?.lastCompanyName ?? "")
+                .trim()
+                .toLowerCase()),
+      ) ?? null)
+    : null;
+  const statusTone = connectionBelongsToThisBrowser
+    ? getStatusTone(selectedConnection)
+    : "error";
   const connectorActive =
-    connectionBelongsToThisBrowser && Boolean(selectedConnection?.bridgeConnected);
+    connectionBelongsToThisBrowser &&
+    Boolean(selectedConnection?.bridgeConnected);
+  const selectedActiveConnectionId = selectedConnection?.bridgeConnected
+    ? (selectedConnection?.id ?? "")
+    : "";
+  const otherActiveConnectionCount = connections.filter(
+    (connection) =>
+      connection.bridgeConnected && connection.id !== selectedActiveConnectionId,
+  ).length;
   const tallyReachable =
-    connectionBelongsToThisBrowser && selectedConnection?.tallyReachable === true;
+    connectionBelongsToThisBrowser &&
+    selectedConnection?.tallyReachable === true;
   const companyLoaded =
-    connectionBelongsToThisBrowser && selectedConnection?.companyLoaded === true;
+    connectionBelongsToThisBrowser &&
+    selectedConnection?.companyLoaded === true;
   const companyDetail = !connectionBelongsToThisBrowser
     ? "Another connector replaced this connection. Reconnect this computer."
-    : selectedConnection?.lastCompanyName || selectedCompany?.companyName
-      || (selectedConnection?.companyLoaded ? "Company loaded" : "Company not detected yet");
+    : selectedConnection?.lastCompanyName ||
+      selectedCompany?.companyName ||
+      (selectedConnection?.companyLoaded
+        ? "Company loaded"
+        : "Company not detected yet");
   async function loadConnections(options?: { quiet?: boolean }) {
     try {
       if (!options?.quiet) {
@@ -311,10 +380,13 @@ export function TallyPrimeDashboard() {
       setSelectedId((current) => {
         const stored =
           typeof window !== "undefined"
-            ? window.localStorage.getItem(SELECTED_CONNECTION_STORAGE_KEY) ?? ""
+            ? (window.localStorage.getItem(SELECTED_CONNECTION_STORAGE_KEY) ??
+              "")
             : "";
         const preferred = current || stored;
-        const nextId = nextConnections.some((connection) => connection.id === preferred)
+        const nextId = nextConnections.some(
+          (connection) => connection.id === preferred,
+        )
           ? preferred
           : nextConnections[0]?.id || "";
         if (typeof window !== "undefined" && nextId) {
@@ -328,13 +400,17 @@ export function TallyPrimeDashboard() {
         cache: "no-store",
       });
       if (companyResponse.ok) {
-        const companyPayload = (await companyResponse.json()) as CompaniesResponse;
+        const companyPayload =
+          (await companyResponse.json()) as CompaniesResponse;
         setCompanies(companyPayload.companies ?? []);
       }
     } catch (error) {
       setMessage({
         tone: "error",
-        text: error instanceof Error ? error.message : "Failed to load Tally connections.",
+        text:
+          error instanceof Error
+            ? error.message
+            : "Failed to load Tally connections.",
       });
     } finally {
       setLoading(false);
@@ -346,10 +422,13 @@ export function TallyPrimeDashboard() {
 
     statusRefreshInFlight.current = true;
     try {
-      const response = await apiFetch(`/api/tally/connections/${connectionId}/status`, {
-        method: "GET",
-        cache: "no-store",
-      });
+      const response = await apiFetch(
+        `/api/tally/connections/${connectionId}/status`,
+        {
+          method: "GET",
+          cache: "no-store",
+        },
+      );
       if (!response.ok) {
         throw new Error(await readError(response));
       }
@@ -359,13 +438,18 @@ export function TallyPrimeDashboard() {
 
       setConnections((current) =>
         current.map((connection) =>
-          connection.id === payload.connection?.id ? payload.connection : connection
-        )
+          connection.id === payload.connection?.id
+            ? payload.connection
+            : connection,
+        ),
       );
     } catch (error) {
       setMessage({
         tone: "error",
-        text: error instanceof Error ? error.message : "Failed to refresh Tally status.",
+        text:
+          error instanceof Error
+            ? error.message
+            : "Failed to refresh Tally status.",
       });
     } finally {
       statusRefreshInFlight.current = false;
@@ -376,7 +460,10 @@ export function TallyPrimeDashboard() {
     try {
       setCreating(true);
       setMessage(null);
-      const tallyUrl = setupMode === "same_machine" ? DEFAULT_TALLY_URL : normalizeTallyUrlInput(tallyUrlInput);
+      const tallyUrl =
+        setupMode === "same_machine"
+          ? DEFAULT_TALLY_URL
+          : normalizeTallyUrlInput(tallyUrlInput);
       if (!tallyUrl) {
         throw new Error("Enter the Tally server URL or IP address.");
       }
@@ -395,7 +482,8 @@ export function TallyPrimeDashboard() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          displayName: setupMode === "same_machine" ? "Tally Prime" : "Tally Prime LAN",
+          displayName:
+            setupMode === "same_machine" ? "Tally Prime" : "Tally Prime LAN",
           tallyUrl,
         }),
       });
@@ -404,36 +492,54 @@ export function TallyPrimeDashboard() {
       }
 
       const payload = (await response.json()) as CreateConnectionResponse;
-      if (!payload.connection || !payload.pairingCode || !payload.controlToken) {
-        throw new Error("Connection created, but pairing details were missing.");
+      if (
+        !payload.connection ||
+        !payload.pairingCode ||
+        !payload.controlToken
+      ) {
+        throw new Error(
+          "Connection created, but pairing details were missing.",
+        );
       }
 
-      setConnections((current) => [payload.connection as TallyConnection, ...current]);
+      setConnections((current) => [
+        payload.connection as TallyConnection,
+        ...current,
+      ]);
       setSelectedId(payload.connection.id);
-      window.localStorage.setItem(SELECTED_CONNECTION_STORAGE_KEY, payload.connection.id);
+      window.localStorage.setItem(
+        SELECTED_CONNECTION_STORAGE_KEY,
+        payload.connection.id,
+      );
       window.localStorage.removeItem(
-        `${EXPECTED_MACHINE_STORAGE_PREFIX}${payload.connection.id}`
+        `${EXPECTED_MACHINE_STORAGE_PREFIX}${payload.connection.id}`,
       );
       window.localStorage.setItem(
         `${CONNECTION_CONTROL_STORAGE_PREFIX}${payload.connection.id}`,
-        payload.controlToken
+        payload.controlToken,
       );
       openConnectorUrl(
         buildConnectorConnectUrl(
           payload.connection,
           payload.pairingCode,
-          payload.controlToken
-        )
+          payload.controlToken,
+        ),
       );
       setMessage({
         tone: "success",
         text: "Connector launch requested. Approve the browser prompt if it appears.",
       });
-      window.setTimeout(() => void refreshStatus(payload.connection?.id || ""), 2500);
+      window.setTimeout(
+        () => void refreshStatus(payload.connection?.id || ""),
+        2500,
+      );
     } catch (error) {
       setMessage({
         tone: "error",
-        text: error instanceof Error ? error.message : "Failed to connect Tally connector.",
+        text:
+          error instanceof Error
+            ? error.message
+            : "Failed to connect Tally connector.",
       });
     } finally {
       setCreating(false);
@@ -447,19 +553,22 @@ export function TallyPrimeDashboard() {
       setDisconnecting(true);
       setMessage(null);
       const controlToken = window.localStorage.getItem(
-        `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnection.id}`
+        `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnection.id}`,
       );
       if (!controlToken) {
         throw new Error(
-          "This connection was created in another browser. Reconnect from this browser to manage it."
+          "This connection was created in another browser. Reconnect from this browser to manage it.",
         );
       }
-      const response = await apiFetch(`/api/tally/connections/${selectedConnection.id}/disconnect`, {
-        method: "POST",
-        headers: {
-          "x-tally-control-token": controlToken,
+      const response = await apiFetch(
+        `/api/tally/connections/${selectedConnection.id}/disconnect`,
+        {
+          method: "POST",
+          headers: {
+            "x-tally-control-token": controlToken,
+          },
         },
-      });
+      );
       if (!response.ok) {
         throw new Error(await readError(response));
       }
@@ -468,15 +577,17 @@ export function TallyPrimeDashboard() {
       if (payload.connection) {
         setConnections((current) =>
           current.map((connection) =>
-            connection.id === payload.connection?.id ? payload.connection : connection
-          )
+            connection.id === payload.connection?.id
+              ? payload.connection
+              : connection,
+          ),
         );
       }
       window.localStorage.removeItem(
-        `${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnection.id}`
+        `${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnection.id}`,
       );
       window.localStorage.removeItem(
-        `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnection.id}`
+        `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnection.id}`,
       );
       setMessage({
         tone: "success",
@@ -485,10 +596,80 @@ export function TallyPrimeDashboard() {
     } catch (error) {
       setMessage({
         tone: "error",
-        text: error instanceof Error ? error.message : "Failed to disconnect connector.",
+        text:
+          error instanceof Error
+            ? error.message
+            : "Failed to disconnect connector.",
       });
     } finally {
       setDisconnecting(false);
+    }
+  }
+
+  async function disconnectOtherConnectors() {
+    try {
+      setDisconnectingOthers(true);
+      setMessage(null);
+      const response = await apiFetch(
+        "/api/tally/connections/disconnect-others",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            keepConnectionId: selectedActiveConnectionId || null,
+          }),
+        },
+      );
+      if (!response.ok) {
+        throw new Error(await readError(response));
+      }
+
+      const payload = (await response.json()) as DisconnectOthersResponse;
+      const disconnectedIds = payload.disconnectedConnectionIds ?? [];
+      for (const connectionId of disconnectedIds) {
+        window.localStorage.removeItem(
+          `${EXPECTED_MACHINE_STORAGE_PREFIX}${connectionId}`,
+        );
+        window.localStorage.removeItem(
+          `${CONNECTION_CONTROL_STORAGE_PREFIX}${connectionId}`,
+        );
+      }
+
+      const nextConnections = payload.connections ?? [];
+      setConnections(nextConnections);
+      setSelectedId((current) => {
+        if (
+          selectedActiveConnectionId &&
+          nextConnections.some(
+            (connection) => connection.id === selectedActiveConnectionId,
+          )
+        ) {
+          return selectedActiveConnectionId;
+        }
+        if (nextConnections.some((connection) => connection.id === current)) {
+          return current;
+        }
+        return nextConnections[0]?.id || "";
+      });
+      setMessage({
+        tone: "success",
+        text:
+          (payload.disconnectedCount ?? disconnectedIds.length) > 0
+            ? "Other connector sessions disconnected."
+            : "No other connector sessions were active.",
+      });
+    } catch (error) {
+      setMessage({
+        tone: "error",
+        text:
+          error instanceof Error
+            ? error.message
+            : "Failed to disconnect other connector sessions.",
+      });
+    } finally {
+      setDisconnectingOthers(false);
     }
   }
 
@@ -498,9 +679,12 @@ export function TallyPrimeDashboard() {
     try {
       setTesting(true);
       setMessage(null);
-      const response = await apiFetch(`/api/tally/connections/${selectedConnection.id}/test`, {
-        method: "POST",
-      });
+      const response = await apiFetch(
+        `/api/tally/connections/${selectedConnection.id}/test`,
+        {
+          method: "POST",
+        },
+      );
       if (!response.ok) {
         throw new Error(await readError(response));
       }
@@ -509,8 +693,10 @@ export function TallyPrimeDashboard() {
       if (payload.connection) {
         setConnections((current) =>
           current.map((connection) =>
-            connection.id === payload.connection?.id ? payload.connection : connection
-          )
+            connection.id === payload.connection?.id
+              ? payload.connection
+              : connection,
+          ),
         );
       }
 
@@ -521,7 +707,10 @@ export function TallyPrimeDashboard() {
     } catch (error) {
       setMessage({
         tone: "error",
-        text: error instanceof Error ? error.message : "Failed to test Tally connection.",
+        text:
+          error instanceof Error
+            ? error.message
+            : "Failed to test Tally connection.",
       });
     } finally {
       setTesting(false);
@@ -550,7 +739,10 @@ export function TallyPrimeDashboard() {
 
   useEffect(() => {
     if (!selectedConnection?.id) return;
-    window.localStorage.setItem(SELECTED_CONNECTION_STORAGE_KEY, selectedConnection.id);
+    window.localStorage.setItem(
+      SELECTED_CONNECTION_STORAGE_KEY,
+      selectedConnection.id,
+    );
   }, [selectedConnection?.id]);
 
   useEffect(() => {
@@ -593,16 +785,18 @@ export function TallyPrimeDashboard() {
             Tally Prime Integration
           </h1>
           <p className="text-xs font-semibold text-slate-500 mt-1">
-            Sync your dealer verification workflows directly with Tally Prime company ledgers.
+            Sync your dealer verification workflows directly with Tally Prime
+            company ledgers.
           </p>
         </div>
 
         {message ? (
           <div
-            className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${message.tone === "success"
+            className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${
+              message.tone === "success"
                 ? "border-emerald-200 bg-emerald-50 text-emerald-800"
                 : "border-red-200 bg-red-50 text-red-800"
-              }`}
+            }`}
           >
             {message.text}
           </div>
@@ -613,7 +807,9 @@ export function TallyPrimeDashboard() {
             description="Configure, test, or launch the Tally desktop sync connector."
             icon={<Server className="h-5.5 w-5.5" />}
             onClick={() => setView("connection")}
-            status={loading ? "Checking..." : getStatusLabel(selectedConnection)}
+            status={
+              loading ? "Checking..." : getStatusLabel(selectedConnection)
+            }
             title="Tally Connection"
           />
           <HubCard
@@ -640,19 +836,23 @@ export function TallyPrimeDashboard() {
             <ArrowLeft className="h-4 w-4" />
             Back to Tally Home
           </button>
-          <h2 className="text-2xl font-black tracking-tight text-[#1a1a1a]">Tally Connection</h2>
+          <h2 className="text-2xl font-black tracking-tight text-[#1a1a1a]">
+            Tally Connection
+          </h2>
           <p className="mt-1 text-xs font-semibold text-slate-500">
-            Connect Tally Prime to sync workflows and post bank statement ledger entries.
+            Connect Tally Prime to sync workflows and post bank statement ledger
+            entries.
           </p>
         </div>
       </div>
 
       {message ? (
         <div
-          className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${message.tone === "success"
+          className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${
+            message.tone === "success"
               ? "border-emerald-255 bg-emerald-50 text-emerald-800"
               : "border-red-255 bg-red-50 text-red-800"
-            }`}
+          }`}
         >
           {message.text}
         </div>
@@ -664,39 +864,49 @@ export function TallyPrimeDashboard() {
             <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">
               Tally target
             </div>
-            <h3 className="mt-2 text-base font-extrabold text-[#1a1a1a]">Connection location</h3>
+            <h3 className="mt-2 text-base font-extrabold text-[#1a1a1a]">
+              Connection location
+            </h3>
           </div>
 
           <div className="grid gap-3 md:grid-cols-2">
             <button
-              className={`rounded-2xl border p-4 text-left transition ${setupMode === "same_machine"
+              className={`rounded-2xl border p-4 text-left transition ${
+                setupMode === "same_machine"
                   ? "border-[#1a1a1a] bg-amber-50"
                   : "border-[#e5ddd0] bg-white hover:bg-[#faf8f4]"
-                }`}
+              }`}
               onClick={() => {
                 setSetupMode("same_machine");
                 setTallyUrlInput(DEFAULT_TALLY_URL);
               }}
               type="button"
             >
-              <div className="text-sm font-extrabold text-[#1a1a1a]">Same machine</div>
+              <div className="text-sm font-extrabold text-[#1a1a1a]">
+                Same machine
+              </div>
               <div className="mt-1 text-xs font-semibold leading-5 text-slate-500">
                 Tally and connector run on this computer.
               </div>
             </button>
 
             <button
-              className={`rounded-2xl border p-4 text-left transition ${setupMode === "lan_server"
+              className={`rounded-2xl border p-4 text-left transition ${
+                setupMode === "lan_server"
                   ? "border-[#1a1a1a] bg-amber-50"
                   : "border-[#e5ddd0] bg-white hover:bg-[#faf8f4]"
-                }`}
+              }`}
               onClick={() => {
                 setSetupMode("lan_server");
-                setTallyUrlInput((current) => (getSetupModeForUrl(current) === "same_machine" ? "" : current));
+                setTallyUrlInput((current) =>
+                  getSetupModeForUrl(current) === "same_machine" ? "" : current,
+                );
               }}
               type="button"
             >
-              <div className="text-sm font-extrabold text-[#1a1a1a]">LAN/server</div>
+              <div className="text-sm font-extrabold text-[#1a1a1a]">
+                LAN/server
+              </div>
               <div className="mt-1 text-xs font-semibold leading-5 text-slate-500">
                 Connector reaches Tally on a Gold LAN machine.
               </div>
@@ -705,7 +915,10 @@ export function TallyPrimeDashboard() {
 
           {setupMode === "lan_server" ? (
             <div className="mt-4">
-              <label className="text-[9px] font-bold uppercase tracking-wider text-slate-400" htmlFor="tally-url">
+              <label
+                className="text-[9px] font-bold uppercase tracking-wider text-slate-400"
+                htmlFor="tally-url"
+              >
                 Tally server URL
               </label>
               <Input
@@ -716,7 +929,8 @@ export function TallyPrimeDashboard() {
                 value={tallyUrlInput}
               />
               <div className="mt-2 text-xs font-semibold leading-5 text-slate-500">
-                Use the Tally server IP or hostname reachable from the connector machine.
+                Use the Tally server IP or hostname reachable from the connector
+                machine.
               </div>
             </div>
           ) : null}
@@ -726,7 +940,10 @@ export function TallyPrimeDashboard() {
       {loading ? (
         <div className="grid gap-4 md:grid-cols-3">
           {Array.from({ length: 3 }).map((_, index) => (
-            <div key={index} className="h-28 animate-pulse rounded-2xl bg-white border border-[#e5ddd0]" />
+            <div
+              key={index}
+              className="h-28 animate-pulse rounded-2xl bg-white border border-[#e5ddd0]"
+            />
           ))}
         </div>
       ) : selectedConnection ? (
@@ -739,7 +956,9 @@ export function TallyPrimeDashboard() {
                 </div>
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="text-base font-extrabold text-[#1a1a1a]">{selectedConnection.displayName}</h3>
+                    <h3 className="text-base font-extrabold text-[#1a1a1a]">
+                      {selectedConnection.displayName}
+                    </h3>
                     <Badge
                       className={
                         statusTone === "success"
@@ -783,7 +1002,11 @@ export function TallyPrimeDashboard() {
                   type="button"
                   variant="outline"
                 >
-                  {testing ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <RefreshCw className="h-3.5 w-3.5 mr-1.5" />}
+                  {testing ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+                  ) : (
+                    <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
+                  )}
                   Test Connection
                 </Button>
                 {connectorActive ? (
@@ -794,7 +1017,11 @@ export function TallyPrimeDashboard() {
                     type="button"
                     variant="outline"
                   >
-                    {disconnecting ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <PlugZap className="h-3.5 w-3.5 mr-1.5" />}
+                    {disconnecting ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+                    ) : (
+                      <PlugZap className="h-3.5 w-3.5 mr-1.5" />
+                    )}
                     Disconnect
                   </Button>
                 ) : (
@@ -804,10 +1031,30 @@ export function TallyPrimeDashboard() {
                     onClick={() => void connectConnector()}
                     type="button"
                   >
-                    {creating ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <PlugZap className="h-3.5 w-3.5 mr-1.5" />}
+                    {creating ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+                    ) : (
+                      <PlugZap className="h-3.5 w-3.5 mr-1.5" />
+                    )}
                     Connect
                   </Button>
                 )}
+                {otherActiveConnectionCount > 0 ? (
+                  <Button
+                    className="w-fit rounded-xl border-red-250 bg-red-50 text-xs font-bold text-red-800 hover:bg-red-100 hover:text-red-900 shadow-sm transition-all"
+                    disabled={disconnectingOthers}
+                    onClick={() => void disconnectOtherConnectors()}
+                    type="button"
+                    variant="outline"
+                  >
+                    {disconnectingOthers ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+                    ) : (
+                      <PlugZap className="h-3.5 w-3.5 mr-1.5" />
+                    )}
+                    Disconnect other sessions
+                  </Button>
+                ) : null}
               </div>
             </div>
           </div>
@@ -845,9 +1092,12 @@ export function TallyPrimeDashboard() {
             <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-amber-50 border border-amber-200/50 text-amber-700">
               <PlugZap className="h-6 w-6 animate-pulse" />
             </div>
-            <h3 className="mt-4 text-base font-extrabold text-[#1a1a1a]">No Tally connection found</h3>
+            <h3 className="mt-4 text-base font-extrabold text-[#1a1a1a]">
+              No Tally connection found
+            </h3>
             <p className="mt-1.5 text-xs font-semibold text-slate-400 max-w-sm">
-              Bridge this workstation to start the Tally Prime desktop agent and sync ledgers.
+              Bridge this workstation to start the Tally Prime desktop agent and
+              sync ledgers.
             </p>
             <Button
               className="mt-6 rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] px-6 py-5 text-xs font-bold text-white shadow-md transition-all"
@@ -855,7 +1105,11 @@ export function TallyPrimeDashboard() {
               onClick={() => void connectConnector()}
               type="button"
             >
-              {creating ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <PlugZap className="h-3.5 w-3.5 mr-1.5" />}
+              {creating ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+              ) : (
+                <PlugZap className="h-3.5 w-3.5 mr-1.5" />
+              )}
               Connect Bridge
             </Button>
           </div>

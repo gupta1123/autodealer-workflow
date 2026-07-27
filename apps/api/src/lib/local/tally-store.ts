@@ -71,7 +71,9 @@ async function writeState(state: LocalState) {
 }
 
 function publicConnection(row: LocalConnectionRow): TallyConnectionRow {
-  return Object.fromEntries(CONNECTION_FIELDS.map((field) => [field, row[field]])) as TallyConnectionRow;
+  return Object.fromEntries(
+    CONNECTION_FIELDS.map((field) => [field, row[field]]),
+  ) as TallyConnectionRow;
 }
 
 function nowIso() {
@@ -98,7 +100,8 @@ export async function listLocalTallyConnections(ownerUserId = LOCAL_USER_ID) {
     connection.revoked_reason = "Expired connector pairing attempt.";
     connection.pairing_code_hash = null;
     connection.pairing_code_expires_at = null;
-    connection.last_error = "Pairing attempt expired. Start a new connection when ready.";
+    connection.last_error =
+      "Pairing attempt expired. Start a new connection when ready.";
     connection.updated_at = now;
     changed = true;
   }
@@ -110,7 +113,7 @@ export async function listLocalTallyConnections(ownerUserId = LOCAL_USER_ID) {
   return state.connections
     .filter(
       (connection) =>
-        connection.owner_user_id === ownerUserId && !connection.revoked_at
+        connection.owner_user_id === ownerUserId && !connection.revoked_at,
     )
     .sort((left, right) => right.updated_at.localeCompare(left.updated_at))
     .map(publicConnection);
@@ -135,7 +138,8 @@ export async function createLocalTallyConnection(input: {
     }
 
     existing.revoked_at = createdAt;
-    existing.revoked_reason = "Superseded by a newer connector pairing attempt.";
+    existing.revoked_reason =
+      "Superseded by a newer connector pairing attempt.";
     existing.pairing_code_hash = null;
     existing.pairing_code_expires_at = null;
     existing.last_error = "Superseded by a newer connection attempt.";
@@ -178,10 +182,15 @@ export async function createLocalTallyConnection(input: {
   return { connection: publicConnection(row), pairingCode, controlToken };
 }
 
-export async function getLocalTallyConnection(connectionId: string, ownerUserId = LOCAL_USER_ID) {
+export async function getLocalTallyConnection(
+  connectionId: string,
+  ownerUserId = LOCAL_USER_ID,
+) {
   const state = await readState();
   const row = state.connections.find(
-    (connection) => connection.id === connectionId && connection.owner_user_id === ownerUserId
+    (connection) =>
+      connection.id === connectionId &&
+      connection.owner_user_id === ownerUserId,
   );
   return row ? publicConnection(row) : null;
 }
@@ -196,10 +205,16 @@ export async function pairLocalTallyConnection(input: {
   controlToken: string;
 }) {
   const state = await readState();
-  const row = state.connections.find((connection) => connection.id === input.connectionId);
-  if (!row) return { error: "Tally connection not found.", status: 404 as const };
+  const row = state.connections.find(
+    (connection) => connection.id === input.connectionId,
+  );
+  if (!row)
+    return { error: "Tally connection not found.", status: 404 as const };
   if (!row.pairing_code_hash || !row.pairing_code_expires_at) {
-    return { error: "This connection does not have an active pairing code.", status: 409 as const };
+    return {
+      error: "This connection does not have an active pairing code.",
+      status: 409 as const,
+    };
   }
   if (new Date(row.pairing_code_expires_at).getTime() <= Date.now()) {
     row.pairing_code_hash = null;
@@ -235,7 +250,8 @@ export async function pairLocalTallyConnection(input: {
     existing.last_company_loaded = null;
     existing.last_company_name = null;
     existing.revoked_at = now;
-    existing.revoked_reason = "Superseded by a newer session from this connector installation.";
+    existing.revoked_reason =
+      "Superseded by a newer session from this connector installation.";
     existing.last_error = existing.revoked_reason;
     existing.updated_at = now;
 
@@ -275,9 +291,14 @@ export async function pairLocalTallyConnection(input: {
   return { connection: publicConnection(row), bridgeToken };
 }
 
-export async function getLocalConnectionForBridge(connectionId: string, token: string) {
+export async function getLocalConnectionForBridge(
+  connectionId: string,
+  token: string,
+) {
   const state = await readState();
-  const row = state.connections.find((connection) => connection.id === connectionId);
+  const row = state.connections.find(
+    (connection) => connection.id === connectionId,
+  );
   if (
     !row?.bridge_token_hash ||
     row.revoked_at ||
@@ -302,8 +323,13 @@ export async function updateLocalTallyHeartbeat(input: {
   error?: string | null;
 }) {
   const state = await readState();
-  const row = state.connections.find((connection) => connection.id === input.connectionId);
-  if (!row?.bridge_token_hash || hashSecret(input.token) !== row.bridge_token_hash) {
+  const row = state.connections.find(
+    (connection) => connection.id === input.connectionId,
+  );
+  if (
+    !row?.bridge_token_hash ||
+    hashSecret(input.token) !== row.bridge_token_hash
+  ) {
     return null;
   }
   if (
@@ -332,11 +358,13 @@ export async function updateLocalTallyHeartbeat(input: {
 export async function disconnectLocalTallyConnection(
   connectionId: string,
   ownerUserId = LOCAL_USER_ID,
-  controlToken = ""
+  controlToken = "",
 ) {
   const state = await readState();
   const row = state.connections.find(
-    (connection) => connection.id === connectionId && connection.owner_user_id === ownerUserId
+    (connection) =>
+      connection.id === connectionId &&
+      connection.owner_user_id === ownerUserId,
   );
   if (!row) return null;
   if (
@@ -377,12 +405,80 @@ export async function disconnectLocalTallyConnection(
   return publicConnection(row);
 }
 
+export async function disconnectLocalOtherTallyConnections(input: {
+  ownerUserId?: string;
+  keepConnectionId?: string | null;
+}) {
+  const state = await readState();
+  const disconnectedAt = nowIso();
+  const ownerUserId = input.ownerUserId ?? LOCAL_USER_ID;
+  const keepConnectionId = input.keepConnectionId ?? null;
+  const disconnectedIds: string[] = [];
+
+  for (const connection of state.connections) {
+    if (
+      connection.owner_user_id !== ownerUserId ||
+      connection.revoked_at ||
+      !connection.bridge_token_hash ||
+      !connection.paired_at ||
+      connection.id === keepConnectionId
+    ) {
+      continue;
+    }
+
+    connection.status = "waiting_for_bridge";
+    connection.pairing_code_hash = null;
+    connection.pairing_code_expires_at = null;
+    connection.bridge_token_hash = null;
+    connection.control_token_hash = null;
+    connection.paired_at = null;
+    connection.last_heartbeat_at = null;
+    connection.last_tested_at = null;
+    connection.last_tally_reachable = null;
+    connection.last_company_loaded = null;
+    connection.last_company_name = null;
+    connection.revoked_at = disconnectedAt;
+    connection.revoked_reason = "Disconnected from another device by user.";
+    connection.last_error = connection.revoked_reason;
+    connection.updated_at = disconnectedAt;
+    disconnectedIds.push(connection.id);
+  }
+
+  if (disconnectedIds.length > 0) {
+    for (const command of state.commands) {
+      if (
+        disconnectedIds.includes(command.connection_id) &&
+        (command.status === "queued" || command.status === "claimed")
+      ) {
+        command.status = "canceled";
+        command.error = "Connection was disconnected from another device.";
+        command.completed_at = disconnectedAt;
+        command.updated_at = disconnectedAt;
+      }
+    }
+    await writeState(state);
+  }
+
+  return {
+    disconnectedIds,
+    connections: state.connections
+      .filter(
+        (connection) =>
+          connection.owner_user_id === ownerUserId && !connection.revoked_at,
+      )
+      .sort((left, right) => right.updated_at.localeCompare(left.updated_at))
+      .map(publicConnection),
+  };
+}
+
 export async function disconnectLocalTallyConnectionFromBridge(
   connectionId: string,
-  token: string
+  token: string,
 ) {
   const state = await readState();
-  const row = state.connections.find((connection) => connection.id === connectionId);
+  const row = state.connections.find(
+    (connection) => connection.id === connectionId,
+  );
   if (
     !row?.bridge_token_hash ||
     row.revoked_at ||
@@ -465,7 +561,10 @@ export async function listLocalTallyCommands(input: {
   const ids = new Set(input.ids ?? []);
   return state.commands
     .filter((command) => command.connection_id === input.connectionId)
-    .filter((command) => command.owner_user_id === (input.ownerUserId ?? LOCAL_USER_ID))
+    .filter(
+      (command) =>
+        command.owner_user_id === (input.ownerUserId ?? LOCAL_USER_ID),
+    )
     .filter((command) => ids.size === 0 || ids.has(command.id))
     .sort((left, right) => right.created_at.localeCompare(left.created_at))
     .slice(0, input.limit ?? 20);
@@ -477,7 +576,9 @@ export async function claimNextLocalTallyCommand(input: {
   bridgeVersion?: string | null;
 }) {
   const state = await readState();
-  const row = state.connections.find((connection) => connection.id === input.connectionId);
+  const row = state.connections.find(
+    (connection) => connection.id === input.connectionId,
+  );
   if (
     !row?.bridge_token_hash ||
     row.revoked_at ||
@@ -491,7 +592,11 @@ export async function claimNextLocalTallyCommand(input: {
     .filter((entry) => entry.connection_id === input.connectionId)
     .filter((entry) => entry.status === "queued")
     .filter((entry) => entry.available_at <= now)
-    .sort((left, right) => right.priority - left.priority || left.created_at.localeCompare(right.created_at))[0];
+    .sort(
+      (left, right) =>
+        right.priority - left.priority ||
+        left.created_at.localeCompare(right.created_at),
+    )[0];
 
   if (!command) return { command: null };
 
@@ -513,7 +618,9 @@ export async function completeLocalTallyCommand(input: {
   error: string | null;
 }) {
   const state = await readState();
-  const row = state.connections.find((connection) => connection.id === input.connectionId);
+  const row = state.connections.find(
+    (connection) => connection.id === input.connectionId,
+  );
   if (
     !row?.bridge_token_hash ||
     row.revoked_at ||
@@ -523,7 +630,9 @@ export async function completeLocalTallyCommand(input: {
   }
 
   const command = state.commands.find(
-    (entry) => entry.id === input.commandId && entry.connection_id === input.connectionId
+    (entry) =>
+      entry.id === input.commandId &&
+      entry.connection_id === input.connectionId,
   );
   if (!command) return { command: null };
 
