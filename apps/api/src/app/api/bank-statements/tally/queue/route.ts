@@ -5,9 +5,11 @@ import {
   buildBankAccountLedgerSourceKey,
   buildBankNarrationLedgerSourceKey,
   buildLedgerMappingTarget,
+  loadActiveTallyLedgerRows,
   suggestBankLedgerForTransaction,
 } from "@/lib/bank-statement-ledger-matching";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import type { TallyMasterRow } from "@/lib/tally/masters";
 
 export const runtime = "nodejs";
 
@@ -79,11 +81,6 @@ type ExistingCommandRow = {
 
 type TransactionStatusSummaryRow = {
   tally_status: string;
-};
-
-type TallyLedgerRow = {
-  tally_name: string;
-  parent_name: string | null;
 };
 
 type MappingRow = {
@@ -165,12 +162,12 @@ function isSuspenseLedger(value?: string | null) {
   return normalized.includes("suspense");
 }
 
-function findCompanySuspenseLedger(ledgers: TallyLedgerRow[]) {
+function findCompanySuspenseLedger(ledgers: TallyMasterRow[]) {
   const candidates = ledgers.filter(
     (ledger) => isSuspenseLedger(ledger.tally_name) || isSuspenseLedger(ledger.parent_name)
   );
   return candidates.sort((left, right) => {
-    const rank = (ledger: TallyLedgerRow) => {
+    const rank = (ledger: TallyMasterRow) => {
       const name = normalizeName(ledger.tally_name);
       if (name === "bankstatementsuspense") return 4;
       if (name === "suspense") return 3;
@@ -547,18 +544,11 @@ export async function POST(request: Request) {
       return [] as TallyCommandInsert[];
     }
 
-    const { data: ledgerRows, error: ledgerError } = await supabase
-      .from("tally_masters")
-      .select("tally_name, parent_name")
-      .eq("owner_user_id", user.id)
-      .eq("connection_id", connectionId)
-      .eq("master_type", "ledger")
-      .eq("is_active", true)
-      .limit(5000);
-
-    if (ledgerError) throw ledgerError;
-
-    const activeLedgers = (ledgerRows ?? []) as unknown as TallyLedgerRow[];
+    const activeLedgers = await loadActiveTallyLedgerRows({
+      supabase,
+      ownerUserId: user.id,
+      connectionId,
+    });
     const companySuspenseLedgerName = findCompanySuspenseLedger(activeLedgers);
 
     const syncedLedgerNames = new Set(
@@ -591,6 +581,7 @@ export async function POST(request: Request) {
           ownerUserId: user.id,
           connectionId,
           accountId: transaction.bank_account_id,
+          ledgerRows: activeLedgers,
           transaction: {
             transactionDate: transaction.transaction_date,
             valueDate: transaction.value_date,

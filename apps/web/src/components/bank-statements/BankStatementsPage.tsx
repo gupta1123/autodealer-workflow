@@ -251,8 +251,10 @@ type LedgerRecommendationAction =
   | "needs_review";
 
 type LedgerRecommendation = {
+  matchType?: "direct_match" | "close_match" | "suspense";
   action: LedgerRecommendationAction;
   ledgerName: string | null;
+  candidateLedgerNames?: string[];
   ledgerGroup: string | null;
   confidence: number;
   requiresUserConfirmation: boolean;
@@ -274,6 +276,7 @@ type ReviewTransaction = {
   suggestedLedgerName: string;
   suggestionConfidence: number | null;
   suggestionReason: string;
+  candidateLedgerNames: string[];
   selectedLedgerName: string;
   ledgerAction: LedgerRecommendationAction;
   ledgerGroup: string;
@@ -834,6 +837,12 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
   const recommendation = readRecommendation(transaction);
   const suggestedLedgerName = transaction.suggestedLedgerName || "";
   const action = recommendation?.action ?? "needs_review";
+  const aiCandidateLedgerNames = Array.isArray(recommendation?.candidateLedgerNames)
+    ? recommendation.candidateLedgerNames
+        .map((ledgerName) => String(ledgerName ?? "").trim())
+        .filter(Boolean)
+    : [];
+  const isAiCloseMatch = recommendation?.matchType === "close_match" || aiCandidateLedgerNames.length > 0;
   const recommendedLedgerName = recommendation?.ledgerName || suggestedLedgerName || fallbackReviewLedgerName(transaction);
   const suspenseLedger = findCompanySuspenseLedger(ledgerMasters);
   const suspenseName = suspenseLedger?.name || "Suspense";
@@ -847,23 +856,49 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
   );
   const standardLedger = findLedgerByNormalizedName(ledgerMasters, standardLedgerNameForTransaction(transaction));
   const matchedLedger = findLedgerByCandidates(ledgerMasters, ledgerCandidates);
+  const fallbackCloseExactName = normalizeName(transaction.counterpartyName || suggestedLedgerName || recommendedLedgerName);
+  const fallbackCloseCandidateNames = !matchedLedger
+    ? Array.from(
+        new Set(
+          [
+            ...findTokenPrefixCloseLedgerMatches(ledgerMasters, ledgerCandidates, fallbackCloseExactName, 5),
+            ...ledgerCandidates.flatMap((candidate) =>
+              findCloseLedgerMatches(ledgerMasters, candidate).map((match) => match.ledger.name)
+            ),
+          ]
+        )
+      )
+    : [];
+  const candidateLedgerNames =
+    aiCandidateLedgerNames.length > 0
+      ? aiCandidateLedgerNames
+      : isAiCloseMatch || fallbackCloseCandidateNames.length >= 2
+        ? fallbackCloseCandidateNames
+        : [];
+  const hasCloseMatchCandidates = candidateLedgerNames.length >= 2;
+  const firstCloseMatchCandidate = hasCloseMatchCandidates
+    ? candidateLedgerNames
+        .map((ledgerName) => findLedgerByNormalizedName(ledgerMasters, ledgerName))
+        .find((ledger): ledger is TallyMaster => Boolean(ledger))
+    : null;
   const closeLedgerMatch = !matchedLedger
     ? findUniqueCloseLedgerMatchByCandidates(ledgerMasters, ledgerCandidates)
     : null;
-  const reviewSuggestedLedgerName = closeLedgerMatch
-    ? closeLedgerMatch?.ledger.name || recommendedLedgerName
-    : recommendedLedgerName;
-  const selectedLedgerName =
-    confirmedMappedLedger?.name ||
-    standardLedger?.name ||
-    matchedLedger?.name ||
-    closeLedgerMatch?.ledger.name ||
-    confirmedSuspenseLedger?.name ||
-    suspenseName;
+  const reviewSuggestedLedgerName = firstCloseMatchCandidate?.name || closeLedgerMatch?.ledger.name || recommendedLedgerName;
+  const selectedLedgerName = hasCloseMatchCandidates
+    ? confirmedMappedLedger?.name || standardLedger?.name || matchedLedger?.name || firstCloseMatchCandidate?.name || ""
+    : confirmedMappedLedger?.name ||
+      standardLedger?.name ||
+      matchedLedger?.name ||
+      closeLedgerMatch?.ledger.name ||
+      confirmedSuspenseLedger?.name ||
+      suspenseName;
   const ledgerAction: LedgerRecommendationAction = confirmedMappedLedger
     ? "use_existing_ledger"
     : standardLedger
     ? "use_standard_ledger"
+    : hasCloseMatchCandidates
+    ? "needs_review"
     : closeLedgerMatch
     ? "use_existing_ledger"
     : matchedLedger
@@ -897,19 +932,25 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     suggestionConfidence: recommendation?.confidence ?? transaction.suggestionConfidence ?? null,
     suggestionReason: closeLedgerMatch
       ? `Single close Tally ledger match found: ${closeLedgerMatch.ledger.name}.`
+      : hasCloseMatchCandidates
+        ? `Close Tally ledger matches found: ${candidateLedgerNames.join(", ")}.`
       : ledgerAction === "use_suspense" && !matchedLedger
         ? "No matching Tally ledger was found. This row will go to Suspense unless changed."
         : recommendation?.reason || transaction.suggestionReason || "",
+    candidateLedgerNames,
     selectedLedgerName,
     ledgerAction,
     ledgerGroup: recommendation?.ledgerGroup || "",
-    requiresUserConfirmation: false,
+    requiresUserConfirmation: hasCloseMatchCandidates,
     ledgerSelectionTouched: false,
   };
 }
 
 function autoMatchUntouchedLedgerSelection(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
   if (transaction.ledgerSelectionTouched) return transaction;
+  if (transaction.ledgerAction === "needs_review" && (transaction.candidateLedgerNames ?? []).length > 0) {
+    return transaction;
+  }
 
   const currentLedger = findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
   if (
@@ -1097,6 +1138,89 @@ function getLedgerCandidateName(transaction: ReviewTransaction) {
   ).trim();
 }
 
+const GENERIC_CLOSE_MATCH_TOKENS = new Set([
+  "and",
+  "bank",
+  "by",
+  "co",
+  "company",
+  "cr",
+  "credit",
+  "debit",
+  "dr",
+  "from",
+  "imps",
+  "limited",
+  "ltd",
+  "nach",
+  "neft",
+  "payment",
+  "private",
+  "pvt",
+  "receipt",
+  "ref",
+  "rtgs",
+  "supplier",
+  "suppliers",
+  "supply",
+  "to",
+  "trader",
+  "traders",
+  "trading",
+  "transaction",
+  "txn",
+  "upi",
+  "utr",
+]);
+
+function closeMatchTokens(value?: string | null) {
+  return normalizeName(value)
+    .split(/\s+/)
+    .filter((token) => token.length >= 3 && !GENERIC_CLOSE_MATCH_TOKENS.has(token));
+}
+
+function tokenMatchesCloseLedgerToken(inputToken: string, ledgerToken: string) {
+  return inputToken === ledgerToken || ledgerToken.startsWith(inputToken);
+}
+
+function findTokenPrefixCloseLedgerMatches(
+  ledgerMasters: TallyMaster[],
+  searchTerms: string[],
+  exactName: string,
+  limit = 5
+) {
+  const matchesByLedger = new Map<string, { ledger: TallyMaster; score: number }>();
+
+  for (const term of searchTerms) {
+    const tokens = closeMatchTokens(term);
+    if (tokens.length === 0) continue;
+
+    for (const ledger of ledgerMasters) {
+      const normalizedLedger = normalizeName(ledger.name);
+      if (!normalizedLedger || normalizedLedger === exactName) continue;
+
+      const ledgerTokens = closeMatchTokens(ledger.name);
+      const matched = tokens.every((token) =>
+        ledgerTokens.some((ledgerToken) => tokenMatchesCloseLedgerToken(token, ledgerToken))
+      );
+      if (!matched) continue;
+
+      const key = normalizeName(ledger.name);
+      const score = tokens.reduce((total, token) => {
+        const exactToken = ledgerTokens.some((ledgerToken) => ledgerToken === token);
+        return total + (exactToken ? 2 : 1);
+      }, 0);
+      const existing = matchesByLedger.get(key);
+      if (!existing || score > existing.score) matchesByLedger.set(key, { ledger, score });
+    }
+  }
+
+  return Array.from(matchesByLedger.values())
+    .sort((left, right) => right.score - left.score || left.ledger.name.localeCompare(right.ledger.name))
+    .slice(0, limit)
+    .map(({ ledger }) => ledger.name);
+}
+
 function getCloseLedgerMatches(transaction: ReviewTransaction, ledgerMasters: TallyMaster[], limit = 5) {
   const searchTerms = [
     transaction.counterpartyName,
@@ -1108,6 +1232,7 @@ function getCloseLedgerMatches(transaction: ReviewTransaction, ledgerMasters: Ta
 
   const exactName = normalizeName(getLedgerCandidateName(transaction));
   const matches: Array<{ ledger: TallyMaster; score: number }> = [];
+  const tokenPrefixMatches = findTokenPrefixCloseLedgerMatches(ledgerMasters, searchTerms, exactName, limit);
 
   for (const ledger of ledgerMasters) {
     const normalizedLedger = normalizeName(ledger.name);
@@ -1128,10 +1253,11 @@ function getCloseLedgerMatches(transaction: ReviewTransaction, ledgerMasters: Ta
     if (score > 0) matches.push({ ledger, score });
   }
 
-  return matches
+  const fuzzyMatches = matches
     .sort((left, right) => right.score - left.score || left.ledger.name.localeCompare(right.ledger.name))
     .slice(0, limit)
     .map(({ ledger }) => ledger.name);
+  return Array.from(new Set([...tokenPrefixMatches, ...fuzzyMatches])).slice(0, limit);
 }
 
 function getCommonLedgerOptions(ledgerMasters: TallyMaster[]) {
@@ -1179,7 +1305,11 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
   const suspenseName = suspenseLedger?.name || "Suspense";
   const currentLedger = findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
   const suggestedLedger = findLedgerByNormalizedName(ledgerMasters, transaction.suggestedLedgerName);
+  const candidateLedgers = (transaction.candidateLedgerNames ?? [])
+    .map((ledgerName) => findLedgerByNormalizedName(ledgerMasters, ledgerName))
+    .filter((ledger): ledger is TallyMaster => Boolean(ledger));
   const closeMatches = getCloseLedgerMatches(transaction, ledgerMasters);
+  const hasPotentialCloseMatches = candidateLedgers.length > 0 || closeMatches.length > 0;
   const commonLedgers = getCommonLedgerOptions(ledgerMasters);
   const groups: LedgerPickerGroup[] = [];
   const usedKeys = new Set<string>();
@@ -1219,7 +1349,7 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
         badge: "Standard",
       },
     ]);
-  } else if (transaction.ledgerAction === "use_suspense") {
+  } else if (transaction.ledgerAction === "use_suspense" && !hasPotentialCloseMatches) {
     addGroup("Current selection", [
       {
         name: suspenseName,
@@ -1246,6 +1376,13 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
             },
           ]
         : []),
+      ...candidateLedgers.map((ledger) => ({
+        name: ledger.name,
+        action: "use_existing_ledger" as const,
+        label: ledger.name,
+        helper: ledger.parent ? `Group: ${ledger.parent}` : "AI close-match candidate.",
+        badge: "Close",
+      })),
       ...closeMatches.map((name) => ({
         name,
         action: "use_existing_ledger" as const,
@@ -1539,6 +1676,9 @@ function LedgerReviewSelect({
 }
 
 function getReviewStatus(transaction: ReviewTransaction): ReviewStatusFilter {
+  if (transaction.ledgerAction === "needs_review") {
+    return "needs_review";
+  }
   if (transaction.ledgerAction === "use_suspense" || isSuspenseLedgerName(transaction.selectedLedgerName)) {
     return "suspense";
   }
@@ -2415,7 +2555,6 @@ function formatFileSize(size: number | null | undefined) {
 
 export function BankStatementsPage() {
   const router = useRouter();
-  const storedCompanySelection = useMemo(() => readStoredCompanySelection(), []);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [documentPreview, setDocumentPreview] = useState<DocumentPreviewState | null>(null);
@@ -2428,19 +2567,16 @@ export function BankStatementsPage() {
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [, setRecentImports] = useState<BankStatementImport[]>([]);
   const [accounts, setAccounts] = useState<BankAccount[]>([]);
-  const [companies, setCompanies] = useState<CompanyOption[]>(() =>
-    storedCompanySelection ? [storedCompanySelection] : []
-  );
+  const [companies, setCompanies] = useState<CompanyOption[]>([]);
   const [connections, setConnections] = useState<TallyConnection[]>([]);
   const [selectedAccountId, setSelectedAccountId] = useState<string>("");
-  const [tallyConnectionId, setTallyConnectionId] = useState(storedCompanySelection?.connectionId ?? "");
-  const [selectedCompanyId, setSelectedCompanyId] = useState(storedCompanySelection?.id ?? "");
+  const [tallyConnectionId, setTallyConnectionId] = useState("");
+  const [selectedCompanyId, setSelectedCompanyId] = useState("");
   const [bankLedgerName, setBankLedgerName] = useState("");
   const [bankLedgerVerified, setBankLedgerVerified] = useState(false);
   const [bankLedgerManuallyConfirmed, setBankLedgerManuallyConfirmed] = useState(false);
   const [bankLedgerChangeMode, setBankLedgerChangeMode] = useState(false);
   const [pendingBankLedgerName, setPendingBankLedgerName] = useState("");
-  const [syncBeforeAnalysis, setSyncBeforeAnalysis] = useState(true);
   const [ledgerMasters, setLedgerMasters] = useState<TallyMaster[]>([]);
   const [tallyBankLedgersByCompany, setTallyBankLedgersByCompany] = useState<Record<string, LocalBankLedger[]>>({});
   const [transactions, setTransactions] = useState<ReviewTransaction[]>([]);
@@ -2452,6 +2588,8 @@ export function BankStatementsPage() {
   const [loadingBankLedgers, setLoadingBankLedgers] = useState(false);
   const [refreshingConnections, setRefreshingConnections] = useState(false);
   const [banner, setBanner] = useState<{ tone: MessageTone; text: string } | null>(null);
+  const [postUploadSyncImportId, setPostUploadSyncImportId] = useState<string | null>(null);
+  const [postUploadSyncError, setPostUploadSyncError] = useState<string | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [tallyPostingStatus, setTallyPostingStatus] = useState<TallyPostingStatus | null>(null);
   const [statementDoneSummary, setStatementDoneSummary] = useState<StatementDoneSummary | null>(null);
@@ -2640,18 +2778,14 @@ export function BankStatementsPage() {
           ? `Tally is open to ${activeTallyCompanyName}. Switch Tally Prime to ${selectedCompanyName}, then refresh.`
           : "";
   const syncModeStatus = useMemo(() => {
-    const stateLabel = syncBeforeAnalysis ? "Sync before analysis: On" : "Sync before analysis: Off";
-    const readyText = syncBeforeAnalysis
-      ? "The current Tally company will be synced before analysis starts."
-      : "Analysis will use the existing selected-company data without a pre-analysis sync.";
+    const stateLabel = "Tally sync after upload";
+    const readyText = "The current Tally company will sync after upload; ledger matching updates when sync completes.";
 
     if (!tallyConnectionId || !selectedCompanyName) {
       return {
         tone: "warning" as const,
         title: stateLabel,
-        text: syncBeforeAnalysis
-          ? "Sync cannot run until you select a Tally company."
-          : "Select a Tally company before upload; no pre-analysis sync will run while this is off.",
+        text: "Sync cannot run until you select a Tally company.",
       };
     }
 
@@ -2659,9 +2793,7 @@ export function BankStatementsPage() {
       return {
         tone: "warning" as const,
         title: stateLabel,
-        text: syncBeforeAnalysis
-          ? "Sync cannot run because the connector or Tally is not reachable. Open Tally Prime, load the company, then refresh."
-          : "Tally is not reachable. Open Tally Prime, load the company, then refresh before upload.",
+        text: "Sync cannot run because the connector or Tally is not reachable. Open Tally Prime, load the company, then refresh.",
       };
     }
 
@@ -2682,20 +2814,23 @@ export function BankStatementsPage() {
     }
 
     return {
-      tone: syncBeforeAnalysis ? ("success" as const) : ("info" as const),
+      tone: "success" as const,
       title: stateLabel,
       text: readyText,
     };
   }, [
     activeTallyCompanyName,
     selectedCompanyName,
-    syncBeforeAnalysis,
     tallyCompanyContextVerified,
     tallyConnected,
     tallyConnectionId,
   ]);
   const missingLedgerCount = useMemo(
     () => validTransactions.filter((transaction) => !transaction.selectedLedgerName.trim()).length,
+    [validTransactions]
+  );
+  const pendingLedgerReviewCount = useMemo(
+    () => validTransactions.filter((transaction) => transaction.ledgerAction === "needs_review").length,
     [validTransactions]
   );
   const pendingBillEligibleTransactions = useMemo(
@@ -2725,7 +2860,7 @@ export function BankStatementsPage() {
   const newReceiptCount = transactionsNeedingTallyWork.filter(isIncomingReceiptRow).length;
   const missingOutgoingCount = transactionsNeedingTallyWork.filter(isOutgoingPaymentRow).length;
   const statementReviewIssueCount =
-    missingOutgoingCount + ambiguousTallyPresenceCount + duplicateTallyPresenceCount;
+    pendingLedgerReviewCount + missingOutgoingCount + ambiguousTallyPresenceCount + duplicateTallyPresenceCount;
   const alreadyInTallyCount = validTransactions.filter(
     (transaction) => tallyPresenceByTransactionId[transaction.id]?.status === "found"
   ).length;
@@ -2786,6 +2921,8 @@ export function BankStatementsPage() {
       : `Checking ${tallyPostingStatus?.paymentCheckTotal ?? 0} Payment${tallyPostingStatus?.paymentCheckTotal === 1 ? "" : "s"}`
     : uncheckedTallyPresenceCount > 0
       ? "Check Tally First"
+      : pendingLedgerReviewCount > 0
+        ? `Review ${pendingLedgerReviewCount} Ledger Match${pendingLedgerReviewCount === 1 ? "" : "es"}`
       : ambiguousTallyPresenceCount > 0
         ? `Review ${ambiguousTallyPresenceCount} Ambiguous`
         : blockingBillAllocationCount > 0
@@ -3013,12 +3150,14 @@ export function BankStatementsPage() {
     }
   }
 
-  const clearStatementReview = useCallback(() => {
+  const clearStatementReview = useCallback((options?: { preserveSelectedFile?: boolean }) => {
     setPreview(null);
     setTransactions([]);
-    setFile(null);
-    setDocumentPreview(null);
-    setDocumentPreviewLoading(false);
+    if (!options?.preserveSelectedFile) {
+      setFile(null);
+      setDocumentPreview(null);
+      setDocumentPreviewLoading(false);
+    }
     setAccount(EMPTY_ACCOUNT);
     setBankLedgerName("");
     setBankLedgerVerified(false);
@@ -3028,6 +3167,8 @@ export function BankStatementsPage() {
     setPendingBankLedgerName("");
     setEditingLedgerIds(new Set());
     setBanner(null);
+    setPostUploadSyncImportId(null);
+    setPostUploadSyncError(null);
     setTallyPostingStatus(null);
     setStatementDoneSummary(null);
     setBillAllocationsByTransactionId({});
@@ -3241,6 +3382,21 @@ export function BankStatementsPage() {
         if (autoMatchedTransaction !== transaction) return autoMatchedTransaction;
 
         if (transaction.ledgerAction === "use_suspense") {
+          const closeMatches = getCloseLedgerMatches(transaction, ledgerMasters);
+          if (closeMatches.length >= 2) {
+            const firstCloseMatch = findLedgerByNormalizedName(ledgerMasters, closeMatches[0]);
+            return {
+              ...transaction,
+              selectedLedgerName: firstCloseMatch?.name || closeMatches[0] || "",
+              suggestedLedgerName: firstCloseMatch?.name || closeMatches[0] || transaction.suggestedLedgerName,
+              candidateLedgerNames: closeMatches,
+              ledgerAction: "needs_review",
+              ledgerGroup: firstCloseMatch?.parent || transaction.ledgerGroup,
+              requiresUserConfirmation: true,
+              suggestionReason: `Close Tally ledger matches found: ${closeMatches.join(", ")}.`,
+            };
+          }
+
           const suspenseLedger = findCompanySuspenseLedger(ledgerMasters);
           return suspenseLedger && transaction.selectedLedgerName !== suspenseLedger.name
             ? { ...transaction, selectedLedgerName: suspenseLedger.name, ledgerGroup: suspenseLedger.parent || "Suspense A/c" }
@@ -3511,14 +3667,7 @@ export function BankStatementsPage() {
   async function pollImportUntilReady(importId: string, ledgerMastersForReview = ledgerMasters) {
     for (let attempt = 0; attempt < 120; attempt += 1) {
       await wait(2500);
-      const response = await apiFetch(`/api/bank-statements/imports/${importId}`, {
-        cache: "no-store",
-      });
-      if (!response.ok) {
-        throw new Error(await readError(response));
-      }
-
-      const payload = (await response.json()) as PreviewResponse;
+      const payload = await loadImportPreview(importId);
       if (payload.processing) {
         setBanner({
           tone: "info",
@@ -3566,9 +3715,22 @@ export function BankStatementsPage() {
     setStatementPasswordError(null);
     setDragActive(false);
     setBanner(null);
+    setPostUploadSyncImportId(null);
+    setPostUploadSyncError(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
+  }
+
+  async function loadImportPreview(importId: string) {
+    const response = await apiFetch(`/api/bank-statements/imports/${importId}`, {
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      throw new Error(await readError(response));
+    }
+
+    return (await response.json()) as PreviewResponse;
   }
 
   async function analyzeFile(nextFile = file) {
@@ -3595,21 +3757,15 @@ export function BankStatementsPage() {
       return;
     }
     try {
-      clearStatementReview();
+      clearStatementReview({ preserveSelectedFile: true });
       setLoading(true);
       setBanner(null);
       setStatementPasswordError(null);
       setTallyPostingStatus(null);
       setStatementDoneSummary(null);
+      setPostUploadSyncImportId(null);
+      setPostUploadSyncError(null);
       setFile(nextFile);
-      let ledgerMastersForReview = ledgerMasters;
-      if (syncBeforeAnalysis) {
-        const syncedMasters = await syncCompanyData({ quiet: true });
-        if (!syncedMasters) {
-          return;
-        }
-        ledgerMastersForReview = syncedMasters;
-      }
       const formData = new FormData();
       formData.set("file", nextFile);
       formData.set("account", JSON.stringify(EMPTY_ACCOUNT));
@@ -3617,7 +3773,7 @@ export function BankStatementsPage() {
       formData.set("companyName", selectedCompanyName);
       formData.set("financialYear", selectedFinancialYear);
       formData.set("bankLedgerName", "");
-      formData.set("syncBeforeAnalysis", String(syncBeforeAnalysis));
+      formData.set("syncBeforeAnalysis", "true");
       if (isPdfFile(nextFile) && statementPassword.trim()) {
         formData.set("statementPassword", statementPassword);
       }
@@ -3649,9 +3805,13 @@ export function BankStatementsPage() {
       }
 
       const payload = (await response.json()) as PreviewResponse;
+      setPostUploadSyncImportId(payload.import.id);
       setStatementPassword("");
       setStatementPasswordRequired(false);
       setStatementPasswordError(null);
+      const syncPromise = syncCompanyData({ quiet: true });
+      const emptyLedgerMasters: TallyMaster[] = [];
+      let analyzedPayload: PreviewResponse;
       if (payload.processing) {
         setBanner({
           tone: "info",
@@ -3659,17 +3819,77 @@ export function BankStatementsPage() {
             ? `Analyzing statement: ${payload.job.stage}`
             : "Analyzing statement...",
         });
-        await pollImportUntilReady(payload.import.id, ledgerMastersForReview);
-        return;
+        analyzedPayload = await pollImportUntilReady(payload.import.id, emptyLedgerMasters);
+      } else {
+        const latestPayload = await loadImportPreview(payload.import.id);
+        if (latestPayload.processing) {
+          analyzedPayload = await pollImportUntilReady(payload.import.id, emptyLedgerMasters);
+        } else {
+          applyPreviewPayload(latestPayload, EMPTY_ACCOUNT, emptyLedgerMasters);
+          setBanner(getAnalysisCompleteMessage(latestPayload));
+          analyzedPayload = latestPayload;
+        }
       }
 
-      applyPreviewPayload(payload, EMPTY_ACCOUNT, ledgerMastersForReview);
-      setBanner(getAnalysisCompleteMessage(payload));
+      const syncedMasters = await syncPromise;
+      if (!syncedMasters) {
+        const message =
+          "Statement analysis is ready, but Tally sync failed. Retry sync on this page to complete ledger matching.";
+        setPostUploadSyncError(message);
+        setBanner({ tone: "error", text: message });
+        return;
+      }
+      const ledgerMastersForReview = syncedMasters;
+      const latestPayload = await loadImportPreview(payload.import.id);
+      if (latestPayload.processing) {
+        await pollImportUntilReady(payload.import.id, ledgerMastersForReview);
+      } else {
+        applyPreviewPayload(latestPayload || analyzedPayload, EMPTY_ACCOUNT, ledgerMastersForReview);
+        setBanner({
+          tone: "success",
+          text: "Statement analyzed and Tally ledgers matched.",
+        });
+      }
+      setPostUploadSyncImportId(null);
+      setPostUploadSyncError(null);
     } catch (error) {
       setBanner({
         tone: "error",
         text: error instanceof Error ? error.message : "Bank statement analysis failed.",
       });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function retryPostUploadSync() {
+    if (!postUploadSyncImportId) return;
+
+    try {
+      setLoading(true);
+      setPostUploadSyncError(null);
+      setBanner({ tone: "info", text: "Retrying Tally company sync after upload..." });
+      const syncedMasters = await syncCompanyData({ quiet: true });
+      if (!syncedMasters) {
+        const message = "Tally company sync is still not complete. Keep the connector open, then retry.";
+        setPostUploadSyncError(message);
+        setBanner({ tone: "error", text: message });
+        return;
+      }
+
+      const payload = await loadImportPreview(postUploadSyncImportId);
+      if (payload.processing) {
+        await pollImportUntilReady(postUploadSyncImportId, syncedMasters);
+      } else {
+        applyPreviewPayload(payload, EMPTY_ACCOUNT, syncedMasters);
+        setBanner(getAnalysisCompleteMessage(payload));
+      }
+      setPostUploadSyncImportId(null);
+      setPostUploadSyncError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not retry Tally company sync.";
+      setPostUploadSyncError(message);
+      setBanner({ tone: "error", text: message });
     } finally {
       setLoading(false);
     }
@@ -3684,7 +3904,7 @@ export function BankStatementsPage() {
 
     try {
       setSyncingMasters(true);
-      setBanner(options?.quiet ? { tone: "info", text: "Refreshing Tally company data before analysis..." } : null);
+      setBanner(options?.quiet ? { tone: "info", text: "Refreshing Tally company data after upload..." } : null);
       const response = await apiFetch(`/api/tally/connections/${connection.id}/commands`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3709,10 +3929,13 @@ export function BankStatementsPage() {
       setBanner({
         tone: "info",
         text: options?.quiet
-          ? "Refreshing Tally company data before analysis..."
+          ? "Refreshing Tally company data after upload..."
           : "Company data sync is running. Keep the connector open.",
       });
-      const completedCommand = await waitForCommand(connection.id, command.id);
+      const completedCommand = await waitForCommand(connection.id, command.id, {
+        attempts: 180,
+        intervalMs: 2000,
+      });
       if (!completedCommand) {
         setBanner({
           tone: "info",
@@ -3865,6 +4088,18 @@ export function BankStatementsPage() {
     if (!bankLedgerName.trim()) {
       throw new Error("Select the Tally bank ledger before checking the statement.");
     }
+    const relevantLedgerNames = Array.from(
+      new Set(
+        [
+          bankLedgerName,
+          ...rows
+            .map((transaction) => transaction.selectedLedgerName)
+            .filter((ledgerName) => ledgerName.trim() && !isSuspenseLedgerName(ledgerName)),
+        ]
+          .map((ledgerName) => ledgerName.trim())
+          .filter(Boolean)
+      )
+    );
     const response = await apiFetch(`/api/tally/connections/${connection.id}/commands`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -3873,6 +4108,8 @@ export function BankStatementsPage() {
         payload: {
           companyName: selectedCompanyName || connection.lastCompanyName,
           bankLedgerName,
+          relevantLedgerNames,
+          voucherTypes: ["Receipt", "Payment", "Contra", "Journal"],
           transactions: rows.map((transaction) => {
             const incoming = isIncomingReceiptRow(transaction);
             const debitAmount = parseNumber(transaction.debitAmount) ?? 0;
@@ -4149,6 +4386,10 @@ export function BankStatementsPage() {
     }
     if (missingLedgerCount > 0) {
       showToast("error", "Select a ledger for every row before sending to Tally.");
+      return;
+    }
+    if (pendingLedgerReviewCount > 0) {
+      showToast("error", "Review and confirm close ledger matches before sending to Tally.");
       return;
     }
     if (uncheckedTallyPresenceCount > 0) {
@@ -4562,6 +4803,40 @@ export function BankStatementsPage() {
             </div>
           )}
 
+          {postUploadSyncImportId && (postUploadSyncError || syncingMasters) ? (
+            <div className="flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex min-w-0 items-start gap-2">
+                {syncingMasters ? (
+                  <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-amber-700" />
+                ) : (
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                )}
+                <div className="min-w-0">
+                  <div className="font-extrabold">
+                    {syncingMasters ? "Tally sync is running" : "Tally sync needed for ledger matching"}
+                  </div>
+                  <div className="mt-0.5 text-xs font-semibold leading-5 text-amber-900">
+                    {postUploadSyncError ||
+                      "Statement analysis can continue. Ledger matching will update after Tally sync completes."}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={retryPostUploadSync}
+                disabled={!tallyCompanyContextVerified || loading || syncingMasters}
+                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-4 text-xs font-bold text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {loading || syncingMasters ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5" />
+                )}
+                {syncingMasters ? "Syncing..." : "Retry sync"}
+              </button>
+            </div>
+          ) : null}
+
           {preview && statementDoneSummary ? (
             <div
               className={`rounded-2xl border px-5 py-4 shadow-[0_2px_8px_rgba(0,0,0,0.02)] ${
@@ -4582,7 +4857,7 @@ export function BankStatementsPage() {
                 </div>
                 <button
                   className="inline-flex h-9 items-center justify-center rounded-xl bg-white px-4 text-xs font-bold text-[#2d2d2d] shadow-sm ring-1 ring-black/5 transition hover:bg-[#faf8f4]"
-                  onClick={clearStatementReview}
+                  onClick={() => clearStatementReview()}
                   type="button"
                 >
                   Upload Another
@@ -4623,30 +4898,18 @@ export function BankStatementsPage() {
                     </select>
                   </label>
 
-                  <label
-                    className={`block rounded-xl border px-4 py-3.5 transition ${
-                      syncBeforeAnalysis
-                        ? "border-amber-250 bg-[#fffaf2]"
-                        : "border-[#e5ddd0] bg-[#faf8f4]/55"
-                    }`}
+                  <div
+                    className="block rounded-xl border border-amber-250 bg-[#fffaf2] px-4 py-3.5 transition"
                     aria-describedby="bank-statement-sync-mode-status"
                   >
                     <span className="flex items-start justify-between gap-4">
                       <span className="min-w-0">
                         <span className="flex flex-wrap items-center gap-2">
                           <span className="text-xs font-extrabold text-[#1a1a1a]">
-                            {documentPreview || documentPreviewLoading
-                              ? "Sync before analysis"
-                              : "Sync current Tally company before analysis"}
+                            Auto-sync Tally company after upload
                           </span>
-                          <span
-                            className={`rounded-full px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide ${
-                              syncBeforeAnalysis
-                                ? "bg-amber-100 text-amber-800"
-                                : "bg-slate-100 text-slate-600"
-                            }`}
-                          >
-                            {syncBeforeAnalysis ? "On" : "Off"}
+                          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide text-amber-800">
+                            Auto
                           </span>
                         </span>
                         <span
@@ -4654,32 +4917,13 @@ export function BankStatementsPage() {
                           className="mt-1.5 block text-xs font-semibold leading-5 text-[#6f6256]"
                         >
                           {syncModeStatus.tone === "warning"
-                            ? syncBeforeAnalysis
-                              ? "Sync will run after the selected Tally company is verified."
-                              : "Pre-analysis sync is off; verify the selected company before upload."
+                            ? "Sync will run after upload once the selected Tally company is verified."
                             : syncModeStatus.text}
                         </span>
                       </span>
-                      <input
-                        checked={syncBeforeAnalysis}
-                        className="sr-only"
-                        onChange={(event) => setSyncBeforeAnalysis(event.target.checked)}
-                        type="checkbox"
-                      />
-                      <span
-                        aria-hidden="true"
-                        className={`mt-0.5 flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition ${
-                          syncBeforeAnalysis ? "bg-amber-500" : "bg-slate-300"
-                        }`}
-                      >
-                        <span
-                          className={`h-5 w-5 rounded-full bg-white shadow-sm transition ${
-                            syncBeforeAnalysis ? "translate-x-5" : "translate-x-0"
-                          }`}
-                        />
-                      </span>
+                      <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
                     </span>
-                  </label>
+                  </div>
 
                   {syncModeStatus.tone === "warning" ? (
                     <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs font-semibold text-amber-900">
@@ -4801,25 +5045,15 @@ export function BankStatementsPage() {
                         </select>
                       </label>
 
-                      <label
-                        className={`flex min-h-9 items-center justify-between gap-3 rounded-xl border px-3 py-2 transition ${
-                          syncBeforeAnalysis
-                            ? "border-amber-200 bg-[#fffaf2]"
-                            : "border-[#e5ddd0] bg-[#faf8f4]/55"
-                        }`}
+                      <div
+                        className="flex min-h-9 items-center justify-between gap-3 rounded-xl border border-amber-200 bg-[#fffaf2] px-3 py-2 transition"
                         aria-describedby="bank-statement-sync-mode-status-preview"
                       >
                         <span className="min-w-0">
                           <span className="flex flex-wrap items-center gap-2">
-                            <span className="text-xs font-extrabold text-[#1a1a1a]">Sync before analysis</span>
-                            <span
-                              className={`rounded-full px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide ${
-                                syncBeforeAnalysis
-                                  ? "bg-amber-100 text-amber-800"
-                                  : "bg-slate-100 text-slate-600"
-                              }`}
-                            >
-                              {syncBeforeAnalysis ? "On" : "Off"}
+                            <span className="text-xs font-extrabold text-[#1a1a1a]">Sync after upload</span>
+                            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide text-amber-800">
+                              Auto
                             </span>
                           </span>
                           <span
@@ -4829,25 +5063,8 @@ export function BankStatementsPage() {
                             {syncModeStatus.text}
                           </span>
                         </span>
-                        <input
-                          checked={syncBeforeAnalysis}
-                          className="sr-only"
-                          onChange={(event) => setSyncBeforeAnalysis(event.target.checked)}
-                          type="checkbox"
-                        />
-                        <span
-                          aria-hidden="true"
-                          className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition ${
-                            syncBeforeAnalysis ? "bg-amber-500" : "bg-slate-300"
-                          }`}
-                        >
-                          <span
-                            className={`h-5 w-5 rounded-full bg-white shadow-sm transition ${
-                              syncBeforeAnalysis ? "translate-x-5" : "translate-x-0"
-                            }`}
-                          />
-                        </span>
-                      </label>
+                        <CheckCircle2 className="h-4 w-4 shrink-0 text-amber-700" />
+                      </div>
 
                       <div className="flex flex-wrap gap-2 lg:justify-end">
                         <button
@@ -5029,11 +5246,9 @@ export function BankStatementsPage() {
                                     : "No file selected",
                             },
                             {
-                              label: syncBeforeAnalysis ? "Sync enabled" : "Sync disabled",
+                              label: "Tally sync after upload",
                               ready: syncModeStatus.tone !== "warning",
-                              detail: syncBeforeAnalysis
-                                ? "Will sync before analysis"
-                                : "Uses existing company data",
+                              detail: "Ledger matching waits for sync",
                             },
                             {
                               label: "Ready to analyze",
@@ -5619,6 +5834,10 @@ export function BankStatementsPage() {
                           const reference = getTransactionReference(transaction);
                           const isEditingLedger = editingLedgerIds.has(transaction.id);
                           const showLedgerSelect = isEditingLedger;
+                          const ledgerDisplayName =
+                            transaction.selectedLedgerName ||
+                            transaction.suggestedLedgerName ||
+                            "-";
                           const billAllocation = billAllocationsByTransactionId[transaction.id];
                           const outgoingVerification = outgoingVerificationsByTransactionId[transaction.id];
                           const tallyPresence = tallyPresenceByTransactionId[transaction.id];
@@ -5704,8 +5923,8 @@ export function BankStatementsPage() {
                                   />
                                 ) : (
                                   <div className="block max-w-full text-left">
-                                    <span className="block whitespace-normal break-words text-sm font-bold leading-5 text-[#1a1a1a]" title={transaction.selectedLedgerName}>
-                                      {transaction.selectedLedgerName}
+                                    <span className="block whitespace-normal break-words text-sm font-bold leading-5 text-[#1a1a1a]" title={ledgerDisplayName}>
+                                      {ledgerDisplayName}
                                     </span>
                                     <span className="mt-1 block whitespace-normal break-words text-xs font-semibold leading-5 text-slate-500">
                                       {getLedgerGroupLabel(transaction, ledgerMasters)}
@@ -6371,7 +6590,7 @@ export function BankStatementsPage() {
                 <div className="flex flex-wrap gap-2">
                   <Button
                     className="border-[#e5ddd0] bg-white text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-all rounded-xl h-10 text-xs font-bold"
-                    onClick={clearStatementReview}
+                    onClick={() => clearStatementReview()}
                     disabled={sending || matchingBills || tallyPostingInProgress}
                     type="button"
                     variant="outline"
@@ -6405,6 +6624,7 @@ export function BankStatementsPage() {
                             tallyPostingInProgress ||
                             validTransactions.length === 0 ||
                             blockingBillAllocationCount > 0 ||
+                            pendingLedgerReviewCount > 0 ||
                             uncheckedTallyPresenceCount > 0 ||
                             ambiguousTallyPresenceCount > 0 ||
                             (!bankLedgerVerified && !bankLedgerManuallyConfirmed)

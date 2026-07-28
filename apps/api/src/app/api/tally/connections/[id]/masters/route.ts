@@ -17,6 +17,8 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
+const TALLY_MASTERS_PAGE_SIZE = 1000;
+
 export async function GET(
   request: Request,
   context: { params: Promise<{ id: string }> }
@@ -49,27 +51,34 @@ export async function GET(
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
     }
 
-    let builder = supabase
-      .from("tally_masters")
-      .select("*")
-      .eq("connection_id", id)
-      .eq("owner_user_id", user.id)
-      .eq("is_active", true)
-      .order("master_type", { ascending: true })
-      .order("tally_name", { ascending: true })
-      .limit(limit);
+    const masters: TallyMasterRow[] = [];
+    for (let offset = 0; offset < limit; offset += TALLY_MASTERS_PAGE_SIZE) {
+      const pageLimit = Math.min(TALLY_MASTERS_PAGE_SIZE, limit - offset);
+      let builder = supabase
+        .from("tally_masters")
+        .select("*")
+        .eq("connection_id", id)
+        .eq("owner_user_id", user.id)
+        .eq("is_active", true)
+        .order("master_type", { ascending: true })
+        .order("tally_name", { ascending: true })
+        .range(offset, offset + pageLimit - 1);
 
-    if (type) {
-      builder = builder.eq("master_type", type);
-    }
+      if (type) {
+        builder = builder.eq("master_type", type);
+      }
 
-    if (query) {
-      builder = builder.ilike("tally_name", `%${query}%`);
-    }
+      if (query) {
+        builder = builder.ilike("tally_name", `%${query}%`);
+      }
 
-    const { data, error } = await builder;
-    if (error) {
-      throw error;
+      const { data, error } = await builder;
+      if (error) {
+        throw error;
+      }
+
+      masters.push(...((data ?? []) as unknown as TallyMasterRow[]));
+      if ((data ?? []).length < pageLimit) break;
     }
 
     const { data: runData, error: runError } = await supabase
@@ -86,7 +95,7 @@ export async function GET(
     }
 
     return jsonWithCors(request, {
-      masters: ((data ?? []) as unknown as TallyMasterRow[]).map(serializeTallyMaster),
+      masters: masters.map(serializeTallyMaster),
       latestSync: runData ?? null,
     });
   } catch (error) {

@@ -1,6 +1,9 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
-import { suggestBankLedgerForTransaction } from "@/lib/bank-statement-ledger-matching";
+import {
+  loadActiveTallyLedgerRows,
+  suggestBankLedgerForTransaction,
+} from "@/lib/bank-statement-ledger-matching";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 export const runtime = "nodejs";
@@ -144,6 +147,11 @@ export async function GET(request: Request) {
 
     const allRows = (data ?? []) as unknown as BankTransactionRow[];
     const rows = status === "queueable" ? allRows.filter(hasPostingAmount) : allRows;
+    const activeLedgerRows = await loadActiveTallyLedgerRows({
+      supabase,
+      ownerUserId: user.id,
+      connectionId,
+    });
     const suggestions = await Promise.all(
       rows.map((row) =>
         suggestBankLedgerForTransaction({
@@ -151,6 +159,7 @@ export async function GET(request: Request) {
           ownerUserId: user.id,
           connectionId,
           accountId,
+          ledgerRows: activeLedgerRows,
           transaction: {
             transactionDate: row.transaction_date,
             valueDate: row.value_date,

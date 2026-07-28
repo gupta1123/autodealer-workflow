@@ -1,6 +1,9 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
-import { suggestBankLedgerForTransaction } from "@/lib/bank-statement-ledger-matching";
+import {
+  loadActiveTallyLedgerRows,
+  suggestBankLedgerForTransaction,
+} from "@/lib/bank-statement-ledger-matching";
 import { getBankLedgerMatchingModel } from "@/lib/processing/openrouter";
 import {
   findBankAccountCandidates,
@@ -8,6 +11,7 @@ import {
   serializeAccount,
 } from "@/lib/bank-statements";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import type { TallyMasterRow } from "@/lib/tally/masters";
 
 export const runtime = "nodejs";
 
@@ -54,7 +58,8 @@ async function resolveStatementBankLedger(
   connectionId: string | null,
   accountNumber: string | null,
   savedCandidates: Array<{ accountNumber?: string | null; tallyLedgerName?: string | null }>,
-  legacyProvidedLedgerName: string | null | undefined
+  legacyProvidedLedgerName: string | null | undefined,
+  ledgerRows?: TallyMasterRow[]
 ) {
   const legacyProvidedLedger = String(legacyProvidedLedgerName ?? "").trim();
   const normalizedAccountNumber = normalizeBankAccountNumber(accountNumber);
@@ -89,19 +94,15 @@ async function resolveStatementBankLedger(
     };
   }
 
-  const { data, error } = await supabase
-    .from("tally_masters")
-    .select("tally_name, parent_name, raw_payload")
-    .eq("owner_user_id", ownerUserId)
-    .eq("connection_id", connectionId)
-    .eq("master_type", "ledger")
-    .eq("is_active", true)
-    .limit(5000);
-  if (error) throw error;
+  const activeLedgerRows = ledgerRows ?? await loadActiveTallyLedgerRows({
+    supabase,
+    ownerUserId,
+    connectionId,
+  });
 
   const exactLedgerNames = Array.from(
     new Set(
-      ((data ?? []) as Array<Record<string, unknown>>)
+      (activeLedgerRows as Array<Record<string, unknown>>)
         .filter(isBankLedgerMaster)
         .filter((ledger) => bankLedgerAccountNumber(ledger) === normalizedAccountNumber)
         .map((ledger) => String(ledger.tally_name ?? "").trim())
@@ -185,6 +186,7 @@ function serializePreviewTransaction(row: Record<string, unknown>) {
           : null,
     suggestionReason: row.suggestion_reason ? String(row.suggestion_reason) : null,
     confirmedLedgerName: row.confirmed_ledger_name ? String(row.confirmed_ledger_name) : null,
+    rawPayload: readRecord(row.raw_payload),
   };
 }
 
@@ -199,7 +201,8 @@ function toNumber(value: unknown) {
 
 function hasAiLedgerRecommendation(row: Record<string, unknown>) {
   const rawPayload = readRecord(row.raw_payload);
-  return Boolean(readRecord(rawPayload.aiLedgerRecommendation).model);
+  const recommendation = readRecord(rawPayload.aiLedgerRecommendation);
+  return Boolean(recommendation.model && recommendation.matchingSafetyVersion === "token_collision_v3");
 }
 
 function readConnectionIdFromMeta(processingMeta: Record<string, unknown>) {
@@ -218,6 +221,7 @@ async function enrichPreviewRowsWithAiSuggestions(params: {
   connectionId: string | null;
   importId: string;
   rows: Array<Record<string, unknown>>;
+  ledgerRows?: TallyMasterRow[];
 }) {
   if (!params.connectionId || params.rows.length === 0 || params.rows.every(hasAiLedgerRecommendation)) {
     return params.rows;
@@ -232,6 +236,7 @@ async function enrichPreviewRowsWithAiSuggestions(params: {
         ownerUserId: params.ownerUserId,
         connectionId: params.connectionId,
         accountId: String(row.bank_account_id ?? ""),
+        ledgerRows: params.ledgerRows,
         transaction: {
           transactionDate: row.transaction_date ? String(row.transaction_date) : "",
           valueDate: row.value_date ? String(row.value_date) : null,
@@ -255,6 +260,7 @@ async function enrichPreviewRowsWithAiSuggestions(params: {
         reason: suggestion.reason,
         model: getBankLedgerMatchingModel(),
         source: "import_preview_api",
+        matchingSafetyVersion: "token_collision_v3",
       };
       const update = {
         suggested_ledger_name: suggestion.ledgerName,
@@ -332,6 +338,12 @@ export async function GET(
     if (previewError) throw previewError;
 
     const processingMeta = readRecord(importRow.processing_meta);
+    const connectionId = readConnectionIdFromMeta(processingMeta);
+    const activeLedgerRows = await loadActiveTallyLedgerRows({
+      supabase,
+      ownerUserId: user.id,
+      connectionId,
+    });
     const effectiveImportStatus = getEffectiveImportStatus(importRow as Record<string, unknown>);
     const previewMeta = readRecord(processingMeta.preview);
     const previewAccount = readRecord(previewMeta.account);
@@ -339,9 +351,10 @@ export async function GET(
     const tablePreviewTransactions = await enrichPreviewRowsWithAiSuggestions({
       supabase,
       ownerUserId: user.id,
-      connectionId: readConnectionIdFromMeta(processingMeta),
+      connectionId,
       importId: id,
       rows: (previewRows ?? []) as Array<Record<string, unknown>>,
+      ledgerRows: activeLedgerRows,
     });
     const transactions =
       tablePreviewTransactions.length > 0
@@ -415,10 +428,11 @@ export async function GET(
     const bankLedgerResolution = await resolveStatementBankLedger(
       supabase,
       user.id,
-      readConnectionIdFromMeta(processingMeta),
+      connectionId,
       account.accountNumber,
       candidates,
-      account.tallyLedgerName
+      account.tallyLedgerName,
+      activeLedgerRows
     );
     account.tallyLedgerName = bankLedgerResolution.ledgerName;
 

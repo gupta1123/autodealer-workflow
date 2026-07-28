@@ -25,6 +25,8 @@ const MASTER_INPUT_KEYS: Record<string, TallyMasterType> = {
   taxLedgers: "tax_ledger",
 };
 
+const MASTER_UPSERT_CHUNK_SIZE = 500;
+
 function getBridgeToken(request: Request) {
   const authorization = request.headers.get("authorization");
   const bearerMatch = authorization?.match(/^Bearer\s+(.+)$/i);
@@ -33,6 +35,36 @@ function getBridgeToken(request: Request) {
 
 function asMasterInputs(value: unknown): TallyMasterInput[] {
   return Array.isArray(value) ? (value as TallyMasterInput[]) : [];
+}
+
+function errorMessage(error: unknown) {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object" && "message" in error) {
+    return String((error as { message?: unknown }).message ?? "Unknown error");
+  }
+  return String(error ?? "Unknown error");
+}
+
+function chunkRows<T>(rows: T[], size: number) {
+  const chunks: T[][] = [];
+  for (let index = 0; index < rows.length; index += size) {
+    chunks.push(rows.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function dedupeMasterRows(rows: Array<Record<string, unknown>>) {
+  const byKey = new Map<string, Record<string, unknown>>();
+  for (const row of rows) {
+    const key = [
+      row.connection_id,
+      row.master_type,
+      row.master_key,
+    ].map((value) => String(value ?? "")).join("::");
+    if (!key.trim()) continue;
+    byKey.set(key, row);
+  }
+  return Array.from(byKey.values());
 }
 
 export function OPTIONS(request: Request) {
@@ -130,36 +162,38 @@ export async function POST(request: Request) {
       .eq("id", connection.id);
 
     if (syncedTypes.size > 0) {
-      await supabase
+      const { error: deleteError } = await supabase
         .from("tally_masters")
-        .update({
-          is_active: false,
-          last_synced_at: now,
-          sync_run_id: syncRunId,
-        })
+        .delete()
         .eq("connection_id", connection.id)
         .in("master_type", Array.from(syncedTypes));
+
+      if (deleteError) {
+        throw deleteError;
+      }
     }
 
-    const rowsWithRun = rows.map((row) => ({
+    const rowsWithRun = dedupeMasterRows(rows.map((row) => ({
       ...row,
       sync_run_id: syncRunId,
-    }));
+    })));
 
-    let upserted: TallyMasterRow[] = [];
+    const upserted: TallyMasterRow[] = [];
     if (rowsWithRun.length > 0) {
-      const { data: masterData, error: upsertError } = await supabase
-        .from("tally_masters")
-        .upsert(rowsWithRun, {
-          onConflict: "connection_id,master_type,master_key",
-        })
-        .select("*");
+      for (const chunk of chunkRows(rowsWithRun, MASTER_UPSERT_CHUNK_SIZE)) {
+        const { data: insertedData, error: insertError } = await supabase
+          .from("tally_masters")
+          .insert(chunk)
+          .select("*");
 
-      if (upsertError) {
-        throw upsertError;
+        if (insertError) {
+          throw insertError;
+        }
+
+        if (upserted.length < 50) {
+          upserted.push(...((insertedData ?? []) as unknown as TallyMasterRow[]).slice(0, 50 - upserted.length));
+        }
       }
-
-      upserted = (masterData ?? []) as unknown as TallyMasterRow[];
     }
 
     await supabase.from("tally_connection_events").insert({
@@ -183,6 +217,16 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     console.error("Error in POST /api/tally/bridge/masters:", error);
-    return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
+    const message = errorMessage(error);
+    return jsonWithCors(
+      request,
+      {
+        error:
+          process.env.NODE_ENV === "production"
+            ? "Tally master sync failed while saving synced data."
+            : `Tally master sync failed while saving synced data: ${message}`,
+      },
+      { status: 500 }
+    );
   }
 }
