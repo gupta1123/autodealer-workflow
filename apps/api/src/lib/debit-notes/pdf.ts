@@ -40,6 +40,40 @@ function formatDate(value: unknown) {
   }).format(date);
 }
 
+function formatDateForFileName(value: unknown) {
+  const text = toText(value, 30);
+  const date = text ? new Date(text) : new Date();
+  const safeDate = Number.isNaN(date.getTime()) ? new Date() : date;
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+  })
+    .format(safeDate)
+    .replace(/\s+/g, "_");
+}
+
+function safeFileNamePart(value: unknown, fallback: string, maxLength = 80) {
+  const text = toText(value, maxLength) || fallback;
+  return text
+    .replace(/[^a-z0-9]+/gi, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "") || fallback;
+}
+
+export function cashDiscountDebitNotePdfFileName(proposal: DebitNoteProposalRow) {
+  const partyName = safeFileNamePart(proposal.party_ledger_name, "Party", 90);
+  const voucherNumber = safeFileNamePart(
+    proposal.tally_voucher_number,
+    `Debit_Note_${proposal.id.slice(0, 8)}`,
+    60
+  );
+  const voucherDate = formatDateForFileName(
+    proposal.tally_voucher_date || proposal.debit_note_date || proposal.created_in_tally_at || proposal.created_at
+  );
+  return `Cash_Discount_Debit_Note_${partyName}_${voucherNumber}_${voucherDate}.pdf`;
+}
+
 function pdfText(x: number, y: number, size: number, text: unknown) {
   return `BT /F1 ${size} Tf ${x} ${y} Td (${escapePdfText(text)}) Tj ET`;
 }
@@ -75,20 +109,11 @@ function buildPdf(lines: string[]) {
 }
 
 export function debitNotePdfFileName(proposal: DebitNoteProposalRow) {
-  const voucherNumber = toText(proposal.tally_voucher_number, 120) || `debit-note-${proposal.id.slice(0, 8)}`;
-  return `${voucherNumber.replace(/[^a-z0-9._-]+/gi, "-")}.pdf`;
+  return cashDiscountDebitNotePdfFileName(proposal);
 }
 
 export function nativeTallyDebitNotePdfFileName(proposal: DebitNoteProposalRow) {
-  const voucherNumber = toText(proposal.tally_voucher_number, 120) || "debit-note";
-  const reference = toText(proposal.tally_open_reference_name, 120);
-  const safe = ["tally-debit-note", voucherNumber, reference]
-    .filter(Boolean)
-    .join("-")
-    .replace(/[^a-z0-9._-]+/gi, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-  return `${safe || `debit-note-${proposal.id.slice(0, 8)}`}.pdf`;
+  return cashDiscountDebitNotePdfFileName(proposal);
 }
 
 export function generateDebitNotePdf(proposal: DebitNoteProposalRow) {

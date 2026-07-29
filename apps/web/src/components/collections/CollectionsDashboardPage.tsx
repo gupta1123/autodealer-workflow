@@ -267,6 +267,39 @@ function formatDate(value?: string | null) {
   }).format(new Date(value));
 }
 
+function formatDateForFileName(value?: string | null) {
+  const date = value ? new Date(value) : new Date();
+  const safeDate = Number.isNaN(date.getTime()) ? new Date() : date;
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+  })
+    .format(safeDate)
+    .replace(/\s+/g, "_");
+}
+
+function safeFileNamePart(value: unknown, fallback: string, maxLength = 80) {
+  const text = String(value ?? "").trim().slice(0, maxLength) || fallback;
+  return text
+    .replace(/[^a-z0-9]+/gi, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "") || fallback;
+}
+
+function cashDiscountDebitNoteDownloadName(proposal: DebitNoteProposal) {
+  const partyName = safeFileNamePart(proposal.partyLedgerName, "Party", 90);
+  const voucherNumber = safeFileNamePart(
+    proposal.tallyVoucherNumber,
+    `Debit_Note_${proposal.id.slice(0, 8)}`,
+    60
+  );
+  const voucherDate = formatDateForFileName(
+    proposal.tallyVoucherDate ?? proposal.debitNoteDate ?? proposal.createdInTallyAt
+  );
+  return `Cash_Discount_Debit_Note_${partyName}_${voucherNumber}_${voucherDate}.pdf`;
+}
+
 function daysPast(value?: string | null) {
   if (!value) return null;
   const date = new Date(`${value}T00:00:00`);
@@ -520,6 +553,7 @@ export function CollectionsDashboardPage() {
   const [checkingLiveTallyCompany, setCheckingLiveTallyCompany] = useState(true);
   const [activeView, setActiveView] = useState<ActiveView>("needsAction");
   const [loading, setLoading] = useState(true);
+  const [cashDiscountLoadStep, setCashDiscountLoadStep] = useState("");
   const [approvingId, setApprovingId] = useState("");
   const [bulkCreating, setBulkCreating] = useState(false);
   const [sendingWhatsappId, setSendingWhatsappId] = useState("");
@@ -583,7 +617,12 @@ export function CollectionsDashboardPage() {
   );
 
   const loadDebtorLedgers = useCallback(async (connectionId: string) => {
-    const response = await apiFetch(`/api/tally/connections/${connectionId}/masters?type=ledger&limit=5000`, {
+    const params = new URLSearchParams({
+      type: "ledger",
+      parent: "Sundry Debtors",
+      limit: "5000",
+    });
+    const response = await apiFetch(`/api/tally/connections/${connectionId}/masters?${params.toString()}`, {
       cache: "no-store",
     });
     if (!response.ok) throw new Error(await readError(response));
@@ -619,6 +658,44 @@ export function CollectionsDashboardPage() {
     }
     throw new Error(
       options?.pendingMessage ?? "The Tally command is still pending. Check the connector status, then refresh."
+    );
+  }, []);
+
+  const pollCommands = useCallback(async (
+    connectionId: string,
+    commandIds: string[],
+    options?: { timeoutSeconds?: number; pendingMessage?: string }
+  ) => {
+    const pending = new Set(commandIds);
+    if (pending.size === 0) return;
+
+    const timeoutSeconds = options?.timeoutSeconds ?? Math.max(90, pending.size * 60);
+    for (let attempt = 0; attempt < timeoutSeconds; attempt += 1) {
+      await wait(1000);
+      const response = await apiFetch(
+        `/api/tally/connections/${connectionId}/commands?${new URLSearchParams({
+          ids: Array.from(pending).join(","),
+          limit: String(Math.max(pending.size, 1)),
+        }).toString()}`,
+        { cache: "no-store" }
+      );
+      if (!response.ok) throw new Error(await readError(response));
+      const payload = (await response.json()) as { commands?: TallyCommand[] };
+
+      for (const command of payload.commands ?? []) {
+        if (!pending.has(command.id)) continue;
+        if (command.status === "succeeded") {
+          pending.delete(command.id);
+        } else if (command.status === "failed" || command.status === "canceled") {
+          throw new Error(command.error || "Tally command failed.");
+        }
+      }
+
+      if (pending.size === 0) return;
+    }
+
+    throw new Error(
+      options?.pendingMessage ?? "The Tally commands are still pending. Check the connector status, then refresh."
     );
   }, []);
 
@@ -663,11 +740,17 @@ export function CollectionsDashboardPage() {
   );
 
   const refreshTallyOpenBills = useCallback(
-    async (connectionId: string, companyName?: string | null) => {
+    async (
+      connectionId: string,
+      companyName?: string | null,
+      options?: { onProgress?: (message: string) => void }
+    ) => {
       // Refresh the ledger list first. A connection may have previously synced a
       // different company, in which case using its old debtor list would omit
       // valid bills or query the wrong parties.
+      options?.onProgress?.("Syncing customer ledgers from Tally...");
       await syncCurrentCompanyLedgers(connectionId, companyName);
+      options?.onProgress?.("Loading customer ledgers...");
       const ledgerNames = await loadDebtorLedgers(connectionId);
       if (ledgerNames.length === 0) return;
 
@@ -675,8 +758,11 @@ export function CollectionsDashboardPage() {
       // customer ledgers. Keep those commands together so the dashboard can use
       // this refresh as one consistent snapshot rather than mixing old chunks.
       const scanId = crypto.randomUUID();
+      const chunks = chunkValues(ledgerNames, 80);
+      const commandIds: string[] = [];
 
-      for (const chunk of chunkValues(ledgerNames, 80)) {
+      options?.onProgress?.(`Queueing open-bill scan for ${ledgerNames.length} customer ledgers...`);
+      for (const chunk of chunks) {
         const response = await apiFetch(`/api/tally/connections/${connectionId}/commands`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -693,17 +779,24 @@ export function CollectionsDashboardPage() {
         if (!response.ok) throw new Error(await readError(response));
         const payload = (await response.json()) as { command?: TallyCommand };
         if (payload.command?.id) {
-          await pollCommand(connectionId, payload.command.id);
+          commandIds.push(payload.command.id);
         }
       }
+
+      options?.onProgress?.(`Scanning open bills from Tally (${commandIds.length} batch${commandIds.length === 1 ? "" : "es"})...`);
+      await pollCommands(connectionId, commandIds, {
+        timeoutSeconds: Math.max(90, commandIds.length * 60),
+        pendingMessage: "The Tally open-bill scan is still pending. Keep the connector open, then refresh.",
+      });
     },
-    [loadDebtorLedgers, pollCommand, syncCurrentCompanyLedgers]
+    [loadDebtorLedgers, pollCommands, syncCurrentCompanyLedgers]
   );
 
   const refreshAll = useCallback(
     async (options?: { quiet?: boolean; refreshTally?: boolean }) => {
       try {
         if (!options?.quiet) setLoading(true);
+        if (!options?.quiet) setCashDiscountLoadStep("Checking the active Tally company...");
         setMessage(null);
         setDashboard(null);
         const nextCompanies = await loadCompanies();
@@ -748,13 +841,18 @@ export function CollectionsDashboardPage() {
         // does not start a second, overlapping scan for the same company.
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
         if (connectionId && options?.refreshTally !== false) {
-          await refreshTallyOpenBills(connectionId, company?.companyName);
+          setCashDiscountLoadStep("Syncing ledgers and scanning open bills from Tally...");
+          await refreshTallyOpenBills(connectionId, company?.companyName, {
+            onProgress: setCashDiscountLoadStep,
+          });
         }
+        setCashDiscountLoadStep("Calculating cash discounts from the latest Tally scan...");
         await loadDashboard(connectionId, company?.companyName);
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
       } catch (error) {
         setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
       } finally {
+        setCashDiscountLoadStep("");
         setLoading(false);
       }
     },
@@ -845,7 +943,12 @@ export function CollectionsDashboardPage() {
   }
 
   async function readTallyLedgerPhone(connectionId: string, ledgerName: string) {
-    const response = await apiFetch(`/api/tally/connections/${connectionId}/masters?type=ledger&limit=5000`, {
+    const params = new URLSearchParams({
+      type: "ledger",
+      name: ledgerName,
+      limit: "1",
+    });
+    const response = await apiFetch(`/api/tally/connections/${connectionId}/masters?${params.toString()}`, {
       cache: "no-store",
     });
     if (!response.ok) throw new Error(await readError(response));
@@ -909,7 +1012,7 @@ export function CollectionsDashboardPage() {
       const objectUrl = URL.createObjectURL(pdf);
       const link = document.createElement("a");
       link.href = objectUrl;
-      link.download = `${proposal.tallyVoucherNumber || "debit-note"}.pdf`;
+      link.download = cashDiscountDebitNoteDownloadName(proposal);
       link.rel = "noreferrer";
       document.body.appendChild(link);
       link.click();
@@ -1047,15 +1150,20 @@ export function CollectionsDashboardPage() {
     lastLoadedConnectionRef.current = loadKey;
     void (async () => {
       setLoading(true);
+      setCashDiscountLoadStep("Syncing ledgers and scanning open bills from Tally...");
       setDashboard(null);
       try {
         // A company switch must read a new live snapshot. Loading the old saved
         // scan here can show bills belonging to the previously selected company.
-        await refreshTallyOpenBills(selectedConnectionId, company?.companyName);
+        await refreshTallyOpenBills(selectedConnectionId, company?.companyName, {
+          onProgress: setCashDiscountLoadStep,
+        });
+        setCashDiscountLoadStep("Calculating cash discounts from the latest Tally scan...");
         await loadDashboard(selectedConnectionId, company?.companyName);
       } catch (error) {
         setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
       } finally {
+        setCashDiscountLoadStep("");
         setLoading(false);
       }
     })();
@@ -1092,6 +1200,16 @@ export function CollectionsDashboardPage() {
   const createdRecoverableTotal = sumRecoverable(createdProposals);
   const paymentFollowUpTotal = paymentFollowUps.reduce((total, item) => total + (Number(item.totalPayableAmount) || 0), 0);
   const companyReady = tallyCompanyVerified;
+  const selectedCompanyLabel = selectedCompany?.companyName || "Choose a company";
+  const tallyStatusLabel = liveCompanyCheckPending
+    ? "Checking active company..."
+    : companyReady
+      ? `Connected to ${activeTallyCompanyName || selectedCompanyLabel}`
+      : activeTallyCompanyName
+        ? `Opened to ${activeTallyCompanyName}`
+        : liveTallyConnection?.tallyReachable === false
+          ? "Connector/Tally not reachable"
+          : "No active Tally company detected";
   const whatsappDialogMissingCount = whatsappDialogProposals.filter((proposal) => !proposal.partyPhone).length;
   const allPhonesValid = whatsappDialogProposals.every((proposal) => {
     const phone = getTenDigitPhone(whatsappPhoneInputs[proposal.id] ?? proposal.partyPhone ?? "");
@@ -1216,7 +1334,7 @@ export function CollectionsDashboardPage() {
             </select>
           </label>
 
-          <div className="inline-flex h-10 items-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs text-slate-500 shadow-sm">
+          <div className="inline-flex min-h-10 items-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-3 py-1.5 text-xs text-slate-500 shadow-sm">
             <span
               className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[10px] font-bold ${
                 companyReady
@@ -1234,8 +1352,10 @@ export function CollectionsDashboardPage() {
                     : "Tally company not ready"}
             </span>
             <span className="hidden h-4 w-px bg-[#e5ddd0] sm:block" />
-            <span className="whitespace-nowrap font-semibold">
-              Selected: {selectedCompany?.companyName || "Not selected"} · Tally: {liveCompanyCheckPending ? "Checking…" : activeTallyCompanyName || "Not detected"}
+            <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5 font-semibold">
+              <span className="whitespace-nowrap">App company: {selectedCompanyLabel}</span>
+              <span className="hidden text-slate-300 sm:inline">/</span>
+              <span className="whitespace-nowrap">Tally status: {tallyStatusLabel}</span>
             </span>
           </div>
 
@@ -1261,6 +1381,30 @@ export function CollectionsDashboardPage() {
         >
           {message.text}
         </div>
+      ) : null}
+
+      {loading && !companyContextLocked ? (
+        <section
+          aria-live="polite"
+          className="mb-6 overflow-hidden rounded-2xl border border-sky-200 bg-sky-50 shadow-[0_10px_30px_rgba(94,67,31,0.08)]"
+        >
+          <div className="flex flex-col gap-4 px-5 py-5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 gap-3">
+              <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-sky-200 bg-white text-sky-700">
+                <Loader2 className="h-4 w-4 animate-spin" />
+              </div>
+              <div>
+                <h2 className="text-sm font-extrabold text-[#1a1a1a]">Loading Cash Discounts data</h2>
+                <p className="mt-1 max-w-3xl text-xs font-medium leading-relaxed text-slate-600">
+                  {cashDiscountLoadStep || "Reading the latest Tally data. Keep the connector open; this can take a little time for larger companies."}
+                </p>
+              </div>
+            </div>
+            <span className="inline-flex h-8 shrink-0 items-center rounded-full border border-sky-200 bg-white px-3 text-[10px] font-black uppercase tracking-wider text-sky-800">
+              In progress
+            </span>
+          </div>
+        </section>
       ) : null}
 
       {companyContextLocked ? (
@@ -1324,7 +1468,7 @@ export function CollectionsDashboardPage() {
             active={activeView === "followUps"}
             count={paymentFollowUps.length}
             detail={`${formatMoney(paymentFollowUpTotal)} outstanding`}
-            label="Payment follow-ups"
+            label="Pending payment follow-ups"
             onClick={() => chooseView("followUps")}
           />
           <WorkflowButton
@@ -1589,8 +1733,8 @@ export function CollectionsDashboardPage() {
 
       {!companyContextLocked && activeView === "followUps" ? (
         <Section
-          description={`${formatMoney(paymentFollowUpTotal)} remains outstanding. Rows flag any debit note that must be created before collection.`}
-          title="Payment follow-ups"
+          description={`${formatMoney(paymentFollowUpTotal)} remains outstanding from customers. Follow up on these pending payments and create any required debit notes before collection.`}
+          title="Pending payment follow-ups"
         >
           {paymentFollowUps.length === 0 ? (
             <EmptyState>There are no payments to follow up from the latest Tally scan.</EmptyState>

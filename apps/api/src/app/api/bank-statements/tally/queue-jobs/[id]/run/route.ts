@@ -33,6 +33,37 @@ function readResult(value: unknown): QueueJobResult {
   return readRecord(value) as QueueJobResult;
 }
 
+function errorText(error: unknown) {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object") {
+    const record = error as Record<string, unknown>;
+    return [record.message, record.details, record.hint]
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .join(" ");
+  }
+  return String(error ?? "").trim();
+}
+
+function queueJobErrorPayload(error: unknown) {
+  const message = errorText(error);
+  if (/bank_statement_tally_queue_jobs|bank_transaction_posting_log|tally_mapping_settings|relation .*does not exist|schema cache/i.test(message)) {
+    return {
+      error: "Bank Statement posting setup is not ready.",
+      userAction: "Run the latest database migration, then try again.",
+    };
+  }
+  if (/on conflict|unique or exclusion constraint|duplicate key/i.test(message)) {
+    return {
+      error: "Some selected rows are already queued or saved.",
+      userAction: "Refresh the statement status, then send again.",
+    };
+  }
+  return {
+    error: message || "Could not prepare the statement for Tally.",
+    userAction: "Refresh the page and try again.",
+  };
+}
+
 function serializeQueueJob(row: Record<string, unknown>) {
   return {
     id: row.id,
@@ -184,11 +215,14 @@ export async function POST(
     if (!queueResponse.ok) {
       const failedAt = new Date().toISOString();
       const error = String(queueBody?.error ?? `Queue job failed with status ${queueResponse.status}`);
+      const detail = typeof queueBody?.detail === "string" ? queueBody.detail : "";
+      const userAction = typeof queueBody?.userAction === "string" ? queueBody.userAction : "";
+      const combinedError = [error, detail, userAction].filter(Boolean).join(" ");
       const { data: failedJob, error: failedUpdateError } = await supabase
         .from("bank_statement_tally_queue_jobs")
         .update({
           status: "failed",
-          error,
+          error: combinedError,
           updated_at: failedAt,
           completed_at: failedAt,
         })
@@ -200,6 +234,8 @@ export async function POST(
       if (failedUpdateError) throw failedUpdateError;
       return jsonWithCors(request, {
         error,
+        detail: detail || undefined,
+        userAction: userAction || undefined,
         job: serializeQueueJob(failedJob as Record<string, unknown>),
       }, { status: 400 });
     }
@@ -235,7 +271,7 @@ export async function POST(
     console.error("Error in POST /api/bank-statements/tally/queue-jobs/[id]/run:", error);
     return jsonWithCors(
       request,
-      { error: error instanceof Error ? error.message : "Internal server error" },
+      queueJobErrorPayload(error),
       { status: 500 }
     );
   }

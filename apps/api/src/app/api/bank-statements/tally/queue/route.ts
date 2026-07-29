@@ -140,6 +140,37 @@ function toNumber(value: unknown) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function errorText(error: unknown) {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object") {
+    const record = error as Record<string, unknown>;
+    return [record.message, record.details, record.hint]
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .join(" ");
+  }
+  return String(error ?? "").trim();
+}
+
+function queueErrorPayload(error: unknown) {
+  const message = errorText(error);
+  if (/bank_statement_tally_queue_jobs|bank_transaction_posting_log|tally_mapping_settings|relation .*does not exist|schema cache/i.test(message)) {
+    return {
+      error: "Bank Statement posting setup is not ready.",
+      userAction: "Run the latest database migration, then try again.",
+    };
+  }
+  if (/on conflict|unique or exclusion constraint|duplicate key/i.test(message)) {
+    return {
+      error: "Some selected rows are already queued or saved.",
+      userAction: "Refresh the statement status, then send again.",
+    };
+  }
+  return {
+    error: message || "Could not prepare the statement for Tally.",
+    userAction: "Refresh the page and try again.",
+  };
+}
+
 function readBillAllocations(value: unknown) {
   if (!Array.isArray(value)) return [];
   return value.flatMap((allocation) => {
@@ -790,7 +821,9 @@ export async function POST(request: Request) {
       return jsonWithCors(
         request,
         {
-          error: `Tally preflight failed: ${voucherCommands.length} of ${expectedReceiptCount} receipt(s) and ${verificationCommands.length} of ${expectedPaymentCheckCount} payment check(s) were ready. Nothing was queued.`,
+          error: "Some rows need review. Nothing was sent to Tally.",
+          detail: `${voucherCommands.length}/${expectedReceiptCount} receipts and ${verificationCommands.length}/${expectedPaymentCheckCount} payment checks are ready.`,
+          userAction: "Fix the highlighted rows, then send again.",
           queuedCount: 0,
           verificationCount: 0,
           commands: [],
@@ -811,7 +844,9 @@ export async function POST(request: Request) {
       return jsonWithCors(
         request,
         {
-          error: "No transactions could be queued. Check diagnostics for the skipped reason.",
+          error: "No rows were ready. Nothing was sent to Tally.",
+          detail: "Rows were skipped because details are missing or already handled.",
+          userAction: "Fix the highlighted rows, then send again.",
           queuedCount: 0,
           commands: [],
           diagnostics: {
@@ -1042,7 +1077,7 @@ export async function POST(request: Request) {
     console.error("Error in POST /api/bank-statements/tally/queue:", error);
     return jsonWithCors(
       request,
-      { error: error instanceof Error ? error.message : "Internal server error" },
+      queueErrorPayload(error),
       { status: 500 }
     );
   }

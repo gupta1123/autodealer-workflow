@@ -33,6 +33,8 @@ export async function GET(
     const url = new URL(request.url);
     const type = parseMasterType(url.searchParams.get("type"));
     const query = url.searchParams.get("q")?.trim() ?? "";
+    const name = url.searchParams.get("name")?.trim() ?? "";
+    const parent = url.searchParams.get("parent")?.trim() ?? "";
     const limit = Math.min(Number(url.searchParams.get("limit") || 100), 5000);
 
     const supabase = createSupabaseAdminClient();
@@ -66,6 +68,14 @@ export async function GET(
 
       if (type) {
         builder = builder.eq("master_type", type);
+      }
+
+      if (parent) {
+        builder = builder.ilike("parent_name", parent);
+      }
+
+      if (name) {
+        builder = builder.ilike("tally_name", name);
       }
 
       if (query) {

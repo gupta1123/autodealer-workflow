@@ -1,7 +1,7 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { getNativeTallyPdfEvidence, serializeDebitNoteProposal, toNullableText, type DebitNoteProposalRow } from "@/lib/collections";
-import { createDebitNotePdfSignedUrl } from "@/lib/debit-notes/pdf";
+import { cashDiscountDebitNotePdfFileName, createDebitNotePdfSignedUrl } from "@/lib/debit-notes/pdf";
 import { sendDebitNoteWhatsapp, getMsg91WhatsappConfig, normalizeWhatsappPhone } from "@/lib/msg91/whatsapp";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
@@ -129,7 +129,7 @@ export async function POST(
 
     const documentName =
       toNullableText(body.documentName, 180) ??
-      (proposal.tally_voucher_number ? `${proposal.tally_voucher_number}.pdf` : undefined);
+      cashDiscountDebitNotePdfFileName(proposal);
     const result = await sendDebitNoteWhatsapp({
       proposal,
       recipientPhone,
