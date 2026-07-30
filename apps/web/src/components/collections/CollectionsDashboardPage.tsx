@@ -1309,6 +1309,12 @@ export function CollectionsDashboardPage({
     await openWhatsappDialog(selectedCreatedProposals);
   }
 
+  const pageTitle = initialView === "followUps" ? "Payment Follow-ups" : "Cash Discounts";
+  const pageDescription =
+    initialView === "followUps"
+      ? "Track pending customer payments and follow-up actions from the latest Tally scan."
+      : "Review, track, and post debit notes for missed cash discounts.";
+
   return (
     <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto px-6 pb-8 pt-5 text-[#1a1a1a] animate-in fade-in slide-in-from-bottom-4 duration-500">
       <div className="mb-8 border-b border-[#e5ddd0] pb-6 flex flex-col xl:flex-row xl:items-center xl:justify-between gap-6">
@@ -1318,10 +1324,10 @@ export function CollectionsDashboardPage({
             Collections Ledgers
           </div>
           <h1 className="text-3xl font-black tracking-tight text-[#1a1a1a] mt-2 flex items-center gap-2">
-            Cash Discounts
+            {pageTitle}
           </h1>
           <p className="text-xs font-semibold text-slate-500 mt-1">
-            Review, track, and post debit notes for missed cash discounts.
+            {pageDescription}
           </p>
         </div>
 
