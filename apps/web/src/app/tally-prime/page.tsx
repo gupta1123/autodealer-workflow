@@ -2,13 +2,14 @@ import { TallyPrimeDashboard } from "@/components/tally/TallyPrimeDashboard";
 import { AppShell } from "@/components/dashboard/AppShell";
 
 interface TallyPrimePageProps {
-  searchParams?: {
+  searchParams?: Promise<{
     view?: string;
-  };
+  }>;
 }
 
-export default function TallyPrimePage({ searchParams }: TallyPrimePageProps) {
-  const initialView = searchParams?.view === "connection" ? "connection" : "home";
+export default async function TallyPrimePage({ searchParams }: TallyPrimePageProps) {
+  const resolvedSearchParams = await searchParams;
+  const initialView = resolvedSearchParams?.view === "connection" ? "connection" : "home";
 
   return (
     <AppShell>

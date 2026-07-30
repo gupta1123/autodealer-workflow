@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
-  ArrowLeft,
   ArrowRight,
   CheckCircle2,
   FileText,
@@ -836,14 +835,6 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
       <div className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div>
-          <button
-            className="mb-3 flex items-center gap-2 text-xs font-bold text-slate-400 hover:text-[#1a1a1a] transition-all"
-            onClick={() => setView("home")}
-            type="button"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            Back to Tally Home
-          </button>
           <h2 className="text-2xl font-black tracking-tight text-[#1a1a1a]">
             Tally Connection
           </h2>

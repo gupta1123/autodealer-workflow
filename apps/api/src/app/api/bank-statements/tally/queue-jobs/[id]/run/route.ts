@@ -3,7 +3,7 @@ import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { POST as runTallyQueue } from "../../../queue/route";
 
-const QUEUE_JOB_BATCH_SIZE = Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_BATCH_SIZE ?? 20);
+const QUEUE_JOB_BATCH_SIZE = Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_BATCH_SIZE ?? 1);
 const QUEUE_JOB_LOCK_STALE_MS = Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_LOCK_STALE_MS ?? 2 * 60_000);
 const QUEUE_JOB_RUNNER_ID = `queue-runner-${process.pid}-${Math.random().toString(36).slice(2)}`;
 

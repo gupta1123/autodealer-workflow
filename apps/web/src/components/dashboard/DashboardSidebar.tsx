@@ -42,7 +42,6 @@ const SIDEBAR_SECTIONS = [
     title: "Reconciliation",
     items: [
       { href: "/bank-statements", label: "Bank Statements", icon: Landmark },
-      { href: "/tally-prime?view=connection", label: "Tally Connector", icon: PlugZap },
       { href: "/collections", label: "Cash Discounts", icon: FileText, exact: true },
       { href: "/collections/follow-ups", label: "Payment Follow-ups", icon: MessageCircle },
     ],
@@ -51,6 +50,7 @@ const SIDEBAR_SECTIONS = [
     id: "system",
     title: "System",
     items: [
+      { href: "/tally-prime?view=connection", label: "Tally Connector", icon: PlugZap },
       { href: "/recycle-bin", label: "Recycle Bin", icon: Trash2 },
     ],
   },

@@ -3335,6 +3335,16 @@ export function BankStatementsPage() {
     return null;
   }, []);
 
+  const readTallyQueueJob = useCallback(async (jobId: string): Promise<TallyQueueJobResponse> => {
+    const response = await apiFetch(`/api/bank-statements/tally/queue-jobs/${jobId}`, {
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      throw new Error(await readError(response));
+    }
+    return (await response.json()) as TallyQueueJobResponse;
+  }, []);
+
   const pollTallyQueueJob = useCallback(async (jobId: string): Promise<TallyQueueResult> => {
     for (let attempt = 0; attempt < 180; attempt += 1) {
       const response = await apiFetch(`/api/bank-statements/tally/queue-jobs/${jobId}/run`, {
@@ -3342,6 +3352,26 @@ export function BankStatementsPage() {
         cache: "no-store",
       });
       if (!response.ok) {
+        if ([502, 503, 504].includes(response.status)) {
+          const payload = await readTallyQueueJob(jobId).catch(() => null);
+          const job = payload?.job;
+          if (job?.status === "succeeded") {
+            return (payload?.result ?? job.result ?? { queuedCount: 0, verificationCount: 0, commands: [] }) as TallyQueueResult;
+          }
+          if (job?.status === "failed" || job?.status === "cancelled") {
+            throw new Error(job.error || payload?.error || "Tally queue job failed.");
+          }
+          const processed = Number(job?.processedCount ?? 0);
+          const total = Number(job?.totalCount ?? 0);
+          setBanner({
+            tone: "info",
+            text: total > 0
+              ? `Preparing Tally queue: ${Math.min(processed, total)} of ${total} transaction(s). Retrying after a server timeout.`
+              : "Preparing Tally queue. Retrying after a server timeout.",
+          });
+          await wait(5000);
+          continue;
+        }
         throw new Error(await readError(response));
       }
 
@@ -3364,7 +3394,7 @@ export function BankStatementsPage() {
     }
 
     throw new Error("Tally queue preparation is still running. Keep the connector open and try refreshing in a moment.");
-  }, []);
+  }, [readTallyQueueJob]);
 
   useEffect(() => {
     if (initialSummaryLoadStartedRef.current) return;
