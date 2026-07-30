@@ -282,9 +282,13 @@ function HubCard({
   );
 }
 
-export function TallyPrimeDashboard() {
+interface TallyPrimeDashboardProps {
+  initialView?: "home" | "connection";
+}
+
+export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboardProps) {
   const router = useRouter();
-  const [view, setView] = useState<"home" | "connection">("home");
+  const [view, setView] = useState<"home" | "connection">(initialView);
   const [connections, setConnections] = useState<TallyConnection[]>([]);
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
   const [selectedId, setSelectedId] = useState("");
@@ -773,6 +777,10 @@ export function TallyPrimeDashboard() {
     }
   }, [message, selectedConnection?.bridgeConnected]);
 
+  useEffect(() => {
+    setView(initialView);
+  }, [initialView]);
+
   if (view === "home") {
     return (
       <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -950,11 +958,11 @@ export function TallyPrimeDashboard() {
         <div className="space-y-5">
           <div className="rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
             <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex items-start gap-4">
+              <div className="flex min-w-0 items-start gap-4">
                 <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-amber-50 border border-amber-100/50 text-amber-700">
                   <Server className="h-5.5 w-5.5" />
                 </div>
-                <div>
+                <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
                     <h3 className="text-base font-extrabold text-[#1a1a1a]">
                       {selectedConnection.displayName}
@@ -976,7 +984,7 @@ export function TallyPrimeDashboard() {
                         : "Reconnect required"}
                     </Badge>
                   </div>
-                  <div className="mt-1 text-sm font-semibold text-slate-500">
+                  <div className="mt-1 max-w-3xl text-sm font-semibold text-slate-500">
                     {selectedCompany?.financialYear
                       ? formatCompanyOptionLabel(selectedCompany)
                       : companyDetail}
@@ -984,64 +992,64 @@ export function TallyPrimeDashboard() {
                 </div>
               </div>
 
-              <div className="flex flex-wrap gap-2.5">
-                <Button
-                  className="rounded-xl border-[#e5ddd0] bg-white text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
-                  disabled={loading}
-                  onClick={() => void loadConnections()}
-                  type="button"
-                  variant="outline"
-                >
-                  <RefreshCw className="h-3.5 w-3.5 mr-1" />
-                  Refresh
-                </Button>
-                <Button
-                  className="w-fit rounded-xl border-[#e5ddd0] bg-white text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
-                  disabled={testing}
-                  onClick={() => void requestTest()}
-                  type="button"
-                  variant="outline"
-                >
-                  {testing ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                  ) : (
-                    <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
-                  )}
-                  Test Connection
-                </Button>
-                {connectorActive ? (
+              <div className="flex w-full flex-wrap gap-2.5 lg:w-auto lg:shrink-0 lg:flex-nowrap lg:items-center lg:justify-end">
                   <Button
-                    className="w-fit rounded-xl border-red-250 bg-red-50 text-xs font-bold text-red-800 hover:bg-red-100 hover:text-red-900 shadow-sm transition-all"
-                    disabled={disconnecting}
-                    onClick={() => void disconnectConnector()}
+                    className="whitespace-nowrap rounded-xl border-[#e5ddd0] bg-white text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
+                    disabled={loading}
+                    onClick={() => void loadConnections()}
                     type="button"
                     variant="outline"
                   >
-                    {disconnecting ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                    ) : (
-                      <PlugZap className="h-3.5 w-3.5 mr-1.5" />
-                    )}
-                    Disconnect
+                    <RefreshCw className="h-3.5 w-3.5 mr-1" />
+                    Refresh
                   </Button>
-                ) : (
                   <Button
-                    className="w-fit rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] text-xs font-bold text-white shadow-md transition-all"
-                    disabled={creating}
-                    onClick={() => void connectConnector()}
+                    className="w-fit whitespace-nowrap rounded-xl border-[#e5ddd0] bg-white text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
+                    disabled={testing}
+                    onClick={() => void requestTest()}
                     type="button"
+                    variant="outline"
                   >
-                    {creating ? (
+                    {testing ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
                     ) : (
-                      <PlugZap className="h-3.5 w-3.5 mr-1.5" />
+                      <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
                     )}
-                    Connect
+                    Test Connection
                   </Button>
-                )}
+                  {connectorActive ? (
+                    <Button
+                      className="w-fit whitespace-nowrap rounded-xl border-red-250 bg-red-50 text-xs font-bold text-red-800 hover:bg-red-100 hover:text-red-900 shadow-sm transition-all"
+                      disabled={disconnecting}
+                      onClick={() => void disconnectConnector()}
+                      type="button"
+                      variant="outline"
+                    >
+                      {disconnecting ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+                      ) : (
+                        <PlugZap className="h-3.5 w-3.5 mr-1.5" />
+                      )}
+                      Disconnect
+                    </Button>
+                  ) : (
+                    <Button
+                      className="w-fit whitespace-nowrap rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] text-xs font-bold text-white shadow-md transition-all"
+                      disabled={creating}
+                      onClick={() => void connectConnector()}
+                      type="button"
+                    >
+                      {creating ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+                      ) : (
+                        <PlugZap className="h-3.5 w-3.5 mr-1.5" />
+                      )}
+                      Connect
+                    </Button>
+                  )}
                 {otherActiveConnectionCount > 0 ? (
                   <Button
-                    className="w-fit rounded-xl border-red-250 bg-red-50 text-xs font-bold text-red-800 hover:bg-red-100 hover:text-red-900 shadow-sm transition-all"
+                    className="w-fit whitespace-nowrap rounded-xl border-red-250 bg-red-50 text-xs font-bold text-red-800 hover:bg-red-100 hover:text-red-900 shadow-sm transition-all"
                     disabled={disconnectingOthers}
                     onClick={() => void disconnectOtherConnectors()}
                     type="button"

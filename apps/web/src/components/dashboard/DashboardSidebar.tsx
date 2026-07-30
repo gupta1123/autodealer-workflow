@@ -9,12 +9,13 @@ import {
   FileStack,
   FileText,
   Landmark,
+  MessageCircle,
   Trash2,
   LogOut,
   ChevronsUpDown,
   Settings,
   ChevronLeft,
-  Receipt,
+  PlugZap,
 } from "lucide-react";
 
 import styles from "./DashboardSidebar.module.css";
@@ -40,8 +41,10 @@ const SIDEBAR_SECTIONS = [
     id: "reconciliation",
     title: "Reconciliation",
     items: [
-      { href: "/tally-prime", label: "Bank Statements", icon: Landmark },
-      { href: "/collections", label: "Cash Discounts", icon: FileText },
+      { href: "/bank-statements", label: "Bank Statements", icon: Landmark },
+      { href: "/tally-prime?view=connection", label: "Tally Connector", icon: PlugZap },
+      { href: "/collections", label: "Cash Discounts", icon: FileText, exact: true },
+      { href: "/collections/follow-ups", label: "Payment Follow-ups", icon: MessageCircle },
     ],
   },
   {
@@ -53,9 +56,10 @@ const SIDEBAR_SECTIONS = [
   },
 ];
 
-function isActivePath(pathname: string, href: string) {
-  if (href === "/") return pathname === "/";
-  return pathname === href || pathname.startsWith(`${href}/`);
+function isActivePath(pathname: string, href: string, exact = false) {
+  const hrefPath = href.split("?")[0];
+  if (hrefPath === "/" || exact) return pathname === hrefPath;
+  return pathname === hrefPath || pathname.startsWith(`${hrefPath}/`);
 }
 
 interface UserInfo {
@@ -109,7 +113,7 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
             {!collapsed && <h3 className={styles.sectionHeader}>{section.title}</h3>}
             <ul className={styles.navList} role="list">
               {section.items.map((item) => {
-                const active = isActivePath(pathname, item.href);
+                const active = isActivePath(pathname, item.href, item.exact);
                 const Icon = item.icon;
                 return (
                   <li key={item.href}>
@@ -135,7 +139,7 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
       <nav className={`${styles.navSection} ${styles.mobileNav}`}>
         <ul className={styles.navList} role="list">
           {SIDEBAR_SECTIONS.flatMap((s) => s.items).map((item) => {
-            const active = isActivePath(pathname, item.href);
+            const active = isActivePath(pathname, item.href, item.exact);
             const Icon = item.icon;
             return (
               <li key={item.href}>

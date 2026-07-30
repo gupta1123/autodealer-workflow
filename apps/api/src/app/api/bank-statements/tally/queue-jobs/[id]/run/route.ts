@@ -4,6 +4,8 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { POST as runTallyQueue } from "../../../queue/route";
 
 const QUEUE_JOB_BATCH_SIZE = Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_BATCH_SIZE ?? 20);
+const QUEUE_JOB_LOCK_STALE_MS = Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_LOCK_STALE_MS ?? 2 * 60_000);
+const QUEUE_JOB_RUNNER_ID = `queue-runner-${process.pid}-${Math.random().toString(36).slice(2)}`;
 
 type QueueJobPayload = {
   connectionId?: string;
@@ -76,6 +78,13 @@ function serializeQueueJob(row: Record<string, unknown>) {
     updatedAt: row.updated_at,
     completedAt: row.completed_at ?? null,
   };
+}
+
+function queueJobIsLocked(row: Record<string, unknown>) {
+  const lockedAt = typeof row.locked_at === "string" ? row.locked_at : "";
+  if (!lockedAt) return false;
+  const lockedAtMs = new Date(lockedAt).getTime();
+  return Number.isFinite(lockedAtMs) && Date.now() - lockedAtMs < QUEUE_JOB_LOCK_STALE_MS;
 }
 
 function transactionIdsFromPayload(payload: QueueJobPayload) {
@@ -153,10 +162,53 @@ export async function POST(
       });
     }
 
-    const payload = readPayload(job.request_payload);
+    if (queueJobIsLocked(job as Record<string, unknown>)) {
+      return jsonWithCors(request, {
+        job: serializeQueueJob(job as Record<string, unknown>),
+        result: null,
+      });
+    }
+
+    const lockCutoff = new Date(Date.now() - QUEUE_JOB_LOCK_STALE_MS).toISOString();
+    const lockStartedAt = new Date().toISOString();
+    const { data: lockedJob, error: lockError } = await supabase
+      .from("bank_statement_tally_queue_jobs")
+      .update({
+        status: "running",
+        started_at: job.started_at ?? lockStartedAt,
+        locked_at: lockStartedAt,
+        locked_by: QUEUE_JOB_RUNNER_ID,
+        updated_at: lockStartedAt,
+      })
+      .eq("id", id)
+      .eq("owner_user_id", user.id)
+      .or(`locked_at.is.null,locked_at.lt.${lockCutoff}`)
+      .select("*")
+      .maybeSingle();
+
+    if (lockError) throw lockError;
+    if (!lockedJob) {
+      const { data: currentJob, error: currentJobError } = await supabase
+        .from("bank_statement_tally_queue_jobs")
+        .select("*")
+        .eq("id", id)
+        .eq("owner_user_id", user.id)
+        .maybeSingle();
+
+      if (currentJobError) throw currentJobError;
+      return jsonWithCors(request, {
+        job: currentJob
+          ? serializeQueueJob(currentJob as Record<string, unknown>)
+          : serializeQueueJob(job as Record<string, unknown>),
+        result: null,
+      });
+    }
+
+    const workingJob = lockedJob as Record<string, unknown>;
+    const payload = readPayload(workingJob.request_payload);
     const allTransactionIds = transactionIdsFromPayload(payload);
-    const processedCount = Math.max(0, Number(job.processed_count ?? 0));
-    const totalCount = allTransactionIds.length || Number(job.total_count ?? 1) || 1;
+    const processedCount = Math.max(0, Number(workingJob.processed_count ?? 0));
+    const totalCount = allTransactionIds.length || Number(workingJob.total_count ?? 1) || 1;
     const batchIds = allTransactionIds.length
       ? allTransactionIds.slice(processedCount, processedCount + QUEUE_JOB_BATCH_SIZE)
       : [];
@@ -179,6 +231,8 @@ export async function POST(
         .update({
           status: "succeeded",
           processed_count: totalCount,
+          locked_at: null,
+          locked_by: null,
           completed_at: completedAt,
           updated_at: completedAt,
         })
@@ -193,17 +247,6 @@ export async function POST(
         result: completedJob.result ?? null,
       });
     }
-
-    const now = new Date().toISOString();
-    await supabase
-      .from("bank_statement_tally_queue_jobs")
-      .update({
-        status: "running",
-        started_at: job.started_at ?? now,
-        updated_at: now,
-      })
-      .eq("id", id)
-      .eq("owner_user_id", user.id);
 
     const queueRequest = new Request(request.url, {
       method: "POST",
@@ -223,6 +266,8 @@ export async function POST(
         .update({
           status: "failed",
           error: combinedError,
+          locked_at: null,
+          locked_by: null,
           updated_at: failedAt,
           completed_at: failedAt,
         })
@@ -240,7 +285,7 @@ export async function POST(
       }, { status: 400 });
     }
 
-    const nextResult = mergeQueueResults(readResult(job.result), readResult(queueBody));
+    const nextResult = mergeQueueResults(readResult(workingJob.result), readResult(queueBody));
     const nextProcessedCount = allTransactionIds.length
       ? Math.min(totalCount, processedCount + batchIds.length)
       : totalCount;
@@ -253,6 +298,8 @@ export async function POST(
         processed_count: nextProcessedCount,
         result: nextResult,
         error: null,
+        locked_at: null,
+        locked_by: null,
         updated_at: updatedAt,
         completed_at: done ? updatedAt : null,
       })

@@ -143,6 +143,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  position: relative;
   border-radius: 8px;
   padding: 0.5rem 0.55rem;
   text-decoration: none;
@@ -211,11 +212,14 @@
 
 /* Active indicator bar */
 .activeBar {
+  position: absolute;
+  left: 0.25rem;
+  top: 50%;
+  transform: translateY(-50%);
   width: 4px;
   height: 22px;
   border-radius: 2px;
   background-color: #16a34a;
-  flex-shrink: 0;
 }
 
 /* =========================================

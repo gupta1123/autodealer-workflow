@@ -544,14 +544,22 @@ function chunkValues<T>(values: T[], size: number) {
   return chunks;
 }
 
-export function CollectionsDashboardPage() {
+interface CollectionsDashboardPageProps {
+  initialView?: ActiveView;
+  showWorkflowSummary?: boolean;
+}
+
+export function CollectionsDashboardPage({
+  initialView = "needsAction",
+  showWorkflowSummary = true,
+}: CollectionsDashboardPageProps) {
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
   const [selectedConnectionId, setSelectedConnectionId] = useState("");
   const [selectedCompanyId, setSelectedCompanyId] = useState("");
   const [dashboard, setDashboard] = useState<DashboardPayload | null>(null);
   const [liveTallyConnection, setLiveTallyConnection] = useState<LiveTallyConnection | null>(null);
   const [checkingLiveTallyCompany, setCheckingLiveTallyCompany] = useState(true);
-  const [activeView, setActiveView] = useState<ActiveView>("needsAction");
+  const [activeView, setActiveView] = useState<ActiveView>(initialView);
   const [loading, setLoading] = useState(true);
   const [cashDiscountLoadStep, setCashDiscountLoadStep] = useState("");
   const [approvingId, setApprovingId] = useState("");
@@ -1126,6 +1134,10 @@ export function CollectionsDashboardPage() {
   }, [refreshAll]);
 
   useEffect(() => {
+    setActiveView(initialView);
+  }, [initialView]);
+
+  useEffect(() => {
     if (!selectedConnectionId) {
       setLiveTallyConnection(null);
       setCheckingLiveTallyCompany(false);
@@ -1455,21 +1467,14 @@ export function CollectionsDashboardPage() {
         </div>
       ) : null}
 
-      {!companyContextLocked ? <section className="mb-6">
-        <div className="grid gap-4 md:grid-cols-3">
+      {!companyContextLocked && showWorkflowSummary ? <section className="mb-6">
+        <div className="grid gap-4 md:grid-cols-2">
           <WorkflowButton
             active={activeView === "needsAction"}
             count={pendingProposals.length}
             detail={`${formatMoney(pendingRecoverableTotal)} recoverable`}
             label="To create"
             onClick={() => chooseView("needsAction")}
-          />
-          <WorkflowButton
-            active={activeView === "followUps"}
-            count={paymentFollowUps.length}
-            detail={`${formatMoney(paymentFollowUpTotal)} outstanding`}
-            label="Pending payment follow-ups"
-            onClick={() => chooseView("followUps")}
           />
           <WorkflowButton
             active={activeView === "done"}
@@ -1480,6 +1485,20 @@ export function CollectionsDashboardPage() {
           />
         </div>
       </section> : null}
+
+      {!companyContextLocked && !showWorkflowSummary && activeView === "followUps" ? (
+        <section className="mb-6">
+          <div className="grid gap-4 md:grid-cols-1">
+            <WorkflowButton
+              active
+              count={paymentFollowUps.length}
+              detail={`${formatMoney(paymentFollowUpTotal)} outstanding`}
+              label="Pending payment follow-ups"
+              onClick={() => undefined}
+            />
+          </div>
+        </section>
+      ) : null}
 
 
 
