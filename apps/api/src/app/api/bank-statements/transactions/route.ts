@@ -147,6 +147,12 @@ export async function GET(request: Request) {
 
     const allRows = (data ?? []) as unknown as BankTransactionRow[];
     const rows = status === "queueable" ? allRows.filter(hasPostingAmount) : allRows;
+    if (status === "queueable") {
+      return jsonWithCors(request, {
+        transactions: rows.map((row) => serializeTransaction(row)),
+      });
+    }
+
     const activeLedgerRows = await loadActiveTallyLedgerRows({
       supabase,
       ownerUserId: user.id,
