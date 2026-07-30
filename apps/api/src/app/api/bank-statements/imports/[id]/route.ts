@@ -1,10 +1,6 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
-import {
-  loadActiveTallyLedgerRows,
-  suggestBankLedgerForTransaction,
-} from "@/lib/bank-statement-ledger-matching";
-import { getBankLedgerMatchingModel } from "@/lib/processing/openrouter";
+import { loadActiveTallyLedgerRows } from "@/lib/bank-statement-ledger-matching";
 import {
   findBankAccountCandidates,
   maskAccountNumber,
@@ -20,6 +16,9 @@ function readRecord(value: unknown): Record<string, unknown> {
     ? (value as Record<string, unknown>)
     : {};
 }
+
+const BANK_STATEMENT_HELPDESK_MESSAGE =
+  "Analysis could not be completed. Please retry. If this continues, contact helpdesk.";
 
 function normalizeBankAccountNumber(value: unknown) {
   return String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
@@ -194,15 +193,31 @@ function isPreviewTransactionArray(value: unknown) {
   return Array.isArray(value) ? (value as Array<Record<string, unknown>>) : [];
 }
 
-function toNumber(value: unknown) {
-  const parsed = Number(String(value ?? "").replace(/,/g, ""));
-  return Number.isFinite(parsed) ? parsed : null;
+function getLedgerRecommendationError(rows: Array<Record<string, unknown>>) {
+  const hasRetryExhaustedRow = rows.some((row) => {
+    const rawPayload = readRecord(row.raw_payload);
+    const recommendation = readRecord(rawPayload.aiLedgerRecommendation);
+    return recommendation.source === "bank_statement_worker_retry_exhausted";
+  });
+
+  return hasRetryExhaustedRow
+    ? "Ledger matching could not be completed after retries. Review ledgers manually."
+    : null;
 }
 
-function hasAiLedgerRecommendation(row: Record<string, unknown>) {
-  const rawPayload = readRecord(row.raw_payload);
-  const recommendation = readRecord(rawPayload.aiLedgerRecommendation);
-  return Boolean(recommendation.model && recommendation.matchingSafetyVersion === "token_collision_v3");
+function sanitizeBankStatementJobError(value: unknown) {
+  const message = typeof value === "string" ? value : "";
+  if (!message) return null;
+
+  if (
+    message.includes("Worker lock expired") ||
+    message.includes("stale") ||
+    message.includes("Preview rows could not be saved")
+  ) {
+    return BANK_STATEMENT_HELPDESK_MESSAGE;
+  }
+
+  return message;
 }
 
 function readConnectionIdFromMeta(processingMeta: Record<string, unknown>) {
@@ -213,80 +228,6 @@ function readConnectionIdFromMeta(processingMeta: Record<string, unknown>) {
     : typeof analysis.connectionId === "string"
       ? analysis.connectionId
       : null;
-}
-
-async function enrichPreviewRowsWithAiSuggestions(params: {
-  supabase: ReturnType<typeof createSupabaseAdminClient>;
-  ownerUserId: string;
-  connectionId: string | null;
-  importId: string;
-  rows: Array<Record<string, unknown>>;
-  ledgerRows?: TallyMasterRow[];
-}) {
-  if (!params.connectionId || params.rows.length === 0 || params.rows.every(hasAiLedgerRecommendation)) {
-    return params.rows;
-  }
-
-  const enrichedRows = await Promise.all(
-    params.rows.map(async (row) => {
-      if (hasAiLedgerRecommendation(row)) return row;
-
-      const suggestion = await suggestBankLedgerForTransaction({
-        supabase: params.supabase,
-        ownerUserId: params.ownerUserId,
-        connectionId: params.connectionId,
-        accountId: String(row.bank_account_id ?? ""),
-        ledgerRows: params.ledgerRows,
-        transaction: {
-          transactionDate: row.transaction_date ? String(row.transaction_date) : "",
-          valueDate: row.value_date ? String(row.value_date) : null,
-          description: String(row.description ?? ""),
-          referenceNumber: row.reference_number ? String(row.reference_number) : null,
-          debitAmount: toNumber(row.debit_amount),
-          creditAmount: toNumber(row.credit_amount),
-          balanceAmount: toNumber(row.balance_amount),
-          transactionType: row.transaction_type ? String(row.transaction_type) : undefined,
-          category: row.category ? String(row.category) : undefined,
-          counterpartyName: row.counterparty_name ? String(row.counterparty_name) : null,
-        },
-      });
-      const rawPayload = readRecord(row.raw_payload);
-      const aiLedgerRecommendation = {
-        matchType: suggestion.matchType ?? (suggestion.ledgerName ? "direct_match" : "suspense"),
-        action: suggestion.ledgerName ? "use_existing_ledger" : "use_suspense",
-        ledgerName: suggestion.ledgerName,
-        candidateLedgerNames: suggestion.candidateLedgerNames ?? [],
-        confidence: suggestion.confidence,
-        reason: suggestion.reason,
-        model: getBankLedgerMatchingModel(),
-        source: "import_preview_api",
-        matchingSafetyVersion: "token_collision_v3",
-      };
-      const update = {
-        suggested_ledger_name: suggestion.ledgerName,
-        suggestion_confidence: suggestion.confidence,
-        suggestion_reason: suggestion.reason,
-        raw_payload: {
-          ...rawPayload,
-          aiLedgerRecommendation,
-        },
-      };
-
-      await params.supabase
-        .from("bank_statement_import_preview_transactions")
-        .update(update)
-        .eq("id", row.id)
-        .eq("owner_user_id", params.ownerUserId)
-        .eq("import_id", params.importId);
-
-      return {
-        ...row,
-        ...update,
-      };
-    })
-  );
-
-  return enrichedRows;
 }
 
 export function OPTIONS(request: Request) {
@@ -348,18 +289,12 @@ export async function GET(
     const previewMeta = readRecord(processingMeta.preview);
     const previewAccount = readRecord(previewMeta.account);
     const storedPreviewTransactions = isPreviewTransactionArray(previewMeta.transactions);
-    const tablePreviewTransactions = await enrichPreviewRowsWithAiSuggestions({
-      supabase,
-      ownerUserId: user.id,
-      connectionId,
-      importId: id,
-      rows: (previewRows ?? []) as Array<Record<string, unknown>>,
-      ledgerRows: activeLedgerRows,
-    });
+    const tablePreviewTransactions = (previewRows ?? []) as Array<Record<string, unknown>>;
     const transactions =
       tablePreviewTransactions.length > 0
         ? tablePreviewTransactions.map((row) => serializePreviewTransaction(row))
         : storedPreviewTransactions;
+    const ledgerRecommendationError = getLedgerRecommendationError(tablePreviewTransactions);
     const analysis = readRecord(processingMeta.analysis);
     const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
     const jobStatus = typeof jobRow?.status === "string" ? jobRow.status : "";
@@ -446,6 +381,7 @@ export async function GET(
       extractionSource: previewMeta.extractionSource ?? processingMeta.extractionSource ?? null,
       extractionError: previewMeta.extractionError ?? processingMeta.extractionError ?? null,
       extractionDiagnostics: previewMeta.extractionDiagnostics ?? processingMeta.extractionDiagnostics ?? null,
+      ledgerRecommendationError,
       processing,
       job: jobRow
         ? {
@@ -453,14 +389,14 @@ export async function GET(
             status: jobRow.status,
             progress: jobRow.progress,
             stage: jobRow.stage,
-            error: jobRow.error,
+            error: sanitizeBankStatementJobError(jobRow.error),
           }
         : {
             id: String(importRow.id),
             status: analysisStatus || (processing ? "processing" : "completed"),
             progress: Number(analysis.progress ?? (processing ? 5 : 100)),
             stage: typeof analysis.stage === "string" ? analysis.stage : null,
-            error: typeof analysis.error === "string" ? analysis.error : null,
+            error: sanitizeBankStatementJobError(analysis.error),
           },
     });
   } catch (error) {

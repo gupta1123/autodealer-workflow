@@ -2522,7 +2522,7 @@ function getAnalysisCompleteMessage(payload: PreviewResponse) {
   if (payload.ledgerRecommendationError) {
     return {
       tone: "info" as const,
-      text: `Statement analyzed, but ledger recommendations need review: ${payload.ledgerRecommendationError}`,
+      text: `Statement analyzed. ${payload.ledgerRecommendationError}`,
     };
   }
 
@@ -3952,10 +3952,7 @@ export function BankStatementsPage() {
         await pollImportUntilReady(payload.import.id, ledgerMastersForReview);
       } else {
         applyPreviewPayload(latestPayload || analyzedPayload, EMPTY_ACCOUNT, ledgerMastersForReview);
-        setBanner({
-          tone: "success",
-          text: "Statement analyzed and Tally ledgers matched.",
-        });
+        setBanner(getAnalysisCompleteMessage(latestPayload || analyzedPayload));
       }
       setPostUploadSyncImportId(null);
       setPostUploadSyncError(null);

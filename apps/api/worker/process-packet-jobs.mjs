@@ -31,6 +31,14 @@ const BANK_STATEMENT_MAX_TOTAL_PAGES = Number(process.env.BANK_STATEMENT_MAX_TOT
 const BANK_STATEMENT_BATCH_PAGE_SIZE = Math.max(1, Number(process.env.BANK_STATEMENT_BATCH_PAGE_SIZE ?? 2));
 const BANK_STATEMENT_BATCH_CONCURRENCY = Math.max(1, Number(process.env.BANK_STATEMENT_BATCH_CONCURRENCY ?? 3));
 const BANK_STATEMENT_BATCH_RETRY_LIMIT = Math.max(0, Number(process.env.BANK_STATEMENT_BATCH_RETRY_LIMIT ?? 2));
+const BANK_STATEMENT_LEDGER_MATCH_RETRY_LIMIT = Math.max(
+  0,
+  Number(process.env.BANK_STATEMENT_LEDGER_MATCH_RETRY_LIMIT ?? 2)
+);
+const BANK_STATEMENT_PREVIEW_INSERT_BATCH_SIZE = Math.max(
+  1,
+  Number(process.env.BANK_STATEMENT_PREVIEW_INSERT_BATCH_SIZE ?? 300)
+);
 const BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT = Math.max(
   0,
   Number(process.env.BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT ?? 50)
@@ -64,6 +72,8 @@ const OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS = Number(
 );
 const execFileAsync = promisify(execFile);
 const WORKER_IDLE_LOG_INTERVAL_MS = Number(process.env.WORKER_IDLE_LOG_INTERVAL_MS ?? 30_000);
+const BANK_STATEMENT_HELPDESK_MESSAGE =
+  "Analysis could not be completed. Please retry. If this continues, contact helpdesk.";
 
 const BANK_LEDGER_MATCHING_SYSTEM_PROMPT = `You match Indian bank statement transactions to synced Tally ledgers.
 Your task is to recommend the correct existing Tally ledger for each bank transaction.
@@ -1114,6 +1124,93 @@ async function applyAiLedgerSuggestionsToPreviewRows({ ownerUserId, connectionId
   });
 }
 
+function markPreviewRowsWithLedgerMatchingFailure(rows, error) {
+  const reason = "Ledger matching could not be completed after retries. Review this row manually.";
+  const errorMessage = diagnosticError(error);
+
+  return rows.map((row) => {
+    const rawPayload = row.raw_payload && typeof row.raw_payload === "object" && !Array.isArray(row.raw_payload)
+      ? row.raw_payload
+      : {};
+
+    return {
+      ...row,
+      suggested_ledger_name: null,
+      suggestion_confidence: 0,
+      suggestion_reason: reason,
+      raw_payload: {
+        ...rawPayload,
+        aiLedgerRecommendation: {
+          matchType: "suspense",
+          action: "use_suspense",
+          ledgerName: null,
+          candidateLedgerNames: [],
+          confidence: 0,
+          reason,
+          model: OPENROUTER_BANK_LEDGER_MODEL,
+          source: "bank_statement_worker_retry_exhausted",
+          matchingSafetyVersion: "token_collision_v3",
+          error: errorMessage,
+        },
+      },
+    };
+  });
+}
+
+async function applyAiLedgerSuggestionsToPreviewRowsWithRetry(input) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= BANK_STATEMENT_LEDGER_MATCH_RETRY_LIMIT; attempt += 1) {
+    try {
+      return await applyAiLedgerSuggestionsToPreviewRows(input);
+    } catch (error) {
+      lastError = error;
+      const totalAttempts = BANK_STATEMENT_LEDGER_MATCH_RETRY_LIMIT + 1;
+      console.warn(
+        `[worker] AI ledger matching attempt ${attempt + 1}/${totalAttempts} failed:`,
+        diagnosticError(error)
+      );
+
+      if (attempt < BANK_STATEMENT_LEDGER_MATCH_RETRY_LIMIT) {
+        await sleep(OPENROUTER_RETRY_BASE_MS * (attempt + 1));
+      }
+    }
+  }
+
+  return markPreviewRowsWithLedgerMatchingFailure(input.rows, lastError);
+}
+
+function chunkArray(items, size) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+async function insertBankStatementPreviewRowsInBatches({ jobId, rows }) {
+  if (rows.length === 0) return;
+
+  const batches = chunkArray(rows, BANK_STATEMENT_PREVIEW_INSERT_BATCH_SIZE);
+  for (let index = 0; index < batches.length; index += 1) {
+    const batch = batches[index];
+    if (batches.length > 1) {
+      const progress = Math.min(90, 80 + Math.round(((index + 1) / batches.length) * 10));
+      await updateBankJob(jobId, {
+        progress,
+        stage: `Saving preview rows (${index + 1}/${batches.length})`,
+      });
+    }
+
+    const { error } = await supabase
+      .from("bank_statement_import_preview_transactions")
+      .insert(batch);
+    if (error) {
+      throw new Error(`Preview rows could not be saved. ${diagnosticError(error)}`);
+    }
+  }
+}
+
 async function extractBankStatementFromImages(fileName, images, bankAccountCandidates = [], options = {}) {
   if (images.length === 0) {
     return {
@@ -1642,11 +1739,12 @@ async function requeueBankJob(jobId, errorMessage) {
   const job = await getBankJob(jobId);
   if (!job || isTerminalJobStatus(job.status)) return;
   if (Number(job.attempt_count ?? 0) >= Number(job.max_attempts ?? 3)) {
+    const userMessage = BANK_STATEMENT_HELPDESK_MESSAGE;
     await updateBankJob(jobId, {
       status: "failed",
       progress: 100,
       stage: "Failed",
-      error: errorMessage,
+      error: userMessage,
       locked_at: null,
       locked_by: null,
       finished_at: new Date().toISOString(),
@@ -1657,7 +1755,8 @@ async function requeueBankJob(jobId, errorMessage) {
         status: "failed",
         processing_meta: {
           jobStatus: "failed",
-          extractionError: errorMessage,
+          extractionError: userMessage,
+          failureDetail: errorMessage,
           failedAt: new Date().toISOString(),
         },
       })
@@ -1790,22 +1889,18 @@ async function runBankStatementJob(job) {
   if (rows.length > 0 && tallyConnectionId) {
     try {
       await updateBankJob(job.id, { progress: 78, stage: "Matching Tally ledgers with AI" });
-      previewRows = await applyAiLedgerSuggestionsToPreviewRows({
+      previewRows = await applyAiLedgerSuggestionsToPreviewRowsWithRetry({
         ownerUserId: job.owner_user_id,
         connectionId: tallyConnectionId,
         rows,
       });
     } catch (error) {
       console.warn("[worker] AI ledger matching failed for preview rows:", diagnosticError(error));
+      previewRows = markPreviewRowsWithLedgerMatchingFailure(rows, error);
     }
   }
 
-  if (previewRows.length > 0) {
-    const { error: previewInsertError } = await supabase
-      .from("bank_statement_import_preview_transactions")
-      .insert(previewRows);
-    if (previewInsertError) throw previewInsertError;
-  }
+  await insertBankStatementPreviewRowsInBatches({ jobId: job.id, rows: previewRows });
 
   const previousAnalysis =
     processingMeta.analysis && typeof processingMeta.analysis === "object" && !Array.isArray(processingMeta.analysis)
