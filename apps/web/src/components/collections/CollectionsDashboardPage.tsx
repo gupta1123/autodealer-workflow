@@ -740,6 +740,7 @@ export function CollectionsDashboardPage({
   const [viewingCreatedProposal, setViewingCreatedProposal] = useState<DebitNoteProposal | null>(null);
   const [createReviewProposals, setCreateReviewProposals] = useState<DebitNoteProposal[]>([]);
   const [createReviewSubmitting, setCreateReviewSubmitting] = useState(false);
+  const [createReviewProgress, setCreateReviewProgress] = useState("");
   const [debitNoteSearchQuery, setDebitNoteSearchQuery] = useState("");
   const [debitNoteFilter, setDebitNoteFilter] = useState<DebitNoteFilter>("all");
   const [debitNoteSort, setDebitNoteSort] = useState<DebitNoteSort>("date_desc");
@@ -868,11 +869,16 @@ export function CollectionsDashboardPage({
   const pollCommands = useCallback(async (
     connectionId: string,
     commandIds: string[],
-    options?: { timeoutSeconds?: number; pendingMessage?: string }
+    options?: {
+      timeoutSeconds?: number;
+      pendingMessage?: string;
+      onProgress?: (progress: { total: number; completed: number; remaining: number; running: number; queued: number }) => void;
+    }
   ) => {
     const pending = new Set(commandIds);
     if (pending.size === 0) return;
 
+    const total = pending.size;
     const timeoutSeconds = options?.timeoutSeconds ?? Math.max(90, pending.size * 60);
     for (let attempt = 0; attempt < timeoutSeconds; attempt += 1) {
       await wait(1000);
@@ -886,14 +892,28 @@ export function CollectionsDashboardPage({
       if (!response.ok) throw new Error(await readError(response));
       const payload = (await response.json()) as { commands?: TallyCommand[] };
 
+      let running = 0;
+      let queued = 0;
       for (const command of payload.commands ?? []) {
         if (!pending.has(command.id)) continue;
         if (command.status === "succeeded") {
           pending.delete(command.id);
         } else if (command.status === "failed" || command.status === "canceled") {
           throw new Error(command.error || "Tally command failed.");
+        } else if (command.status === "claimed") {
+          running += 1;
+        } else {
+          queued += 1;
         }
       }
+
+      options?.onProgress?.({
+        total,
+        completed: total - pending.size,
+        remaining: pending.size,
+        running,
+        queued,
+      });
 
       if (pending.size === 0) return;
     }
@@ -991,6 +1011,11 @@ export function CollectionsDashboardPage({
       await pollCommands(connectionId, commandIds, {
         timeoutSeconds: Math.max(90, commandIds.length * 60),
         pendingMessage: "The Tally open-bill scan is still pending. Keep the connector open, then refresh.",
+        onProgress: ({ total, completed, remaining, running, queued }) => {
+          options?.onProgress?.(
+            `Scanning open bills from Tally: ${completed}/${total} batches done, ${remaining} remaining${running > 0 ? `, ${running} running` : ""}${queued > 0 ? `, ${queued} queued` : ""}.`
+          );
+        },
       });
     },
     [loadDebtorLedgers, pollCommands, syncCurrentCompanyLedgers]
@@ -1145,18 +1170,26 @@ export function CollectionsDashboardPage({
     try {
       setCreateReviewSubmitting(true);
       setBulkCreating(!single);
+      setCreateReviewProgress(single ? "Creating debit note in Tally..." : `Creating debit note 1 of ${proposalsToCreate.length}...`);
       setMessage({ tone: "info", text: single ? "Creating debit note in Tally..." : `Creating ${proposalsToCreate.length} debit notes in Tally...` });
-      for (const item of proposalsToCreate) {
+      for (const [index, item] of proposalsToCreate.entries()) {
+        setCreateReviewProgress(single ? "Creating debit note in Tally..." : `Creating debit note ${index + 1} of ${proposalsToCreate.length}...`);
         setApprovingId(item.id);
         await createDebitNoteForProposal(item);
       }
       if (selectedConnectionId) {
-        await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
+        setCreateReviewProgress("Refreshing Tally open bills...");
+        await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName, {
+          onProgress: setCreateReviewProgress,
+        });
+        setCreateReviewProgress("Updating Cash Discounts from the latest Tally data...");
         await loadDashboard(selectedConnectionId, selectedCompany?.companyName);
       } else {
+        setCreateReviewProgress("Updating Cash Discounts...");
         await loadDashboard();
       }
       setCreateReviewProposals([]);
+      setCreateReviewProgress("");
       setSelectedPendingIds(new Set());
       setActiveView("done");
       setMessage({ tone: "success", text: single ? "Debit note created in Tally." : `${proposalsToCreate.length} debit notes created in Tally.` });
@@ -1167,6 +1200,7 @@ export function CollectionsDashboardPage({
       setApprovingId("");
       setBulkCreating(false);
       setCreateReviewSubmitting(false);
+      setCreateReviewProgress("");
     }
   }
 
@@ -1549,7 +1583,7 @@ export function CollectionsDashboardPage({
   const lastKnownSyncAt = lastCashDiscountSyncAt ?? selectedCompany?.lastSyncAt ?? null;
   const syncInProgress = loading || syncingTally;
   const refreshStatusLabel = syncInProgress
-    ? cashDiscountLoadStep || "Syncing with Tally..."
+    ? "Syncing with Tally..."
     : lastKnownSyncAt
       ? `Last synced ${formatDateTime(lastKnownSyncAt)}`
       : "Not synced yet";
@@ -2551,7 +2585,10 @@ export function CollectionsDashboardPage({
               <button
                 className="rounded-lg p-1.5 text-slate-400 transition hover:bg-[#faf8f4] hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
                 disabled={createReviewSubmitting}
-                onClick={() => setCreateReviewProposals([])}
+                onClick={() => {
+                  setCreateReviewProposals([]);
+                  setCreateReviewProgress("");
+                }}
                 type="button"
               >
                 <X className="h-4 w-4" />
@@ -2643,11 +2680,21 @@ export function CollectionsDashboardPage({
               This will create the debit note{createReviewSingle ? "" : "s"} in Tally for the active company. Review the company, ledger, invoice, amount, date, and narration before continuing.
             </div>
 
+            {createReviewSubmitting ? (
+              <div className="mt-3 flex items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2.5 text-xs font-semibold text-sky-800" aria-live="polite">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                {createReviewProgress || "Creating debit note in Tally..."}
+              </div>
+            ) : null}
+
             <div className="mt-6 flex flex-wrap justify-end gap-3 border-t border-[#e5ddd0]/60 pt-4">
               <button
                 className="inline-flex h-10 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-5 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4] disabled:cursor-not-allowed disabled:opacity-50"
                 disabled={createReviewSubmitting}
-                onClick={() => setCreateReviewProposals([])}
+                onClick={() => {
+                  setCreateReviewProposals([]);
+                  setCreateReviewProgress("");
+                }}
                 type="button"
               >
                 Cancel
