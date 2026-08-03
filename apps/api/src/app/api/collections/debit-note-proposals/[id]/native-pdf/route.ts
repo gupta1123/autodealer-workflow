@@ -2,7 +2,6 @@ import { applyCorsHeaders, jsonWithCors, optionsWithCors } from "@/lib/api/cors"
 import { NextResponse } from "next/server";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
-  cashDiscountDebitNotePdfFileName,
   createDebitNotePdfSignedUrl,
 } from "@/lib/debit-notes/pdf";
 import {
@@ -20,6 +19,14 @@ function normalizeCompanyName(value: string | null | undefined) {
 
 function isLiveConnection(row: { status?: string | null; last_tally_reachable?: boolean | null; last_company_loaded?: boolean | null }) {
   return row.status === "company_loaded" || (row.last_tally_reachable === true && row.last_company_loaded === true);
+}
+
+function debitNotePdfFilename(proposal: DebitNoteProposalRow) {
+  const voucherNumber = String(proposal.tally_voucher_number ?? "tally-debit-note")
+    .trim()
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/^-+|-+$/g, "");
+  return `${voucherNumber || "tally-debit-note"}.pdf`;
 }
 
 export function OPTIONS(request: Request) {
@@ -60,7 +67,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       const response = new NextResponse(await sourceResponse.arrayBuffer(), {
         headers: {
           "Content-Type": sourceResponse.headers.get("content-type") ?? "application/pdf",
-          "Content-Disposition": `attachment; filename="${cashDiscountDebitNotePdfFileName(proposal)}"`,
+          "Content-Disposition": `attachment; filename="${debitNotePdfFilename(proposal)}"`,
           "Cache-Control": "private, no-store",
         },
       });

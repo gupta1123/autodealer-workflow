@@ -17,8 +17,6 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-const TALLY_MASTERS_PAGE_SIZE = 1000;
-
 export async function GET(
   request: Request,
   context: { params: Promise<{ id: string }> }
@@ -33,14 +31,12 @@ export async function GET(
     const url = new URL(request.url);
     const type = parseMasterType(url.searchParams.get("type"));
     const query = url.searchParams.get("q")?.trim() ?? "";
-    const name = url.searchParams.get("name")?.trim() ?? "";
-    const parent = url.searchParams.get("parent")?.trim() ?? "";
     const limit = Math.min(Number(url.searchParams.get("limit") || 100), 5000);
 
     const supabase = createSupabaseAdminClient();
     const { data: connection, error: connectionError } = await supabase
       .from("tally_connections")
-      .select("id, owner_user_id")
+      .select("id, owner_user_id, last_company_name")
       .eq("id", id)
       .eq("owner_user_id", user.id)
       .maybeSingle();
@@ -53,42 +49,28 @@ export async function GET(
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
     }
 
-    const masters: TallyMasterRow[] = [];
-    for (let offset = 0; offset < limit; offset += TALLY_MASTERS_PAGE_SIZE) {
-      const pageLimit = Math.min(TALLY_MASTERS_PAGE_SIZE, limit - offset);
-      let builder = supabase
-        .from("tally_masters")
-        .select("*")
-        .eq("connection_id", id)
-        .eq("owner_user_id", user.id)
-        .eq("is_active", true)
-        .order("master_type", { ascending: true })
-        .order("tally_name", { ascending: true })
-        .range(offset, offset + pageLimit - 1);
+    let builder = supabase
+      .from("tally_masters")
+      .select("*")
+      .eq("connection_id", id)
+      .eq("owner_user_id", user.id)
+      .eq("company_name", connection.last_company_name ?? "Unknown company")
+      .eq("is_active", true)
+      .order("master_type", { ascending: true })
+      .order("tally_name", { ascending: true })
+      .limit(limit);
 
-      if (type) {
-        builder = builder.eq("master_type", type);
-      }
+    if (type) {
+      builder = builder.eq("master_type", type);
+    }
 
-      if (parent) {
-        builder = builder.ilike("parent_name", parent);
-      }
+    if (query) {
+      builder = builder.ilike("tally_name", `%${query}%`);
+    }
 
-      if (name) {
-        builder = builder.ilike("tally_name", name);
-      }
-
-      if (query) {
-        builder = builder.ilike("tally_name", `%${query}%`);
-      }
-
-      const { data, error } = await builder;
-      if (error) {
-        throw error;
-      }
-
-      masters.push(...((data ?? []) as unknown as TallyMasterRow[]));
-      if ((data ?? []).length < pageLimit) break;
+    const { data, error } = await builder;
+    if (error) {
+      throw error;
     }
 
     const { data: runData, error: runError } = await supabase
@@ -105,7 +87,7 @@ export async function GET(
     }
 
     return jsonWithCors(request, {
-      masters: masters.map(serializeTallyMaster),
+      masters: ((data ?? []) as unknown as TallyMasterRow[]).map(serializeTallyMaster),
       latestSync: runData ?? null,
     });
   } catch (error) {

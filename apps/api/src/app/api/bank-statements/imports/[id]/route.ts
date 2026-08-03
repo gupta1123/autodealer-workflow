@@ -1,13 +1,13 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
-import { loadActiveTallyLedgerRows } from "@/lib/bank-statement-ledger-matching";
+import { suggestBankLedgerForTransaction } from "@/lib/bank-statement-ledger-matching";
+import { getBankLedgerMatchingModel } from "@/lib/processing/openrouter";
 import {
   findBankAccountCandidates,
   maskAccountNumber,
   serializeAccount,
 } from "@/lib/bank-statements";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
-import type { TallyMasterRow } from "@/lib/tally/masters";
 
 export const runtime = "nodejs";
 
@@ -16,11 +16,6 @@ function readRecord(value: unknown): Record<string, unknown> {
     ? (value as Record<string, unknown>)
     : {};
 }
-
-const BANK_STATEMENT_HELPDESK_MESSAGE =
-  "Analysis could not be completed. Please retry. If this continues, contact helpdesk.";
-const DEFAULT_PREVIEW_PAGE_SIZE = 500;
-const MAX_PREVIEW_PAGE_SIZE = 1000;
 
 function normalizeBankAccountNumber(value: unknown) {
   return String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
@@ -59,8 +54,7 @@ async function resolveStatementBankLedger(
   connectionId: string | null,
   accountNumber: string | null,
   savedCandidates: Array<{ accountNumber?: string | null; tallyLedgerName?: string | null }>,
-  legacyProvidedLedgerName: string | null | undefined,
-  ledgerRows?: TallyMasterRow[]
+  legacyProvidedLedgerName: string | null | undefined
 ) {
   const legacyProvidedLedger = String(legacyProvidedLedgerName ?? "").trim();
   const normalizedAccountNumber = normalizeBankAccountNumber(accountNumber);
@@ -95,15 +89,19 @@ async function resolveStatementBankLedger(
     };
   }
 
-  const activeLedgerRows = ledgerRows ?? await loadActiveTallyLedgerRows({
-    supabase,
-    ownerUserId,
-    connectionId,
-  });
+  const { data, error } = await supabase
+    .from("tally_masters")
+    .select("tally_name, parent_name, raw_payload")
+    .eq("owner_user_id", ownerUserId)
+    .eq("connection_id", connectionId)
+    .eq("master_type", "ledger")
+    .eq("is_active", true)
+    .limit(5000);
+  if (error) throw error;
 
   const exactLedgerNames = Array.from(
     new Set(
-      (activeLedgerRows as Array<Record<string, unknown>>)
+      ((data ?? []) as Array<Record<string, unknown>>)
         .filter(isBankLedgerMaster)
         .filter((ledger) => bankLedgerAccountNumber(ledger) === normalizedAccountNumber)
         .map((ledger) => String(ledger.tally_name ?? "").trim())
@@ -187,7 +185,6 @@ function serializePreviewTransaction(row: Record<string, unknown>) {
           : null,
     suggestionReason: row.suggestion_reason ? String(row.suggestion_reason) : null,
     confirmedLedgerName: row.confirmed_ledger_name ? String(row.confirmed_ledger_name) : null,
-    rawPayload: readRecord(row.raw_payload),
   };
 }
 
@@ -195,37 +192,14 @@ function isPreviewTransactionArray(value: unknown) {
   return Array.isArray(value) ? (value as Array<Record<string, unknown>>) : [];
 }
 
-function getLedgerRecommendationError(rows: Array<Record<string, unknown>>) {
-  const hasRetryExhaustedRow = rows.some((row) => {
-    const rawPayload = readRecord(row.raw_payload);
-    const recommendation = readRecord(rawPayload.aiLedgerRecommendation);
-    return recommendation.source === "bank_statement_worker_retry_exhausted";
-  });
-
-  return hasRetryExhaustedRow
-    ? "Ledger matching could not be completed after retries. Review ledgers manually."
-    : null;
+function toNumber(value: unknown) {
+  const parsed = Number(String(value ?? "").replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
-function sanitizeBankStatementJobError(value: unknown) {
-  const message = typeof value === "string" ? value : "";
-  if (!message) return null;
-
-  if (
-    message.includes("Worker lock expired") ||
-    message.includes("stale") ||
-    message.includes("Preview rows could not be saved")
-  ) {
-    return BANK_STATEMENT_HELPDESK_MESSAGE;
-  }
-
-  return message;
-}
-
-function readPositiveInteger(value: string | null, fallback: number, max: number) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return Math.min(Math.floor(parsed), max);
+function hasAiLedgerRecommendation(row: Record<string, unknown>) {
+  const rawPayload = readRecord(row.raw_payload);
+  return Boolean(readRecord(rawPayload.aiLedgerRecommendation).model);
 }
 
 function readConnectionIdFromMeta(processingMeta: Record<string, unknown>) {
@@ -236,6 +210,77 @@ function readConnectionIdFromMeta(processingMeta: Record<string, unknown>) {
     : typeof analysis.connectionId === "string"
       ? analysis.connectionId
       : null;
+}
+
+async function enrichPreviewRowsWithAiSuggestions(params: {
+  supabase: ReturnType<typeof createSupabaseAdminClient>;
+  ownerUserId: string;
+  connectionId: string | null;
+  importId: string;
+  rows: Array<Record<string, unknown>>;
+}) {
+  if (!params.connectionId || params.rows.length === 0 || params.rows.every(hasAiLedgerRecommendation)) {
+    return params.rows;
+  }
+
+  const enrichedRows = await Promise.all(
+    params.rows.map(async (row) => {
+      if (hasAiLedgerRecommendation(row)) return row;
+
+      const suggestion = await suggestBankLedgerForTransaction({
+        supabase: params.supabase,
+        ownerUserId: params.ownerUserId,
+        connectionId: params.connectionId,
+        accountId: String(row.bank_account_id ?? ""),
+        transaction: {
+          transactionDate: row.transaction_date ? String(row.transaction_date) : "",
+          valueDate: row.value_date ? String(row.value_date) : null,
+          description: String(row.description ?? ""),
+          referenceNumber: row.reference_number ? String(row.reference_number) : null,
+          debitAmount: toNumber(row.debit_amount),
+          creditAmount: toNumber(row.credit_amount),
+          balanceAmount: toNumber(row.balance_amount),
+          transactionType: row.transaction_type ? String(row.transaction_type) : undefined,
+          category: row.category ? String(row.category) : undefined,
+          counterpartyName: row.counterparty_name ? String(row.counterparty_name) : null,
+        },
+      });
+      const rawPayload = readRecord(row.raw_payload);
+      const aiLedgerRecommendation = {
+        matchType: suggestion.matchType ?? (suggestion.ledgerName ? "direct_match" : "suspense"),
+        action: suggestion.ledgerName ? "use_existing_ledger" : "use_suspense",
+        ledgerName: suggestion.ledgerName,
+        candidateLedgerNames: suggestion.candidateLedgerNames ?? [],
+        confidence: suggestion.confidence,
+        reason: suggestion.reason,
+        model: getBankLedgerMatchingModel(),
+        source: "import_preview_api",
+      };
+      const update = {
+        suggested_ledger_name: suggestion.ledgerName,
+        suggestion_confidence: suggestion.confidence,
+        suggestion_reason: suggestion.reason,
+        raw_payload: {
+          ...rawPayload,
+          aiLedgerRecommendation,
+        },
+      };
+
+      await params.supabase
+        .from("bank_statement_import_preview_transactions")
+        .update(update)
+        .eq("id", row.id)
+        .eq("owner_user_id", params.ownerUserId)
+        .eq("import_id", params.importId);
+
+      return {
+        ...row,
+        ...update,
+      };
+    })
+  );
+
+  return enrichedRows;
 }
 
 export function OPTIONS(request: Request) {
@@ -253,16 +298,6 @@ export async function GET(
     }
 
     const { id } = await context.params;
-    const url = new URL(request.url);
-    const includeTransactions = url.searchParams.get("includeTransactions") !== "false";
-    const transactionPage = readPositiveInteger(url.searchParams.get("transactionsPage"), 1, 1000000);
-    const transactionPageSize = readPositiveInteger(
-      url.searchParams.get("transactionsPageSize"),
-      DEFAULT_PREVIEW_PAGE_SIZE,
-      MAX_PREVIEW_PAGE_SIZE
-    );
-    const transactionRangeFrom = (transactionPage - 1) * transactionPageSize;
-    const transactionRangeTo = transactionRangeFrom + transactionPageSize - 1;
     const supabase = createSupabaseAdminClient();
     const { data: importRow, error: importError } = await supabase
       .from("bank_statement_imports")
@@ -287,44 +322,31 @@ export async function GET(
     if (jobError) throw jobError;
     let jobRow = latestJobRow;
 
-    const previewRowsResult = includeTransactions
-      ? await supabase
-          .from("bank_statement_import_preview_transactions")
-          .select("*", { count: "exact" })
-          .eq("import_id", id)
-          .eq("owner_user_id", user.id)
-          .order("row_index", { ascending: true })
-          .range(transactionRangeFrom, transactionRangeTo)
-      : await supabase
-          .from("bank_statement_import_preview_transactions")
-          .select("id", { count: "exact", head: true })
-          .eq("import_id", id)
-          .eq("owner_user_id", user.id);
-    const { data: previewRows, error: previewError, count: previewTransactionTotal } = previewRowsResult;
+    const { data: previewRows, error: previewError } = await supabase
+      .from("bank_statement_import_preview_transactions")
+      .select("*")
+      .eq("import_id", id)
+      .eq("owner_user_id", user.id)
+      .order("row_index", { ascending: true });
 
     if (previewError) throw previewError;
 
     const processingMeta = readRecord(importRow.processing_meta);
-    const connectionId = readConnectionIdFromMeta(processingMeta);
-    const activeLedgerRows = includeTransactions
-      ? await loadActiveTallyLedgerRows({
-          supabase,
-          ownerUserId: user.id,
-          connectionId,
-        })
-      : [];
     const effectiveImportStatus = getEffectiveImportStatus(importRow as Record<string, unknown>);
     const previewMeta = readRecord(processingMeta.preview);
     const previewAccount = readRecord(previewMeta.account);
     const storedPreviewTransactions = isPreviewTransactionArray(previewMeta.transactions);
-    const tablePreviewTransactions = (previewRows ?? []) as Array<Record<string, unknown>>;
+    const tablePreviewTransactions = await enrichPreviewRowsWithAiSuggestions({
+      supabase,
+      ownerUserId: user.id,
+      connectionId: readConnectionIdFromMeta(processingMeta),
+      importId: id,
+      rows: (previewRows ?? []) as Array<Record<string, unknown>>,
+    });
     const transactions =
       tablePreviewTransactions.length > 0
         ? tablePreviewTransactions.map((row) => serializePreviewTransaction(row))
         : storedPreviewTransactions;
-    const ledgerRecommendationError = includeTransactions
-      ? getLedgerRecommendationError(tablePreviewTransactions)
-      : null;
     const analysis = readRecord(processingMeta.analysis);
     const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
     const jobStatus = typeof jobRow?.status === "string" ? jobRow.status : "";
@@ -393,11 +415,10 @@ export async function GET(
     const bankLedgerResolution = await resolveStatementBankLedger(
       supabase,
       user.id,
-      connectionId,
+      readConnectionIdFromMeta(processingMeta),
       account.accountNumber,
       candidates,
-      account.tallyLedgerName,
-      activeLedgerRows
+      account.tallyLedgerName
     );
     account.tallyLedgerName = bankLedgerResolution.ledgerName;
 
@@ -407,16 +428,10 @@ export async function GET(
       candidates: Array.isArray(previewMeta.candidates) ? candidates : candidates.map(serializeAccount),
       bankLedgerResolution,
       transactions,
-      transactionsPage: transactionPage,
-      transactionsPageSize: transactionPageSize,
-      transactionsTotal: includeTransactions
-        ? previewTransactionTotal ?? transactions.length
-        : previewTransactionTotal ?? 0,
       requiresManualExtraction,
       extractionSource: previewMeta.extractionSource ?? processingMeta.extractionSource ?? null,
       extractionError: previewMeta.extractionError ?? processingMeta.extractionError ?? null,
       extractionDiagnostics: previewMeta.extractionDiagnostics ?? processingMeta.extractionDiagnostics ?? null,
-      ledgerRecommendationError,
       processing,
       job: jobRow
         ? {
@@ -424,14 +439,14 @@ export async function GET(
             status: jobRow.status,
             progress: jobRow.progress,
             stage: jobRow.stage,
-            error: sanitizeBankStatementJobError(jobRow.error),
+            error: jobRow.error,
           }
         : {
             id: String(importRow.id),
             status: analysisStatus || (processing ? "processing" : "completed"),
             progress: Number(analysis.progress ?? (processing ? 5 : 100)),
             stage: typeof analysis.stage === "string" ? analysis.stage : null,
-            error: sanitizeBankStatementJobError(analysis.error),
+            error: typeof analysis.error === "string" ? analysis.error : null,
           },
     });
   } catch (error) {

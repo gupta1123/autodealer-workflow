@@ -25,8 +25,6 @@ const MASTER_INPUT_KEYS: Record<string, TallyMasterType> = {
   taxLedgers: "tax_ledger",
 };
 
-const MASTER_UPSERT_CHUNK_SIZE = 500;
-
 function getBridgeToken(request: Request) {
   const authorization = request.headers.get("authorization");
   const bearerMatch = authorization?.match(/^Bearer\s+(.+)$/i);
@@ -37,41 +35,15 @@ function asMasterInputs(value: unknown): TallyMasterInput[] {
   return Array.isArray(value) ? (value as TallyMasterInput[]) : [];
 }
 
-function errorMessage(error: unknown) {
-  if (error instanceof Error) return error.message;
-  if (error && typeof error === "object" && "message" in error) {
-    return String((error as { message?: unknown }).message ?? "Unknown error");
-  }
-  return String(error ?? "Unknown error");
-}
-
-function chunkRows<T>(rows: T[], size: number) {
-  const chunks: T[][] = [];
-  for (let index = 0; index < rows.length; index += size) {
-    chunks.push(rows.slice(index, index + size));
-  }
-  return chunks;
-}
-
-function dedupeMasterRows(rows: Array<Record<string, unknown>>) {
-  const byKey = new Map<string, Record<string, unknown>>();
-  for (const row of rows) {
-    const key = [
-      row.connection_id,
-      row.master_type,
-      row.master_key,
-    ].map((value) => String(value ?? "")).join("::");
-    if (!key.trim()) continue;
-    byKey.set(key, row);
-  }
-  return Array.from(byKey.values());
-}
-
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
 export async function POST(request: Request) {
+  let syncFailureContext: {
+    supabase: ReturnType<typeof createSupabaseAdminClient>;
+    syncRunId: string;
+  } | null = null;
   try {
     const token = getBridgeToken(request);
     const body = await request.json().catch(() => ({}));
@@ -107,7 +79,12 @@ export async function POST(request: Request) {
 
     const mastersPayload = body.masters && typeof body.masters === "object" ? body.masters : {};
     const now = new Date().toISOString();
-    const companyName = toNullableText(body.companyName, 240);
+    const companyName = toNullableText(body.companyName, 240) ?? "Unknown company";
+    const companyProfile = body.companyProfile && typeof body.companyProfile === "object"
+      ? body.companyProfile as Record<string, unknown>
+      : {};
+    const companyGstin = toNullableText(companyProfile.gstin, 32);
+    const companyStateCode = toNullableText(companyProfile.stateCode, 8);
     const rows: Array<Record<string, unknown>> = [];
     const totals: Record<string, number> = {};
     const syncedTypes = new Set<TallyMasterType>();
@@ -115,7 +92,7 @@ export async function POST(request: Request) {
     for (const [payloadKey, masterType] of Object.entries(MASTER_INPUT_KEYS)) {
       const items = asMasterInputs((mastersPayload as Record<string, unknown>)[payloadKey]);
       totals[masterType] = items.length;
-      if (items.length > 0) {
+      if (Array.isArray((mastersPayload as Record<string, unknown>)[payloadKey])) {
         syncedTypes.add(masterType);
       }
 
@@ -127,6 +104,7 @@ export async function POST(request: Request) {
           ...normalized,
           connection_id: connection.id,
           owner_user_id: connection.owner_user_id,
+          company_name: companyName,
           is_active: true,
           last_synced_at: now,
         });
@@ -138,10 +116,13 @@ export async function POST(request: Request) {
       .insert({
         connection_id: connection.id,
         owner_user_id: connection.owner_user_id,
-        status: "completed",
+        status: "failed",
         company_name: companyName,
+        company_gstin: companyGstin,
+        company_state_code: companyStateCode,
         bridge_version: toNullableText(body.bridgeVersion, 80),
         totals,
+        error: "Master sync did not complete.",
         completed_at: now,
       })
       .select("id")
@@ -152,6 +133,7 @@ export async function POST(request: Request) {
     }
 
     const syncRunId = (syncRun as { id: string }).id;
+    syncFailureContext = { supabase, syncRunId };
 
     // This sync can explicitly read a company that is not currently open in
     // Tally. Do not overwrite the heartbeat's active-company value here; doing
@@ -161,40 +143,69 @@ export async function POST(request: Request) {
       .update({ last_tested_at: now })
       .eq("id", connection.id);
 
-    if (syncedTypes.size > 0) {
-      const { error: deleteError } = await supabase
-        .from("tally_masters")
-        .delete()
-        .eq("connection_id", connection.id)
-        .in("master_type", Array.from(syncedTypes));
-
-      if (deleteError) {
-        throw deleteError;
-      }
-    }
-
-    const rowsWithRun = dedupeMasterRows(rows.map((row) => ({
+    const rowsWithRun = rows.map((row) => ({
       ...row,
       sync_run_id: syncRunId,
-    })));
+    }));
 
-    const upserted: TallyMasterRow[] = [];
-    if (rowsWithRun.length > 0) {
-      for (const chunk of chunkRows(rowsWithRun, MASTER_UPSERT_CHUNK_SIZE)) {
-        const { data: insertedData, error: insertError } = await supabase
-          .from("tally_masters")
-          .insert(chunk)
-          .select("*");
-
-        if (insertError) {
-          throw insertError;
-        }
-
-        if (upserted.length < 50) {
-          upserted.push(...((insertedData ?? []) as unknown as TallyMasterRow[]).slice(0, 50 - upserted.length));
-        }
-      }
+    const reportedMasterCount = Object.values(totals).reduce((sum, total) => sum + total, 0);
+    if (reportedMasterCount > 0 && rowsWithRun.length === 0) {
+      throw new Error(
+        "Tally reported masters, but none contained a recognizable name. Update the connector and retry."
+      );
     }
+
+    let upserted: TallyMasterRow[] = [];
+    if (rowsWithRun.length > 0) {
+      const { data: masterData, error: upsertError } = await supabase
+        .from("tally_masters")
+        .upsert(rowsWithRun, {
+          onConflict: "connection_id,company_name,master_type,master_key",
+        })
+        .select("*");
+
+      if (upsertError) {
+        throw upsertError;
+      }
+
+      upserted = (masterData ?? []) as unknown as TallyMasterRow[];
+    }
+
+    // Only retire the prior snapshot after the new rows have been written.
+    // This prevents a failed upsert from leaving the company with no active
+    // masters, and sync_run_id keeps the just-upserted rows active.
+    const { error: otherCompanyDeactivateError } = await supabase
+      .from("tally_masters")
+      .update({ is_active: false, last_synced_at: now })
+      .eq("connection_id", connection.id)
+      .neq("company_name", companyName)
+      .eq("is_active", true);
+    if (otherCompanyDeactivateError) throw otherCompanyDeactivateError;
+
+    if (syncedTypes.size > 0) {
+      const { error: priorSnapshotDeactivateError } = await supabase
+        .from("tally_masters")
+        .update({ is_active: false, last_synced_at: now })
+        .eq("connection_id", connection.id)
+        .eq("company_name", companyName)
+        .in("master_type", Array.from(syncedTypes))
+        .or(`sync_run_id.is.null,sync_run_id.neq.${syncRunId}`)
+        .eq("is_active", true);
+      if (priorSnapshotDeactivateError) throw priorSnapshotDeactivateError;
+    }
+
+    const { error: completionError } = await supabase
+      .from("tally_master_sync_runs")
+      .update({
+        status: "completed",
+        totals,
+        error: null,
+        completed_at: now,
+      })
+      .eq("id", syncRunId)
+      .eq("connection_id", connection.id);
+    if (completionError) throw completionError;
+    syncFailureContext = null;
 
     await supabase.from("tally_connection_events").insert({
       connection_id: connection.id,
@@ -216,17 +227,17 @@ export async function POST(request: Request) {
       supportedTypes: MASTER_TYPES,
     });
   } catch (error) {
+    if (syncFailureContext) {
+      await syncFailureContext.supabase
+        .from("tally_master_sync_runs")
+        .update({
+          status: "failed",
+          error: error instanceof Error ? error.message.slice(0, 1000) : "Master sync failed.",
+          completed_at: new Date().toISOString(),
+        })
+        .eq("id", syncFailureContext.syncRunId);
+    }
     console.error("Error in POST /api/tally/bridge/masters:", error);
-    const message = errorMessage(error);
-    return jsonWithCors(
-      request,
-      {
-        error:
-          process.env.NODE_ENV === "production"
-            ? "Tally master sync failed while saving synced data."
-            : `Tally master sync failed while saving synced data: ${message}`,
-      },
-      { status: 500 }
-    );
+    return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }

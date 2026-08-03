@@ -4,6 +4,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pairBridge, createBridgeRunner, disconnectBridge } from "./src/bridge.mjs";
 
+const CONNECTOR_NAME = "Kalika Tally Connector";
+const PROTOCOL_NAME = "kalika-tally";
+const APP_USER_MODEL_ID = "com.kalika.tally-connector";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const installDir = path.resolve(__dirname, "..", "..");
 const logPath = path.join(installDir, "bridge.log");
@@ -134,7 +138,12 @@ async function startRunner() {
 async function handleConnectUrl(value) {
   try {
     const args = parseConnectUrl(value);
-    if (!args["api-base"] || !args["connection-id"] || !args["pairing-code"] || !args["control-token"]) {
+    if (
+      !args["api-base"] ||
+      !args["connection-id"] ||
+      !args["pairing-code"] ||
+      !args["control-token"]
+    ) {
       throw new Error("Connect link is missing pairing details.");
     }
     showWindow();
@@ -176,6 +185,7 @@ function handleProtocolUrl(value) {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
+    title: CONNECTOR_NAME,
     width: 460,
     height: 260,
     show: true,
@@ -189,6 +199,7 @@ function createWindow() {
 
   mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(`
     <html>
+      <head><title>${CONNECTOR_NAME}</title></head>
       <body style="font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f8f5ef;color:#24140c">
         <div style="padding:24px">
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:18px">
@@ -226,11 +237,14 @@ function createWindow() {
   });
 }
 
+app.setName(CONNECTOR_NAME);
+app.setAppUserModelId(APP_USER_MODEL_ID);
+
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.setAsDefaultProtocolClient("kalika-tally");
+  app.setAsDefaultProtocolClient(PROTOCOL_NAME);
   app.on("second-instance", (_event, argv) => {
     const protocolArg = argv.find((entry) => entry.startsWith("kalika-tally://"));
     if (protocolArg) {

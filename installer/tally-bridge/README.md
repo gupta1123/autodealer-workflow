@@ -10,8 +10,8 @@ The installer is intentionally defensive:
 - installs one clean Electron runtime under `C:\Autodealer\tally-bridge`
 - registers the `kalika-tally://` protocol for Connect links
 - starts the connector after install so the user can see its current status
-- includes the native Tally Debit Note PDF TDL and tries to copy it to the
-  TallyPrime folder for easy one-time activation
+- includes the native Debit Note export and Purchase source-document TDLs and
+  tries to copy both to the TallyPrime folder for easy one-time activation
 
 ## Build
 
@@ -63,16 +63,17 @@ This matters because Electron prefers `resources\app.asar` when it exists. A sta
 3. Open Kalika and click **Connect** from the Tally page.
 4. The connector window should show `Connected to <company name>` once paired and Tally has a company loaded.
 
-### One-time native PDF activation
+### One-time Tally document activation
 
 The installer keeps the canonical TDL at:
 
 ```text
 C:\Autodealer\tally-bridge\tdl\kalika-native-debit-note-export.tdl
+C:\Autodealer\tally-bridge\tdl\kalika-purchase-document-attachment.tdl
 ```
 
 It also attempts to make a convenience copy in the TallyPrime installation
-folder. In TallyPrime, select this TDL once in `F1: Help > TDL & Add-On`, turn
+folder. In TallyPrime, select both TDLs once in `F1: Help > TDL & Add-On`, turn
 on **Load selected TDL files on startup**, and restart TallyPrime. The setup is
 per TallyPrime installation, not per company or Debit Note.
 

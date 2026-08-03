@@ -1,0 +1,93 @@
+import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { requireRequestUser } from "@/lib/api/request-auth";
+import {
+  getPurchaseAccountingSettings,
+  isPurchaseAccountingSettingsSchemaMissing,
+  savePurchaseAccountingSettings,
+  type PurchaseAccountingSettings,
+} from "@/lib/purchase-accounting-settings";
+
+const MIGRATION_FILE =
+  "supabase/migrations/20260731160143_purchase_accounting_settings.sql";
+
+export function OPTIONS(request: Request) {
+  return optionsWithCors(request);
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error ?? "Unknown error");
+}
+
+function schemaMissingResponse(request: Request) {
+  return jsonWithCors(
+    request,
+    {
+      error: `Purchase accounting settings are not installed. Run ${MIGRATION_FILE}.`,
+      migrationRequired: true,
+      migrationFile: MIGRATION_FILE,
+    },
+    { status: 409 }
+  );
+}
+
+function parseSettings(input: unknown): PurchaseAccountingSettings | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const record = input as Record<string, unknown>;
+  const keys = [
+    "purchaseGoodsTdsEnabled",
+    "transporterTdsEnabled",
+    "gstTdsEnabled",
+  ] as const;
+  if (keys.some((key) => typeof record[key] !== "boolean")) return null;
+  return {
+    purchaseGoodsTdsEnabled: record.purchaseGoodsTdsEnabled as boolean,
+    transporterTdsEnabled: record.transporterTdsEnabled as boolean,
+    gstTdsEnabled: record.gstTdsEnabled as boolean,
+  };
+}
+
+export async function GET(request: Request) {
+  try {
+    const user = await requireRequestUser(request);
+    if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
+
+    const settings = await getPurchaseAccountingSettings();
+    return jsonWithCors(request, { settings });
+  } catch (error) {
+    if (isPurchaseAccountingSettingsSchemaMissing(error)) {
+      return schemaMissingResponse(request);
+    }
+    console.error("Error in GET /api/settings/purchase-accounting:", error);
+    return jsonWithCors(request, { error: errorMessage(error) }, { status: 500 });
+  }
+}
+
+export async function PUT(request: Request) {
+  try {
+    const user = await requireRequestUser(request);
+    if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
+
+    const body = await request.json().catch(() => null);
+    const settings = parseSettings(
+      body && typeof body === "object" && !Array.isArray(body)
+        ? (body as Record<string, unknown>).settings
+        : null
+    );
+    if (!settings) {
+      return jsonWithCors(
+        request,
+        { error: "All purchase accounting settings must be true or false." },
+        { status: 400 }
+      );
+    }
+
+    const saved = await savePurchaseAccountingSettings(settings);
+    return jsonWithCors(request, { success: true, settings: saved });
+  } catch (error) {
+    if (isPurchaseAccountingSettingsSchemaMissing(error)) {
+      return schemaMissingResponse(request);
+    }
+    console.error("Error in PUT /api/settings/purchase-accounting:", error);
+    return jsonWithCors(request, { error: errorMessage(error) }, { status: 500 });
+  }
+}

@@ -218,6 +218,7 @@ export async function GET(
       .select("*")
       .eq("connection_id", connection.id)
       .eq("owner_user_id", user.id)
+      .eq("company_name", connection.last_company_name ?? "Unknown company")
       .eq("status", "active");
 
     if (mappingsError) throw mappingsError;

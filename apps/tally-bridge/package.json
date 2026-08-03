@@ -1,6 +1,6 @@
 {
   "name": "@autodealer/tally-bridge",
-  "version": "0.1.32",
+  "version": "0.1.39",
   "private": true,
   "type": "module",
   "exports": {

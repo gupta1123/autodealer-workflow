@@ -7,12 +7,19 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
+  Database,
   Loader2,
+  PlugZap,
+  RefreshCw,
   ShieldAlert,
   X,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
+import {
+  TallyPurchasePostingPanel,
+  type TallyPurchaseHeaderState,
+} from "@/components/cases/TallyPurchasePostingPanel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -27,6 +34,7 @@ import {
 import { isLineItemMismatchField } from "@/lib/line-items";
 import {
   fetchCaseDetail,
+  updateCaseDecision,
   updateCaseMismatchDecisions,
   updateCaseMismatchDecision,
   type MismatchDecision,
@@ -37,6 +45,7 @@ import {
   fetchComparisonGroups,
   type ComparisonFieldGroup,
 } from "@/lib/comparison-groups";
+import { fetchTallyPurchasePosting } from "@/lib/tally-purchase-posting";
 
 type LoadState = "loading" | "ready" | "error";
 type MismatchRecord = SavedCaseDetail["mismatches"][number];
@@ -61,6 +70,18 @@ const LINE_ITEM_FIELD_LABELS: Record<string, string> = {
   "lineItems.amountMismatch": "Line item amount",
 };
 const TERMS_COMPLIANCE_FIELD = "termsAndConditions";
+
+function normalizeCompanyName(value?: string | null) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function normalizeGstin(value?: string | null) {
+  const normalized = String(value ?? "").trim().toUpperCase();
+  return /^\d{2}[A-Z0-9]{13}$/.test(normalized) ? normalized : "";
+}
 
 function getFieldLabel(fieldName: string) {
   if (LINE_ITEM_FIELD_LABELS[fieldName]) {
@@ -628,7 +649,7 @@ function getSingleIssueRows(evidence: MismatchEvidence[], fieldName: string) {
 function MismatchReviewSkeleton() {
   return (
     <div className="flex flex-1 flex-col min-h-0 overflow-hidden lg:flex-row">
-      <aside className="flex shrink-0 flex-col border-b border-slate-200 bg-white lg:w-80 lg:border-b-0 lg:border-r">
+      <aside className="flex shrink-0 flex-col border-b border-slate-200 bg-white lg:w-72 lg:border-b-0 lg:border-r">
         <div className="hidden border-b border-slate-100 p-5 lg:block">
           <div className="mb-4 flex items-center gap-2">
             <Skeleton className="h-4 w-4 rounded bg-slate-100" />
@@ -709,8 +730,11 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
   const [status, setStatus] = useState<LoadState>("loading");
   const [error, setError] = useState<string | null>(null);
   const [activeMismatchId, setActiveMismatchId] = useState<string | null>(null);
+  const [reviewMode, setReviewMode] = useState<"mismatches" | "tally">("mismatches");
   const [decisionStatus, setDecisionStatus] = useState<"idle" | "updating" | "error">("idle");
   const [decisionError, setDecisionError] = useState<string | null>(null);
+  const [tallyHeaderState, setTallyHeaderState] = useState<TallyPurchaseHeaderState | null>(null);
+  const [refreshingTallyHeader, setRefreshingTallyHeader] = useState(false);
   const [selectedMismatchIds, setSelectedMismatchIds] = useState<Set<string>>(() => new Set());
   const [comparisonGroups, setComparisonGroups] = useState<ComparisonFieldGroup[]>(
     () => DEFAULT_COMPARISON_FIELD_GROUPS
@@ -769,6 +793,16 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
       ) ?? [],
     [detail]
   );
+  const hasInvoice = useMemo(
+    () => detail?.documents.some((document) => /invoice/i.test(document.documentType)) ?? false,
+    [detail]
+  );
+
+  useEffect(() => {
+    if (hasInvoice && visibleMismatches.length === 0) {
+      setReviewMode("tally");
+    }
+  }, [hasInvoice, visibleMismatches.length]);
 
   useEffect(() => {
     setActiveMismatchId((current) => {
@@ -948,13 +982,118 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
     }
   }
 
+  async function handleApprovePacketFromTally() {
+    if (!detail || detail.case.status !== "completed") return;
+    if (pendingMismatchCount > 0 || rejectedMismatchCount > 0) {
+      throw new Error("Resolve every packet issue before approving the packet.");
+    }
+
+    const updated = await updateCaseDecision(caseId, "accepted");
+    setDetail((current) =>
+      current
+        ? {
+            ...current,
+            case: {
+              ...current.case,
+              ...updated.case,
+            },
+          }
+        : current
+    );
+  }
+
+  async function refreshTallyHeader() {
+    try {
+      setRefreshingTallyHeader(true);
+      const payload = await fetchTallyPurchasePosting(
+        caseId,
+        tallyHeaderState?.selectedConnectionId
+      );
+      setTallyHeaderState({
+        selectedConnectionId: payload.selectedConnectionId,
+        connection: payload.connection,
+        connectionOptions: payload.connectionOptions,
+        buyerGstin: payload.review?.buyerGstin || payload.source?.buyerGstin || null,
+      });
+    } finally {
+      setRefreshingTallyHeader(false);
+    }
+  }
+
+  const selectedTallyConnection = tallyHeaderState?.connection;
+  const detectedTallyConnection =
+    tallyHeaderState?.connectionOptions.find(
+      (option) =>
+        option.bridgeConnected &&
+        option.tallyReachable &&
+        option.companyLoaded &&
+        !option.heartbeatStale
+    ) ?? tallyHeaderState?.connectionOptions[0];
+  const tallyConnectionReady = Boolean(
+    selectedTallyConnection?.bridgeConnected &&
+    selectedTallyConnection?.tallyReachable &&
+    selectedTallyConnection?.companyLoaded &&
+    !selectedTallyConnection?.heartbeatStale
+  );
+  const kalikaCompanyName = selectedTallyConnection?.companyName || "Not selected";
+  const activeTallyCompanyName =
+    (selectedTallyConnection?.companyLoaded
+      ? selectedTallyConnection.activeCompanyName
+      : null) ||
+    detectedTallyConnection?.companyName ||
+    "Not detected";
+  const tallyCompanyNameMatches = Boolean(
+    tallyConnectionReady &&
+      normalizeCompanyName(kalikaCompanyName) &&
+      normalizeCompanyName(activeTallyCompanyName) &&
+      normalizeCompanyName(kalikaCompanyName) ===
+        normalizeCompanyName(activeTallyCompanyName)
+  );
+  const tallyCompanyContextMismatch = Boolean(
+    tallyConnectionReady && !tallyCompanyNameMatches
+  );
+  const tallyCompanyGstin = normalizeGstin(selectedTallyConnection?.companyGstin);
+  const invoiceBuyerGstin = normalizeGstin(tallyHeaderState?.buyerGstin);
+  const tallyCompanyContextVerified = Boolean(
+    tallyCompanyNameMatches &&
+      tallyCompanyGstin &&
+      invoiceBuyerGstin &&
+      tallyCompanyGstin === invoiceBuyerGstin
+  );
+  const tallyCompanyIdentityMismatch = Boolean(
+    tallyCompanyNameMatches &&
+      tallyCompanyGstin &&
+      invoiceBuyerGstin &&
+      tallyCompanyGstin !== invoiceBuyerGstin
+  );
+  const tallyHeaderTitle = refreshingTallyHeader
+    ? "Checking Tally company"
+    : !tallyHeaderState?.selectedConnectionId
+      ? "Select Tally company"
+      : tallyCompanyContextVerified
+        ? "Tally company verified"
+        : tallyCompanyContextMismatch
+          ? "Switch company in Tally"
+          : tallyCompanyIdentityMismatch
+            ? "Buyer GSTIN does not match Tally"
+            : tallyCompanyNameMatches && !tallyCompanyGstin
+              ? "Company GSTIN missing in Tally"
+              : tallyCompanyNameMatches && !invoiceBuyerGstin
+                ? "Invoice buyer GSTIN missing"
+                : "Tally unavailable";
+  const tallyHeaderToneClass = tallyCompanyContextVerified
+    ? "border-emerald-200 bg-emerald-50/80"
+    : tallyHeaderState?.selectedConnectionId
+      ? "border-amber-300 bg-amber-50"
+      : "border-[#e5ddd0] bg-white";
+
   return (
     <AppShell>
       <div className="flex h-full flex-col bg-slate-50 animate-in fade-in duration-500">
 
         {/* Header */}
-        <header className="sticky top-0 z-10 flex h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 sm:px-6 shadow-sm">
-          <div className="flex min-w-0 items-center gap-3 w-full">
+        <header className="sticky top-0 z-10 flex h-16 shrink-0 items-center justify-between gap-4 border-b border-slate-200 bg-white px-4 shadow-sm sm:px-6">
+          <div className="flex min-w-0 flex-1 items-center gap-3">
             <Link
               href={`/cases/${caseId}`}
               className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900"
@@ -966,11 +1105,11 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
               {status === "loading" ? (
                 <Skeleton className="h-5 w-52 max-w-[55vw] bg-slate-100" />
               ) : (
-                <h1 className="truncate text-lg font-medium tracking-tight text-slate-900">
+                <h1 className="truncate text-sm font-semibold tracking-tight text-slate-900 sm:text-[15px]">
                   {detail?.case.displayName}
                 </h1>
               )}
-              {detail && (
+              {detail && reviewMode !== "tally" && (
                 <div className="hidden items-center gap-2 sm:flex shrink-0">
                   <Badge
                     variant="secondary"
@@ -997,6 +1136,60 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
               )}
             </div>
           </div>
+          {reviewMode === "tally" ? (
+            <div className={`hidden min-w-0 shrink-0 items-center gap-3 rounded-xl border px-3 py-2 shadow-sm transition-colors md:inline-flex ${tallyHeaderToneClass}`}>
+              <div className="flex min-w-0 items-center gap-2">
+                {refreshingTallyHeader ? (
+                  <Loader2 className="h-4 w-4 shrink-0 animate-spin text-slate-500" />
+                ) : tallyCompanyContextVerified ? (
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
+                ) : (
+                  <ShieldAlert className="h-4 w-4 shrink-0 text-amber-700" />
+                )}
+                <div className="min-w-0">
+                  <div className={`text-xs font-bold ${
+                    tallyCompanyContextVerified
+                      ? "text-emerald-950"
+                      : tallyHeaderState?.selectedConnectionId
+                        ? "text-amber-950"
+                        : "text-slate-950"
+                  }`}>{tallyHeaderTitle}</div>
+                  <div
+                    className={`mt-0.5 max-w-[285px] truncate text-[11px] font-semibold ${
+                      tallyCompanyContextVerified
+                        ? "text-emerald-700"
+                        : tallyHeaderState?.selectedConnectionId
+                          ? "text-amber-700"
+                          : "text-slate-400"
+                    }`}
+                    title={`Kalika: ${kalikaCompanyName} - Tally: ${activeTallyCompanyName}`}
+                  >
+                    Kalika: {kalikaCompanyName} - Tally: {activeTallyCompanyName}
+                  </div>
+                </div>
+              </div>
+              <button
+                className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] shadow-sm transition hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-60"
+                disabled={refreshingTallyHeader}
+                onClick={() => void refreshTallyHeader()}
+                type="button"
+              >
+                {refreshingTallyHeader ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5" />
+                )}
+                Refresh
+              </button>
+              <Link
+                className="inline-flex h-8 items-center gap-1.5 rounded-xl bg-[#2d2d2d] px-3.5 text-xs font-bold text-white shadow-sm transition hover:bg-[#1a1a1a]"
+                href="/tally-prime"
+              >
+                <PlugZap className="h-3.5 w-3.5" />
+                {tallyConnectionReady ? "Manage Tally" : "Connect Tally"}
+              </Link>
+            </div>
+          ) : null}
         </header>
 
         {/* Loading State */}
@@ -1022,7 +1215,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
           <div className="flex flex-1 flex-col lg:flex-row min-h-0 overflow-hidden">
 
             {/* Grouped issue navigation */}
-            <aside className="flex shrink-0 flex-col border-b border-slate-200 bg-white lg:w-[340px] lg:border-b-0 lg:border-r">
+            <aside className="flex min-h-0 shrink-0 flex-col border-b border-slate-200 bg-white lg:w-72 lg:border-b-0 lg:border-r">
 
               {/* Desktop Only: Case Meta Summary */}
               <div className="hidden">
@@ -1049,7 +1242,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                 </div>
               </div>
 
-              <div className="flex-1 overflow-hidden bg-white">
+              <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-white">
                 <div className="border-b border-slate-100 px-4 py-3 lg:px-5">
                   <div className="flex items-center justify-between gap-3">
                     <div>
@@ -1067,10 +1260,35 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                   </div>
                 </div>
 
+                {hasInvoice ? (
+                  <div className="border-b border-slate-100 p-3 lg:px-4">
+                    <button
+                      className={`flex w-full items-center gap-3 rounded-lg border px-3 py-3 text-left transition ${
+                        reviewMode === "tally"
+                          ? "border-emerald-200 bg-emerald-50 text-emerald-950"
+                          : "border-slate-200 bg-white text-slate-900 hover:bg-slate-50"
+                      }`}
+                      onClick={() => setReviewMode("tally")}
+                      type="button"
+                    >
+                      <span className={`grid h-8 w-8 place-items-center rounded-md ${
+                        reviewMode === "tally" ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-600"
+                      }`}>
+                        <Database className="h-4 w-4" />
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-sm font-medium">Tally Purchase voucher</span>
+                        <span className="mt-0.5 block text-xs text-slate-500">Separate review and posting approval</span>
+                      </span>
+                      <ChevronDown className={`h-4 w-4 -rotate-90 ${reviewMode === "tally" ? "text-emerald-600" : "text-slate-400"}`} />
+                    </button>
+                  </div>
+                ) : null}
+
                 {visibleMismatches.length === 0 ? (
                   <div className="p-5 text-sm text-slate-500">No conflicting values found.</div>
                 ) : (
-                  <div className="flex h-full gap-2 overflow-x-auto p-3 lg:block lg:space-y-1 lg:overflow-y-auto lg:p-4">
+                  <div className="flex min-h-0 flex-1 gap-2 overflow-x-auto p-3 lg:block lg:space-y-1 lg:overflow-x-hidden lg:overflow-y-auto lg:p-4 lg:pb-20">
                     {mismatchGroups.map((group) => {
                       const isExpanded = expandedGroupKeys.has(group.key);
                       const isActiveGroup = activeGroupKey === group.key;
@@ -1090,7 +1308,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                               }`}
                             />
                             <span className="min-w-0 flex-1">
-                              <span className="block truncate text-sm font-medium text-slate-950">
+                              <span className="block break-words text-sm font-medium leading-5 text-slate-950">
                                 {group.label}
                               </span>
                               <span className="mt-0.5 block text-xs text-slate-500">
@@ -1150,18 +1368,21 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                                     )}
                                     <button
                                       className="min-w-0 flex-1 text-left"
-                                      onClick={() => setActiveMismatchId(mismatch.id)}
+                                      onClick={() => {
+                                        setReviewMode("mismatches");
+                                        setActiveMismatchId(mismatch.id);
+                                      }}
                                       type="button"
                                     >
                                       {itemLabel ? (
-                                        <span className="block truncate text-xs text-slate-500">
+                                        <span className="block break-words text-xs leading-4 text-slate-500">
                                           {itemLabel}
                                         </span>
                                       ) : null}
-                                      <span className="block truncate text-sm font-medium text-slate-900">
+                                      <span className="block break-words text-sm font-medium leading-5 text-slate-900">
                                         {issueLabel}
                                       </span>
-                                      <span className="block truncate text-xs text-slate-500">
+                                      <span className="block break-words text-xs leading-4 text-slate-500">
                                         {issueDetail}
                                       </span>
                                     </button>
@@ -1181,6 +1402,19 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
             {/* Main Detail Content */}
             <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
               <div className="flex-1 overflow-y-auto">
+                {reviewMode === "tally" ? (
+                  <TallyPurchasePostingPanel
+                    caseId={caseId}
+                    onApprovePacket={
+                      detail.case.status === "completed" &&
+                      pendingMismatchCount === 0 &&
+                      rejectedMismatchCount === 0
+                        ? handleApprovePacketFromTally
+                        : undefined
+                    }
+                    onHeaderStateChange={setTallyHeaderState}
+                  />
+                ) : (
                 <div className="mx-auto max-w-4xl p-3 sm:p-4 lg:p-5">
                   {visibleMismatches.length === 0 ? (
                     <div className="flex flex-col items-center justify-center rounded-2xl bg-white border border-slate-200 p-12 text-center shadow-sm mt-8">
@@ -1404,9 +1638,10 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                     </div>
                   )}
                 </div>
+                )}
               </div>
 
-              {visibleMismatches.length > 0 && activeMismatch && (
+              {reviewMode === "mismatches" && visibleMismatches.length > 0 && activeMismatch && (
                 <footer className="z-20 shrink-0 border-t border-slate-200 bg-white/95 px-4 py-3 shadow-[0_-8px_24px_rgba(15,23,42,0.08)] backdrop-blur sm:px-6 lg:px-8">
                   <div className="mx-auto flex max-w-5xl flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <div className="min-w-0">

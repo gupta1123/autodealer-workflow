@@ -1,9 +1,10 @@
 /** @type {import('next').NextConfig} */
-const path = require("node:path");
-
 const nextConfig = {
+  // Keep production builds separate from the cache used by `next dev`.
+  // Running a build while the local API is open must not corrupt the dev server.
+  distDir: process.env.NODE_ENV === "production" ? ".next-build" : ".next",
   turbopack: {
-    root: path.join(__dirname, "../.."),
+    root: `${process.cwd()}/../..`,
   },
 };
 

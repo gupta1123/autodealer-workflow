@@ -16,9 +16,6 @@ import {
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 export const runtime = "nodejs";
-const BANK_STATEMENT_CONFIRM_QUERY_BATCH_SIZE = 500;
-const BANK_STATEMENT_CONFIRM_INSERT_BATCH_SIZE = 300;
-const BANK_STATEMENT_CONFIRM_UPDATE_BATCH_SIZE = 50;
 
 type ConfirmPayload = {
   accountId?: string | null;
@@ -105,14 +102,6 @@ function readRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
-}
-
-function chunkArray<T>(values: T[], size: number) {
-  const chunks: T[][] = [];
-  for (let index = 0; index < values.length; index += size) {
-    chunks.push(values.slice(index, index + size));
-  }
-  return chunks;
 }
 
 function getEffectiveImportStatus(row: Record<string, unknown>) {
@@ -569,61 +558,54 @@ export async function POST(
         },
       }));
 
-      for (const postedLogBatch of chunkArray(postedLogRows, BANK_STATEMENT_CONFIRM_INSERT_BATCH_SIZE)) {
-        const { error: postedLogError } = await supabase
-          .from("bank_transaction_posting_log")
-          .upsert(postedLogBatch, {
-            onConflict: "owner_user_id,bank_account_id,fingerprint",
-          });
+      const { error: postedLogError } = await supabase
+        .from("bank_transaction_posting_log")
+        .upsert(postedLogRows, {
+          onConflict: "owner_user_id,bank_account_id,fingerprint",
+        });
 
-        if (postedLogError) throw postedLogError;
-      }
+      if (postedLogError) throw postedLogError;
     }
 
     const submittedFingerprints = rows.map((row) => row.fingerprint);
     if (reconcileAgainstLiveTally && submittedFingerprints.length > 0) {
-      for (const fingerprintBatch of chunkArray(submittedFingerprints, BANK_STATEMENT_CONFIRM_QUERY_BATCH_SIZE)) {
-        const { error: stalePostingLogError } = await supabase
+      const { error: stalePostingLogError } = await supabase
+        .from("bank_transaction_posting_log")
+        .delete()
+        .eq("owner_user_id", user.id)
+        .eq("bank_account_id", accountId)
+        .in("fingerprint", submittedFingerprints);
+      if (stalePostingLogError) throw stalePostingLogError;
+    }
+    const { data: postedLogData, error: postedLogReadError } = submittedFingerprints.length
+      ? await supabase
           .from("bank_transaction_posting_log")
-          .delete()
+          .select("fingerprint, tally_voucher_id, tally_posted_at")
           .eq("owner_user_id", user.id)
           .eq("bank_account_id", accountId)
-          .in("fingerprint", fingerprintBatch);
-        if (stalePostingLogError) throw stalePostingLogError;
-      }
-    }
-    const postedLogData: PostedLogRow[] = [];
-    const existingTransactionData: ExistingTransactionRow[] = [];
+          .eq("status", "posted")
+          .in("fingerprint", submittedFingerprints)
+      : { data: [], error: null };
 
-    for (const fingerprintBatch of chunkArray(submittedFingerprints, BANK_STATEMENT_CONFIRM_QUERY_BATCH_SIZE)) {
-      const { data: postedLogBatch, error: postedLogReadError } = await supabase
-        .from("bank_transaction_posting_log")
-        .select("fingerprint, tally_voucher_id, tally_posted_at")
-        .eq("owner_user_id", user.id)
-        .eq("bank_account_id", accountId)
-        .eq("status", "posted")
-        .in("fingerprint", fingerprintBatch);
+    if (postedLogReadError) throw postedLogReadError;
 
-      if (postedLogReadError) throw postedLogReadError;
-      postedLogData.push(...((postedLogBatch ?? []) as unknown as PostedLogRow[]));
+    const { data: existingTransactionData, error: existingTransactionReadError } = submittedFingerprints.length
+      ? await supabase
+          .from("bank_transactions")
+          .select("id, fingerprint, statement_import_id, tally_status")
+          .eq("owner_user_id", user.id)
+          .eq("bank_account_id", accountId)
+          .in("fingerprint", submittedFingerprints)
+      : { data: [], error: null };
 
-      const { data: existingTransactionBatch, error: existingTransactionReadError } = await supabase
-        .from("bank_transactions")
-        .select("id, fingerprint, statement_import_id, tally_status")
-        .eq("owner_user_id", user.id)
-        .eq("bank_account_id", accountId)
-        .in("fingerprint", fingerprintBatch);
-
-      if (existingTransactionReadError) throw existingTransactionReadError;
-      existingTransactionData.push(...((existingTransactionBatch ?? []) as ExistingTransactionRow[]));
-    }
+    if (existingTransactionReadError) throw existingTransactionReadError;
 
     const existingFingerprints = new Set(
-      existingTransactionData.flatMap((row) =>
+      ((existingTransactionData ?? []) as ExistingTransactionRow[]).flatMap((row) =>
         row.fingerprint ? [row.fingerprint] : []
       )
     );
-    const existingQueueableRows = existingTransactionData.filter(
+    const existingQueueableRows = ((existingTransactionData ?? []) as ExistingTransactionRow[]).filter(
       (row) =>
         row.id &&
         row.fingerprint &&
@@ -632,7 +614,7 @@ export async function POST(
     );
     const submittedRowsByFingerprint = new Map(rows.map((row) => [row.fingerprint, row]));
     const postedByFingerprint = new Map(
-      postedLogData.map((row) => [row.fingerprint, row])
+      ((postedLogData ?? []) as unknown as PostedLogRow[]).map((row) => [row.fingerprint, row])
     );
     const snapshotRows = rowsAfterCheckpoint.flatMap((row) => {
       if (existingFingerprints.has(row.fingerprint)) return [];
@@ -677,42 +659,38 @@ export async function POST(
     }));
 
     if (rowsToInsert.length > 0) {
-      for (const insertBatch of chunkArray(rowsToInsert, BANK_STATEMENT_CONFIRM_INSERT_BATCH_SIZE)) {
-        const { error: insertError } = await supabase.from("bank_transactions").insert(insertBatch);
-        if (insertError) throw insertError;
-      }
+      const { error: insertError } = await supabase.from("bank_transactions").insert(rowsToInsert);
+      if (insertError) throw insertError;
     }
 
     if (existingQueueableRows.length > 0) {
-      for (const updateBatch of chunkArray(existingQueueableRows, BANK_STATEMENT_CONFIRM_UPDATE_BATCH_SIZE)) {
-        const updateResults = await Promise.all(
-          updateBatch.map((existingRow) => {
-            const matchingRow = existingRow.fingerprint ? submittedRowsByFingerprint.get(existingRow.fingerprint) : null;
+      const updateResults = await Promise.all(
+        existingQueueableRows.map((existingRow) => {
+          const matchingRow = existingRow.fingerprint ? submittedRowsByFingerprint.get(existingRow.fingerprint) : null;
 
-            return supabase
-              .from("bank_transactions")
-              .update({
-                statement_import_id: id,
-                suggested_ledger_name: matchingRow?.suggested_ledger_name ?? null,
-                suggestion_confidence: matchingRow?.suggestion_confidence ?? null,
-                suggestion_reason: matchingRow?.suggestion_reason ?? null,
-                confirmed_ledger_name: matchingRow?.confirmed_ledger_name ?? null,
-                ledger_mapping_source: matchingRow?.ledger_mapping_source ?? null,
-                ...(reconcileAgainstLiveTally
-                  ? {
-                      tally_status: "pending",
-                      tally_voucher_id: null,
-                      tally_posted_at: null,
-                    }
-                  : {}),
-              })
-              .eq("id", existingRow.id)
-              .eq("owner_user_id", user.id);
-          })
-        );
-        const updateError = updateResults.find((result) => result.error)?.error;
-        if (updateError) throw updateError;
-      }
+          return supabase
+            .from("bank_transactions")
+            .update({
+              statement_import_id: id,
+              suggested_ledger_name: matchingRow?.suggested_ledger_name ?? null,
+              suggestion_confidence: matchingRow?.suggestion_confidence ?? null,
+              suggestion_reason: matchingRow?.suggestion_reason ?? null,
+              confirmed_ledger_name: matchingRow?.confirmed_ledger_name ?? null,
+              ledger_mapping_source: matchingRow?.ledger_mapping_source ?? null,
+              ...(reconcileAgainstLiveTally
+                ? {
+                    tally_status: "pending",
+                    tally_voucher_id: null,
+                    tally_posted_at: null,
+                  }
+                : {}),
+            })
+            .eq("id", existingRow.id)
+            .eq("owner_user_id", user.id);
+        })
+      );
+      const updateError = updateResults.find((result) => result.error)?.error;
+      if (updateError) throw updateError;
     }
 
     const latestAcceptedRow = latestTransactionRow(rowsAfterCheckpoint);

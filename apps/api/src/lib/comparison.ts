@@ -459,8 +459,22 @@ export function getComparableFieldValue(doc: ComparableDoc, fieldKey: FieldKey) 
       return PAYMENT_EVIDENCE_DOC_TYPES.has(doc.type)
         ? doc.fields.referenceInvoiceNumber ?? doc.fields.invoiceNumber
         : doc.fields.invoiceNumber ?? doc.fields.referenceInvoiceNumber;
-    case "totalAmount":
+    case "totalAmount": {
+      if (
+        doc.type === "E-Way Bill" &&
+        doc.fields.totalAmount &&
+        (doc.fields.totalTaxableAmount || doc.fields.subtotal) &&
+        areComparableValuesEqual(
+          doc.fields.totalAmount,
+          doc.fields.totalTaxableAmount ?? doc.fields.subtotal,
+          DEFAULT_COMPARISON_OPTIONS,
+          "totalAmount"
+        )
+      ) {
+        return undefined;
+      }
       return doc.fields.totalAmount;
+    }
     case "vehicleNumber":
       return VEHICLE_REGISTRATION_DOC_TYPES.has(doc.type)
         ? doc.fields.registrationNumber ?? doc.fields.vehicleNumber
@@ -479,7 +493,9 @@ export function getComparableFieldValue(doc: ComparableDoc, fieldKey: FieldKey) 
 }
 
 export function getCommercialAmountValue(doc: ComparableDoc) {
-  return PAYMENT_EVIDENCE_DOC_TYPES.has(doc.type) ? undefined : doc.fields.totalAmount;
+  return PAYMENT_EVIDENCE_DOC_TYPES.has(doc.type)
+    ? undefined
+    : getComparableFieldValue(doc, "totalAmount");
 }
 
 export function getPaymentEvidenceAmountValue(doc: ComparableDoc) {

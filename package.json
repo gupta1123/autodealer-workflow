@@ -19,6 +19,7 @@
     "dist:tally-desktop": "npm run dist --workspace @autodealer/tally-desktop",
     "build:connector": "node scripts/build-unified-connector.mjs",
     "installer:tally-bridge": "node scripts/build-tally-connector-installer.mjs",
+    "installer:tally-bridge:validate": "node scripts/build-tally-connector-installer.mjs --validate",
     "heroku-postbuild": "npm run build:api",
     "build": "npm run build:web && npm run build:api",
     "lint:web": "npm run lint --workspace @autodealer/web",
@@ -27,6 +28,9 @@
     "typecheck:web": "npm run typecheck --workspace @autodealer/web",
     "typecheck:api": "npm run typecheck --workspace @autodealer/api",
     "typecheck": "npm run typecheck:web && npm run typecheck:api",
+    "test:cash-discount": "node --test --experimental-strip-types apps/api/src/lib/cash-discount-narration.test.mjs",
+    "test:tally-bridge": "node --test apps/tally-bridge/src/bridge.test.mjs",
+    "test:purchase-posting": "node --test apps/api/src/lib/tally/purchase-posting.test.mjs",
     "quality:packet-regressions": "node scripts/packet-quality-regressions.mjs",
     "worker": "npm run worker --workspace @autodealer/api",
     "worker:local": "npm run worker:local --workspace @autodealer/api"

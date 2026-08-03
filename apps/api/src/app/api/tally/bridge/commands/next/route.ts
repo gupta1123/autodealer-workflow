@@ -72,7 +72,7 @@ export async function GET(request: Request) {
 
     const now = new Date().toISOString();
     const staleClaimedBefore = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-    const { error: exhaustedClaimError } = await supabase
+    const { data: exhaustedCommands, error: exhaustedClaimError } = await supabase
       .from("tally_bridge_commands")
       .update({
         status: "failed",
@@ -82,11 +82,33 @@ export async function GET(request: Request) {
       .eq("connection_id", connection.id)
       .eq("status", "claimed")
       .lt("claimed_at", staleClaimedBefore)
-      .gte("attempts", 3);
+      .gte("attempts", 3)
+      .select("id, command_type");
 
     if (exhaustedClaimError) throw exhaustedClaimError;
+    const exhaustedIds = (exhaustedCommands ?? [])
+      .filter((command) => command.command_type === "create_purchase_voucher")
+      .map((command) => command.id);
+    if (exhaustedIds.length > 0) {
+      const [postingCleanup, commandCleanup] = await Promise.all([
+        supabase
+          .from("purchase_invoice_tally_postings")
+          .update({
+            status: "failed",
+            last_error: "Tally bridge did not report a result before the retry limit.",
+          })
+          .in("command_id", exhaustedIds)
+          .in("status", ["queued", "creating"]),
+        supabase
+          .from("tally_bridge_commands")
+          .update({ payload: {}, result: {} })
+          .in("id", exhaustedIds),
+      ]);
+      if (postingCleanup.error) throw postingCleanup.error;
+      if (commandCleanup.error) throw commandCleanup.error;
+    }
 
-    const { error: staleClaimError } = await supabase
+    const { data: requeuedCommands, error: staleClaimError } = await supabase
       .from("tally_bridge_commands")
       .update({
         status: "queued",
@@ -96,9 +118,20 @@ export async function GET(request: Request) {
       .eq("connection_id", connection.id)
       .eq("status", "claimed")
       .lt("claimed_at", staleClaimedBefore)
-      .lt("attempts", 3);
+      .lt("attempts", 3)
+      .select("id, command_type");
 
     if (staleClaimError) throw staleClaimError;
+    const requeuedIds = (requeuedCommands ?? [])
+      .filter((command) => command.command_type === "create_purchase_voucher")
+      .map((command) => command.id);
+    if (requeuedIds.length > 0) {
+      await supabase
+        .from("purchase_invoice_tally_postings")
+        .update({ status: "queued", last_error: null })
+        .in("command_id", requeuedIds)
+        .eq("status", "creating");
+    }
 
     const { data: commandData, error: commandError } = await supabase
       .from("tally_bridge_commands")
@@ -134,6 +167,14 @@ export async function GET(request: Request) {
     if (claimError) throw claimError;
     if (!claimedData) {
       return jsonWithCors(request, { command: null });
+    }
+
+    if ((claimedData as TallyBridgeCommandRow).command_type === "create_purchase_voucher") {
+      await supabase
+        .from("purchase_invoice_tally_postings")
+        .update({ status: "creating", last_error: null })
+        .eq("command_id", (claimedData as TallyBridgeCommandRow).id)
+        .in("status", ["approved", "queued", "creating"]);
     }
 
     return jsonWithCors(request, {

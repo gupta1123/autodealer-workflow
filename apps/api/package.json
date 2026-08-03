@@ -7,13 +7,13 @@
     "npm": "11.x"
   },
   "scripts": {
-    "dev": "next dev --turbopack --port 3001",
+    "dev": "node --use-system-ca ../../node_modules/next/dist/bin/next dev --turbopack --port 3001",
     "build": "next build --turbopack",
-    "start": "next start",
+    "start": "node --use-system-ca ../../node_modules/next/dist/bin/next start",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "worker": "node ./worker/process-packet-jobs.mjs",
-    "worker:local": "node --env-file=.env.local --env-file=.env.development.local ./worker/process-packet-jobs.mjs"
+    "worker": "node --use-system-ca ./worker/process-packet-jobs.mjs",
+    "worker:local": "node --use-system-ca --env-file=.env.local --env-file=.env.development.local ./worker/process-packet-jobs.mjs"
   },
   "devDependencies": {
     "@types/node": "20.17.6",

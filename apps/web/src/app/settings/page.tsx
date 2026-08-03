@@ -28,7 +28,7 @@ import {
 } from "@/lib/document-schema";
 import type { DocType, FieldKey } from "@/types/pipeline";
 
-type ActiveTab = "documents" | "groups";
+type ActiveTab = "documents" | "groups" | "accounting";
 type BannerState = {
   tone: "success" | "error";
   text: string;
@@ -40,8 +40,25 @@ type SettingsResponse = {
   error?: string;
 };
 
+type PurchaseAccountingSettings = {
+  purchaseGoodsTdsEnabled: boolean;
+  transporterTdsEnabled: boolean;
+  gstTdsEnabled: boolean;
+};
+
+type PurchaseAccountingResponse = {
+  settings?: PurchaseAccountingSettings;
+  error?: string;
+};
+
 type DocTypeEnabledState = Record<string, boolean>;
 type FieldEnabledState = Record<string, Record<string, boolean>>;
+
+const DEFAULT_PURCHASE_ACCOUNTING_SETTINGS: PurchaseAccountingSettings = {
+  purchaseGoodsTdsEnabled: false,
+  transporterTdsEnabled: false,
+  gstTdsEnabled: false,
+};
 
 const AVAILABLE_DOC_TYPES = (Object.keys(DOC_TYPE_EXTRACTION_FIELDS) as DocType[]).filter(
   (docType) => docType !== "Unknown"
@@ -128,6 +145,10 @@ function serializeComparisonGroups(groups: ComparisonFieldGroup[]) {
   );
 }
 
+function serializePurchaseAccountingSettings(settings: PurchaseAccountingSettings) {
+  return JSON.stringify(settings);
+}
+
 const AVAILABLE_GROUP_FIELDS = FIELD_DEFINITIONS.filter(
   (field) => !HIDDEN_SETTING_FIELD_KEYS.has(field.key)
 );
@@ -190,6 +211,8 @@ export default function SettingsPage() {
   const [comparisonGroups, setComparisonGroups] = useState<ComparisonFieldGroup[]>(() =>
     DEFAULT_COMPARISON_FIELD_GROUPS
   );
+  const [purchaseAccountingSettings, setPurchaseAccountingSettings] =
+    useState<PurchaseAccountingSettings>(DEFAULT_PURCHASE_ACCOUNTING_SETTINGS);
   const [selectedGroupKey, setSelectedGroupKey] = useState(
     DEFAULT_COMPARISON_FIELD_GROUPS[0]?.groupKey ?? ""
   );
@@ -208,12 +231,16 @@ export default function SettingsPage() {
         setLoading(true);
         setBanner(null);
 
-        const [response, loadedGroups] = await Promise.all([
+        const [response, loadedGroups, accountingResponse] = await Promise.all([
           apiFetch("/api/settings/field", {
             method: "GET",
             cache: "no-store",
           }),
           fetchComparisonGroups(),
+          apiFetch("/api/settings/purchase-accounting", {
+            method: "GET",
+            cache: "no-store",
+          }),
         ]);
 
         if (!response.ok) {
@@ -222,6 +249,15 @@ export default function SettingsPage() {
 
         const payload = (await response.json()) as SettingsResponse;
         const hydratedState = buildStateFromPayload(payload);
+        let loadedAccountingSettings = DEFAULT_PURCHASE_ACCOUNTING_SETTINGS;
+        let accountingLoadError: string | null = null;
+        if (accountingResponse.ok) {
+          const accountingPayload = (await accountingResponse.json()) as PurchaseAccountingResponse;
+          loadedAccountingSettings =
+            accountingPayload.settings ?? DEFAULT_PURCHASE_ACCOUNTING_SETTINGS;
+        } else {
+          accountingLoadError = await getResponseError(accountingResponse);
+        }
 
         if (cancelled) {
           return;
@@ -230,10 +266,17 @@ export default function SettingsPage() {
         setDocTypeEnabled(hydratedState.docTypeEnabled);
         setFieldEnabled(hydratedState.fieldEnabled);
         setComparisonGroups(loadedGroups);
+        setPurchaseAccountingSettings(loadedAccountingSettings);
         setSelectedGroupKey(loadedGroups[0]?.groupKey ?? "");
         setSavedSignature(
-          `${serializeSettings(hydratedState.docTypeEnabled, hydratedState.fieldEnabled)}:${serializeComparisonGroups(loadedGroups)}`
+          `${serializeSettings(hydratedState.docTypeEnabled, hydratedState.fieldEnabled)}:${serializeComparisonGroups(loadedGroups)}:${serializePurchaseAccountingSettings(loadedAccountingSettings)}`
         );
+        if (accountingLoadError) {
+          setBanner({
+            tone: "error",
+            text: `${accountingLoadError}. Purchase accounting rules are shown with safe defaults.`,
+          });
+        }
       } catch (error) {
         const fallbackDocTypeState = createDefaultDocTypeState();
         const fallbackFieldState = createDefaultFieldState();
@@ -246,9 +289,10 @@ export default function SettingsPage() {
         setDocTypeEnabled(fallbackDocTypeState);
         setFieldEnabled(fallbackFieldState);
         setComparisonGroups(fallbackGroups);
+        setPurchaseAccountingSettings(DEFAULT_PURCHASE_ACCOUNTING_SETTINGS);
         setSelectedGroupKey(fallbackGroups[0]?.groupKey ?? "");
         setSavedSignature(
-          `${serializeSettings(fallbackDocTypeState, fallbackFieldState)}:${serializeComparisonGroups(fallbackGroups)}`
+          `${serializeSettings(fallbackDocTypeState, fallbackFieldState)}:${serializeComparisonGroups(fallbackGroups)}:${serializePurchaseAccountingSettings(DEFAULT_PURCHASE_ACCOUNTING_SETTINGS)}`
         );
         setBanner({
           tone: "error",
@@ -271,7 +315,7 @@ export default function SettingsPage() {
     };
   }, []);
 
-  const currentSignature = `${serializeSettings(docTypeEnabled, fieldEnabled)}:${serializeComparisonGroups(comparisonGroups)}`;
+  const currentSignature = `${serializeSettings(docTypeEnabled, fieldEnabled)}:${serializeComparisonGroups(comparisonGroups)}:${serializePurchaseAccountingSettings(purchaseAccountingSettings)}`;
   const hasUnsavedChanges = savedSignature !== currentSignature;
 
   const selectedDocTypeEnabled = docTypeEnabled[selectedDocType] ?? true;
@@ -349,8 +393,22 @@ export default function SettingsPage() {
     }));
   }
 
+  function handleTogglePurchaseAccountingRule(
+    key: keyof PurchaseAccountingSettings
+  ) {
+    setBanner(null);
+    setPurchaseAccountingSettings((current) => ({
+      ...current,
+      [key]: !current[key],
+    }));
+  }
+
   function handleResetDefaults() {
     setBanner(null);
+    if (activeTab === "accounting") {
+      setPurchaseAccountingSettings(DEFAULT_PURCHASE_ACCOUNTING_SETTINGS);
+      return;
+    }
     if (activeTab === "groups") {
       setComparisonGroups(DEFAULT_COMPARISON_FIELD_GROUPS);
       setSelectedGroupKey(DEFAULT_COMPARISON_FIELD_GROUPS[0]?.groupKey ?? "");
@@ -442,7 +500,7 @@ export default function SettingsPage() {
         }))
       );
 
-      const [docTypeResponse, fieldResponse, groupResponse] = await Promise.all([
+      const [docTypeResponse, fieldResponse, groupResponse, accountingResponse] = await Promise.all([
         apiFetch("/api/settings/doctype", {
           method: "POST",
           headers: {
@@ -463,6 +521,13 @@ export default function SettingsPage() {
             sortOrder: (index + 1) * 10,
           }))
         ),
+        apiFetch("/api/settings/purchase-accounting", {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ settings: purchaseAccountingSettings }),
+        }),
       ]);
 
       if (!docTypeResponse.ok) {
@@ -476,6 +541,14 @@ export default function SettingsPage() {
       if (!groupResponse.success) {
         throw new Error("Failed to save comparison groups.");
       }
+
+      if (!accountingResponse.ok) {
+        throw new Error(await getResponseError(accountingResponse));
+      }
+
+      const accountingPayload = (await accountingResponse.json()) as PurchaseAccountingResponse;
+      const savedAccountingSettings =
+        accountingPayload.settings ?? purchaseAccountingSettings;
 
       setPacketFieldConfiguration(
         buildPacketFieldConfiguration({
@@ -493,11 +566,12 @@ export default function SettingsPage() {
 
       const savedGroups = sanitizeComparisonGroups(groupResponse.groups);
       setComparisonGroups(savedGroups);
-      const nextSignature = `${serializeSettings(docTypeEnabled, fieldEnabled)}:${serializeComparisonGroups(savedGroups)}`;
+      setPurchaseAccountingSettings(savedAccountingSettings);
+      const nextSignature = `${serializeSettings(docTypeEnabled, fieldEnabled)}:${serializeComparisonGroups(savedGroups)}:${serializePurchaseAccountingSettings(savedAccountingSettings)}`;
       setSavedSignature(nextSignature);
       setBanner({
         tone: "success",
-        text: "Settings saved. New checks will follow field settings, and mismatch pages will use the saved groups.",
+        text: "Settings saved. New reviews will use these document, comparison, and purchase accounting rules.",
       });
     } catch (error) {
       setBanner({
@@ -612,6 +686,17 @@ export default function SettingsPage() {
               type="button"
             >
               Review groups
+            </button>
+            <button
+              className={`rounded-[7px] px-4 py-2 text-sm font-medium transition ${
+                activeTab === "accounting"
+                  ? "bg-white text-[#20201c] shadow-sm"
+                  : "text-[#6b6a60] hover:text-[#20201c]"
+              }`}
+              onClick={() => setActiveTab("accounting")}
+              type="button"
+            >
+              Purchase accounting
             </button>
           </div>
 
@@ -855,7 +940,7 @@ export default function SettingsPage() {
                     )}
                   </main>
                 </>
-              ) : (
+              ) : activeTab === "groups" ? (
                 <>
                   <aside className="w-full shrink-0 md:w-[270px]">
                     <div className="max-h-[calc(100vh-260px)] space-y-2 overflow-y-auto pr-1">
@@ -1070,6 +1155,66 @@ export default function SettingsPage() {
                     )}
                   </main>
                 </>
+              ) : (
+                <main className="w-full">
+                  <section className="rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5">
+                    <div className="max-w-3xl">
+                      <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#8a7f72]">
+                        Purchase voucher deductions
+                      </p>
+                      <h2 className="mt-1 text-lg font-medium tracking-tight text-[#20201c]">
+                        Choose which deductions Kalika should handle
+                      </h2>
+                      <p className="mt-1 text-[13px] leading-5 text-[#6b6a60]">
+                        Leave a rule off when your business does not use it. When enabled, Kalika uses only the amount shown on the invoice and requires the matching Tally ledger before posting.
+                      </p>
+                    </div>
+
+                    <div className="mt-4 divide-y divide-[#e8e5de] rounded-lg border border-[#e8e5de]">
+                      {[
+                        {
+                          key: "purchaseGoodsTdsEnabled" as const,
+                          label: "Purchase TDS on goods",
+                          description: "Subtracts the confirmed purchase TDS from the supplier payable and posts it to the purchase TDS ledger in Tally. Enable only when purchase TDS applies to this business.",
+                        },
+                        {
+                          key: "transporterTdsEnabled" as const,
+                          label: "Transporter TDS",
+                          description: "Subtracts the confirmed transporter TDS and posts it to the transporter TDS ledger. Freight itself is included only when it appears on the invoice.",
+                        },
+                        {
+                          key: "gstTdsEnabled" as const,
+                          label: "GST TDS",
+                          description: "Posts confirmed CGST/SGST or IGST TDS as separate deductions in Tally. Enable only if this business is a notified GST deductor.",
+                        },
+                      ].map((rule) => {
+                        const enabled = purchaseAccountingSettings[rule.key];
+                        return (
+                          <button
+                            aria-pressed={enabled}
+                            className={`flex w-full items-center justify-between gap-5 px-4 py-3.5 text-left transition ${
+                              enabled ? "bg-[#f7fbf7]" : "hover:bg-[#faf9f6]"
+                            }`}
+                            key={rule.key}
+                            onClick={() => handleTogglePurchaseAccountingRule(rule.key)}
+                            type="button"
+                          >
+                            <span className="min-w-0">
+                              <span className="block text-[13px] font-medium text-[#20201c]">{rule.label}</span>
+                              <span className="mt-0.5 block text-[12px] leading-5 text-[#6b6a60]">{rule.description}</span>
+                            </span>
+                            <span className="flex shrink-0 items-center gap-2">
+                              <span className={`text-[11px] font-medium ${enabled ? "text-[#3d6b4a]" : "text-[#9b8f82]"}`}>
+                                {enabled ? "On" : "Off"}
+                              </span>
+                              <SwitchControl checked={enabled} />
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                </main>
               )}
             </div>
           </div>

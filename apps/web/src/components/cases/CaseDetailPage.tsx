@@ -1061,6 +1061,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       ) ?? [],
     [detail]
   );
+  const canonicalInvoiceCount = displayDocuments.filter(isInvoiceDocument).length;
   const pendingMismatchCount = visibleMismatches.filter(
     (mismatch) => mismatch.resolutionStatus === "pending"
   ).length;
@@ -1126,8 +1127,15 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
         buttonLabel:
           visibleMismatches.length > 0
             ? `View ${visibleMismatches.length} Reviewed Issue${visibleMismatches.length === 1 ? "" : "s"}`
-            : null,
-        action: visibleMismatches.length > 0 ? "review" as const : null,
+            : canonicalInvoiceCount === 1
+              ? "Prepare Tally Purchase Voucher"
+              : null,
+        action:
+          visibleMismatches.length > 0
+            ? "review" as const
+            : canonicalInvoiceCount === 1
+              ? "tally" as const
+              : null,
         badgeLabel: "Accepted",
         showConfidence: false,
         showBadge: false,
@@ -1213,7 +1221,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       showBadge: false,
       facts,
     };
-  }, [detail, pendingMismatchCount, rejectedMismatchCount, visibleMismatches.length]);
+  }, [canonicalInvoiceCount, detail, pendingMismatchCount, rejectedMismatchCount, visibleMismatches.length]);
 
   const activeDocumentEntries = useMemo(() => {
     if (!activeDocument) return [];
@@ -2046,6 +2054,18 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                         </Button>
                       )}
 
+                      {reviewSummary.buttonLabel && reviewSummary.action === "tally" && (
+                        <Button
+                          asChild
+                          className="mt-4 h-10 w-full bg-slate-900 font-medium text-white shadow-sm hover:bg-slate-800"
+                        >
+                          <Link href={`/cases/${caseId}/mismatches`}>
+                            <Database className="mr-2 h-4 w-4" />
+                            {reviewSummary.buttonLabel}
+                          </Link>
+                        </Button>
+                      )}
+
                       {reviewSummary.buttonLabel && reviewSummary.action === "approve" && showActions && (
                         <Button
                           className="mt-4 h-10 w-full bg-emerald-600 font-medium text-white shadow-sm hover:bg-emerald-700"
@@ -2060,6 +2080,21 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                           {reviewSummary.buttonLabel}
                         </Button>
                       )}
+
+                      {canonicalInvoiceCount === 1 &&
+                        reviewSummary.action === "approve" &&
+                        showActions && (
+                          <Button
+                            asChild
+                            variant="outline"
+                            className="mt-2 h-10 w-full border-emerald-200 bg-white font-medium text-slate-800 shadow-sm hover:bg-emerald-50 hover:text-emerald-950"
+                          >
+                            <Link href={`/cases/${caseId}/mismatches`}>
+                              <Database className="mr-2 h-4 w-4 text-emerald-700" />
+                              Prepare Tally voucher
+                            </Link>
+                          </Button>
+                        )}
 
                       {reviewSummary.buttonLabel && reviewSummary.action === "retry" && (
                         <Button
@@ -2585,6 +2620,18 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
             className="fixed left-0 right-0 z-[90] flex items-center gap-3 border-t border-slate-200 bg-white p-3 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] md:hidden"
             style={{ bottom: "calc(5.25rem + env(safe-area-inset-bottom))" }}
           >
+            {canonicalInvoiceCount === 1 && (
+              <Button
+                asChild
+                variant="outline"
+                className="flex-1 rounded-xl border-emerald-200 bg-emerald-50 text-emerald-800 shadow-sm h-12 font-medium hover:bg-emerald-100 hover:text-emerald-900"
+              >
+                <Link href={`/cases/${caseId}/mismatches`}>
+                  <Database className="mr-2 h-5 w-5" />
+                  Tally
+                </Link>
+              </Button>
+            )}
             <Button
               variant="outline"
               className="flex-1 rounded-xl text-rose-600 hover:bg-rose-50 hover:text-rose-700 border-slate-200 shadow-sm h-12 font-medium"

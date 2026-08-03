@@ -1,29 +1,74 @@
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+
+const connector = {
+  brandName: "Kalika",
+  connectorName: "Kalika Tally Connector",
+  executableName: "Kalika Tally Connector.exe",
+  setupName: "KalikaTallyConnectorSetup.exe",
+  protocolName: "kalika-tally",
+  configFolderName: ".autodealer-tally-bridge",
+  installDir: "C:\\Autodealer\\tally-bridge",
+  runtimeEnvironmentVariable: "KALIKA_CONNECTOR_RUNTIME",
+  runtimePackageName: "@autodealer/tally-bridge-runtime",
+  version: "0.1.39",
+  tdlFileNames: [
+    "kalika-native-debit-note-export.tdl",
+    "kalika-purchase-document-attachment.tdl",
+  ],
+};
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const installerRoot = path.join(repoRoot, "installer", "tally-bridge");
-const sourceRuntime = process.env.KALIKA_CONNECTOR_RUNTIME || "C:\\Autodealer\\tally-bridge";
+const electronAppSource = path.join(installerRoot, "electron-app");
 const payloadDir = path.join(installerRoot, "payload-clean");
 const outputDir = path.join(installerRoot, "output");
-const outputExe = path.join(outputDir, "KalikaTallyConnectorSetup.exe");
-const tempBuildRoot = "C:\\tmp\\kalika-tally-connector-installer";
-const stagingDir = path.join(tempBuildRoot, "staging");
-const tempOutputDir = path.join(tempBuildRoot, "output");
-const tempOutputExe = path.join(tempOutputDir, "KalikaTallyConnectorSetup.exe");
-const payloadZip = path.join(stagingDir, "payload.zip");
-const electronAppSource = path.join(installerRoot, "electron-app");
-const bridgeSource = path.join(repoRoot, "apps", "tally-bridge", "src", "bridge.mjs");
-const powerShellSource = path.join(repoRoot, "apps", "tally-bridge", "powershell");
-const samplesSource = path.join(repoRoot, "apps", "tally-bridge", "samples");
-const tdlSource = path.join(repoRoot, "apps", "tally-bridge", "tdl");
+const outputExe = path.join(outputDir, connector.setupName);
+const innoDefinition = path.join(installerRoot, "kalika-tally-bridge.iss");
+const bridgeRoot = path.join(repoRoot, "apps", "tally-bridge");
+const bridgeSource = path.join(bridgeRoot, "src", "bridge.mjs");
+const powerShellSource = path.join(bridgeRoot, "powershell");
+const samplesSource = path.join(bridgeRoot, "samples");
+const tdlSource = path.join(bridgeRoot, "tdl");
+const dashboardSource = path.join(
+  repoRoot,
+  "apps",
+  "web",
+  "src",
+  "components",
+  "tally",
+  "TallyPrimeDashboard.tsx"
+);
 
 function ensureFile(filePath, label = filePath) {
-  if (!fs.existsSync(filePath)) {
+  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
     throw new Error(`Missing ${label}: ${filePath}`);
   }
+}
+
+function ensureContains(filePath, expected, label) {
+  ensureFile(filePath, label);
+  const content = fs.readFileSync(filePath, "utf8");
+  if (!content.includes(expected)) {
+    throw new Error(`${label} does not contain ${JSON.stringify(expected)}: ${filePath}`);
+  }
+}
+
+function validateSources() {
+  ensureFile(bridgeSource, "Tally bridge source");
+  ensureFile(path.join(electronAppSource, "main.mjs"), "Electron wrapper");
+  ensureFile(path.join(electronAppSource, "package.json"), "Electron wrapper package");
+  for (const fileName of connector.tdlFileNames) {
+    ensureFile(path.join(tdlSource, fileName), `Kalika TDL ${fileName}`);
+  }
+  ensureContains(dashboardSource, `${connector.protocolName}://connect`, "Kalika web connector protocol");
+  ensureContains(bridgeSource, connector.configFolderName, "Kalika bridge configuration folder");
+  ensureContains(innoDefinition, connector.connectorName, "Inno Setup product name");
+  ensureContains(innoDefinition, connector.protocolName, "Inno Setup protocol");
+  ensureContains(path.join(electronAppSource, "main.mjs"), connector.connectorName, "Electron product name");
+  console.log(`Installer sources validated for ${connector.connectorName} (${connector.protocolName}://).`);
 }
 
 function resetDir(dir) {
@@ -32,150 +77,69 @@ function resetDir(dir) {
 }
 
 function copyDir(source, destination) {
-  if (!fs.existsSync(source)) return;
-  fs.cpSync(source, destination, { recursive: true, force: true });
+  if (fs.existsSync(source)) fs.cpSync(source, destination, { recursive: true, force: true });
 }
 
-function copyRuntimeFile(name) {
+function findRuntimeExecutable(runtimeSource) {
+  const preferredNames = [connector.executableName, "electron.exe"];
+  for (const name of preferredNames) {
+    const candidate = path.join(runtimeSource, name);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  if (!fs.existsSync(runtimeSource)) return null;
+  const candidates = fs
+    .readdirSync(runtimeSource, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".exe"))
+    .filter((entry) => !/(setup|unins|update|squirrel)/i.test(entry.name));
+  return candidates.length === 1 ? path.join(runtimeSource, candidates[0].name) : null;
+}
+
+function findRuntime() {
+  const candidates = [
+    process.env[connector.runtimeEnvironmentVariable],
+    connector.installDir,
+  ].filter(Boolean);
+  for (const runtimeSource of candidates) {
+    const executable = findRuntimeExecutable(runtimeSource);
+    if (executable) return { runtimeSource, executable };
+  }
+  throw new Error(
+    `Missing Electron runtime. Set ${connector.runtimeEnvironmentVariable} to an Electron runtime directory.`
+  );
+}
+
+function findInnoCompiler() {
+  const candidates = [
+    process.env.INNO_SETUP_COMPILER,
+    path.join(process.env.LOCALAPPDATA || "", "Programs", "Inno Setup 6", "ISCC.exe"),
+    "C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe",
+    "C:\\Program Files\\Inno Setup 6\\ISCC.exe",
+  ].filter(Boolean);
+  const compiler = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!compiler) {
+    throw new Error("Inno Setup 6 compiler was not found. Install Inno Setup 6 or set INNO_SETUP_COMPILER.");
+  }
+  return compiler;
+}
+
+function copyOptionalRuntimeFile(runtimeSource, name) {
   const source = path.join(runtimeSource, name);
-  if (fs.existsSync(source)) {
-    fs.copyFileSync(source, path.join(payloadDir, name));
-  }
+  if (fs.existsSync(source)) fs.copyFileSync(source, path.join(payloadDir, name));
 }
 
-function writeInstallFiles() {
-  const installCmd = `@echo off\r\nsetlocal\r\nset SCRIPT_DIR=%~dp0\r\n"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%install.ps1"\r\nexit /b %ERRORLEVEL%\r\n`;
-
-  const installPs1 = String.raw`$ErrorActionPreference = "Stop"
-
-$installDir = "C:\Autodealer\tally-bridge"
-$configDir = Join-Path $env:USERPROFILE ".autodealer-tally-bridge"
-$payloadZip = Join-Path $PSScriptRoot "payload.zip"
-$payloadExtract = Join-Path $env:TEMP "kalika-tally-connector-payload"
-$nativePdfTdl = Join-Path $installDir "tdl\kalika-native-debit-note-export.tdl"
-$tallyInstallDir = Join-Path $env:ProgramFiles "TallyPrime"
-$tallyTdl = Join-Path $tallyInstallDir "kalika-native-debit-note-export.tdl"
-
-Write-Host "Closing old Kalika Tally Connector instances..."
-Get-Process -Name "Kalika Tally Connector" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 800
-
-Write-Host "Preparing clean install folder..."
-if (Test-Path $installDir) {
-  Remove-Item -LiteralPath $installDir -Recurse -Force
-}
-New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-
-Write-Host "Extracting connector files..."
-if (Test-Path $payloadExtract) {
-  Remove-Item -LiteralPath $payloadExtract -Recurse -Force
-}
-Expand-Archive -LiteralPath $payloadZip -DestinationPath $payloadExtract -Force
-Copy-Item -Path (Join-Path $payloadExtract "*") -Destination $installDir -Recurse -Force
-
-Write-Host "Preparing the native Tally PDF add-on..."
-if (Test-Path $nativePdfTdl) {
-  try {
-    # This is only a convenience copy for Tally's default file picker. The
-    # connector always retains its canonical copy under C:\Autodealer.
-    Copy-Item -LiteralPath $nativePdfTdl -Destination $tallyTdl -Force
-    Write-Host "TDL available in TallyPrime: $tallyTdl"
-  } catch {
-    Write-Warning "Could not copy the TDL into TallyPrime. Select it once from: $nativePdfTdl"
-  }
+validateSources();
+if (process.argv.includes("--validate")) process.exit(0);
+if (process.platform !== "win32") {
+  throw new Error("The setup executable must be built on Windows because it uses Inno Setup.");
 }
 
-Write-Host "Registering Kalika connect link..."
-$protocolRoot = "HKCU:\Software\Classes\kalika-tally"
-New-Item -Path $protocolRoot -Force | Out-Null
-Set-Item -Path $protocolRoot -Value "URL:Kalika Tally Protocol"
-New-ItemProperty -Path $protocolRoot -Name "URL Protocol" -Value "" -PropertyType String -Force | Out-Null
-New-Item -Path "$protocolRoot\DefaultIcon" -Force | Out-Null
-Set-Item -Path "$protocolRoot\DefaultIcon" -Value "$installDir\Kalika Tally Connector.exe,0"
-New-Item -Path "$protocolRoot\shell\open\command" -Force | Out-Null
-$openCommand = '"' + (Join-Path $installDir "Kalika Tally Connector.exe") + '" "%1"'
-Set-Item -Path "$protocolRoot\shell\open\command" -Value $openCommand
-
-Write-Host "Starting connector..."
-Start-Process -FilePath "$installDir\Kalika Tally Connector.exe"
-Write-Host "Kalika Tally Connector installed successfully."
-`;
-
-  fs.writeFileSync(path.join(stagingDir, "install.cmd"), installCmd);
-  fs.writeFileSync(path.join(stagingDir, "install.ps1"), installPs1);
-}
-
-function writeSedFile() {
-  const sedPath = path.join(stagingDir, "kalika-tally-connector.sed");
-  const sed = `[Version]
-Class=IEXPRESS
-SEDVersion=3
-
-[Options]
-PackagePurpose=InstallApp
-ShowInstallProgramWindow=1
-HideExtractAnimation=1
-UseLongFileName=1
-InsideCompressed=0
-CAB_FixedSize=0
-CAB_ResvCodeSigning=0
-RebootMode=N
-InstallPrompt=%InstallPrompt%
-DisplayLicense=
-FinishMessage=%FinishMessage%
-TargetName=%TargetName%
-FriendlyName=%FriendlyName%
-AppLaunched=%AppLaunched%
-PostInstallCmd=<None>
-AdminQuietInstCmd=
-UserQuietInstCmd=
-SourceFiles=SourceFiles
-
-[Strings]
-InstallPrompt=
-FinishMessage=
-TargetName=${tempOutputExe}
-FriendlyName=Kalika Tally Connector Setup
-AppLaunched=install.cmd
-FILE0=install.cmd
-FILE1=install.ps1
-FILE2=payload.zip
-
-[SourceFiles]
-SourceFiles0=${stagingDir}
-
-[SourceFiles0]
-%FILE0%=
-%FILE1%=
-%FILE2%=
-`;
-  fs.writeFileSync(sedPath, sed);
-  return sedPath;
-}
-
-let runtimeSource = sourceRuntime;
-if (!fs.existsSync(path.join(runtimeSource, "Kalika Tally Connector.exe"))) {
-  const existingCleanPayload = payloadDir;
-  const tempRuntimeSeed = path.join(tempBuildRoot, "runtime-seed");
-  if (!fs.existsSync(path.join(existingCleanPayload, "Kalika Tally Connector.exe"))) {
-    throw new Error(`Missing installed Electron runtime: ${sourceRuntime}`);
-  }
-  resetDir(tempRuntimeSeed);
-  fs.cpSync(existingCleanPayload, tempRuntimeSeed, { recursive: true, force: true });
-  runtimeSource = tempRuntimeSeed;
-}
-
-ensureFile(path.join(runtimeSource, "Kalika Tally Connector.exe"), "installed Electron runtime");
-ensureFile(bridgeSource, "bridge source");
-ensureFile(path.join(electronAppSource, "main.mjs"), "Electron wrapper");
-
+const { runtimeSource, executable: runtimeExecutable } = findRuntime();
+const innoCompiler = findInnoCompiler();
 resetDir(payloadDir);
-resetDir(stagingDir);
 fs.mkdirSync(outputDir, { recursive: true });
-fs.mkdirSync(tempOutputDir, { recursive: true });
 
+fs.copyFileSync(runtimeExecutable, path.join(payloadDir, connector.executableName));
 for (const name of [
-  "Kalika Tally Connector.exe",
   "chrome_100_percent.pak",
   "chrome_200_percent.pak",
   "d3dcompiler_47.dll",
@@ -192,7 +156,7 @@ for (const name of [
   "vk_swiftshader_icd.json",
   "vulkan-1.dll",
 ]) {
-  copyRuntimeFile(name);
+  copyOptionalRuntimeFile(runtimeSource, name);
 }
 
 copyDir(path.join(runtimeSource, "locales"), path.join(payloadDir, "locales"));
@@ -205,53 +169,16 @@ fs.mkdirSync(path.join(appDir, "src"), { recursive: true });
 fs.copyFileSync(path.join(electronAppSource, "main.mjs"), path.join(appDir, "main.mjs"));
 fs.copyFileSync(path.join(electronAppSource, "package.json"), path.join(appDir, "package.json"));
 fs.copyFileSync(bridgeSource, path.join(appDir, "src", "bridge.mjs"));
-
 fs.writeFileSync(
   path.join(payloadDir, "package.json"),
   `${JSON.stringify(
-    {
-      name: "@autodealer/tally-bridge-runtime",
-      version: "0.1.17",
-      private: true,
-      type: "module",
-    },
+    { name: connector.runtimePackageName, version: connector.version, private: true, type: "module" },
     null,
     2
   )}\n`
 );
 
-writeInstallFiles();
-
-if (fs.existsSync(payloadZip)) fs.rmSync(payloadZip, { force: true });
-execFileSync(
-  "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-  [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-Command",
-    `Compress-Archive -Path '${payloadDir}\\*' -DestinationPath '${payloadZip}' -Force`,
-  ],
-  { stdio: "inherit" }
-);
-
-const sedPath = writeSedFile();
 if (fs.existsSync(outputExe)) fs.rmSync(outputExe, { force: true });
-if (fs.existsSync(tempOutputExe)) fs.rmSync(tempOutputExe, { force: true });
-execFileSync("C:\\Windows\\System32\\iexpress.exe", ["/N", sedPath], { stdio: "inherit" });
-
-if (!fs.existsSync(tempOutputExe)) {
-  const ddfPath = path.join(tempOutputDir, "~KalikaTallyConnectorSetup.DDF");
-  if (!fs.existsSync(ddfPath)) {
-    throw new Error("IExpress did not create the setup exe or a fallback cabinet definition.");
-  }
-  execFileSync("C:\\Windows\\System32\\makecab.exe", ["/F", ddfPath], { stdio: "ignore" });
-}
-
-if (!fs.existsSync(tempOutputExe)) {
-  throw new Error("Setup exe was not created.");
-}
-
-fs.copyFileSync(tempOutputExe, outputExe);
-
+execFileSync(innoCompiler, [innoDefinition], { cwd: installerRoot, stdio: "inherit" });
+if (!fs.existsSync(outputExe)) throw new Error("Inno Setup did not create the setup executable.");
 console.log(`Installer created: ${outputExe}`);

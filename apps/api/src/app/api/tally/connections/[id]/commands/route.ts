@@ -199,7 +199,7 @@ export async function POST(
       }
       const requestedMasterTypes = Array.isArray(rawPayload.requestedMasterTypes)
         ? rawPayload.requestedMasterTypes.filter((value): value is string => typeof value === "string")
-        : ["ledger", "group", "voucher_type", "gst_ledger", "tax_ledger"];
+        : ["ledger", "group", "stock_item", "unit", "voucher_type", "gst_ledger", "tax_ledger"];
       const payload = {
         companyName,
         requestedMasterTypes,
@@ -328,6 +328,7 @@ export async function POST(
         .select("*")
         .eq("connection_id", id)
         .eq("owner_user_id", user.id)
+        .eq("company_name", toNullableText(connection.last_company_name, 240) ?? "Unknown company")
         .eq("master_key", masterKey)
         .in("master_type", ["ledger", "gst_ledger"])
         .eq("is_active", true)
@@ -398,6 +399,7 @@ export async function POST(
         .select("id")
         .eq("connection_id", id)
         .eq("owner_user_id", user.id)
+        .eq("company_name", toNullableText(connection.last_company_name, 240) ?? "Unknown company")
         .eq("master_type", "ledger")
         .ilike("tally_name", name)
         .eq("is_active", true)
@@ -569,26 +571,10 @@ export async function POST(
         if (transactions.length !== rawTransactions.length) {
           return jsonWithCors(request, { error: "Every bank statement row must be valid." }, { status: 400 });
         }
-        const relevantLedgerNames = Array.from(
-          new Set(
-            (Array.isArray(rawPayload.relevantLedgerNames) ? rawPayload.relevantLedgerNames : [])
-              .map((value) => toRequiredText(value).slice(0, 500))
-              .filter(Boolean)
-          )
-        ).slice(0, 250);
-        const voucherTypes = Array.from(
-          new Set(
-            (Array.isArray(rawPayload.voucherTypes) ? rawPayload.voucherTypes : [])
-              .map((value) => toRequiredText(value).slice(0, 120))
-              .filter(Boolean)
-          )
-        ).slice(0, 50);
 
         const payload = {
           companyName,
           bankLedgerName,
-          relevantLedgerNames,
-          voucherTypes,
           transactions,
           source: "bank_statement_batch_review_check",
         };

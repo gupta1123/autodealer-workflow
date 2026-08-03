@@ -1,28 +1,265 @@
 # Modified Files
 
-- **NYX-143**: Added a review/confirmation step before creating Cash Discount debit notes in Tally.
-  - **How to test**: Open Cash Discounts, select one or more eligible rows, click create. Confirm that a review dialog shows company, customer, invoice, amount, date, ledger, and narration before the debit note is created. When you click Create in Tally, confirm the modal shows progress such as `Creating debit note 1 of 2` and then Tally refresh progress before closing.
+This file tracks project files changed by Codex during the current work.
 
-- **NYX-144**: Added safer Created debit-note actions. Delete was not added because created debit notes already exist in Tally and should remain auditable.
-  - **How to test**: Open the Created tab, verify each created debit note has actions to view, prepare/download PDF, send/resend WhatsApp, and view cancel/reverse guidance. Confirm there is no delete action.
+## 2026-07-27
 
-- **NYX-145**: Bulk actions are available after selecting Cash Discount rows.
-  - **How to test**: Select multiple To Create rows and verify a bulk create action appears. Select multiple Created rows and verify a bulk WhatsApp action appears.
+- `apps/api/src/lib/cash-discount-narration.ts` - removed Cash Discount AI review, restricted deterministic detection to supported 1% and 1.5% terms, applies default periods of 15 and 7 days when narration omits days, records whether each period was explicit/default, and keeps all eligibility, receipt, tier, and reversal calculations deterministic.
+- `apps/api/src/app/api/collections/dashboard/route.ts` - removed AI calls/cache gating and AI response fields, emits deterministic calculation evidence, uses deterministic eligibility for debit-note candidates, and exposes default-period information to payment follow-ups.
+- `apps/api/src/app/api/collections/tally-debit-notes/approve/route.ts` - stopped trusting browser-supplied debit-note amounts and ledgers; approval now re-reads the latest Tally open-bill scan, recalculates eligibility and amount deterministically, subtracts created reversals, blocks duplicate in-flight commands, and queues only server-derived accounting values.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - removed Cash Discount AI types/badges, displays deterministic/default-period evidence, and sends only invoice identity fields for server-side approval recalculation.
+- `apps/api/src/lib/cash-discount-narration.test.mjs` - added deterministic regression tests for CD markers, default and explicit periods, exact 1%/1.5% matching, unrelated/unsupported rates, deadlines, receipt reconciliation, late short payments, and unpaid invoice gross-up.
+- `package.json` - added the `test:cash-discount` regression-test command.
+- `MODIFIED_FILES.md` - documented every project file changed for the deterministic Cash Discount implementation.
 
-- **NYX-146**: Added search, sort, and filter controls for Cash Discount debit-note lists.
-  - **How to test**: On To Create and Created lists, search by customer/invoice/status, change filters, and change sort order. Confirm the displayed rows update without reloading the browser.
+## 2026-07-09
 
-- **Cash Discount refresh sync status**: Refresh now shows one compact header status, detailed sync progress in the main banner, and the last completed sync time after completion.
-  - **How to test**: Click Refresh on Cash Discounts. Confirm the header button changes to Syncing, only the main blue banner shows detailed progress, open-bill scan progress changes like `2/13 batches done, 11 remaining`, and after completion the page shows the latest sync time.
+- `apps/api/src/lib/processing/openrouter.ts` - added a dedicated OpenRouter bank-ledger matching model configuration, defaulting to `deepseek/deepseek-v4-flash`.
+- `apps/api/src/lib/bank-statement-ledger-matching.ts` - moved bank-statement ledger assignment to the dedicated DeepSeek V4 Flash AI prompt after saved mappings, with deterministic category/fuzzy logic kept only as a fallback.
+- `apps/api/src/app/api/bank-statements/transactions/route.ts` - passes full bank-row context into the AI ledger matcher when refreshing transaction suggestions.
+- `apps/api/src/app/api/bank-statements/tally/queue/route.ts` - passes full bank-row context into the AI ledger matcher before queueing Send to Tally actions.
+- `apps/api/src/app/api/bank-statements/imports/[id]/route.ts` - fills missing import-preview ledger suggestions through the DeepSeek ledger matcher on page load, so stale/background extraction workers cannot leave old non-AI suggestions on the analyzed screen.
+- `apps/api/worker/process-packet-jobs.mjs` - applies DeepSeek V4 Flash ledger matching to bank-statement preview rows using synced Tally ledgers, and removes ledger suggestion from the extraction prompt.
+- `.env.example` - documented the dedicated bank-ledger OpenRouter model settings.
+- `apps/api/.env` - configured local bank-ledger matching to use `deepseek/deepseek-v4-flash`.
+- `apps/api/src/lib/processing/openrouter.ts`, `apps/api/worker/process-packet-jobs.mjs`, `.env.example`, and `apps/api/.env` - switched bank-ledger matching from DeepSeek V4 Flash to the stronger OpenRouter model `deepseek/deepseek-v4-pro`.
+- `apps/api/src/app/api/bank-statements/imports/[id]/route.ts` - records the active bank-ledger model dynamically in preview-row AI audit metadata instead of hardcoding the old Flash model id.
+- `apps/tally-bridge/src/bridge.mjs` - fixed multi-company discovery by falling back to local Tally data folders when Tally's HTTP API returns no companies on the Select Company screen, and bumped the bridge version to `0.1.10`.
+- `C:/Autodealer/tally-bridge/resources/app/src/bridge.mjs` - mirrored the multi-company discovery fix into the currently installed connector runtime.
+- `installer/tally-bridge/payload-clean/resources/app/src/bridge.mjs` - mirrored the multi-company discovery fix into the clean installer payload.
+- `scripts/build-tally-connector-installer.mjs` - bumped the generated connector runtime package version to `0.1.10`.
+- `installer/tally-bridge/output/KalikaTallyConnectorSetup.exe` - rebuilt the installable connector setup executable with the fixed multi-company bridge.
+- `apps/api/src/app/api/tally/companies/route.ts` - added the same local Tally data-folder fallback to the company dropdown API and prefers companies from the latest live connector over stale disconnected rows.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - stopped Cash Discounts from auto-queuing open-bill scans on passive page load/company changes; it now uses the latest dashboard data until the user explicitly refreshes or performs an action.
+- `tally_bridge_commands` Supabase data - canceled stale queued commands from old connector ids so the browser stops polling command ids that the live connector can never claim.
+- `apps/api/src/app/api/bank-statements/imports/[id]/confirm/route.ts` - prevents a duplicate statement upload from reusing queueable rows from an older import, so the same PDF cannot be sent again just because its previous rows were still in a retryable state.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - renamed the debit-note action to `Create debit note`, added checkbox selection and bulk create for Cash Discount debit notes, added checkbox selection and bulk WhatsApp send for created debit notes, and added a missing-phone dialog with an option to save the number back to Tally.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - adds 10-digit WhatsApp number validation, confirmation prompts before bulk create/send actions, and fixes the `Create debit note` action button width so the label does not wrap into a broken stacked button.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - replaces the one-row WhatsApp phone prompt with a single send-confirmation modal for one or many selected debit notes, including missing-number inputs, 10-digit validation, and one save-to-Tally checkbox for entered numbers.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - changes the WhatsApp send modal from stacked debit-note cards to a compact table with customer, debit note, amount, and WhatsApp number columns.
+- `apps/api/src/app/api/collections/debit-note-proposals/[id]/whatsapp/route.ts` - stores a newly entered WhatsApp number on the debit-note record and queues a Tally ledger phone update when the user chooses to save the number to Tally.
+- `apps/api/src/app/api/collections/debit-note-proposals/[id]/whatsapp/route.ts` - rejects manually entered WhatsApp numbers unless they resolve to a valid 10-digit Indian mobile number.
+- `apps/tally-bridge/src/bridge.mjs` - extends ledger alter XML to support updating ledger phone/mobile fields without renaming the ledger.
+- `C:/Autodealer/tally-bridge/resources/app/src/bridge.mjs` - mirrors the ledger phone/mobile update support into the currently installed local connector runtime.
+- `apps/api/src/app/api/collections/dashboard/route.ts` - changed Cash Discounts Needs Action to derive recoveries from the latest Tally open-bill scan, while showing only created debit notes from Supabase as history.
+- `apps/api/src/app/api/collections/dashboard/route.ts` - expanded Cash Discounts Needs Action to include expired fully unpaid and partial unpaid invoices from Tally, while keeping debit-note creation limited to true cash-discount shortfall rows.
+- `apps/api/src/app/api/collections/dashboard/route.ts` - sorts Cash Discounts Needs Action rows by invoice date, oldest first.
+- `apps/api/src/app/api/collections/dashboard/route.ts` - allows expired unpaid and partial unpaid invoices to create debit notes for the expected discount amount.
+- `apps/api/src/app/api/collections/dashboard/route.ts` - backfills missing Done/history rows from succeeded Tally debit-note commands so confirmed Tally vouchers do not disappear from Cash Discounts.
+- `apps/api/src/app/api/collections/tally-debit-notes/approve/route.ts` - added direct approval for Tally-derived cash-discount suggestions without inserting a debit-note proposal before Tally creates the voucher.
+- `apps/api/src/app/api/tally/bridge/commands/[commandId]/result/route.ts` - creates the Supabase debit-note record and PDF only after the connector confirms a Tally debit-note voucher was created from a Tally-derived suggestion.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - refreshes debtor open bills from Tally before rendering Cash Discounts, queues Tally-derived suggestions through the new direct endpoint, and keeps old saved rows out of the live Needs Action source.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - labels Needs Action rows as discount shortfall, invoice still unpaid, or payment partially pending, and disables debit-note creation for unpaid/partial rows.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - enables Create on expired unpaid and partial unpaid rows and shows the debit-note amount as the expected expired discount.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - waits for Tally debit-note creation to succeed, refreshes Tally open bills, and only then switches to Done so the new entry appears without a manual reload.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - refocused the Cash Discounts dashboard for daily use with recoverable totals, clearer To Create/Created cards, invoice amount, pending amount, discount-expiry timing, contact readiness, and richer created debit-note history.
+- `apps/api/src/app/api/collections/debit-note-proposals/route.ts` - limits duplicate detection to debit notes already created in Tally so stale uncreated proposal rows cannot block a fresh Tally-derived action.
+- `apps/api/src/app/api/collections/dashboard/route.ts` - collapses duplicate Cash Discount/debit-note proposals across old Tally connection ids so the same invoice/recoverable amount appears once on the dashboard.
+- `apps/api/src/app/api/collections/debit-note-proposals/route.ts` - makes debit-note proposal creation idempotent across reconnects for the same company, customer, invoice, and recoverable amount.
+- `apps/api/src/app/api/collections/debit-note-proposals/[id]/approve/route.ts` - queues debit-note creation on the latest live Tally connection for the proposal company instead of the stale connection id stored on older proposals.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - tightened the bank statement Tally bank-ledger selector to show only real Tally bank account ledgers or ledgers with bank account metadata, excluding Cash, Bank Charges, and Bank Statement Suspense.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - loads Tally bank ledgers immediately when a company is auto-selected or manually selected, and prevents older ledger requests from overwriting the current company selection.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - keeps the initial bank-statement summary `useEffect` dependency list stable and guards it to run once, preventing the React dependency-size console error after hot reload.
+- `apps/api/src/app/api/tally/companies/route.ts` - prevents generic connector labels such as `Tally Prime` from being treated as real company names, preferring actual synced/loaded Tally company names in all company dropdowns.
+- `apps/api/src/app/api/collections/dashboard/route.ts` - avoids using generic connector labels as Cash Discounts company names when returning dashboard context.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - de-duplicates the company dropdown and uses the shared company/year label format.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - uses the shared company/year label format and stops falling back to the connector display name as a company name.
+- `apps/web/src/components/tally/TallyPrimeDashboard.tsx` - reads the same Tally company API used by Bank Statements/Cash Discounts so the connection page shows the real loaded company name.
+- `apps/api/src/app/api/tally/companies/route.ts` - changed the company list API to return all named/synced Tally companies, sorted with the currently connected company first, instead of hiding other companies whenever one live company is connected.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - tightened the Tally bank ledger picker so it only shows bank/cash account ledgers, no longer falls back to every ledger, clears/reloads bank ledgers when changing company, and shows a clear empty-state placeholder when no bank account ledger is synced.
+- `scripts/supabase-clean-july-aug-workflow.mjs` - added a Supabase cleanup helper used to identify and remove stale July/August bank-statement, posting-log, bridge-command, and debit-note workflow rows after the matching Tally vouchers were deleted.
+- `scripts/keep-one-cash-discount-rule.mjs` - added a Supabase cleanup helper used to keep only the standard default Cash Discount rule and remove duplicate/test rules.
+- `scripts/seed_june_july_bank_cash_discount_pack.mjs` - added an idempotent June/July test-pack generator that prepares June open invoices, July outgoing Tally vouchers, a single standard Cash Discount rule, the Triveni debit-note proposal with WhatsApp phone `9765723830`, and three realistic bank-statement PDFs dated no later than 09 Jul 2026.
+- `scripts/seed_june_july_bank_cash_discount_pack.mjs` - expanded the June/July bank-statement stress pack to 10 rows per PDF, covering exact receipts, cash-discount eligibility, amount-only matching, split bills, partials, overpayments, advances, unknown credits, outgoing found/missing checks, bank charges, ambiguous outgoing payments, and debit-note recovery; added a `KALIKA_PDF_ONLY=1` mode for regenerating PDFs without touching Tally/Supabase.
+- `scripts/build-tally-connector-installer.mjs` - added a repeatable Windows installer builder that creates a clean Kalika Tally Connector payload, removes stale connector archives/logs/backups from the package, embeds the latest bridge source, and packages a self-extracting setup executable using built-in Windows tools.
+- `package.json` - repointed `npm run installer:tally-bridge` to the new repeatable connector installer builder instead of the stale Inno Setup command.
+- `installer/tally-bridge/README.md` - replaced the old guide-only installer notes with the new defensive connector installer workflow, build command, runtime layout, and expected user flow.
+- `installer/tally-bridge/electron-app/package.json` - added the canonical Electron wrapper package metadata for the connector app.
+- `installer/tally-bridge/electron-app/main.mjs` - added the canonical Electron wrapper that enforces a single app instance, shows an honest connector status window, handles connect/disconnect links, starts only one bridge runner, and reports reconnect-required states when tokens expire.
+- `installer/tally-bridge/output/KalikaTallyConnectorSetup.exe` - generated the final installable connector setup executable.
+- `installer/tally-bridge/payload-clean/` - generated the clean connector runtime payload used by the setup executable, without old logs, backups, nested app archives, or stale `app.asar` files.
+- `output/pdf/bank-cash-discount-june-july-2026/AccountStatement_03-Jul-2026.pdf` - generated the first test bank statement covering timely cash-discount receipt and exact bill clearing.
+- `output/pdf/bank-cash-discount-june-july-2026/AccountStatement_07-Jul-2026.pdf` - generated the second test bank statement covering split bills, partial receipt, advance/no-bill, outgoing found, and outgoing missing cases.
+- `output/pdf/bank-cash-discount-june-july-2026/AccountStatement_09-Jul-2026.pdf` - generated the third test bank statement covering late short cash-discount recovery, bank-charge found/missing, and ambiguous outgoing payment cases.
+- `output/pdf/bank-cash-discount-june-july-2026/bank_cash_discount_manifest.json` - generated the expected-outcome manifest for all June/July bank-statement and Cash Discount test cases.
+- `output/pdf/bank-cash-discount-june-july-2026/README.md` - generated the human test guide and Tally folder handoff instructions for the June/July test pack.
+- `output/pdf/bank-cash-discount-june-july-2026/AccountStatement_03-Jul-2026.pdf` - regenerated with 10 realistic rows covering exact receipt, timely discount, amount-only match, outgoing found/missing, bank-charge found, unknown credit, ATM withdrawal, interest credit, and fee review.
+- `output/pdf/bank-cash-discount-june-july-2026/AccountStatement_07-Jul-2026.pdf` - regenerated with 10 realistic rows covering split bills, partial receipt, overpayment/advance, no-bill advance, outgoing found/missing, bank-charge missing, unknown credits, and rent debit review.
+- `output/pdf/bank-cash-discount-june-july-2026/AccountStatement_09-Jul-2026.pdf` - regenerated with 10 realistic rows covering late short cash-discount recovery, bank charges found/missing, ambiguous outgoing payment, unknown credits, small/utility debits, cash deposit, and cheque-return charge.
+- `output/pdf/bank-cash-discount-june-july-2026/bank_cash_discount_manifest.json` - updated with 31 expected outcomes for the expanded 30-row stress pack plus re-upload protection.
+- `output/pdf/bank-cash-discount-june-july-2026/README.md` - updated with the expanded row-by-row test checklist and expected behavior.
+- `scripts/seed_june_july_bank_cash_discount_pack.mjs` - updated the bank-statement stress pack to include close-but-not-exact customer/supplier names such as singular/plural, Pvt/Private, and minor spelling variants for ledger matching tests.
+- `output/pdf/bank-cash-discount-june-july-2026/AccountStatement_03-Jul-2026.pdf` - regenerated with close-name matching rows for Vardhan, Harshita, and Prakash.
+- `output/pdf/bank-cash-discount-june-july-2026/AccountStatement_07-Jul-2026.pdf` - regenerated with close-name matching rows for Kalyani, Rudra, and Noble.
+- `output/pdf/bank-cash-discount-june-july-2026/AccountStatement_09-Jul-2026.pdf` - regenerated with a close-name matching row for Triveni cash-discount recovery.
+- `output/pdf/bank-cash-discount-june-july-2026/bank_cash_discount_manifest.json` - updated expected outcomes to identify close-name matching cases outside the uploaded PDFs.
+- `output/pdf/bank-cash-discount-june-july-2026/README.md` - updated the human checklist to include the close-name ledger matching expectations.
+- `output/pdf/bank-cash-discount-june-july-2026/jul03_manifest.json` - generated the hidden per-PDF expected-outcome manifest for the 03 Jul statement.
+- `output/pdf/bank-cash-discount-june-july-2026/jul07_manifest.json` - generated the hidden per-PDF expected-outcome manifest for the 07 Jul statement.
+- `output/pdf/bank-cash-discount-june-july-2026/jul09_manifest.json` - generated the hidden per-PDF expected-outcome manifest for the 09 Jul statement.
+- `apps/web/src/components/tally/TallyPrimeDashboard.tsx` - restores the connector launch API base to the deployed Heroku endpoint by default while still allowing `NEXT_PUBLIC_BRIDGE_API_BASE_URL` or `NEXT_PUBLIC_API_BASE_URL` to override it.
+- `C:/Autodealer/tally-bridge/resources/app/` - adds a direct Electron wrapper around the installed bridge file so the connector no longer crashes while importing the missing `@autodealer/tally-bridge` package.
+- `C:/Autodealer/tally-bridge/resources/app.asar.disabled-20260709103309` - disables the broken installed connector archive after backing it up, allowing Electron to load the repaired `resources/app` folder.
+- `C:/Users/Shubham/.autodealer-tally-bridge/config.json.backup-before-heroku-repair-20260709103442` - backs up and clears the stale local connector pairing so the next Connect action pairs fresh against the deployed Heroku API.
 
-- **NYX-148**: Debit-note rounding issue identified. Not fixed yet; the correct fix is to round the debit-note amount before queueing the Tally command and use that same rounded amount in preview, review, created records, duplicate checks, and Tally posting.
-  - **How to test**: Use an invoice/payment case where the calculated debit-note amount has paise. Confirm the current app still preserves the exact calculated amount. This issue should remain open until the posting amount is intentionally rounded everywhere.
+## 2026-07-08
 
-- **NYX-150**: Cash Discount pages now check a lightweight dashboard version marker and quietly reload the dashboard only when stored data changes.
-  - **How to test**: Open Cash Discounts in two tabs. In one tab, create/send/update a debit note. Keep the second tab open; within about 30 seconds, or after switching back to it, confirm the dashboard updates without a browser refresh.
+- `apps/web/src/components/cases/CaseDetailPage.tsx` - restored from `Shubham Kalika Workflows.zip` after the working copy file was found empty.
+- `apps/api/src/app/api/bank-statements/imports/[id]/confirm/route.ts` - returns a clearer retryable 503 when Supabase/network connectivity times out during bank statement confirmation instead of misreporting it as a generic app failure.
+- `apps/tally-bridge/src/bridge.mjs` - checks Tally live before posting incoming receipt vouchers, skips posting when the receipt already exists, and returns possible-duplicate review results instead of relying on Supabase last-posted state.
+- `apps/api/src/app/api/bank-statements/tally/queue/route.ts` - marks incoming receipt post commands for live Tally preflight verification before creating vouchers.
+- `apps/api/src/app/api/tally/bridge/commands/[commandId]/result/route.ts` - records possible duplicate receipt checks as review-needed and stops updating the Supabase last-posted bank transaction checkpoint.
+- `C:/Autodealer/tally-bridge/src/bridge.mjs` - mirrored the live Tally preflight duplicate-check logic into the installed connector source.
+- `C:/Autodealer/tally-bridge/resources/app.asar` - rebuilt the installed connector archive so the EXE uses the live Tally preflight duplicate-check logic.
+- `C:/Autodealer/tally-bridge/resources/app.asar.backup-clean-2026-07-08T19-06-24.asar` - backup of the installed connector archive before the clean rebuild.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - simplified the outgoing payment check drawer by hiding the metadata grid, shortening the header, making the result card primary, hiding empty candidate sections, and lightening voucher candidate cards.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - simplified the bill-allocation review drawer by hiding report-like metadata/proposed-allocation sections, showing only a compact receipt summary, allocation status, and editable bill/advance amounts.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - renamed the final bank statement action button to Send to Tally.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - compacted the analyzed-statement header into one summary bar with company, period, statement account, Tally ledger, and small sync/change controls.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - keeps the analyzed statement visible after Send to Tally, shows a final confirmation state with Upload Another as the next action, locks completed rows, and tightens the table layout for laptop widths.
+- `apps/web/src/lib/api-client.ts` - retries API calls once after refreshing the Supabase session when a protected request returns 401, preventing long bank-statement sessions from failing at Send to Tally because of an expired token.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - reduced setup-screen copy, removed duplicate context tiles, shortened the sync/upload messaging, and compacted the empty upload panel.
+- `apps/web/src/components/dashboard/DashboardSidebar.tsx` - keeps the sidebar label as Bank Statements but routes that item to the Tally Prime connection page.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - moved the Cash Discounts company selector, Tally readiness, heartbeat, and refresh action into a compact top-right header cluster and removed the bulky setup card.
+- `supabase/migrations/20260708062944_add_bank_statement_outgoing_verification.sql` - adds the missing bank-transaction and posting-log statuses for outgoing verification, then backfills already-completed verification command results into the transaction/log rows.
+- `apps/api/src/app/api/tally/bridge/commands/[commandId]/result/route.ts` - now checks database update/upsert errors when saving bank voucher and outgoing verification results, preventing silent fake-success states.
+- `apps/api/src/app/api/bank-statements/tally/queue/route.ts` - now checks status-update errors when marking receipt rows pending and debit rows checking in Tally.
+- `apps/api/src/app/api/bank-statements/tally/queue/route.ts` - keeps outgoing debit rows as verification-only Tally checks, so missing debits are flagged instead of being auto-created from the bank statement review.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - simplifies debit rows to show only the Tally check result such as Found in Tally, Missing in Tally, or Possible Match, while keeping the side panel for possible voucher details.
+- `apps/api/src/app/api/tally/connections/[id]/commands/route.ts` - lets the review screen queue a safe `verify_bank_transaction` command so outgoing bank debits can be checked against existing Tally vouchers before final posting.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - changes the review action from receipt-only bill matching to `Check Tally Matches`, matching incoming receipts to bills and checking outgoing debits for existing Tally entries with row-level results like Found in Tally, Missing in Tally, or Possible Match.
+- `apps/api/src/lib/bank-statement-ledger-matching.ts` - now prioritizes standard bank transaction categories such as bank charges and fees before party-name matching, preventing fee rows from being matched to the bank account ledger.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - now prefers standard ledgers such as `Bank Charges` for bank fee rows during review and renames row status from `Matched` to `Ledger matched` so it is clear this is ledger matching, not bill/payment verification.
+- `supabase/migrations/202607080001_bank_statement_outgoing_verification.sql` - extends the Tally bridge command constraint to allow outgoing bank transaction verification commands.
+- `apps/api/src/lib/tally/commands.ts` - added the `verify_bank_transaction` bridge command type.
+- `apps/api/src/app/api/bank-statements/tally/queue/route.ts` - split bank statement Tally actions so credits queue receipt posting while debits queue verification against existing Tally vouchers instead of creating payments.
+- `apps/api/src/app/api/tally/bridge/commands/[commandId]/result/route.ts` - saves outgoing verification results as verified, missing in Tally, needs review, or verification failed.
+- `apps/api/src/app/api/bank-statements/transactions/route.ts` - allows previously missing outgoing rows to be rechecked.
+- `apps/api/src/app/api/bank-statements/imports/[id]/confirm/route.ts` - refreshes existing missing/failed verification rows on re-upload so they can be checked again.
+- `apps/tally-bridge/src/bridge.mjs` - added Tally voucher scanning for outgoing bank payments using date, amount, bank ledger, UTR/reference, and party ledger evidence, persists the active Tally company detected during pair/test/sync/heartbeat so `Nyx` is not lost after reconnect, and restores the Electron desktop connector export surface/runner guard expected by the packaged EXE.
+- `apps/api/src/app/api/tally/connections/[id]/pair/route.ts` - stores bridge-reported company readiness and active company name during pairing.
+- `apps/api/src/app/api/tally/bridge/masters/route.ts` - stores the bridge-reported active company name during master sync and refreshes connection readiness from that signal.
+- `apps/api/src/app/api/tally/bridge/heartbeat/route.ts` - resolves missing heartbeat company names from the connection or latest synced company so old/stale connector payloads cannot overwrite `Nyx` with a generic label.
+- `C:/Autodealer/tally-bridge/src/bridge.mjs` - mirrored the outgoing bank payment verification logic, active-company persistence fixes, and Electron export/runner fixes into the installed local bridge source.
+- `C:/Autodealer/tally-bridge/resources/app.asar` - patched the bundled bridge copy inside the installed Electron connector so future EXE-launched reconnects use the same active-company persistence and Electron import fixes.
+- `C:/Autodealer/tally-bridge/resources/app.asar.backup-2026-07-08T08-06-28.asar` - backup of the installed Electron connector archive before patching the bundled bridge copy.
+- `C:/Autodealer/tally-bridge/resources/app.asar.backup-2026-07-08T08-23-48.asar` - backup of the installed Electron connector archive before restoring the Electron export surface in the bundled bridge copy.
+- `C:/Users/Shubham/.autodealer-tally-bridge/config.json` - pointed the local bridge directly at the API dev server instead of routing through the frontend proxy, restored the active connection token, and saved the detected `Nyx` company name for stable reconnects.
+- `apps/web/src/components/tally/TallyPrimeDashboard.tsx` - makes local one-click Tally connector links target the API dev server directly (`localhost:3001`) instead of depending on the frontend proxy when the app runs on `localhost:3000`.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - changed bank-statement UX copy and row actions to post incoming receipts and check outgoing payments, with bill matching only for incoming customer receipts.
+- `scripts/seed_bank_statement_verification_pack.mjs` - added a repeatable August 2026 Tally/bank-statement verification pack covering receipt posting, bill allocation, partials, advances, outgoing verification, missing outgoing rows, bank charges, ambiguity, and Cash Discounts recovery.
+- `output/pdf/bank-statement-verification-2026-08/bank_statement_verification_manifest.json` - generated the test manifest with row-by-row expected outcomes kept outside the uploaded PDF.
+- `output/pdf/bank-statement-verification-2026-08/README.md` - generated the human checklist for testing the August bank statement pack.
+- `output/pdf/bank-statement-verification-2026-08/AccountStatement_01-Aug-2026_31-Aug-2026.pdf` - generated the realistic bank statement PDF for import testing.
+- `output/pdf/bank-statement-verification-2026-08/AccountStatement_01-Aug-2026_31-Aug-2026.page1.png` - rendered page preview used to visually verify the generated PDF.
 
-- **NYX-151**: Cash Discount pages now load the latest saved dashboard first, then refresh Tally data in the background so minimal data does not wait on the full sync.
-  - **How to test**: Open Cash Discounts for a connected company. Confirm saved dashboard data appears first, then the page shows background sync progress and updates again after Tally sync completes.
+## 2026-07-07
 
-- **NYX-152**: Resend debit note functionality is already available for created debit notes.
-  - **How to test**: Send a created debit note through WhatsApp once. Open the Created tab again and confirm the button shows Resend. Click Resend and verify the WhatsApp dialog opens and sends the same debit note PDF again.
+- `apps/api/src/lib/tally/commands.ts` - added the `fetch_bank_ledgers` bridge command type so the app can ask the local connector for real bank-account ledgers.
+- `apps/api/src/app/api/tally/connections/[id]/commands/route.ts` - queues company-scoped bank-ledger fetch commands for the bridge.
+- `apps/api/src/app/api/tally/companies/route.ts` - stopped using local Tally data-folder guesses for live company dropdowns, and now lets fresh heartbeat company names win over stale sync history.
+- `apps/tally-bridge/src/bridge.mjs` - added live Tally Bank Accounts export support, stopped advertising folder-discovered companies as live companies, and bumped the bridge to `0.1.12`.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - fetches bank ledgers from Tally through the bridge for all visible companies and avoids masking an empty live result with stale fallback data.
+- `apps/web/src/components/dashboard/DashboardHome.tsx` - added explicit daily summary types so the web type check passes cleanly.
+- `scripts/build-tally-connector-installer.mjs` - bumped the packaged connector runtime version to `0.1.12`.
+- `installer/tally-bridge/payload-clean/resources/app/src/bridge.mjs` - refreshed the installer payload with the corrected bridge runtime.
+- `C:/Autodealer/tally-bridge/resources/app/src/bridge.mjs` - refreshed the installed connector runtime with the corrected bridge code.
+
+- `supabase/migrations/202607070001_collections_cash_discount.sql` - added workflow-only Cash Discount rules, debit-note proposal, collections cache tables, and allowed the bridge queue to carry `create_debit_note` commands.
+- `supabase/migrations/202607070002_collections_debit_note_history.sql` - added debit-note customer contact snapshots, created-in-Tally audit fields, remaining recovery amount, and communication status fields.
+- `apps/api/src/lib/collections.ts` - added shared serializers and value coercion helpers for Cash Discount and debit-note proposal APIs.
+- `apps/api/src/lib/tally/masters.ts` - carries Tally ledger email, phone, contact person, and address fields into synced master data.
+- `apps/api/src/app/api/tally/companies/route.ts` - added authenticated company context lookup from Tally connections and latest master sync runs, now prefers the live Tally heartbeat company name over stale sync/display labels, and hides stale connector rows when a live connected company exists.
+- `apps/api/src/app/api/tally/connections/[id]/disconnect/route.ts` - preserves the last loaded Tally company name when a bridge is disconnected so company-scoped workflow data remains findable after reconnecting.
+- `apps/api/src/app/api/tally/bridge/heartbeat/route.ts` - preserves the last known Tally company name when an older connector heartbeat omits it, preventing `Nyx` from being overwritten by a generic Tally label.
+- `apps/api/src/app/api/collections/dashboard/route.ts` - added the collections dashboard API using workflow proposal/rule data, enriches debit-note proposals with Tally ledger contact snapshots, keeps Collections independent from bank-statement transactions, and loads records across reconnected Tally connections for the same company.
+- `apps/api/src/app/api/collections/cash-discount-rules/route.ts` - added Cash Discount rule list/create endpoints with setup-required handling.
+- `apps/api/src/app/api/collections/debit-note-proposals/route.ts` - added debit-note proposal list/create endpoints with setup-required handling and saves customer/contact snapshots on new proposals.
+- `apps/api/src/app/api/collections/debit-note-proposals/[id]/approve/route.ts` - added approval flow that queues debit-note creation for the Tally bridge, and avoids sending the UI label `Tally Prime` as a real Tally company name.
+- `apps/api/src/app/api/bank-statements/imports/route.ts` - requires Tally company and bank ledger before bank statement analysis, stores that context and the auto-sync preference with the import job, and leaves statement period blank until it is extracted from the uploaded file.
+- `apps/api/src/app/api/bank-statements/imports/[id]/route.ts` - returns stored statement period dates with bank statement previews.
+- `apps/api/src/app/api/bank-statements/imports/[id]/confirm/route.ts` - returns stored statement period dates after confirmation and fixes checkpoint handling so overlapping/reuploaded statements are not skipped unless the exact checkpoint row is present.
+- `apps/api/src/lib/bank-statements.ts` - adds running-balance validation so extracted bank rows can correct debit/credit direction when the balance proves the model read it wrong.
+- `apps/api/worker/process-packet-jobs.mjs` - applies the same running-balance debit/credit correction before saving preview rows and writes the extracted statement period into the completed analysis metadata.
+- `apps/api/src/lib/tally/commands.ts` - added `create_debit_note` to bridge command typing.
+- `apps/api/src/app/api/tally/connections/[id]/commands/route.ts` - lets the open-bill command accept multiple party ledgers in one queued request while keeping the old single-ledger payload compatible.
+- `apps/api/src/app/api/tally/bridge/commands/[commandId]/result/route.ts` - updates debit-note proposals when the bridge reports Tally success or failure, including voucher id, open reference, remaining recovery amount, and created timestamp.
+- `apps/tally-bridge/src/bridge.mjs` - added Debit Note voucher XML creation and command execution support, carries bill allocation references on supplier payment vouchers, fetches open bills for multiple party ledgers with one Tally export, syncs the Tally bill-wise ledger flag, posts Cash Discount debit notes as a transfer from the original invoice to a new debit-note recovery reference so outstanding does not double, extracts ledger contact details, and detects the active Tally company name during heartbeat.
+- `C:/Autodealer/tally-bridge/src/bridge.mjs` - mirrored the supplier payment bill-allocation, bulk open-bill fetch, bill-wise flag, corrected Cash Discount debit-note posting, ledger contact extraction, and active company-name heartbeat changes into the local connector source beside the packaged app.
+- `C:/Users/Shubham/.autodealer-tally-bridge/config.json` - recreated the local bridge pairing config so the connector can heartbeat and claim queued Tally commands again.
+- `scripts/seed_collections_test_data.mjs` - added a reusable seed utility that creates isolated collections/bank-statement test ledgers, open bills, a Cash Discount rule, a debit-note proposal, and a matching bank statement manifest.
+- `scripts/create_collections_bank_statement_pdf.py` - added the ReportLab renderer for the collections bank statement test PDF.
+- `scripts/seed_collections_stress_pack.mjs` - added a realistic repeatable Collections/bank-statement stress-pack seed that creates natural party ledgers, open Tally bill refs, a standard Cash Discount rule, a pending debit-note proposal, and a matching statement manifest without scenario hints in names.
+- `scripts/create_collections_stress_statement_pdf.py` - added the ReportLab renderer for the realistic stress-test bank statement PDF.
+- `output/pdf/collections-bank-test/collections_test_manifest.json` - generated the test manifest with expected bank-matching and collections cases.
+- `output/pdf/collections-bank-test/AccountStatement_KTC-260707_01-Jul-2026_31-Jul-2026.pdf` - generated the bank statement PDF for end-to-end testing.
+- `output/pdf/collections-bank-test/AccountStatement_KTC-260707_01-Jul-2026_31-Jul-2026.page1.png` - rendered page preview used to visually verify the generated PDF.
+- `output/pdf/collections-stress-2026-07-07/collections_stress_manifest.json` - generated the realistic stress-pack manifest with expected outcomes kept outside the uploaded PDF.
+- `output/pdf/collections-stress-2026-07-07/AccountStatement_01-Jul-2026_31-Jul-2026.pdf` - generated the realistic bank statement PDF for stress testing bank posting plus Collections debit-note flow.
+- `output/pdf/collections-stress-2026-07-07/AccountStatement_01-Jul-2026_31-Jul-2026.page1.png` - rendered page preview used to visually verify the stress statement PDF.
+- `apps/web/src/app/collections/page.tsx` - added the Collections route inside the app shell.
+- `apps/web/next.config.js` - pinned Turbopack root to the Kalika-Shilpa workspace so Next does not scan the whole Windows user folder.
+- `apps/api/next.config.js` - pinned Turbopack root to the Kalika-Shilpa workspace so API dev mode does not scan the whole Windows user folder.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - added the company-scoped Collections UI, redesigned it into a calmer task-first workbench with simple Needs Action, Done, and Rules views, changed debit-note create/history views from bulky cards to compact bank-statement-style tables focused on customer, issue, amount, status, and action, fixed page/card padding, removed bank-ledger/receipt-review sections from Collections, and removed manual debit-note creation so only system-suggested recoveries are actionable.
+- `apps/api/src/lib/msg91/whatsapp.ts` - added the MSG91 WhatsApp helper for reading environment configuration, listing templates, building debit-note template payloads, normalizing phone numbers, and sending the temporary `share_invoice` test template until the debit-note template is approved.
+- `apps/api/src/lib/debit-notes/pdf.ts` - added debit-note PDF generation, private Supabase storage upload, storage-reference encoding, and signed URL creation for WhatsApp attachments.
+- `apps/api/src/app/api/collections/whatsapp/templates/route.ts` - added an authenticated endpoint to verify MSG91 configuration and list connected WhatsApp templates without exposing the auth key.
+- `apps/api/src/app/api/collections/debit-note-proposals/[id]/whatsapp/route.ts` - added an authenticated send endpoint for created debit notes that sends WhatsApp through MSG91, now preferring the stored debit-note PDF signed URL before falling back to the temporary test document.
+- `apps/api/src/app/api/tally/bridge/commands/[commandId]/result/route.ts` - generates and stores a debit-note PDF after Tally confirms debit-note creation, then saves the storage reference on the proposal.
+- `apps/api/.env` - added local MSG91 WhatsApp settings for testing.
+- `.env.example` - documented MSG91 WhatsApp environment variables and the temporary test-template mode.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - added a compact WhatsApp send/retry action and message status in the Done debit-note table, and switches to Done after debit-note creation is queued with a follow-up refresh for the Tally bridge result.
+- `apps/web/src/components/dashboard/DashboardSidebar.tsx` - renamed the user-facing Collections navigation item to Cash Discounts and restored the bank statement workflow in the sidebar as Bank Statements.
+- `apps/web/src/components/collections/CollectionsDashboardPage.tsx` - renamed the user-facing Collections page title and setup/load messages to Cash Discounts while keeping internal routes stable.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - changed the bank statement flow to require only company and bank ledger before upload, reads the statement period from the uploaded file after analysis, auto-syncs company data before analysis unless turned off, uses the freshly synced ledger list immediately when rendering review rows, keeps the selected context visible through review and posting, makes the statement review grid scroll inside the table, avoids showing a successful send when zero rows were queued, and changes bill matching from customer-receipt-only to bill-wise party rows with clearer row-level reasons and one grouped open-bill fetch.
+- `apps/api/src/app/api/tally/companies/route.ts` - exposes locally discovered Tally companies and their bank account ledgers so Bank Statements can show all local companies even when Tally is on the company-selection screen.
+- `apps/web/src/components/bank-statements/BankStatementsPage.tsx` - uses locally discovered bank account ledgers immediately in the Bank Ledger dropdown, avoids full ledger-master fetches on page open/company switch, and fills selected bank details from the local ledger fallback.
+- `apps/web/src/components/dashboard/DashboardSidebar.tsx` - added Collections to the main sidebar navigation.
+
+## 2026-07-10
+
+- `apps/web/src/components/cases/CaseDetailPage.tsx` - replaced with Vaishnavi's Case workflow implementation, including duplicate-copy display collapsing and split/seller-chain context presentation; the prior local version is preserved under `.codex-merge-backup/vaishnavi-case-flow-20260710-163803/`.
+- `apps/web/src/components/cases/CaseMismatchPage.tsx` - replaced with Vaishnavi's mismatch-review implementation as the Cases source of truth.
+- `apps/web/src/components/workspace/WorkspacePage.tsx` - replaced with Vaishnavi's Case upload and analysis implementation.
+- `apps/web/src/services/verification.ts` - replaced with Vaishnavi's browser-side Case verification logic.
+- `apps/api/src/services/verification.ts` - replaced with Vaishnavi's authoritative Case verification logic for seller chains, multi-invoice reconciliation, duplicate copies, and grouped evidence.
+- `apps/api/src/app/api/internal/jobs/[id]/run/route.ts` - replaced with Vaishnavi's Case-analysis and split-case processing flow, including `splitAnalysis` metadata.
+- `apps/api/src/app/api/cases/[id]/route.ts` - replaced with Vaishnavi's Case-detail response route to match the merged Cases frontend.
+- `apps/web/src/components/cases/PacketIntelligencePanel.tsx` - hides routine single-shipment packet intelligence so the case-detail sidebar prioritizes the document list; packet-structure exceptions remain visible.
+- `apps/web/src/components/cases/CaseMismatchPage.tsx` - expands the mismatch review canvas to the available desktop/laptop width, uses a slightly narrower responsive issue rail, and preserves readable comparison values on smaller screens.
+- `apps/web/src/components/cases/CaseDetailPage.tsx` - makes the entire desktop detail sidebar scroll as one continuous packet/document rail so long seller-chain and multi-shipment signals never hide documents below the fold.
+- `apps/api/src/app/api/cases/[id]/route.ts` - returns sibling shipment cases from the same split upload batch using existing processing metadata, without a schema change.
+- `apps/web/src/lib/case-persistence.ts` - adds the typed split-upload shipment batch to case-detail responses.
+- `apps/web/src/components/cases/ShipmentBatchPanel.tsx` - adds a compact upload-batch navigator so reviewers can move directly between the separately organized shipments.
+- `apps/web/src/components/cases/CaseDetailPage.tsx` - places the shipment-batch navigator above the individual document workspace.
+- `MODIFIED_FILES.md` - recorded the packet-intelligence sidebar simplification.
+
+## 2026-07-02
+
+- `apps/api/src/lib/packet-intelligence.ts` - added deterministic packet diagnosis for duplicate uploaded packets, duplicate invoice copies, multi-invoice uploads, seller-chain packets, tax/terms signals, and reviewer actions.
+- `apps/api/src/app/api/cases/[id]/route.ts` - returns `packetIntelligence` from case detail responses and looks up duplicate case references from upload fingerprints where available.
+- `apps/web/src/lib/packet-intelligence.ts` - added the frontend packet-intelligence response types.
+- `apps/web/src/lib/case-persistence.ts` - added `packetIntelligence` to saved case detail responses.
+- `apps/web/src/components/cases/PacketIntelligencePanel.tsx` - added the compact packet diagnosis panel used by case detail and mismatch review screens.
+- `apps/web/src/components/cases/CaseMismatchPage.tsx` - shows the packet diagnosis above mismatch details so reviewers see packet structure before issue decisions.
+- `apps/web/src/components/cases/CaseDetailPage.tsx` - shows the packet diagnosis in the desktop sidebar and mobile detail view.
+- `apps/api/src/lib/processing/case-splitting.ts` - added conservative shipment-group splitting for reviewed extracted documents, including duplicate-copy and seller-chain guards, per-shipment re-verification, child case creation, and copied preview files.
+- `apps/api/src/app/api/internal/jobs/[id]/run/route.ts` - invokes shipment splitting after extraction review so multi-invoice uploads save as separate completed cases instead of one flat mismatch case.
+- `scripts/create_packet_test_pdfs.py` - rebuilt the ReportLab generator so every synthetic packet-intelligence PDF contains complete shipment evidence with neutral realistic filenames, business-like document numbers, and no category labels inside the uploaded PDFs.
+- `output/pdf/packet-intelligence-test-set/` - regenerated complete-packet blind-test PDFs, README, and manifest; expected categories remain only in the manifest/README for human reference.
+
+## 2026-07-01
+
+- `apps/web/src/components/cases/CasesPage.tsx` - redesigned the `/cases` directory UI, changed cases pagination to 10 per page, normalized case/company/category display text to readable sentence case, removed the separate company/category column and unused filter/page-size controls, split case state into analysis/reconciliation/decision signals, wired status/sort to server-side results, corrected the footer count label to cases, softened all heavy typography to medium weight, and simplified the toolbar to search only.
+- `apps/web/src/lib/case-persistence.ts` - added case list status and sort query parameters to the client fetch helper.
+- `apps/api/src/app/api/cases/route.ts` - added server-side case list status filtering and sorting before pagination, restored exact paginated counts, and fixed legacy no-`deleted_at` pagination so active cases report the real page count.
+- `apps/api/src/lib/processing/packet-upload-debug.ts` - added the packet upload AI debug log helper required by the merged cases API route.
+- `apps/web/src/components/cases/CaseDetailPage.tsx` - aligned case detail typography, fixed the desktop document sidebar scroll/wrapping, added an action-oriented case decision card, compacted the extracted data view, made the packet index document-type-first with truncated filenames and page numbers, removed internal Packet AI usage details from the UI, and softened all heavy typography to medium weight.
+- `apps/web/src/components/cases/CaseMismatchPage.tsx` - redesigned mismatch review around saved review groups, added a first-class line item group, grouped/expandable issue navigation, reviewer hints, a side-by-side comparison table for true document mismatches, a separate validation-issue layout for one-document rule failures, GST/tax-specific parsing so tax shortfalls show expected vs extracted values clearly, value-only line item comparison cells, softened all heavy typography to medium weight, and compacted the single-document validation/tax issue layout.
+- `apps/web/src/components/cases/RecycleBinPage.tsx` - softened all heavy typography to medium weight so recycle-bin case surfaces match the lighter case UI.
+- `apps/web/src/app/settings/page.tsx` - redesigned the settings page into a simple Review Rules workspace with summary metrics, document search, switch-style rails, lighter typography, and clearer document/field and review group editing.
+- `apps/web/src/app/layout.tsx` - added Poppins through `next/font` and applied it to the app body.
+- `apps/web/src/app/globals.css` - updated the app sans font token and base text rendering.
+- `package.json` - updated by npm while refreshing Windows native optional dependencies needed to run Next.js locally and adding `motion-dom` explicitly for Framer Motion.
+- `package-lock.json` - updated by npm while refreshing Windows native optional dependencies needed to run Next.js locally and locking `motion-dom`.
+- `MODIFIED_FILES.md` - added this tracker.

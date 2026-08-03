@@ -3,9 +3,7 @@ import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { POST as runTallyQueue } from "../../../queue/route";
 
-const QUEUE_JOB_BATCH_SIZE = Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_BATCH_SIZE ?? 1);
-const QUEUE_JOB_LOCK_STALE_MS = Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_LOCK_STALE_MS ?? 2 * 60_000);
-const QUEUE_JOB_RUNNER_ID = `queue-runner-${process.pid}-${Math.random().toString(36).slice(2)}`;
+const QUEUE_JOB_BATCH_SIZE = Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_BATCH_SIZE ?? 20);
 
 type QueueJobPayload = {
   connectionId?: string;
@@ -35,37 +33,6 @@ function readResult(value: unknown): QueueJobResult {
   return readRecord(value) as QueueJobResult;
 }
 
-function errorText(error: unknown) {
-  if (error instanceof Error) return error.message;
-  if (error && typeof error === "object") {
-    const record = error as Record<string, unknown>;
-    return [record.message, record.details, record.hint]
-      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-      .join(" ");
-  }
-  return String(error ?? "").trim();
-}
-
-function queueJobErrorPayload(error: unknown) {
-  const message = errorText(error);
-  if (/bank_statement_tally_queue_jobs|bank_transaction_posting_log|tally_mapping_settings|relation .*does not exist|schema cache/i.test(message)) {
-    return {
-      error: "Bank Statement posting setup is not ready.",
-      userAction: "Run the latest database migration, then try again.",
-    };
-  }
-  if (/on conflict|unique or exclusion constraint|duplicate key/i.test(message)) {
-    return {
-      error: "Some selected rows are already queued or saved.",
-      userAction: "Refresh the statement status, then send again.",
-    };
-  }
-  return {
-    error: message || "Could not prepare the statement for Tally.",
-    userAction: "Refresh the page and try again.",
-  };
-}
-
 function serializeQueueJob(row: Record<string, unknown>) {
   return {
     id: row.id,
@@ -78,13 +45,6 @@ function serializeQueueJob(row: Record<string, unknown>) {
     updatedAt: row.updated_at,
     completedAt: row.completed_at ?? null,
   };
-}
-
-function queueJobIsLocked(row: Record<string, unknown>) {
-  const lockedAt = typeof row.locked_at === "string" ? row.locked_at : "";
-  if (!lockedAt) return false;
-  const lockedAtMs = new Date(lockedAt).getTime();
-  return Number.isFinite(lockedAtMs) && Date.now() - lockedAtMs < QUEUE_JOB_LOCK_STALE_MS;
 }
 
 function transactionIdsFromPayload(payload: QueueJobPayload) {
@@ -162,53 +122,10 @@ export async function POST(
       });
     }
 
-    if (queueJobIsLocked(job as Record<string, unknown>)) {
-      return jsonWithCors(request, {
-        job: serializeQueueJob(job as Record<string, unknown>),
-        result: null,
-      });
-    }
-
-    const lockCutoff = new Date(Date.now() - QUEUE_JOB_LOCK_STALE_MS).toISOString();
-    const lockStartedAt = new Date().toISOString();
-    const { data: lockedJob, error: lockError } = await supabase
-      .from("bank_statement_tally_queue_jobs")
-      .update({
-        status: "running",
-        started_at: job.started_at ?? lockStartedAt,
-        locked_at: lockStartedAt,
-        locked_by: QUEUE_JOB_RUNNER_ID,
-        updated_at: lockStartedAt,
-      })
-      .eq("id", id)
-      .eq("owner_user_id", user.id)
-      .or(`locked_at.is.null,locked_at.lt.${lockCutoff}`)
-      .select("*")
-      .maybeSingle();
-
-    if (lockError) throw lockError;
-    if (!lockedJob) {
-      const { data: currentJob, error: currentJobError } = await supabase
-        .from("bank_statement_tally_queue_jobs")
-        .select("*")
-        .eq("id", id)
-        .eq("owner_user_id", user.id)
-        .maybeSingle();
-
-      if (currentJobError) throw currentJobError;
-      return jsonWithCors(request, {
-        job: currentJob
-          ? serializeQueueJob(currentJob as Record<string, unknown>)
-          : serializeQueueJob(job as Record<string, unknown>),
-        result: null,
-      });
-    }
-
-    const workingJob = lockedJob as Record<string, unknown>;
-    const payload = readPayload(workingJob.request_payload);
+    const payload = readPayload(job.request_payload);
     const allTransactionIds = transactionIdsFromPayload(payload);
-    const processedCount = Math.max(0, Number(workingJob.processed_count ?? 0));
-    const totalCount = allTransactionIds.length || Number(workingJob.total_count ?? 1) || 1;
+    const processedCount = Math.max(0, Number(job.processed_count ?? 0));
+    const totalCount = allTransactionIds.length || Number(job.total_count ?? 1) || 1;
     const batchIds = allTransactionIds.length
       ? allTransactionIds.slice(processedCount, processedCount + QUEUE_JOB_BATCH_SIZE)
       : [];
@@ -231,8 +148,6 @@ export async function POST(
         .update({
           status: "succeeded",
           processed_count: totalCount,
-          locked_at: null,
-          locked_by: null,
           completed_at: completedAt,
           updated_at: completedAt,
         })
@@ -248,6 +163,17 @@ export async function POST(
       });
     }
 
+    const now = new Date().toISOString();
+    await supabase
+      .from("bank_statement_tally_queue_jobs")
+      .update({
+        status: "running",
+        started_at: job.started_at ?? now,
+        updated_at: now,
+      })
+      .eq("id", id)
+      .eq("owner_user_id", user.id);
+
     const queueRequest = new Request(request.url, {
       method: "POST",
       headers: buildInternalQueueHeaders(request),
@@ -258,16 +184,11 @@ export async function POST(
     if (!queueResponse.ok) {
       const failedAt = new Date().toISOString();
       const error = String(queueBody?.error ?? `Queue job failed with status ${queueResponse.status}`);
-      const detail = typeof queueBody?.detail === "string" ? queueBody.detail : "";
-      const userAction = typeof queueBody?.userAction === "string" ? queueBody.userAction : "";
-      const combinedError = [error, detail, userAction].filter(Boolean).join(" ");
       const { data: failedJob, error: failedUpdateError } = await supabase
         .from("bank_statement_tally_queue_jobs")
         .update({
           status: "failed",
-          error: combinedError,
-          locked_at: null,
-          locked_by: null,
+          error,
           updated_at: failedAt,
           completed_at: failedAt,
         })
@@ -279,13 +200,11 @@ export async function POST(
       if (failedUpdateError) throw failedUpdateError;
       return jsonWithCors(request, {
         error,
-        detail: detail || undefined,
-        userAction: userAction || undefined,
         job: serializeQueueJob(failedJob as Record<string, unknown>),
       }, { status: 400 });
     }
 
-    const nextResult = mergeQueueResults(readResult(workingJob.result), readResult(queueBody));
+    const nextResult = mergeQueueResults(readResult(job.result), readResult(queueBody));
     const nextProcessedCount = allTransactionIds.length
       ? Math.min(totalCount, processedCount + batchIds.length)
       : totalCount;
@@ -298,8 +217,6 @@ export async function POST(
         processed_count: nextProcessedCount,
         result: nextResult,
         error: null,
-        locked_at: null,
-        locked_by: null,
         updated_at: updatedAt,
         completed_at: done ? updatedAt : null,
       })
@@ -318,7 +235,7 @@ export async function POST(
     console.error("Error in POST /api/bank-statements/tally/queue-jobs/[id]/run:", error);
     return jsonWithCors(
       request,
-      queueJobErrorPayload(error),
+      { error: error instanceof Error ? error.message : "Internal server error" },
       { status: 500 }
     );
   }

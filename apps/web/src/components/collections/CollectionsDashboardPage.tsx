@@ -2,16 +2,11 @@
 
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ArrowUpDown,
   CheckCircle2,
   Download,
-  Eye,
-  Filter,
   Loader2,
   MessageCircle,
   RefreshCw,
-  RotateCcw,
-  Search,
   Send,
   Sparkles,
   TriangleAlert,
@@ -19,6 +14,7 @@ import {
 } from "lucide-react";
 
 import { apiFetch } from "@/lib/api-client";
+import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 
 type CompanyOption = {
   id: string;
@@ -249,16 +245,12 @@ type DashboardPayload = {
   notes?: string[];
 };
 
-type DashboardVersionPayload = {
-  version?: string | null;
-  changedAt?: string | null;
-  setupRequired?: boolean;
-  error?: string;
-};
-
 type ActiveView = "needsAction" | "followUps" | "done";
-type DebitNoteFilter = "all" | "contact_ready" | "missing_contact" | "message_sent" | "message_pending" | "high_amount";
-type DebitNoteSort = "date_desc" | "date_asc" | "amount_desc" | "amount_asc" | "customer_asc" | "status_asc";
+
+type CollectionsDashboardPageProps = {
+  initialView?: ActiveView;
+  showWorkflowSummary?: boolean;
+};
 
 function formatMoney(value?: number | null) {
   if (value === null || value === undefined || Number.isNaN(value)) return "-";
@@ -281,52 +273,6 @@ function formatDate(value?: string | null) {
   }).format(new Date(value));
 }
 
-function formatDateTime(value?: string | null) {
-  if (!value) return "-";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat("en-IN", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
-}
-
-function formatDateForFileName(value?: string | null) {
-  const date = value ? new Date(value) : new Date();
-  const safeDate = Number.isNaN(date.getTime()) ? new Date() : date;
-  return new Intl.DateTimeFormat("en-GB", {
-    day: "2-digit",
-    month: "long",
-    year: "numeric",
-  })
-    .format(safeDate)
-    .replace(/\s+/g, "_");
-}
-
-function safeFileNamePart(value: unknown, fallback: string, maxLength = 80) {
-  const text = String(value ?? "").trim().slice(0, maxLength) || fallback;
-  return text
-    .replace(/[^a-z0-9]+/gi, "_")
-    .replace(/_+/g, "_")
-    .replace(/^_|_$/g, "") || fallback;
-}
-
-function cashDiscountDebitNoteDownloadName(proposal: DebitNoteProposal) {
-  const partyName = safeFileNamePart(proposal.partyLedgerName, "Party", 90);
-  const voucherNumber = safeFileNamePart(
-    proposal.tallyVoucherNumber,
-    `Debit_Note_${proposal.id.slice(0, 8)}`,
-    60
-  );
-  const voucherDate = formatDateForFileName(
-    proposal.tallyVoucherDate ?? proposal.debitNoteDate ?? proposal.createdInTallyAt
-  );
-  return `Cash_Discount_Debit_Note_${partyName}_${voucherNumber}_${voucherDate}.pdf`;
-}
-
 function daysPast(value?: string | null) {
   if (!value) return null;
   const date = new Date(`${value}T00:00:00`);
@@ -338,72 +284,6 @@ function daysPast(value?: string | null) {
 
 function sumRecoverable(values: DebitNoteProposal[]) {
   return values.reduce((total, item) => total + (Number(item.recoverableAmount) || 0), 0);
-}
-
-function proposalDateValue(proposal: DebitNoteProposal) {
-  const rawDate = proposal.createdInTallyAt ?? proposal.tallyVoucherDate ?? proposal.debitNoteDate ?? proposal.linkedInvoiceDate;
-  const date = rawDate ? new Date(rawDate) : null;
-  return date && !Number.isNaN(date.getTime()) ? date.getTime() : 0;
-}
-
-function proposalSearchText(proposal: DebitNoteProposal) {
-  return [
-    proposal.partyLedgerName,
-    proposal.partyGstin,
-    proposal.partyEmail,
-    proposal.partyPhone,
-    proposal.partyContactPerson,
-    proposal.linkedInvoiceNumber,
-    proposal.tallyVoucherNumber,
-    proposal.tallyOpenReferenceName,
-    proposal.sourceSalesLedgerName,
-    proposal.narration,
-    proposal.cashDiscountAnalysis?.sourceNarration,
-    proposal.cashDiscountAnalysis?.matchedCashDiscountContext,
-    proposal.cashDiscountAnalysis?.termsLabel,
-    proposal.status,
-    proposal.communicationStatus,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-}
-
-function proposalHasContact(proposal: DebitNoteProposal) {
-  return Boolean(proposal.partyPhone || proposal.partyEmail || proposal.partyGstin);
-}
-
-function matchesDebitNoteFilter(proposal: DebitNoteProposal, filterValue: DebitNoteFilter) {
-  if (filterValue === "contact_ready") return proposalHasContact(proposal);
-  if (filterValue === "missing_contact") return !proposalHasContact(proposal);
-  if (filterValue === "message_sent") return proposal.communicationStatus === "sent";
-  if (filterValue === "message_pending") return proposal.communicationStatus !== "sent";
-  if (filterValue === "high_amount") return (Number(proposal.recoverableAmount) || 0) >= 10000;
-  return true;
-}
-
-function compareDebitNoteProposals(left: DebitNoteProposal, right: DebitNoteProposal, sortValue: DebitNoteSort) {
-  if (sortValue === "amount_desc") return (Number(right.recoverableAmount) || 0) - (Number(left.recoverableAmount) || 0);
-  if (sortValue === "amount_asc") return (Number(left.recoverableAmount) || 0) - (Number(right.recoverableAmount) || 0);
-  if (sortValue === "customer_asc") return left.partyLedgerName.localeCompare(right.partyLedgerName);
-  if (sortValue === "status_asc") {
-    return `${left.status}:${left.communicationStatus ?? ""}`.localeCompare(`${right.status}:${right.communicationStatus ?? ""}`);
-  }
-  if (sortValue === "date_asc") return proposalDateValue(left) - proposalDateValue(right);
-  return proposalDateValue(right) - proposalDateValue(left);
-}
-
-function filterAndSortDebitNotes(
-  values: DebitNoteProposal[],
-  searchQuery: string,
-  filterValue: DebitNoteFilter,
-  sortValue: DebitNoteSort
-) {
-  const query = searchQuery.trim().toLowerCase();
-  return values
-    .filter((proposal) => (query ? proposalSearchText(proposal).includes(query) : true))
-    .filter((proposal) => matchesDebitNoteFilter(proposal, filterValue))
-    .sort((left, right) => compareDebitNoteProposals(left, right, sortValue));
 }
 
 function statusClass(value?: string) {
@@ -518,7 +398,7 @@ function canCreateInTally(proposal: DebitNoteProposal) {
 
 function messageLabel(proposal: DebitNoteProposal) {
   if (needsUpdatedPdfDelivery(proposal)) return "Send updated PDF";
-  if (proposal.communicationStatus === "sent") return "Resend";
+  if (proposal.communicationStatus === "sent") return "Sent";
   if (proposal.communicationStatus === "failed") return "Retry";
   if (!proposal.partyPhone) return "No phone";
   return "Send";
@@ -614,76 +494,6 @@ function EmptyState({ children }: { children: ReactNode }) {
   );
 }
 
-function DebitNoteListControls({
-  searchQuery,
-  filterValue,
-  sortValue,
-  resultCount,
-  totalCount,
-  onSearchChange,
-  onFilterChange,
-  onSortChange,
-}: {
-  searchQuery: string;
-  filterValue: DebitNoteFilter;
-  sortValue: DebitNoteSort;
-  resultCount: number;
-  totalCount: number;
-  onSearchChange: (value: string) => void;
-  onFilterChange: (value: DebitNoteFilter) => void;
-  onSortChange: (value: DebitNoteSort) => void;
-}) {
-  return (
-    <div className="flex flex-col gap-3 border-b border-[#e5ddd0] bg-[#fcfbfa] px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
-      <div className="relative min-w-0 flex-1">
-        <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-        <input
-          className="h-10 w-full rounded-xl border border-[#e5ddd0] bg-white pl-9 pr-3 text-xs font-semibold text-[#1a1a1a] outline-none transition focus:border-[#2d2d2d]"
-          onChange={(event) => onSearchChange(event.target.value)}
-          placeholder="Search customer, invoice, voucher, status"
-          type="search"
-          value={searchQuery}
-        />
-      </div>
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-        <label className="relative block">
-          <Filter className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-          <select
-            className="h-10 w-full appearance-none rounded-xl border border-[#e5ddd0] bg-white pl-9 pr-8 text-xs font-bold text-[#5a5046] outline-none transition focus:border-[#2d2d2d] sm:w-48"
-            onChange={(event) => onFilterChange(event.target.value as DebitNoteFilter)}
-            value={filterValue}
-          >
-            <option value="all">All records</option>
-            <option value="contact_ready">Contact ready</option>
-            <option value="missing_contact">Missing contact</option>
-            <option value="message_sent">Message sent</option>
-            <option value="message_pending">Message pending</option>
-            <option value="high_amount">High amount</option>
-          </select>
-        </label>
-        <label className="relative block">
-          <ArrowUpDown className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-          <select
-            className="h-10 w-full appearance-none rounded-xl border border-[#e5ddd0] bg-white pl-9 pr-8 text-xs font-bold text-[#5a5046] outline-none transition focus:border-[#2d2d2d] sm:w-44"
-            onChange={(event) => onSortChange(event.target.value as DebitNoteSort)}
-            value={sortValue}
-          >
-            <option value="date_desc">Newest first</option>
-            <option value="date_asc">Oldest first</option>
-            <option value="amount_desc">Amount high to low</option>
-            <option value="amount_asc">Amount low to high</option>
-            <option value="customer_asc">Customer A-Z</option>
-            <option value="status_asc">Status A-Z</option>
-          </select>
-        </label>
-        <span className="shrink-0 text-[11px] font-bold text-slate-400">
-          Showing {resultCount} of {totalCount}
-        </span>
-      </div>
-    </div>
-  );
-}
-
 async function readError(response: Response) {
   const payload = (await response.json().catch(() => ({}))) as { error?: string };
   return payload.error || `Request failed with status ${response.status}`;
@@ -707,15 +517,10 @@ function chunkValues<T>(values: T[], size: number) {
   return chunks;
 }
 
-interface CollectionsDashboardPageProps {
-  initialView?: ActiveView;
-  showWorkflowSummary?: boolean;
-}
-
 export function CollectionsDashboardPage({
   initialView = "needsAction",
   showWorkflowSummary = true,
-}: CollectionsDashboardPageProps) {
+}: CollectionsDashboardPageProps = {}) {
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
   const [selectedConnectionId, setSelectedConnectionId] = useState("");
   const [selectedCompanyId, setSelectedCompanyId] = useState("");
@@ -724,8 +529,6 @@ export function CollectionsDashboardPage({
   const [checkingLiveTallyCompany, setCheckingLiveTallyCompany] = useState(true);
   const [activeView, setActiveView] = useState<ActiveView>(initialView);
   const [loading, setLoading] = useState(true);
-  const [syncingTally, setSyncingTally] = useState(false);
-  const [cashDiscountLoadStep, setCashDiscountLoadStep] = useState("");
   const [approvingId, setApprovingId] = useState("");
   const [bulkCreating, setBulkCreating] = useState(false);
   const [sendingWhatsappId, setSendingWhatsappId] = useState("");
@@ -737,20 +540,9 @@ export function CollectionsDashboardPage({
   const [whatsappPhoneInputs, setWhatsappPhoneInputs] = useState<Record<string, string>>({});
   const [whatsappSaveToTally, setWhatsappSaveToTally] = useState(true);
   const [whatsappDialogSending, setWhatsappDialogSending] = useState(false);
-  const [viewingCreatedProposal, setViewingCreatedProposal] = useState<DebitNoteProposal | null>(null);
-  const [createReviewProposals, setCreateReviewProposals] = useState<DebitNoteProposal[]>([]);
-  const [createReviewSubmitting, setCreateReviewSubmitting] = useState(false);
-  const [createReviewProgress, setCreateReviewProgress] = useState("");
-  const [debitNoteSearchQuery, setDebitNoteSearchQuery] = useState("");
-  const [debitNoteFilter, setDebitNoteFilter] = useState<DebitNoteFilter>("all");
-  const [debitNoteSort, setDebitNoteSort] = useState<DebitNoteSort>("date_desc");
-  const [lastCashDiscountSyncAt, setLastCashDiscountSyncAt] = useState<string | null>(null);
   const [message, setMessage] = useState<{ tone: "success" | "error" | "info"; text: string } | null>(null);
   const initialLoadStartedRef = useRef(false);
   const lastLoadedConnectionRef = useRef("");
-  const dashboardVersionRef = useRef<string | null>(null);
-  const dashboardVersionCheckInFlightRef = useRef(false);
-  const cashDiscountPageBusyRef = useRef(false);
 
   const selectedCompany = useMemo(
     () =>
@@ -762,7 +554,18 @@ export function CollectionsDashboardPage({
   );
 
   const loadCompanies = useCallback(async () => {
-    const response = await apiFetch("/api/tally/companies", { cache: "no-store" });
+    const connectionId =
+      readPreferredTallyConnectionId() || selectedConnectionId;
+    if (!connectionId) {
+      setCompanies([]);
+      setSelectedCompanyId("");
+      setSelectedConnectionId("");
+      return [];
+    }
+    const response = await apiFetch(
+      `/api/tally/companies?connectionId=${encodeURIComponent(connectionId)}`,
+      { cache: "no-store" }
+    );
     if (!response.ok) throw new Error(await readError(response));
     const payload = (await response.json()) as { companies?: CompanyOption[]; selectedCompanyId?: string | null };
     const nextCompanies = uniqueCompanyOptions(payload.companies ?? []);
@@ -781,28 +584,7 @@ export function CollectionsDashboardPage({
       return nextCompanies.some((company) => company.connectionId === current) ? current : "";
     });
     return nextCompanies;
-  }, [selectedCompanyId]);
-
-  const loadDashboardVersion = useCallback(
-    async (connectionId = selectedConnectionId, companyName = selectedCompany?.companyName ?? "") => {
-      if (!connectionId) return null;
-      const params = new URLSearchParams({ connectionId });
-      if (companyName) params.set("companyName", companyName);
-      const response = await apiFetch(`/api/collections/dashboard/version?${params.toString()}`, { cache: "no-store" });
-      const payload = (await response.json().catch(() => ({}))) as DashboardVersionPayload;
-      if (!response.ok) throw new Error(payload.error || `Request failed with status ${response.status}`);
-      return payload.version ?? null;
-    },
-    [selectedCompany?.companyName, selectedConnectionId]
-  );
-
-  const syncDashboardVersionMarker = useCallback(
-    async (connectionId = selectedConnectionId, companyName = selectedCompany?.companyName ?? "") => {
-      const version = await loadDashboardVersion(connectionId, companyName).catch(() => null);
-      if (version) dashboardVersionRef.current = version;
-    },
-    [loadDashboardVersion, selectedCompany?.companyName, selectedConnectionId]
-  );
+  }, [selectedCompanyId, selectedConnectionId]);
 
   const loadDashboard = useCallback(
     async (connectionId = selectedConnectionId, companyName = selectedCompany?.companyName ?? "") => {
@@ -816,18 +598,12 @@ export function CollectionsDashboardPage({
       const payload = (await response.json().catch(() => ({}))) as DashboardPayload;
       if (!response.ok) throw new Error(payload.error || `Request failed with status ${response.status}`);
       setDashboard(payload);
-      void syncDashboardVersionMarker(connectionId, companyName);
     },
-    [selectedCompany?.companyName, selectedConnectionId, syncDashboardVersionMarker]
+    [selectedCompany?.companyName, selectedConnectionId]
   );
 
   const loadDebtorLedgers = useCallback(async (connectionId: string) => {
-    const params = new URLSearchParams({
-      type: "ledger",
-      parent: "Sundry Debtors",
-      limit: "5000",
-    });
-    const response = await apiFetch(`/api/tally/connections/${connectionId}/masters?${params.toString()}`, {
+    const response = await apiFetch(`/api/tally/connections/${connectionId}/masters?type=ledger&limit=5000`, {
       cache: "no-store",
     });
     if (!response.ok) throw new Error(await readError(response));
@@ -863,63 +639,6 @@ export function CollectionsDashboardPage({
     }
     throw new Error(
       options?.pendingMessage ?? "The Tally command is still pending. Check the connector status, then refresh."
-    );
-  }, []);
-
-  const pollCommands = useCallback(async (
-    connectionId: string,
-    commandIds: string[],
-    options?: {
-      timeoutSeconds?: number;
-      pendingMessage?: string;
-      onProgress?: (progress: { total: number; completed: number; remaining: number; running: number; queued: number }) => void;
-    }
-  ) => {
-    const pending = new Set(commandIds);
-    if (pending.size === 0) return;
-
-    const total = pending.size;
-    const timeoutSeconds = options?.timeoutSeconds ?? Math.max(90, pending.size * 60);
-    for (let attempt = 0; attempt < timeoutSeconds; attempt += 1) {
-      await wait(1000);
-      const response = await apiFetch(
-        `/api/tally/connections/${connectionId}/commands?${new URLSearchParams({
-          ids: Array.from(pending).join(","),
-          limit: String(Math.max(pending.size, 1)),
-        }).toString()}`,
-        { cache: "no-store" }
-      );
-      if (!response.ok) throw new Error(await readError(response));
-      const payload = (await response.json()) as { commands?: TallyCommand[] };
-
-      let running = 0;
-      let queued = 0;
-      for (const command of payload.commands ?? []) {
-        if (!pending.has(command.id)) continue;
-        if (command.status === "succeeded") {
-          pending.delete(command.id);
-        } else if (command.status === "failed" || command.status === "canceled") {
-          throw new Error(command.error || "Tally command failed.");
-        } else if (command.status === "claimed") {
-          running += 1;
-        } else {
-          queued += 1;
-        }
-      }
-
-      options?.onProgress?.({
-        total,
-        completed: total - pending.size,
-        remaining: pending.size,
-        running,
-        queued,
-      });
-
-      if (pending.size === 0) return;
-    }
-
-    throw new Error(
-      options?.pendingMessage ?? "The Tally commands are still pending. Check the connector status, then refresh."
     );
   }, []);
 
@@ -964,17 +683,11 @@ export function CollectionsDashboardPage({
   );
 
   const refreshTallyOpenBills = useCallback(
-    async (
-      connectionId: string,
-      companyName?: string | null,
-      options?: { onProgress?: (message: string) => void }
-    ) => {
+    async (connectionId: string, companyName?: string | null) => {
       // Refresh the ledger list first. A connection may have previously synced a
       // different company, in which case using its old debtor list would omit
       // valid bills or query the wrong parties.
-      options?.onProgress?.("Syncing customer ledgers from Tally...");
       await syncCurrentCompanyLedgers(connectionId, companyName);
-      options?.onProgress?.("Loading customer ledgers...");
       const ledgerNames = await loadDebtorLedgers(connectionId);
       if (ledgerNames.length === 0) return;
 
@@ -982,11 +695,8 @@ export function CollectionsDashboardPage({
       // customer ledgers. Keep those commands together so the dashboard can use
       // this refresh as one consistent snapshot rather than mixing old chunks.
       const scanId = crypto.randomUUID();
-      const chunks = chunkValues(ledgerNames, 80);
-      const commandIds: string[] = [];
 
-      options?.onProgress?.(`Queueing open-bill scan for ${ledgerNames.length} customer ledgers...`);
-      for (const chunk of chunks) {
+      for (const chunk of chunkValues(ledgerNames, 80)) {
         const response = await apiFetch(`/api/tally/connections/${connectionId}/commands`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1003,30 +713,19 @@ export function CollectionsDashboardPage({
         if (!response.ok) throw new Error(await readError(response));
         const payload = (await response.json()) as { command?: TallyCommand };
         if (payload.command?.id) {
-          commandIds.push(payload.command.id);
+          await pollCommand(connectionId, payload.command.id);
         }
       }
-
-      options?.onProgress?.(`Scanning open bills from Tally (${commandIds.length} batch${commandIds.length === 1 ? "" : "es"})...`);
-      await pollCommands(connectionId, commandIds, {
-        timeoutSeconds: Math.max(90, commandIds.length * 60),
-        pendingMessage: "The Tally open-bill scan is still pending. Keep the connector open, then refresh.",
-        onProgress: ({ total, completed, remaining, running, queued }) => {
-          options?.onProgress?.(
-            `Scanning open bills from Tally: ${completed}/${total} batches done, ${remaining} remaining${running > 0 ? `, ${running} running` : ""}${queued > 0 ? `, ${queued} queued` : ""}.`
-          );
-        },
-      });
     },
-    [loadDebtorLedgers, pollCommands, syncCurrentCompanyLedgers]
+    [loadDebtorLedgers, pollCommand, syncCurrentCompanyLedgers]
   );
 
   const refreshAll = useCallback(
     async (options?: { quiet?: boolean; refreshTally?: boolean }) => {
       try {
         if (!options?.quiet) setLoading(true);
-        if (!options?.quiet) setCashDiscountLoadStep("Checking the active Tally company...");
         setMessage(null);
+        setDashboard(null);
         const nextCompanies = await loadCompanies();
         let company =
           nextCompanies.find((item) => item.id === selectedCompanyId) ??
@@ -1068,36 +767,15 @@ export function CollectionsDashboardPage({
         // Set this before the asynchronous Tally scan so the selection effect
         // does not start a second, overlapping scan for the same company.
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
-        let loadedSavedDashboard = false;
-        setCashDiscountLoadStep("Loading latest saved Cash Discount data...");
-        try {
-          await loadDashboard(connectionId, company?.companyName);
-          loadedSavedDashboard = true;
-        } catch (dashboardError) {
-          if (options?.refreshTally === false) throw dashboardError;
-        }
-        if (loadedSavedDashboard) setLoading(false);
-
         if (connectionId && options?.refreshTally !== false) {
-          setSyncingTally(true);
-          setCashDiscountLoadStep("Syncing ledgers and scanning open bills from Tally...");
-          await refreshTallyOpenBills(connectionId, company?.companyName, {
-            onProgress: setCashDiscountLoadStep,
-          });
-          setLastCashDiscountSyncAt(new Date().toISOString());
-          setCashDiscountLoadStep("Updating Cash Discounts from the latest Tally scan...");
-          await loadDashboard(connectionId, company?.companyName);
-        } else if (!loadedSavedDashboard) {
-          setCashDiscountLoadStep("Calculating cash discounts from the latest Tally scan...");
-          await loadDashboard(connectionId, company?.companyName);
+          await refreshTallyOpenBills(connectionId, company?.companyName);
         }
+        await loadDashboard(connectionId, company?.companyName);
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
       } catch (error) {
         setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
       } finally {
-        setCashDiscountLoadStep("");
         setLoading(false);
-        setSyncingTally(false);
       }
     },
     [loadCompanies, loadDashboard, refreshLiveTallyCompany, refreshTallyOpenBills, selectedCompanyId, selectedConnectionId]
@@ -1153,54 +831,23 @@ export function CollectionsDashboardPage({
       setMessage({ tone: "error", text: `Tally is open to ${activeTallyCompanyName || "another company"}. Switch it to ${selectedCompany?.companyName || "the selected company"}, refresh, then create the debit note.` });
       return;
     }
-    setCreateReviewProposals([proposal]);
-  }
-
-  async function createReviewedDebitNotes() {
-    if (!tallyCompanyVerified) {
-      setMessage({ tone: "error", text: `Tally is open to ${activeTallyCompanyName || "another company"}. Switch it to ${selectedCompany?.companyName || "the selected company"}, refresh, then create debit notes.` });
-      return;
-    }
-    const proposalsToCreate = createReviewProposals.filter(canCreateInTally);
-    if (proposalsToCreate.length === 0) {
-      setCreateReviewProposals([]);
-      return;
-    }
-    const single = proposalsToCreate.length === 1;
+    const id = proposal.id;
     try {
-      setCreateReviewSubmitting(true);
-      setBulkCreating(!single);
-      setCreateReviewProgress(single ? "Creating debit note in Tally..." : `Creating debit note 1 of ${proposalsToCreate.length}...`);
-      setMessage({ tone: "info", text: single ? "Creating debit note in Tally..." : `Creating ${proposalsToCreate.length} debit notes in Tally...` });
-      for (const [index, item] of proposalsToCreate.entries()) {
-        setCreateReviewProgress(single ? "Creating debit note in Tally..." : `Creating debit note ${index + 1} of ${proposalsToCreate.length}...`);
-        setApprovingId(item.id);
-        await createDebitNoteForProposal(item);
-      }
+      setApprovingId(id);
+      setMessage({ tone: "info", text: "Creating debit note in Tally..." });
+      await createDebitNoteForProposal(proposal);
       if (selectedConnectionId) {
-        setCreateReviewProgress("Refreshing Tally open bills...");
-        await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName, {
-          onProgress: setCreateReviewProgress,
-        });
-        setCreateReviewProgress("Updating Cash Discounts from the latest Tally data...");
+        await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
         await loadDashboard(selectedConnectionId, selectedCompany?.companyName);
       } else {
-        setCreateReviewProgress("Updating Cash Discounts...");
         await loadDashboard();
       }
-      setCreateReviewProposals([]);
-      setCreateReviewProgress("");
-      setSelectedPendingIds(new Set());
       setActiveView("done");
-      setMessage({ tone: "success", text: single ? "Debit note created in Tally." : `${proposalsToCreate.length} debit notes created in Tally.` });
+      setMessage({ tone: "success", text: "Debit note created in Tally." });
     } catch (error) {
-      setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not create debit notes." });
-      await loadDashboard().catch(() => undefined);
+      setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not approve proposal." });
     } finally {
       setApprovingId("");
-      setBulkCreating(false);
-      setCreateReviewSubmitting(false);
-      setCreateReviewProgress("");
     }
   }
 
@@ -1218,12 +865,7 @@ export function CollectionsDashboardPage({
   }
 
   async function readTallyLedgerPhone(connectionId: string, ledgerName: string) {
-    const params = new URLSearchParams({
-      type: "ledger",
-      name: ledgerName,
-      limit: "1",
-    });
-    const response = await apiFetch(`/api/tally/connections/${connectionId}/masters?${params.toString()}`, {
+    const response = await apiFetch(`/api/tally/connections/${connectionId}/masters?type=ledger&limit=5000`, {
       cache: "no-store",
     });
     if (!response.ok) throw new Error(await readError(response));
@@ -1260,7 +902,9 @@ export function CollectionsDashboardPage({
   }
 
   async function openWhatsappDialog(proposalsToSend: DebitNoteProposal[]) {
-    const sendable = proposalsToSend.filter(isCreatedDebitNote);
+    const sendable = proposalsToSend.filter(
+      (proposal) => proposal.communicationStatus !== "sent" || needsUpdatedPdfDelivery(proposal)
+    );
     if (sendable.length === 0) return;
     // Opening the dialog must be immediate. In particular, a user needs to
     // see and enter a missing phone number before we ask Tally for a PDF.
@@ -1276,22 +920,6 @@ export function CollectionsDashboardPage({
     setMessage(null);
   }
 
-  async function prepareAndRefreshNativeTallyPdf(proposal: DebitNoteProposal) {
-    try {
-      setPreparingNativePdfId(proposal.id);
-      setMessage({ tone: "info", text: "Preparing official Tally PDF..." });
-      const updatedProposal = await prepareNativeTallyPdf(proposal);
-      setViewingCreatedProposal((current) =>
-        current?.id === proposal.id ? { ...current, ...updatedProposal, nativeTallyPdfVerified: true } : current
-      );
-      setMessage({ tone: "success", text: "Official Tally PDF is ready." });
-    } catch (error) {
-      setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not prepare the official Tally PDF." });
-    } finally {
-      setPreparingNativePdfId("");
-    }
-  }
-
   async function downloadNativeTallyPdf(proposal: DebitNoteProposal) {
     try {
       const response = await apiFetch(`/api/collections/debit-note-proposals/${proposal.id}/native-pdf?download=1`, { cache: "no-store" });
@@ -1301,7 +929,7 @@ export function CollectionsDashboardPage({
       const objectUrl = URL.createObjectURL(pdf);
       const link = document.createElement("a");
       link.href = objectUrl;
-      link.download = cashDiscountDebitNoteDownloadName(proposal);
+      link.download = `${proposal.tallyVoucherNumber || "debit-note"}.pdf`;
       link.rel = "noreferrer";
       document.body.appendChild(link);
       link.click();
@@ -1310,14 +938,6 @@ export function CollectionsDashboardPage({
     } catch (error) {
       setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not download the official Tally PDF." });
     }
-  }
-
-  function showReverseInstructions(proposal: DebitNoteProposal) {
-    setViewingCreatedProposal(proposal);
-    setMessage({
-      tone: "info",
-      text: "Reverse or cancel this debit note directly in Tally, then refresh this page. We do not delete created Tally vouchers from the app.",
-    });
   }
 
   async function sendWhatsappFromDialog() {
@@ -1423,10 +1043,6 @@ export function CollectionsDashboardPage({
   }, [refreshAll]);
 
   useEffect(() => {
-    setActiveView(initialView);
-  }, [initialView]);
-
-  useEffect(() => {
     if (!selectedConnectionId) {
       setLiveTallyConnection(null);
       setCheckingLiveTallyCompany(false);
@@ -1434,10 +1050,6 @@ export function CollectionsDashboardPage({
     }
     void refreshLiveTallyCompany(selectedConnectionId).catch(() => undefined);
   }, [refreshLiveTallyCompany, selectedConnectionId]);
-
-  useEffect(() => {
-    cashDiscountPageBusyRef.current = loading || syncingTally;
-  }, [loading, syncingTally]);
 
   useEffect(() => {
     if (!selectedConnectionId) return;
@@ -1455,83 +1067,19 @@ export function CollectionsDashboardPage({
     lastLoadedConnectionRef.current = loadKey;
     void (async () => {
       setLoading(true);
-      setCashDiscountLoadStep("Loading latest saved Cash Discount data...");
+      setDashboard(null);
       try {
-        try {
-          await loadDashboard(selectedConnectionId, company?.companyName);
-          setLoading(false);
-        } catch {
-          // If no saved scan exists yet, keep the loader visible and let the
-          // normal Tally refresh path populate the same dashboard.
-        }
-        setSyncingTally(true);
-        setCashDiscountLoadStep("Syncing ledgers and scanning open bills from Tally...");
-        await refreshTallyOpenBills(selectedConnectionId, company?.companyName, {
-          onProgress: setCashDiscountLoadStep,
-        });
-        setLastCashDiscountSyncAt(new Date().toISOString());
-        setCashDiscountLoadStep("Updating Cash Discounts from the latest Tally scan...");
+        // A company switch must read a new live snapshot. Loading the old saved
+        // scan here can show bills belonging to the previously selected company.
+        await refreshTallyOpenBills(selectedConnectionId, company?.companyName);
         await loadDashboard(selectedConnectionId, company?.companyName);
       } catch (error) {
         setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
       } finally {
-        setCashDiscountLoadStep("");
         setLoading(false);
-        setSyncingTally(false);
       }
     })();
   }, [liveTallyConnection, loadDashboard, refreshTallyOpenBills, selectedCompany, selectedConnectionId]);
-
-  useEffect(() => {
-    if (!selectedConnectionId) return;
-    const company = selectedCompany;
-    if (!isLiveTallyCompanyMatch(liveTallyConnection, selectedConnectionId, company)) return;
-
-    let stopped = false;
-    const checkForDashboardChange = async () => {
-      if (stopped || dashboardVersionCheckInFlightRef.current || cashDiscountPageBusyRef.current) return;
-      dashboardVersionCheckInFlightRef.current = true;
-      try {
-        const version = await loadDashboardVersion(selectedConnectionId, company?.companyName);
-        if (stopped || !version) return;
-        if (!dashboardVersionRef.current) {
-          dashboardVersionRef.current = version;
-          return;
-        }
-        if (dashboardVersionRef.current === version) return;
-        dashboardVersionRef.current = version;
-        await loadDashboard(selectedConnectionId, company?.companyName);
-      } catch {
-        // This is a passive refresh check. Keep the current dashboard visible
-        // and let normal page actions surface any actionable errors.
-      } finally {
-        dashboardVersionCheckInFlightRef.current = false;
-      }
-    };
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        void checkForDashboardChange();
-      }
-    };
-
-    const interval = window.setInterval(() => {
-      if (document.visibilityState === "visible") {
-        void checkForDashboardChange();
-      }
-    }, 30_000);
-
-    window.addEventListener("focus", checkForDashboardChange);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    void checkForDashboardChange();
-
-    return () => {
-      stopped = true;
-      window.clearInterval(interval);
-      window.removeEventListener("focus", checkForDashboardChange);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    };
-  }, [liveTallyConnection, loadDashboard, loadDashboardVersion, selectedCompany, selectedConnectionId]);
 
   const proposals = dashboard?.tabs?.debitNoteQueue ?? [];
   const paymentFollowUps = dashboard?.tabs?.paymentFollowUps ?? [];
@@ -1541,6 +1089,13 @@ export function CollectionsDashboardPage({
   const tallyCompanyVerified =
     !checkingLiveTallyCompany &&
     isLiveTallyCompanyMatch(liveTallyConnection, selectedConnectionId, selectedCompany);
+  const tallyCompanyMismatch = Boolean(
+    !checkingLiveTallyCompany &&
+      selectedCompany?.companyName &&
+      activeTallyCompanyName &&
+      normalizeCompanyName(selectedCompany.companyName) !==
+        normalizeCompanyName(activeTallyCompanyName)
+  );
   const liveCompanyCheckPending = Boolean(
     selectedConnectionId &&
       (checkingLiveTallyCompany || liveTallyConnection?.id !== selectedConnectionId)
@@ -1550,17 +1105,11 @@ export function CollectionsDashboardPage({
 
   const pendingProposals = proposals.filter(isPendingDebitNote);
   const createdProposals = proposals.filter(isCreatedDebitNote);
-  const displayPendingProposals = useMemo(
-    () => filterAndSortDebitNotes(pendingProposals, debitNoteSearchQuery, debitNoteFilter, debitNoteSort),
-    [debitNoteFilter, debitNoteSearchQuery, debitNoteSort, pendingProposals]
-  );
-  const displayCreatedProposals = useMemo(
-    () => filterAndSortDebitNotes(createdProposals, debitNoteSearchQuery, debitNoteFilter, debitNoteSort),
-    [createdProposals, debitNoteFilter, debitNoteSearchQuery, debitNoteSort]
-  );
-  const selectablePendingProposals = tallyCompanyVerified ? displayPendingProposals.filter(canCreateInTally) : [];
+  const selectablePendingProposals = tallyCompanyVerified ? pendingProposals.filter(canCreateInTally) : [];
   const selectedPendingProposals = selectablePendingProposals.filter((proposal) => selectedPendingIds.has(proposal.id));
-  const selectableCreatedProposals = displayCreatedProposals;
+  const selectableCreatedProposals = createdProposals.filter(
+    (proposal) => proposal.communicationStatus !== "sent" || needsUpdatedPdfDelivery(proposal)
+  );
   const selectedCreatedProposals = selectableCreatedProposals.filter((proposal) => selectedCreatedIds.has(proposal.id));
   const allPendingSelected =
     selectablePendingProposals.length > 0 && selectablePendingProposals.every((proposal) => selectedPendingIds.has(proposal.id));
@@ -1570,30 +1119,11 @@ export function CollectionsDashboardPage({
   const createdRecoverableTotal = sumRecoverable(createdProposals);
   const paymentFollowUpTotal = paymentFollowUps.reduce((total, item) => total + (Number(item.totalPayableAmount) || 0), 0);
   const companyReady = tallyCompanyVerified;
-  const selectedCompanyLabel = selectedCompany?.companyName || "Choose a company";
-  const tallyStatusLabel = liveCompanyCheckPending
-    ? "Checking active company..."
-    : companyReady
-      ? `Connected to ${activeTallyCompanyName || selectedCompanyLabel}`
-      : activeTallyCompanyName
-        ? `Opened to ${activeTallyCompanyName}`
-        : liveTallyConnection?.tallyReachable === false
-          ? "Connector/Tally not reachable"
-          : "No active Tally company detected";
-  const lastKnownSyncAt = lastCashDiscountSyncAt ?? selectedCompany?.lastSyncAt ?? null;
-  const syncInProgress = loading || syncingTally;
-  const refreshStatusLabel = syncInProgress
-    ? "Syncing with Tally..."
-    : lastKnownSyncAt
-      ? `Last synced ${formatDateTime(lastKnownSyncAt)}`
-      : "Not synced yet";
   const whatsappDialogMissingCount = whatsappDialogProposals.filter((proposal) => !proposal.partyPhone).length;
   const allPhonesValid = whatsappDialogProposals.every((proposal) => {
     const phone = getTenDigitPhone(whatsappPhoneInputs[proposal.id] ?? proposal.partyPhone ?? "");
     return Boolean(phone);
   });
-  const createReviewTotal = sumRecoverable(createReviewProposals);
-  const createReviewSingle = createReviewProposals.length === 1;
 
   function togglePendingSelection(id: string, checked: boolean) {
     setSelectedPendingIds((current) => {
@@ -1641,19 +1171,40 @@ export function CollectionsDashboardPage({
       return;
     }
     if (selectedPendingProposals.length === 0) return;
-    setCreateReviewProposals(selectedPendingProposals);
+    const confirmed = window.confirm(
+      `Create ${selectedPendingProposals.length} debit note${selectedPendingProposals.length === 1 ? "" : "s"} in Tally?`
+    );
+    if (!confirmed) return;
+
+    try {
+      setBulkCreating(true);
+      setMessage({ tone: "info", text: `Creating ${selectedPendingProposals.length} debit notes in Tally...` });
+      for (const proposal of selectedPendingProposals) {
+        setApprovingId(proposal.id);
+        await createDebitNoteForProposal(proposal);
+      }
+      if (selectedConnectionId) {
+        await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
+        await loadDashboard(selectedConnectionId, selectedCompany?.companyName);
+      } else {
+        await loadDashboard();
+      }
+      setSelectedPendingIds(new Set());
+      setActiveView("done");
+      setMessage({ tone: "success", text: `${selectedPendingProposals.length} debit notes created in Tally.` });
+    } catch (error) {
+      setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not create selected debit notes." });
+      await loadDashboard().catch(() => undefined);
+    } finally {
+      setApprovingId("");
+      setBulkCreating(false);
+    }
   }
 
   async function sendSelectedWhatsappMessages() {
     if (selectedCreatedProposals.length === 0) return;
     await openWhatsappDialog(selectedCreatedProposals);
   }
-
-  const pageTitle = initialView === "followUps" ? "Payment Follow-ups" : "Cash Discounts";
-  const pageDescription =
-    initialView === "followUps"
-      ? "Track pending customer payments and follow-up actions from the latest Tally scan."
-      : "Review, track, and post debit notes for missed cash discounts.";
 
   return (
     <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto px-6 pb-8 pt-5 text-[#1a1a1a] animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -1664,10 +1215,10 @@ export function CollectionsDashboardPage({
             Collections Ledgers
           </div>
           <h1 className="text-3xl font-black tracking-tight text-[#1a1a1a] mt-2 flex items-center gap-2">
-            {pageTitle}
+            Cash Discounts
           </h1>
           <p className="text-xs font-semibold text-slate-500 mt-1">
-            {pageDescription}
+            Review, track, and post debit notes for missed cash discounts.
           </p>
         </div>
 
@@ -1692,45 +1243,63 @@ export function CollectionsDashboardPage({
             </select>
           </label>
 
-          <div className="inline-flex min-h-10 items-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-3 py-1.5 text-xs text-slate-500 shadow-sm">
+          <div className={`inline-flex h-10 items-center gap-2 rounded-xl border px-3 text-xs shadow-sm transition-colors ${
+            companyReady
+              ? "border-emerald-200 bg-emerald-50/80 text-emerald-800"
+              : tallyCompanyMismatch
+                ? "border-amber-300 bg-amber-50 text-amber-800"
+                : "border-[#e5ddd0] bg-white text-slate-500"
+          }`}>
             <span
               className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[10px] font-bold ${
                 companyReady
                   ? "border-emerald-250 bg-emerald-50 text-emerald-800"
-                  : "border-amber-250 bg-amber-50 text-amber-800"
+                  : tallyCompanyMismatch
+                    ? "border-amber-300 bg-amber-100 text-amber-900"
+                    : "border-amber-250 bg-amber-50 text-amber-800"
               }`}
             >
-              {companyReady ? <CheckCircle2 className="h-3.5 w-3.5" /> : <TriangleAlert className="h-3.5 w-3.5" />}
+              {liveCompanyCheckPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : companyReady ? (
+                <CheckCircle2 className="h-3.5 w-3.5" />
+              ) : (
+                <TriangleAlert className="h-3.5 w-3.5" />
+              )}
               {liveCompanyCheckPending
                 ? "Verifying active Tally company"
                 : companyReady
                   ? "Tally company verified"
-                  : activeTallyCompanyName
-                    ? "Company context locked"
+                  : tallyCompanyMismatch
+                    ? "Switch company in Tally"
                     : "Tally company not ready"}
             </span>
-            <span className="hidden h-4 w-px bg-[#e5ddd0] sm:block" />
-            <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5 font-semibold">
-              <span className="whitespace-nowrap">App company: {selectedCompanyLabel}</span>
-              <span className="hidden text-slate-300 sm:inline">/</span>
-              <span className="whitespace-nowrap">Tally status: {tallyStatusLabel}</span>
+            <span className={`hidden h-4 w-px sm:block ${
+              companyReady
+                ? "bg-emerald-200"
+                : tallyCompanyMismatch
+                  ? "bg-amber-300"
+                  : "bg-[#e5ddd0]"
+            }`} />
+            <span className={`whitespace-nowrap font-semibold ${
+              companyReady
+                ? "text-emerald-700"
+                : tallyCompanyMismatch
+                  ? "text-amber-800"
+                  : ""
+            }`}>
+              Selected: {selectedCompany?.companyName || "Not selected"} · Tally: {liveCompanyCheckPending ? "Checking…" : activeTallyCompanyName || "Not detected"}
             </span>
           </div>
 
-          <div className="flex min-w-[190px] flex-col items-start gap-1 xl:items-end">
-            <button
-              className="inline-flex h-10 w-fit items-center justify-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-70"
-              disabled={syncInProgress}
-              onClick={() => void refreshAll()}
-              type="button"
-            >
-              {syncInProgress ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <RefreshCw className="h-3.5 w-3.5 mr-1.5" />}
-              {syncInProgress ? "Syncing" : "Refresh"}
-            </button>
-            <span className={`max-w-[280px] text-[11px] font-semibold leading-snug ${syncInProgress ? "text-sky-700" : "text-slate-400"}`}>
-              {refreshStatusLabel}
-            </span>
-          </div>
+          <button
+            className="inline-flex h-10 w-fit items-center justify-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
+            onClick={() => void refreshAll()}
+            type="button"
+          >
+            {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> : <RefreshCw className="h-3.5 w-3.5 mr-1.5" />}
+            Refresh
+          </button>
         </div>
       </div>
 
@@ -1745,32 +1314,6 @@ export function CollectionsDashboardPage({
         >
           {message.text}
         </div>
-      ) : null}
-
-      {syncInProgress && !companyContextLocked ? (
-        <section
-          aria-live="polite"
-          className="mb-6 overflow-hidden rounded-2xl border border-sky-200 bg-sky-50 shadow-[0_10px_30px_rgba(94,67,31,0.08)]"
-        >
-          <div className="flex flex-col gap-4 px-5 py-5 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex min-w-0 gap-3">
-              <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-sky-200 bg-white text-sky-700">
-                <Loader2 className="h-4 w-4 animate-spin" />
-              </div>
-              <div>
-                <h2 className="text-sm font-extrabold text-[#1a1a1a]">
-                  {loading ? "Loading Cash Discounts data" : "Syncing latest Tally data"}
-                </h2>
-                <p className="mt-1 max-w-3xl text-xs font-medium leading-relaxed text-slate-600">
-                  {cashDiscountLoadStep || "Refreshing Tally data in the background. Keep the connector open; larger companies can take a little time."}
-                </p>
-              </div>
-            </div>
-            <span className="inline-flex h-8 shrink-0 items-center rounded-full border border-sky-200 bg-white px-3 text-[10px] font-black uppercase tracking-wider text-sky-800">
-              In progress
-            </span>
-          </div>
-        </section>
       ) : null}
 
       {companyContextLocked ? (
@@ -1822,13 +1365,20 @@ export function CollectionsDashboardPage({
       ) : null}
 
       {!companyContextLocked && showWorkflowSummary ? <section className="mb-6">
-        <div className="grid gap-4 md:grid-cols-2">
+        <div className="grid gap-4 md:grid-cols-3">
           <WorkflowButton
             active={activeView === "needsAction"}
             count={pendingProposals.length}
             detail={`${formatMoney(pendingRecoverableTotal)} recoverable`}
             label="To create"
             onClick={() => chooseView("needsAction")}
+          />
+          <WorkflowButton
+            active={activeView === "followUps"}
+            count={paymentFollowUps.length}
+            detail={`${formatMoney(paymentFollowUpTotal)} outstanding`}
+            label="Payment follow-ups"
+            onClick={() => chooseView("followUps")}
           />
           <WorkflowButton
             active={activeView === "done"}
@@ -1839,20 +1389,6 @@ export function CollectionsDashboardPage({
           />
         </div>
       </section> : null}
-
-      {!companyContextLocked && !showWorkflowSummary && activeView === "followUps" ? (
-        <section className="mb-6">
-          <div className="grid gap-4 md:grid-cols-1">
-            <WorkflowButton
-              active
-              count={paymentFollowUps.length}
-              detail={`${formatMoney(paymentFollowUpTotal)} outstanding`}
-              label="Pending payment follow-ups"
-              onClick={() => undefined}
-            />
-          </div>
-        </section>
-      ) : null}
 
 
 
@@ -1880,22 +1416,6 @@ export function CollectionsDashboardPage({
             </EmptyState>
           ) : (
             <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm">
-              <DebitNoteListControls
-                filterValue={debitNoteFilter}
-                onFilterChange={setDebitNoteFilter}
-                onSearchChange={setDebitNoteSearchQuery}
-                onSortChange={setDebitNoteSort}
-                resultCount={displayPendingProposals.length}
-                searchQuery={debitNoteSearchQuery}
-                sortValue={debitNoteSort}
-                totalCount={pendingProposals.length}
-              />
-              {displayPendingProposals.length === 0 ? (
-                <div className="p-4">
-                  <EmptyState>No debit notes match the current search or filters.</EmptyState>
-                </div>
-              ) : (
-                <>
               <div className="hidden max-h-[calc(100vh-430px)] overflow-auto lg:block">
                 <table className="w-full min-w-[1040px] table-fixed border-collapse text-left">
                   <thead className="sticky top-0 z-10 bg-[#fcfbfa]">
@@ -1919,7 +1439,7 @@ export function CollectionsDashboardPage({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
-                    {displayPendingProposals.map((proposal) => {
+                    {pendingProposals.map((proposal) => {
                       const createEnabled = tallyCompanyVerified && canCreateInTally(proposal);
                       const displayAmount = proposal.recoverableAmount;
                       const lateByDays = daysPast(proposal.discountDeadline);
@@ -2044,7 +1564,7 @@ export function CollectionsDashboardPage({
                 </table>
               </div>
               <div className="divide-y divide-[#e5ddd0] lg:hidden">
-                {displayPendingProposals.map((proposal) => {
+                {pendingProposals.map((proposal) => {
                   const createEnabled = tallyCompanyVerified && canCreateInTally(proposal);
                   const lateByDays = daysPast(proposal.discountDeadline);
                   const displayAmount = proposal.recoverableAmount;
@@ -2115,8 +1635,6 @@ export function CollectionsDashboardPage({
                   );
                 })}
               </div>
-                </>
-              )}
             </div>
           )}
         </Section>
@@ -2124,8 +1642,8 @@ export function CollectionsDashboardPage({
 
       {!companyContextLocked && activeView === "followUps" ? (
         <Section
-          description={`${formatMoney(paymentFollowUpTotal)} remains outstanding from customers. Follow up on these pending payments and create any required debit notes before collection.`}
-          title="Pending payment follow-ups"
+          description={`${formatMoney(paymentFollowUpTotal)} remains outstanding. Rows flag any debit note that must be created before collection.`}
+          title="Payment follow-ups"
         >
           {paymentFollowUps.length === 0 ? (
             <EmptyState>There are no payments to follow up from the latest Tally scan.</EmptyState>
@@ -2322,22 +1840,6 @@ export function CollectionsDashboardPage({
             <EmptyState>Nothing completed yet.</EmptyState>
           ) : (
             <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm">
-              <DebitNoteListControls
-                filterValue={debitNoteFilter}
-                onFilterChange={setDebitNoteFilter}
-                onSearchChange={setDebitNoteSearchQuery}
-                onSortChange={setDebitNoteSort}
-                resultCount={displayCreatedProposals.length}
-                searchQuery={debitNoteSearchQuery}
-                sortValue={debitNoteSort}
-                totalCount={createdProposals.length}
-              />
-              {displayCreatedProposals.length === 0 ? (
-                <div className="p-4">
-                  <EmptyState>No debit notes match the current search or filters.</EmptyState>
-                </div>
-              ) : (
-                <>
               <div className="hidden max-h-[calc(100vh-430px)] overflow-auto lg:block">
                 <table className="w-full min-w-[1000px] table-fixed border-collapse text-left">
                   <thead className="sticky top-0 z-10 bg-[#fcfbfa]">
@@ -2357,11 +1859,12 @@ export function CollectionsDashboardPage({
                       <th className="w-1/5 px-4 py-3.5 bg-[#fcfbfa]">Linked invoice</th>
                       <th className="w-32 px-4 py-3.5 text-right bg-[#fcfbfa]">Amount</th>
                       <th className="w-36 px-4 py-3.5 bg-[#fcfbfa]">Result</th>
-                      <th className="w-72 px-4 py-3.5 text-right bg-[#fcfbfa]">Actions</th>
+                      <th className="w-56 px-4 py-3.5 text-right bg-[#fcfbfa]">Message</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
-                    {displayCreatedProposals.map((proposal) => {
+                    {createdProposals.map((proposal) => {
+                      const canMessage = proposal.communicationStatus !== "sent" || needsUpdatedPdfDelivery(proposal);
                       const sending = sendingWhatsappId === proposal.id;
                       const preparingNativePdf = preparingNativePdfId === proposal.id;
 
@@ -2372,7 +1875,7 @@ export function CollectionsDashboardPage({
                               aria-label={`Select WhatsApp for ${proposal.partyLedgerName}`}
                               checked={selectedCreatedIds.has(proposal.id)}
                               className="h-4 w-4 rounded border-[#d6cabb] text-[#2d2d2d] focus:ring-[#2d2d2d] disabled:opacity-40"
-                              disabled={bulkSendingWhatsapp}
+                              disabled={!canMessage || bulkSendingWhatsapp}
                               onChange={(event) => toggleCreatedSelection(proposal.id, event.target.checked)}
                               type="checkbox"
                             />
@@ -2420,32 +1923,20 @@ export function CollectionsDashboardPage({
                               >
                                 {proposal.communicationStatus === "sent" ? "Sent" : proposal.communicationStatus === "failed" ? "Failed" : "Not sent"}
                               </span>
-                              <button
-                                aria-label={`View debit note for ${proposal.partyLedgerName}`}
-                                className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
-                                onClick={() => setViewingCreatedProposal(proposal)}
-                                title="View debit note details"
-                                type="button"
-                              >
-                                <Eye className="h-3.5 w-3.5" />
-                              </button>
-                              <button
-                                aria-label={`${proposal.nativeTallyPdfVerified ? "Download" : "Prepare"} Tally PDF for ${proposal.partyLedgerName}`}
-                                className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
-                                disabled={preparingNativePdf}
-                                onClick={() =>
-                                  proposal.nativeTallyPdfVerified
-                                    ? void downloadNativeTallyPdf(proposal)
-                                    : void prepareAndRefreshNativeTallyPdf(proposal)
-                                }
-                                title={proposal.nativeTallyPdfVerified ? "Download verified Tally PDF" : "Prepare official Tally PDF"}
-                                type="button"
-                              >
-                                {preparingNativePdf ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
-                              </button>
+                              {proposal.nativeTallyPdfVerified ? (
+                                <button
+                                  aria-label={`Download verified Tally PDF for ${proposal.partyLedgerName}`}
+                                  className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                                  onClick={() => void downloadNativeTallyPdf(proposal)}
+                                  title="Download verified Tally PDF"
+                                  type="button"
+                                >
+                                  <Download className="h-3.5 w-3.5" />
+                                </button>
+                              ) : null}
                               <button
                                 className="inline-flex h-9 items-center justify-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm disabled:cursor-not-allowed disabled:opacity-50 transition-all"
-                                disabled={sending || preparingNativePdf}
+                                disabled={!canMessage || sending || preparingNativePdf}
                                 onClick={() => void openWhatsappDialog([proposal])}
                                 type="button"
                               >
@@ -2456,15 +1947,6 @@ export function CollectionsDashboardPage({
                                 )}
                                 {preparingNativePdf ? "Preparing PDF" : messageLabel(proposal)}
                               </button>
-                              <button
-                                aria-label={`Cancel or reverse debit note for ${proposal.partyLedgerName}`}
-                                className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-amber-200 bg-amber-50 text-amber-800 shadow-sm transition-all hover:bg-amber-100"
-                                onClick={() => showReverseInstructions(proposal)}
-                                title="Cancel/Reverse in Tally"
-                                type="button"
-                              >
-                                <RotateCcw className="h-3.5 w-3.5" />
-                              </button>
                             </div>
                           </td>
                         </tr>
@@ -2474,7 +1956,8 @@ export function CollectionsDashboardPage({
                 </table>
               </div>
               <div className="divide-y divide-[#e5ddd0] lg:hidden">
-                {displayCreatedProposals.map((proposal) => {
+                {createdProposals.map((proposal) => {
+                  const canMessage = proposal.communicationStatus !== "sent" || needsUpdatedPdfDelivery(proposal);
                   const sending = sendingWhatsappId === proposal.id;
                   const preparingNativePdf = preparingNativePdfId === proposal.id;
                   return (
@@ -2484,7 +1967,7 @@ export function CollectionsDashboardPage({
                           aria-label={`Select WhatsApp for ${proposal.partyLedgerName}`}
                           checked={selectedCreatedIds.has(proposal.id)}
                           className="mt-1 h-4 w-4 shrink-0 rounded border-[#d6cabb] text-[#2d2d2d] focus:ring-[#2d2d2d] disabled:opacity-40"
-                          disabled={bulkSendingWhatsapp}
+                          disabled={!canMessage || bulkSendingWhatsapp}
                           onChange={(event) => toggleCreatedSelection(proposal.id, event.target.checked)}
                           type="checkbox"
                         />
@@ -2516,46 +1999,25 @@ export function CollectionsDashboardPage({
                           <span className={`rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${messageStatusClass(proposal.communicationStatus)}`}>
                             {proposal.communicationStatus === "sent" ? "Sent" : proposal.communicationStatus === "failed" ? "Failed" : "Not sent"}
                           </span>
-                          <button
-                            aria-label={`View debit note for ${proposal.partyLedgerName}`}
-                            className="inline-flex min-h-9 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-3 text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
-                            onClick={() => setViewingCreatedProposal(proposal)}
-                            title="View debit note details"
-                            type="button"
-                          >
-                            <Eye className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            aria-label={`${proposal.nativeTallyPdfVerified ? "Download" : "Prepare"} Tally PDF for ${proposal.partyLedgerName}`}
-                            className="inline-flex min-h-9 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-3 text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
-                            disabled={preparingNativePdf}
-                            onClick={() =>
-                              proposal.nativeTallyPdfVerified
-                                ? void downloadNativeTallyPdf(proposal)
-                                : void prepareAndRefreshNativeTallyPdf(proposal)
-                            }
-                            title={proposal.nativeTallyPdfVerified ? "Download verified Tally PDF" : "Prepare official Tally PDF"}
-                            type="button"
-                          >
-                            {preparingNativePdf ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
-                          </button>
+                          {proposal.nativeTallyPdfVerified ? (
+                            <button
+                              aria-label={`Download verified Tally PDF for ${proposal.partyLedgerName}`}
+                              className="inline-flex min-h-9 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-3 text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                              onClick={() => void downloadNativeTallyPdf(proposal)}
+                              title="Download verified Tally PDF"
+                              type="button"
+                            >
+                              <Download className="h-3.5 w-3.5" />
+                            </button>
+                          ) : null}
                           <button
                             className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
-                            disabled={sending || preparingNativePdf}
+                            disabled={!canMessage || sending || preparingNativePdf}
                             onClick={() => void openWhatsappDialog([proposal])}
                             type="button"
                           >
                             {sending || preparingNativePdf ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <MessageCircle className="h-3.5 w-3.5" />}
                             {preparingNativePdf ? "Preparing PDF" : messageLabel(proposal)}
-                          </button>
-                          <button
-                            aria-label={`Cancel or reverse debit note for ${proposal.partyLedgerName}`}
-                            className="inline-flex min-h-9 items-center justify-center rounded-xl border border-amber-200 bg-amber-50 px-3 text-amber-800 shadow-sm transition-all hover:bg-amber-100"
-                            onClick={() => showReverseInstructions(proposal)}
-                            title="Cancel/Reverse in Tally"
-                            type="button"
-                          >
-                            <RotateCcw className="h-3.5 w-3.5" />
                           </button>
                         </div>
                       </div>
@@ -2563,266 +2025,9 @@ export function CollectionsDashboardPage({
                   );
                 })}
               </div>
-                </>
-              )}
             </div>
           )}
         </Section>
-      ) : null}
-
-      {createReviewProposals.length > 0 ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 backdrop-blur-sm">
-          <div className="w-full max-w-5xl rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_24px_48px_-12px_rgba(0,0,0,0.18)] animate-in fade-in zoom-in-95 duration-200">
-            <div className="flex items-start justify-between gap-4 border-b border-[#e5ddd0]/60 pb-4">
-              <div>
-                <h3 className="text-base font-bold text-[#1a1a1a]">
-                  Review debit note{createReviewSingle ? "" : "s"}
-                </h3>
-                <p className="mt-1 text-xs font-semibold text-slate-500">
-                  Check the details before creating {createReviewSingle ? "this debit note" : `${createReviewProposals.length} debit notes`} in Tally.
-                </p>
-              </div>
-              <button
-                className="rounded-lg p-1.5 text-slate-400 transition hover:bg-[#faf8f4] hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={createReviewSubmitting}
-                onClick={() => {
-                  setCreateReviewProposals([]);
-                  setCreateReviewProgress("");
-                }}
-                type="button"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="mt-4 grid gap-3 text-xs sm:grid-cols-3">
-              <div className="rounded-xl border border-[#eee7dc] bg-[#fcfbfa] p-3">
-                <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Company</div>
-                <div className="mt-1 font-bold text-[#1a1a1a]">
-                  {selectedCompany?.companyName || createReviewProposals[0]?.companyName || "Selected company"}
-                </div>
-                <div className="mt-0.5 text-[11px] font-semibold text-slate-500">
-                  {selectedCompany?.financialYear || createReviewProposals[0]?.financialYear || "Financial year"}
-                </div>
-              </div>
-              <div className="rounded-xl border border-[#eee7dc] bg-[#fcfbfa] p-3">
-                <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Tally status</div>
-                <div className="mt-1 font-bold text-[#1a1a1a]">{tallyStatusLabel}</div>
-              </div>
-              <div className="rounded-xl border border-[#eee7dc] bg-[#fcfbfa] p-3">
-                <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Total amount</div>
-                <div className="mt-1 font-bold text-[#1a1a1a]">{formatMoney(createReviewTotal)}</div>
-              </div>
-            </div>
-
-            <div className="mt-5 max-h-[430px] overflow-auto rounded-xl border border-[#e5ddd0]/80">
-              <table className="w-full min-w-[980px] table-fixed border-collapse text-left">
-                <thead className="sticky top-0 z-10 bg-[#fcfbfa]">
-                  <tr className="border-b border-[#e5ddd0] text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                    <th className="w-[18%] bg-[#fcfbfa] px-4 py-3">Customer</th>
-                    <th className="w-[16%] bg-[#fcfbfa] px-4 py-3">Invoice</th>
-                    <th className="w-28 bg-[#fcfbfa] px-4 py-3">Date</th>
-                    <th className="w-32 bg-[#fcfbfa] px-4 py-3 text-right">Amount</th>
-                    <th className="w-[18%] bg-[#fcfbfa] px-4 py-3">Ledger</th>
-                    <th className="w-[28%] bg-[#fcfbfa] px-4 py-3">Narration</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
-                  {createReviewProposals.map((proposal) => (
-                    <tr className="align-top transition-colors hover:bg-[#fcfbfa]/40" key={proposal.id}>
-                      <td className="px-4 py-3">
-                        <div className="break-words text-sm font-bold text-[#1a1a1a]" title={proposal.partyLedgerName}>
-                          {proposal.partyLedgerName}
-                        </div>
-                        <ContactMeta proposal={proposal} />
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="break-words font-bold text-[#1a1a1a]" title={proposal.linkedInvoiceNumber ?? ""}>
-                          {shortText(proposal.linkedInvoiceNumber, "No invoice")}
-                        </div>
-                        <div className="mt-1 text-[11px] text-slate-500">
-                          Invoice {formatMoney(proposal.originalInvoiceAmount)}
-                        </div>
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="font-bold text-[#1a1a1a]">{formatDate(proposal.debitNoteDate)}</div>
-                        <div className="mt-1 text-[11px] text-slate-500">
-                          Invoice {formatDate(proposal.linkedInvoiceDate)}
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 text-right tabular-nums">
-                        <div className="text-sm font-bold text-[#1a1a1a]">{formatMoney(proposal.recoverableAmount)}</div>
-                        {typeof proposal.pendingAmount === "number" ? (
-                          <div className="mt-1 text-[11px] text-slate-500">Pending {formatMoney(proposal.pendingAmount)}</div>
-                        ) : null}
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="break-words font-bold text-[#1a1a1a]">
-                          {shortText(proposal.sourceSalesLedgerName, "Cash discount recovery")}
-                        </div>
-                        <div className="mt-1 text-[11px] text-slate-500">{expiredDiscountLabel(proposal)}</div>
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="break-words leading-relaxed text-[#1a1a1a]">
-                          {shortText(proposal.narration ?? proposal.cashDiscountAnalysis?.sourceNarration, "No narration")}
-                        </div>
-                        <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
-                          {whyNowSummary(proposal, daysPast(proposal.discountDeadline))}
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs font-semibold leading-relaxed text-amber-900">
-              This will create the debit note{createReviewSingle ? "" : "s"} in Tally for the active company. Review the company, ledger, invoice, amount, date, and narration before continuing.
-            </div>
-
-            {createReviewSubmitting ? (
-              <div className="mt-3 flex items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2.5 text-xs font-semibold text-sky-800" aria-live="polite">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                {createReviewProgress || "Creating debit note in Tally..."}
-              </div>
-            ) : null}
-
-            <div className="mt-6 flex flex-wrap justify-end gap-3 border-t border-[#e5ddd0]/60 pt-4">
-              <button
-                className="inline-flex h-10 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-5 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4] disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={createReviewSubmitting}
-                onClick={() => {
-                  setCreateReviewProposals([]);
-                  setCreateReviewProgress("");
-                }}
-                type="button"
-              >
-                Cancel
-              </button>
-              <button
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-[#2d2d2d] px-5 text-xs font-bold text-white shadow-sm transition hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={createReviewSubmitting || !tallyCompanyVerified}
-                onClick={() => void createReviewedDebitNotes()}
-                type="button"
-              >
-                {createReviewSubmitting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
-                Create in Tally
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
-      {viewingCreatedProposal ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 backdrop-blur-sm">
-          <div className="w-full max-w-2xl rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_24px_48px_-12px_rgba(0,0,0,0.18)] animate-in fade-in zoom-in-95 duration-200">
-            <div className="flex items-start justify-between gap-4 border-b border-[#e5ddd0]/60 pb-4">
-              <div>
-                <h3 className="text-base font-bold text-[#1a1a1a]">Created debit note</h3>
-                <p className="mt-1 text-xs font-semibold text-slate-500">
-                  {viewingCreatedProposal.partyLedgerName}
-                </p>
-              </div>
-              <button
-                className="rounded-lg p-1.5 text-slate-400 transition hover:bg-[#faf8f4] hover:text-slate-700"
-                onClick={() => setViewingCreatedProposal(null)}
-                type="button"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <dl className="mt-5 grid gap-3 text-sm sm:grid-cols-2">
-              <div className="rounded-xl border border-[#eee7dc] bg-[#fcfbfa] p-3">
-                <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Voucher</dt>
-                <dd className="mt-1 break-words font-bold text-[#1a1a1a]">
-                  {shortText(viewingCreatedProposal.tallyVoucherNumber, "Debit note created")}
-                </dd>
-              </div>
-              <div className="rounded-xl border border-[#eee7dc] bg-[#fcfbfa] p-3">
-                <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Created date</dt>
-                <dd className="mt-1 font-bold text-[#1a1a1a]">
-                  {formatDate(viewingCreatedProposal.createdInTallyAt ?? viewingCreatedProposal.tallyVoucherDate)}
-                </dd>
-              </div>
-              <div className="rounded-xl border border-[#eee7dc] bg-[#fcfbfa] p-3">
-                <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Linked invoice</dt>
-                <dd className="mt-1 break-words font-bold text-[#1a1a1a]">
-                  {shortText(viewingCreatedProposal.linkedInvoiceNumber, "No invoice")}
-                </dd>
-              </div>
-              <div className="rounded-xl border border-[#eee7dc] bg-[#fcfbfa] p-3">
-                <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Amount</dt>
-                <dd className="mt-1 font-bold text-[#1a1a1a]">
-                  {formatMoney(viewingCreatedProposal.recoverableAmount)}
-                </dd>
-              </div>
-              <div className="rounded-xl border border-[#eee7dc] bg-[#fcfbfa] p-3">
-                <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">WhatsApp status</dt>
-                <dd className="mt-1 font-bold text-[#1a1a1a]">
-                  {viewingCreatedProposal.communicationStatus === "sent"
-                    ? `Sent${viewingCreatedProposal.communicationSentAt ? ` on ${formatDate(viewingCreatedProposal.communicationSentAt)}` : ""}`
-                    : viewingCreatedProposal.communicationStatus === "failed"
-                      ? "Failed"
-                      : "Not sent"}
-                </dd>
-              </div>
-              <div className="rounded-xl border border-[#eee7dc] bg-[#fcfbfa] p-3">
-                <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">PDF</dt>
-                <dd className="mt-1 font-bold text-[#1a1a1a]">
-                  {viewingCreatedProposal.nativeTallyPdfVerified ? "Official Tally PDF ready" : "PDF not prepared yet"}
-                </dd>
-              </div>
-            </dl>
-
-            <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs font-semibold leading-relaxed text-amber-900">
-              To cancel or reverse a created debit note, reverse it in Tally first, then refresh this page. The app keeps the created record for audit visibility.
-            </div>
-
-            <div className="mt-6 flex flex-wrap justify-end gap-3 border-t border-[#e5ddd0]/60 pt-4">
-              <button
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4]"
-                onClick={() => setViewingCreatedProposal(null)}
-                type="button"
-              >
-                Close
-              </button>
-              <button
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4] disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={preparingNativePdfId === viewingCreatedProposal.id}
-                onClick={() =>
-                  viewingCreatedProposal.nativeTallyPdfVerified
-                    ? void downloadNativeTallyPdf(viewingCreatedProposal)
-                    : void prepareAndRefreshNativeTallyPdf(viewingCreatedProposal)
-                }
-                type="button"
-              >
-                {preparingNativePdfId === viewingCreatedProposal.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
-                {viewingCreatedProposal.nativeTallyPdfVerified ? "Download PDF" : "Prepare PDF"}
-              </button>
-              <button
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4]"
-                onClick={() => {
-                  const proposal = viewingCreatedProposal;
-                  setViewingCreatedProposal(null);
-                  void openWhatsappDialog([proposal]);
-                }}
-                type="button"
-              >
-                <MessageCircle className="h-3.5 w-3.5" />
-                {messageLabel(viewingCreatedProposal)}
-              </button>
-              <button
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 text-xs font-bold text-amber-800 transition hover:bg-amber-100"
-                onClick={() => showReverseInstructions(viewingCreatedProposal)}
-                type="button"
-              >
-                <RotateCcw className="h-3.5 w-3.5" />
-                Cancel/Reverse in Tally
-              </button>
-            </div>
-          </div>
-        </div>
       ) : null}
 
       {whatsappDialogProposals.length > 0 ? (

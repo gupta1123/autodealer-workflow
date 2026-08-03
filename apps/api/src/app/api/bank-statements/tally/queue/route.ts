@@ -5,11 +5,9 @@ import {
   buildBankAccountLedgerSourceKey,
   buildBankNarrationLedgerSourceKey,
   buildLedgerMappingTarget,
-  loadActiveTallyLedgerRows,
   suggestBankLedgerForTransaction,
 } from "@/lib/bank-statement-ledger-matching";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
-import type { TallyMasterRow } from "@/lib/tally/masters";
 
 export const runtime = "nodejs";
 
@@ -83,6 +81,11 @@ type TransactionStatusSummaryRow = {
   tally_status: string;
 };
 
+type TallyLedgerRow = {
+  tally_name: string;
+  parent_name: string | null;
+};
+
 type MappingRow = {
   connection_id: string;
   owner_user_id: string;
@@ -140,37 +143,6 @@ function toNumber(value: unknown) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function errorText(error: unknown) {
-  if (error instanceof Error) return error.message;
-  if (error && typeof error === "object") {
-    const record = error as Record<string, unknown>;
-    return [record.message, record.details, record.hint]
-      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-      .join(" ");
-  }
-  return String(error ?? "").trim();
-}
-
-function queueErrorPayload(error: unknown) {
-  const message = errorText(error);
-  if (/bank_statement_tally_queue_jobs|bank_transaction_posting_log|tally_mapping_settings|relation .*does not exist|schema cache/i.test(message)) {
-    return {
-      error: "Bank Statement posting setup is not ready.",
-      userAction: "Run the latest database migration, then try again.",
-    };
-  }
-  if (/on conflict|unique or exclusion constraint|duplicate key/i.test(message)) {
-    return {
-      error: "Some selected rows are already queued or saved.",
-      userAction: "Refresh the statement status, then send again.",
-    };
-  }
-  return {
-    error: message || "Could not prepare the statement for Tally.",
-    userAction: "Refresh the page and try again.",
-  };
-}
-
 function readBillAllocations(value: unknown) {
   if (!Array.isArray(value)) return [];
   return value.flatMap((allocation) => {
@@ -193,12 +165,12 @@ function isSuspenseLedger(value?: string | null) {
   return normalized.includes("suspense");
 }
 
-function findCompanySuspenseLedger(ledgers: TallyMasterRow[]) {
+function findCompanySuspenseLedger(ledgers: TallyLedgerRow[]) {
   const candidates = ledgers.filter(
     (ledger) => isSuspenseLedger(ledger.tally_name) || isSuspenseLedger(ledger.parent_name)
   );
   return candidates.sort((left, right) => {
-    const rank = (ledger: TallyMasterRow) => {
+    const rank = (ledger: TallyLedgerRow) => {
       const name = normalizeName(ledger.tally_name);
       if (name === "bankstatementsuspense") return 4;
       if (name === "suspense") return 3;
@@ -575,11 +547,18 @@ export async function POST(request: Request) {
       return [] as TallyCommandInsert[];
     }
 
-    const activeLedgers = await loadActiveTallyLedgerRows({
-      supabase,
-      ownerUserId: user.id,
-      connectionId,
-    });
+    const { data: ledgerRows, error: ledgerError } = await supabase
+      .from("tally_masters")
+      .select("tally_name, parent_name")
+      .eq("owner_user_id", user.id)
+      .eq("connection_id", connectionId)
+      .eq("master_type", "ledger")
+      .eq("is_active", true)
+      .limit(5000);
+
+    if (ledgerError) throw ledgerError;
+
+    const activeLedgers = (ledgerRows ?? []) as unknown as TallyLedgerRow[];
     const companySuspenseLedgerName = findCompanySuspenseLedger(activeLedgers);
 
     const syncedLedgerNames = new Set(
@@ -612,7 +591,6 @@ export async function POST(request: Request) {
           ownerUserId: user.id,
           connectionId,
           accountId: transaction.bank_account_id,
-          ledgerRows: activeLedgers,
           transaction: {
             transactionDate: transaction.transaction_date,
             valueDate: transaction.value_date,
@@ -821,9 +799,7 @@ export async function POST(request: Request) {
       return jsonWithCors(
         request,
         {
-          error: "Some rows need review. Nothing was sent to Tally.",
-          detail: `${voucherCommands.length}/${expectedReceiptCount} receipts and ${verificationCommands.length}/${expectedPaymentCheckCount} payment checks are ready.`,
-          userAction: "Fix the highlighted rows, then send again.",
+          error: `Tally preflight failed: ${voucherCommands.length} of ${expectedReceiptCount} receipt(s) and ${verificationCommands.length} of ${expectedPaymentCheckCount} payment check(s) were ready. Nothing was queued.`,
           queuedCount: 0,
           verificationCount: 0,
           commands: [],
@@ -844,9 +820,7 @@ export async function POST(request: Request) {
       return jsonWithCors(
         request,
         {
-          error: "No rows were ready. Nothing was sent to Tally.",
-          detail: "Rows were skipped because details are missing or already handled.",
-          userAction: "Fix the highlighted rows, then send again.",
+          error: "No transactions could be queued. Check diagnostics for the skipped reason.",
           queuedCount: 0,
           commands: [],
           diagnostics: {
@@ -1077,7 +1051,7 @@ export async function POST(request: Request) {
     console.error("Error in POST /api/bank-statements/tally/queue:", error);
     return jsonWithCors(
       request,
-      queueErrorPayload(error),
+      { error: error instanceof Error ? error.message : "Internal server error" },
       { status: 500 }
     );
   }

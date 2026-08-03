@@ -33,7 +33,7 @@ const INTERNAL_PO_REFERENCE_PATTERN = /\b[A-Z]{1,4}\/\d{2}-\d{2}\/[A-Z0-9][A-Z0-
 const IMAGE_HANDWRITTEN_EXTRACTION_INSTRUCTION =
   "Some packet documents are handwritten/manual or mixed printed and handwritten. Treat handwritten entries as first-class visible text, not as noise. Carefully inspect handwritten numbers, dates, party names, vehicle numbers, challan/receipt/permit/certificate numbers, financial amounts, weights, quantities, table cells, stamps, and signatures. Preserve readable handwriting in visibleText. Do not infer a handwritten value from other documents, file names, or nearby labels; if a value is only partly legible, omit the structured field and keep the uncertain transcription in visibleText. ";
 const AMOUNT_EXTRACTION_INSTRUCTION =
-  "Copy financial amounts exactly as printed, preserving digit count and decimal placement after removing separators. Do not add or drop zeros. Cross-check quantity x rate, taxable amount + tax amount, and subtotal + tax amount before returning totals; if arithmetic conflicts with a visually uncertain amount, prefer the arithmetically consistent value visible in the row/summary. Extract visible GST/tax percentage fields as taxRate, cgstRate, sgstRate, and igstRate; do not put tax percentages into taxAmount. Use GSTIN state codes for GST type: same-state or state code 27 means CGST+SGST split, while different-state/non-27 means IGST. ";
+  "Copy financial amounts exactly as printed, preserving digit count and decimal placement after removing separators. Do not add or drop zeros. Cross-check quantity x rate, taxable amount + tax amount, and subtotal + tax amount before returning totals; if arithmetic conflicts with a visually uncertain amount, prefer the arithmetically consistent value visible in the row/summary. Extract visible GST/tax percentage fields as taxRate, cgstRate, sgstRate, and igstRate; do not put tax percentages into taxAmount. For invoices, separately extract freightAmount and freightGstRate; normal income-tax TDS under section 194Q as tds194qAmount and tds194qRate; goods-transport TDS as transportTdsAmount and transportTdsRate; GST withholding as cgstTdsAmount, sgstTdsAmount, igstTdsAmount, and gstTdsRate; and visible TCS and round-off as tcsAmount and roundOffAmount. Keep these deductions separate and never infer an amount that is absent. Use tdsAmount and tdsRate only when the document does not identify the TDS type. Use GSTIN state codes for GST type: same-state or state code 27 means CGST+SGST split, while different-state/non-27 means IGST. ";
 const CONSIGNEE_EXTRACTION_INSTRUCTION =
   "If a party is labelled Consignee, Ship To, or Recipient, map it to buyerName/buyerGstin only when that party is Kalika or Kalika Steel Alloys. If the consignee/ship-to/recipient is any other party, do not use that value as buyerName or buyerGstin; keep it only in visibleText or address fields when applicable. ";
 const CONSIGNEE_NAME_ALIASES = new Set(["consigneeName", "consignee", "shipToName", "recipientName"]);
@@ -228,6 +228,16 @@ const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   cgstRate: ["cgstRate", "centralGstRate", "cgstPercent", "cgstPercentage"],
   sgstRate: ["sgstRate", "stateGstRate", "sgstPercent", "sgstPercentage"],
   igstRate: ["igstRate", "integratedGstRate", "igstPercent", "igstPercentage"],
+  tdsAmount: ["tdsAmount", "taxDeductedAtSource", "tdsDeducted", "tds"],
+  tdsRate: ["tdsRate", "tdsPercent", "tdsPercentage"],
+  tds194qAmount: ["tds194qAmount", "section194qAmount", "tdsPayable194q"],
+  tds194qRate: ["tds194qRate", "section194qRate"],
+  transportTdsAmount: ["transportTdsAmount", "goodsTransportTdsAmount", "freightTdsAmount"],
+  transportTdsRate: ["transportTdsRate", "goodsTransportTdsRate", "freightTdsRate"],
+  cgstTdsAmount: ["cgstTdsAmount", "cgstWithholdingAmount"],
+  sgstTdsAmount: ["sgstTdsAmount", "sgstWithholdingAmount"],
+  igstTdsAmount: ["igstTdsAmount", "igstWithholdingAmount"],
+  gstTdsRate: ["gstTdsRate", "gstWithholdingRate"],
   totalAmount: ["totalAmount", "grandTotal", "documentTotal"],
   paymentTerms: ["paymentTerms", "paymentTerm", "termsOfPayment", "paymentCondition"],
   deliveryTerms: ["deliveryTerms", "deliveryTerm", "deliveryPeriod", "deliverySchedule", "deliveryCondition"],
@@ -241,6 +251,7 @@ const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   paidAmount: ["paidAmount", "amountPaid", "paidTollAmount", "tollAmount", "amountReceived", "receivedAmount"],
   statementAmount: ["statementAmount", "availableBalance", "availableBal", "avblBal", "balance", "debitAmount", "creditAmount", "transactionAmount"],
   freightAmount: ["freightAmount", "freight", "transportCharge"],
+  freightGstRate: ["freightGstRate", "freightTaxRate", "transportGstRate"],
   advanceAmount: ["advanceAmount", "advancePaid"],
   toPayAmount: ["toPayAmount", "toPay", "ttbAmount"],
   itemDescription: ["itemDescription", "description", "productDescription"],

@@ -16,6 +16,7 @@ import {
   omitIgnoredFields,
 } from "@/lib/document-schema";
 import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
+import { applyInvoiceCommercialFieldFallback } from "@/lib/invoice-commercial-fields";
 import {
   enrichDocumentsWithPacketGstTaxContext,
   isCommercialDocType,
@@ -63,7 +64,7 @@ const IMAGE_HANDWRITTEN_EXTRACTION_INSTRUCTION =
 const TEXT_HANDWRITTEN_EXTRACTION_INSTRUCTION =
   "This text may come from PDF embedded text/OCR and can omit handwritten entries. Use only the provided text; do not guess handwritten values that are not present. If the text shows manual or handwritten content, preserve it in visibleText and extract it when clearly labelled. ";
 const AMOUNT_EXTRACTION_INSTRUCTION =
-  "Copy financial amounts exactly as printed, preserving digit count and decimal placement after removing separators. Do not add or drop zeros. Cross-check quantity x rate, taxable amount + tax amount, and subtotal + tax amount before returning totals; if arithmetic conflicts with a visually uncertain amount, prefer the arithmetically consistent value visible in the row/summary. Extract visible GST/tax percentage fields as taxRate, cgstRate, sgstRate, and igstRate; do not put tax percentages into taxAmount. Use GSTIN state codes for GST type: same-state or state code 27 means CGST+SGST split, while different-state/non-27 means IGST. ";
+  "Copy financial amounts exactly as printed, preserving digit count and decimal placement after removing separators. Do not add or drop zeros. Cross-check quantity x rate, taxable amount + tax amount, and subtotal + tax amount before returning totals; if arithmetic conflicts with a visually uncertain amount, prefer the arithmetically consistent value visible in the row/summary. Extract visible GST/tax percentage fields as taxRate, cgstRate, sgstRate, and igstRate; do not put tax percentages into taxAmount. For invoices, extract printed total GST as taxAmount and separately extract freightAmount and freightGstRate; normal income-tax TDS under section 194Q as tds194qAmount and tds194qRate; goods-transport TDS as transportTdsAmount and transportTdsRate; GST withholding as cgstTdsAmount, sgstTdsAmount, igstTdsAmount, and gstTdsRate; and TCS and round-off as tcsAmount and roundOffAmount. Keep deductions separate and never infer an amount that is absent. Use tdsAmount and tdsRate only when the document does not identify the TDS type. Use GSTIN state codes for GST type: same-state or state code 27 means CGST+SGST split, while different-state/non-27 means IGST. ";
 const CONSIGNEE_EXTRACTION_INSTRUCTION =
   "If a party is labelled Consignee, Ship To, or Recipient, map it to buyerName/buyerGstin only when that party is Kalika or Kalika Steel Alloys. If the consignee/ship-to/recipient is any other party, do not use that value as buyerName or buyerGstin; keep it only in visibleText or address fields when applicable. ";
 const CONSIGNEE_NAME_ALIASES = new Set(["consigneeName", "consignee", "shipToName", "recipientName"]);
@@ -156,6 +157,18 @@ const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   cgstRate: ["cgstRate", "centralGstRate", "cgstPercent", "cgstPercentage"],
   sgstRate: ["sgstRate", "stateGstRate", "sgstPercent", "sgstPercentage"],
   igstRate: ["igstRate", "integratedGstRate", "igstPercent", "igstPercentage"],
+  tdsAmount: ["tdsAmount", "taxDeductedAtSource", "tdsDeducted", "tds"],
+  tdsRate: ["tdsRate", "tdsPercent", "tdsPercentage"],
+  tds194qAmount: ["tds194qAmount", "section194qAmount", "tdsPayable194q"],
+  tds194qRate: ["tds194qRate", "section194qRate"],
+  transportTdsAmount: ["transportTdsAmount", "goodsTransportTdsAmount", "freightTdsAmount"],
+  transportTdsRate: ["transportTdsRate", "goodsTransportTdsRate", "freightTdsRate"],
+  cgstTdsAmount: ["cgstTdsAmount", "cgstWithholdingAmount"],
+  sgstTdsAmount: ["sgstTdsAmount", "sgstWithholdingAmount"],
+  igstTdsAmount: ["igstTdsAmount", "igstWithholdingAmount"],
+  gstTdsRate: ["gstTdsRate", "gstWithholdingRate"],
+  tcsAmount: ["tcsAmount", "taxCollectedAtSource", "tcsCollected", "tcs"],
+  roundOffAmount: ["roundOffAmount", "roundoffAmount", "roundingAmount", "roundOff"],
   totalAmount: ["totalAmount", "grandTotal", "documentTotal"],
   paymentTerms: ["paymentTerms", "paymentTerm", "termsOfPayment", "paymentCondition"],
   deliveryTerms: ["deliveryTerms", "deliveryTerm", "deliveryPeriod", "deliverySchedule", "deliveryCondition"],
@@ -169,6 +182,7 @@ const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   paidAmount: ["paidAmount", "amountPaid", "paidTollAmount", "tollAmount", "amountReceived", "receivedAmount"],
   statementAmount: ["statementAmount", "availableBalance", "availableBal", "avblBal", "balance", "debitAmount", "creditAmount", "transactionAmount"],
   freightAmount: ["freightAmount", "freight", "transportCharge"],
+  freightGstRate: ["freightGstRate", "freightTaxRate", "transportGstRate"],
   advanceAmount: ["advanceAmount", "advancePaid"],
   toPayAmount: ["toPayAmount", "toPay", "ttbAmount"],
   itemDescription: ["itemDescription", "description", "productDescription"],
@@ -1438,6 +1452,7 @@ export async function reviewAndCorrectExtractedDocuments(documents: CaseDoc[]): 
             "Review all extracted documents against their visibleText and correct only values that are explicitly supported by visible packet evidence. " +
             "Do not invent data from file names, nearby documents, expectations, or arithmetic alone. " +
             "You may correct documentType, fields, lineItems, and quarantine unsupported fields. " +
+            "For every Invoice or Tax Invoice with a visible commercial item table, ensure lineItems contains every visible goods or service row. Do not move an invoice row to another document merely because the same HSN or amount also appears there. " +
             "E-Way Bill numbers must be exactly 12 digits. If an extracted eWayBillNumber is not 12 digits, remove it. " +
             "Do not automatically move an invalid e-way value into referenceInvoiceNumber unless the visible page explicitly labels it as Doc No, Document No, Invoice No, Tax Invoice No, or Delivery Challan No for that same document. " +
             "If a page is a PASS OUT DOCUMENT, delivery summary, logistics summary, or contains multiple delivery refs such as EM5032/EM5033, avoid creating a strong invoice reference unless the label and line amounts clearly support that exact invoice. " +
@@ -1817,6 +1832,31 @@ function countMeaningfulFields(fields: Partial<Record<FieldKey, string>>) {
   return Object.values(fields).filter((value) => value !== undefined && value !== null && String(value).trim()).length;
 }
 
+function hasVisibleCommercialItemTable(doc: CaseDoc) {
+  const visibleText = String(doc.md ?? "").toLowerCase();
+  if (!visibleText) return false;
+  const hasItemHeading = /\b(description|particulars?|item\s+description|invoice\s+items?)\b/.test(visibleText);
+  const hasQuantityHeading = /\b(qty|quantity)\b/.test(visibleText);
+  const hasCommercialHeading = /\b(hsn|sac|rate|taxable|amount|value)\b/.test(visibleText);
+  return hasItemHeading && hasQuantityHeading && hasCommercialHeading;
+}
+
+function hasPositiveInvoiceValue(doc: CaseDoc) {
+  return ["totalTaxableAmount", "subtotal", "totalAmount"].some((key) => {
+    const value = parseLooseNumber(doc.fields?.[key as FieldKey]);
+    return value !== null && value > 0;
+  });
+}
+
+function hasIncompleteVisibleInvoiceLines(doc: CaseDoc) {
+  return (
+    (doc.type === "Tax Invoice" || doc.type === "Invoice") &&
+    !doc.lineItems?.length &&
+    hasPositiveInvoiceValue(doc) &&
+    hasVisibleCommercialItemTable(doc)
+  );
+}
+
 function isWeakExtraction(doc: CaseDoc) {
   const fields = doc.fields ?? {};
   const meaningfulFieldCount = countMeaningfulFields(fields);
@@ -1840,7 +1880,10 @@ function isWeakExtraction(doc: CaseDoc) {
       return !fields.eWayBillNumber && !fields.vehicleNumber;
     case "Tax Invoice":
     case "Invoice":
-      return !hasAnyField("invoiceNumber", "totalAmount", "itemDescription", "itemQuantity") && !hasLineItems;
+      return (
+        hasIncompleteVisibleInvoiceLines(doc) ||
+        (!hasAnyField("invoiceNumber", "totalAmount", "itemDescription", "itemQuantity") && !hasLineItems)
+      );
     case "Receipt":
       return !hasAnyField("receiptNumber", "referenceInvoiceNumber", "paidAmount", "transactionDate");
     case "Delivery Challan":
@@ -4802,7 +4845,7 @@ async function extractDataFromImagePages(params: {
   const lineItemInstruction = getLineItemExtractionInstruction(params.documentType);
   const documentSpecificInstruction = getDocumentSpecificExtractionInstruction(params.documentType);
   const qualityInstruction = params.qualityRetry
-    ? "This is a quality retry because the first extraction was weak. Re-read the page carefully, including handwritten/manual entries, small text, IDs, stamps, QR-adjacent text, and rotated/cropped regions. Do not return empty fields when any requested value is visible. "
+    ? "This is a quality retry because the first extraction was incomplete. Re-read the page carefully, including every visible commercial item row, handwritten/manual entries, small text, IDs, stamps, QR-adjacent text, and rotated/cropped regions. If the document has an item table, return each goods or service row in lineItems with its visible description, HSN/SAC, quantity, unit, rate, taxable amount, and tax values. Do not return empty fields when any requested value is visible. "
     : "";
 
   for (let index = 0; index < params.pageImages.length; index += 1) {
@@ -4868,7 +4911,15 @@ async function extractDataFromImagePages(params: {
             applyEWayBillAddressFallback(
               applyConsigneeBuyerGuard(
                 applyPurchaseOrderTermsFallback(
-                  applyPurchaseOrderDateFallback(mappedFields, params.documentType, visibleText),
+                  applyPurchaseOrderDateFallback(
+                    applyInvoiceCommercialFieldFallback(
+                      mappedFields,
+                      params.documentType,
+                      visibleText
+                    ),
+                    params.documentType,
+                    visibleText
+                  ),
                   params.documentType,
                   visibleText
                 ),
@@ -4920,7 +4971,7 @@ async function extractDataFromTextPages(params: {
   const lineItemInstruction = getLineItemExtractionInstruction(params.documentType);
   const documentSpecificInstruction = getDocumentSpecificExtractionInstruction(params.documentType);
   const qualityInstruction = params.qualityRetry
-    ? "This is a quality retry because the first extraction was weak. Re-read the text carefully and do not return empty fields when any requested value is visible. "
+    ? "This is a quality retry because the first extraction was incomplete. Re-read the text carefully, capture every visible commercial item row in lineItems, and do not return empty fields when any requested value is visible. "
     : "";
   const visibleText = params.textPages.map((page, index) => `Page ${index + 1}: ${page}`).join("\n\n");
 
@@ -4965,7 +5016,15 @@ async function extractDataFromTextPages(params: {
             applyEWayBillAddressFallback(
               applyConsigneeBuyerGuard(
                 applyPurchaseOrderTermsFallback(
-                  applyPurchaseOrderDateFallback(mappedFields, params.documentType, visibleText),
+                  applyPurchaseOrderDateFallback(
+                    applyInvoiceCommercialFieldFallback(
+                      mappedFields,
+                      params.documentType,
+                      visibleText
+                    ),
+                    params.documentType,
+                    visibleText
+                  ),
                   params.documentType,
                   visibleText
                 ),

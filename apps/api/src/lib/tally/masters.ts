@@ -13,6 +13,10 @@ export type TallyMappingType =
   | "item_hsn"
   | "item_description"
   | "gst_rate"
+  | "purchase_ledger"
+  | "tds_ledger"
+  | "tcs_ledger"
+  | "stock_unit"
   | "freight_ledger"
   | "round_off_ledger"
   | "voucher_type"
@@ -44,6 +48,7 @@ export type TallyMasterRow = {
   id: string;
   connection_id: string;
   owner_user_id: string;
+  company_name: string;
   sync_run_id: string | null;
   master_type: TallyMasterType;
   master_key: string;
@@ -65,6 +70,7 @@ export type TallyMappingRow = {
   id: string;
   connection_id: string;
   owner_user_id: string;
+  company_name: string;
   mapping_type: TallyMappingType;
   source_key: string;
   source_label: string;
@@ -93,6 +99,10 @@ export const MAPPING_TYPES: TallyMappingType[] = [
   "item_hsn",
   "item_description",
   "gst_rate",
+  "purchase_ledger",
+  "tds_ledger",
+  "tcs_ledger",
+  "stock_unit",
   "freight_ledger",
   "round_off_ledger",
   "voucher_type",
@@ -131,6 +141,25 @@ export function toNullableNumber(value: unknown) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function getMasterInputValue(input: TallyMasterInput, ...fieldNames: string[]) {
+  const values = input as Record<string, unknown>;
+  const normalizedFields = new Map(
+    Object.entries(values).map(([key, value]) => [
+      key.toLowerCase().replace(/[^a-z0-9]/g, ""),
+      value,
+    ])
+  );
+
+  for (const fieldName of fieldNames) {
+    const value = normalizedFields.get(fieldName.toLowerCase().replace(/[^a-z0-9]/g, ""));
+    if (value !== undefined && value !== null) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
 export function normalizeMasterKey(input: {
   masterType: TallyMasterType;
   name: string;
@@ -141,12 +170,16 @@ export function normalizeMasterKey(input: {
 }
 
 export function normalizeMasterInput(masterType: TallyMasterType, input: TallyMasterInput) {
-  const name = toRequiredText(input.name);
+  // Connector builds and PowerShell helpers have historically emitted both
+  // camelCase and Tally-style uppercase keys. Normalize field names here so a
+  // valid read cannot be reported as a successful sync with zero accepted rows.
+  const name = toRequiredText(getMasterInputValue(input, "name"));
   if (!name) return null;
 
-  const guid = toNullableText(input.guid, 160);
-  const parent = toNullableText(input.parent, 240);
-  const raw = input.raw && typeof input.raw === "object" ? input.raw : input;
+  const guid = toNullableText(getMasterInputValue(input, "guid"), 160);
+  const parent = toNullableText(getMasterInputValue(input, "parent"), 240);
+  const rawInput = getMasterInputValue(input, "raw");
+  const raw = rawInput && typeof rawInput === "object" ? rawInput : input;
 
   return {
     master_type: masterType,
@@ -154,10 +187,18 @@ export function normalizeMasterInput(masterType: TallyMasterType, input: TallyMa
     tally_guid: guid,
     tally_name: name.slice(0, 500),
     parent_name: parent,
-    gstin: toNullableText(input.gstin, 32),
-    hsn_code: toNullableText(input.hsnCode, 32),
-    unit_name: toNullableText(input.unitName, 80),
-    tax_rate: toNullableNumber(input.taxRate),
+    gstin: toNullableText(
+      getMasterInputValue(input, "gstin", "partyGstin", "gstRegistrationNumber"),
+      32
+    ),
+    hsn_code: toNullableText(getMasterInputValue(input, "hsnCode", "gstHsnCode"), 32),
+    unit_name: toNullableText(
+      getMasterInputValue(input, "unitName", "baseUnits", "originalBaseUnits"),
+      80
+    ),
+    tax_rate: toNullableNumber(
+      getMasterInputValue(input, "taxRate", "gstTaxRate", "rateOfTaxCalculation")
+    ),
     raw_payload: raw as Record<string, unknown>,
   };
 }
@@ -171,6 +212,7 @@ export function serializeTallyMaster(row: TallyMasterRow) {
   return {
     id: row.id,
     connectionId: row.connection_id,
+    companyName: row.company_name,
     type: row.master_type,
     key: row.master_key,
     guid: row.tally_guid,
@@ -205,6 +247,7 @@ export function serializeTallyMapping(row: TallyMappingRow) {
   return {
     id: row.id,
     connectionId: row.connection_id,
+    companyName: row.company_name,
     mappingType: row.mapping_type,
     sourceKey: row.source_key,
     sourceLabel: row.source_label,

@@ -35,31 +35,6 @@ function normalizeDisplayName(value: unknown) {
   return value.trim().slice(0, 120);
 }
 
-function errorText(error: unknown) {
-  if (error instanceof Error) return error.message;
-  if (error && typeof error === "object") {
-    const record = error as Record<string, unknown>;
-    return [record.message, record.details, record.hint]
-      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-      .join(" ");
-  }
-  return String(error ?? "").trim();
-}
-
-function tallyConnectionErrorPayload(error: unknown) {
-  const message = errorText(error);
-  if (/tally_connections|tally_connection_events|relation .*does not exist|schema cache/i.test(message)) {
-    return {
-      error: "Tally Connector setup is not ready.",
-      userAction: "Run the latest Tally connector database migration, then try again.",
-    };
-  }
-  return {
-    error: message || "Could not load Tally connections.",
-    userAction: "Check the API server logs if this continues.",
-  };
-}
-
 function connectionSortTime(connection: ReturnType<typeof serializeTallyConnectionStatus>) {
   const heartbeatTime = connection.lastHeartbeatAt
     ? new Date(connection.lastHeartbeatAt).getTime()
@@ -173,7 +148,7 @@ export async function GET(request: Request) {
     });
   } catch (error) {
     console.error("Error in GET /api/tally/connections:", error);
-    return jsonWithCors(request, tallyConnectionErrorPayload(error), { status: 500 });
+    return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
 
@@ -265,6 +240,6 @@ export async function POST(request: Request) {
     );
   } catch (error) {
     console.error("Error in POST /api/tally/connections:", error);
-    return jsonWithCors(request, tallyConnectionErrorPayload(error), { status: 500 });
+    return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }

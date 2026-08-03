@@ -26,6 +26,76 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
+function compactPurchaseCommandPayload(payload: Record<string, unknown>) {
+  return {
+    postingId: payload.postingId ?? null,
+    caseId: payload.caseId ?? null,
+    revision: payload.revision ?? null,
+    idempotencyKey: payload.idempotencyKey ?? null,
+  };
+}
+
+function positiveTallyId(value: unknown) {
+  const text = toNullableText(value, 500);
+  return text && text !== "0" ? text : null;
+}
+
+function compactPurchaseResult(result: Record<string, unknown>) {
+  const verification = result.verification && typeof result.verification === "object"
+    ? result.verification as Record<string, unknown>
+    : result;
+  const importSummary = {
+    httpStatus: result.httpStatus ?? null,
+    created: result.created ?? null,
+    altered: result.altered ?? null,
+    errors: result.errors ?? null,
+    exceptions: result.exceptions ?? null,
+    ignored: result.ignored ?? null,
+    cancelled: result.cancelled ?? null,
+  };
+  return {
+    verificationStatus: verification.verificationStatus ?? null,
+    differences: Array.isArray(verification.differences)
+      ? verification.differences
+          .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+          .slice(0, 20)
+          .map((value) => value.trim().slice(0, 500))
+      : [],
+    voucherNumber: verification.voucherNumber ?? result.voucherNumber ?? null,
+    masterId:
+      positiveTallyId(verification.masterId) ??
+      positiveTallyId(verification.voucherId) ??
+      positiveTallyId(result.lastVchId),
+    guid: verification.guid ?? result.guid ?? null,
+    voucherCreated: Boolean(
+      result.voucherCreatedButVerificationFailed ||
+      Number(result.created ?? 0) > 0 ||
+      verification.voucherNumber ||
+      positiveTallyId(verification.masterId) ||
+      positiveTallyId(verification.voucherId) ||
+      positiveTallyId(result.lastVchId)
+    ),
+    importSummary,
+    tallyResponse: toNullableText(result.response, 4000),
+  };
+}
+
+function purchaseVerificationError(
+  fallback: string | null,
+  verification: Record<string, unknown>
+) {
+  const differences = Array.isArray(verification.differences)
+    ? verification.differences
+        .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+        .slice(0, 5)
+        .map((value) => value.trim())
+    : [];
+  if (differences.length > 0) {
+    return `Tally created the voucher, but these checks need attention: ${differences.join(" ")}`.slice(0, 2000);
+  }
+  return fallback;
+}
+
 export async function POST(
   request: Request,
   context: { params: Promise<{ commandId: string }> }
@@ -93,11 +163,32 @@ export async function POST(
 
     const now = new Date().toISOString();
 
+    const { data: pendingCommandData, error: pendingCommandError } = await supabase
+      .from("tally_bridge_commands")
+      .select("*")
+      .eq("id", commandId)
+      .eq("connection_id", connection.id)
+      .in("status", ["claimed", "queued"])
+      .maybeSingle();
+
+    if (pendingCommandError) throw pendingCommandError;
+    if (!pendingCommandData) {
+      return jsonWithCors(request, { error: "Tally command not found." }, { status: 404 });
+    }
+
+    const pendingCommand = pendingCommandData as unknown as TallyBridgeCommandRow;
+    const commandPayload =
+      pendingCommand.payload && typeof pendingCommand.payload === "object"
+        ? (pendingCommand.payload as Record<string, unknown>)
+        : {};
+    const isPurchaseVoucher = pendingCommand.command_type === "create_purchase_voucher";
+
     const { data: commandData, error: updateError } = await supabase
       .from("tally_bridge_commands")
       .update({
         status: success ? "succeeded" : "failed",
-        result,
+        payload: isPurchaseVoucher ? compactPurchaseCommandPayload(commandPayload) : commandPayload,
+        result: isPurchaseVoucher ? compactPurchaseResult(result) : result,
         error: errorMessage,
         completed_at: now,
       })
@@ -113,10 +204,6 @@ export async function POST(
     }
 
     const command = commandData as unknown as TallyBridgeCommandRow;
-    const commandPayload =
-      command.payload && typeof command.payload === "object"
-        ? (command.payload as Record<string, unknown>)
-        : {};
 
     if (success && command.command_type === "alter_ledger") {
       const masterKey = toNullableText(commandPayload.masterKey, 500);
@@ -135,6 +222,7 @@ export async function POST(
           })
           .eq("connection_id", connection.id)
           .eq("owner_user_id", connection.owner_user_id)
+          .eq("company_name", toNullableText(commandPayload.companyName, 240) ?? connection.last_company_name ?? "Unknown company")
           .eq("master_key", masterKey);
       }
     }
@@ -148,6 +236,7 @@ export async function POST(
           {
             connection_id: connection.id,
             owner_user_id: connection.owner_user_id,
+            company_name: toNullableText(commandPayload.companyName, 240) ?? connection.last_company_name ?? "Unknown company",
             sync_run_id: null,
             master_type: "ledger",
             master_key: normalizeMasterKey({ masterType: "ledger", name }),
@@ -163,7 +252,7 @@ export async function POST(
             last_synced_at: now,
           },
           {
-            onConflict: "connection_id,master_type,master_key",
+            onConflict: "connection_id,company_name,master_type,master_key",
           }
         );
       }
@@ -229,6 +318,61 @@ export async function POST(
         if (postingLogError) throw postingLogError;
       }
 
+    }
+
+    if (command.command_type === "create_purchase_voucher") {
+      const postingId = toNullableText(commandPayload.postingId, 80);
+      const verification = result.verification && typeof result.verification === "object"
+        ? result.verification as Record<string, unknown>
+        : result;
+      const verificationStatus = toNullableText(verification.verificationStatus, 80);
+      const verified = success && verificationStatus === "verified";
+      const correctionRequired = Boolean(
+        result.voucherCreatedButVerificationFailed ||
+        result.possibleDuplicateInTally ||
+        verificationStatus === "mismatch" ||
+        verificationStatus === "ambiguous"
+      );
+      const postingStatus = verified
+        ? "created"
+        : correctionRequired
+          ? "verification_required"
+          : "failed";
+      const voucherNumber =
+        toNullableText(verification.voucherNumber, 500) ??
+        toNullableText(result.voucherNumber, 500);
+      const masterId =
+        positiveTallyId(verification.masterId) ??
+        positiveTallyId(verification.voucherId) ??
+        positiveTallyId(result.lastVchId);
+      const tallyGuid =
+        toNullableText(verification.guid, 500) ??
+        toNullableText(result.guid, 500);
+      const voucherWasCreated = verified || Boolean(
+        result.voucherCreatedButVerificationFailed ||
+        Number(result.created ?? 0) > 0 ||
+        voucherNumber ||
+        masterId
+      );
+
+      if (postingId) {
+        const { error: postingUpdateError } = await supabase
+          .from("purchase_invoice_tally_postings")
+          .update({
+            status: postingStatus,
+            tally_voucher_number: voucherNumber,
+            tally_master_id: masterId,
+            tally_guid: tallyGuid,
+            tally_created_at: voucherWasCreated ? now : null,
+            verified_at: verified ? now : null,
+            verification_status: verificationStatus,
+            last_error: verified ? null : purchaseVerificationError(errorMessage, verification),
+          })
+          .eq("id", postingId)
+          .eq("owner_user_id", connection.owner_user_id)
+          .eq("command_id", commandId);
+        if (postingUpdateError) throw postingUpdateError;
+      }
     }
 
     if (command.command_type === "verify_bank_transaction") {

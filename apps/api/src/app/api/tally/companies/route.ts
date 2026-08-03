@@ -62,24 +62,17 @@ function isGenericTallyLabel(value: string | null | undefined) {
   );
 }
 
-function pickCompanyName(connection: TallyConnectionWithSync, overrideName?: string | null) {
-  const latestSync = connection.latestSync ?? null;
-  const names = [overrideName, connection.last_company_name, latestSync?.company_name, connection.display_name];
-  return names.find((name) => !isGenericTallyLabel(name)) ?? names.find((name) => String(name ?? "").trim()) ?? "Tally Prime";
-}
-
 function virtualCompanyId(connectionId: string, companyName: string) {
   return `${connectionId}::${encodeURIComponent(companyName)}`;
 }
 
 function serializeCompany(
   connection: TallyConnectionWithSync,
-  companyNameOverride?: string | null,
+  companyName: string,
   metadata?: HeartbeatCompany | null
 ) {
   const status = serializeTallyConnectionStatus(connection);
   const latestSync = connection.latestSync ?? null;
-  const companyName = pickCompanyName(connection, companyNameOverride);
   const totals = latestSync?.totals && typeof latestSync.totals === "object" ? latestSync.totals : {};
   const bankAccountCount =
     typeof totals.bank_ledger === "number"
@@ -163,14 +156,14 @@ function nullablePayloadText(value: unknown) {
 function companiesFromPayload(payload: Record<string, unknown> | null | undefined): HeartbeatCompany[] {
   if (!payload || typeof payload !== "object") return [];
   const rawCompanies = payload.companies ?? payload.availableCompanies;
-  if (!Array.isArray(rawCompanies)) return [];
+  const companyRows = Array.isArray(rawCompanies) ? rawCompanies : [];
 
   const activeCompanyName =
     nullablePayloadText(payload.heartbeatCompanyName) ?? nullablePayloadText(payload.companyName);
   const seen = new Set<string>();
   const companies: HeartbeatCompany[] = [];
 
-  for (const value of rawCompanies) {
+  for (const value of companyRows) {
     const row =
       value && typeof value === "object"
         ? (value as Record<string, unknown>)
@@ -341,35 +334,57 @@ export async function GET(request: Request) {
     if (!user) {
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }
+    const connectionId = new URL(request.url).searchParams
+      .get("connectionId")
+      ?.trim();
+    if (!connectionId) {
+      return jsonWithCors(
+        request,
+        { error: "Select a Tally connector before loading companies." },
+        { status: 400 }
+      );
+    }
 
     if (localMode) {
       const localTallyCompanies = readLocalTallyCompanies();
-      const companyEntries = (await listLocalTallyConnections(user.id)).map((connection) => {
-        const companyName = pickCompanyName(connection);
-
-        return {
-          company: serializeCompany(connection, companyName),
-          hasSpecificName: !isGenericTallyLabel(companyName),
-          updatedAt: connection.updated_at,
-        };
-      });
-
-      companyEntries.sort((a, b) => {
-        if (a.hasSpecificName !== b.hasSpecificName) {
-          return a.hasSpecificName ? -1 : 1;
-        }
-
-        return timestampValue(b.updatedAt) - timestampValue(a.updatedAt);
-      });
-
-      const connectedCompanyEntries = companyEntries.filter(
-        (entry) => entry.company.bridgeConnected && entry.company.tallyReachable && entry.company.companyLoaded
-      );
-      const companies = companyEntries.map((entry) => withLocalBankLedgers(entry.company, localTallyCompanies));
+      const companies = (await listLocalTallyConnections(user.id))
+        .filter((connection) => connection.id === connectionId)
+        .flatMap((connection) => {
+          const status = serializeTallyConnectionStatus(connection);
+          const companyName = status.lastCompanyName?.trim();
+          if (
+            !status.bridgeConnected ||
+            !status.tallyReachable ||
+            !status.companyLoaded ||
+            !companyName ||
+            isGenericTallyLabel(companyName)
+          ) {
+            return [];
+          }
+          return [
+            withLocalBankLedgers(
+              serializeCompany(connection, companyName, {
+                companyName,
+                guid: null,
+                financialYear: null,
+                financialYearStart: null,
+                booksFrom: null,
+                currentPeriod: null,
+                isActive: true,
+              }),
+              localTallyCompanies
+            ),
+          ];
+        })
+        .sort(
+          (left, right) =>
+            timestampValue(right.lastHeartbeatAt) -
+            timestampValue(left.lastHeartbeatAt)
+        );
 
       return jsonWithCors(request, {
         companies,
-        selectedCompanyId: connectedCompanyEntries[0]?.company.id ?? companies[0]?.id ?? null,
+        selectedCompanyId: companies[0]?.id ?? null,
       });
     }
 
@@ -378,6 +393,7 @@ export async function GET(request: Request) {
       .from("tally_connections")
       .select(TALLY_CONNECTION_SELECT)
       .eq("owner_user_id", user.id)
+      .eq("id", connectionId)
       .is("revoked_at", null)
       .order("updated_at", { ascending: false })
       .limit(20);
@@ -387,8 +403,7 @@ export async function GET(request: Request) {
     const connections = (data ?? []) as unknown as TallyConnectionRow[];
     const connectionIds = connections.map((connection) => connection.id);
     const latestSyncByConnection = new Map<string, LatestSyncRow>();
-    const syncCompanyNamesByConnection = new Map<string, string[]>();
-    const heartbeatCompaniesByConnection = new Map<string, HeartbeatCompany[]>();
+    const latestHeartbeatByConnection = new Map<string, HeartbeatEventRow>();
     const localTallyCompanies: LocalTallyCompany[] = [];
 
     if (connectionIds.length > 0) {
@@ -406,11 +421,6 @@ export async function GET(request: Request) {
         if (!latestSyncByConnection.has(row.connection_id)) {
           latestSyncByConnection.set(row.connection_id, row);
         }
-        const existing = syncCompanyNamesByConnection.get(row.connection_id) ?? [];
-        syncCompanyNamesByConnection.set(
-          row.connection_id,
-          normalizedCompanyNames([...existing, row.company_name])
-        );
       }
 
       const { data: eventRows, error: eventError } = await supabase
@@ -425,10 +435,8 @@ export async function GET(request: Request) {
       if (eventError) throw eventError;
 
       for (const row of (eventRows ?? []) as unknown as HeartbeatEventRow[]) {
-        if (heartbeatCompaniesByConnection.has(row.connection_id)) continue;
-        const companies = companiesFromPayload(row.payload);
-        if (companies.length > 0) {
-          heartbeatCompaniesByConnection.set(row.connection_id, companies);
+        if (!latestHeartbeatByConnection.has(row.connection_id)) {
+          latestHeartbeatByConnection.set(row.connection_id, row);
         }
       }
     }
@@ -436,40 +444,23 @@ export async function GET(request: Request) {
     const companyEntries = connections.flatMap((connection) => {
       const latestSync = latestSyncByConnection.get(connection.id) ?? null;
       const status = serializeTallyConnectionStatus(connection);
-      const heartbeatCompanies = heartbeatCompaniesByConnection.get(connection.id) ?? [];
-      const shouldUseHeartbeatNames =
-        heartbeatCompanies.length > 0 &&
-        status.bridgeConnected &&
-        status.tallyReachable;
-      const companiesToSerialize: HeartbeatCompany[] = shouldUseHeartbeatNames
-        ? heartbeatCompanies
-        : normalizedCompanyNames([
-            ...(syncCompanyNamesByConnection.get(connection.id) ?? []),
-            connection.last_company_name,
-            latestSync?.company_name,
-          ]).map((companyName) => ({
-            companyName,
-            guid: null,
-            financialYear: null,
-            financialYearStart: null,
-            booksFrom: null,
-            currentPeriod: null,
-            isActive: false,
-          }));
-      const finalCompanies =
-        companiesToSerialize.length > 0
-          ? companiesToSerialize
-          : [{
-              companyName: pickCompanyName({ ...connection, latestSync }),
-              guid: null,
-              financialYear: null,
-              financialYearStart: null,
-              booksFrom: null,
-              currentPeriod: null,
-              isActive: false,
-            }];
+      const latestHeartbeat =
+        latestHeartbeatByConnection.get(connection.id) ?? null;
+      const heartbeatAt = timestampValue(latestHeartbeat?.created_at);
+      const heartbeatFresh =
+        heartbeatAt > 0 && Date.now() - heartbeatAt <= 45_000;
+      if (
+        !heartbeatFresh ||
+        !status.bridgeConnected ||
+        !status.tallyReachable
+      ) {
+        return [];
+      }
+      const heartbeatCompanies = companiesFromPayload(
+        latestHeartbeat?.payload
+      );
 
-      return finalCompanies.map((metadata) => ({
+      return heartbeatCompanies.map((metadata) => ({
         company: serializeCompany(
           {
             ...connection,
@@ -484,39 +475,19 @@ export async function GET(request: Request) {
     });
 
     companyEntries.sort((a, b) => {
-      if (a.hasSpecificName !== b.hasSpecificName) {
-        return a.hasSpecificName ? -1 : 1;
-      }
-
+      const activeDiff =
+        Number(b.company.isActive) - Number(a.company.isActive);
+      if (activeDiff !== 0) return activeDiff;
       return timestampValue(b.updatedAt) - timestampValue(a.updatedAt);
     });
-
-    const connectedCompanyEntries = companyEntries.filter(
-      (entry) => entry.company.bridgeConnected && entry.company.tallyReachable && entry.company.companyLoaded
+    const companies = companyEntries.map((entry) =>
+      withLocalBankLedgers(entry.company, localTallyCompanies)
     );
-    const namedCompanyEntries = companyEntries.filter((entry) => entry.hasSpecificName);
-    const liveNamedCompanyEntries = namedCompanyEntries.filter(
-      (entry) => entry.company.bridgeConnected && entry.company.tallyReachable
-    );
-    const visibleCompanyEntries =
-      liveNamedCompanyEntries.length > 0
-        ? liveNamedCompanyEntries
-        : namedCompanyEntries.length > 0
-          ? namedCompanyEntries
-          : companyEntries;
-    const connectedCompanyIds = new Set(connectedCompanyEntries.map((entry) => entry.company.id));
-    visibleCompanyEntries.sort((a, b) => {
-      const connectedDiff = Number(connectedCompanyIds.has(b.company.id)) - Number(connectedCompanyIds.has(a.company.id));
-      if (connectedDiff !== 0) return connectedDiff;
-      return timestampValue(b.updatedAt) - timestampValue(a.updatedAt);
-    });
-    const companies = visibleCompanyEntries.map((entry) => withLocalBankLedgers(entry.company, localTallyCompanies));
 
     return jsonWithCors(request, {
       companies,
       selectedCompanyId:
-        connectedCompanyEntries.find((entry) => entry.company.isActive)?.company.id ??
-        connectedCompanyEntries[0]?.company.id ??
+        companyEntries.find((entry) => entry.company.isActive)?.company.id ??
         companies[0]?.id ??
         null,
     });

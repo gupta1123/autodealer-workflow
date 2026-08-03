@@ -31,14 +31,6 @@ const BANK_STATEMENT_MAX_TOTAL_PAGES = Number(process.env.BANK_STATEMENT_MAX_TOT
 const BANK_STATEMENT_BATCH_PAGE_SIZE = Math.max(1, Number(process.env.BANK_STATEMENT_BATCH_PAGE_SIZE ?? 2));
 const BANK_STATEMENT_BATCH_CONCURRENCY = Math.max(1, Number(process.env.BANK_STATEMENT_BATCH_CONCURRENCY ?? 3));
 const BANK_STATEMENT_BATCH_RETRY_LIMIT = Math.max(0, Number(process.env.BANK_STATEMENT_BATCH_RETRY_LIMIT ?? 2));
-const BANK_STATEMENT_LEDGER_MATCH_RETRY_LIMIT = Math.max(
-  0,
-  Number(process.env.BANK_STATEMENT_LEDGER_MATCH_RETRY_LIMIT ?? 2)
-);
-const BANK_STATEMENT_PREVIEW_INSERT_BATCH_SIZE = Math.max(
-  1,
-  Number(process.env.BANK_STATEMENT_PREVIEW_INSERT_BATCH_SIZE ?? 300)
-);
 const BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT = Math.max(
   0,
   Number(process.env.BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT ?? 50)
@@ -72,8 +64,6 @@ const OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS = Number(
 );
 const execFileAsync = promisify(execFile);
 const WORKER_IDLE_LOG_INTERVAL_MS = Number(process.env.WORKER_IDLE_LOG_INTERVAL_MS ?? 30_000);
-const BANK_STATEMENT_HELPDESK_MESSAGE =
-  "Analysis could not be completed. Please retry. If this continues, contact helpdesk.";
 
 const BANK_LEDGER_MATCHING_SYSTEM_PROMPT = `You match Indian bank statement transactions to synced Tally ledgers.
 Your task is to recommend the correct existing Tally ledger for each bank transaction.
@@ -82,40 +72,15 @@ Return only valid JSON. Do not return markdown, explanations outside JSON, or co
 Choose only from the provided tallyLedgers list. Copy every selected ledger name exactly as provided.
 Never invent, modify, shorten, merge, or create a ledger. If no existing ledger is clearly correct, use suspense.
 Every transaction must produce exactly one result using its original index.
-Return this exact structure: {"matches":[{"index":0,"matchType":"direct_match","action":"use_existing_ledger","ledgerName":"Exact Ledger Name From tallyLedgers","candidateLedgerNames":[],"confidence":0.95,"bankPartyRoot":"party root extracted from narration","ledgerPartyRoot":"party root from selected ledger or null","rootComparison":"same_root | different_root | unclear","savedMappingDecision":"not_provided","reason":"Short reason"}]}.
+Return this exact structure: {"matches":[{"index":0,"matchType":"direct_match","action":"use_existing_ledger","ledgerName":"Exact Ledger Name From tallyLedgers","candidateLedgerNames":[],"confidence":0.95,"reason":"Short reason"}]}.
 Allowed matchType values: direct_match, close_match, suspense.
 For direct_match, action must be "use_existing_ledger", ledgerName must be one exact name from tallyLedgers, candidateLedgerNames must be [], and confidence must be at least 0.90.
 For close_match, action must be "use_suspense", ledgerName must be null, candidateLedgerNames must contain at least two exact competing ledger names from tallyLedgers, and confidence must be 0.0.
 For suspense, action must be "use_suspense", ledgerName must be null, candidateLedgerNames must be [], and confidence must be 0.0.
 A shortened, OCR-damaged, misspelled, or incomplete party name can still be a direct match when it uniquely identifies one existing ledger.
-Split the narration and ledger names into party-root tokens and meaningful descriptor tokens. Party-root tokens identify the person/business name. Descriptor tokens distinguish similar ledgers under the same root, such as trading, traders, steel, metal, transport, logistics, suppliers, enterprise, engineering, fabrication, construction, services, chemicals, hardware, fuel, bank, charges, interest, cash, and similar business/category words.
-Before selecting any direct_match, find all ledgers that share the narration's party root and compare descriptor evidence. Visible descriptor evidence narrows candidates. If the narration has a descriptor token that matches one descriptor family, include only ledgers under the same party root whose descriptors match that visible family. Do not include unrelated same-root descriptors only because they might be OCR mistakes. If exactly one ledger remains, return direct_match. If two or more ledgers remain, return close_match and include all plausible exact ledger names in candidateLedgerNames. If no ledger remains, return suspense. When returning close_match, candidateLedgerNames should include all ledgers that share the same descriptor family and have the same party root or a likely OCR/spelling variant of that root. Do not include only exact-root candidates if near-root spelling variants are also plausible.
-Use close_match, not suspense, when the narration has a distinctive party root and two or more current ledgers share that root but the narration has no descriptor to choose between them.
-Even when one ledger name exactly matches the extracted text, check whether another ledger has the same descriptor and a very similar party root that could be an OCR/spelling variant. If two ledgers differ only by likely OCR/spelling changes, missing letters, swapped adjacent letters, or small edit distance, return close_match with both exact ledger names. Exact text is not enough to direct_match when another current ledger has the same descriptor family and a party root differing only by one or two characters, inserted/missing letters, vowel changes, or swapped adjacent letters. In that case, return close_match with the exact-text ledger and the near-duplicate ledger.
-Shortened tokens are evidence, not exact proof. A narration token can be a prefix of a ledger token, for example TRA can match traders, trading, transport, transporter, or travel; STE can match steel or steels; ENG can match engineering or engineers; SUP can match suppliers or supply; ENT can match enterprise or enterprises; FAB can match fabrication or fabricators.
-For descriptor tokens, prefix matching must follow the actual token prefix after normalization. Do not treat a partial descriptor as matching an unrelated descriptor family. For example, STE can match Steel but must not match Transport; SUP can match Supplier/Supply but must not match Transport.
-OCR/spelling collision checks apply mainly to party-root tokens. Do not use loose OCR assumptions to turn one business descriptor into an unrelated descriptor.
-If a partial token matches multiple descriptor families or multiple ledgers under the same party root, return close_match.
-For bank, loan, OD, WCDL, CC, cash-credit, and account-number ledgers, the bank name alone is not enough for direct_match when more than one ledger shares that bank root. Use direct_match for these ledgers only when the narration visibly includes the unique account subtype or account number, such as WCDL, OD, CC, or the account number itself. If the narration says only "Axis Bank" and ledgers include "Axis Bank WCDL A/c 92108044607205" and "Axis Bank OD Account", use close_match with both ledgers. If the narration says "Axis Bank WCDL A/c 92108044607205", use direct_match for "Axis Bank WCDL A/c 92108044607205".
 Ignore bank-system noise such as NEFT, RTGS, IMPS, UPI, NACH, ACH, ECS, CMS, CR, DR, payment, receipt, UTR, RRN, TXN, REF, beneficiary, account words, IFSC, bank, branch, dates, and reference numbers.
 Ignore case, spaces, punctuation, legal suffixes, and common spelling variants only when the full party root remains clearly the same.
 Do not remove meaningful descriptors such as Steel, Metals, Alloys, Traders, Transport, Logistics, Engineering, Fabrication, Electricals, Industries, Services, and Works when they differentiate parties.
-Treat Trader, Traders, Trading, and Trade as the same trading descriptor when the party root is otherwise the same.
-If the narration says "Kamal Trading" and ledgers include "Kamal Traders" and "Kamal Steel", prefer "Kamal Traders" because the root and trading descriptor align.
-If the narration says only "Kamal" and ledgers include "Kamal Traders" and "Kamal Steel", use close_match because the descriptor is missing and both ledgers share the root.
-If the narration says "Kamal TRAD" and ledgers include "Kamal Traders", "Kamla Traders", "Kamaal Traders", "Kamal Trading Co", and "Kamal Steel", use close_match with the trading-related exact-root and near-root ledgers, not "Kamal Steel".
-If the narration says "Kamla Traders" and ledgers include "Kamla Traders" and "Kamal Traders", use close_match with both ledgers even though "Kamla Traders" is an exact text match, because "Kamla" and "Kamal" are near OCR/spelling variants with the same descriptor.
-If the narration says "Sahil TRA" or "Sahil TRANSP" and ledgers include "Sahil Transport", "Sahil Transport And Suppliers", and "Sahil Steel Suppliers", use close_match with the transport-related ledgers, not "Sahil Steel Suppliers".
-If the narration says "Ambika" and ledgers include "Ambika Steel" and "Ambika Trading Co", use close_match because the descriptor is missing.
-If the narration says "Ambika TRAD" and ledgers include "Ambika Traders Malegaon Baramati Pune", "Ambika Trading Co", and "Ambika Steel", use close_match with the trading-related ledgers only, not "Ambika Steel".
-If the narration says "Sargvny Traders" and ledgers include "Sargvny Traders" and "Sarvagny Traders", use close_match because they are OCR/spelling variants with the same trading descriptor.
-If the narration says "Manibhadra Steel Cement" and ledgers include "Manibhadra Steel Cement Co" and "Manibhaddar Steel And Cement Company", use close_match with both ledgers because the party roots are near OCR/spelling variants and the descriptors align.
-If the narration says "Kamal STE" and ledgers include "Kamal Traders" and "Kamal Steel", use direct_match for "Kamal Steel" because the descriptor uniquely identifies it.
-If the narration contains only bank reference numbers, UTRs, RRN, account codes, or a generic payment mode, use suspense with no candidates.
-For every row, extract the bankPartyRoot from the narration after removing bank-system noise and legal suffixes.
-Use direct_match only when the bankPartyRoot and selected ledgerPartyRoot are the same party root or a safe spelling/OCR variant of the same party root.
-Generic business words such as traders, trading, steel, metal, transport, enterprise, company, industries, services, supplier, customer, payment, receipt, and private limited are not party roots by themselves.
-Names with different roots must not be matched even when one descriptor or one generic word overlaps.
 A named party ledger is preferred over a generic expense-category ledger when both are available.
 Select an expense, statutory, payroll, or bank-related ledger only when the narration explicitly supports that category and exactly one existing ledger clearly fits.
 Use suspense for generic narrations, only-reference rows, ambiguous merchants, self-transfers/reversals without a unique ledger, multiple plausible ledgers, best match below 0.90, or anything requiring guessing.`;
@@ -898,83 +863,19 @@ function findLedgerNameByNormalized(ledgerNames, ledgerName) {
   return ledgerNames.find((name) => normalizeName(name) === normalized) || null;
 }
 
-const GENERIC_LEDGER_MATCH_TOKENS = new Set([
-  "and",
-  "co",
-  "company",
-  "enterprise",
-  "enterprises",
-  "firm",
-  "llp",
-  "ltd",
-  "limited",
-  "private",
-  "pvt",
-  "service",
-  "services",
-  "supplier",
-  "suppliers",
-  "supply",
-  "trader",
-  "traders",
-  "trading",
-]);
-
-function ledgerMatchTokens(value) {
-  return normalizeName(value)
-    .split(/\s+/)
-    .filter((token) => token.length >= 3 && !GENERIC_LEDGER_MATCH_TOKENS.has(token));
-}
-
-function tokenMatchesLedgerToken(inputToken, ledgerToken) {
-  return inputToken === ledgerToken || ledgerToken.startsWith(inputToken);
-}
-
-function findTokenCollisionLedgerNames(ledgers, row) {
-  const texts = [
-    row.counterparty_name,
-    extractCounterpartyName(row.description),
-    row.description,
-  ];
-  const matchesByName = new Map();
-
-  for (const text of texts) {
-    const tokens = ledgerMatchTokens(text);
-    if (tokens.length === 0) continue;
-
-    for (const ledger of ledgers) {
-      const ledgerTokens = ledgerMatchTokens(ledger.name);
-      const matched = tokens.every((token) =>
-        ledgerTokens.some((ledgerToken) => tokenMatchesLedgerToken(token, ledgerToken))
-      );
-      if (matched) matchesByName.set(normalizeName(ledger.name), ledger.name);
-    }
-  }
-
-  return Array.from(matchesByName.values()).sort((left, right) => left.localeCompare(right));
-}
-
 async function applyAiLedgerSuggestionsToPreviewRows({ ownerUserId, connectionId, rows }) {
   if (!connectionId || rows.length === 0) return rows;
 
-  const ledgerRows = [];
-  const pageSize = 1000;
-  const maxRows = 5000;
-  for (let offset = 0; offset < maxRows; offset += pageSize) {
-    const { data, error } = await supabase
-      .from("tally_masters")
-      .select("tally_name, parent_name")
-      .eq("owner_user_id", ownerUserId)
-      .eq("connection_id", connectionId)
-      .eq("master_type", "ledger")
-      .eq("is_active", true)
-      .order("tally_name", { ascending: true })
-      .range(offset, offset + pageSize - 1);
+  const { data: ledgerRows, error: ledgerError } = await supabase
+    .from("tally_masters")
+    .select("tally_name, parent_name")
+    .eq("owner_user_id", ownerUserId)
+    .eq("connection_id", connectionId)
+    .eq("master_type", "ledger")
+    .eq("is_active", true)
+    .limit(5000);
 
-    if (error) throw error;
-    ledgerRows.push(...(data ?? []));
-    if ((data ?? []).length < pageSize) break;
-  }
+  if (ledgerError) throw ledgerError;
 
   const ledgers = (ledgerRows ?? []).flatMap((ledger) => {
     const name = textCell(ledger?.tally_name);
@@ -1026,29 +927,6 @@ async function applyAiLedgerSuggestionsToPreviewRows({ ownerUserId, connectionId
     const rawPayload = row.raw_payload && typeof row.raw_payload === "object" && !Array.isArray(row.raw_payload)
       ? row.raw_payload
       : {};
-    const tokenCollisionLedgerNames = findTokenCollisionLedgerNames(ledgers, row);
-
-    if (tokenCollisionLedgerNames.length >= 2) {
-      return {
-        ...row,
-        suggested_ledger_name: null,
-        suggestion_confidence: 0,
-        suggestion_reason: "Multiple close Tally ledger matches were found, so the row needs review.",
-        raw_payload: {
-          ...rawPayload,
-          aiLedgerRecommendation: {
-            matchType: "close_match",
-            action: "use_suspense",
-            ledgerName: null,
-            candidateLedgerNames: tokenCollisionLedgerNames,
-            confidence: 0,
-            reason: "Multiple close Tally ledger matches were found, so the row needs review.",
-            model: OPENROUTER_BANK_LEDGER_MODEL,
-            matchingSafetyVersion: "token_collision_v3",
-          },
-        },
-      };
-    }
 
     if (
       match.matchType === "direct_match" &&
@@ -1072,34 +950,10 @@ async function applyAiLedgerSuggestionsToPreviewRows({ ownerUserId, connectionId
               confidence,
               reason,
               model: OPENROUTER_BANK_LEDGER_MODEL,
-              matchingSafetyVersion: "token_collision_v3",
             },
           },
         };
       }
-    }
-
-    const closeMatchLedgerNames = candidateLedgerNames.length >= 2 ? candidateLedgerNames : tokenCollisionLedgerNames;
-    if (closeMatchLedgerNames.length >= 2) {
-      return {
-        ...row,
-        suggested_ledger_name: null,
-        suggestion_confidence: 0,
-        suggestion_reason: reason,
-        raw_payload: {
-          ...rawPayload,
-          aiLedgerRecommendation: {
-            matchType: "close_match",
-            action: "use_suspense",
-            ledgerName: null,
-            candidateLedgerNames: closeMatchLedgerNames,
-            confidence: 0,
-            reason: candidateLedgerNames.length >= 2 ? reason : "Multiple close Tally ledger matches were found, so the row needs review.",
-            model: OPENROUTER_BANK_LEDGER_MODEL,
-            matchingSafetyVersion: "token_collision_v3",
-          },
-        },
-      };
     }
 
     return {
@@ -1117,101 +971,13 @@ async function applyAiLedgerSuggestionsToPreviewRows({ ownerUserId, connectionId
           confidence: 0,
           reason,
           model: OPENROUTER_BANK_LEDGER_MODEL,
-          matchingSafetyVersion: "token_collision_v3",
         },
       },
     };
   });
 }
 
-function markPreviewRowsWithLedgerMatchingFailure(rows, error) {
-  const reason = "Ledger matching could not be completed after retries. Review this row manually.";
-  const errorMessage = diagnosticError(error);
-
-  return rows.map((row) => {
-    const rawPayload = row.raw_payload && typeof row.raw_payload === "object" && !Array.isArray(row.raw_payload)
-      ? row.raw_payload
-      : {};
-
-    return {
-      ...row,
-      suggested_ledger_name: null,
-      suggestion_confidence: 0,
-      suggestion_reason: reason,
-      raw_payload: {
-        ...rawPayload,
-        aiLedgerRecommendation: {
-          matchType: "suspense",
-          action: "use_suspense",
-          ledgerName: null,
-          candidateLedgerNames: [],
-          confidence: 0,
-          reason,
-          model: OPENROUTER_BANK_LEDGER_MODEL,
-          source: "bank_statement_worker_retry_exhausted",
-          matchingSafetyVersion: "token_collision_v3",
-          error: errorMessage,
-        },
-      },
-    };
-  });
-}
-
-async function applyAiLedgerSuggestionsToPreviewRowsWithRetry(input) {
-  let lastError = null;
-
-  for (let attempt = 0; attempt <= BANK_STATEMENT_LEDGER_MATCH_RETRY_LIMIT; attempt += 1) {
-    try {
-      return await applyAiLedgerSuggestionsToPreviewRows(input);
-    } catch (error) {
-      lastError = error;
-      const totalAttempts = BANK_STATEMENT_LEDGER_MATCH_RETRY_LIMIT + 1;
-      console.warn(
-        `[worker] AI ledger matching attempt ${attempt + 1}/${totalAttempts} failed:`,
-        diagnosticError(error)
-      );
-
-      if (attempt < BANK_STATEMENT_LEDGER_MATCH_RETRY_LIMIT) {
-        await sleep(OPENROUTER_RETRY_BASE_MS * (attempt + 1));
-      }
-    }
-  }
-
-  return markPreviewRowsWithLedgerMatchingFailure(input.rows, lastError);
-}
-
-function chunkArray(items, size) {
-  const chunks = [];
-  for (let index = 0; index < items.length; index += size) {
-    chunks.push(items.slice(index, index + size));
-  }
-  return chunks;
-}
-
-async function insertBankStatementPreviewRowsInBatches({ jobId, rows }) {
-  if (rows.length === 0) return;
-
-  const batches = chunkArray(rows, BANK_STATEMENT_PREVIEW_INSERT_BATCH_SIZE);
-  for (let index = 0; index < batches.length; index += 1) {
-    const batch = batches[index];
-    if (batches.length > 1) {
-      const progress = Math.min(90, 80 + Math.round(((index + 1) / batches.length) * 10));
-      await updateBankJob(jobId, {
-        progress,
-        stage: `Saving preview rows (${index + 1}/${batches.length})`,
-      });
-    }
-
-    const { error } = await supabase
-      .from("bank_statement_import_preview_transactions")
-      .insert(batch);
-    if (error) {
-      throw new Error(`Preview rows could not be saved. ${diagnosticError(error)}`);
-    }
-  }
-}
-
-async function extractBankStatementFromImages(fileName, images, bankAccountCandidates = [], options = {}) {
+async function extractBankStatementFromImages(fileName, images, bankAccountCandidates = []) {
   if (images.length === 0) {
     return {
       account: { bankName: null, accountNumber: null, accountHolderName: null, ifscCode: null },
@@ -1230,12 +996,7 @@ async function extractBankStatementFromImages(fileName, images, bankAccountCandi
         "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
         "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
         "counterpartyName must be only the real party/vendor/customer name, separate from the full description. Remove payment modes, bank/channel prefixes, CR/DR markers, account numbers, UTR/ref/invoice/bill text, and bank names from counterpartyName. For example, description NEFT CR-HDFC-BHARAT LTD / INVOICE BL-801 should produce counterpartyName BHARAT LTD; UPI/9188201001/ORION TOOLING CENTRE should produce ORION TOOLING CENTRE. Use numbers for amounts, with debit and credit as positive values in their own columns. Do not invent rows. Preserve narration text exactly enough for audit matching. " +
-        "A cropped image, one-row image, or test image may omit account header details. If a visible row has a date or value date, narration/reference, and a debit or credit amount, extract it as a transaction even when account details are missing. " +
-        "Rows may continue on following lines without a date; attach those continuation lines to the previous dated transaction. Ignore BALANCE FORWARD, OPENING BALANCE, CLOSING BALANCE, summary totals, page footers, and bank notices. " +
-        "If a page contains only summary information and no ledger rows, extract account/period only and leave transactions empty. " +
-        (options.repairMode
-          ? "Repair mode: a previous pass found no usable rows. Treat the visible fixed-width or tabular bank statement image as authoritative and extract every ledger transaction row you can see, including a single visible row."
-          : "") +
+        "If a page contains only summary information and no ledger rows, extract account/period only and leave transactions empty." +
         bankAccountCandidateInstruction(bankAccountCandidates),
     },
     {
@@ -1622,10 +1383,6 @@ async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, 
       } else if (isImage) {
         const image = await imageBytesToProviderDataUrl(bytes, mimeType || "image/jpeg", fileName);
         parsed = await extractBankStatementFromImages(fileName, [image], bankAccountCandidates);
-        if (parsed.transactions.length === 0) {
-          diagnostics.recovery.push({ stage: "single_shot_ai_image_repair", reason: "initial image extraction returned zero rows" });
-          parsed = await extractBankStatementFromImages(fileName, [image], bankAccountCandidates, { repairMode: true });
-        }
         extractionSource = "single_shot_ai_image";
       }
       diagnostics.singleShotRows = parsed?.transactions.length ?? 0;
@@ -1739,12 +1496,11 @@ async function requeueBankJob(jobId, errorMessage) {
   const job = await getBankJob(jobId);
   if (!job || isTerminalJobStatus(job.status)) return;
   if (Number(job.attempt_count ?? 0) >= Number(job.max_attempts ?? 3)) {
-    const userMessage = BANK_STATEMENT_HELPDESK_MESSAGE;
     await updateBankJob(jobId, {
       status: "failed",
       progress: 100,
       stage: "Failed",
-      error: userMessage,
+      error: errorMessage,
       locked_at: null,
       locked_by: null,
       finished_at: new Date().toISOString(),
@@ -1755,8 +1511,7 @@ async function requeueBankJob(jobId, errorMessage) {
         status: "failed",
         processing_meta: {
           jobStatus: "failed",
-          extractionError: userMessage,
-          failureDetail: errorMessage,
+          extractionError: errorMessage,
           failedAt: new Date().toISOString(),
         },
       })
@@ -1889,18 +1644,22 @@ async function runBankStatementJob(job) {
   if (rows.length > 0 && tallyConnectionId) {
     try {
       await updateBankJob(job.id, { progress: 78, stage: "Matching Tally ledgers with AI" });
-      previewRows = await applyAiLedgerSuggestionsToPreviewRowsWithRetry({
+      previewRows = await applyAiLedgerSuggestionsToPreviewRows({
         ownerUserId: job.owner_user_id,
         connectionId: tallyConnectionId,
         rows,
       });
     } catch (error) {
       console.warn("[worker] AI ledger matching failed for preview rows:", diagnosticError(error));
-      previewRows = markPreviewRowsWithLedgerMatchingFailure(rows, error);
     }
   }
 
-  await insertBankStatementPreviewRowsInBatches({ jobId: job.id, rows: previewRows });
+  if (previewRows.length > 0) {
+    const { error: previewInsertError } = await supabase
+      .from("bank_statement_import_preview_transactions")
+      .insert(previewRows);
+    if (previewInsertError) throw previewInsertError;
+  }
 
   const previousAnalysis =
     processingMeta.analysis && typeof processingMeta.analysis === "object" && !Array.isArray(processingMeta.analysis)

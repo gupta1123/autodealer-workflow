@@ -1,14 +1,9 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
-import {
-  loadActiveTallyLedgerRows,
-  suggestBankLedgerForTransaction,
-} from "@/lib/bank-statement-ledger-matching";
+import { suggestBankLedgerForTransaction } from "@/lib/bank-statement-ledger-matching";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 export const runtime = "nodejs";
-const DEFAULT_TRANSACTION_PAGE_SIZE = 200;
-const MAX_TRANSACTION_PAGE_SIZE = 1000;
 
 type BankTransactionRow = {
   id: string;
@@ -48,12 +43,6 @@ function normalizeLedgerName(value?: string | null) {
 function isSuspenseLedger(value?: string | null) {
   const normalized = normalizeLedgerName(value);
   return normalized === "suspense" || normalized === "suspenseac" || normalized === "suspenseaccount";
-}
-
-function readPositiveInteger(value: string | null, fallback: number, max: number) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return Math.min(Math.floor(parsed), max);
 }
 
 function serializeTransaction(row: BankTransactionRow, suggestion?: Awaited<ReturnType<typeof suggestBankLedgerForTransaction>>) {
@@ -114,14 +103,6 @@ export async function GET(request: Request) {
     const importId = url.searchParams.get("importId")?.trim();
     const connectionId = url.searchParams.get("connectionId")?.trim() || null;
     const status = url.searchParams.get("status")?.trim() || "pending";
-    const page = readPositiveInteger(url.searchParams.get("page"), 1, 1000000);
-    const pageSize = readPositiveInteger(
-      url.searchParams.get("pageSize"),
-      DEFAULT_TRANSACTION_PAGE_SIZE,
-      MAX_TRANSACTION_PAGE_SIZE
-    );
-    const rangeFrom = (page - 1) * pageSize;
-    const rangeTo = rangeFrom + pageSize - 1;
 
     if (!accountId) {
       return jsonWithCors(request, { error: "Bank account is required." }, { status: 400 });
@@ -142,11 +123,11 @@ export async function GET(request: Request) {
 
     let builder = supabase
       .from("bank_transactions")
-      .select("*", { count: "exact" })
+      .select("*")
       .eq("owner_user_id", user.id)
       .eq("bank_account_id", accountId)
       .order("transaction_date", { ascending: true })
-      .range(rangeFrom, rangeTo);
+      .limit(200);
 
     if (importId) {
       builder = builder.eq("statement_import_id", importId);
@@ -158,25 +139,11 @@ export async function GET(request: Request) {
       builder = builder.eq("tally_status", status);
     }
 
-    const { data, error, count } = await builder;
+    const { data, error } = await builder;
     if (error) throw error;
 
     const allRows = (data ?? []) as unknown as BankTransactionRow[];
     const rows = status === "queueable" ? allRows.filter(hasPostingAmount) : allRows;
-    if (status === "queueable") {
-      return jsonWithCors(request, {
-        transactions: rows.map((row) => serializeTransaction(row)),
-        page,
-        pageSize,
-        total: count ?? rows.length,
-      });
-    }
-
-    const activeLedgerRows = await loadActiveTallyLedgerRows({
-      supabase,
-      ownerUserId: user.id,
-      connectionId,
-    });
     const suggestions = await Promise.all(
       rows.map((row) =>
         suggestBankLedgerForTransaction({
@@ -184,7 +151,6 @@ export async function GET(request: Request) {
           ownerUserId: user.id,
           connectionId,
           accountId,
-          ledgerRows: activeLedgerRows,
           transaction: {
             transactionDate: row.transaction_date,
             valueDate: row.value_date,
@@ -203,9 +169,6 @@ export async function GET(request: Request) {
 
     return jsonWithCors(request, {
       transactions: rows.map((row, index) => serializeTransaction(row, suggestions[index])),
-      page,
-      pageSize,
-      total: count ?? rows.length,
     });
   } catch (error) {
     console.error("Error in GET /api/bank-statements/transactions:", error);

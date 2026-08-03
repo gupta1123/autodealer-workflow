@@ -19,7 +19,7 @@ async function requireConnection(ownerUserId: string, connectionId: string) {
   const supabase = createSupabaseAdminClient();
   const { data, error } = await supabase
     .from("tally_connections")
-    .select("id, owner_user_id")
+    .select("id, owner_user_id, last_company_name")
     .eq("id", connectionId)
     .eq("owner_user_id", ownerUserId)
     .maybeSingle();
@@ -57,6 +57,7 @@ export async function GET(
       .select("*")
       .eq("connection_id", id)
       .eq("owner_user_id", user.id)
+      .eq("company_name", connection.last_company_name ?? "Unknown company")
       .order("updated_at", { ascending: false });
 
     if (error) {
@@ -107,6 +108,7 @@ export async function POST(
         {
           connection_id: id,
           owner_user_id: user.id,
+          company_name: connection.last_company_name ?? "Unknown company",
           mapping_type: mappingType,
           source_key: sourceKey,
           source_label: sourceLabel,
@@ -117,7 +119,7 @@ export async function POST(
           notes: toNullableText(body.notes, 1000),
         },
         {
-          onConflict: "connection_id,mapping_type,source_key",
+          onConflict: "connection_id,company_name,mapping_type,source_key",
         }
       )
       .select("*")
