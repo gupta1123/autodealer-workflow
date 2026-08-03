@@ -304,6 +304,9 @@ type PreviewResponse = {
   };
   candidates: BankAccount[];
   transactions: PreviewTransaction[];
+  transactionsPage?: number;
+  transactionsPageSize?: number;
+  transactionsTotal?: number;
   requiresManualExtraction?: boolean;
   extractionError?: string | null;
   extractionDiagnostics?: {
@@ -2658,6 +2661,7 @@ export function BankStatementsPage() {
   const [reviewDateFrom, setReviewDateFrom] = useState("");
   const [reviewDateTo, setReviewDateTo] = useState("");
   const [rowsPerPage, setRowsPerPage] = useState(50);
+  const [reviewPage, setReviewPage] = useState(1);
   const [billAllocationsByTransactionId, setBillAllocationsByTransactionId] = useState<Record<string, BillAllocationDraft>>({});
   const [outgoingVerificationsByTransactionId, setOutgoingVerificationsByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
   const [tallyPresenceByTransactionId, setTallyPresenceByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
@@ -2995,9 +2999,19 @@ export function BankStatementsPage() {
     });
   }, [reviewDateFrom, reviewDateTo, reviewDirectionFilter, reviewSearch, reviewStatusFilter, validTransactions]);
   const visibleReviewTransactions = useMemo(
-    () => filteredTransactions.filter(transactionIsValid).slice(0, rowsPerPage),
-    [filteredTransactions, rowsPerPage]
+    () => {
+      const start = (reviewPage - 1) * rowsPerPage;
+      return filteredTransactions.filter(transactionIsValid).slice(start, start + rowsPerPage);
+    },
+    [filteredTransactions, reviewPage, rowsPerPage]
   );
+  const reviewPageCount = Math.max(1, Math.ceil(filteredTransactions.length / rowsPerPage));
+  const reviewRangeStart =
+    visibleReviewTransactions.length === 0 ? 0 : (reviewPage - 1) * rowsPerPage + 1;
+  const reviewRangeEnd =
+    visibleReviewTransactions.length === 0
+      ? 0
+      : Math.min(reviewRangeStart + visibleReviewTransactions.length - 1, filteredTransactions.length);
   const tallyPostingInProgress = Boolean(tallyPostingStatus && !tallyPostingStatus.finished);
   const postReceiptsButtonLabel = sending
     ? "Sending..."
@@ -3028,6 +3042,13 @@ export function BankStatementsPage() {
     reviewDateFrom,
     reviewDateTo,
   ].filter(Boolean).length;
+  useEffect(() => {
+    setReviewPage(1);
+  }, [reviewDateFrom, reviewDateTo, reviewDirectionFilter, reviewSearch, reviewStatusFilter, rowsPerPage]);
+
+  useEffect(() => {
+    setReviewPage((current) => Math.min(current, reviewPageCount));
+  }, [reviewPageCount]);
   const billAllocationReviewTransaction = billAllocationReviewTransactionId
     ? validTransactions.find((transaction) => transaction.id === billAllocationReviewTransactionId) ?? null
     : null;
@@ -3246,6 +3267,7 @@ export function BankStatementsPage() {
   const clearStatementReview = useCallback((options?: { preserveSelectedFile?: boolean }) => {
     setPreview(null);
     setTransactions([]);
+    setReviewPage(1);
     if (!options?.preserveSelectedFile) {
       setFile(null);
       setDocumentPreview(null);
@@ -3792,6 +3814,7 @@ export function BankStatementsPage() {
     setTransactions(
       payload.transactions.map((transaction) => normalizeReviewTransaction(transaction, ledgerMastersForReview))
     );
+    setReviewPage(1);
     setEditingLedgerIds(new Set());
     setTallyPostingStatus(null);
     setBillAllocationsByTransactionId({});
@@ -3804,7 +3827,7 @@ export function BankStatementsPage() {
   async function pollImportUntilReady(importId: string, ledgerMastersForReview = ledgerMasters) {
     for (let attempt = 0; attempt < 120; attempt += 1) {
       await wait(2500);
-      const payload = await loadImportPreview(importId);
+      const payload = await loadImportPreviewMetadata(importId);
       if (payload.processing) {
         setBanner({
           tone: "info",
@@ -3819,9 +3842,10 @@ export function BankStatementsPage() {
         throw new Error(payload.job.error || "Bank statement analysis failed.");
       }
 
-      applyPreviewPayload(payload, EMPTY_ACCOUNT, ledgerMastersForReview);
-      setBanner(getAnalysisCompleteMessage(payload));
-      return payload;
+      const fullPayload = await loadImportPreviewWithPagedTransactions(importId);
+      applyPreviewPayload(fullPayload, EMPTY_ACCOUNT, ledgerMastersForReview);
+      setBanner(getAnalysisCompleteMessage(fullPayload));
+      return fullPayload;
     }
 
     throw new Error("Bank statement analysis is still running. Please refresh in a moment.");
@@ -3859,8 +3883,8 @@ export function BankStatementsPage() {
     }
   }
 
-  async function loadImportPreview(importId: string) {
-    const response = await apiFetch(`/api/bank-statements/imports/${importId}`, {
+  async function loadImportPreviewMetadata(importId: string) {
+    const response = await apiFetch(`/api/bank-statements/imports/${importId}?includeTransactions=false`, {
       cache: "no-store",
     });
     if (!response.ok) {
@@ -3868,6 +3892,88 @@ export function BankStatementsPage() {
     }
 
     return (await response.json()) as PreviewResponse;
+  }
+
+  async function loadImportPreviewWithPagedTransactions(importId: string) {
+    const pageSize = 500;
+    const firstResponse = await apiFetch(
+      `/api/bank-statements/imports/${importId}?${new URLSearchParams({
+        transactionsPage: "1",
+        transactionsPageSize: String(pageSize),
+      }).toString()}`,
+      { cache: "no-store" }
+    );
+    if (!firstResponse.ok) {
+      throw new Error(await readError(firstResponse));
+    }
+
+    const firstPayload = (await firstResponse.json()) as PreviewResponse;
+    const total = firstPayload.transactionsTotal ?? firstPayload.transactions.length;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const transactions = [...firstPayload.transactions];
+
+    for (let page = 2; page <= totalPages; page += 1) {
+      setBanner({
+        tone: "info",
+        text: `Loading analyzed transactions ${page}/${totalPages}...`,
+      });
+      const pageResponse = await apiFetch(
+        `/api/bank-statements/imports/${importId}?${new URLSearchParams({
+          transactionsPage: String(page),
+          transactionsPageSize: String(pageSize),
+        }).toString()}`,
+        { cache: "no-store" }
+      );
+      if (!pageResponse.ok) {
+        throw new Error(await readError(pageResponse));
+      }
+      const pagePayload = (await pageResponse.json()) as PreviewResponse;
+      transactions.push(...pagePayload.transactions);
+    }
+
+    return {
+      ...firstPayload,
+      transactions,
+      transactionsPage: 1,
+      transactionsPageSize: pageSize,
+      transactionsTotal: total,
+    };
+  }
+
+  async function fetchQueueableTransactions(params: {
+    accountId: string;
+    importId: string;
+    connectionId: string;
+  }) {
+    const pageSize = 500;
+    const rows: QueueTransaction[] = [];
+    for (let page = 1; ; page += 1) {
+      const transactionsResponse = await apiFetch(
+        `/api/bank-statements/transactions?${new URLSearchParams({
+          accountId: params.accountId,
+          importId: params.importId,
+          status: "queueable",
+          connectionId: params.connectionId,
+          page: String(page),
+          pageSize: String(pageSize),
+        }).toString()}`,
+        { cache: "no-store" }
+      );
+      if (!transactionsResponse.ok) {
+        throw new Error(await readError(transactionsResponse));
+      }
+
+      const queuePayload = (await transactionsResponse.json()) as {
+        transactions?: QueueTransaction[];
+        total?: number;
+      };
+      const pageRows = queuePayload.transactions ?? [];
+      rows.push(...pageRows);
+      const total = queuePayload.total ?? rows.length;
+      if (page * pageSize >= total || total === 0) {
+        return rows;
+      }
+    }
   }
 
   async function analyzeFile(nextFile = file) {
@@ -3958,13 +4064,13 @@ export function BankStatementsPage() {
         });
         analyzedPayload = await pollImportUntilReady(payload.import.id, emptyLedgerMasters);
       } else {
-        const latestPayload = await loadImportPreview(payload.import.id);
+        const latestPayload = await loadImportPreviewMetadata(payload.import.id);
         if (latestPayload.processing) {
           analyzedPayload = await pollImportUntilReady(payload.import.id, emptyLedgerMasters);
         } else {
-          applyPreviewPayload(latestPayload, EMPTY_ACCOUNT, emptyLedgerMasters);
-          setBanner(getAnalysisCompleteMessage(latestPayload));
-          analyzedPayload = latestPayload;
+          analyzedPayload = await loadImportPreviewWithPagedTransactions(payload.import.id);
+          applyPreviewPayload(analyzedPayload, EMPTY_ACCOUNT, emptyLedgerMasters);
+          setBanner(getAnalysisCompleteMessage(analyzedPayload));
         }
       }
 
@@ -3977,12 +4083,13 @@ export function BankStatementsPage() {
         return;
       }
       const ledgerMastersForReview = syncedMasters;
-      const latestPayload = await loadImportPreview(payload.import.id);
+      const latestPayload = await loadImportPreviewMetadata(payload.import.id);
       if (latestPayload.processing) {
         await pollImportUntilReady(payload.import.id, ledgerMastersForReview);
       } else {
-        applyPreviewPayload(latestPayload || analyzedPayload, EMPTY_ACCOUNT, ledgerMastersForReview);
-        setBanner(getAnalysisCompleteMessage(latestPayload || analyzedPayload));
+        const fullPayload = await loadImportPreviewWithPagedTransactions(payload.import.id);
+        applyPreviewPayload(fullPayload || analyzedPayload, EMPTY_ACCOUNT, ledgerMastersForReview);
+        setBanner(getAnalysisCompleteMessage(fullPayload || analyzedPayload));
       }
       setPostUploadSyncImportId(null);
       setPostUploadSyncError(null);
@@ -4011,12 +4118,13 @@ export function BankStatementsPage() {
         return;
       }
 
-      const payload = await loadImportPreview(postUploadSyncImportId);
+      const payload = await loadImportPreviewMetadata(postUploadSyncImportId);
       if (payload.processing) {
         await pollImportUntilReady(postUploadSyncImportId, syncedMasters);
       } else {
-        applyPreviewPayload(payload, EMPTY_ACCOUNT, syncedMasters);
-        setBanner(getAnalysisCompleteMessage(payload));
+        const fullPayload = await loadImportPreviewWithPagedTransactions(postUploadSyncImportId);
+        applyPreviewPayload(fullPayload, EMPTY_ACCOUNT, syncedMasters);
+        setBanner(getAnalysisCompleteMessage(fullPayload));
       }
       setPostUploadSyncImportId(null);
       setPostUploadSyncError(null);
@@ -4600,22 +4708,13 @@ export function BankStatementsPage() {
         duplicateTransactionCount: number;
       };
 
-      const transactionsResponse = await apiFetch(
-        `/api/bank-statements/transactions?${new URLSearchParams({
-          accountId: confirmPayload.account.id,
-          importId: confirmPayload.import.id,
-          status: "queueable",
-          connectionId: tallyConnectionId,
-        }).toString()}`,
-        { cache: "no-store" }
-      );
-      if (!transactionsResponse.ok) {
-        throw new Error(await readError(transactionsResponse));
-      }
-
-      const queuePayload = (await transactionsResponse.json()) as { transactions?: QueueTransaction[] };
+      const queueableTransactions = await fetchQueueableTransactions({
+        accountId: confirmPayload.account.id,
+        importId: confirmPayload.import.id,
+        connectionId: tallyConnectionId,
+      });
       const selectedQueueKeys = new Set(selectedTallyWorkTransactions.map(transactionQueueKey));
-      const queueRows = (queuePayload.transactions ?? []).filter((transaction) =>
+      const queueRows = queueableTransactions.filter((transaction) =>
         selectedQueueKeys.has(transactionQueueKey(transaction))
       );
       const reviewedTransactionsByKey = new Map(
@@ -6206,7 +6305,10 @@ export function BankStatementsPage() {
                     <span>Rows per page</span>
                     <select
                       className="h-8.5 rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] outline-none focus:border-amber-500"
-                      onChange={(event) => setRowsPerPage(Number(event.target.value))}
+                      onChange={(event) => {
+                        setRowsPerPage(Number(event.target.value));
+                        setReviewPage(1);
+                      }}
                       value={rowsPerPage}
                     >
                       {[25, 50, 100, 200].map((value) => (
@@ -6216,12 +6318,34 @@ export function BankStatementsPage() {
                       ))}
                     </select>
                   </div>
-                  <div>
-                    Showing {visibleReviewTransactions.length === 0 ? 0 : 1}-
-                    {visibleReviewTransactions.length} of {filteredTransactions.length}
-                    {ignoredStatementRowCount > 0
-                      ? ` (${ignoredStatementRowCount} statement header/summary row${ignoredStatementRowCount === 1 ? "" : "s"} ignored)`
-                      : ""}
+                  <div className="flex flex-wrap items-center gap-3">
+                    <span>
+                      Showing {reviewRangeStart}-{reviewRangeEnd} of {filteredTransactions.length}
+                      {ignoredStatementRowCount > 0
+                        ? ` (${ignoredStatementRowCount} statement header/summary row${ignoredStatementRowCount === 1 ? "" : "s"} ignored)`
+                        : ""}
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        className="rounded-xl border border-[#e5ddd0] bg-white px-3 py-2 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4] disabled:cursor-not-allowed disabled:opacity-50"
+                        disabled={reviewPage <= 1}
+                        onClick={() => setReviewPage((current) => Math.max(1, current - 1))}
+                        type="button"
+                      >
+                        Previous
+                      </button>
+                      <span className="text-xs font-bold text-slate-500">
+                        Page {reviewPage} of {reviewPageCount}
+                      </span>
+                      <button
+                        className="rounded-xl border border-[#e5ddd0] bg-white px-3 py-2 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4] disabled:cursor-not-allowed disabled:opacity-50"
+                        disabled={reviewPage >= reviewPageCount}
+                        onClick={() => setReviewPage((current) => Math.min(reviewPageCount, current + 1))}
+                        type="button"
+                      >
+                        Next
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>

@@ -1864,6 +1864,23 @@ function voucherHasLedger(voucher, ledgerName) {
   ].some((name) => normalizeLooseName(name) === key);
 }
 
+function uniqueNormalizedLedgerNames(values) {
+  return new Set(
+    (Array.isArray(values) ? values : [])
+      .map((value) => normalizeLooseName(value))
+      .filter(Boolean)
+  );
+}
+
+function relevantBankVoucher(voucher, bankLedgerName, relevantLedgerNames = new Set()) {
+  if (!voucherHasLedger(voucher, bankLedgerName)) return false;
+  if (relevantLedgerNames.size === 0) return true;
+  return [
+    voucher.partyLedgerName,
+    ...voucher.ledgerNames,
+  ].some((ledgerName) => relevantLedgerNames.has(normalizeLooseName(ledgerName)));
+}
+
 function voucherHasLedgerAmount(voucher, ledgerName, amount) {
   const key = normalizeLooseName(ledgerName);
   if (!key) return false;
@@ -2044,8 +2061,15 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
     dateFrom,
     dateTo,
   });
-  const vouchers = parseVoucherCollection(xml).filter(
+  const relevantLedgerNames = uniqueNormalizedLedgerNames([
+    bankLedgerName,
+    ...(commandPayload.relevantLedgerNames || []),
+  ]);
+  const exportedVouchers = parseVoucherCollection(xml).filter(
     (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
+  );
+  const vouchers = exportedVouchers.filter((voucher) =>
+    relevantBankVoucher(voucher, bankLedgerName, relevantLedgerNames)
   );
   const reservedVoucherIndexes = new Set();
   const results = normalizedTransactions.map((transaction) => {
@@ -2133,6 +2157,8 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
       dateFrom,
       dateTo,
       bankLedgerName,
+      exportedVoucherCount: exportedVouchers.length,
+      relevantLedgerCount: relevantLedgerNames.size,
       scannedCount: vouchers.length,
       transactions: results,
       balanceProof: {
@@ -2235,8 +2261,16 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
     dateFrom: voucherDate,
     dateTo: voucherDate,
   });
-  const vouchers = parseVoucherCollection(xml).filter(
+  const exportedVouchers = parseVoucherCollection(xml).filter(
     (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
+  );
+  const relevantLedgerNames = uniqueNormalizedLedgerNames([
+    bankLedgerName,
+    commandPayload.counterpartyLedgerName,
+    commandPayload.matchedLedgerName,
+  ]);
+  const vouchers = exportedVouchers.filter((voucher) =>
+    relevantBankVoucher(voucher, bankLedgerName, relevantLedgerNames)
   );
   const strictResult = strictBankTransactionCandidates(
     vouchers,
@@ -2257,6 +2291,7 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
     success: true,
     result: {
       verificationStatus,
+      exportedVoucherCount: exportedVouchers.length,
       scannedCount: vouchers.length,
       matchCount: strictMatches.length,
       duplicateInTally,
@@ -2397,6 +2432,18 @@ function toOpenBill(block, ledgerName) {
 
 function openBillNarrationKey(ledgerName, referenceName) {
   return `${normalizeLooseName(ledgerName)}|${normalizeLooseName(referenceName)}`;
+}
+
+function minIsoDate(values) {
+  const dates = values
+    .map((value) => normalizeDateForCompare(value))
+    .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || "")))
+    .sort();
+  return dates[0] || null;
+}
+
+function todayIsoDate() {
+  return new Date().toISOString().slice(0, 10);
 }
 
 function isSalesInvoiceVoucher(block) {
@@ -2545,6 +2592,38 @@ function indexInvoiceNarrations(xml, requestedLedgerByKey) {
   return { narrationByBill, receiptEvidenceByBill, salesLedgerByBill };
 }
 
+async function fetchSettlementVoucherEvidenceXml(tallyUrl, options) {
+  const baseOptions = {
+    collectionName: "Autodealer Customer Invoice Narrations",
+    tallyType: "Voucher",
+    fetchFields:
+      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount",
+    companyName: options.companyName,
+  };
+
+  if (options.dateFrom && options.dateTo) {
+    try {
+      return await exportTallyCollection(tallyUrl, {
+        ...baseOptions,
+        dateFrom: options.dateFrom,
+        dateTo: options.dateTo,
+      });
+    } catch (error) {
+      console.warn(
+        `Scoped settlement voucher evidence export failed; falling back to legacy broad export: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
+  return exportTallyCollection(tallyUrl, {
+    ...baseOptions,
+    dateFrom: "2000-04-01",
+    dateTo: "2099-03-31",
+  });
+}
+
 async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
   const ledgerNames = uniquePayloadLedgerNames(commandPayload);
   if (ledgerNames.length === 0) {
@@ -2565,18 +2644,7 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
       "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
     companyName,
   });
-  const voucherXml = await exportTallyCollection(tallyUrl, {
-    collectionName: "Autodealer Customer Invoice Narrations",
-    tallyType: "Voucher",
-    fetchFields:
-      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount",
-    companyName,
-    dateFrom: "2000-04-01",
-    dateTo: "2099-03-31",
-  });
-  const { narrationByBill, receiptEvidenceByBill, salesLedgerByBill } = indexInvoiceNarrations(voucherXml, requestedLedgerByKey);
-  const byLedger = Object.fromEntries(ledgerNames.map((ledgerName) => [ledgerName, emptyOpenBillBucket(ledgerName)]));
-
+  const rawOpenBillEntries = [];
   for (const block of extractBlocks(xml, "BILL")) {
     const rowLedgerName = billLedgerName(block);
     const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(rowLedgerName));
@@ -2584,7 +2652,20 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
 
     const entry = toOpenBill(block, requestedLedgerName);
     if (!entry) continue;
+    rawOpenBillEntries.push({ requestedLedgerName, entry });
+  }
+  const settlementEvidenceDateFrom = minIsoDate(
+    rawOpenBillEntries.map(({ entry }) => entry.invoiceDate || entry.receiptDate)
+  );
+  const voucherXml = await fetchSettlementVoucherEvidenceXml(tallyUrl, {
+    companyName,
+    dateFrom: settlementEvidenceDateFrom,
+    dateTo: todayIsoDate(),
+  });
+  const { narrationByBill, receiptEvidenceByBill, salesLedgerByBill } = indexInvoiceNarrations(voucherXml, requestedLedgerByKey);
+  const byLedger = Object.fromEntries(ledgerNames.map((ledgerName) => [ledgerName, emptyOpenBillBucket(ledgerName)]));
 
+  for (const { requestedLedgerName, entry } of rawOpenBillEntries) {
     if (entry.kind === "bill") {
       entry.narration =
         narrationByBill.get(openBillNarrationKey(requestedLedgerName, entry.referenceName)) ||
@@ -2772,7 +2853,8 @@ async function postMastersToBackend(config, payload) {
   const result = await readJsonResponse(response);
 
   if (!response.ok) {
-    throw new Error(result.error || `Master sync upload failed with HTTP ${response.status}.`);
+    const detail = result.error || result.message || JSON.stringify(result);
+    throw new Error(`Master sync upload failed with HTTP ${response.status}: ${detail}`);
   }
 
   return result;

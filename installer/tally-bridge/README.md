@@ -1,0 +1,79 @@
+# Kalika Tally Connector Installer
+
+This folder contains the Windows installer assets for the desktop Tally connector.
+
+The installer is intentionally defensive:
+
+- closes existing `Kalika Tally Connector.exe` processes before installing
+- removes the old connector install folder before copying new files
+- preserves the existing `%USERPROFILE%\.autodealer-tally-bridge\config.json` pairing during connector updates
+- installs one clean Electron runtime under `C:\Autodealer\tally-bridge`
+- registers the `kalika-tally://` protocol for Connect links
+- starts the connector after install so the user can see its current status
+- includes the native Tally Debit Note PDF TDL and tries to copy it to the
+  TallyPrime folder for easy one-time activation
+
+## Build
+
+From the repo root:
+
+```powershell
+npm run installer:tally-bridge
+```
+
+The setup executable is written to:
+
+```text
+installer\tally-bridge\output\KalikaTallyConnectorSetup.exe
+```
+
+The build uses the existing local Electron runtime at:
+
+```text
+C:\Autodealer\tally-bridge
+```
+
+It then replaces the packaged app contents with:
+
+- `installer/tally-bridge/electron-app/main.mjs`
+- `apps/tally-bridge/src/bridge.mjs`
+
+## Runtime Layout
+
+The installed connector loads an unpacked app folder:
+
+```text
+C:\Autodealer\tally-bridge\resources\app
+```
+
+The clean payload does not include:
+
+- old `bridge.log` / `bridge.err.log`
+- old backup archives
+- stale `resources\app.asar`
+- stale `resources\app.asar.unpacked`
+- nested Electron build folders
+
+This matters because Electron prefers `resources\app.asar` when it exists. A stale archive can bypass the repaired `resources\app` folder and bring back old connector behavior.
+
+## User Flow
+
+1. Run `KalikaTallyConnectorSetup.exe`.
+2. The installer closes old connector processes and starts the new connector.
+3. Open Kalika and click **Connect** from the Tally page.
+4. The connector window should show `Connected to <company name>` once paired and Tally has a company loaded.
+
+### One-time native PDF activation
+
+The installer keeps the canonical TDL at:
+
+```text
+C:\Autodealer\tally-bridge\tdl\kalika-native-debit-note-export.tdl
+```
+
+It also attempts to make a convenience copy in the TallyPrime installation
+folder. In TallyPrime, select this TDL once in `F1: Help > TDL & Add-On`, turn
+on **Load selected TDL files on startup**, and restart TallyPrime. The setup is
+per TallyPrime installation, not per company or Debit Note.
+
+If the token expires or the connector is paired to an old server, the window shows reconnect-required status instead of silently pretending to be connected.

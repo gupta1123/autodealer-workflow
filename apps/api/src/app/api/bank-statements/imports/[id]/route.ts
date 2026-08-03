@@ -19,6 +19,8 @@ function readRecord(value: unknown): Record<string, unknown> {
 
 const BANK_STATEMENT_HELPDESK_MESSAGE =
   "Analysis could not be completed. Please retry. If this continues, contact helpdesk.";
+const DEFAULT_PREVIEW_PAGE_SIZE = 500;
+const MAX_PREVIEW_PAGE_SIZE = 1000;
 
 function normalizeBankAccountNumber(value: unknown) {
   return String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
@@ -220,6 +222,12 @@ function sanitizeBankStatementJobError(value: unknown) {
   return message;
 }
 
+function readPositiveInteger(value: string | null, fallback: number, max: number) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(Math.floor(parsed), max);
+}
+
 function readConnectionIdFromMeta(processingMeta: Record<string, unknown>) {
   const selectedContext = readRecord(processingMeta.selectedContext);
   const analysis = readRecord(processingMeta.analysis);
@@ -245,6 +253,16 @@ export async function GET(
     }
 
     const { id } = await context.params;
+    const url = new URL(request.url);
+    const includeTransactions = url.searchParams.get("includeTransactions") !== "false";
+    const transactionPage = readPositiveInteger(url.searchParams.get("transactionsPage"), 1, 1000000);
+    const transactionPageSize = readPositiveInteger(
+      url.searchParams.get("transactionsPageSize"),
+      DEFAULT_PREVIEW_PAGE_SIZE,
+      MAX_PREVIEW_PAGE_SIZE
+    );
+    const transactionRangeFrom = (transactionPage - 1) * transactionPageSize;
+    const transactionRangeTo = transactionRangeFrom + transactionPageSize - 1;
     const supabase = createSupabaseAdminClient();
     const { data: importRow, error: importError } = await supabase
       .from("bank_statement_imports")
@@ -269,22 +287,32 @@ export async function GET(
     if (jobError) throw jobError;
     let jobRow = latestJobRow;
 
-    const { data: previewRows, error: previewError } = await supabase
-      .from("bank_statement_import_preview_transactions")
-      .select("*")
-      .eq("import_id", id)
-      .eq("owner_user_id", user.id)
-      .order("row_index", { ascending: true });
+    const previewRowsResult = includeTransactions
+      ? await supabase
+          .from("bank_statement_import_preview_transactions")
+          .select("*", { count: "exact" })
+          .eq("import_id", id)
+          .eq("owner_user_id", user.id)
+          .order("row_index", { ascending: true })
+          .range(transactionRangeFrom, transactionRangeTo)
+      : await supabase
+          .from("bank_statement_import_preview_transactions")
+          .select("id", { count: "exact", head: true })
+          .eq("import_id", id)
+          .eq("owner_user_id", user.id);
+    const { data: previewRows, error: previewError, count: previewTransactionTotal } = previewRowsResult;
 
     if (previewError) throw previewError;
 
     const processingMeta = readRecord(importRow.processing_meta);
     const connectionId = readConnectionIdFromMeta(processingMeta);
-    const activeLedgerRows = await loadActiveTallyLedgerRows({
-      supabase,
-      ownerUserId: user.id,
-      connectionId,
-    });
+    const activeLedgerRows = includeTransactions
+      ? await loadActiveTallyLedgerRows({
+          supabase,
+          ownerUserId: user.id,
+          connectionId,
+        })
+      : [];
     const effectiveImportStatus = getEffectiveImportStatus(importRow as Record<string, unknown>);
     const previewMeta = readRecord(processingMeta.preview);
     const previewAccount = readRecord(previewMeta.account);
@@ -294,7 +322,9 @@ export async function GET(
       tablePreviewTransactions.length > 0
         ? tablePreviewTransactions.map((row) => serializePreviewTransaction(row))
         : storedPreviewTransactions;
-    const ledgerRecommendationError = getLedgerRecommendationError(tablePreviewTransactions);
+    const ledgerRecommendationError = includeTransactions
+      ? getLedgerRecommendationError(tablePreviewTransactions)
+      : null;
     const analysis = readRecord(processingMeta.analysis);
     const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
     const jobStatus = typeof jobRow?.status === "string" ? jobRow.status : "";
@@ -377,6 +407,11 @@ export async function GET(
       candidates: Array.isArray(previewMeta.candidates) ? candidates : candidates.map(serializeAccount),
       bankLedgerResolution,
       transactions,
+      transactionsPage: transactionPage,
+      transactionsPageSize: transactionPageSize,
+      transactionsTotal: includeTransactions
+        ? previewTransactionTotal ?? transactions.length
+        : previewTransactionTotal ?? 0,
       requiresManualExtraction,
       extractionSource: previewMeta.extractionSource ?? processingMeta.extractionSource ?? null,
       extractionError: previewMeta.extractionError ?? processingMeta.extractionError ?? null,
