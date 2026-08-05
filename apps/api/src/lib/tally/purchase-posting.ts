@@ -230,6 +230,10 @@ function parseDate(value: unknown) {
   const raw = text(value);
   if (!raw) return "";
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const looseIso = raw.match(/^(\d{4})[./-](\d{1,2})[./-](\d{1,2})$/);
+  if (looseIso) {
+    return `${looseIso[1]}-${looseIso[2].padStart(2, "0")}-${looseIso[3].padStart(2, "0")}`;
+  }
   const parts = raw.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
   if (!parts) return raw;
   const year = parts[3].length === 2 ? `20${parts[3]}` : parts[3];
@@ -716,8 +720,8 @@ function buildDefaultReview(
     ...baseReview,
     ...(saved ?? {}),
     lines,
-    invoiceDate: saved?.invoiceDate || baseReview.invoiceDate,
-    voucherDate: saved?.voucherDate || baseReview.voucherDate,
+    invoiceDate: parseDate(saved?.invoiceDate) || baseReview.invoiceDate,
+    voucherDate: parseDate(saved?.voucherDate) || baseReview.voucherDate,
     supplierLedgerName: saved?.supplierLedgerName || baseReview.supplierLedgerName,
     cgstLedgerName: saved?.cgstLedgerName || baseReview.cgstLedgerName,
     sgstLedgerName: saved?.sgstLedgerName || baseReview.sgstLedgerName,
@@ -949,6 +953,14 @@ export function preparePurchasePosting(params: {
   if (!isValidIsoDate(source.invoiceDate)) {
     source.invoiceDate = linkedInvoiceDate(invoice, params.documents);
   }
+  if (!isValidIsoDate(source.invoiceDate)) {
+    warnings.push(issue(
+      "INVOICE_DATE_MISSING_FROM_EXTRACTION",
+      "Invoice date was not found",
+      "The invoice date was not found in the extracted documents. Enter the supplier invoice date manually before posting.",
+      "invoice"
+    ));
+  }
   if (linkedLineSource) {
     warnings.push(issue(
       "INVOICE_LINES_RECOVERED_FROM_LINKED_DOCUMENT",
@@ -1045,7 +1057,12 @@ export function preparePurchasePosting(params: {
     ));
   }
   if (!isValidIsoDate(review.invoiceDate)) {
-    blockers.push(issue("INVOICE_DATE_REQUIRED", "Invoice date required", "Enter a valid invoice date.", "invoice"));
+    blockers.push(issue(
+      "INVOICE_DATE_REQUIRED",
+      "Invoice date required",
+      "Enter the supplier invoice date before posting.",
+      "invoice"
+    ));
   }
   if (!isValidIsoDate(review.voucherDate)) {
     blockers.push(issue("VOUCHER_DATE_REQUIRED", "Tally voucher date required", "Enter the accounting date for the Tally voucher.", "invoice"));

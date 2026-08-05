@@ -1,6 +1,6 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
-import { suggestBankLedgerForTransaction } from "@/lib/bank-statement-ledger-matching";
+import { suggestBankLedgersForTransactions } from "@/lib/bank-statement-ledger-matching";
 import { getBankLedgerMatchingModel } from "@/lib/processing/openrouter";
 import {
   findBankAccountCandidates,
@@ -202,6 +202,11 @@ function hasAiLedgerRecommendation(row: Record<string, unknown>) {
   return Boolean(readRecord(rawPayload.aiLedgerRecommendation).model);
 }
 
+function readPositiveInteger(value: string | null, fallback: number) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function readConnectionIdFromMeta(processingMeta: Record<string, unknown>) {
   const selectedContext = readRecord(processingMeta.selectedContext);
   const analysis = readRecord(processingMeta.analysis);
@@ -223,28 +228,37 @@ async function enrichPreviewRowsWithAiSuggestions(params: {
     return params.rows;
   }
 
+  const rowsToEnrich = params.rows.filter((row) => !hasAiLedgerRecommendation(row));
+  const suggestions = await suggestBankLedgersForTransactions({
+    supabase: params.supabase,
+    ownerUserId: params.ownerUserId,
+    connectionId: params.connectionId,
+    transactions: rowsToEnrich.map((row) => ({
+      accountId: String(row.bank_account_id ?? ""),
+      transaction: {
+        transactionDate: row.transaction_date ? String(row.transaction_date) : "",
+        valueDate: row.value_date ? String(row.value_date) : null,
+        description: String(row.description ?? ""),
+        referenceNumber: row.reference_number ? String(row.reference_number) : null,
+        debitAmount: toNumber(row.debit_amount),
+        creditAmount: toNumber(row.credit_amount),
+        balanceAmount: toNumber(row.balance_amount),
+        transactionType: row.transaction_type ? String(row.transaction_type) : undefined,
+        category: row.category ? String(row.category) : undefined,
+        counterpartyName: row.counterparty_name ? String(row.counterparty_name) : null,
+      },
+    })),
+  });
+  const suggestionByRowId = new Map(
+    rowsToEnrich.map((row, index) => [String(row.id), suggestions[index]])
+  );
+
   const enrichedRows = await Promise.all(
     params.rows.map(async (row) => {
       if (hasAiLedgerRecommendation(row)) return row;
 
-      const suggestion = await suggestBankLedgerForTransaction({
-        supabase: params.supabase,
-        ownerUserId: params.ownerUserId,
-        connectionId: params.connectionId,
-        accountId: String(row.bank_account_id ?? ""),
-        transaction: {
-          transactionDate: row.transaction_date ? String(row.transaction_date) : "",
-          valueDate: row.value_date ? String(row.value_date) : null,
-          description: String(row.description ?? ""),
-          referenceNumber: row.reference_number ? String(row.reference_number) : null,
-          debitAmount: toNumber(row.debit_amount),
-          creditAmount: toNumber(row.credit_amount),
-          balanceAmount: toNumber(row.balance_amount),
-          transactionType: row.transaction_type ? String(row.transaction_type) : undefined,
-          category: row.category ? String(row.category) : undefined,
-          counterpartyName: row.counterparty_name ? String(row.counterparty_name) : null,
-        },
-      });
+      const suggestion = suggestionByRowId.get(String(row.id));
+      if (!suggestion) return row;
       const rawPayload = readRecord(row.raw_payload);
       const aiLedgerRecommendation = {
         matchType: suggestion.matchType ?? (suggestion.ledgerName ? "direct_match" : "suspense"),
@@ -298,6 +312,15 @@ export async function GET(
     }
 
     const { id } = await context.params;
+    const searchParams = new URL(request.url).searchParams;
+    const includeTransactions = searchParams.get("includeTransactions") !== "false";
+    const transactionsPage = readPositiveInteger(searchParams.get("transactionsPage"), 1);
+    const transactionsPageSize = Math.min(
+      500,
+      readPositiveInteger(searchParams.get("transactionsPageSize"), 500)
+    );
+    const transactionsFrom = (transactionsPage - 1) * transactionsPageSize;
+    const transactionsTo = transactionsFrom + transactionsPageSize - 1;
     const supabase = createSupabaseAdminClient();
     const { data: importRow, error: importError } = await supabase
       .from("bank_statement_imports")
@@ -322,31 +345,50 @@ export async function GET(
     if (jobError) throw jobError;
     let jobRow = latestJobRow;
 
-    const { data: previewRows, error: previewError } = await supabase
-      .from("bank_statement_import_preview_transactions")
-      .select("*")
-      .eq("import_id", id)
-      .eq("owner_user_id", user.id)
-      .order("row_index", { ascending: true });
-
-    if (previewError) throw previewError;
-
     const processingMeta = readRecord(importRow.processing_meta);
     const effectiveImportStatus = getEffectiveImportStatus(importRow as Record<string, unknown>);
     const previewMeta = readRecord(processingMeta.preview);
     const previewAccount = readRecord(previewMeta.account);
     const storedPreviewTransactions = isPreviewTransactionArray(previewMeta.transactions);
-    const tablePreviewTransactions = await enrichPreviewRowsWithAiSuggestions({
-      supabase,
-      ownerUserId: user.id,
-      connectionId: readConnectionIdFromMeta(processingMeta),
-      importId: id,
-      rows: (previewRows ?? []) as Array<Record<string, unknown>>,
-    });
-    const transactions =
-      tablePreviewTransactions.length > 0
+    let previewRows: Array<Record<string, unknown>> = [];
+    let previewRowsTotal = storedPreviewTransactions.length;
+    if (includeTransactions) {
+      const { data, error, count } = await supabase
+        .from("bank_statement_import_preview_transactions")
+        .select("*", { count: "exact" })
+        .eq("import_id", id)
+        .eq("owner_user_id", user.id)
+        .order("row_index", { ascending: true })
+        .range(transactionsFrom, transactionsTo);
+
+      if (error) throw error;
+      previewRows = (data ?? []) as Array<Record<string, unknown>>;
+      previewRowsTotal = count ?? previewRows.length;
+    } else {
+      const { count, error } = await supabase
+        .from("bank_statement_import_preview_transactions")
+        .select("id", { count: "exact", head: true })
+        .eq("import_id", id)
+        .eq("owner_user_id", user.id);
+
+      if (error) throw error;
+      previewRowsTotal = count ?? previewRowsTotal;
+    }
+
+    const tablePreviewTransactions = includeTransactions
+      ? await enrichPreviewRowsWithAiSuggestions({
+          supabase,
+          ownerUserId: user.id,
+          connectionId: readConnectionIdFromMeta(processingMeta),
+          importId: id,
+          rows: previewRows,
+        })
+      : [];
+    const transactions = includeTransactions
+      ? tablePreviewTransactions.length > 0
         ? tablePreviewTransactions.map((row) => serializePreviewTransaction(row))
-        : storedPreviewTransactions;
+        : storedPreviewTransactions.slice(transactionsFrom, transactionsTo + 1)
+      : [];
     const analysis = readRecord(processingMeta.analysis);
     const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
     const jobStatus = typeof jobRow?.status === "string" ? jobRow.status : "";
@@ -377,7 +419,7 @@ export async function GET(
       effectiveImportStatus === "manual_review_required" ||
       effectiveImportStatus === "failed" ||
       Boolean(previewMeta.requiresManualExtraction) ||
-      (!processing && transactions.length === 0);
+      (!processing && previewRowsTotal === 0);
     const account = {
       bankName:
         typeof previewAccount.bankName === "string"
@@ -428,6 +470,9 @@ export async function GET(
       candidates: Array.isArray(previewMeta.candidates) ? candidates : candidates.map(serializeAccount),
       bankLedgerResolution,
       transactions,
+      transactionsPage,
+      transactionsPageSize,
+      transactionsTotal: previewRowsTotal,
       requiresManualExtraction,
       extractionSource: previewMeta.extractionSource ?? processingMeta.extractionSource ?? null,
       extractionError: previewMeta.extractionError ?? processingMeta.extractionError ?? null,

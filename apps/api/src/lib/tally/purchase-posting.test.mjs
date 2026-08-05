@@ -571,6 +571,48 @@ test("visible invoice date and TDS in source text fill missing structured fields
   assert.ok(!result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
 });
 
+test("loose ISO invoice dates are normalized before posting validation", () => {
+  const document = invoiceDocument({
+    documentDate: "2026-7-27",
+  });
+  const result = prepare(document, { savedReview: { sourceReferenceApproved: true } });
+
+  assert.equal(result.review.invoiceDate, "2026-07-27");
+  assert.ok(!result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
+  assert.equal(result.tallyPayload.supplierInvoiceDate, "2026-07-27");
+});
+
+test("manual invoice date review accepts common slash date format", () => {
+  const document = invoiceDocument();
+  delete document.extracted_fields.documentDate;
+  document.markdown = "TAX INVOICE\\nInvoice No: INV-100";
+  const result = prepare(document, {
+    savedReview: {
+      sourceReferenceApproved: true,
+      invoiceDate: "27/07/2026",
+    },
+  });
+
+  assert.equal(result.review.invoiceDate, "2026-07-27");
+  assert.ok(!result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
+  assert.equal(result.tallyPayload.supplierInvoiceDate, "2026-07-27");
+});
+
+test("missing extracted invoice date is shown as an invoice warning and posting blocker", () => {
+  const document = invoiceDocument();
+  delete document.extracted_fields.documentDate;
+  delete document.extracted_fields.invoiceDate;
+  document.markdown = "TAX INVOICE\\nInvoice No: INV-100";
+
+  const result = prepare(document, { savedReview: { sourceReferenceApproved: true } });
+
+  assert.ok(result.warnings.some((warning) =>
+    warning.code === "INVOICE_DATE_MISSING_FROM_EXTRACTION" &&
+    warning.scope === "invoice"
+  ));
+  assert.ok(result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
+});
+
 test("linked E-Way Bill supplies one unambiguous missing invoice date", () => {
   const invoice = invoiceDocument();
   delete invoice.extracted_fields.documentDate;

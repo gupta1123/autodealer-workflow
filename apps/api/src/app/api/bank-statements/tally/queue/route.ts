@@ -5,7 +5,7 @@ import {
   buildBankAccountLedgerSourceKey,
   buildBankNarrationLedgerSourceKey,
   buildLedgerMappingTarget,
-  suggestBankLedgerForTransaction,
+  suggestBankLedgersForTransactions,
 } from "@/lib/bank-statement-ledger-matching";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
@@ -88,6 +88,7 @@ type TallyLedgerRow = {
 
 type MappingRow = {
   connection_id: string;
+  company_name: string;
   owner_user_id: string;
   mapping_type: string;
   source_key: string;
@@ -98,6 +99,16 @@ type MappingRow = {
   status: string;
   notes: string;
 };
+
+function serializeError(error: unknown) {
+  if (error instanceof Error) return error.message;
+  if (!error || typeof error !== "object") return String(error ?? "Internal server error");
+
+  const record = error as Record<string, unknown>;
+  return [record.message, record.details, record.hint, record.error]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join(" ") || "Internal server error";
+}
 
 type TransactionLedgerSelection = {
   counterpartyLedgerName: string;
@@ -584,62 +595,63 @@ export async function POST(request: Request) {
       return isPartyParent(ledgerParentByName.get(normalizeName(ledgerName)) || "");
     }
 
-    const commandInputs = await Promise.all(
-      transactions.map(async (transaction) => {
-        const suggestion = await suggestBankLedgerForTransaction({
-          supabase,
-          ownerUserId: user.id,
-          connectionId,
-          accountId: transaction.bank_account_id,
-          transaction: {
-            transactionDate: transaction.transaction_date,
-            valueDate: transaction.value_date,
-            description: transaction.description,
-            referenceNumber: transaction.reference_number,
-            debitAmount: toNumber(transaction.debit_amount),
-            creditAmount: toNumber(transaction.credit_amount),
-            balanceAmount: toNumber(transaction.balance_amount),
-            transactionType: transaction.transaction_type,
-            category: transaction.category,
-            counterpartyName: transaction.counterparty_name,
-          },
-        });
-        const selectedLedger = ledgerSelectionByTransactionId.get(transaction.id);
-        const createLedgerName = selectedLedger?.createLedgerName || "";
-        const legacyFallback = requestedTransactionIds.length === 1 ? toText(body.counterpartyLedgerName, 500) : "";
-        const strongSuggestedLedger =
-          suggestion.ledgerName && !isSuspenseLedger(suggestion.ledgerName) && suggestion.confidence >= 0.85
-            ? suggestion.ledgerName
-            : "";
-        const confirmedLedgerName =
-          transaction.confirmed_ledger_name && !(isSuspenseLedger(transaction.confirmed_ledger_name) && strongSuggestedLedger)
-            ? transaction.confirmed_ledger_name
-            : "";
-        const storedSuggestedLedgerName =
-          transaction.suggested_ledger_name && !(isSuspenseLedger(transaction.suggested_ledger_name) && strongSuggestedLedger)
-            ? transaction.suggested_ledger_name
-            : "";
-        const selectedCounterpartyLedgerName =
-          createLedgerName ||
-          selectedLedger?.counterpartyLedgerName ||
-          confirmedLedgerName ||
-          strongSuggestedLedger ||
-          (Number(transaction.suggestion_confidence ?? 0) >= 0.85 ? storedSuggestedLedgerName : "") ||
-          legacyFallback;
-        const counterpartyLedgerName =
-          isSuspenseLedger(selectedCounterpartyLedgerName) && companySuspenseLedgerName
-            ? companySuspenseLedgerName
-            : selectedCounterpartyLedgerName;
+    const ledgerSuggestions = await suggestBankLedgersForTransactions({
+      supabase,
+      ownerUserId: user.id,
+      connectionId,
+      transactions: transactions.map((transaction) => ({
+        accountId: transaction.bank_account_id,
+        transaction: {
+          transactionDate: transaction.transaction_date,
+          valueDate: transaction.value_date,
+          description: transaction.description,
+          referenceNumber: transaction.reference_number,
+          debitAmount: toNumber(transaction.debit_amount),
+          creditAmount: toNumber(transaction.credit_amount),
+          balanceAmount: toNumber(transaction.balance_amount),
+          transactionType: transaction.transaction_type,
+          category: transaction.category,
+          counterpartyName: transaction.counterparty_name,
+        },
+      })),
+    });
+    const commandInputs = transactions.map((transaction, transactionIndex) => {
+      const suggestion = ledgerSuggestions[transactionIndex];
+      const selectedLedger = ledgerSelectionByTransactionId.get(transaction.id);
+      const createLedgerName = selectedLedger?.createLedgerName || "";
+      const legacyFallback = requestedTransactionIds.length === 1 ? toText(body.counterpartyLedgerName, 500) : "";
+      const strongSuggestedLedger =
+        suggestion.ledgerName && !isSuspenseLedger(suggestion.ledgerName) && suggestion.confidence >= 0.85
+          ? suggestion.ledgerName
+          : "";
+      const confirmedLedgerName =
+        transaction.confirmed_ledger_name && !(isSuspenseLedger(transaction.confirmed_ledger_name) && strongSuggestedLedger)
+          ? transaction.confirmed_ledger_name
+          : "";
+      const storedSuggestedLedgerName =
+        transaction.suggested_ledger_name && !(isSuspenseLedger(transaction.suggested_ledger_name) && strongSuggestedLedger)
+          ? transaction.suggested_ledger_name
+          : "";
+      const selectedCounterpartyLedgerName =
+        createLedgerName ||
+        selectedLedger?.counterpartyLedgerName ||
+        confirmedLedgerName ||
+        strongSuggestedLedger ||
+        (Number(transaction.suggestion_confidence ?? 0) >= 0.85 ? storedSuggestedLedgerName : "") ||
+        legacyFallback;
+      const counterpartyLedgerName =
+        isSuspenseLedger(selectedCounterpartyLedgerName) && companySuspenseLedgerName
+          ? companySuspenseLedgerName
+          : selectedCounterpartyLedgerName;
 
-        return {
-          transaction,
-          suggestion,
-          counterpartyLedgerName,
-          createLedgerName,
-          createLedgerParentName: selectedLedger?.createLedgerParentName || "Sundry Creditors",
-        };
-      })
-    );
+      return {
+        transaction,
+        suggestion,
+        counterpartyLedgerName,
+        createLedgerName,
+        createLedgerParentName: selectedLedger?.createLedgerParentName || "Sundry Creditors",
+      };
+    });
 
     const queuedCreateLedgerKeys = new Set<string>();
     const commands: TallyCommandInsert[] = commandInputs.flatMap(
@@ -836,6 +848,71 @@ export async function POST(request: Request) {
       );
     }
 
+    // Persist company-scoped mappings before releasing commands to the bridge.
+    // A mapping/schema failure must not leave the queue job marked failed after
+    // Tally vouchers have already started executing.
+    const mappingRows = commands.flatMap((command) => {
+      const payload = command.payload && typeof command.payload === "object" ? command.payload : {};
+      const transaction = transactions.find((row) => row.id === payload.transactionId);
+      const account = transaction ? accountsById.get(transaction.bank_account_id) : null;
+      const bankLedger = typeof payload.bankLedgerName === "string" ? payload.bankLedgerName.trim() : "";
+      const counterpartyLedger =
+        typeof payload.matchedLedgerName === "string"
+          ? payload.matchedLedgerName.trim()
+          : typeof payload.counterpartyLedgerName === "string"
+            ? payload.counterpartyLedgerName.trim()
+            : "";
+      const rows: MappingRow[] = [];
+
+      if (account && bankLedger) {
+        rows.push({
+          connection_id: connectionId,
+          company_name: expectedCompanyName,
+          owner_user_id: user.id,
+          mapping_type: "bank_account_ledger",
+          source_key: buildBankAccountLedgerSourceKey(account.id),
+          source_label: `${account.bank_name || "Bank"} ${account.account_number_masked}`.trim(),
+          ...buildLedgerMappingTarget(bankLedger),
+          status: "active",
+          notes: "Saved from bank voucher queue confirmation.",
+        });
+      }
+
+      if (transaction && counterpartyLedger && saveMappingTransactionIds.has(transaction.id)) {
+        rows.push({
+          connection_id: connectionId,
+          company_name: expectedCompanyName,
+          owner_user_id: user.id,
+          mapping_type: "bank_narration_ledger",
+          source_key: buildBankNarrationLedgerSourceKey(transaction.bank_account_id, transaction.description),
+          source_label: transaction.description.slice(0, 500),
+          ...buildLedgerMappingTarget(counterpartyLedger),
+          status: "active",
+          notes: "Saved from bank voucher queue confirmation.",
+        });
+      }
+
+      return rows;
+    });
+    const uniqueMappingRows = Array.from(
+      new Map(
+        mappingRows.map((row) => [
+          `${row.connection_id}:${row.company_name}:${row.mapping_type}:${row.source_key}`,
+          row,
+        ])
+      ).values()
+    );
+
+    if (uniqueMappingRows.length > 0) {
+      const { error: mappingError } = await supabase
+        .from("tally_mapping_settings")
+        .upsert(uniqueMappingRows, {
+          onConflict: "connection_id,company_name,mapping_type,source_key",
+        });
+
+      if (mappingError) throw mappingError;
+    }
+
     const { data: createdCommands, error: commandError } = await supabase
       .from("tally_bridge_commands")
       .insert(commands)
@@ -941,64 +1018,6 @@ export async function POST(request: Request) {
       )
     );
 
-    const mappingRows = createdCommandRows.flatMap((command) => {
-      const payload = command.payload && typeof command.payload === "object" ? command.payload : {};
-      const transaction = transactions.find((row) => row.id === payload.transactionId);
-      const account = transaction ? accountsById.get(transaction.bank_account_id) : null;
-      const bankLedger = typeof payload.bankLedgerName === "string" ? payload.bankLedgerName.trim() : "";
-      const counterpartyLedger =
-        typeof payload.matchedLedgerName === "string"
-          ? payload.matchedLedgerName.trim()
-          : typeof payload.counterpartyLedgerName === "string"
-            ? payload.counterpartyLedgerName.trim()
-            : "";
-      const rows: MappingRow[] = [];
-
-      if (account && bankLedger) {
-        rows.push({
-          connection_id: connectionId,
-          owner_user_id: user.id,
-          mapping_type: "bank_account_ledger",
-          source_key: buildBankAccountLedgerSourceKey(account.id),
-          source_label: `${account.bank_name || "Bank"} ${account.account_number_masked}`.trim(),
-          ...buildLedgerMappingTarget(bankLedger),
-          status: "active",
-          notes: "Saved from bank voucher queue confirmation.",
-        });
-      }
-
-      if (transaction && counterpartyLedger && saveMappingTransactionIds.has(transaction.id)) {
-        rows.push({
-          connection_id: connectionId,
-          owner_user_id: user.id,
-          mapping_type: "bank_narration_ledger",
-          source_key: buildBankNarrationLedgerSourceKey(transaction.bank_account_id, transaction.description),
-          source_label: transaction.description.slice(0, 500),
-          ...buildLedgerMappingTarget(counterpartyLedger),
-          status: "active",
-          notes: "Saved from bank voucher queue confirmation.",
-        });
-      }
-
-      return rows;
-    });
-    const uniqueMappingRows = Array.from(
-      new Map(
-        mappingRows.map((row) => [
-          `${row.connection_id}:${row.mapping_type}:${row.source_key}`,
-          row,
-        ])
-      ).values()
-    );
-
-    if (uniqueMappingRows.length > 0) {
-      const { error: mappingError } = await supabase
-        .from("tally_mapping_settings")
-        .upsert(uniqueMappingRows, { onConflict: "connection_id,mapping_type,source_key" });
-
-      if (mappingError) throw mappingError;
-    }
-
     const bankLedgerByAccountId = new Map(
       createdCommandRows.flatMap((command) => {
         const payload = command.payload && typeof command.payload === "object" ? command.payload : {};
@@ -1051,7 +1070,7 @@ export async function POST(request: Request) {
     console.error("Error in POST /api/bank-statements/tally/queue:", error);
     return jsonWithCors(
       request,
-      { error: error instanceof Error ? error.message : "Internal server error" },
+      { error: serializeError(error) },
       { status: 500 }
     );
   }

@@ -1,6 +1,9 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
-import { suggestBankLedgerForTransaction } from "@/lib/bank-statement-ledger-matching";
+import {
+  suggestBankLedgersForTransactions,
+  type BankLedgerSuggestion,
+} from "@/lib/bank-statement-ledger-matching";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 export const runtime = "nodejs";
@@ -45,7 +48,7 @@ function isSuspenseLedger(value?: string | null) {
   return normalized === "suspense" || normalized === "suspenseac" || normalized === "suspenseaccount";
 }
 
-function serializeTransaction(row: BankTransactionRow, suggestion?: Awaited<ReturnType<typeof suggestBankLedgerForTransaction>>) {
+function serializeTransaction(row: BankTransactionRow, suggestion?: BankLedgerSuggestion) {
   const strongSuggestedLedger =
     suggestion?.ledgerName && !isSuspenseLedger(suggestion.ledgerName) && suggestion.confidence >= 0.85
       ? suggestion.ledgerName
@@ -144,28 +147,26 @@ export async function GET(request: Request) {
 
     const allRows = (data ?? []) as unknown as BankTransactionRow[];
     const rows = status === "queueable" ? allRows.filter(hasPostingAmount) : allRows;
-    const suggestions = await Promise.all(
-      rows.map((row) =>
-        suggestBankLedgerForTransaction({
-          supabase,
-          ownerUserId: user.id,
-          connectionId,
-          accountId,
-          transaction: {
-            transactionDate: row.transaction_date,
-            valueDate: row.value_date,
-            description: row.description,
-            referenceNumber: row.reference_number,
-            debitAmount: toNumber(row.debit_amount),
-            creditAmount: toNumber(row.credit_amount),
-            balanceAmount: toNumber(row.balance_amount),
-            transactionType: row.transaction_type,
-            category: row.category,
-            counterpartyName: row.counterparty_name,
-          },
-        })
-      )
-    );
+    const suggestions = await suggestBankLedgersForTransactions({
+      supabase,
+      ownerUserId: user.id,
+      connectionId,
+      transactions: rows.map((row) => ({
+        accountId,
+        transaction: {
+          transactionDate: row.transaction_date,
+          valueDate: row.value_date,
+          description: row.description,
+          referenceNumber: row.reference_number,
+          debitAmount: toNumber(row.debit_amount),
+          creditAmount: toNumber(row.credit_amount),
+          balanceAmount: toNumber(row.balance_amount),
+          transactionType: row.transaction_type,
+          category: row.category,
+          counterpartyName: row.counterparty_name,
+        },
+      })),
+    });
 
     return jsonWithCors(request, {
       transactions: rows.map((row, index) => serializeTransaction(row, suggestions[index])),

@@ -56,34 +56,8 @@ const OPENROUTER_MAX_RETRIES = Number(process.env.OPENROUTER_MAX_RETRIES ?? 2);
 const OPENROUTER_RETRY_BASE_MS = Number(process.env.OPENROUTER_RETRY_BASE_MS ?? 1200);
 const OPENROUTER_MAX_OUTPUT_TOKENS = Number(process.env.OPENROUTER_MAX_OUTPUT_TOKENS ?? 8192);
 const OPENROUTER_QUALITY_REASONING_TOKENS = Number(process.env.OPENROUTER_QUALITY_REASONING_TOKENS ?? 2000);
-const OPENROUTER_BANK_LEDGER_MODEL =
-  process.env.OPENROUTER_BANK_LEDGER_MODEL ||
-  "deepseek/deepseek-v4-pro";
-const OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS = Number(
-  process.env.OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS ?? 4096
-);
 const execFileAsync = promisify(execFile);
 const WORKER_IDLE_LOG_INTERVAL_MS = Number(process.env.WORKER_IDLE_LOG_INTERVAL_MS ?? 30_000);
-
-const BANK_LEDGER_MATCHING_SYSTEM_PROMPT = `You match Indian bank statement transactions to synced Tally ledgers.
-Your task is to recommend the correct existing Tally ledger for each bank transaction.
-This is ledger assignment only. Do not attempt invoice matching, voucher matching, invoice settlement, split allocation, or full bank reconciliation.
-Return only valid JSON. Do not return markdown, explanations outside JSON, or code fences.
-Choose only from the provided tallyLedgers list. Copy every selected ledger name exactly as provided.
-Never invent, modify, shorten, merge, or create a ledger. If no existing ledger is clearly correct, use suspense.
-Every transaction must produce exactly one result using its original index.
-Return this exact structure: {"matches":[{"index":0,"matchType":"direct_match","action":"use_existing_ledger","ledgerName":"Exact Ledger Name From tallyLedgers","candidateLedgerNames":[],"confidence":0.95,"reason":"Short reason"}]}.
-Allowed matchType values: direct_match, close_match, suspense.
-For direct_match, action must be "use_existing_ledger", ledgerName must be one exact name from tallyLedgers, candidateLedgerNames must be [], and confidence must be at least 0.90.
-For close_match, action must be "use_suspense", ledgerName must be null, candidateLedgerNames must contain at least two exact competing ledger names from tallyLedgers, and confidence must be 0.0.
-For suspense, action must be "use_suspense", ledgerName must be null, candidateLedgerNames must be [], and confidence must be 0.0.
-A shortened, OCR-damaged, misspelled, or incomplete party name can still be a direct match when it uniquely identifies one existing ledger.
-Ignore bank-system noise such as NEFT, RTGS, IMPS, UPI, NACH, ACH, ECS, CMS, CR, DR, payment, receipt, UTR, RRN, TXN, REF, beneficiary, account words, IFSC, bank, branch, dates, and reference numbers.
-Ignore case, spaces, punctuation, legal suffixes, and common spelling variants only when the full party root remains clearly the same.
-Do not remove meaningful descriptors such as Steel, Metals, Alloys, Traders, Transport, Logistics, Engineering, Fabrication, Electricals, Industries, Services, and Works when they differentiate parties.
-A named party ledger is preferred over a generic expense-category ledger when both are available.
-Select an expense, statutory, payroll, or bank-related ledger only when the narration explicitly supports that category and exactly one existing ledger clearly fits.
-Use suspense for generic narrations, only-reference rows, ambiguous merchants, self-transfers/reversals without a unique ledger, multiple plausible ledgers, best match below 0.90, or anything requiring guessing.`;
 
 function resolvePdfJsWorkerSrc() {
   const candidates = [
@@ -798,185 +772,6 @@ async function callOpenRouterForBankStatement(messages) {
   throw new Error(lastError);
 }
 
-async function callOpenRouterForLedgerMatching(messages) {
-  if (!OPENROUTER_API_KEY) {
-    throw new Error("OPENROUTER_API_KEY is not configured.");
-  }
-
-  let attempt = 0;
-  let lastError = "OpenRouter ledger matching request failed";
-  while (attempt <= OPENROUTER_MAX_RETRIES) {
-    try {
-      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": process.env.APP_BASE_URL || "http://localhost:3001",
-          "X-Title": "Autodealer Workflow Bank Ledger Matching",
-        },
-        body: JSON.stringify({
-          model: OPENROUTER_BANK_LEDGER_MODEL,
-          messages,
-          temperature: 0,
-          response_format: { type: "json_object" },
-          max_tokens:
-            Number.isFinite(OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS) && OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS > 0
-              ? Math.floor(OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS)
-              : undefined,
-        }),
-      });
-
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok || payload?.error) {
-        const errorText =
-          payload?.error?.message ||
-          payload?.message ||
-          (response.ok ? "OpenRouter returned an error payload" : `OpenRouter request failed (${response.status})`);
-        lastError = errorText;
-        if (!isRetryableStatus(response.status) || isHardQuotaError(errorText) || attempt === OPENROUTER_MAX_RETRIES) {
-          throw new Error(errorText);
-        }
-        await sleep(OPENROUTER_RETRY_BASE_MS * Math.pow(2, attempt));
-        attempt += 1;
-        continue;
-      }
-
-      const message = payload?.choices?.[0]?.message?.content;
-      return Array.isArray(message) ? message.map((part) => part?.text || "").join("\n") : String(message || "");
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error ?? "Unknown error");
-      if (attempt === OPENROUTER_MAX_RETRIES) {
-        throw new Error(lastError);
-      }
-      await sleep(OPENROUTER_RETRY_BASE_MS * Math.pow(2, attempt));
-      attempt += 1;
-    }
-  }
-
-  throw new Error(lastError);
-}
-
-function findLedgerNameByNormalized(ledgerNames, ledgerName) {
-  const normalized = normalizeName(ledgerName);
-  if (!normalized) return null;
-  return ledgerNames.find((name) => normalizeName(name) === normalized) || null;
-}
-
-async function applyAiLedgerSuggestionsToPreviewRows({ ownerUserId, connectionId, rows }) {
-  if (!connectionId || rows.length === 0) return rows;
-
-  const { data: ledgerRows, error: ledgerError } = await supabase
-    .from("tally_masters")
-    .select("tally_name, parent_name")
-    .eq("owner_user_id", ownerUserId)
-    .eq("connection_id", connectionId)
-    .eq("master_type", "ledger")
-    .eq("is_active", true)
-    .limit(5000);
-
-  if (ledgerError) throw ledgerError;
-
-  const ledgers = (ledgerRows ?? []).flatMap((ledger) => {
-    const name = textCell(ledger?.tally_name);
-    return name ? [{ name, group: textCell(ledger?.parent_name) || null }] : [];
-  });
-  if (ledgers.length === 0) return rows;
-
-  const raw = await callOpenRouterForLedgerMatching([
-    { role: "system", content: BANK_LEDGER_MATCHING_SYSTEM_PROMPT },
-    {
-      role: "user",
-      content: JSON.stringify({
-        tallyLedgers: ledgers,
-        transactions: rows.map((row, index) => ({
-          index,
-          transactionDate: row.transaction_date,
-          description: row.description,
-          referenceNumber: row.reference_number,
-          debitAmount: row.debit_amount,
-          creditAmount: row.credit_amount,
-          transactionType: row.transaction_type,
-          category: row.category,
-          counterpartyName: row.counterparty_name,
-        })),
-      }),
-    },
-  ]);
-
-  const parsed = safeJsonParse(raw, {});
-  const matches = Array.isArray(parsed?.matches) ? parsed.matches : [];
-  const ledgerNames = ledgers.map((ledger) => ledger.name);
-  const matchByIndex = new Map(
-    matches
-      .filter((match) => match && typeof match === "object" && Number.isInteger(Number(match.index)))
-      .map((match) => [Number(match.index), match])
-  );
-
-  return rows.map((row, index) => {
-    const match = matchByIndex.get(index);
-    if (!match) return row;
-
-    const candidateLedgerNames = Array.isArray(match.candidateLedgerNames)
-      ? match.candidateLedgerNames
-          .map((name) => findLedgerNameByNormalized(ledgerNames, name))
-          .filter(Boolean)
-      : [];
-    const confidence = Math.max(0, Math.min(1, Number(match.confidence) || 0));
-    const reason = textCell(match.reason) || "AI ledger matching completed.";
-    const rawPayload = row.raw_payload && typeof row.raw_payload === "object" && !Array.isArray(row.raw_payload)
-      ? row.raw_payload
-      : {};
-
-    if (
-      match.matchType === "direct_match" &&
-      match.action === "use_existing_ledger" &&
-      confidence >= 0.9
-    ) {
-      const ledgerName = findLedgerNameByNormalized(ledgerNames, match.ledgerName);
-      if (ledgerName) {
-        return {
-          ...row,
-          suggested_ledger_name: ledgerName,
-          suggestion_confidence: confidence,
-          suggestion_reason: reason,
-          raw_payload: {
-            ...rawPayload,
-            aiLedgerRecommendation: {
-              matchType: "direct_match",
-              action: "use_existing_ledger",
-              ledgerName,
-              candidateLedgerNames: [],
-              confidence,
-              reason,
-              model: OPENROUTER_BANK_LEDGER_MODEL,
-            },
-          },
-        };
-      }
-    }
-
-    return {
-      ...row,
-      suggested_ledger_name: null,
-      suggestion_confidence: 0,
-      suggestion_reason: reason,
-      raw_payload: {
-        ...rawPayload,
-        aiLedgerRecommendation: {
-          matchType: match.matchType === "close_match" && candidateLedgerNames.length >= 2 ? "close_match" : "suspense",
-          action: "use_suspense",
-          ledgerName: null,
-          candidateLedgerNames,
-          confidence: 0,
-          reason,
-          model: OPENROUTER_BANK_LEDGER_MODEL,
-        },
-      },
-    };
-  });
-}
-
 async function extractBankStatementFromImages(fileName, images, bankAccountCandidates = []) {
   if (images.length === 0) {
     return {
@@ -1640,19 +1435,12 @@ async function runBankStatementJob(job) {
     ...transaction,
     row_index: index + 1,
   }));
-  let previewRows = rows;
-  if (rows.length > 0 && tallyConnectionId) {
-    try {
-      await updateBankJob(job.id, { progress: 78, stage: "Matching Tally ledgers with AI" });
-      previewRows = await applyAiLedgerSuggestionsToPreviewRows({
-        ownerUserId: job.owner_user_id,
-        connectionId: tallyConnectionId,
-        rows,
-      });
-    } catch (error) {
-      console.warn("[worker] AI ledger matching failed for preview rows:", diagnosticError(error));
-    }
-  }
+  // Ledger matching is deliberately deferred to the import preview API. The
+  // browser completes a live Tally master sync before creating this job, and
+  // the API owns the current prompt, shortlisting, batching, and validation.
+  // Keeping extraction rows unmatched here avoids stale/duplicated worker
+  // recommendations blocking a fresh preview-time match.
+  const previewRows = rows;
 
   if (previewRows.length > 0) {
     const { error: previewInsertError } = await supabase

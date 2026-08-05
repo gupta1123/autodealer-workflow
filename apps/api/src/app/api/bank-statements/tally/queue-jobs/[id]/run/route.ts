@@ -33,6 +33,16 @@ function readResult(value: unknown): QueueJobResult {
   return readRecord(value) as QueueJobResult;
 }
 
+function serializeError(error: unknown) {
+  if (error instanceof Error) return error.message;
+  if (!error || typeof error !== "object") return String(error ?? "Internal server error");
+
+  const record = error as Record<string, unknown>;
+  return [record.message, record.details, record.hint, record.error]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join(" ") || "Internal server error";
+}
+
 function serializeQueueJob(row: Record<string, unknown>) {
   return {
     id: row.id,
@@ -235,7 +245,7 @@ export async function POST(
     console.error("Error in POST /api/bank-statements/tally/queue-jobs/[id]/run:", error);
     return jsonWithCors(
       request,
-      { error: error instanceof Error ? error.message : "Internal server error" },
+      { error: serializeError(error) },
       { status: 500 }
     );
   }
