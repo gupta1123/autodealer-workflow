@@ -1,0 +1,2 @@
+# Runtime dependency for validating and unlocking uploaded bank-statement PDFs.
+pypdf>=5.0,<7.0
