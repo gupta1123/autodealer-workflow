@@ -1952,12 +1952,36 @@ function allocateBillsForTransaction(
       : null;
   const safeBill = narrationBill || exactSingleBill;
 
+  if (existingAdvances.length === 0 && openBills.length === 0) {
+    const advanceAllocation: BillAllocationLine = {
+      referenceType: "Advance",
+      referenceName: buildAdvanceReference(transaction),
+      allocatedAmount: receiptAmount,
+      pendingAmountAfterAllocation: receiptAmount,
+      statusAfterAllocation: "advance",
+    };
+    const allocations = [advanceAllocation];
+    return {
+      status: "ready_to_post",
+      caseType: getAllocationCaseType(allocations, receiptAmount),
+      caseLabel: getAllocationCaseLabel(allocations, receiptAmount),
+      reason: "No open bill was found. The receipt is prefilled as a new advance and can be reviewed before posting.",
+      receiptAmount,
+      totalAllocatedAmount: receiptAmount,
+      newAdvanceAmount: receiptAmount,
+      unallocatedAmount: 0,
+      allocations,
+      candidateBills,
+      existingAdvances,
+      requiresUserReview: false,
+      isEligibleForPosting: true,
+    };
+  }
+
   if (existingAdvances.length > 0 || !safeBill) {
     const reason = existingAdvances.length > 0
       ? "Existing advances require an explicit allocation review before applying this receipt."
-      : openBills.length === 0
-        ? "No open bill was found. Confirm whether this receipt should be a new advance."
-        : openBills.length > 1
+      : openBills.length > 1
           ? "Multiple open bills were found. Choose the intended bill allocation explicitly."
           : "A partial receipt can be auto-allocated only when its bill reference is visible in the bank narration.";
     return {
@@ -1978,24 +2002,8 @@ function allocateBillsForTransaction(
   }
 
   const pendingAmount = Math.max(0, Number(safeBill.pendingAmount ?? 0));
-  if (receiptAmount - pendingAmount > 0.01) {
-    return {
-      status: "needs_review",
-      caseType: "cannot_match_yet",
-      caseLabel: "Needs Review",
-      reason: `Receipt exceeds visible bill ${safeBill.referenceName}. Review the bill and advance split explicitly.`,
-      receiptAmount,
-      totalAllocatedAmount: 0,
-      newAdvanceAmount: 0,
-      unallocatedAmount: receiptAmount,
-      allocations: [],
-      candidateBills,
-      existingAdvances,
-      requiresUserReview: true,
-      isEligibleForPosting: false,
-    };
-  }
-
+  const billAllocatedAmount = Math.min(receiptAmount, pendingAmount);
+  const newAdvanceAmount = Number(Math.max(0, receiptAmount - pendingAmount).toFixed(2));
   const allocation: BillAllocationLine = {
     referenceType: "Agst Ref",
     referenceName: safeBill.referenceName,
@@ -2003,24 +2011,35 @@ function allocateBillsForTransaction(
     invoiceDate: safeBill.invoiceDate,
     dueDate: safeBill.dueDate,
     previousPendingAmount: pendingAmount,
-    allocatedAmount: receiptAmount,
-    pendingAmountAfterAllocation: Number((pendingAmount - receiptAmount).toFixed(2)),
-    statusAfterAllocation: pendingAmount - receiptAmount <= 0.01 ? "cleared" : "partially_settled",
+    allocatedAmount: billAllocatedAmount,
+    pendingAmountAfterAllocation: Number((pendingAmount - billAllocatedAmount).toFixed(2)),
+    statusAfterAllocation: pendingAmount - billAllocatedAmount <= 0.01 ? "cleared" : "partially_settled",
   };
-  const allocations = [allocation];
-  const caseType = getAllocationCaseType(allocations, 0);
-  const caseLabel = getAllocationCaseLabel(allocations, 0);
+  const allocations: BillAllocationLine[] = [allocation];
+  if (newAdvanceAmount > 0) {
+    allocations.push({
+      referenceType: "Advance",
+      referenceName: buildAdvanceReference(transaction),
+      allocatedAmount: newAdvanceAmount,
+      pendingAmountAfterAllocation: newAdvanceAmount,
+      statusAfterAllocation: "advance",
+    });
+  }
+  const caseType = getAllocationCaseType(allocations, newAdvanceAmount);
+  const caseLabel = getAllocationCaseLabel(allocations, newAdvanceAmount);
 
   return {
     status: "ready_to_post",
     caseType,
     caseLabel,
-    reason: narrationBill
-      ? `Matched the visible bill reference ${narrationBill.referenceName}.`
-      : "Exactly one open bill matched the receipt amount.",
+    reason: newAdvanceAmount > 0
+      ? `Matched ${safeBill.referenceName} and prefilled the excess as a new advance.`
+      : narrationBill
+        ? `Matched the visible bill reference ${narrationBill.referenceName}.`
+        : "Exactly one open bill matched the receipt amount.",
     receiptAmount,
     totalAllocatedAmount: receiptAmount,
-    newAdvanceAmount: 0,
+    newAdvanceAmount,
     unallocatedAmount: 0,
     allocations,
     candidateBills,
@@ -3534,6 +3553,12 @@ export function BankStatementsPage() {
         .map((line) => [line.referenceName, line.allocatedAmount])
     );
     billAmounts[referenceName] = nextAmount;
+    const nextBillTotal = currentDraft.candidateBills.reduce((sum, bill) => {
+      const requestedAmount = Math.max(0, Number(billAmounts[bill.referenceName] ?? 0));
+      const pendingAmount = Math.max(0, Number(bill.pendingAmount ?? 0));
+      return sum + Math.min(requestedAmount, pendingAmount);
+    }, 0);
+    const nextAdvanceAmount = Number(Math.max(0, currentDraft.receiptAmount - nextBillTotal).toFixed(2));
 
     setBillAllocationsByTransactionId((current) => ({
       ...current,
@@ -3541,7 +3566,7 @@ export function BankStatementsPage() {
         transaction,
         currentDraft,
         billAmounts,
-        currentDraft.newAdvanceAmount
+        nextAdvanceAmount
       ),
     }));
   }
