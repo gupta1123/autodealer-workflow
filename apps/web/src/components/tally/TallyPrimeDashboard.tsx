@@ -149,6 +149,9 @@ function getBridgeApiBaseUrl() {
     ""
   ).replace(/\/+$/, "");
   if (configuredBaseUrl) return configuredBaseUrl;
+  if (typeof window !== "undefined" && window.location.origin) {
+    return window.location.origin.replace(/\/+$/, "");
+  }
   return DEFAULT_BRIDGE_API_BASE_URL;
 }
 
