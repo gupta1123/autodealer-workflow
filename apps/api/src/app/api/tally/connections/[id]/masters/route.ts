@@ -1,6 +1,7 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { classifyPartyLedgerFromGroups } from "@/lib/bank-statement-ledger-safety";
 import {
   MASTER_TYPES,
   serializeTallyMaster,
@@ -32,6 +33,7 @@ export async function GET(
     const type = parseMasterType(url.searchParams.get("type"));
     const query = url.searchParams.get("q")?.trim() ?? "";
     const limit = Math.min(Number(url.searchParams.get("limit") || 100), 5000);
+    const fetchAll = url.searchParams.get("all") === "true";
 
     const supabase = createSupabaseAdminClient();
     const { data: connection, error: connectionError } = await supabase
@@ -49,28 +51,38 @@ export async function GET(
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
     }
 
-    let builder = supabase
-      .from("tally_masters")
-      .select("*")
-      .eq("connection_id", id)
-      .eq("owner_user_id", user.id)
-      .eq("company_name", connection.last_company_name ?? "Unknown company")
-      .eq("is_active", true)
-      .order("master_type", { ascending: true })
-      .order("tally_name", { ascending: true })
-      .limit(limit);
+    const buildMasterQuery = () => {
+      let builder = supabase
+        .from("tally_masters")
+        .select("*")
+        .eq("connection_id", id)
+        .eq("owner_user_id", user.id)
+        .eq("company_name", connection.last_company_name ?? "Unknown company")
+        .eq("is_active", true)
+        .order("master_type", { ascending: true })
+        .order("tally_name", { ascending: true });
+      if (type) builder = builder.eq("master_type", type);
+      if (query) builder = builder.ilike("tally_name", `%${query}%`);
+      return builder;
+    };
 
-    if (type) {
-      builder = builder.eq("master_type", type);
-    }
-
-    if (query) {
-      builder = builder.ilike("tally_name", `%${query}%`);
-    }
-
-    const { data, error } = await builder;
-    if (error) {
-      throw error;
+    const masters: TallyMasterRow[] = [];
+    if (fetchAll) {
+      const pageSize = 1000;
+      for (let from = 0; from < 20000; from += pageSize) {
+        const { data, error } = await buildMasterQuery().range(from, from + pageSize - 1);
+        if (error) throw error;
+        const page = (data ?? []) as unknown as TallyMasterRow[];
+        masters.push(...page);
+        if (page.length < pageSize) break;
+        if (from + pageSize >= 20000) {
+          throw new Error("Tally master list exceeds the supported 20,000-master safety limit.");
+        }
+      }
+    } else {
+      const { data, error } = await buildMasterQuery().limit(limit);
+      if (error) throw error;
+      masters.push(...((data ?? []) as unknown as TallyMasterRow[]));
     }
 
     const { data: runData, error: runError } = await supabase
@@ -86,8 +98,48 @@ export async function GET(
       throw runError;
     }
 
+    const groupRows: TallyMasterRow[] = [];
+    if (type === "ledger") {
+      const pageSize = 1000;
+      for (let from = 0; from < 20000; from += pageSize) {
+        const { data, error } = await supabase
+          .from("tally_masters")
+          .select("*")
+          .eq("connection_id", id)
+          .eq("owner_user_id", user.id)
+          .eq("company_name", connection.last_company_name ?? "Unknown company")
+          .eq("master_type", "group")
+          .eq("is_active", true)
+          .order("tally_name", { ascending: true })
+          .range(from, from + pageSize - 1);
+        if (error) throw error;
+        const page = (data ?? []) as unknown as TallyMasterRow[];
+        groupRows.push(...page);
+        if (page.length < pageSize) break;
+        if (from + pageSize >= 20000) {
+          throw new Error("Tally group list exceeds the supported 20,000-master safety limit.");
+        }
+      }
+    }
+
+    const groupIdentities = groupRows.map((group) => ({
+      name: group.tally_name,
+      parent: group.parent_name,
+    }));
+
     return jsonWithCors(request, {
-      masters: ((data ?? []) as unknown as TallyMasterRow[]).map(serializeTallyMaster),
+      masters: masters.map((master) => {
+        const serialized = serializeTallyMaster(master);
+        if (master.master_type !== "ledger" || groupIdentities.length === 0) return serialized;
+        return {
+          ...serialized,
+          ledgerType: classifyPartyLedgerFromGroups(
+            { name: master.tally_name, parent: master.parent_name },
+            groupIdentities
+          ),
+        };
+      }),
+      masterCount: masters.length,
       latestSync: runData ?? null,
     });
   } catch (error) {

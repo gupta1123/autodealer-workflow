@@ -8,6 +8,8 @@ import { promisify } from "node:util";
 import { createClient } from "@supabase/supabase-js";
 import sharp from "sharp";
 
+import { suggestBankLedgersForTransactions } from "../src/lib/bank-statement-ledger-matching.ts";
+
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const WORKER_SECRET = process.env.WORKER_SECRET;
@@ -56,6 +58,8 @@ const OPENROUTER_MAX_RETRIES = Number(process.env.OPENROUTER_MAX_RETRIES ?? 2);
 const OPENROUTER_RETRY_BASE_MS = Number(process.env.OPENROUTER_RETRY_BASE_MS ?? 1200);
 const OPENROUTER_MAX_OUTPUT_TOKENS = Number(process.env.OPENROUTER_MAX_OUTPUT_TOKENS ?? 8192);
 const OPENROUTER_QUALITY_REASONING_TOKENS = Number(process.env.OPENROUTER_QUALITY_REASONING_TOKENS ?? 2000);
+const OPENROUTER_BANK_LEDGER_MODEL =
+  process.env.OPENROUTER_BANK_LEDGER_MODEL || "deepseek/deepseek-v4-pro";
 const execFileAsync = promisify(execFile);
 const WORKER_IDLE_LOG_INTERVAL_MS = Number(process.env.WORKER_IDLE_LOG_INTERVAL_MS ?? 30_000);
 
@@ -668,20 +672,49 @@ function bankAccountNumberFromTallyLedger(ledger) {
 
 async function getTallyBankAccountCandidates(ownerUserId, connectionId) {
   if (!connectionId) return [];
-  const { data, error } = await supabase
-    .from("tally_masters")
-    .select("tally_name, parent_name, raw_payload")
-    .eq("owner_user_id", ownerUserId)
-    .eq("connection_id", connectionId)
-    .eq("master_type", "ledger")
-    .eq("is_active", true)
-    .limit(5000);
-  if (error) throw error;
+  const ledgers = [];
+  const groups = [];
+  const pageSize = 1000;
+  for (const [masterType, target] of [["ledger", ledgers], ["group", groups]]) {
+    for (let from = 0; from < 20000; from += pageSize) {
+      const { data, error } = await supabase
+        .from("tally_masters")
+        .select("tally_name, parent_name, raw_payload")
+        .eq("owner_user_id", ownerUserId)
+        .eq("connection_id", connectionId)
+        .eq("master_type", masterType)
+        .eq("is_active", true)
+        .order("tally_name", { ascending: true })
+        .range(from, from + pageSize - 1);
+      if (error) throw error;
+      const page = data ?? [];
+      target.push(...page);
+      if (page.length < pageSize) break;
+      if (from + pageSize >= 20000) {
+        throw new Error(`Tally ${masterType} sync exceeds the supported 20,000-master safety limit.`);
+      }
+    }
+  }
+  const groupParentByName = new Map(
+    groups.map((group) => [normalizeName(group.tally_name), textCell(group.parent_name)])
+  );
+  function isDescendantOfGroup(parentName, targetGroupName) {
+    const target = normalizeName(targetGroupName);
+    const visited = new Set();
+    let current = textCell(parentName);
+    while (current) {
+      const normalized = normalizeName(current);
+      if (!normalized || visited.has(normalized)) return false;
+      if (normalized === target) return true;
+      visited.add(normalized);
+      current = groupParentByName.get(normalized) || "";
+    }
+    return false;
+  }
 
-  return (data ?? []).flatMap((ledger) => {
-    const parent = textCell(ledger.parent_name).toLowerCase();
+  return ledgers.flatMap((ledger) => {
     const accountNumber = bankAccountNumberFromTallyLedger(ledger);
-    if (!/\bbank\s+accounts?\b/.test(parent) || !accountNumber) return [];
+    if (!isDescendantOfGroup(ledger.parent_name, "Bank Accounts") || !accountNumber) return [];
     return [{ ledgerName: textCell(ledger.tally_name), accountNumber }];
   });
 }
@@ -1325,6 +1358,75 @@ async function requeueBankJob(jobId, errorMessage) {
   });
 }
 
+function bankLedgerMatchTransaction(row) {
+  return {
+    transactionDate: row.transaction_date || "",
+    valueDate: row.value_date || null,
+    description: row.description || "",
+    referenceNumber: row.reference_number || null,
+    debitAmount: row.debit_amount ?? null,
+    creditAmount: row.credit_amount ?? null,
+    balanceAmount: row.balance_amount ?? null,
+    transactionType: row.transaction_type || undefined,
+    category: row.category || undefined,
+    counterpartyName: row.counterparty_name || null,
+  };
+}
+
+async function addBankLedgerRecommendations({
+  rows,
+  ownerUserId,
+  connectionId,
+  accountId,
+}) {
+  if (rows.length === 0) return rows;
+
+  const suggestions = await suggestBankLedgersForTransactions({
+    supabase,
+    ownerUserId,
+    connectionId,
+    transactions: rows.map((row) => ({
+      accountId,
+      transaction: bankLedgerMatchTransaction(row),
+    })),
+  });
+
+  return rows.map((row, index) => {
+    const suggestion = suggestions[index];
+    if (!suggestion) return row;
+
+    const recommendationCompleted = suggestion.mappingSource !== "none";
+    const rawPayload =
+      row.raw_payload && typeof row.raw_payload === "object" && !Array.isArray(row.raw_payload)
+        ? row.raw_payload
+        : {};
+    return {
+      ...row,
+      suggested_ledger_name: suggestion.ledgerName,
+      suggestion_confidence: suggestion.confidence,
+      suggestion_reason: suggestion.reason,
+      raw_payload: {
+        ...rawPayload,
+        aiLedgerRecommendation: {
+          matchType: suggestion.matchType || (suggestion.ledgerName ? "direct_match" : "suspense"),
+          action: suggestion.ledgerName ? "use_existing_ledger" : "use_suspense",
+          ledgerName: suggestion.ledgerName,
+          candidateLedgerNames: suggestion.candidateLedgerNames || [],
+          confidence: suggestion.confidence,
+          reason: suggestion.reason,
+          model: recommendationCompleted
+            ? suggestion.mappingSource === "ai_match"
+              ? OPENROUTER_BANK_LEDGER_MODEL
+              : suggestion.mappingSource
+            : null,
+          source: suggestion.mappingSource,
+          status: recommendationCompleted ? "completed" : "unavailable",
+        },
+      },
+    };
+  });
+}
+
 async function runBankStatementJob(job) {
   const { data: importRow, error: importError } = await supabase
     .from("bank_statement_imports")
@@ -1422,25 +1524,40 @@ async function runBankStatementJob(job) {
       : candidateCount > 1
         ? "needs_account_selection"
         : "ready_to_review";
-  await updateBankJob(job.id, { progress: 75, stage: "Saving preview rows" });
-  await supabase
-    .from("bank_statement_import_preview_transactions")
-    .delete()
-    .eq("import_id", job.import_id)
-    .eq("owner_user_id", job.owner_user_id);
-
   const rows = parsed.transactions.map((transaction, index) => ({
     import_id: job.import_id,
     owner_user_id: job.owner_user_id,
     ...transaction,
     row_index: index + 1,
   }));
-  // Ledger matching is deliberately deferred to the import preview API. The
-  // browser completes a live Tally master sync before creating this job, and
-  // the API owns the current prompt, shortlisting, batching, and validation.
-  // Keeping extraction rows unmatched here avoids stale/duplicated worker
-  // recommendations blocking a fresh preview-time match.
-  const previewRows = rows;
+  await updateBankJob(job.id, { progress: 82, stage: "Matching Tally ledgers" });
+  const previewRows = await addBankLedgerRecommendations({
+    rows,
+    ownerUserId: job.owner_user_id,
+    connectionId: tallyConnectionId,
+    accountId: String(selectedAccountId || importRow.bank_account_id || ""),
+  });
+
+  const incompleteRecommendationCount = previewRows.reduce((count, row) => {
+    const payload = row?.raw_payload;
+    const recommendation =
+      payload && typeof payload === "object" && !Array.isArray(payload)
+        ? payload.aiLedgerRecommendation
+        : null;
+    return recommendation?.status === "completed" ? count : count + 1;
+  }, 0);
+  if (incompleteRecommendationCount > 0) {
+    throw new Error(
+      `Ledger matching did not complete for ${incompleteRecommendationCount} of ${previewRows.length} transaction(s).`,
+    );
+  }
+
+  await updateBankJob(job.id, { progress: 88, stage: "Saving preview rows" });
+  await supabase
+    .from("bank_statement_import_preview_transactions")
+    .delete()
+    .eq("import_id", job.import_id)
+    .eq("owner_user_id", job.owner_user_id);
 
   if (previewRows.length > 0) {
     const { error: previewInsertError } = await supabase
@@ -1506,6 +1623,7 @@ async function runBankStatementJob(job) {
     result: {
       importId: job.import_id,
       transactionCount: previewRows.length,
+      ledgerRecommendationCount: previewRows.length - incompleteRecommendationCount,
       status: finalStatus,
     },
     locked_at: null,

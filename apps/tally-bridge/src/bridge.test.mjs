@@ -3,10 +3,129 @@ import test from "node:test";
 
 import {
   buildPurchaseVoucherXml,
+  classifyOpenBillReferenceKind,
   classifyTaxLedgers,
+  findBankLedgersFromMasters,
   parseTallyImportResult,
   purchaseVoucherReadbackComparison,
+  strictBankTransactionCandidates,
 } from "./bridge.mjs";
+
+function bankVoucher({ reference = "", party = "Customer A" } = {}) {
+  return {
+    date: "20260801",
+    effectiveDate: "20260801",
+    reference,
+    bankReferences: reference ? [reference] : [],
+    partyLedgerName: party,
+    ledgerNames: [party, "ICICI Current Account"],
+    ledgerEntries: [
+      { ledgerName: "ICICI Current Account", amount: 1250, isDebit: true },
+      { ledgerName: party, amount: 1250, isDebit: false },
+    ],
+  };
+}
+
+test("strict bank presence uses exact reference independently of a wrong selected party", () => {
+  const result = strictBankTransactionCandidates(
+    [bankVoucher({ reference: "UTR-123456", party: "Actual Customer" })],
+    {
+      voucherDate: "2026-08-01",
+      amount: 1250,
+      expectedDirection: "incoming",
+      referenceNumber: "UTR-123456",
+      counterpartyLedgerName: "Wrong Customer",
+    },
+    "ICICI Current Account",
+    new Set()
+  );
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.hasUsableReference, true);
+});
+
+test("strict bank presence requires the exact party when no usable reference exists", () => {
+  const result = strictBankTransactionCandidates(
+    [bankVoucher({ party: "Actual Customer" })],
+    {
+      voucherDate: "2026-08-01",
+      amount: 1250,
+      expectedDirection: "incoming",
+      counterpartyLedgerName: "Wrong Customer",
+    },
+    "ICICI Current Account",
+    new Set()
+  );
+  assert.equal(result.baseCandidateCount, 1);
+  assert.equal(result.candidates.length, 0);
+  assert.equal(result.hasUsableCounterparty, true);
+});
+
+test("strict bank presence marks same-date amount evidence insufficient for Suspense", () => {
+  const result = strictBankTransactionCandidates(
+    [bankVoucher({ party: "Actual Customer" })],
+    {
+      voucherDate: "2026-08-01",
+      amount: 1250,
+      expectedDirection: "incoming",
+      counterpartyLedgerName: "Suspense",
+    },
+    "ICICI Current Account",
+    new Set()
+  );
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.identityInsufficient, true);
+});
+
+test("open-bill classification preserves invoices and recovers exported advances", () => {
+  assert.equal(
+    classifyOpenBillReferenceKind({ billType: "Advance", referenceName: "RCPT-1" }),
+    "advance"
+  );
+  assert.equal(
+    classifyOpenBillReferenceKind({ referenceName: "ADV-0007", sourceVoucherType: "Receipt" }),
+    "advance"
+  );
+  assert.equal(
+    classifyOpenBillReferenceKind({ referenceName: "ADV-0007", knownInvoice: true }),
+    "bill"
+  );
+  assert.equal(
+    classifyOpenBillReferenceKind({ referenceName: "INV-0007", sourceVoucherType: "Sales" }),
+    "bill"
+  );
+});
+
+test("bank discovery returns ledgers nested below Bank Accounts, never groups", () => {
+  const groups = [
+    { name: "Current Assets", parent: "Primary" },
+    { name: "Bank Accounts", parent: "Current Assets" },
+    { name: "QA Current Accounts", parent: "Bank Accounts" },
+    { name: "Deeply Nested Banks", parent: "QA Current Accounts" },
+    { name: "Sundry Debtors", parent: "Current Assets" },
+  ];
+  const ledgers = [
+    { name: "Direct Bank", parent: "Bank Accounts" },
+    { name: "Nested HDFC Bank", parent: "QA Current Accounts" },
+    { name: "Deep Bank", parent: "Deeply Nested Banks" },
+    { name: "Ordinary Customer", parent: "Sundry Debtors" },
+    { name: "Metadata Bank", parent: "Current Assets", bankAccountNumber: "50123456789" },
+  ];
+
+  assert.deepEqual(
+    findBankLedgersFromMasters(ledgers, groups).map((item) => item.name),
+    ["Direct Bank", "Nested HDFC Bank", "Deep Bank", "Metadata Bank"]
+  );
+});
+
+test("bank discovery terminates safely when custom group ancestry contains a cycle", () => {
+  const groups = [
+    { name: "Cycle A", parent: "Cycle B" },
+    { name: "Cycle B", parent: "Cycle A" },
+  ];
+  const ledgers = [{ name: "Not A Bank", parent: "Cycle A" }];
+
+  assert.deepEqual(findBankLedgersFromMasters(ledgers, groups), []);
+});
 
 function ledger(name, { dutyHead = "", taxType = "", parent = "Duties & Taxes" } = {}) {
   return {

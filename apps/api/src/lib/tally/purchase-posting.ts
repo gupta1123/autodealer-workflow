@@ -168,6 +168,10 @@ export type PurchasePostingCalculation = {
   cgstTdsAmount: string;
   sgstTdsAmount: string;
   igstTdsAmount: string;
+  gstTdsBasisAmount: string;
+  gstTdsRate: string;
+  gstTdsAutomatic: boolean;
+  scrapGstTdsEligible: boolean;
   totalWithholdingAmount: string;
   tcsAmount: string;
   roundOffAmount: string;
@@ -194,6 +198,8 @@ type PurchasePostingReviewPatch = Omit<Partial<PurchasePostingReview>, "lines"> 
 
 const TAX_TOLERANCE_PAISE = 100;
 const TOTAL_TOLERANCE_PAISE = 100;
+const SCRAP_GST_TDS_EFFECTIVE_DATE = "2024-10-10";
+const GST_TDS_CONTRACT_THRESHOLD_PAISE = 250_000 * 100;
 
 function text(value: unknown) {
   if (value === null || value === undefined) return "";
@@ -230,10 +236,6 @@ function parseDate(value: unknown) {
   const raw = text(value);
   if (!raw) return "";
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
-  const looseIso = raw.match(/^(\d{4})[./-](\d{1,2})[./-](\d{1,2})$/);
-  if (looseIso) {
-    return `${looseIso[1]}-${looseIso[2].padStart(2, "0")}-${looseIso[3].padStart(2, "0")}`;
-  }
   const parts = raw.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
   if (!parts) return raw;
   const year = parts[3].length === 2 ? `20${parts[3]}` : parts[3];
@@ -720,8 +722,8 @@ function buildDefaultReview(
     ...baseReview,
     ...(saved ?? {}),
     lines,
-    invoiceDate: parseDate(saved?.invoiceDate) || baseReview.invoiceDate,
-    voucherDate: parseDate(saved?.voucherDate) || baseReview.voucherDate,
+    invoiceDate: saved?.invoiceDate || baseReview.invoiceDate,
+    voucherDate: saved?.voucherDate || baseReview.voucherDate,
     supplierLedgerName: saved?.supplierLedgerName || baseReview.supplierLedgerName,
     cgstLedgerName: saved?.cgstLedgerName || baseReview.cgstLedgerName,
     sgstLedgerName: saved?.sgstLedgerName || baseReview.sgstLedgerName,
@@ -843,6 +845,19 @@ function calculate(
     ? Math.round((gstTaxable * gstRateBasisPoints) / 10000)
     : 0;
   const gst = cgst + sgst + igst;
+  const scrapGstTdsBasis = sum(review.lines.map((line) =>
+    materialFromHsn(line.hsn).material === "ms_scrap"
+      ? calculateLineTaxable(line)
+      : null
+  ));
+  const scrapGstTdsEligible =
+    isValidIsoDate(review.invoiceDate) &&
+    review.invoiceDate >= SCRAP_GST_TDS_EFFECTIVE_DATE &&
+    validGstin(review.supplierGstin) &&
+    validGstin(buyerGstin || review.buyerGstin) &&
+    taxMode !== "unknown" &&
+    scrapGstTdsBasis > GST_TDS_CONTRACT_THRESHOLD_PAISE;
+  const automaticScrapGstTds = accountingSettings.gstTdsEnabled && scrapGstTdsEligible;
   const confirmedDeduction = (enabled: boolean, value: string) => {
     const amount = moneyPaise(value);
     return enabled && amount !== null ? Math.abs(amount) : 0;
@@ -859,14 +874,24 @@ function calculate(
     source.invoiceTransportTdsAmount
   );
   const cgstTds = taxMode === "cgst_sgst"
-    ? confirmedDeduction(accountingSettings.gstTdsEnabled, source.invoiceCgstTdsAmount)
+    ? automaticScrapGstTds
+      ? Math.round(scrapGstTdsBasis / 100)
+      : confirmedDeduction(accountingSettings.gstTdsEnabled, source.invoiceCgstTdsAmount)
     : 0;
   const sgstTds = taxMode === "cgst_sgst"
-    ? confirmedDeduction(accountingSettings.gstTdsEnabled, source.invoiceSgstTdsAmount)
+    ? automaticScrapGstTds
+      ? Math.round(scrapGstTdsBasis / 100)
+      : confirmedDeduction(accountingSettings.gstTdsEnabled, source.invoiceSgstTdsAmount)
     : 0;
   const igstTds = taxMode === "igst"
-    ? confirmedDeduction(accountingSettings.gstTdsEnabled, source.invoiceIgstTdsAmount)
+    ? automaticScrapGstTds
+      ? Math.round(scrapGstTdsBasis / 50)
+      : confirmedDeduction(accountingSettings.gstTdsEnabled, source.invoiceIgstTdsAmount)
     : 0;
+  const hasGstTds = cgstTds + sgstTds + igstTds > 0;
+  const effectiveGstTdsRate = hasGstTds
+    ? taxMode === "cgst_sgst" ? "1" : "2"
+    : review.gstTdsRate;
   const totalWithholding = tds194q + transportTds + cgstTds + sgstTds + igstTds;
   const tcs = review.tcsReceivable ? (moneyPaise(review.tcsAmount) ?? 0) : 0;
   const invoiceTotal = moneyPaise(review.invoiceTotal) ?? 0;
@@ -876,7 +901,12 @@ function calculate(
   const roundOff = sourceRoundOff
     ? reviewedRoundOff ?? sourceRoundOff
     : 0;
+  const grossInvoiceAmount = basic + freight + gst + tcs + roundOff;
   const payable = beforeRound + roundOff;
+  // Buyer-side scrap GST TDS is not part of the supplier's tax-invoice total.
+  // Reconcile the printed invoice to its gross value, then show the separately
+  // withheld amount in the final supplier payable.
+  const reconciliationAmount = automaticScrapGstTds ? grossInvoiceAmount : payable;
 
   return {
     taxMode,
@@ -898,12 +928,16 @@ function calculate(
     cgstTdsAmount: formatPaise(cgstTds),
     sgstTdsAmount: formatPaise(sgstTds),
     igstTdsAmount: formatPaise(igstTds),
+    gstTdsBasisAmount: formatPaise(scrapGstTdsBasis),
+    gstTdsRate: effectiveGstTdsRate,
+    gstTdsAutomatic: automaticScrapGstTds,
+    scrapGstTdsEligible,
     totalWithholdingAmount: formatPaise(totalWithholding),
     tcsAmount: formatPaise(tcs),
     roundOffAmount: formatPaise(roundOff),
     calculatedPayable: formatPaise(payable),
     invoiceTotal: formatPaise(invoiceTotal),
-    totalDifference: formatPaise(payable - invoiceTotal),
+    totalDifference: formatPaise(reconciliationAmount - invoiceTotal),
   };
 }
 
@@ -952,14 +986,6 @@ export function preparePurchasePosting(params: {
   const source = buildSource(invoice, linkedLineSource ?? invoice, params.documents);
   if (!isValidIsoDate(source.invoiceDate)) {
     source.invoiceDate = linkedInvoiceDate(invoice, params.documents);
-  }
-  if (!isValidIsoDate(source.invoiceDate)) {
-    warnings.push(issue(
-      "INVOICE_DATE_MISSING_FROM_EXTRACTION",
-      "Invoice date was not found",
-      "The invoice date was not found in the extracted documents. Enter the supplier invoice date manually before posting.",
-      "invoice"
-    ));
   }
   if (linkedLineSource) {
     warnings.push(issue(
@@ -1057,12 +1083,7 @@ export function preparePurchasePosting(params: {
     ));
   }
   if (!isValidIsoDate(review.invoiceDate)) {
-    blockers.push(issue(
-      "INVOICE_DATE_REQUIRED",
-      "Invoice date required",
-      "Enter the supplier invoice date before posting.",
-      "invoice"
-    ));
+    blockers.push(issue("INVOICE_DATE_REQUIRED", "Invoice date required", "Enter a valid invoice date.", "invoice"));
   }
   if (!isValidIsoDate(review.voucherDate)) {
     blockers.push(issue("VOUCHER_DATE_REQUIRED", "Tally voucher date required", "Enter the accounting date for the Tally voucher.", "invoice"));
@@ -1240,6 +1261,31 @@ export function preparePurchasePosting(params: {
     }
   }
 
+  const hasPostEffectiveScrap =
+    isValidIsoDate(review.invoiceDate) &&
+    review.invoiceDate >= SCRAP_GST_TDS_EFFECTIVE_DATE &&
+    review.lines.some((line) => materialFromHsn(line.hsn).material === "ms_scrap");
+  if (calculation.scrapGstTdsEligible && !accountingSettings.gstTdsEnabled) {
+    blockers.push(issue(
+      "SCRAP_GST_TDS_DISABLED",
+      "Enable GST TDS for this metal-scrap purchase",
+      "This registered-party MS Scrap purchase exceeds ₹2.5 lakh. Enable GST TDS in Purchase accounting settings so Kalika can withhold 1% CGST + 1% SGST, or 2% IGST.",
+      "tax"
+    ));
+  } else if (
+    hasPostEffectiveScrap &&
+    validGstin(review.supplierGstin) &&
+    validGstin(params.companyGstin || review.buyerGstin) &&
+    !calculation.scrapGstTdsEligible
+  ) {
+    warnings.push(issue(
+      "SCRAP_GST_TDS_CONTRACT_THRESHOLD_REVIEW",
+      "Confirm the metal-scrap contract value",
+      "This invoice alone does not exceed ₹2.5 lakh of MS Scrap. Confirm whether multiple invoices belong to one contract whose taxable value exceeds the threshold.",
+      "tax"
+    ));
+  }
+
   const purchaseGoodsTdsActive = (moneyPaise(calculation.tds194qAmount) ?? 0) > 0;
   const gstTdsActive = sum([
     moneyPaise(calculation.cgstTdsAmount),
@@ -1251,11 +1297,12 @@ export function preparePurchasePosting(params: {
       codePrefix: string,
       label: string,
       invoiceAmount: string,
-      calculatedAmount: string
+      calculatedAmount: string,
+      evidenceRequired = true
     ) => {
       const invoicePaise = moneyPaise(invoiceAmount);
       const calculatedPaise = moneyPaise(calculatedAmount) ?? 0;
-      if (calculatedPaise > 0 && invoicePaise === null) {
+      if (calculatedPaise > 0 && invoicePaise === null && evidenceRequired) {
         blockers.push(issue(
           `${codePrefix}_INVOICE_EVIDENCE_REQUIRED`,
           `${label} is not confirmed from the invoice`,
@@ -1298,7 +1345,7 @@ export function preparePurchasePosting(params: {
       );
     }
     if (gstTdsActive) {
-      const gstTdsRate = rateBasisPoints(review.gstTdsRate);
+      const gstTdsRate = rateBasisPoints(calculation.gstTdsRate);
       if (gstTdsRate === null || gstTdsRate <= 0) {
         blockers.push(issue("GST_TDS_RATE_REQUIRED", "GST TDS rate required", "Confirm the GST withholding rate for the selected tax mode.", "tax"));
       }
@@ -1307,13 +1354,15 @@ export function preparePurchasePosting(params: {
         "CGST_TDS",
         "CGST TDS",
         source.invoiceCgstTdsAmount,
-        calculation.cgstTdsAmount
+        calculation.cgstTdsAmount,
+        !calculation.gstTdsAutomatic
       );
       requireMatchingInvoiceDeduction(
         "SGST_TDS",
         "SGST TDS",
         source.invoiceSgstTdsAmount,
-        calculation.sgstTdsAmount
+        calculation.sgstTdsAmount,
+        !calculation.gstTdsAutomatic
       );
       if (
         normalizeKey(review.cgstTdsLedgerName) !== normalizeKey("CGST TDS PAYABLE 1%") ||
@@ -1332,7 +1381,8 @@ export function preparePurchasePosting(params: {
         "IGST_TDS",
         "IGST TDS",
         source.invoiceIgstTdsAmount,
-        calculation.igstTdsAmount
+        calculation.igstTdsAmount,
+        !calculation.gstTdsAutomatic
       );
       if (
         normalizeKey(review.igstTdsLedgerName) !== normalizeKey("IGST TDS PAYABLE 2%") ||
@@ -1468,11 +1518,11 @@ export function preparePurchasePosting(params: {
         : []),
       ...(gstTdsActive && calculation.taxMode === "cgst_sgst"
         ? [
-          { kind: "cgst_tds", name: review.cgstTdsLedgerName, rate: review.gstTdsRate, amount: calculation.cgstTdsAmount },
-          { kind: "sgst_tds", name: review.sgstTdsLedgerName, rate: review.gstTdsRate, amount: calculation.sgstTdsAmount },
+          { kind: "cgst_tds", name: review.cgstTdsLedgerName, rate: calculation.gstTdsRate, taxableBasis: calculation.gstTdsBasisAmount, amount: calculation.cgstTdsAmount },
+          { kind: "sgst_tds", name: review.sgstTdsLedgerName, rate: calculation.gstTdsRate, taxableBasis: calculation.gstTdsBasisAmount, amount: calculation.sgstTdsAmount },
         ]
         : gstTdsActive && calculation.taxMode === "igst"
-          ? [{ kind: "igst_tds", name: review.igstTdsLedgerName, rate: review.gstTdsRate, amount: calculation.igstTdsAmount }]
+          ? [{ kind: "igst_tds", name: review.igstTdsLedgerName, rate: calculation.gstTdsRate, taxableBasis: calculation.gstTdsBasisAmount, amount: calculation.igstTdsAmount }]
           : []),
     ],
     ledgers: {

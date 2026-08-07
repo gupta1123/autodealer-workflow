@@ -31,6 +31,7 @@
     "test:cash-discount": "node --test --experimental-strip-types apps/api/src/lib/cash-discount-narration.test.mjs",
     "test:tally-bridge": "node --test apps/tally-bridge/src/bridge.test.mjs",
     "test:purchase-posting": "node --test apps/api/src/lib/tally/purchase-posting.test.mjs",
+    "test:pdf-security": "node --experimental-strip-types --test apps/api/src/lib/pdf-security.test.mjs",
     "quality:packet-regressions": "node scripts/packet-quality-regressions.mjs",
     "worker": "npm run worker --workspace @autodealer/api",
     "worker:local": "npm run worker:local --workspace @autodealer/api"

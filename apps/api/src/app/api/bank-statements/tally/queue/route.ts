@@ -5,8 +5,13 @@ import {
   buildBankAccountLedgerSourceKey,
   buildBankNarrationLedgerSourceKey,
   buildLedgerMappingTarget,
-  suggestBankLedgersForTransactions,
 } from "@/lib/bank-statement-ledger-matching";
+import {
+  classifyPartyLedgerFromGroups,
+  isSuspenseLedgerIdentity,
+  masterParentDescendsFromGroup,
+  resolveCompanySuspenseLedgerName,
+} from "@/lib/bank-statement-ledger-safety";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 export const runtime = "nodejs";
@@ -176,22 +181,6 @@ function isSuspenseLedger(value?: string | null) {
   return normalized.includes("suspense");
 }
 
-function findCompanySuspenseLedger(ledgers: TallyLedgerRow[]) {
-  const candidates = ledgers.filter(
-    (ledger) => isSuspenseLedger(ledger.tally_name) || isSuspenseLedger(ledger.parent_name)
-  );
-  return candidates.sort((left, right) => {
-    const rank = (ledger: TallyLedgerRow) => {
-      const name = normalizeName(ledger.tally_name);
-      if (name === "bankstatementsuspense") return 4;
-      if (name === "suspense") return 3;
-      if (name.includes("bankstatement") && name.includes("suspense")) return 2;
-      return name.includes("suspense") ? 1 : 0;
-    };
-    return rank(right) - rank(left);
-  })[0]?.tally_name || "";
-}
-
 function isValidTransactionDate(value: unknown) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value ?? "").trim());
 }
@@ -294,7 +283,7 @@ export async function POST(request: Request) {
     const saveMappingTransactionIds = new Set(
       (Array.isArray(body.transactions) ? body.transactions : []).flatMap((transaction) => {
         const transactionId = toText(transaction?.transactionId, 80);
-        return transactionId && transaction?.saveMapping !== false ? [transactionId] : [];
+        return transactionId && transaction?.saveMapping === true ? [transactionId] : [];
       })
     );
     const accountId = toText(body.accountId, 80);
@@ -558,19 +547,52 @@ export async function POST(request: Request) {
       return [] as TallyCommandInsert[];
     }
 
-    const { data: ledgerRows, error: ledgerError } = await supabase
-      .from("tally_masters")
-      .select("tally_name, parent_name")
-      .eq("owner_user_id", user.id)
-      .eq("connection_id", connectionId)
-      .eq("master_type", "ledger")
-      .eq("is_active", true)
-      .limit(5000);
-
-    if (ledgerError) throw ledgerError;
-
-    const activeLedgers = (ledgerRows ?? []) as unknown as TallyLedgerRow[];
-    const companySuspenseLedgerName = findCompanySuspenseLedger(activeLedgers);
+    const activeLedgers: TallyLedgerRow[] = [];
+    const ledgerPageSize = 1000;
+    for (let from = 0; from < 20000; from += ledgerPageSize) {
+      const { data: ledgerRows, error: ledgerError } = await supabase
+        .from("tally_masters")
+        .select("tally_name, parent_name")
+        .eq("owner_user_id", user.id)
+        .eq("connection_id", connectionId)
+        .eq("master_type", "ledger")
+        .eq("is_active", true)
+        .order("tally_name", { ascending: true })
+        .range(from, from + ledgerPageSize - 1);
+      if (ledgerError) throw ledgerError;
+      const page = (ledgerRows ?? []) as unknown as TallyLedgerRow[];
+      activeLedgers.push(...page);
+      if (page.length < ledgerPageSize) break;
+      if (from + ledgerPageSize >= 20000) {
+        throw new Error("Tally ledger sync exceeds the supported 20,000-ledger safety limit.");
+      }
+    }
+    const companySuspenseLedgerName = resolveCompanySuspenseLedgerName(
+      activeLedgers.map((ledger) => ({ name: ledger.tally_name, parent: ledger.parent_name }))
+    ) || "";
+    const activeGroups: TallyLedgerRow[] = [];
+    for (let from = 0; from < 20000; from += ledgerPageSize) {
+      const { data: groupRows, error: groupError } = await supabase
+        .from("tally_masters")
+        .select("tally_name, parent_name")
+        .eq("owner_user_id", user.id)
+        .eq("connection_id", connectionId)
+        .eq("master_type", "group")
+        .eq("is_active", true)
+        .order("tally_name", { ascending: true })
+        .range(from, from + ledgerPageSize - 1);
+      if (groupError) throw groupError;
+      const page = (groupRows ?? []) as unknown as TallyLedgerRow[];
+      activeGroups.push(...page);
+      if (page.length < ledgerPageSize) break;
+      if (from + ledgerPageSize >= 20000) {
+        throw new Error("Tally group sync exceeds the supported 20,000-group safety limit.");
+      }
+    }
+    const groupIdentities = activeGroups.map((group) => ({
+      name: group.tally_name,
+      parent: group.parent_name,
+    }));
 
     const syncedLedgerNames = new Set(
       activeLedgers.map((ledger) => normalizeName(ledger.tally_name))
@@ -587,57 +609,35 @@ export async function POST(request: Request) {
     }
 
     function isPartyParent(parentName: string) {
-      const parent = normalizeName(parentName);
-      return parent.includes("sundry debtor") || parent.includes("sundry creditor");
+      return (
+        masterParentDescendsFromGroup(parentName, groupIdentities, "Sundry Debtors") ||
+        masterParentDescendsFromGroup(parentName, groupIdentities, "Sundry Creditors")
+      );
     }
 
     function isPartyLedger(ledgerName: string) {
-      return isPartyParent(ledgerParentByName.get(normalizeName(ledgerName)) || "");
+      return classifyPartyLedgerFromGroups(
+        {
+          name: ledgerName,
+          parent: ledgerParentByName.get(normalizeName(ledgerName)) || "",
+        },
+        groupIdentities
+      ) !== "other";
     }
 
-    const ledgerSuggestions = await suggestBankLedgersForTransactions({
-      supabase,
-      ownerUserId: user.id,
-      connectionId,
-      transactions: transactions.map((transaction) => ({
-        accountId: transaction.bank_account_id,
-        transaction: {
-          transactionDate: transaction.transaction_date,
-          valueDate: transaction.value_date,
-          description: transaction.description,
-          referenceNumber: transaction.reference_number,
-          debitAmount: toNumber(transaction.debit_amount),
-          creditAmount: toNumber(transaction.credit_amount),
-          balanceAmount: toNumber(transaction.balance_amount),
-          transactionType: transaction.transaction_type,
-          category: transaction.category,
-          counterpartyName: transaction.counterparty_name,
-        },
-      })),
-    });
-    const commandInputs = transactions.map((transaction, transactionIndex) => {
-      const suggestion = ledgerSuggestions[transactionIndex];
+    const commandInputs = transactions.map((transaction) => {
       const selectedLedger = ledgerSelectionByTransactionId.get(transaction.id);
       const createLedgerName = selectedLedger?.createLedgerName || "";
       const legacyFallback = requestedTransactionIds.length === 1 ? toText(body.counterpartyLedgerName, 500) : "";
-      const strongSuggestedLedger =
-        suggestion.ledgerName && !isSuspenseLedger(suggestion.ledgerName) && suggestion.confidence >= 0.85
-          ? suggestion.ledgerName
-          : "";
-      const confirmedLedgerName =
-        transaction.confirmed_ledger_name && !(isSuspenseLedger(transaction.confirmed_ledger_name) && strongSuggestedLedger)
-          ? transaction.confirmed_ledger_name
-          : "";
-      const storedSuggestedLedgerName =
-        transaction.suggested_ledger_name && !(isSuspenseLedger(transaction.suggested_ledger_name) && strongSuggestedLedger)
-          ? transaction.suggested_ledger_name
-          : "";
+      const confirmedLedgerName = transaction.confirmed_ledger_name || "";
+      const storedSuggestedLedgerName = transaction.suggested_ledger_name || "";
       const selectedCounterpartyLedgerName =
         createLedgerName ||
         selectedLedger?.counterpartyLedgerName ||
         confirmedLedgerName ||
-        strongSuggestedLedger ||
-        (Number(transaction.suggestion_confidence ?? 0) >= 0.85 ? storedSuggestedLedgerName : "") ||
+        (Number(transaction.suggestion_confidence ?? 0) >= 0.85 && !isSuspenseLedger(storedSuggestedLedgerName)
+          ? storedSuggestedLedgerName
+          : "") ||
         legacyFallback;
       const counterpartyLedgerName =
         isSuspenseLedger(selectedCounterpartyLedgerName) && companySuspenseLedgerName
@@ -646,7 +646,6 @@ export async function POST(request: Request) {
 
       return {
         transaction,
-        suggestion,
         counterpartyLedgerName,
         createLedgerName,
         createLedgerParentName: selectedLedger?.createLedgerParentName || "Sundry Creditors",
@@ -655,7 +654,7 @@ export async function POST(request: Request) {
 
     const queuedCreateLedgerKeys = new Set<string>();
     const commands: TallyCommandInsert[] = commandInputs.flatMap(
-      ({ transaction, suggestion, counterpartyLedgerName, createLedgerName, createLedgerParentName }) => {
+      ({ transaction, counterpartyLedgerName, createLedgerName, createLedgerParentName }) => {
         if (blockedFingerprints.has(transaction.fingerprint)) {
           return skipTransaction(transaction, "alreadyPostedOrActive");
         }
@@ -723,7 +722,7 @@ export async function POST(request: Request) {
               referenceNumber,
               transactionType: transaction.transaction_type,
               category: transaction.category,
-              counterpartyName: transaction.counterparty_name || suggestion.counterpartyName,
+              counterpartyName: transaction.counterparty_name,
               accountNumberMasked: account.account_number_masked,
               expectedDirection: "outgoing",
             },
@@ -787,7 +786,7 @@ export async function POST(request: Request) {
             referenceNumber,
             transactionType: transaction.transaction_type,
             category: transaction.category,
-            counterpartyName: transaction.counterparty_name || suggestion.counterpartyName,
+            counterpartyName: transaction.counterparty_name,
             accountNumberMasked: account.account_number_masked,
             billAllocations,
             expectedDirection: "incoming",
@@ -878,7 +877,15 @@ export async function POST(request: Request) {
         });
       }
 
-      if (transaction && counterpartyLedger && saveMappingTransactionIds.has(transaction.id)) {
+      if (
+        transaction &&
+        counterpartyLedger &&
+        saveMappingTransactionIds.has(transaction.id) &&
+        !isSuspenseLedgerIdentity({
+          name: counterpartyLedger,
+          parent: ledgerParentByName.get(normalizeName(counterpartyLedger)) || "",
+        })
+      ) {
         rows.push({
           connection_id: connectionId,
           company_name: expectedCompanyName,

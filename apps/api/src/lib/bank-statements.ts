@@ -8,7 +8,11 @@ import { promisify } from "node:util";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import sharp from "sharp";
 
-import { callOpenRouter, getQualityExtractionModel, getQualityExtractionReasoning } from "@/lib/processing/openrouter";
+import {
+  callOpenRouter,
+  getQualityExtractionModel,
+  getQualityExtractionReasoning,
+} from "./processing/openrouter.ts";
 
 export const BANK_STATEMENT_BUCKET = "bank-statement-files";
 const execFileAsync = promisify(execFile);

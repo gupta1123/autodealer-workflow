@@ -66,6 +66,47 @@ function money(value: string | null | undefined) {
     : value;
 }
 
+function tallyAmount(
+  value: string | number | null | undefined,
+  options: { credit?: boolean } = {}
+) {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed)) return String(value ?? "0.00");
+  const signed = options.credit && parsed > 0 ? -parsed : parsed;
+  return new Intl.NumberFormat("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(signed);
+}
+
+function tallyQuantity(value: string | number | null | undefined) {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed)) return String(value ?? "0.000");
+  return new Intl.NumberFormat("en-IN", {
+    minimumFractionDigits: 3,
+    maximumFractionDigits: 3,
+  }).format(parsed);
+}
+
+function tallyDate(value: string | null | undefined) {
+  if (!value) return "Date missing";
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return value;
+  const [, year, month, day] = match;
+  const monthLabel = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][Number(month) - 1];
+  return monthLabel ? `${Number(day)}-${monthLabel}-${year.slice(-2)}` : value;
+}
+
+function tallyWeekday(value: string | null | undefined) {
+  if (!value) return "";
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return "";
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  return Number.isNaN(date.getTime())
+    ? ""
+    : new Intl.DateTimeFormat("en-IN", { weekday: "long", timeZone: "UTC" }).format(date);
+}
+
 function moneyOrMissing(value: string | null | undefined) {
   if (value === null || value === undefined || value.trim() === "") return "Not found";
   return money(value);
@@ -1105,6 +1146,14 @@ export function TallyPurchasePostingPanel({
     scopeIssues("tax", ["FREIGHT_LEDGER_REQUIRED", "FREIGHT_GST_RATE_REQUIRED"]).length > 0;
   const showFreight = freightRelevant;
   const showRoundOff = Boolean(Number(payload.source?.invoiceRoundOffAmount));
+  const reviewedTcsValue = Number(String(review.tcsAmount || "0").replace(/,/g, ""));
+  const liveTcsAmount = review.tcsReceivable && Number.isFinite(reviewedTcsValue)
+    ? Math.abs(reviewedTcsValue)
+    : 0;
+  const savedTcsAmount = Number(calculation?.tcsAmount || 0);
+  const liveTcsDelta = liveTcsAmount - (Number.isFinite(savedTcsAmount) ? savedTcsAmount : 0);
+  const liveCalculatedPayable = Number(calculation?.calculatedPayable || 0) + liveTcsDelta;
+  const liveTotalDifference = Number(calculation?.totalDifference || 0) + liveTcsDelta;
   const halfInvoiceGst = invoiceTaxKnown
     ? String(Number(payload.source?.invoiceTaxAmount) / 2)
     : null;
@@ -1130,6 +1179,62 @@ export function TallyPurchasePostingPanel({
       : calculation?.taxMode === "igst"
         ? applicableTaxOptions.length === 0
         : false);
+
+  const previewPurchaseLedgers = Array.from(new Set(
+    review.lines.map((line) => line.purchaseLedgerName).filter(Boolean)
+  ));
+  const previewPurchaseLedger = previewPurchaseLedgers.length === 1
+    ? previewPurchaseLedgers[0]
+    : previewPurchaseLedgers.length > 1
+      ? "Multiple purchase ledgers"
+      : "Purchase ledger not selected";
+  const previewTotalQuantity = review.lines.reduce(
+    (total, line) => total + (Number.isFinite(Number(line.quantity)) ? Number(line.quantity) : 0),
+    0
+  );
+  const previewUnits = Array.from(new Set(review.lines.map((line) => line.unit).filter(Boolean)));
+  const previewQuantityLabel = previewUnits.length === 1
+    ? `${tallyQuantity(previewTotalQuantity)} ${previewUnits[0]}`
+    : `${review.lines.length} item${review.lines.length === 1 ? "" : "s"}`;
+  const previewLedgerRows = [
+    Number(calculation?.freightAmount || 0)
+      ? { ledger: review.freightLedgerName || "Freight inward", rate: review.freightGstRate, amount: calculation?.freightAmount }
+      : null,
+    calculation?.taxMode === "cgst_sgst"
+      ? { ledger: review.cgstLedgerName || "Input CGST", rate: String(Number(calculation.gstRate || 0) / 2), amount: calculation.cgstAmount }
+      : calculation?.taxMode === "igst"
+        ? { ledger: review.igstLedgerName || "Input IGST", rate: calculation.gstRate, amount: calculation.igstAmount }
+        : null,
+    calculation?.taxMode === "cgst_sgst"
+      ? { ledger: review.sgstLedgerName || "Input SGST", rate: String(Number(calculation.gstRate || 0) / 2), amount: calculation.sgstAmount }
+      : null,
+    purchaseGoodsTdsActive
+      ? { ledger: review.tds194qLedgerName || "Purchase TDS", rate: review.tds194qRate, amount: calculation?.tds194qAmount, credit: true }
+      : null,
+    transporterTdsActive
+      ? { ledger: review.transportTdsLedgerName || "Transport TDS", rate: review.transportTdsRate, amount: calculation?.transportTdsAmount, credit: true }
+      : null,
+    cgstTdsActive
+      ? { ledger: review.cgstTdsLedgerName || "CGST TDS", rate: calculation?.gstTdsRate, amount: calculation?.cgstTdsAmount, credit: true }
+      : null,
+    sgstTdsActive
+      ? { ledger: review.sgstTdsLedgerName || "SGST TDS", rate: calculation?.gstTdsRate, amount: calculation?.sgstTdsAmount, credit: true }
+      : null,
+    igstTdsActive
+      ? { ledger: review.igstTdsLedgerName || "IGST TDS", rate: calculation?.gstTdsRate, amount: calculation?.igstTdsAmount, credit: true }
+      : null,
+    review.tcsReceivable
+      ? { ledger: review.tcsLedgerName || "TCS Receivable", amount: String(liveTcsAmount) }
+      : null,
+    Number(calculation?.roundOffAmount || 0)
+      ? { ledger: review.roundOffLedgerName || "Round-off", amount: calculation?.roundOffAmount }
+      : null,
+  ].filter(Boolean) as Array<{
+    ledger: string;
+    rate?: string;
+    amount?: string;
+    credit?: boolean;
+  }>;
 
   return (
     <div className="tally-purchase-workflow mx-auto max-w-6xl space-y-4 p-3 pb-32 sm:p-5 sm:pb-32">
@@ -1643,12 +1748,23 @@ export function TallyPurchasePostingPanel({
                   {purchaseGoodsTdsActive ? (
                     <div className="grid grid-cols-[100px_105px_95px_100px_minmax(200px,1fr)_72px] items-center gap-2 border-t border-slate-100 px-3 py-2">
                       <div>
-                        <div className="text-xs font-semibold text-slate-900">Purchase TDS on goods</div>
-                        <div className="mt-1 w-24">
-                          <Field id="field-tds-194q-rate" disabled={locked} issues={scopeIssues("tax", ["TDS_194Q_RATE_REQUIRED"])} label="Rate %" onChange={(value) => updateReview("tds194qRate", value)} sourceValue={payload.source?.invoiceTds194qRate} value={review.tds194qRate} />
-                        </div>
+                        <div className="whitespace-nowrap text-xs font-semibold text-slate-900">Purchase TDS</div>
+                        <label className="mt-1 flex h-5 items-center gap-1 text-[10px] text-slate-500" id="field-tds-194q-rate">
+                          <span>Goods</span>
+                          <span aria-hidden="true">·</span>
+                          <input
+                            aria-invalid={Boolean(scopeIssues("tax", ["TDS_194Q_RATE_REQUIRED"]).length)}
+                            aria-label="Purchase TDS rate percentage"
+                            className={`h-5 w-10 rounded border bg-white px-1 text-center text-[10px] font-semibold leading-none text-slate-700 outline-none transition focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 disabled:cursor-not-allowed disabled:bg-slate-50 ${scopeIssues("tax", ["TDS_194Q_RATE_REQUIRED"]).length ? "border-rose-300" : "border-slate-200"}`}
+                            disabled={locked}
+                            inputMode="decimal"
+                            onChange={(event) => updateReview("tds194qRate", event.target.value)}
+                            value={review.tds194qRate}
+                          />
+                          <span>%</span>
+                        </label>
                       </div>
-                      <div className="pt-1 text-[11px] font-medium text-slate-500">Confirmed on invoice</div>
+                      <div className="text-[11px] font-medium leading-4 text-slate-500">Invoice-confirmed</div>
                       <div className="pt-1 text-xs text-slate-700">{moneyOrMissing(payload.source?.invoiceTds194qAmount)}</div>
                       <div className="pt-1 text-xs font-semibold text-slate-900">{money(calculation?.tds194qAmount)}</div>
                       <MasterCombobox {...masterContext} compact hideLabel id="field-tds-194q-ledger" disabled={locked || mastersNeedSync} emptyMessage="The configured purchase TDS ledger was not returned by Tally." issues={scopeIssues("tax", ["TDS_194Q_LEDGER_REQUIRED"])} label="Purchase TDS ledger" onChange={(value) => updateReview("tds194qLedgerName", value)} options={tds194qOptions} value={review.tds194qLedgerName} />
@@ -1662,10 +1778,13 @@ export function TallyPurchasePostingPanel({
                     <>
                       {cgstTdsActive ? (
                         <div className="grid grid-cols-[100px_105px_95px_100px_minmax(200px,1fr)_72px] items-center gap-2 border-t border-slate-100 px-3 py-2">
-                          <div className="text-xs font-semibold text-slate-900">CGST TDS</div>
-                          <div className="pt-1 text-[11px] font-medium text-slate-500">Confirmed on invoice</div>
-                          <div className="pt-1 text-xs text-slate-700">{moneyOrMissing(payload.source?.invoiceCgstTdsAmount)}</div>
-                          <Field id="field-gst-tds-rate" disabled={locked} issues={scopeIssues("tax", ["GST_TDS_RATE_REQUIRED"])} label={`Calculated ${money(calculation?.cgstTdsAmount)} · rate %`} onChange={(value) => updateReview("gstTdsRate", value)} sourceValue={payload.source?.invoiceGstTdsRate} value={review.gstTdsRate} />
+                          <div>
+                            <div className="text-xs font-semibold text-slate-900">CGST TDS</div>
+                            <div className="mt-0.5 text-[10px] text-slate-400">{calculation?.gstTdsRate || "1"}%</div>
+                          </div>
+                          <div className="pt-1 text-[11px] font-medium text-slate-500">{calculation?.gstTdsAutomatic ? `Scrap basis ${money(calculation.gstTdsBasisAmount)}` : "Confirmed on invoice"}</div>
+                          <div className="pt-1 text-xs text-slate-700">{calculation?.gstTdsAutomatic ? "Automatic" : moneyOrMissing(payload.source?.invoiceCgstTdsAmount)}</div>
+                          <div className="text-xs font-semibold text-slate-900">{money(calculation?.cgstTdsAmount)}</div>
                           <MasterCombobox {...masterContext} compact hideLabel id="field-cgst-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="CGST TDS PAYABLE 1% was not returned by Tally." issues={scopeIssues("tax", ["CGST_TDS_LEDGER_REQUIRED"])} label="CGST TDS ledger" onChange={(value) => updateReview("cgstTdsLedgerName", value)} options={cgstTdsOptions} value={review.cgstTdsLedgerName} />
                           <div className={`pt-1 text-xs font-semibold ${invoiceCgstTdsKnown && Math.abs(Number(numericDifference(payload.source?.invoiceCgstTdsAmount, calculation?.cgstTdsAmount))) > 1 ? "text-rose-600" : invoiceCgstTdsKnown ? "text-emerald-700" : "text-slate-400"}`}>
                             {invoiceCgstTdsKnown ? money(numericDifference(payload.source?.invoiceCgstTdsAmount, calculation?.cgstTdsAmount)) : "—"}
@@ -1674,9 +1793,12 @@ export function TallyPurchasePostingPanel({
                       ) : null}
                       {sgstTdsActive ? (
                         <div className="grid grid-cols-[100px_105px_95px_100px_minmax(200px,1fr)_72px] items-center gap-2 border-t border-slate-100 px-3 py-2">
-                          <div className="text-xs font-semibold text-slate-900">SGST TDS</div>
-                          <div className="pt-1 text-[11px] font-medium text-slate-500">Confirmed on invoice</div>
-                          <div className="pt-1 text-xs text-slate-700">{moneyOrMissing(payload.source?.invoiceSgstTdsAmount)}</div>
+                          <div>
+                            <div className="text-xs font-semibold text-slate-900">SGST TDS</div>
+                            <div className="mt-0.5 text-[10px] text-slate-400">{calculation?.gstTdsRate || "1"}%</div>
+                          </div>
+                          <div className="pt-1 text-[11px] font-medium text-slate-500">{calculation?.gstTdsAutomatic ? `Scrap basis ${money(calculation.gstTdsBasisAmount)}` : "Confirmed on invoice"}</div>
+                          <div className="pt-1 text-xs text-slate-700">{calculation?.gstTdsAutomatic ? "Automatic" : moneyOrMissing(payload.source?.invoiceSgstTdsAmount)}</div>
                           <div className="pt-1 text-xs font-semibold text-slate-900">{money(calculation?.sgstTdsAmount)}</div>
                           <MasterCombobox {...masterContext} compact hideLabel id="field-sgst-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="SGST TDS PAYABLE 1% was not returned by Tally." issues={scopeIssues("tax", ["SGST_TDS_LEDGER_REQUIRED"])} label="SGST TDS ledger" onChange={(value) => updateReview("sgstTdsLedgerName", value)} options={sgstTdsOptions} value={review.sgstTdsLedgerName} />
                           <div className={`pt-1 text-xs font-semibold ${invoiceSgstTdsKnown && Math.abs(Number(numericDifference(payload.source?.invoiceSgstTdsAmount, calculation?.sgstTdsAmount))) > 1 ? "text-rose-600" : invoiceSgstTdsKnown ? "text-emerald-700" : "text-slate-400"}`}>
@@ -1687,10 +1809,13 @@ export function TallyPurchasePostingPanel({
                     </>
                   ) : igstTdsActive ? (
                     <div className="grid grid-cols-[100px_105px_95px_100px_minmax(200px,1fr)_72px] items-center gap-2 border-t border-slate-100 px-3 py-2">
-                      <div className="text-xs font-semibold text-slate-900">IGST TDS</div>
-                      <div className="pt-1 text-[11px] font-medium text-slate-500">Confirmed on invoice</div>
-                      <div className="pt-1 text-xs text-slate-700">{moneyOrMissing(payload.source?.invoiceIgstTdsAmount)}</div>
-                      <Field id="field-gst-tds-rate" disabled={locked} issues={scopeIssues("tax", ["GST_TDS_RATE_REQUIRED"])} label={`Calculated ${money(calculation?.igstTdsAmount)} · rate %`} onChange={(value) => updateReview("gstTdsRate", value)} sourceValue={payload.source?.invoiceGstTdsRate} value={review.gstTdsRate} />
+                      <div>
+                        <div className="text-xs font-semibold text-slate-900">IGST TDS</div>
+                        <div className="mt-0.5 text-[10px] text-slate-400">{calculation?.gstTdsRate || "2"}%</div>
+                      </div>
+                      <div className="pt-1 text-[11px] font-medium text-slate-500">{calculation?.gstTdsAutomatic ? `Scrap basis ${money(calculation.gstTdsBasisAmount)}` : "Confirmed on invoice"}</div>
+                      <div className="pt-1 text-xs text-slate-700">{calculation?.gstTdsAutomatic ? "Automatic" : moneyOrMissing(payload.source?.invoiceIgstTdsAmount)}</div>
+                      <div className="text-xs font-semibold text-slate-900">{money(calculation?.igstTdsAmount)}</div>
                       <MasterCombobox {...masterContext} compact hideLabel id="field-igst-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="IGST TDS PAYABLE 2% was not returned by Tally." issues={scopeIssues("tax", ["IGST_TDS_LEDGER_REQUIRED"])} label="IGST TDS ledger" onChange={(value) => updateReview("igstTdsLedgerName", value)} options={igstTdsOptions} value={review.igstTdsLedgerName} />
                       <div className={`pt-1 text-xs font-semibold ${invoiceIgstTdsKnown && Math.abs(Number(numericDifference(payload.source?.invoiceIgstTdsAmount, calculation?.igstTdsAmount))) > 1 ? "text-rose-600" : invoiceIgstTdsKnown ? "text-emerald-700" : "text-slate-400"}`}>
                         {invoiceIgstTdsKnown ? money(numericDifference(payload.source?.invoiceIgstTdsAmount, calculation?.igstTdsAmount)) : "—"}
@@ -1766,7 +1891,7 @@ export function TallyPurchasePostingPanel({
                       <span className="text-[#8a7f72]">−</span>
                       <span>{money(calculation?.totalWithholdingAmount)} deductions</span>
                       <span className="text-[#8a7f72]">+</span>
-                      <span>{money(calculation?.tcsAmount)} TCS</span>
+                      <span>{money(String(liveTcsAmount))} TCS</span>
                       {Number(calculation?.roundOffAmount) !== 0 ? (
                         <>
                           <span className="text-[#8a7f72]">±</span>
@@ -1777,18 +1902,18 @@ export function TallyPurchasePostingPanel({
                   </div>
                   <div className="flex items-end gap-5 lg:text-right">
                     <div>
-                      <div className="text-[9px] uppercase tracking-wide text-[#8a7f72]">Invoice payable</div>
+                      <div className="text-[9px] uppercase tracking-wide text-[#8a7f72]">Invoice total</div>
                       <div className={`mt-0.5 text-xs font-semibold ${invoiceTotalKnown ? "text-slate-900" : "text-amber-700"}`}>{moneyOrMissing(payload.source?.invoiceTotal)}</div>
                     </div>
                     <div>
                       <div className="text-[9px] uppercase tracking-wide text-[#8a7f72]">Difference</div>
-                      <div className={`mt-0.5 text-xs font-semibold ${invoiceTotalKnown && Math.abs(Number(calculation?.totalDifference)) > 1 ? "text-rose-700" : invoiceTotalKnown ? "text-emerald-700" : "text-[#8a7f72]"}`}>
-                        {invoiceTotalKnown ? money(calculation?.totalDifference) : "—"}
+                      <div className={`mt-0.5 text-xs font-semibold ${invoiceTotalKnown && Math.abs(liveTotalDifference) > 1 ? "text-rose-700" : invoiceTotalKnown ? "text-emerald-700" : "text-[#8a7f72]"}`}>
+                        {invoiceTotalKnown ? money(String(liveTotalDifference)) : "—"}
                       </div>
                     </div>
                     <div className="min-w-28">
-                      <div className="text-[9px] uppercase tracking-wide text-[#8a7f72]">Will post</div>
-                      <div className="mt-0.5 text-base font-semibold">{money(calculation?.calculatedPayable)}</div>
+                      <div className="text-[9px] uppercase tracking-wide text-[#8a7f72]">Supplier payable</div>
+                      <div className="mt-0.5 text-base font-semibold">{money(String(liveCalculatedPayable))}</div>
                     </div>
                   </div>
                 </div>
@@ -1836,7 +1961,118 @@ export function TallyPurchasePostingPanel({
           </div>
         ) : null}
 
-        <div className="grid lg:grid-cols-[minmax(0,1fr)_280px]">
+        <div className="border-b border-slate-100 bg-[#eef1f7] p-3 sm:p-5">
+          <div className="mb-2 flex items-center justify-between gap-3 px-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-500">
+            <span>Tally-style voucher preview</span>
+            <span className="normal-case tracking-normal text-slate-400 sm:hidden">Swipe to inspect</span>
+          </div>
+          <div className="overflow-x-auto rounded-sm border border-[#aeb4c0] bg-[#f6f5fb] shadow-[0_1px_2px_rgba(15,23,42,0.08)]">
+            <div className="min-h-[560px] min-w-[760px] p-4 text-[12px] leading-5 text-[#111827] sm:p-5">
+              <div className="flex items-start justify-between gap-8">
+                <div className="flex items-center gap-2">
+                  <span className="inline-flex h-5 items-center bg-[#173b70] px-3 text-[11px] font-bold text-white">Purchase</span>
+                  <span className="font-semibold">No.</span>
+                  <span className="font-bold tabular-nums">{payload.posting?.tallyVoucherNumber || "Auto"}</span>
+                  {!payload.posting?.tallyVoucherNumber ? (
+                    <span className="text-[9px] text-[#677386]">assigned by Tally</span>
+                  ) : null}
+                </div>
+                <div className="min-w-48 border border-[#d7c700] bg-[#fffbd1] px-4 py-2 text-right">
+                  <div className="font-bold tabular-nums">{tallyDate(review.voucherDate)}</div>
+                  <div className="text-[10px] text-[#4b5563]">{tallyWeekday(review.voucherDate)}</div>
+                </div>
+              </div>
+
+              <div className="mt-4 grid grid-cols-[145px_12px_minmax(180px,1fr)_60px_12px_150px] gap-y-1">
+                <span>Supplier Invoice No.</span>
+                <span>:</span>
+                <strong>{review.invoiceNumber || "Missing"}</strong>
+                <span>Date</span>
+                <span>:</span>
+                <strong>{tallyDate(review.invoiceDate)}</strong>
+
+                <span>Party A/c name</span>
+                <span>:</span>
+                <div className="col-span-4 min-w-0">
+                  <strong>{review.supplierLedgerName || "Supplier ledger not selected"}</strong>
+                  <div className="text-[9px] italic text-[#657186]">
+                    {review.supplierGstin ? `GSTIN ${review.supplierGstin}` : review.supplierName || "Supplier GSTIN missing"}
+                  </div>
+                </div>
+
+                <span>Purchase ledger</span>
+                <span>:</span>
+                <div className="col-span-4">
+                  <strong>{previewPurchaseLedger}</strong>
+                  <div className="text-[9px] italic text-[#657186]">{connection?.companyName || "Tally company not selected"}</div>
+                </div>
+              </div>
+
+              <div className="mt-5 border-t border-[#9da5b2]">
+                <div className="grid grid-cols-[minmax(280px,1fr)_120px_115px_60px_145px] border-b border-[#aeb4c0] px-1 py-1 font-bold">
+                  <span>Name of Item</span>
+                  <span className="text-right">Quantity</span>
+                  <span className="text-right">Rate</span>
+                  <span className="text-center">per</span>
+                  <span className="text-right">Amount</span>
+                </div>
+                <div className="min-h-[255px] py-1">
+                  {review.lines.map((line) => (
+                    <div className="grid grid-cols-[minmax(280px,1fr)_120px_115px_60px_145px] items-start px-1 py-1" key={line.lineId}>
+                      <div className="pr-5">
+                        <strong>{line.stockItemName || line.description || "Item not mapped"}</strong>
+                        <div className="text-[9px] text-[#657186]">{line.description || `HSN ${line.hsn || "missing"}`}</div>
+                      </div>
+                      <strong className="text-right tabular-nums">{tallyQuantity(line.quantity)}</strong>
+                      <strong className="text-right tabular-nums">{tallyAmount(line.rate)}</strong>
+                      <span className="text-center">{line.unit || "—"}</span>
+                      <strong className="text-right tabular-nums">{tallyAmount(line.taxableAmount)}</strong>
+                    </div>
+                  ))}
+                  {previewLedgerRows.map((row, index) => (
+                    <div className="grid grid-cols-[minmax(280px,1fr)_120px_115px_60px_145px] px-1 py-0.5" key={`${row.ledger}-${index}`}>
+                      <strong>{row.ledger}</strong>
+                      <span />
+                      <span className="text-right tabular-nums">
+                        {row.rate && Number(row.rate) > 0
+                          ? `${new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(Number(row.rate))} %`
+                          : ""}
+                      </span>
+                      <span />
+                      <strong className="text-right tabular-nums">{tallyAmount(row.amount, { credit: row.credit })}</strong>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="border-t border-[#9da5b2] pt-3">
+                <div className="grid grid-cols-[210px_1fr] gap-y-2">
+                  <span>Provide GST/e-Way Bill details</span>
+                  <strong>: &nbsp; No</strong>
+                  <span>Narration</span>
+                  <strong className="whitespace-pre-wrap">: &nbsp; {review.narration || "No narration"}</strong>
+                </div>
+                <div className="mt-4 ml-auto grid w-[46%] min-w-[360px] grid-cols-2 border-y border-[#9da5b2] py-1 font-bold">
+                  <span className="text-center tabular-nums">{previewQuantityLabel}</span>
+                  <span className="text-right text-[14px] tabular-nums">{tallyAmount(String(liveCalculatedPayable))}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-500">
+            <span>Preview mirrors the Item Invoice layout; Tally assigns the final voucher number.</span>
+            <span className={`font-semibold ${Math.abs(liveTotalDifference) > 1 ? "text-rose-600" : "text-emerald-700"}`}>
+              Invoice difference {money(String(liveTotalDifference))}
+            </span>
+          </div>
+        </div>
+
+        <details className="group border-b border-slate-100">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 sm:px-5">
+            <span>View detailed accounting breakdown</span>
+            <ChevronDown className="h-4 w-4 transition group-open:rotate-180" />
+          </summary>
+          <div className="grid border-t border-slate-100 lg:grid-cols-[minmax(0,1fr)_280px]">
           <div className="min-w-0">
             <div className="flex flex-col gap-3 border-b border-slate-100 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
               <div className="min-w-0">
@@ -1945,7 +2181,7 @@ export function TallyPurchasePostingPanel({
                     ? ["IGST TDS", review.igstTdsLedgerName, payload.calculation?.igstTdsAmount]
                     : null,
                   review.tcsReceivable
-                    ? ["TCS Receivable", review.tcsLedgerName, payload.calculation?.tcsAmount]
+                    ? ["TCS Receivable", review.tcsLedgerName, String(liveTcsAmount)]
                     : null,
                   Number(payload.calculation?.roundOffAmount || 0)
                     ? ["Round-off", review.roundOffLedgerName, payload.calculation?.roundOffAmount]
@@ -1967,11 +2203,11 @@ export function TallyPurchasePostingPanel({
           <aside className="border-t border-slate-100 bg-slate-50/70 px-4 py-5 lg:border-l lg:border-t-0">
             <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Amount payable</div>
             <div className={`mt-1 text-2xl font-semibold tracking-tight ${
-              Number(payload.calculation?.calculatedPayable || 0) > 0 ? "text-slate-950" : "text-amber-700"
+              liveCalculatedPayable > 0 ? "text-slate-950" : "text-amber-700"
             }`}>
-              {money(payload.calculation?.calculatedPayable)}
+              {money(String(liveCalculatedPayable))}
             </div>
-            {Number(payload.calculation?.calculatedPayable || 0) <= 0 ? (
+            {liveCalculatedPayable <= 0 ? (
               <p className="mt-1 text-[11px] leading-4 text-amber-700">Complete the item values before this voucher can be approved.</p>
             ) : null}
             <div className="mt-5 space-y-2 text-xs">
@@ -1982,7 +2218,7 @@ export function TallyPurchasePostingPanel({
                   : null,
                 ["GST", payload.calculation?.gstAmount],
                 ["Total deductions", payload.calculation?.totalWithholdingAmount],
-                ["TCS", payload.calculation?.tcsAmount],
+                ["TCS", String(liveTcsAmount)],
                 Number(payload.calculation?.roundOffAmount || 0)
                   ? ["Round-off", payload.calculation?.roundOffAmount]
                   : null,
@@ -2005,12 +2241,13 @@ export function TallyPurchasePostingPanel({
               <div className="mt-2 flex items-center justify-between gap-3 text-xs">
                 <span className="text-slate-500">Difference</span>
                 <span className={`font-semibold ${
-                  Math.abs(Number(payload.calculation?.totalDifference || 0)) > 1 ? "text-rose-600" : "text-emerald-700"
-                }`}>{money(payload.calculation?.totalDifference)}</span>
+                  Math.abs(liveTotalDifference) > 1 ? "text-rose-600" : "text-emerald-700"
+                }`}>{money(String(liveTotalDifference))}</span>
               </div>
             </div>
           </aside>
         </div>
+        </details>
 
         <div className="grid border-t border-slate-100 lg:grid-cols-2">
           <div className="p-4 sm:p-5 lg:border-r lg:border-slate-100">
@@ -2149,7 +2386,7 @@ export function TallyPurchasePostingPanel({
               ["Company GSTIN", connection?.companyGstin || "Missing"],
               ["Supplier invoice", review.invoiceNumber || "Missing"],
               ["Supplier ledger", review.supplierLedgerName || "Missing"],
-              ["Final payable", money(payload.calculation?.calculatedPayable)],
+              ["Final payable", money(String(liveCalculatedPayable))],
             ].map(([label, value]) => (
               <div className="grid grid-cols-[140px_1fr] border-b border-slate-100 px-4 py-3 text-sm last:border-b-0" key={label}>
                 <span className="text-slate-500">{label}</span>

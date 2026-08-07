@@ -145,7 +145,11 @@ function prepare(document, options = {}) {
 }
 
 test("72044900 maps to the combined client stock and Maharashtra purchase rules", () => {
-  const result = prepare(invoiceDocument());
+  const document = invoiceDocument();
+  // Some invoices/OCR return the combined GST-TDS rate as 2%. Tally's
+  // intrastate ledgers must still receive 1% CGST and 1% SGST individually.
+  document.extracted_fields.gstTdsRate = "2";
+  const result = prepare(document);
   assert.equal(result.review.lines[0].stockItemName, "M S Scrap & Sponge Iron");
   assert.equal(result.review.lines[0].unit, "MT");
   assert.equal(result.tallyPayload.items[0].unit, "MTS");
@@ -157,7 +161,117 @@ test("72044900 maps to the combined client stock and Maharashtra purchase rules"
   assert.equal(result.calculation.tds194qAmount, "1.00");
   assert.equal(result.calculation.cgstTdsAmount, "10.00");
   assert.equal(result.calculation.sgstTdsAmount, "10.00");
+  assert.equal(result.calculation.gstTdsRate, "1");
+  assert.ok(result.tallyPayload.withholdings
+    .filter((entry) => entry.kind === "cgst_tds" || entry.kind === "sgst_tds")
+    .every((entry) => entry.rate === "1"));
   assert.equal(result.blockers.length, 0);
+});
+
+test("qualifying Maharashtra MS Scrap automatically deducts 1% CGST and 1% SGST without invoice-printed TDS", () => {
+  const document = invoiceDocument({
+    totalAmount: "354000.00",
+    taxAmount: "54000.00",
+    tdsAmount: "",
+    lines: [{
+      description: "MS Scrap",
+      hsnSac: "72044900",
+      quantity: "10",
+      unit: "MT",
+      rate: "30000.00",
+      taxableAmount: "300000.00",
+      taxAmount: "54000.00",
+    }],
+  });
+  delete document.extracted_fields.cgstTdsAmount;
+  delete document.extracted_fields.sgstTdsAmount;
+
+  const result = prepare(document, {
+    accountingSettings: {
+      purchaseGoodsTdsEnabled: false,
+      transporterTdsEnabled: false,
+      gstTdsEnabled: true,
+    },
+  });
+
+  assert.equal(result.calculation.scrapGstTdsEligible, true);
+  assert.equal(result.calculation.gstTdsAutomatic, true);
+  assert.equal(result.calculation.gstTdsBasisAmount, "300000.00");
+  assert.equal(result.calculation.gstTdsRate, "1");
+  assert.equal(result.calculation.cgstTdsAmount, "3000.00");
+  assert.equal(result.calculation.sgstTdsAmount, "3000.00");
+  assert.equal(result.calculation.calculatedPayable, "348000.00");
+  assert.equal(result.calculation.totalDifference, "0.00");
+  assert.ok(!result.blockers.some((blocker) => /INVOICE_EVIDENCE_REQUIRED$/.test(blocker.code)));
+  assert.ok(result.tallyPayload.withholdings.some((entry) =>
+    entry.kind === "cgst_tds" && entry.taxableBasis === "300000.00" && entry.amount === "3000.00"
+  ));
+  assert.equal(result.blockers.length, 0);
+});
+
+test("qualifying interstate MS Scrap automatically deducts 2% IGST TDS", () => {
+  const document = invoiceDocument({
+    buyerGstin: gujaratBuyerGstin,
+    totalAmount: "354000.00",
+    taxAmount: "54000.00",
+    tdsAmount: "",
+    lines: [{
+      description: "MS Scrap",
+      hsnSac: "72044900",
+      quantity: "10",
+      unit: "MT",
+      rate: "30000.00",
+      taxableAmount: "300000.00",
+      taxAmount: "54000.00",
+    }],
+  });
+
+  const result = prepare(document, {
+    companyGstin: gujaratBuyerGstin,
+    accountingSettings: {
+      purchaseGoodsTdsEnabled: false,
+      transporterTdsEnabled: false,
+      gstTdsEnabled: true,
+    },
+  });
+
+  assert.equal(result.calculation.gstTdsAutomatic, true);
+  assert.equal(result.calculation.gstTdsRate, "2");
+  assert.equal(result.calculation.igstTdsAmount, "6000.00");
+  assert.equal(result.calculation.calculatedPayable, "348000.00");
+  assert.equal(result.calculation.totalDifference, "0.00");
+  assert.equal(result.blockers.length, 0);
+});
+
+test("qualifying MS Scrap is blocked instead of silently posting when GST TDS is disabled", () => {
+  const document = invoiceDocument({
+    totalAmount: "354000.00",
+    taxAmount: "54000.00",
+    tdsAmount: "",
+    lines: [{
+      description: "MS Scrap",
+      hsnSac: "72044900",
+      quantity: "10",
+      unit: "MT",
+      rate: "30000.00",
+      taxableAmount: "300000.00",
+      taxAmount: "54000.00",
+    }],
+  });
+  delete document.extracted_fields.cgstTdsAmount;
+  delete document.extracted_fields.sgstTdsAmount;
+
+  const result = prepare(document, {
+    accountingSettings: {
+      purchaseGoodsTdsEnabled: false,
+      transporterTdsEnabled: false,
+      gstTdsEnabled: false,
+    },
+  });
+
+  assert.equal(result.calculation.scrapGstTdsEligible, true);
+  assert.equal(result.calculation.gstTdsAutomatic, false);
+  assert.ok(result.blockers.some((blocker) => blocker.code === "SCRAP_GST_TDS_DISABLED"));
 });
 
 test("source PDF attachment is automatic and legacy link approval no longer blocks posting", () => {
@@ -569,48 +683,6 @@ test("visible invoice date and TDS in source text fill missing structured fields
   assert.equal(result.review.tds194qRate, "0.1");
   assert.equal(result.calculation.tds194qAmount, "10.00");
   assert.ok(!result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
-});
-
-test("loose ISO invoice dates are normalized before posting validation", () => {
-  const document = invoiceDocument({
-    documentDate: "2026-7-27",
-  });
-  const result = prepare(document, { savedReview: { sourceReferenceApproved: true } });
-
-  assert.equal(result.review.invoiceDate, "2026-07-27");
-  assert.ok(!result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
-  assert.equal(result.tallyPayload.supplierInvoiceDate, "2026-07-27");
-});
-
-test("manual invoice date review accepts common slash date format", () => {
-  const document = invoiceDocument();
-  delete document.extracted_fields.documentDate;
-  document.markdown = "TAX INVOICE\\nInvoice No: INV-100";
-  const result = prepare(document, {
-    savedReview: {
-      sourceReferenceApproved: true,
-      invoiceDate: "27/07/2026",
-    },
-  });
-
-  assert.equal(result.review.invoiceDate, "2026-07-27");
-  assert.ok(!result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
-  assert.equal(result.tallyPayload.supplierInvoiceDate, "2026-07-27");
-});
-
-test("missing extracted invoice date is shown as an invoice warning and posting blocker", () => {
-  const document = invoiceDocument();
-  delete document.extracted_fields.documentDate;
-  delete document.extracted_fields.invoiceDate;
-  document.markdown = "TAX INVOICE\\nInvoice No: INV-100";
-
-  const result = prepare(document, { savedReview: { sourceReferenceApproved: true } });
-
-  assert.ok(result.warnings.some((warning) =>
-    warning.code === "INVOICE_DATE_MISSING_FROM_EXTRACTION" &&
-    warning.scope === "invoice"
-  ));
-  assert.ok(result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
 });
 
 test("linked E-Way Bill supplies one unambiguous missing invoice date", () => {

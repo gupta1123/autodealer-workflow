@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const BRIDGE_VERSION = "0.1.39";
+const BRIDGE_VERSION = "0.1.40";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
@@ -326,63 +326,6 @@ function buildLedgerBalanceExportXml({ companyName, ledgerName, dateFrom, dateTo
     "<FETCH>Name</FETCH>",
     "<FETCH>ClosingBalance</FETCH>",
     "</FETCHLIST>",
-    "</DESC>",
-    "</BODY>",
-    "</ENVELOPE>",
-  ].join("");
-}
-
-function buildBankLedgersExportXml(companyName) {
-  const companyVariable = companyName
-    ? `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>`
-    : "";
-  const nativeMethods = [
-    "Name",
-    "Parent",
-    "GUID",
-    "BankName",
-    "Bank",
-    "BankerName",
-    "BankAccountNumber",
-    "AccountNumber",
-    "BankAccountNo",
-    "BankAcNo",
-    "AcNumber",
-    "IFSCCODE",
-    "IFSCODE",
-    "IFSC",
-    "BankIFSCCODE",
-    "BranchName",
-    "BankBranchName",
-    "Branch",
-    "BankAccHolderName",
-    "BankAccountName",
-    "BankAccountHolderName",
-    "AccountHolderName",
-  ];
-
-  return [
-    "<ENVELOPE>",
-    "<HEADER>",
-    "<VERSION>1</VERSION>",
-    "<TALLYREQUEST>Export</TALLYREQUEST>",
-    "<TYPE>Collection</TYPE>",
-    "<ID>List of Ledgers</ID>",
-    "</HEADER>",
-    "<BODY>",
-    "<DESC>",
-    "<STATICVARIABLES>",
-    companyVariable,
-    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
-    "</STATICVARIABLES>",
-    "<TDL>",
-    "<TDLMESSAGE>",
-    '<COLLECTION NAME="List of Ledgers" ISMODIFY="Yes">',
-    "<ADD>CHILD OF : Bank Accounts</ADD>",
-    ...nativeMethods.map((method) => `<NATIVEMETHOD>${escapeXml(method)}</NATIVEMETHOD>`),
-    "</COLLECTION>",
-    "</TDLMESSAGE>",
-    "</TDL>",
     "</DESC>",
     "</BODY>",
     "</ENVELOPE>",
@@ -2551,15 +2494,32 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
   });
 
   const hasUsableReference = normalizeExactReference(referenceNumber).length >= 5;
-  let candidates = hasUsableReference
-    ? baseCandidates.filter(({ voucher }) => voucherHasExactReference(voucher, referenceNumber))
-    : baseCandidates;
-  const partyMatches = counterpartyLedgerName
-    ? candidates.filter(({ voucher }) => voucherHasLedger(voucher, counterpartyLedgerName))
-    : [];
-  if (candidates.length > 1 && partyMatches.length === 1) candidates = partyMatches;
+  const counterpartyKey = normalizeLooseName(counterpartyLedgerName);
+  const hasUsableCounterparty = Boolean(counterpartyKey && !counterpartyKey.includes("suspense"));
+  const identityInsufficient = !hasUsableReference && !hasUsableCounterparty;
+  let candidates;
+  if (hasUsableReference) {
+    // An exact usable bank reference is independent transaction identity. Party
+    // mismatch must not hide a voucher when the selected ledger was wrong.
+    candidates = baseCandidates.filter(({ voucher }) => voucherHasExactReference(voucher, referenceNumber));
+  } else if (hasUsableCounterparty) {
+    // Without a bank reference, the exact selected counterparty is mandatory.
+    // Same-date and same-amount vouchers belonging to another ledger are not a
+    // match and must remain missing.
+    candidates = baseCandidates.filter(({ voucher }) => voucherHasLedger(voucher, counterpartyLedgerName));
+  } else {
+    // Keep same-date/amount candidates only so the caller can report ambiguity;
+    // one such voucher is never sufficient without a reference or party.
+    candidates = baseCandidates;
+  }
 
-  return { candidates, baseCandidateCount: baseCandidates.length, hasUsableReference };
+  return {
+    candidates,
+    baseCandidateCount: baseCandidates.length,
+    hasUsableReference,
+    hasUsableCounterparty,
+    identityInsufficient,
+  };
 }
 
 function serializeStrictVoucherMatch(candidate) {
@@ -2615,7 +2575,13 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
   );
   const reservedVoucherIndexes = new Set();
   const results = normalizedTransactions.map((transaction) => {
-    const { candidates, baseCandidateCount, hasUsableReference } = strictBankTransactionCandidates(
+    const {
+      candidates,
+      baseCandidateCount,
+      hasUsableReference,
+      hasUsableCounterparty,
+      identityInsufficient,
+    } = strictBankTransactionCandidates(
       vouchers,
       transaction,
       bankLedgerName,
@@ -2626,7 +2592,9 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
     // row is unquestionably already posted; the extra vouchers are a Tally data
     // quality issue, not a reason to post the bank row again.
     const duplicateInTally = hasUsableReference && candidates.length > 1;
-    const verificationStatus = candidates.length === 1 || duplicateInTally
+    const verificationStatus = identityInsufficient && candidates.length > 0
+      ? "ambiguous"
+      : candidates.length === 1 || duplicateInTally
       ? "found"
       : candidates.length > 1
         ? "ambiguous"
@@ -2653,8 +2621,12 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}) {
         ? `${candidates.length} Tally vouchers have the same strict bank transaction reference. The statement row is already posted; review the duplicate Tally vouchers separately.`
         : verificationStatus === "found"
           ? "A unique Tally voucher matched the date, bank ledger, amount, direction and available reference."
+        : identityInsufficient && verificationStatus === "ambiguous"
+          ? "A same-date and same-amount voucher exists, but no usable bank reference or exact counterparty ledger proves it is this statement row. Review manually."
         : verificationStatus === "ambiguous"
           ? "More than one same-date and same-amount voucher matched, but no reliable bank reference identifies one transaction. Review manually."
+          : !hasUsableReference && hasUsableCounterparty && baseCandidateCount > 0
+            ? "Date, amount and direction matched, but the exact selected counterparty ledger did not."
           : hasUsableReference && baseCandidateCount > 0
             ? "Date, amount and direction matched, but the exact UTR/reference did not."
             : "No unused Tally voucher matched the date, selected bank ledger, amount and direction.",
@@ -2812,7 +2784,9 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
   );
   const strictMatches = strictResult.candidates;
   const duplicateInTally = strictResult.hasUsableReference && strictMatches.length > 1;
-  const verificationStatus = strictMatches.length === 0
+  const verificationStatus = strictResult.identityInsufficient && strictMatches.length > 0
+    ? "ambiguous"
+    : strictMatches.length === 0
     ? "missing"
     : strictMatches.length === 1 || duplicateInTally
       ? "found"
@@ -2838,8 +2812,12 @@ async function verifyBankTransactionInTally(config, commandPayload = {}) {
           ? `${strictMatches.length} Tally vouchers have the same strict bank transaction reference. The bank row is already posted; review the duplicate Tally vouchers separately.`
           : verificationStatus === "found"
             ? "Found a unique strict match in Tally."
+          : strictResult.identityInsufficient && verificationStatus === "ambiguous"
+            ? "A same-date and same-amount voucher exists, but no usable bank reference or exact counterparty ledger proves it is this bank row. Review manually."
           : verificationStatus === "ambiguous"
             ? "More than one same-date and same-amount voucher matched, but no reliable bank reference identifies one transaction. Review manually."
+            : !strictResult.hasUsableReference && strictResult.hasUsableCounterparty && strictResult.baseCandidateCount > 0
+              ? "Date, amount and direction matched, but the exact selected counterparty ledger did not."
             : strictResult.hasUsableReference && strictResult.baseCandidateCount > 0
               ? "Date, amount and direction matched, but the exact UTR/reference did not."
               : "No matching Tally voucher found for this bank transaction.",
@@ -2921,7 +2899,29 @@ function emptyOpenBillBucket(ledgerName) {
   };
 }
 
-function toOpenBill(block, ledgerName) {
+function classifyOpenBillReferenceKind({
+  billType,
+  sourceVoucherType,
+  referenceName,
+  knownInvoice = false,
+  knownAdvance = false,
+} = {}) {
+  const type = String(billType || "").toLowerCase();
+  if (type.includes("advance")) return "advance";
+  if (knownInvoice) return "bill";
+  if (knownAdvance) return "advance";
+
+  // Some Tally Bill collection exports omit BillType for receipt advances.
+  // ADV-prefixed references are a controlled fallback only when no Sales
+  // invoice with that reference was found.
+  const looksLikeAdvanceReference = /^(?:adv|advance)(?:[-/\s]|\d)/i.test(String(referenceName || "").trim());
+  if (looksLikeAdvanceReference && (/receipt/i.test(String(sourceVoucherType || "")) || !sourceVoucherType)) {
+    return "advance";
+  }
+  return "bill";
+}
+
+function toOpenBill(block, ledgerName, evidence = {}) {
   const referenceName = getAttribute(block, "NAME") || getTagText(block, "NAME") || getTagText(block, "BILLREF");
   if (!referenceName) return null;
   const rowLedgerName = billLedgerName(block);
@@ -2935,7 +2935,14 @@ function toOpenBill(block, ledgerName) {
   const pendingAmount = Math.abs(closing ?? 0);
   if (pendingAmount <= 0) return null;
 
-  const type = billReferenceType(block).toLowerCase();
+  const sourceVoucherType = getTagText(block, "VOUCHERTYPENAME") || getTagText(block, "VOUCHERTYPE") || null;
+  const kind = classifyOpenBillReferenceKind({
+    billType: billReferenceType(block),
+    sourceVoucherType,
+    referenceName,
+    knownInvoice: evidence.knownInvoice === true,
+    knownAdvance: evidence.knownAdvance === true,
+  });
   const common = {
     referenceName,
     voucherNumber: getTagText(block, "VOUCHERNUMBER") || referenceName,
@@ -2944,11 +2951,11 @@ function toOpenBill(block, ledgerName) {
     originalAmount: Math.abs(parseTallyAmount(getTagText(block, "OPENINGBALANCE")) ?? pendingAmount),
     settledAmount: null,
     pendingAmount,
-    sourceVoucherType: getTagText(block, "VOUCHERTYPENAME") || getTagText(block, "VOUCHERTYPE") || null,
+    sourceVoucherType,
     status: "open",
   };
 
-  if (type.includes("advance")) {
+  if (kind === "advance") {
     return {
       kind: "advance",
       referenceName,
@@ -3024,6 +3031,8 @@ function salesLedgerFromInvoiceVoucher(voucher, partyLedgerName) {
 function indexInvoiceNarrations(xml, requestedLedgerByKey) {
   const narrationByBill = new Map();
   const invoiceReferencesByLedger = new Map();
+  const invoiceReferenceKeys = new Set();
+  const advanceReferenceKeys = new Set();
   const salesLedgerByBill = new Map();
 
   for (const voucher of extractBlocks(xml, "VOUCHER")) {
@@ -3046,6 +3055,7 @@ function indexInvoiceNarrations(xml, requestedLedgerByKey) {
       const salesLedgerName = salesLedgerFromInvoiceVoucher(voucher, requestedLedgerName);
       for (const billReference of billReferences) {
         const key = openBillNarrationKey(requestedLedgerName, billReference);
+        invoiceReferenceKeys.add(key);
         if (narration) narrationByBill.set(key, narration);
         if (salesLedgerName) salesLedgerByBill.set(key, salesLedgerName);
         const references = invoiceReferencesByLedger.get(requestedLedgerName) || new Set();
@@ -3080,6 +3090,12 @@ function indexInvoiceNarrations(xml, requestedLedgerByKey) {
       let matchedAllocation = false;
 
       for (const allocation of entry.billAllocations) {
+        const allocationKey = openBillNarrationKey(requestedLedgerName, allocation.referenceName);
+        const allocationLooksLikeAdvance =
+          /advance/i.test(String(allocation.billType || "")) ||
+          (/^(?:adv|advance)(?:[-/\s]|\d)/i.test(allocation.referenceName) &&
+            !invoiceReferenceKeys.has(allocationKey));
+        if (allocationLooksLikeAdvance) advanceReferenceKeys.add(allocationKey);
         const invoiceReference = referenceByKey.get(normalizeLooseName(allocation.referenceName));
         if (!invoiceReference) continue;
         const key = openBillNarrationKey(requestedLedgerName, invoiceReference);
@@ -3108,7 +3124,13 @@ function indexInvoiceNarrations(xml, requestedLedgerByKey) {
     }
   }
 
-  return { narrationByBill, receiptEvidenceByBill, salesLedgerByBill };
+  return {
+    narrationByBill,
+    receiptEvidenceByBill,
+    salesLedgerByBill,
+    invoiceReferenceKeys,
+    advanceReferenceKeys,
+  };
 }
 
 async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
@@ -3140,7 +3162,13 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
     dateFrom: "2000-04-01",
     dateTo: "2099-03-31",
   });
-  const { narrationByBill, receiptEvidenceByBill, salesLedgerByBill } = indexInvoiceNarrations(voucherXml, requestedLedgerByKey);
+  const {
+    narrationByBill,
+    receiptEvidenceByBill,
+    salesLedgerByBill,
+    invoiceReferenceKeys,
+    advanceReferenceKeys,
+  } = indexInvoiceNarrations(voucherXml, requestedLedgerByKey);
   const byLedger = Object.fromEntries(ledgerNames.map((ledgerName) => [ledgerName, emptyOpenBillBucket(ledgerName)]));
 
   for (const block of extractBlocks(xml, "BILL")) {
@@ -3148,7 +3176,12 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}) {
     const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(rowLedgerName));
     if (!requestedLedgerName) continue;
 
-    const entry = toOpenBill(block, requestedLedgerName);
+    const referenceName = getAttribute(block, "NAME") || getTagText(block, "NAME") || getTagText(block, "BILLREF");
+    const referenceKey = openBillNarrationKey(requestedLedgerName, referenceName);
+    const entry = toOpenBill(block, requestedLedgerName, {
+      knownInvoice: invoiceReferenceKeys.has(referenceKey),
+      knownAdvance: advanceReferenceKeys.has(referenceKey),
+    });
     if (!entry) continue;
 
     if (entry.kind === "bill") {
@@ -3265,6 +3298,40 @@ function toBankLedgerPayload(master) {
   };
 }
 
+function findBankLedgersFromMasters(ledgers, groups) {
+  const groupParentByName = new Map(
+    groups
+      .filter((group) => group?.name)
+      .map((group) => [normalizeLooseName(group.name), group.parent || null])
+  );
+
+  const descendsFromBankAccounts = (parentName) => {
+    const visited = new Set();
+    let currentName = parentName;
+
+    while (currentName) {
+      const normalized = normalizeLooseName(currentName);
+      if (!normalized || visited.has(normalized)) return false;
+      if (normalized === normalizeLooseName("Bank Accounts")) return true;
+      visited.add(normalized);
+      currentName = groupParentByName.get(normalized) || null;
+    }
+
+    return false;
+  };
+
+  return ledgers.filter((ledger) => {
+    const hasBankIdentity = Boolean(
+      ledger.bankName ||
+      ledger.bankAccountNumber ||
+      ledger.ifscCode ||
+      ledger.branchName ||
+      ledger.accountHolderName
+    );
+    return hasBankIdentity || descendsFromBankAccounts(ledger.parent);
+  });
+}
+
 async function fetchBankLedgersFromTally(config, commandPayload = {}) {
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const companyNames = mergeCompanyNames([
@@ -3278,17 +3345,24 @@ async function fetchBankLedgersFromTally(config, commandPayload = {}) {
   for (const companyName of targets) {
     const key = companyName || "Current company";
     try {
-      const xml = await exportTallyXml(
-        tallyUrl,
-        buildBankLedgersExportXml(companyName),
-        `Bank ledgers for ${key}`
-      );
-      byCompany[key] = parseMasterCollection(xml, "LEDGER")
-        .filter(
-          (master) =>
-            !master.parent ||
-            normalizeLooseName(master.parent) === normalizeLooseName("Bank Accounts")
-        )
+      const [ledgerXml, groupXml] = await Promise.all([
+        exportTallyCollection(tallyUrl, {
+          collectionName: "Autodealer Bank Ledger Discovery",
+          tallyType: "Ledger",
+          fetchFields:
+            "Name,Parent,GUID,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName",
+          companyName,
+        }),
+        exportTallyCollection(tallyUrl, {
+          collectionName: "Autodealer Bank Group Discovery",
+          tallyType: "Group",
+          fetchFields: "Name,Parent,GUID",
+          companyName,
+        }),
+      ]);
+      const ledgers = parseMasterCollection(ledgerXml, "LEDGER");
+      const groups = parseMasterCollection(groupXml, "GROUP");
+      byCompany[key] = findBankLedgersFromMasters(ledgers, groups)
         .map(toBankLedgerPayload);
     } catch (error) {
       errors.push({
@@ -4846,12 +4920,15 @@ export {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_TALLY_URL,
   createBridgeRunner,
+  classifyOpenBillReferenceKind,
   classifyTaxLedgers,
   buildPurchaseVoucherXml,
   deleteConfig,
   disconnectBridge,
   exportTallyCollection,
   fetchAvailableCompanies,
+  fetchBankLedgersFromTally,
+  findBankLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
   normalizeTallyUrl,
   pairBridge,
@@ -4859,6 +4936,7 @@ export {
   purchaseVoucherReadbackComparison,
   readConfig,
   reconcileBankTransactionsInTally,
+  strictBankTransactionCandidates,
   runOnce,
   startBridge,
   testBridge,

@@ -1,9 +1,5 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
-import {
-  suggestBankLedgersForTransactions,
-  type BankLedgerSuggestion,
-} from "@/lib/bank-statement-ledger-matching";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 export const runtime = "nodejs";
@@ -48,24 +44,11 @@ function isSuspenseLedger(value?: string | null) {
   return normalized === "suspense" || normalized === "suspenseac" || normalized === "suspenseaccount";
 }
 
-function serializeTransaction(row: BankTransactionRow, suggestion?: BankLedgerSuggestion) {
-  const strongSuggestedLedger =
-    suggestion?.ledgerName && !isSuspenseLedger(suggestion.ledgerName) && suggestion.confidence >= 0.85
-      ? suggestion.ledgerName
-      : null;
-  const confirmedLedgerName =
-    row.confirmed_ledger_name && !(isSuspenseLedger(row.confirmed_ledger_name) && strongSuggestedLedger)
-      ? row.confirmed_ledger_name
-      : null;
-  const storedSuggestedLedgerName =
-    row.suggested_ledger_name && !(isSuspenseLedger(row.suggested_ledger_name) && strongSuggestedLedger)
-      ? row.suggested_ledger_name
-      : null;
-  const suggestedLedgerName = confirmedLedgerName || strongSuggestedLedger || storedSuggestedLedgerName || suggestion?.ledgerName || null;
-  const suggestionConfidence =
-    suggestedLedgerName === suggestion?.ledgerName
-      ? suggestion.confidence
-      : toNumber(row.suggestion_confidence) ?? suggestion?.confidence ?? null;
+function serializeTransaction(row: BankTransactionRow) {
+  const confirmedLedgerName = row.confirmed_ledger_name || null;
+  const storedSuggestedLedgerName = row.suggested_ledger_name || null;
+  const suggestedLedgerName = confirmedLedgerName || storedSuggestedLedgerName;
+  const suggestionConfidence = toNumber(row.suggestion_confidence);
 
   return {
     id: row.id,
@@ -79,14 +62,16 @@ function serializeTransaction(row: BankTransactionRow, suggestion?: BankLedgerSu
     balanceAmount: row.balance_amount,
     transactionType: row.transaction_type,
     category: row.category,
-    counterpartyName: row.counterparty_name || suggestion?.counterpartyName || null,
+    counterpartyName: row.counterparty_name || null,
     suggestedLedgerName,
     suggestionConfidence,
-    suggestionReason: row.suggestion_reason || suggestion?.reason || null,
-    confirmedLedgerName: confirmedLedgerName || (strongSuggestedLedger ? null : row.confirmed_ledger_name),
-    ledgerMappingSource: row.ledger_mapping_source || suggestion?.mappingSource || null,
+    suggestionReason: row.suggestion_reason || null,
+    confirmedLedgerName,
+    ledgerMappingSource: row.ledger_mapping_source || null,
     tallyStatus: row.tally_status,
-    needsLedgerConfirmation: !suggestedLedgerName || (suggestionConfidence ?? 0) < 0.85,
+    needsLedgerConfirmation:
+      !confirmedLedgerName &&
+      (!suggestedLedgerName || isSuspenseLedger(suggestedLedgerName) || (suggestionConfidence ?? 0) < 0.85),
   };
 }
 
@@ -104,7 +89,6 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const accountId = url.searchParams.get("accountId")?.trim();
     const importId = url.searchParams.get("importId")?.trim();
-    const connectionId = url.searchParams.get("connectionId")?.trim() || null;
     const status = url.searchParams.get("status")?.trim() || "pending";
 
     if (!accountId) {
@@ -147,29 +131,8 @@ export async function GET(request: Request) {
 
     const allRows = (data ?? []) as unknown as BankTransactionRow[];
     const rows = status === "queueable" ? allRows.filter(hasPostingAmount) : allRows;
-    const suggestions = await suggestBankLedgersForTransactions({
-      supabase,
-      ownerUserId: user.id,
-      connectionId,
-      transactions: rows.map((row) => ({
-        accountId,
-        transaction: {
-          transactionDate: row.transaction_date,
-          valueDate: row.value_date,
-          description: row.description,
-          referenceNumber: row.reference_number,
-          debitAmount: toNumber(row.debit_amount),
-          creditAmount: toNumber(row.credit_amount),
-          balanceAmount: toNumber(row.balance_amount),
-          transactionType: row.transaction_type,
-          category: row.category,
-          counterpartyName: row.counterparty_name,
-        },
-      })),
-    });
-
     return jsonWithCors(request, {
-      transactions: rows.map((row, index) => serializeTransaction(row, suggestions[index])),
+      transactions: rows.map((row) => serializeTransaction(row)),
     });
   } catch (error) {
     console.error("Error in GET /api/bank-statements/transactions:", error);

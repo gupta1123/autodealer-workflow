@@ -1,7 +1,6 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
-import { suggestBankLedgersForTransactions } from "@/lib/bank-statement-ledger-matching";
-import { getBankLedgerMatchingModel } from "@/lib/processing/openrouter";
+import { masterParentDescendsFromGroup } from "@/lib/bank-statement-ledger-safety";
 import {
   findBankAccountCandidates,
   maskAccountNumber,
@@ -21,11 +20,13 @@ function normalizeBankAccountNumber(value: unknown) {
   return String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
 }
 
-function isBankLedgerMaster(row: Record<string, unknown>) {
+function isBankLedgerMaster(
+  row: Record<string, unknown>,
+  groups: Array<{ name: string; parent?: string | null }>
+) {
   const raw = readRecord(row.raw_payload);
-  const parentName = String(row.parent_name ?? "").toLowerCase();
   return (
-    /\bbank\s+accounts?\b/.test(parentName) ||
+    masterParentDescendsFromGroup(String(row.parent_name ?? ""), groups, "Bank Accounts") ||
     Boolean(String(raw.bankName ?? raw.bank_name ?? "").trim()) ||
     Boolean(String(raw.bankAccountNumber ?? raw.accountNumber ?? raw.account_number ?? "").trim())
   );
@@ -89,20 +90,41 @@ async function resolveStatementBankLedger(
     };
   }
 
-  const { data, error } = await supabase
-    .from("tally_masters")
-    .select("tally_name, parent_name, raw_payload")
-    .eq("owner_user_id", ownerUserId)
-    .eq("connection_id", connectionId)
-    .eq("master_type", "ledger")
-    .eq("is_active", true)
-    .limit(5000);
-  if (error) throw error;
+  const ledgerRows: Array<Record<string, unknown>> = [];
+  const groupRows: Array<Record<string, unknown>> = [];
+  const pageSize = 1000;
+  for (const [masterType, target] of [
+    ["ledger", ledgerRows],
+    ["group", groupRows],
+  ] as const) {
+    for (let from = 0; from < 20000; from += pageSize) {
+      const { data, error } = await supabase
+        .from("tally_masters")
+        .select("tally_name, parent_name, raw_payload")
+        .eq("owner_user_id", ownerUserId)
+        .eq("connection_id", connectionId)
+        .eq("master_type", masterType)
+        .eq("is_active", true)
+        .order("tally_name", { ascending: true })
+        .range(from, from + pageSize - 1);
+      if (error) throw error;
+      const page = (data ?? []) as Array<Record<string, unknown>>;
+      target.push(...page);
+      if (page.length < pageSize) break;
+      if (from + pageSize >= 20000) {
+        throw new Error(`Tally ${masterType} sync exceeds the supported 20,000-master safety limit.`);
+      }
+    }
+  }
+  const groupIdentities = groupRows.map((group) => ({
+    name: String(group.tally_name ?? ""),
+    parent: group.parent_name ? String(group.parent_name) : null,
+  }));
 
   const exactLedgerNames = Array.from(
     new Set(
-      ((data ?? []) as Array<Record<string, unknown>>)
-        .filter(isBankLedgerMaster)
+      ledgerRows
+        .filter((ledger) => isBankLedgerMaster(ledger, groupIdentities))
         .filter((ledger) => bankLedgerAccountNumber(ledger) === normalizedAccountNumber)
         .map((ledger) => String(ledger.tally_name ?? "").trim())
         .filter(Boolean)
@@ -185,26 +207,12 @@ function serializePreviewTransaction(row: Record<string, unknown>) {
           : null,
     suggestionReason: row.suggestion_reason ? String(row.suggestion_reason) : null,
     confirmedLedgerName: row.confirmed_ledger_name ? String(row.confirmed_ledger_name) : null,
+    rawPayload: readRecord(row.raw_payload),
   };
 }
 
 function isPreviewTransactionArray(value: unknown) {
   return Array.isArray(value) ? (value as Array<Record<string, unknown>>) : [];
-}
-
-function toNumber(value: unknown) {
-  const parsed = Number(String(value ?? "").replace(/,/g, ""));
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function hasAiLedgerRecommendation(row: Record<string, unknown>) {
-  const rawPayload = readRecord(row.raw_payload);
-  return Boolean(readRecord(rawPayload.aiLedgerRecommendation).model);
-}
-
-function readPositiveInteger(value: string | null, fallback: number) {
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function readConnectionIdFromMeta(processingMeta: Record<string, unknown>) {
@@ -215,86 +223,6 @@ function readConnectionIdFromMeta(processingMeta: Record<string, unknown>) {
     : typeof analysis.connectionId === "string"
       ? analysis.connectionId
       : null;
-}
-
-async function enrichPreviewRowsWithAiSuggestions(params: {
-  supabase: ReturnType<typeof createSupabaseAdminClient>;
-  ownerUserId: string;
-  connectionId: string | null;
-  importId: string;
-  rows: Array<Record<string, unknown>>;
-}) {
-  if (!params.connectionId || params.rows.length === 0 || params.rows.every(hasAiLedgerRecommendation)) {
-    return params.rows;
-  }
-
-  const rowsToEnrich = params.rows.filter((row) => !hasAiLedgerRecommendation(row));
-  const suggestions = await suggestBankLedgersForTransactions({
-    supabase: params.supabase,
-    ownerUserId: params.ownerUserId,
-    connectionId: params.connectionId,
-    transactions: rowsToEnrich.map((row) => ({
-      accountId: String(row.bank_account_id ?? ""),
-      transaction: {
-        transactionDate: row.transaction_date ? String(row.transaction_date) : "",
-        valueDate: row.value_date ? String(row.value_date) : null,
-        description: String(row.description ?? ""),
-        referenceNumber: row.reference_number ? String(row.reference_number) : null,
-        debitAmount: toNumber(row.debit_amount),
-        creditAmount: toNumber(row.credit_amount),
-        balanceAmount: toNumber(row.balance_amount),
-        transactionType: row.transaction_type ? String(row.transaction_type) : undefined,
-        category: row.category ? String(row.category) : undefined,
-        counterpartyName: row.counterparty_name ? String(row.counterparty_name) : null,
-      },
-    })),
-  });
-  const suggestionByRowId = new Map(
-    rowsToEnrich.map((row, index) => [String(row.id), suggestions[index]])
-  );
-
-  const enrichedRows = await Promise.all(
-    params.rows.map(async (row) => {
-      if (hasAiLedgerRecommendation(row)) return row;
-
-      const suggestion = suggestionByRowId.get(String(row.id));
-      if (!suggestion) return row;
-      const rawPayload = readRecord(row.raw_payload);
-      const aiLedgerRecommendation = {
-        matchType: suggestion.matchType ?? (suggestion.ledgerName ? "direct_match" : "suspense"),
-        action: suggestion.ledgerName ? "use_existing_ledger" : "use_suspense",
-        ledgerName: suggestion.ledgerName,
-        candidateLedgerNames: suggestion.candidateLedgerNames ?? [],
-        confidence: suggestion.confidence,
-        reason: suggestion.reason,
-        model: getBankLedgerMatchingModel(),
-        source: "import_preview_api",
-      };
-      const update = {
-        suggested_ledger_name: suggestion.ledgerName,
-        suggestion_confidence: suggestion.confidence,
-        suggestion_reason: suggestion.reason,
-        raw_payload: {
-          ...rawPayload,
-          aiLedgerRecommendation,
-        },
-      };
-
-      await params.supabase
-        .from("bank_statement_import_preview_transactions")
-        .update(update)
-        .eq("id", row.id)
-        .eq("owner_user_id", params.ownerUserId)
-        .eq("import_id", params.importId);
-
-      return {
-        ...row,
-        ...update,
-      };
-    })
-  );
-
-  return enrichedRows;
 }
 
 export function OPTIONS(request: Request) {
@@ -312,15 +240,13 @@ export async function GET(
     }
 
     const { id } = await context.params;
-    const searchParams = new URL(request.url).searchParams;
-    const includeTransactions = searchParams.get("includeTransactions") !== "false";
-    const transactionsPage = readPositiveInteger(searchParams.get("transactionsPage"), 1);
+    const requestUrl = new URL(request.url);
+    const includeTransactions = requestUrl.searchParams.get("includeTransactions") !== "false";
+    const transactionsPage = Math.max(1, Number(requestUrl.searchParams.get("transactionsPage") ?? 1) || 1);
     const transactionsPageSize = Math.min(
       500,
-      readPositiveInteger(searchParams.get("transactionsPageSize"), 500)
+      Math.max(1, Number(requestUrl.searchParams.get("transactionsPageSize") ?? 500) || 500)
     );
-    const transactionsFrom = (transactionsPage - 1) * transactionsPageSize;
-    const transactionsTo = transactionsFrom + transactionsPageSize - 1;
     const supabase = createSupabaseAdminClient();
     const { data: importRow, error: importError } = await supabase
       .from("bank_statement_imports")
@@ -350,45 +276,34 @@ export async function GET(
     const previewMeta = readRecord(processingMeta.preview);
     const previewAccount = readRecord(previewMeta.account);
     const storedPreviewTransactions = isPreviewTransactionArray(previewMeta.transactions);
-    let previewRows: Array<Record<string, unknown>> = [];
-    let previewRowsTotal = storedPreviewTransactions.length;
+    let tablePreviewTransactions: Array<Record<string, unknown>> = [];
+    let tablePreviewTransactionCount = Number(processingMeta.previewTransactionCount ?? 0);
     if (includeTransactions) {
-      const { data, error, count } = await supabase
+      const rangeStart = (transactionsPage - 1) * transactionsPageSize;
+      const { data: previewRows, error: previewError, count } = await supabase
         .from("bank_statement_import_preview_transactions")
         .select("*", { count: "exact" })
         .eq("import_id", id)
         .eq("owner_user_id", user.id)
         .order("row_index", { ascending: true })
-        .range(transactionsFrom, transactionsTo);
+        .range(rangeStart, rangeStart + transactionsPageSize - 1);
 
-      if (error) throw error;
-      previewRows = (data ?? []) as Array<Record<string, unknown>>;
-      previewRowsTotal = count ?? previewRows.length;
-    } else {
-      const { count, error } = await supabase
-        .from("bank_statement_import_preview_transactions")
-        .select("id", { count: "exact", head: true })
-        .eq("import_id", id)
-        .eq("owner_user_id", user.id);
-
-      if (error) throw error;
-      previewRowsTotal = count ?? previewRowsTotal;
+      if (previewError) throw previewError;
+      tablePreviewTransactions = (previewRows ?? []) as Array<Record<string, unknown>>;
+      tablePreviewTransactionCount = count ?? tablePreviewTransactions.length;
     }
-
-    const tablePreviewTransactions = includeTransactions
-      ? await enrichPreviewRowsWithAiSuggestions({
-          supabase,
-          ownerUserId: user.id,
-          connectionId: readConnectionIdFromMeta(processingMeta),
-          importId: id,
-          rows: previewRows,
-        })
-      : [];
-    const transactions = includeTransactions
-      ? tablePreviewTransactions.length > 0
+    const transactions =
+      tablePreviewTransactions.length > 0
         ? tablePreviewTransactions.map((row) => serializePreviewTransaction(row))
-        : storedPreviewTransactions.slice(transactionsFrom, transactionsTo + 1)
-      : [];
+        : includeTransactions
+          ? storedPreviewTransactions
+          : [];
+    const transactionsTotal =
+      tablePreviewTransactionCount > 0
+        ? tablePreviewTransactionCount
+        : includeTransactions
+          ? storedPreviewTransactions.length
+          : Number(processingMeta.previewTransactionCount ?? 0);
     const analysis = readRecord(processingMeta.analysis);
     const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
     const jobStatus = typeof jobRow?.status === "string" ? jobRow.status : "";
@@ -419,7 +334,7 @@ export async function GET(
       effectiveImportStatus === "manual_review_required" ||
       effectiveImportStatus === "failed" ||
       Boolean(previewMeta.requiresManualExtraction) ||
-      (!processing && previewRowsTotal === 0);
+      (!processing && transactionsTotal === 0);
     const account = {
       bankName:
         typeof previewAccount.bankName === "string"
@@ -454,14 +369,21 @@ export async function GET(
           ifscCode: account.ifscCode,
         })
       : [];
-    const bankLedgerResolution = await resolveStatementBankLedger(
-      supabase,
-      user.id,
-      readConnectionIdFromMeta(processingMeta),
-      account.accountNumber,
-      candidates,
-      account.tallyLedgerName
-    );
+    const bankLedgerResolution = processing
+      ? {
+          ledgerName: account.tallyLedgerName,
+          source: "analysis_processing",
+          requiresSelection: !account.tallyLedgerName,
+          verified: false,
+        }
+      : await resolveStatementBankLedger(
+          supabase,
+          user.id,
+          readConnectionIdFromMeta(processingMeta),
+          account.accountNumber,
+          candidates,
+          account.tallyLedgerName
+        );
     account.tallyLedgerName = bankLedgerResolution.ledgerName;
 
     return jsonWithCors(request, {
@@ -470,9 +392,9 @@ export async function GET(
       candidates: Array.isArray(previewMeta.candidates) ? candidates : candidates.map(serializeAccount),
       bankLedgerResolution,
       transactions,
+      transactionsTotal,
       transactionsPage,
       transactionsPageSize,
-      transactionsTotal: previewRowsTotal,
       requiresManualExtraction,
       extractionSource: previewMeta.extractionSource ?? processingMeta.extractionSource ?? null,
       extractionError: previewMeta.extractionError ?? processingMeta.extractionError ?? null,

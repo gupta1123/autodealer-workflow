@@ -5,14 +5,15 @@ import {
   normalizeName,
   normalizeNarrationPattern,
   type ParsedBankTransaction,
-} from "@/lib/bank-statements";
+} from "./bank-statements.ts";
 import {
   callOpenRouter,
   getBankLedgerMatchingMaxTokens,
   getBankLedgerMatchingModel,
   getBankLedgerMatchingTimeoutMs,
-} from "@/lib/processing/openrouter";
-import { normalizeMasterKey, type TallyMappingRow, type TallyMasterRow } from "@/lib/tally/masters";
+} from "./processing/openrouter.ts";
+import { isSuspenseLedgerIdentity } from "./bank-statement-ledger-safety.ts";
+import { normalizeMasterKey, type TallyMappingRow, type TallyMasterRow } from "./tally/masters.ts";
 
 export type BankLedgerSuggestion = {
   counterpartyName: string | null;
@@ -54,7 +55,7 @@ const BANK_LEDGER_AI_BATCH_CONCURRENCY = Math.min(
 );
 
 const BANK_LEDGER_MATCHING_SYSTEM_PROMPT = `You match Indian bank statement transactions to synced Tally ledgers.
-Your task is to recommend the correct existing Tally ledger for each bank transaction.
+Your task is to identify an existing Tally ledger only when the transaction evidence uniquely identifies it.
 This is ledger assignment only. Do not attempt invoice matching, voucher matching, invoice settlement, split allocation, or full bank reconciliation.
 Return only valid JSON. Do not return markdown, explanations outside JSON, or code fences.
 
@@ -64,7 +65,7 @@ The tallyLedgers list is shared by every transaction in the request.
 When a transaction includes allowedLedgerNames, that transaction may choose and may return candidates only from its own allowedLedgerNames list.
 Never invent, modify, shorten, merge, or create a ledger.
 Never create a new party, expense, tax, bank, transfer, or suspense ledger.
-If no existing ledger is clearly correct, use suspense.
+If no existing ledger is uniquely supported, use suspense.
 Every transaction must produce exactly one result using its original index.
 
 Output format:
@@ -85,21 +86,29 @@ Output format:
 Allowed matchType values: direct_match, close_match, suspense.
 
 Direct match:
-Use direct_match only when exactly one existing ledger is clearly the best match.
+Use direct_match only when the transaction evidence uniquely identifies exactly one existing ledger. The closest or highest-scoring name is not enough when another ledger remains plausible.
 For direct_match, action must be "use_existing_ledger", ledgerName must be one exact name from tallyLedgers, candidateLedgerNames must be [], and confidence must be at least 0.90.
 
 Close match:
 Use close_match when two or more existing ledgers are genuinely plausible and no single ledger can be selected safely.
-For close_match, action must be "use_suspense", ledgerName must be null, candidateLedgerNames must contain at least two exact competing ledger names from tallyLedgers, and confidence must be 0.0.
+For close_match, action must be "use_suspense", ledgerName must be null, candidateLedgerNames must contain at least two exact competing ledger names from tallyLedgers ordered from most to least plausible, and confidence must be 0.0.
+close_match still means the selected posting ledger is Suspense. candidateLedgerNames are advisory choices for a human reviewer only. Never preselect the first candidate and never treat candidate ordering as a ledger decision.
 
 Suspense:
 Use suspense when there is no clear existing ledger, the narration is too generic, or matching would require guessing.
 For suspense, action must be "use_suspense", ledgerName must be null, candidateLedgerNames must be [], and confidence must be 0.0.
 
 Core rule:
-A shortened, OCR-damaged, misspelled, or incomplete party name can still be a direct match when it uniquely identifies one existing ledger.
+A shortened, OCR-damaged, misspelled, or incomplete party name can still be a direct match only when it uniquely identifies one existing ledger after considering every plausible collision.
 Do not call something a close match only because the bank narration does not exactly equal the ledger name.
 Use close_match only when there is a real collision.
+If the narration contains only a shared party root and multiple ledgers extend or vary that root, return close_match and keep the posting ledger in Suspense, even when one candidate has a somewhat stronger textual similarity.
+
+Exact complete-name precedence:
+After removing bank-system noise and normalizing only case, spacing, and punctuation, if the narrated party identity exactly equals one complete allowed ledger name, treat that ledger as a direct_match.
+A merely misspelled, phonetic, OCR, singular/plural, or legal-suffix variant of the same complete name does not veto this exact complete-name match.
+This precedence does not apply when another ledger begins with the same exact complete token sequence and adds a meaningful product, division, location, service, supplier, trader, or other identity descriptor. That is a shorter-name/extended-name collision and must remain close_match.
+It also does not override a genuine conflict between the raw description and a derived counterpartyName.
 
 Evidence hierarchy and derived-field safety:
 The raw description is the primary evidence. counterpartyName, category, and transactionType are machine-derived hints that may have been extracted from that same description.
@@ -115,18 +124,26 @@ Derived-field conflict examples:
 Mandatory collision veto before every direct_match:
 Before returning direct_match, scan every ledger allowed for that transaction for a plausible collision.
 A collision exists when two or more ledgers share the narrated party root; one ledger name is the narrated root while another extends it with a meaningful descriptor, product, division, or location; or two ledger names are plausible spelling, OCR, phonetic, singular/plural, or legal-suffix variants.
-An exact textual match does not override a spelling/OCR-twin collision or a conflict with counterpartyName. However, a narration that supplies one complete ledger identity, including its distinctive descriptors or its stated terminal legal suffix, may directly match that ledger when the only alternative merely extends a shorter root into a different product, division, or entity name.
+Apply the exact complete-name precedence before treating spelling, OCR, phonetic, singular/plural, or legal-suffix variants as collisions.
+An exact complete-name match overrides those same-length variants, but it never overrides a conflict with counterpartyName or a shorter-name/extended-name collision.
+
+Shorter exact-name collision — hard veto:
+If the narrated party name exactly equals one allowed ledger, but another allowed ledger begins with that same complete party identity and adds further party, business, product, division, location, service, supplier, trader, or legal-entity words, the narration does not uniquely identify the shorter ledger.
+In this situation, return close_match, keep ledgerName null, use action use_suspense, set confidence to 0.0, and include the exact shorter ledger plus every genuinely plausible extended ledger in candidateLedgerNames.
+This rule applies even when the shorter ledger is a character-for-character match and even when the shorter ledger has a more plausible group or transaction direction.
+The longer ledger may be a direct_match only when the raw narration itself contains its additional distinguishing words and no spelling, entity, or further-extension collision remains.
+For example, with ledgers Orchid Foundry and Orchid Foundry Supplies, narration ORCHID FOUNDRY must return close_match with both candidates; narration ORCHID FOUNDRY SUPPLIES may directly match the longer ledger only if no other collision exists.
+
 Do not use ledger group, customer/supplier role, debit/credit direction, amount, or category to choose between colliding names.
-When a real collision exists, return close_match and include every plausible colliding ledger, not only the closest one.
+When a real collision exists, return close_match and include every plausible colliding ledger, not only the closest one. A candidate list is never permission to select a candidate.
 Use token boundaries when identifying roots: OM may match ledgers beginning with the separate token OM, but OM must not match OMKAR merely because the letters are a prefix.
 
 Collision examples:
-- MAHAVIR STEEL TRADERS collides with Mahavir Steel Traders and Mahaveer Steel Traders, so return close_match even though one spelling is exact.
 - JSW STEEL collides with JSW Steel Limited and JSW Steel Coated Products Limited, but the complete name JSW STEEL LIMITED directly matches JSW Steel Limited.
 - TATA STEEL collides with Tata Steel Limited and Tata Steel Downstream Products Limited, but TATA STEEL DOWNSTREAM PRODUCTS LIMITED directly matches the downstream-products ledger.
-- BHARAT STEEL collides with Bharat Steels, Bharat Steel Corporation, and Bharath Steel Suppliers.
-- SHAKTI alone collides with every ledger whose separate first token is Shakti; group and payment direction cannot select one.
 - BALAJI alone collides with every ledger containing the Balaji party root; BALAJI STEEL also collides with ledgers that extend that root with Traders, Transport, or another meaningful descriptor.
+- With ledgers Zenith Metal Corporation and Zenit Metal Corporation, narration ZENITH METAL CORPORATION directly matches the exact complete ledger; the phonetic spelling variant does not veto it.
+- With ledgers Pioneer Alloy and Pioneer Alloy Scrap, narration PIONEER ALLOY must return close_match with both candidates because the second ledger extends the exact narrated identity with a meaningful product word.
 
 Remove bank-system noise before comparing names:
 Ignore NEFT, RTGS, IMPS, UPI, UPIREF, NACH, ACH, ECS, CMS, CR, DR, transfer, fund transfer, payment, receipt, UTR, RRN, TXN, REF, beneficiary, to, from, by, account words, IFSC, bank, branch, mobile/account/reference numbers, M/S, MS, M S, dates, and similar bank references.
@@ -173,48 +190,22 @@ Reversal and cheque-return narrations do not prove which original party ledger s
 Cases that must go to suspense:
 No identifiable party/category; only UTR/RRN/account/bank code/reference; multiple possible expense categories; merchant name does not reveal purpose; self-transfer/reversal without explicit matching ledger; best possible match below 0.90; selecting requires guessing; transaction may need split allocation or voucher-level reconciliation.
 
+Reference and memory safety:
+referenceNumber is normally a bank UTR/RRN/reference and does not identify a Tally ledger by itself. A visible invoice or bill reference may support a direct match only when the supplied evidence explicitly connects that reference to one ledger; do not invent that connection. Saved narration mappings are validated before this AI request and are therefore not represented by a guessed AI match.
+
 Final decision rules:
-First verify that the raw description contains identity or purpose evidence. Then run the mandatory collision veto. Use direct_match only when exactly one ledger remains clearly possible after both checks.
+First verify that the raw description contains identity or purpose evidence. Then check for an exact complete-name match, apply the exact complete-name precedence and its exceptions, and finally run the remaining collision veto. Use direct_match only when exactly one ledger remains possible after these checks; "more likely than the others" is not unique identification.
 A unique shortened party name is a direct match when no competing ledger shares that root.
+A character-for-character match to a shorter ledger is still close_match when another ledger extends that complete name with additional identity words.
+A character-for-character match to one complete ledger is direct_match when the only alternatives are spelling, phonetic, OCR, singular/plural, or legal-suffix variants of that same complete name and no extension or derived-field conflict exists.
 A typo, OCR issue, joined word, missing space, or phonetic variation can still be a direct match when one ledger clearly fits.
 Use close_match only when two or more existing ledgers are genuinely plausible.
 Use suspense when no clear ledger exists or matching requires guessing.
 An exact derived counterpartyName, a preferred ledger group, or a plausible transaction direction never raises an ambiguous result to direct_match.
 Never select a ledger when confidence is below 0.90.
 Never invent, alter, or create a ledger.
+When returning close_match, remember that its posting selection remains Suspense until a human explicitly chooses one candidate.
 Never guess between similar ledgers.`;
-
-function categoryLedgerCandidates(category?: string | null, description?: string | null) {
-  const text = `${category ?? ""} ${description ?? ""}`.toLowerCase();
-  if (/\batm\b|\bcash\s*withdrawal\b|\bcash\b/.test(text)) return ["Cash", "Cash in Hand", "Cash-in-Hand"];
-  if (/\binterest\b/.test(text)) return ["Interest Income", "Interest Received"];
-  if (/\bbank[_\s-]*charges\b|\bcharge|charges|fee\b/.test(text)) {
-    if (/\bgst\b/.test(text)) return ["Bank Charges GST", "Bank Charges", "Duties & Taxes"];
-    return ["Bank Charges", "Bank Charges GST"];
-  }
-  if (/\btax|tds|gst\b/.test(text)) return ["Duties & Taxes", "GST Payable", "TDS Payable"];
-  if (/\bsalary|wages\b/.test(text)) return ["Salary Payable", "Salary"];
-  return [];
-}
-
-function findLedgerByName(ledgers: TallyMasterRow[], candidates: string[]) {
-  for (const candidate of candidates) {
-    const normalizedCandidate = normalizeName(candidate);
-    const exact = ledgers.find((ledger) => normalizeName(ledger.tally_name) === normalizedCandidate);
-    if (exact) return exact.tally_name;
-  }
-
-  for (const candidate of candidates) {
-    const normalizedCandidate = normalizeName(candidate);
-    const partial = ledgers.find((ledger) => {
-      const normalizedLedger = normalizeName(ledger.tally_name);
-      return normalizedLedger.includes(normalizedCandidate) || normalizedCandidate.includes(normalizedLedger);
-    });
-    if (partial) return partial.tally_name;
-  }
-
-  return null;
-}
 
 function ledgerNameTokens(value?: string | null) {
   return normalizeName(value)
@@ -329,11 +320,6 @@ function findCloseLedgerMatches(ledgers: TallyMasterRow[], candidateName?: strin
   }
 
   return matches.sort((left, right) => right.score - left.score || left.ledgerName.localeCompare(right.ledgerName));
-}
-
-function findUniqueCloseLedgerByName(ledgers: TallyMasterRow[], candidateName?: string | null) {
-  const matches = findCloseLedgerMatches(ledgers, candidateName);
-  return matches.length === 1 ? matches[0] : null;
 }
 
 function safeJsonParse<T>(raw: string, fallback: T): T {
@@ -522,6 +508,47 @@ function sourceKeyForNarration(accountId: string, description: string) {
   return `${accountId}:${normalizeNarrationPattern(description)}`.slice(0, 240);
 }
 
+function validateSavedNarrationLedger(
+  ledgers: TallyMasterRow[],
+  mappedLedger: TallyMasterRow | null | undefined,
+  item: BankLedgerSuggestionTransaction
+) {
+  if (!mappedLedger || !item.accountId.trim() || !normalizeNarrationPattern(item.transaction.description)) {
+    return null;
+  }
+  if (isSuspenseLedgerIdentity({ name: mappedLedger.tally_name, parent: mappedLedger.parent_name })) {
+    return null;
+  }
+
+  // Saved narration memory is deliberately keyed and validated from raw bank
+  // narration. A derived counterparty field is not independent evidence.
+  const rawCounterparty = extractCounterpartyName(item.transaction.description);
+  if (!rawCounterparty) return null;
+  const rawMatches = findCloseLedgerMatches(ledgers, rawCounterparty);
+  if (
+    rawMatches.length !== 1 ||
+    normalizeName(rawMatches[0].ledgerName) !== normalizeName(mappedLedger.tally_name)
+  ) {
+    return null;
+  }
+
+  // A conflict between the raw narration identity and a supplied derived hint
+  // invalidates memory and sends the transaction through normal matching.
+  const derivedCounterparty = String(item.transaction.counterpartyName ?? "").trim();
+  if (derivedCounterparty && normalizeName(derivedCounterparty) !== normalizeName(rawCounterparty)) {
+    const derivedMatches = findCloseLedgerMatches(ledgers, derivedCounterparty);
+    if (
+      derivedMatches.some(
+        (match) => normalizeName(match.ledgerName) !== normalizeName(mappedLedger.tally_name)
+      )
+    ) {
+      return null;
+    }
+  }
+
+  return mappedLedger;
+}
+
 export function buildBankAccountLedgerSourceKey(accountId: string) {
   return `bank_account:${accountId}`.slice(0, 240);
 }
@@ -530,56 +557,15 @@ export function buildBankNarrationLedgerSourceKey(accountId: string, description
   return sourceKeyForNarration(accountId, description);
 }
 
-function deterministicLedgerSuggestion(
-  ledgers: TallyMasterRow[],
-  transaction: MatchableTransaction,
-  counterpartyName: string | null
-): BankLedgerSuggestion {
-  const categoryCandidates = categoryLedgerCandidates(transaction.category, transaction.description);
-  const categoryLedgerName = findLedgerByName(ledgers, categoryCandidates);
-  if (categoryCandidates.length > 0) {
-    return {
-      counterpartyName,
-      ledgerName: categoryLedgerName,
-      confidence: categoryLedgerName ? 0.9 : 0.4,
-      reason: categoryLedgerName
-        ? "Matched standard bank transaction category"
-        : "Category detected, but no matching Tally ledger was synced",
-      mappingSource: categoryLedgerName ? "category" : "none",
-    };
-  }
-
-  if (counterpartyName) {
-    const normalizedCounterparty = normalizeName(counterpartyName);
-    const matchedLedger = ledgers.find((ledger) => normalizeName(ledger.tally_name) === normalizedCounterparty);
-    if (matchedLedger) {
-      return {
-        counterpartyName,
-        ledgerName: matchedLedger.tally_name,
-        confidence: 0.88,
-        reason: "Counterparty matched synced Tally ledger name",
-        mappingSource: "ledger_name",
-      };
-    }
-
-    const closeLedger = findUniqueCloseLedgerByName(ledgers, counterpartyName);
-    if (closeLedger) {
-      return {
-        counterpartyName,
-        ledgerName: closeLedger.ledgerName,
-        confidence: Math.min(0.95, Math.max(0.86, closeLedger.score)),
-        reason: "One close Tally ledger match found",
-        mappingSource: "close_match",
-      };
-    }
-  }
-
+function deterministicLedgerSuggestion(counterpartyName: string | null): BankLedgerSuggestion {
   return {
     counterpartyName,
     ledgerName: null,
     confidence: 0,
-    reason: null,
+    reason: "AI ledger matching was unavailable, so the row was kept in Suspense.",
     mappingSource: "none",
+    matchType: "suspense",
+    candidateLedgerNames: [],
   };
 }
 
@@ -589,6 +575,34 @@ function chunkValues<T>(values: T[], size: number) {
     chunks.push(values.slice(index, index + size));
   }
   return chunks;
+}
+
+async function fetchAllActiveTallyLedgers(input: {
+  supabase: SupabaseClient;
+  ownerUserId: string;
+  connectionId?: string | null;
+}) {
+  if (!input.connectionId) return [] as TallyMasterRow[];
+
+  const ledgers: TallyMasterRow[] = [];
+  const pageSize = 1000;
+  for (let from = 0; from < 20000; from += pageSize) {
+    const { data, error } = await input.supabase
+      .from("tally_masters")
+      .select("*")
+      .eq("owner_user_id", input.ownerUserId)
+      .eq("connection_id", input.connectionId)
+      .eq("master_type", "ledger")
+      .eq("is_active", true)
+      .order("tally_name", { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (error) throw error;
+    const page = (data ?? []) as unknown as TallyMasterRow[];
+    ledgers.push(...page);
+    if (page.length < pageSize) return ledgers;
+  }
+
+  throw new Error("Tally ledger sync exceeds the supported 20,000-ledger safety limit.");
 }
 
 export async function suggestBankLedgersForTransactions(input: {
@@ -607,9 +621,22 @@ export async function suggestBankLedgersForTransactions(input: {
     sourceKey: sourceKeyForNarration(item.accountId, item.transaction.description),
   }));
   const suggestions: Array<BankLedgerSuggestion | undefined> = input.transactions.map(() => undefined);
+  const ledgers = await fetchAllActiveTallyLedgers(input);
+  const activeLedgerByName = new Map(
+    ledgers.map((ledger) => [normalizeName(ledger.tally_name), ledger])
+  );
 
   if (input.connectionId) {
-    const sourceKeys = Array.from(new Set(preparedTransactions.map((item) => item.sourceKey)));
+    const sourceKeys = Array.from(
+      new Set(
+        preparedTransactions
+          .filter(
+            (item) =>
+              item.accountId.trim() && normalizeNarrationPattern(item.transaction.description)
+          )
+          .map((item) => item.sourceKey)
+      )
+    );
     const mappingChunks = await Promise.all(
       chunkValues(sourceKeys, 40).map(async (sourceKeyChunk) => {
         const { data, error } = await input.supabase
@@ -634,13 +661,23 @@ export async function suggestBankLedgersForTransactions(input: {
     }
     for (const item of preparedTransactions) {
       const savedMapping = savedMappingBySourceKey.get(item.sourceKey);
-      if (savedMapping?.target_master_name) {
+      const activeMappedLedger = savedMapping?.target_master_name
+        ? activeLedgerByName.get(normalizeName(savedMapping.target_master_name))
+        : null;
+      const validatedMappedLedger = validateSavedNarrationLedger(
+        ledgers,
+        activeMappedLedger,
+        item
+      );
+      if (validatedMappedLedger) {
         suggestions[item.index] = {
           counterpartyName: item.counterpartyName,
-          ledgerName: savedMapping.target_master_name,
+          ledgerName: validatedMappedLedger.tally_name,
           confidence: 0.99,
-          reason: "Saved narration mapping",
+          reason: "Saved narration mapping validated against the active Tally ledger list",
           mappingSource: "saved_narration",
+          matchType: "direct_match",
+          candidateLedgerNames: [],
         };
       }
     }
@@ -651,54 +688,54 @@ export async function suggestBankLedgersForTransactions(input: {
     return suggestions as BankLedgerSuggestion[];
   }
 
-  const { data: ledgerRows, error: ledgerError } = input.connectionId
-    ? await input.supabase
-        .from("tally_masters")
-        .select("*")
-        .eq("owner_user_id", input.ownerUserId)
-        .eq("connection_id", input.connectionId)
-        .eq("master_type", "ledger")
-        .eq("is_active", true)
-        .limit(5000)
-    : { data: [], error: null };
-
-  if (ledgerError) throw ledgerError;
-
-  const ledgers = (ledgerRows ?? []) as unknown as TallyMasterRow[];
   if (ledgers.length > 0) {
     const chunks = chunkValues(unresolvedTransactions, BANK_LEDGER_AI_BATCH_SIZE);
     let nextChunkIndex = 0;
+    const matchChunkWithRecovery = async (chunk: typeof unresolvedTransactions): Promise<void> => {
+      try {
+        const aiMatches = await aiMatchLedgersForTransactions({
+          ledgers,
+          transactions: chunk.map((item) => ({
+            transaction: item.transaction,
+            counterpartyName: item.counterpartyName,
+          })),
+        });
+        chunk.forEach((item, index) => {
+          const aiLedger = aiMatches[index];
+          if (!aiLedger) return;
+          suggestions[item.index] = {
+            counterpartyName: item.counterpartyName,
+            ledgerName: aiLedger.ledgerName,
+            confidence: aiLedger.confidence,
+            reason: aiLedger.reason,
+            // A valid AI suspense/close-match decision is still a completed
+            // AI result even though it deliberately has no selected ledger.
+            mappingSource: "ai_match",
+            matchType: aiLedger.matchType,
+            candidateLedgerNames: aiLedger.candidateLedgerNames,
+          };
+        });
+      } catch (error) {
+        if (chunk.length === 1) {
+          console.warn("AI ledger match failed for one transaction; keeping it retryable in Suspense:", error);
+          return;
+        }
+
+        console.warn(
+          `AI ledger batch match failed for ${chunk.length} transaction(s); retrying with smaller batches:`,
+          error
+        );
+        const midpoint = Math.ceil(chunk.length / 2);
+        await matchChunkWithRecovery(chunk.slice(0, midpoint));
+        await matchChunkWithRecovery(chunk.slice(midpoint));
+      }
+    };
+
     const runWorker = async () => {
       while (nextChunkIndex < chunks.length) {
         const chunk = chunks[nextChunkIndex];
         nextChunkIndex += 1;
-        try {
-          const aiMatches = await aiMatchLedgersForTransactions({
-            ledgers,
-            transactions: chunk.map((item) => ({
-              transaction: item.transaction,
-              counterpartyName: item.counterpartyName,
-            })),
-          });
-          chunk.forEach((item, index) => {
-            const aiLedger = aiMatches[index];
-            if (!aiLedger) return;
-            suggestions[item.index] = {
-              counterpartyName: item.counterpartyName,
-              ledgerName: aiLedger.ledgerName,
-              confidence: aiLedger.confidence,
-              reason: aiLedger.reason,
-              mappingSource: aiLedger.ledgerName ? "ai_match" : "none",
-              matchType: aiLedger.matchType,
-              candidateLedgerNames: aiLedger.candidateLedgerNames,
-            };
-          });
-        } catch (error) {
-          console.warn(
-            `AI ledger batch match failed for ${chunk.length} transaction(s); using deterministic fallbacks:`,
-            error
-          );
-        }
+        await matchChunkWithRecovery(chunk);
       }
     };
 
@@ -712,11 +749,7 @@ export async function suggestBankLedgersForTransactions(input: {
 
   for (const item of unresolvedTransactions) {
     if (!suggestions[item.index]) {
-      suggestions[item.index] = deterministicLedgerSuggestion(
-        ledgers,
-        item.transaction,
-        item.counterpartyName
-      );
+      suggestions[item.index] = deterministicLedgerSuggestion(item.counterpartyName);
     }
   }
 

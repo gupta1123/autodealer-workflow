@@ -1184,8 +1184,8 @@ export default function SettingsPage() {
                         },
                         {
                           key: "gstTdsEnabled" as const,
-                          label: "GST TDS",
-                          description: "Posts confirmed CGST/SGST or IGST TDS as separate deductions in Tally. Enable only if this business is a notified GST deductor.",
+                          label: "GST TDS, including metal scrap",
+                          description: "For qualifying registered-party MS Scrap purchases from 10 October 2024, automatically withholds 1% CGST + 1% SGST or 2% IGST on the taxable scrap value above the contract threshold. Other GST TDS remains invoice-confirmed.",
                         },
                       ].map((rule) => {
                         const enabled = purchaseAccountingSettings[rule.key];

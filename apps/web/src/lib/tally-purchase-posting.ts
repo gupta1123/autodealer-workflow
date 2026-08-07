@@ -192,6 +192,10 @@ export type TallyPostingResponse = {
     cgstTdsAmount: string;
     sgstTdsAmount: string;
     igstTdsAmount: string;
+    gstTdsBasisAmount: string;
+    gstTdsRate: string;
+    gstTdsAutomatic: boolean;
+    scrapGstTdsEligible: boolean;
     totalWithholdingAmount: string;
     tcsAmount: string;
     roundOffAmount: string;
