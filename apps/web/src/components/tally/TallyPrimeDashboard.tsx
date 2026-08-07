@@ -380,32 +380,42 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       const payload = (await response.json()) as ConnectionsResponse;
       const nextConnections = payload.connections ?? [];
       setConnections(nextConnections);
-      setSelectedId((current) => {
-        const stored =
-          typeof window !== "undefined"
-            ? (window.localStorage.getItem(SELECTED_CONNECTION_STORAGE_KEY) ??
-              "")
-            : "";
-        const preferred = current || stored;
-        const nextId = nextConnections.some(
-          (connection) => connection.id === preferred,
-        )
-          ? preferred
-          : nextConnections[0]?.id || "";
-        if (typeof window !== "undefined" && nextId) {
-          window.localStorage.setItem(SELECTED_CONNECTION_STORAGE_KEY, nextId);
-        }
-        return nextId;
-      });
+      const stored =
+        typeof window !== "undefined"
+          ? (window.localStorage.getItem(SELECTED_CONNECTION_STORAGE_KEY) ??
+            "")
+          : "";
+      const preferred = selectedId || stored;
+      const nextSelectedId = nextConnections.some(
+        (connection) => connection.id === preferred,
+      )
+        ? preferred
+        : nextConnections[0]?.id || "";
+      setSelectedId(nextSelectedId);
+      if (typeof window !== "undefined" && nextSelectedId) {
+        window.localStorage.setItem(
+          SELECTED_CONNECTION_STORAGE_KEY,
+          nextSelectedId,
+        );
+      }
 
-      const companyResponse = await apiFetch("/api/tally/companies", {
-        method: "GET",
-        cache: "no-store",
-      });
-      if (companyResponse.ok) {
-        const companyPayload =
-          (await companyResponse.json()) as CompaniesResponse;
-        setCompanies(companyPayload.companies ?? []);
+      if (nextSelectedId) {
+        const companyResponse = await apiFetch(
+          `/api/tally/companies?connectionId=${encodeURIComponent(
+            nextSelectedId,
+          )}`,
+          {
+            method: "GET",
+            cache: "no-store",
+          },
+        );
+        if (companyResponse.ok) {
+          const companyPayload =
+            (await companyResponse.json()) as CompaniesResponse;
+          setCompanies(companyPayload.companies ?? []);
+        }
+      } else {
+        setCompanies([]);
       }
     } catch (error) {
       setMessage({
