@@ -1919,6 +1919,55 @@ function buildManualAllocationDraft(
   };
 }
 
+function buildSequentialReceiptAllocation(
+  transaction: ReviewTransaction,
+  openBills: OpenBillReference[],
+  existingAdvances: ExistingAdvanceReference[],
+  reason: string,
+  options: { requiresUserReview?: boolean; manual?: boolean } = {}
+): BillAllocationDraft {
+  const receiptAmount = Math.max(parseNumber(transaction.creditAmount) ?? 0, parseNumber(transaction.debitAmount) ?? 0);
+  const candidateBills = sortOpenBills(openBills);
+  let remainingAmount = receiptAmount;
+  const billAmounts: Record<string, number> = {};
+
+  for (const bill of candidateBills) {
+    if (remainingAmount <= 0.01) break;
+    const pendingAmount = Math.max(0, Number(bill.pendingAmount ?? 0));
+    const allocatedAmount = Number(Math.min(remainingAmount, pendingAmount).toFixed(2));
+    if (allocatedAmount <= 0) continue;
+    billAmounts[bill.referenceName] = allocatedAmount;
+    remainingAmount = Number((remainingAmount - allocatedAmount).toFixed(2));
+  }
+
+  const baseDraft: BillAllocationDraft = {
+    status: "needs_review",
+    caseType: "cannot_match_yet",
+    caseLabel: "Needs Review",
+    reason,
+    receiptAmount,
+    totalAllocatedAmount: 0,
+    newAdvanceAmount: 0,
+    unallocatedAmount: receiptAmount,
+    allocations: [],
+    candidateBills,
+    existingAdvances,
+    requiresUserReview: true,
+    isEligibleForPosting: false,
+  };
+  const draft = buildManualAllocationDraft(transaction, baseDraft, billAmounts, remainingAmount);
+  const requiresUserReview = options.requiresUserReview ?? false;
+
+  return {
+    ...draft,
+    caseType: getAllocationCaseType(draft.allocations, draft.newAdvanceAmount, options.manual),
+    caseLabel: getAllocationCaseLabel(draft.allocations, draft.newAdvanceAmount, options.manual),
+    reason,
+    requiresUserReview,
+    isEligibleForPosting: draft.isEligibleForPosting && !requiresUserReview,
+  };
+}
+
 function allocateBillsForTransaction(
   transaction: ReviewTransaction,
   openBills: OpenBillReference[],
@@ -1979,6 +2028,15 @@ function allocateBillsForTransaction(
   }
 
   if (existingAdvances.length > 0 || !safeBill) {
+    if (existingAdvances.length === 0 && openBills.length > 1) {
+      return buildSequentialReceiptAllocation(
+        transaction,
+        openBills,
+        existingAdvances,
+        "Multiple open bills were found. The receipt is prefilled against the oldest bills first, with any balance as a new advance.",
+        { requiresUserReview: false }
+      );
+    }
     const reason = existingAdvances.length > 0
       ? "Existing advances require an explicit allocation review before applying this receipt."
       : openBills.length > 1
