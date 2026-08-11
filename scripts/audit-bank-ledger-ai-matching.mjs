@@ -15,6 +15,10 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const MODEL = process.env.OPENROUTER_BANK_LEDGER_MODEL || "deepseek/deepseek-v4-pro";
 const MAX_TOKENS = Number(process.env.OPENROUTER_BANK_LEDGER_MAX_OUTPUT_TOKENS || 4096);
 const TIMEOUT_MS = Number(process.env.OPENROUTER_BANK_LEDGER_TIMEOUT_MS || 45_000);
+const DEFAULT_BATCH_SIZE = Math.min(
+  25,
+  Math.max(1, Number(process.env.OPENROUTER_BANK_LEDGER_BATCH_SIZE || 3) || 3)
+);
 
 const defaultCases = [
   {
@@ -454,6 +458,8 @@ function parseArgs() {
     casesFile: "",
     report: defaultReportPath,
     filter: "",
+    batchSize: DEFAULT_BATCH_SIZE,
+    generatedLedgerCount: 0,
     dryRun: false,
   };
 
@@ -463,16 +469,24 @@ function parseArgs() {
     else if (arg === "--cases") options.casesFile = path.resolve(args[++index] || "");
     else if (arg === "--report") options.report = path.resolve(args[++index] || "");
     else if (arg === "--filter") options.filter = args[++index] || "";
+    else if (arg === "--batch-size") {
+      options.batchSize = Math.min(25, Math.max(1, Number(args[++index] || DEFAULT_BATCH_SIZE) || DEFAULT_BATCH_SIZE));
+    }
+    else if (arg === "--generated-ledgers") {
+      options.generatedLedgerCount = Math.min(5000, Math.max(0, Number(args[++index] || 0) || 0));
+    }
     else if (arg === "--dry-run") options.dryRun = true;
     else if (arg === "--help" || arg === "-h") {
       console.log([
         "Usage: node scripts/audit-bank-ledger-ai-matching.mjs [options]",
         "",
         "Options:",
-        "  --ledger-file <path>  Markdown file with backtick-wrapped ledger names.",
+        "  --ledger-file <path>  Markdown ledger table or JSON array of {name, group} ledgers.",
         "  --cases <path>        JSON file with test cases. Defaults to built-in cases.",
         "  --report <path>       Markdown report path.",
-        "  --filter <text>       Run only cases whose id includes this text.",
+        "  --filter <text,...>   Run cases whose id includes any comma-separated filter.",
+        "  --batch-size <count>  Transactions per AI request (default: 12, maximum: 25).",
+        "  --generated-ledgers N  Add N neutral static distractor ledgers (maximum: 5000).",
         "  --dry-run             Write report with prompts only; do not call OpenRouter.",
       ].join("\n"));
       process.exit(0);
@@ -500,7 +514,56 @@ function extractLedgerNames(markdown) {
       const match = trimmed.match(/^\| `([^`]+)`/);
       return match ? [match[1].trim()] : [];
     });
-  return [...new Set(matches)].filter((name) => name && name !== "---");
+  return [...new Set(matches)]
+    .filter((name) => name && name !== "---")
+    .map((name) => ({ name, group: "Sundry Debtors" }));
+}
+
+function extractLedgers(filePath, source) {
+  if (path.extname(filePath).toLowerCase() !== ".json") {
+    return extractLedgerNames(source);
+  }
+
+  const parsed = JSON.parse(source);
+  const rows = Array.isArray(parsed) ? parsed : parsed?.ledgers;
+  if (!Array.isArray(rows)) {
+    throw new Error(`JSON ledger fixture must be an array or contain a ledgers array: ${filePath}`);
+  }
+
+  const ledgers = rows.flatMap((row) => {
+    if (typeof row === "string" && row.trim()) {
+      return [{ name: row.trim(), group: null }];
+    }
+    if (!row || typeof row !== "object" || typeof row.name !== "string" || !row.name.trim()) {
+      return [];
+    }
+    return [{
+      name: row.name.trim(),
+      group: typeof row.group === "string" && row.group.trim() ? row.group.trim() : null,
+    }];
+  });
+
+  const deduped = new Map();
+  for (const ledger of ledgers) {
+    const key = normalizeName(ledger.name);
+    if (key && !deduped.has(key)) deduped.set(key, ledger);
+  }
+  return [...deduped.values()];
+}
+
+function addGeneratedLedgers(ledgers, count) {
+  const deduped = new Map(ledgers.map((ledger) => [normalizeName(ledger.name), ledger]));
+  for (let index = 1; index <= count; index += 1) {
+    const name = `TMT Load Test Party ${String(index).padStart(4, "0")}`;
+    const key = normalizeName(name);
+    if (!deduped.has(key)) {
+      deduped.set(key, {
+        name,
+        group: index % 2 === 0 ? "Sundry Creditors" : "Sundry Debtors",
+      });
+    }
+  }
+  return [...deduped.values()];
 }
 
 function normalizeName(value) {
@@ -573,15 +636,14 @@ async function callOpenRouter(messages) {
   throw new Error(lastError || "OpenRouter request failed");
 }
 
-function buildMessages(prompt, ledgers, testCase) {
+function buildMessages(prompt, ledgers, testCases) {
   return [
     { role: "system", content: prompt },
     {
       role: "user",
       content: JSON.stringify({
-        transactions: [
-          {
-            index: 0,
+        transactions: testCases.map((testCase, index) => ({
+            index,
             transactionDate: testCase.transactionDate || "2026-06-08",
             description: testCase.description,
             referenceNumber: testCase.referenceNumber ?? null,
@@ -590,17 +652,15 @@ function buildMessages(prompt, ledgers, testCase) {
             transactionType: testCase.transactionType ?? null,
             category: testCase.category ?? null,
             counterpartyName: testCase.counterpartyName ?? null,
-          },
-        ],
-        tallyLedgers: ledgers.map((name) => ({ name, group: testCase.group || "Sundry Debtors" })),
-        savedMapping: testCase.savedMapping ?? null,
+          })),
+        tallyLedgers: ledgers.map((ledger) => ({ name: ledger.name, group: ledger.group })),
       }, null, 2),
     },
   ];
 }
 
-function evaluateCase(testCase, actual) {
-  const match = actual?.matches?.find((entry) => Number(entry?.index) === 0) || {};
+function evaluateCase(testCase, actual, index) {
+  const match = actual?.matches?.find((entry) => Number(entry?.index) === index) || {};
   const expected = testCase.expected;
   const actualCandidateNames = Array.isArray(match.candidateLedgerNames)
     ? match.candidateLedgerNames
@@ -614,6 +674,14 @@ function evaluateCase(testCase, actual) {
     match,
     checks: { matchTypeOk, ledgerNameOk, candidatesOk },
   };
+}
+
+function chunkValues(values, size) {
+  const chunks = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
 }
 
 function markdownCell(value) {
@@ -634,6 +702,7 @@ function renderReport({ options, ledgers, prompt, results }) {
     `Ledger file: \`${path.relative(repoRoot, options.ledgerFile)}\``,
     `Prompt source: \`${path.relative(repoRoot, promptSourcePath)}\``,
     `Ledger count: ${ledgers.length}`,
+    `Batch size: ${options.batchSize}`,
     `Result: ${passedCount}/${results.length} passed`,
     "",
     "## Summary",
@@ -685,12 +754,19 @@ async function main() {
     fs.readFile(options.ledgerFile, "utf8"),
   ]);
   const prompt = extractPrompt(source);
-  const ledgers = extractLedgerNames(ledgerMarkdown);
+  const ledgers = addGeneratedLedgers(
+    extractLedgers(options.ledgerFile, ledgerMarkdown),
+    options.generatedLedgerCount
+  );
   const allCases = options.casesFile
     ? JSON.parse(await fs.readFile(options.casesFile, "utf8"))
     : defaultCases;
-  const cases = options.filter
-    ? allCases.filter((testCase) => String(testCase.id).includes(options.filter))
+  const filterTerms = options.filter
+    .split(",")
+    .map((term) => term.trim())
+    .filter(Boolean);
+  const cases = filterTerms.length > 0
+    ? allCases.filter((testCase) => filterTerms.some((term) => String(testCase.id).includes(term)))
     : allCases;
 
   if (cases.length === 0) {
@@ -698,23 +774,33 @@ async function main() {
   }
 
   const results = [];
-  for (const testCase of cases) {
-    const messages = buildMessages(prompt, ledgers, testCase);
+  for (const batch of chunkValues(cases, options.batchSize)) {
+    const messages = buildMessages(prompt, ledgers, batch);
     if (options.dryRun) {
-      results.push({ testCase, actual: { dryRun: true, messages }, evaluation: { passed: false, match: null } });
+      batch.forEach((testCase, index) => {
+        results.push({
+          testCase,
+          actual: { dryRun: true, batchIndex: index, messages },
+          evaluation: { passed: false, match: null },
+        });
+      });
       continue;
     }
 
     try {
       const raw = await callOpenRouter(messages);
       const actual = readJsonFromModel(raw);
-      const evaluation = evaluateCase(testCase, actual);
-      results.push({ testCase, actual, evaluation });
-      console.log(`${evaluation.passed ? "PASS" : "FAIL"} ${testCase.id}`);
+      batch.forEach((testCase, index) => {
+        const evaluation = evaluateCase(testCase, actual, index);
+        results.push({ testCase, actual, evaluation });
+        console.log(`${evaluation.passed ? "PASS" : "FAIL"} ${testCase.id}`);
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
-      results.push({ testCase, error: message, evaluation: { passed: false, match: null } });
-      console.log(`FAIL ${testCase.id}: ${message}`);
+      batch.forEach((testCase) => {
+        results.push({ testCase, error: message, evaluation: { passed: false, match: null } });
+        console.log(`FAIL ${testCase.id}: ${message}`);
+      });
     }
   }
 
