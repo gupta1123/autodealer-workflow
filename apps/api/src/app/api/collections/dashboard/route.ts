@@ -12,15 +12,16 @@ import {
   type CashDiscountNarrationAnalysis,
 } from "@/lib/cash-discount-narration";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { businessDateText } from "@/lib/business-date";
 
-type TallyLedgerRow = {
+export type TallyLedgerRow = {
   tally_name: string;
   parent_name: string | null;
   gstin: string | null;
   raw_payload: Record<string, unknown> | null;
 };
 
-type OpenBillRow = {
+export type OpenBillRow = {
   kind?: string | null;
   ledgerName?: string | null;
   referenceName?: string | null;
@@ -37,7 +38,7 @@ type OpenBillRow = {
   status?: string | null;
 };
 
-type OpenBillBucket = {
+export type OpenBillBucket = {
   ledgerName?: string | null;
   openBills?: OpenBillRow[];
 };
@@ -52,7 +53,7 @@ type TallyCommandRow = {
   created_at: string;
 };
 
-function nullableText(value: unknown, maxLength = 500) {
+export function nullableText(value: unknown, maxLength = 500) {
   const text = toText(value, maxLength);
   return text || null;
 }
@@ -62,7 +63,7 @@ function isMissingCollectionsTable(error: unknown) {
   return /cash_discount_rules|debit_note_proposals|relation .* does not exist|schema cache/i.test(message);
 }
 
-function normalizeLedgerName(value: string | null | undefined) {
+export function normalizeLedgerName(value: string | null | undefined) {
   return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
@@ -96,7 +97,7 @@ function readRawText(raw: Record<string, unknown> | null | undefined, key: strin
   return toText(raw?.[key], maxLength) || null;
 }
 
-function proposalWithLedgerSnapshot(proposal: DebitNoteProposalRow, ledger?: TallyLedgerRow) {
+export function proposalWithLedgerSnapshot(proposal: DebitNoteProposalRow, ledger?: TallyLedgerRow) {
   if (!ledger) return proposal;
   const raw = ledger.raw_payload && typeof ledger.raw_payload === "object" ? ledger.raw_payload : {};
   const partyEmail = proposal.party_email ?? readRawText(raw, "email", 320);
@@ -149,7 +150,7 @@ function proposalRank(proposal: DebitNoteProposalRow) {
   return statusScore * 10_000_000_000_000 + updatedScore;
 }
 
-function dedupeDebitNoteProposals(proposals: DebitNoteProposalRow[]) {
+export function dedupeDebitNoteProposals(proposals: DebitNoteProposalRow[]) {
   const bestByKey = new Map<string, DebitNoteProposalRow>();
 
   for (const proposal of proposals) {
@@ -163,11 +164,11 @@ function dedupeDebitNoteProposals(proposals: DebitNoteProposalRow[]) {
   return Array.from(bestByKey.values()).sort((left, right) => proposalRank(right) - proposalRank(left));
 }
 
-function todayText() {
-  return new Date().toISOString().slice(0, 10);
+export function todayText() {
+  return businessDateText();
 }
 
-function serializeTallyCandidate(params: {
+export function serializeTallyCandidate(params: {
   bill: OpenBillRow;
   ledgerName: string;
   ledger?: TallyLedgerRow;
@@ -309,7 +310,7 @@ type PaymentFollowUpKind =
   | "payment_due"
   | "payment_review";
 
-function isPaymentFollowUpStatus(status: CashDiscountNarrationAnalysis["deterministicStatus"]) {
+export function isPaymentFollowUpStatus(status: CashDiscountNarrationAnalysis["deterministicStatus"]) {
   return [
     "no_cash_discount_context",
     "cash_discount_rate_missing",
@@ -324,7 +325,7 @@ function isPaymentFollowUpStatus(status: CashDiscountNarrationAnalysis["determin
   ].includes(status);
 }
 
-function serializePaymentFollowUp(params: {
+export function serializePaymentFollowUp(params: {
   bill: OpenBillRow;
   ledgerName: string;
   ledger?: TallyLedgerRow;
@@ -418,7 +419,7 @@ function serializePaymentFollowUp(params: {
   };
 }
 
-function readTallyOpenBills(commandResult: Record<string, unknown> | null | undefined) {
+export function readTallyOpenBills(commandResult: Record<string, unknown> | null | undefined) {
   const result = commandResult?.result && typeof commandResult.result === "object"
     ? (commandResult.result as Record<string, unknown>)
     : commandResult;
@@ -435,7 +436,7 @@ function readTallyOpenBills(commandResult: Record<string, unknown> | null | unde
   });
 }
 
-function invoiceIdentityKey(partyLedgerName: string | null | undefined, linkedInvoiceNumber: string | null | undefined) {
+export function invoiceIdentityKey(partyLedgerName: string | null | undefined, linkedInvoiceNumber: string | null | undefined) {
   return [normalizeLedgerName(partyLedgerName), normalizeLedgerName(linkedInvoiceNumber)].join("|");
 }
 
@@ -480,7 +481,7 @@ function debitNoteRowFromSucceededCommand(command: TallyCommandRow, connection: 
     reason_code: nullableText(payload.reasonCode, 80) ?? "cash_discount_expired",
     narration: nullableText(payload.narration, 1000),
     gst_mode: nullableText(payload.gstMode, 80) ?? "finance_review",
-    debit_note_date: voucherDate ?? new Date().toISOString().slice(0, 10),
+    debit_note_date: voucherDate ?? businessDateText(),
     status: "created_in_tally",
     approval_by: command.owner_user_id,
     approved_at: command.created_at,

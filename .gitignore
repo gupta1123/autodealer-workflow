@@ -6,6 +6,7 @@
 # Dependencies and framework build output
 node_modules/
 **/node_modules/
+node_modules.*/
 .next/
 **/.next/
 dist/
@@ -35,6 +36,7 @@ installer/**/.cache/
 .codex-merge-backup/
 .codex-run-logs/
 .playwright-cli/
+**/.local-data/
 
 # Local Tally runtime files
 tally.ini

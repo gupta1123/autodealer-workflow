@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const BRIDGE_VERSION = "0.1.40";
+const BRIDGE_VERSION = "0.1.41";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
@@ -3332,6 +3332,156 @@ function findBankLedgersFromMasters(ledgers, groups) {
   });
 }
 
+function findPartyLedgersFromMasters(ledgers, groups, rootGroupName) {
+  const rootKey = normalizeLooseName(rootGroupName);
+  const groupParentByName = new Map(
+    groups
+      .filter((group) => group?.name)
+      .map((group) => [normalizeLooseName(group.name), group.parent || null])
+  );
+
+  const descendsFromRoot = (parentName) => {
+    const visited = new Set();
+    let currentName = parentName;
+    while (currentName) {
+      const normalized = normalizeLooseName(currentName);
+      if (!normalized || visited.has(normalized)) return false;
+      if (normalized === rootKey) return true;
+      visited.add(normalized);
+      currentName = groupParentByName.get(normalized) || null;
+    }
+    return false;
+  };
+
+  return ledgers.filter((ledger) => descendsFromRoot(ledger.parent));
+}
+
+function cashDiscountLiveLedger(master) {
+  return {
+    name: master.name,
+    parent: master.parent || null,
+    gstin: master.gstin || null,
+    raw: {
+      ...(master.raw || {}),
+      email: master.email || null,
+      phone: master.phone || null,
+      contactPerson: master.contactPerson || null,
+      address: master.address || null,
+      billWiseEnabled: master.raw?.billWiseEnabled ?? null,
+    },
+  };
+}
+
+async function collectCashDiscountLiveSnapshot(config, operation, companyName, proposal, onProgress) {
+  const readiness = await testTally(config.tallyUrl);
+  if (!readiness.tallyReachable || !readiness.companyLoaded) {
+    throw new Error(readiness.error || "Tally Prime is not ready for Cash Discount analysis.");
+  }
+  const requestedCompany = String(companyName || "").trim();
+  if (requestedCompany && normalizeLooseName(requestedCompany) !== normalizeLooseName(readiness.companyName)) {
+    throw new Error(`Tally is currently open to ${readiness.companyName || "another company"}. Switch to ${requestedCompany} and refresh.`);
+  }
+  const resolvedCompany = requestedCompany || readiness.companyName || null;
+
+  onProgress?.("Reading customer ledgers and Sundry Debtors subgroups from Tally...");
+  const ledgerXml = await exportTallyCollection(config.tallyUrl, {
+    collectionName: "Kalika Cash Discount Ledgers",
+    tallyType: "Ledger",
+    fetchFields:
+      "Name,Parent,GUID,PartyGSTIN,IsBillWiseOn,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode",
+    companyName: resolvedCompany,
+  });
+  const groupXml = await exportTallyCollection(config.tallyUrl, {
+    collectionName: "Kalika Cash Discount Groups",
+    tallyType: "Group",
+    fetchFields: "Name,Parent,GUID",
+    companyName: resolvedCompany,
+  });
+  const ledgers = parseMasterCollection(ledgerXml, "LEDGER");
+  const groups = parseMasterCollection(groupXml, "GROUP");
+  const debtorLedgers = findPartyLedgersFromMasters(ledgers, groups, "Sundry Debtors");
+  const requestedLedgerName = String(proposal?.partyLedgerName || "").trim();
+  const ledgersToScan = operation === "cash_discount_revalidate"
+    ? debtorLedgers.filter((ledger) => normalizeLooseName(ledger.name) === normalizeLooseName(requestedLedgerName))
+    : debtorLedgers;
+
+  if (operation === "cash_discount_revalidate" && ledgersToScan.length !== 1) {
+    throw new Error("The selected customer is no longer under Sundry Debtors in Tally.");
+  }
+
+  if (ledgersToScan.length === 0) {
+    return {
+      companyName: resolvedCompany,
+      ledgers: debtorLedgers.map(cashDiscountLiveLedger),
+      openBillsResult: { success: true, result: { ledgerNames: [], byLedger: {}, openBills: [], existingAdvances: [], rawCount: 0 } },
+    };
+  }
+
+  onProgress?.(`Reading open bills for ${ledgersToScan.length} customer ledger${ledgersToScan.length === 1 ? "" : "s"}...`);
+  const openBillsResult = await fetchCustomerOpenBillsFromTally(config, {
+    companyName: resolvedCompany,
+    ledgerName: ledgersToScan[0].name,
+    ledgerNames: ledgersToScan.map((ledger) => ledger.name),
+  });
+  return {
+    companyName: resolvedCompany,
+    ledgers: debtorLedgers.map(cashDiscountLiveLedger),
+    openBillsResult,
+  };
+}
+
+async function executeCashDiscountDebitNote(config, payload) {
+  const readiness = await testTally(config.tallyUrl);
+  const requestedCompany = String(payload?.companyName || "").trim();
+  if (!readiness.tallyReachable || !readiness.companyLoaded) {
+    throw new Error(readiness.error || "Tally Prime is not ready to create the Debit Note.");
+  }
+  if (requestedCompany && normalizeLooseName(requestedCompany) !== normalizeLooseName(readiness.companyName)) {
+    throw new Error(`Tally is currently open to ${readiness.companyName || "another company"}. Switch to ${requestedCompany} before creating the Debit Note.`);
+  }
+
+  let existingVoucher = null;
+  try {
+    existingVoucher = await resolveDebitNoteVoucher(config.tallyUrl, payload, requestedCompany || readiness.companyName);
+  } catch (error) {
+    if (!/did not return the expected Debit Note/i.test(String(error?.message || ""))) throw error;
+  }
+  if (existingVoucher) {
+    return {
+      success: true,
+      result: {
+        alreadyInTally: true,
+        voucherId: existingVoucher.masterId,
+        voucherGuid: existingVoucher.guid || null,
+        voucherNumber: existingVoucher.voucherNumber,
+        voucherDate: normalizeDateForCompare(existingVoucher.effectiveDate || existingVoucher.date),
+        openReferenceName: existingVoucher.reference || null,
+      },
+    };
+  }
+
+  const posted = await postDebitNote(config.tallyUrl, payload, requestedCompany || readiness.companyName);
+  if (!posted.outcome.success) {
+    throw new Error(posted.outcome.error || "Tally did not create the Debit Note.");
+  }
+  const voucher = await resolveDebitNoteVoucher(
+    config.tallyUrl,
+    { ...payload, tallyVoucherId: posted.outcome.result?.lastVchId },
+    requestedCompany || readiness.companyName
+  );
+  return {
+    success: true,
+    result: {
+      ...(posted.outcome.result || {}),
+      voucherId: voucher.masterId,
+      voucherGuid: voucher.guid || null,
+      voucherNumber: voucher.voucherNumber,
+      voucherDate: normalizeDateForCompare(voucher.effectiveDate || voucher.date),
+      openReferenceName: voucher.reference || null,
+    },
+  };
+}
+
 async function fetchBankLedgersFromTally(config, commandPayload = {}) {
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const companyNames = mergeCompanyNames([
@@ -4280,6 +4430,121 @@ async function runOnce(config, options = {}) {
   };
 }
 
+function cashDiscountGatewayUrl(config) {
+  const configured = String(process.env.CASH_DISCOUNT_GATEWAY_URL || "").trim();
+  if (configured) return configured;
+  const url = new URL(config.apiBase);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  if (["localhost", "127.0.0.1"].includes(url.hostname)) {
+    url.port = "3002";
+    url.pathname = "/";
+  } else {
+    url.pathname = "/cash-discount-live";
+  }
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
+  let socket = null;
+  let reconnectTimer = null;
+  let stopped = false;
+
+  const log = (level, message) => emitLog(options, level, message);
+  const send = (payload) => {
+    if (socket?.readyState === 1) socket.send(JSON.stringify(payload));
+  };
+  const scheduleReconnect = () => {
+    if (stopped || reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, 3000);
+    reconnectTimer.unref?.();
+  };
+
+  const handleOperation = async (message) => {
+    const requestId = String(message.requestId || "").trim();
+    const operation = String(message.operation || "");
+    if (!requestId) return;
+    try {
+      const data = await executeExclusive(async () => {
+        if (operation === "cash_discount_scan" || operation === "cash_discount_revalidate") {
+          return collectCashDiscountLiveSnapshot(
+            config,
+            operation,
+            message.companyName,
+            message.proposal,
+            (progressMessage) => send({ type: "progress", requestId, message: progressMessage })
+          );
+        }
+        if (operation === "cash_discount_execute_debit_note") {
+          send({ type: "progress", requestId, message: "Creating and verifying the Debit Note in Tally..." });
+          return executeCashDiscountDebitNote(config, message.commandPayload);
+        }
+        throw new Error("Unsupported live Cash Discount operation.");
+      });
+      send({ type: "operation_result", requestId, success: true, companyName: message.companyName, data });
+    } catch (error) {
+      send({
+        type: "operation_result",
+        requestId,
+        success: false,
+        companyName: message.companyName,
+        error: error instanceof Error ? error.message : String(error || "Live Cash Discount operation failed."),
+      });
+    }
+  };
+
+  const connect = () => {
+    if (stopped) return;
+    if (typeof WebSocket !== "function") {
+      log("error", "This connector runtime does not support the live Cash Discount channel.");
+      return;
+    }
+    try {
+      socket = new WebSocket(cashDiscountGatewayUrl(config));
+      socket.addEventListener("open", () => {
+        send({
+          type: "authenticate",
+          role: "connector",
+          connectionId: config.connectionId,
+          token: config.bridgeToken,
+        });
+      });
+      socket.addEventListener("message", (event) => {
+        try {
+          const message = JSON.parse(String(event.data || "{}"));
+          if (message.type === "authenticated") {
+            log("info", "Cash Discount live channel connected.");
+          } else if (message.type === "operation") {
+            void handleOperation(message);
+          } else if (message.type === "error") {
+            log("error", `Cash Discount live channel: ${message.error || "unknown error"}`);
+          }
+        } catch (error) {
+          log("error", error instanceof Error ? error.message : "Invalid Cash Discount live message.");
+        }
+      });
+      socket.addEventListener("error", () => {
+        log("error", "Cash Discount live channel is unavailable; retrying.");
+      });
+      socket.addEventListener("close", scheduleReconnect);
+    } catch (error) {
+      log("error", error instanceof Error ? error.message : "Could not start the Cash Discount live channel.");
+      scheduleReconnect();
+    }
+  };
+
+  connect();
+  return () => {
+    stopped = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    socket?.close();
+  };
+}
+
 async function startBridge(args) {
   const config = readConfig();
   if (!config) {
@@ -4296,6 +4561,17 @@ async function startBridge(args) {
   console.log(`Sending heartbeat every ${intervalMs} ms.`);
 
   let running = false;
+  const executeExclusive = async (task) => {
+    while (running) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    running = true;
+    try {
+      return await task();
+    } finally {
+      running = false;
+    }
+  };
   const runSerially = async () => {
     if (running) {
       console.log("Previous bridge cycle is still running; skipping this heartbeat.");
@@ -4311,6 +4587,7 @@ async function startBridge(args) {
   };
 
   await runOnce(config);
+  startCashDiscountLiveChannel(config, executeExclusive);
   setInterval(() => {
     runSerially().catch((error) => {
       console.error(error instanceof Error ? error.message : error);
@@ -4354,6 +4631,20 @@ function createBridgeRunner(options = {}) {
   let timer = null;
   let running = false;
   let stopped = false;
+  let stopCashDiscountLiveChannel = null;
+
+  const executeExclusive = async (task) => {
+    while (running && !stopped) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (stopped) throw new Error("The connector has stopped.");
+    running = true;
+    try {
+      return await task();
+    } finally {
+      running = false;
+    }
+  };
 
   const stop = (reason = "stopped", error = null) => {
     if (stopped) return;
@@ -4362,6 +4653,8 @@ function createBridgeRunner(options = {}) {
       clearInterval(timer);
       timer = null;
     }
+    stopCashDiscountLiveChannel?.();
+    stopCashDiscountLiveChannel = null;
     if (typeof options.onStop === "function") {
       options.onStop({ reason, error, timestamp: new Date().toISOString() });
     }
@@ -4407,6 +4700,7 @@ function createBridgeRunner(options = {}) {
     async start() {
       emitLog(options, "info", `Starting Tally bridge for ${config.tallyUrl}`);
       emitLog(options, "info", `Sending heartbeat every ${intervalMs} ms.`);
+      stopCashDiscountLiveChannel = startCashDiscountLiveChannel(config, executeExclusive, options);
       await runSerially();
       if (!stopped) {
         timer = setInterval(() => {
@@ -4929,6 +5223,7 @@ export {
   fetchAvailableCompanies,
   fetchBankLedgersFromTally,
   findBankLedgersFromMasters,
+  findPartyLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
   normalizeTallyUrl,
   pairBridge,

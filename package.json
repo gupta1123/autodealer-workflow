@@ -13,6 +13,7 @@
   "scripts": {
     "dev:web": "npm run dev --workspace @autodealer/web",
     "dev:api": "npm run dev --workspace @autodealer/api",
+    "dev:cash-discount-gateway": "npm run dev --workspace @autodealer/cash-discount-gateway",
     "dev:tally-desktop": "npm run dev --workspace @autodealer/tally-desktop",
     "build:web": "npm run build --workspace @autodealer/web",
     "build:api": "npm run build --workspace @autodealer/api",

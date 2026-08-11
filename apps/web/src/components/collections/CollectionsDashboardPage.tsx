@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 
 import { apiFetch } from "@/lib/api-client";
+import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 
 type CompanyOption = {
@@ -87,6 +88,11 @@ type NarrationAnalysisRow = {
 type PaymentFollowUp = {
   id: string;
   kind: "discount_window_open" | "full_payment_due" | "payment_due" | "payment_review";
+  followUpStatus: "needs_follow_up" | "escalate" | "needs_review";
+  ageBasis: "due_date" | "invoice_date" | "missing_dates";
+  ageDays: number | null;
+  ageLabel: string;
+  dueDate: string | null;
   title: string;
   nextAction: string;
   partyLedgerName: string;
@@ -111,9 +117,6 @@ type PaymentFollowUp = {
     discountAmount: number;
   } | null;
   paymentAmountIfPaidToday: number | null;
-  totalPayableAmount: number;
-  createdTierReversalAmount: number;
-  pendingTierReversalAmount: number;
   reversalPlan: CashDiscountReversalPlan | null;
   deterministicStatus: string;
   deterministicReason: string;
@@ -183,6 +186,7 @@ type TallyMaster = {
   name: string;
   parent?: string | null;
   type?: string | null;
+  ledgerType?: string | null;
   billWiseEnabled?: boolean | null;
   phone?: string | null;
 };
@@ -246,6 +250,7 @@ type DashboardPayload = {
 };
 
 type ActiveView = "needsAction" | "followUps" | "done";
+type PaymentFollowUpSort = "priority" | "most_overdue" | "highest_outstanding" | "oldest_invoice" | "customer";
 
 type CollectionsDashboardPageProps = {
   initialView?: ActiveView;
@@ -299,18 +304,48 @@ function messageStatusClass(value?: string | null) {
   return "border-slate-200 bg-white text-slate-500";
 }
 
-function followUpStatusClass(kind: PaymentFollowUp["kind"]) {
-  if (kind === "discount_window_open") return "border-sky-200 bg-sky-50 text-sky-800";
-  if (kind === "full_payment_due") return "border-amber-250 bg-amber-50 text-amber-800";
-  if (kind === "payment_review") return "border-violet-200 bg-violet-50 text-violet-800";
-  return "border-slate-200 bg-white text-slate-600";
+function followUpStatusClass(status: PaymentFollowUp["followUpStatus"]) {
+  if (status === "escalate") return "border-red-200 bg-red-50 text-red-700";
+  if (status === "needs_review") return "border-violet-200 bg-violet-50 text-violet-800";
+  return "border-sky-200 bg-sky-50 text-sky-800";
 }
 
-function followUpStatusLabel(kind: PaymentFollowUp["kind"]) {
-  if (kind === "discount_window_open") return "Discount window open";
-  if (kind === "full_payment_due") return "Full payment due";
-  if (kind === "payment_review") return "Review payment";
-  return "Payment due";
+function followUpStatusLabel(status: PaymentFollowUp["followUpStatus"]) {
+  if (status === "escalate") return "Escalate";
+  if (status === "needs_review") return "Needs review";
+  return "Needs follow-up";
+}
+
+function sortPaymentFollowUpRows(rows: PaymentFollowUp[], sort: PaymentFollowUpSort) {
+  const basisRank: Record<PaymentFollowUp["ageBasis"], number> = {
+    due_date: 1,
+    invoice_date: 2,
+    missing_dates: 3,
+  };
+  const compareName = (left: PaymentFollowUp, right: PaymentFollowUp) =>
+    left.partyLedgerName.localeCompare(right.partyLedgerName);
+  const compareAmount = (left: PaymentFollowUp, right: PaymentFollowUp) =>
+    right.outstandingAmount - left.outstandingAmount;
+  const compareAge = (left: PaymentFollowUp, right: PaymentFollowUp) => {
+    const basisDifference = basisRank[left.ageBasis] - basisRank[right.ageBasis];
+    if (basisDifference !== 0) return basisDifference;
+    return (right.ageDays ?? -1) - (left.ageDays ?? -1);
+  };
+
+  return [...rows].sort((left, right) => {
+    if (sort === "customer") return compareName(left, right);
+    if (sort === "highest_outstanding") return compareAmount(left, right) || compareAge(left, right) || compareName(left, right);
+    if (sort === "oldest_invoice") {
+      const leftDate = Date.parse(`${left.linkedInvoiceDate ?? ""}T00:00:00.000Z`) || Number.MAX_SAFE_INTEGER;
+      const rightDate = Date.parse(`${right.linkedInvoiceDate ?? ""}T00:00:00.000Z`) || Number.MAX_SAFE_INTEGER;
+      return leftDate - rightDate || compareAmount(left, right) || compareName(left, right);
+    }
+    if (sort === "most_overdue") return compareAge(left, right) || compareAmount(left, right) || compareName(left, right);
+
+    const leftPriority = basisRank[left.ageBasis];
+    const rightPriority = basisRank[right.ageBasis];
+    return leftPriority - rightPriority || compareAge(left, right) || compareAmount(left, right) || compareName(left, right);
+  });
 }
 
 function proposalStatusLabel(value: string) {
@@ -505,22 +540,11 @@ function wait(ms: number) {
   });
 }
 
-function isDebtorLedger(master: TallyMaster) {
-  return String(master.parent ?? "").trim().toLowerCase() === "sundry debtors";
-}
-
-function chunkValues<T>(values: T[], size: number) {
-  const chunks: T[][] = [];
-  for (let index = 0; index < values.length; index += size) {
-    chunks.push(values.slice(index, index + size));
-  }
-  return chunks;
-}
-
 export function CollectionsDashboardPage({
   initialView = "needsAction",
   showWorkflowSummary = true,
 }: CollectionsDashboardPageProps = {}) {
+  const isDedicatedFollowUpsPage = initialView === "followUps" && !showWorkflowSummary;
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
   const [selectedConnectionId, setSelectedConnectionId] = useState("");
   const [selectedCompanyId, setSelectedCompanyId] = useState("");
@@ -528,6 +552,7 @@ export function CollectionsDashboardPage({
   const [liveTallyConnection, setLiveTallyConnection] = useState<LiveTallyConnection | null>(null);
   const [checkingLiveTallyCompany, setCheckingLiveTallyCompany] = useState(true);
   const [activeView, setActiveView] = useState<ActiveView>(initialView);
+  const [paymentFollowUpSort, setPaymentFollowUpSort] = useState<PaymentFollowUpSort>("priority");
   const [loading, setLoading] = useState(true);
   const [approvingId, setApprovingId] = useState("");
   const [bulkCreating, setBulkCreating] = useState(false);
@@ -586,31 +611,6 @@ export function CollectionsDashboardPage({
     return nextCompanies;
   }, [selectedCompanyId, selectedConnectionId]);
 
-  const loadDashboard = useCallback(
-    async (connectionId = selectedConnectionId, companyName = selectedCompany?.companyName ?? "") => {
-      if (!connectionId) {
-        setDashboard(null);
-        return;
-      }
-      const params = new URLSearchParams({ connectionId });
-      if (companyName) params.set("companyName", companyName);
-      const response = await apiFetch(`/api/collections/dashboard?${params.toString()}`, { cache: "no-store" });
-      const payload = (await response.json().catch(() => ({}))) as DashboardPayload;
-      if (!response.ok) throw new Error(payload.error || `Request failed with status ${response.status}`);
-      setDashboard(payload);
-    },
-    [selectedCompany?.companyName, selectedConnectionId]
-  );
-
-  const loadDebtorLedgers = useCallback(async (connectionId: string) => {
-    const response = await apiFetch(`/api/tally/connections/${connectionId}/masters?type=ledger&limit=5000`, {
-      cache: "no-store",
-    });
-    if (!response.ok) throw new Error(await readError(response));
-    const payload = (await response.json()) as { masters?: TallyMaster[] };
-    return (payload.masters ?? []).filter(isDebtorLedger).map((master) => master.name).filter(Boolean);
-  }, []);
-
   const pollCommand = useCallback(async (
     connectionId: string,
     commandId: string,
@@ -661,63 +661,20 @@ export function CollectionsDashboardPage({
     }
   }, []);
 
-  const syncCurrentCompanyLedgers = useCallback(
-    async (connectionId: string, companyName?: string | null) => {
-      const response = await apiFetch(`/api/tally/connections/${connectionId}/commands`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          commandType: "sync_masters",
-          payload: {
-            companyName,
-            requestedMasterTypes: ["ledger"],
-          },
-        }),
-      });
-      if (!response.ok) throw new Error(await readError(response));
-      const payload = (await response.json()) as { command?: TallyCommand };
-      if (!payload.command?.id) throw new Error("Tally ledger sync could not be started.");
-      await pollCommand(connectionId, payload.command.id);
-    },
-    [pollCommand]
-  );
-
   const refreshTallyOpenBills = useCallback(
     async (connectionId: string, companyName?: string | null) => {
-      // Refresh the ledger list first. A connection may have previously synced a
-      // different company, in which case using its old debtor list would omit
-      // valid bills or query the wrong parties.
-      await syncCurrentCompanyLedgers(connectionId, companyName);
-      const ledgerNames = await loadDebtorLedgers(connectionId);
-      if (ledgerNames.length === 0) return;
-
-      // One page refresh can require several Tally commands when there are many
-      // customer ledgers. Keep those commands together so the dashboard can use
-      // this refresh as one consistent snapshot rather than mixing old chunks.
-      const scanId = crypto.randomUUID();
-
-      for (const chunk of chunkValues(ledgerNames, 80)) {
-        const response = await apiFetch(`/api/tally/connections/${connectionId}/commands`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            commandType: "fetch_customer_open_bills",
-            payload: {
-              ledgerName: chunk[0],
-              ledgerNames: chunk,
-              companyName,
-              scanId,
-            },
-          }),
-        });
-        if (!response.ok) throw new Error(await readError(response));
-        const payload = (await response.json()) as { command?: TallyCommand };
-        if (payload.command?.id) {
-          await pollCommand(connectionId, payload.command.id);
-        }
+      const resolvedCompanyName = String(companyName ?? "").trim();
+      if (!connectionId || !resolvedCompanyName) {
+        throw new Error("Select the live Tally company before refreshing Cash Discounts.");
       }
+      return runCashDiscountLiveRequest<DashboardPayload>({
+        connectionId,
+        companyName: resolvedCompanyName,
+        operation: "scan",
+        onProgress: (text) => setMessage({ tone: "info", text }),
+      });
     },
-    [loadDebtorLedgers, pollCommand, syncCurrentCompanyLedgers]
+    []
   );
 
   const refreshAll = useCallback(
@@ -767,10 +724,9 @@ export function CollectionsDashboardPage({
         // Set this before the asynchronous Tally scan so the selection effect
         // does not start a second, overlapping scan for the same company.
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
-        if (connectionId && options?.refreshTally !== false) {
-          await refreshTallyOpenBills(connectionId, company?.companyName);
-        }
-        await loadDashboard(connectionId, company?.companyName);
+        const nextDashboard = await refreshTallyOpenBills(connectionId, company?.companyName);
+        setDashboard(nextDashboard);
+        setMessage(null);
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
       } catch (error) {
         setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
@@ -778,52 +734,26 @@ export function CollectionsDashboardPage({
         setLoading(false);
       }
     },
-    [loadCompanies, loadDashboard, refreshLiveTallyCompany, refreshTallyOpenBills, selectedCompanyId, selectedConnectionId]
+    [loadCompanies, refreshLiveTallyCompany, refreshTallyOpenBills, selectedCompanyId, selectedConnectionId]
   );
 
-  async function approveTallySuggestion(proposal: DebitNoteProposal) {
-    const response = await apiFetch("/api/collections/tally-debit-notes/approve", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        connectionId: selectedConnectionId,
-        companyName: selectedCompany?.companyName ?? proposal.companyName,
-        proposal: {
-          connectionId: proposal.connectionId,
-          partyLedgerName: proposal.partyLedgerName,
-          linkedInvoiceNumber: proposal.linkedInvoiceNumber,
-          financialYear: selectedCompany?.financialYear ?? proposal.financialYear,
-        },
-      }),
-    });
-    if (!response.ok) throw new Error(await readError(response));
-    const payload = (await response.json().catch(() => ({}))) as { command?: TallyCommand };
-    return payload.command ?? null;
-  }
-
   async function createDebitNoteForProposal(proposal: DebitNoteProposal) {
-    const id = proposal.id;
-    let command: TallyCommand | null = null;
-    if (proposal.sourceKind === "tally_open_bill" || id.startsWith("tally:")) {
-      command = await approveTallySuggestion(proposal);
-    } else {
-      const response = await apiFetch(`/api/collections/debit-note-proposals/${id}/approve`, {
-        method: "POST",
-      });
-      if (!response.ok) throw new Error(await readError(response));
-      const payload = (await response.json().catch(() => ({}))) as { command?: TallyCommand };
-      command = payload.command ?? null;
-    }
-
-    const commandConnectionId = command?.connectionId ?? selectedConnectionId;
-    if (command?.id && commandConnectionId) {
-      await pollCommand(commandConnectionId, command.id, {
-        timeoutSeconds: 75,
-        pendingMessage: "The official Tally PDF is still being prepared. Check the connector status, then retry once it is online.",
-      });
-    } else {
-      await wait(1800);
-    }
+    const companyName = selectedCompany?.companyName ?? proposal.companyName ?? "";
+    if (!selectedConnectionId || !companyName) throw new Error("The live Tally company is not selected.");
+    return runCashDiscountLiveRequest<{ proposal: DebitNoteProposal }>({
+      connectionId: selectedConnectionId,
+      companyName,
+      operation: "create_debit_note",
+      proposal: {
+        connectionId: proposal.connectionId,
+        companyName,
+        financialYear: selectedCompany?.financialYear ?? proposal.financialYear,
+        partyLedgerName: proposal.partyLedgerName,
+        linkedInvoiceNumber: proposal.linkedInvoiceNumber,
+        recoverableAmount: proposal.recoverableAmount,
+      },
+      onProgress: (text) => setMessage({ tone: "info", text }),
+    });
   }
 
   async function approveProposal(proposal: DebitNoteProposal) {
@@ -837,10 +767,8 @@ export function CollectionsDashboardPage({
       setMessage({ tone: "info", text: "Creating debit note in Tally..." });
       await createDebitNoteForProposal(proposal);
       if (selectedConnectionId) {
-        await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
-        await loadDashboard(selectedConnectionId, selectedCompany?.companyName);
-      } else {
-        await loadDashboard();
+        const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
+        setDashboard(nextDashboard);
       }
       setActiveView("done");
       setMessage({ tone: "success", text: "Debit note created in Tally." });
@@ -897,7 +825,10 @@ export function CollectionsDashboardPage({
     } else if (!payload.ready) {
       throw new Error("The native Tally PDF export could not be started.");
     }
-    await loadDashboard(selectedConnectionId, selectedCompany?.companyName);
+    if (selectedConnectionId) {
+      const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
+      setDashboard(nextDashboard);
+    }
     return { ...(payload.proposal ?? proposal), nativeTallyPdfVerified: true };
   }
 
@@ -1020,10 +951,12 @@ export function CollectionsDashboardPage({
       setWhatsappDialogProposals([]);
       setWhatsappPhoneInputs({});
       setSelectedCreatedIds(new Set());
-      await loadDashboard();
+      if (selectedConnectionId) {
+        const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
+        setDashboard(nextDashboard);
+      }
     } catch (error) {
       setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not send WhatsApp message." });
-      await loadDashboard().catch(() => undefined);
     } finally {
       setWhatsappDialogSending(false);
       setBulkSendingWhatsapp(false);
@@ -1071,18 +1004,23 @@ export function CollectionsDashboardPage({
       try {
         // A company switch must read a new live snapshot. Loading the old saved
         // scan here can show bills belonging to the previously selected company.
-        await refreshTallyOpenBills(selectedConnectionId, company?.companyName);
-        await loadDashboard(selectedConnectionId, company?.companyName);
+        const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, company?.companyName);
+        setDashboard(nextDashboard);
+        setMessage(null);
       } catch (error) {
         setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
       } finally {
         setLoading(false);
       }
     })();
-  }, [liveTallyConnection, loadDashboard, refreshTallyOpenBills, selectedCompany, selectedConnectionId]);
+  }, [liveTallyConnection, refreshTallyOpenBills, selectedCompany, selectedConnectionId]);
 
   const proposals = dashboard?.tabs?.debitNoteQueue ?? [];
-  const paymentFollowUps = dashboard?.tabs?.paymentFollowUps ?? [];
+  const paymentFollowUps = useMemo(() => dashboard?.tabs?.paymentFollowUps ?? [], [dashboard]);
+  const sortedPaymentFollowUps = useMemo(
+    () => sortPaymentFollowUpRows(paymentFollowUps, paymentFollowUpSort),
+    [paymentFollowUpSort, paymentFollowUps]
+  );
   const narrationAnalysis = dashboard?.narrationAnalysis ?? [];
 
   const activeTallyCompanyName = liveTallyConnection?.lastCompanyName?.trim() ?? "";
@@ -1117,7 +1055,7 @@ export function CollectionsDashboardPage({
     selectableCreatedProposals.length > 0 && selectableCreatedProposals.every((proposal) => selectedCreatedIds.has(proposal.id));
   const pendingRecoverableTotal = sumRecoverable(pendingProposals);
   const createdRecoverableTotal = sumRecoverable(createdProposals);
-  const paymentFollowUpTotal = paymentFollowUps.reduce((total, item) => total + (Number(item.totalPayableAmount) || 0), 0);
+  const paymentFollowUpTotal = paymentFollowUps.reduce((total, item) => total + (Number(item.outstandingAmount) || 0), 0);
   const companyReady = tallyCompanyVerified;
   const whatsappDialogMissingCount = whatsappDialogProposals.filter((proposal) => !proposal.partyPhone).length;
   const allPhonesValid = whatsappDialogProposals.every((proposal) => {
@@ -1184,17 +1122,14 @@ export function CollectionsDashboardPage({
         await createDebitNoteForProposal(proposal);
       }
       if (selectedConnectionId) {
-        await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
-        await loadDashboard(selectedConnectionId, selectedCompany?.companyName);
-      } else {
-        await loadDashboard();
+        const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
+        setDashboard(nextDashboard);
       }
       setSelectedPendingIds(new Set());
       setActiveView("done");
       setMessage({ tone: "success", text: `${selectedPendingProposals.length} debit notes created in Tally.` });
     } catch (error) {
       setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not create selected debit notes." });
-      await loadDashboard().catch(() => undefined);
     } finally {
       setApprovingId("");
       setBulkCreating(false);
@@ -1212,13 +1147,15 @@ export function CollectionsDashboardPage({
         <div>
           <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200/50 text-[10px] font-bold uppercase tracking-wider text-amber-800">
             <Sparkles className="h-3 w-3 text-amber-600 animate-spin duration-3000" />
-            Collections Ledgers
+            {isDedicatedFollowUpsPage ? "Customer Collections" : "Collections Ledgers"}
           </div>
           <h1 className="text-3xl font-black tracking-tight text-[#1a1a1a] mt-2 flex items-center gap-2">
-            Cash Discounts
+            {isDedicatedFollowUpsPage ? "Payment Follow-ups" : "Cash Discounts"}
           </h1>
           <p className="text-xs font-semibold text-slate-500 mt-1">
-            Review, track, and post debit notes for missed cash discounts.
+            {isDedicatedFollowUpsPage
+              ? "Review overdue customer payments and prioritize collection follow-ups."
+              : "Review, track, and post debit notes for missed cash discounts."}
           </p>
         </div>
 
@@ -1365,20 +1302,13 @@ export function CollectionsDashboardPage({
       ) : null}
 
       {!companyContextLocked && showWorkflowSummary ? <section className="mb-6">
-        <div className="grid gap-4 md:grid-cols-3">
+        <div className="grid gap-4 md:grid-cols-2">
           <WorkflowButton
             active={activeView === "needsAction"}
             count={pendingProposals.length}
             detail={`${formatMoney(pendingRecoverableTotal)} recoverable`}
             label="To create"
             onClick={() => chooseView("needsAction")}
-          />
-          <WorkflowButton
-            active={activeView === "followUps"}
-            count={paymentFollowUps.length}
-            detail={`${formatMoney(paymentFollowUpTotal)} outstanding`}
-            label="Payment follow-ups"
-            onClick={() => chooseView("followUps")}
           />
           <WorkflowButton
             active={activeView === "done"}
@@ -1416,8 +1346,8 @@ export function CollectionsDashboardPage({
             </EmptyState>
           ) : (
             <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm">
-              <div className="hidden max-h-[calc(100vh-430px)] overflow-auto lg:block">
-                <table className="w-full min-w-[1040px] table-fixed border-collapse text-left">
+              <div className="hidden max-h-[calc(100vh-430px)] overflow-y-auto xl:block">
+                <table className="w-full table-fixed border-collapse text-left">
                   <thead className="sticky top-0 z-10 bg-[#fcfbfa]">
                     <tr className="border-b border-[#e5ddd0] text-[10px] font-bold uppercase tracking-wider text-slate-400">
                       <th className="w-10 px-4 py-3.5 bg-[#fcfbfa]">
@@ -1430,12 +1360,12 @@ export function CollectionsDashboardPage({
                           type="checkbox"
                         />
                       </th>
-                      <th className="w-1/5 px-4 py-3.5 bg-[#fcfbfa]">Customer</th>
-                      <th className="w-[22%] px-4 py-3.5 bg-[#fcfbfa]">Invoice</th>
-                      <th className="w-[28%] px-4 py-3.5 bg-[#fcfbfa]">Why now</th>
-                      <th className="w-32 px-4 py-3.5 text-right bg-[#fcfbfa]">Discount reversal</th>
-                      <th className="w-28 px-4 py-3.5 bg-[#fcfbfa]">Status</th>
-                      <th className="w-52 px-4 py-3.5 text-right bg-[#fcfbfa]">Action</th>
+                      <th className="w-[15%] px-3 py-3.5 bg-[#fcfbfa]">Customer</th>
+                      <th className="w-[16%] px-3 py-3.5 bg-[#fcfbfa]">Invoice</th>
+                      <th className="w-[27%] px-3 py-3.5 bg-[#fcfbfa]">Why now</th>
+                      <th className="w-[105px] px-3 py-3.5 text-right bg-[#fcfbfa]">Discount reversal</th>
+                      <th className="w-[88px] px-3 py-3.5 bg-[#fcfbfa]">Status</th>
+                      <th className="w-[145px] px-3 py-3.5 text-right bg-[#fcfbfa]">Action</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
@@ -1446,7 +1376,7 @@ export function CollectionsDashboardPage({
 
                       return (
                         <tr className="align-top hover:bg-[#fcfbfa]/60 transition-colors" key={proposal.id}>
-                          <td className="px-4 py-4">
+                          <td className="px-3 py-4">
                             <input
                               aria-label={`Select debit note for ${proposal.partyLedgerName}`}
                               checked={selectedPendingIds.has(proposal.id)}
@@ -1456,7 +1386,7 @@ export function CollectionsDashboardPage({
                               type="checkbox"
                             />
                           </td>
-                          <td className="px-4 py-4">
+                          <td className="px-3 py-4">
                             <div className="break-words text-sm font-semibold leading-snug text-[#1a1a1a]" title={proposal.partyLedgerName}>
                               {proposal.partyLedgerName}
                             </div>
@@ -1466,7 +1396,7 @@ export function CollectionsDashboardPage({
                               </div>
                             ) : null}
                           </td>
-                          <td className="px-4 py-4">
+                          <td className="px-3 py-4">
                             <div className="break-words text-sm font-semibold leading-snug text-[#1a1a1a]" title={proposal.linkedInvoiceNumber ?? ""}>
                               {shortText(proposal.linkedInvoiceNumber, "No invoice")}
                             </div>
@@ -1482,7 +1412,7 @@ export function CollectionsDashboardPage({
                               ) : null}
                             </div>
                           </td>
-                          <td className="px-4 py-4">
+                          <td className="px-3 py-4">
                             <div className="text-sm font-semibold text-[#1a1a1a]">{issueLabel(proposal)}</div>
                             <div className="mt-1 text-[11px] leading-relaxed text-slate-500">{whyNowSummary(proposal, lateByDays)}</div>
                             {proposal.cashDiscountAnalysis ? (
@@ -1529,20 +1459,20 @@ export function CollectionsDashboardPage({
                               </div>
                             ) : null}
                           </td>
-                          <td className="px-4 py-4 text-right">
+                          <td className="px-3 py-4 text-right">
                             <div className="tabular-nums text-sm font-semibold text-[#1a1a1a]">{formatMoney(displayAmount)}</div>
                             <div className="mt-1 text-[11px] font-medium text-slate-400">
                               {expiredDiscountLabel(proposal)}
                             </div>
                           </td>
-                          <td className="px-4 py-4">
+                          <td className="px-3 py-4">
                             <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${statusClass(proposal.status)}`}>
                               {actionStatusLabel(proposal)}
                             </span>
                           </td>
-                          <td className="px-4 py-4 text-right">
+                          <td className="px-3 py-4 text-right">
                             <button
-                              className="inline-flex min-h-9 min-w-[150px] items-center justify-center gap-1.5 whitespace-nowrap rounded-xl bg-[#2d2d2d] px-4 py-2 text-xs font-bold leading-none text-white shadow-sm transition-all hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
+                              className="inline-flex min-h-9 w-full min-w-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-xl bg-[#2d2d2d] px-2 py-2 text-[11px] font-bold leading-none text-white shadow-sm transition-all hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
                               disabled={!createEnabled || approvingId === proposal.id}
                               onClick={() => {
                                 if (createEnabled) void approveProposal(proposal);
@@ -1563,7 +1493,7 @@ export function CollectionsDashboardPage({
                   </tbody>
                 </table>
               </div>
-              <div className="divide-y divide-[#e5ddd0] lg:hidden">
+              <div className="divide-y divide-[#e5ddd0] xl:hidden">
                 {pendingProposals.map((proposal) => {
                   const createEnabled = tallyCompanyVerified && canCreateInTally(proposal);
                   const lateByDays = daysPast(proposal.discountDeadline);
@@ -1642,27 +1572,44 @@ export function CollectionsDashboardPage({
 
       {!companyContextLocked && activeView === "followUps" ? (
         <Section
-          description={`${formatMoney(paymentFollowUpTotal)} remains outstanding. Rows flag any debit note that must be created before collection.`}
+          action={
+            <label className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              Sort
+              <select
+                aria-label="Sort payment follow-ups"
+                className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold normal-case tracking-normal text-[#1a1a1a] outline-none transition focus:border-amber-400 focus:ring-2 focus:ring-amber-100"
+                onChange={(event) => setPaymentFollowUpSort(event.target.value as PaymentFollowUpSort)}
+                value={paymentFollowUpSort}
+              >
+                <option value="priority">Priority</option>
+                <option value="most_overdue">Most overdue</option>
+                <option value="highest_outstanding">Highest outstanding</option>
+                <option value="oldest_invoice">Oldest invoice</option>
+                <option value="customer">Customer name</option>
+              </select>
+            </label>
+          }
+          description={`${formatMoney(paymentFollowUpTotal)} pending across bills at least 7 days overdue, or 7 days old when the due date is missing.`}
           title="Payment follow-ups"
         >
           {paymentFollowUps.length === 0 ? (
             <EmptyState>There are no payments to follow up from the latest Tally scan.</EmptyState>
           ) : (
             <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm">
-              <div className="hidden max-h-[calc(100vh-430px)] overflow-auto lg:block">
-                <table className="w-full min-w-[980px] table-fixed border-collapse text-left">
+              <div className="hidden max-h-[calc(100vh-430px)] overflow-y-auto xl:block">
+                <table className="w-full table-fixed border-collapse text-left">
                   <thead className="sticky top-0 z-10 bg-[#fcfbfa]">
                     <tr className="border-b border-[#e5ddd0] text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                      <th className="w-[18%] px-4 py-3.5 bg-[#fcfbfa]">Customer</th>
-                      <th className="w-[20%] px-4 py-3.5 bg-[#fcfbfa]">Invoice</th>
-                      <th className="w-36 px-4 py-3.5 text-right bg-[#fcfbfa]">Outstanding</th>
-                      <th className="w-[23%] px-4 py-3.5 bg-[#fcfbfa]">Discount position</th>
-                      <th className="w-[25%] px-4 py-3.5 bg-[#fcfbfa]">Next follow-up</th>
-                      <th className="w-36 px-4 py-3.5 bg-[#fcfbfa]">Status</th>
+                      <th className="w-[16%] px-3 py-3.5 bg-[#fcfbfa]">Customer</th>
+                      <th className="w-[17%] px-3 py-3.5 bg-[#fcfbfa]">Invoice</th>
+                      <th className="w-[112px] px-3 py-3.5 text-right bg-[#fcfbfa]">Outstanding</th>
+                      <th className="w-[18%] px-3 py-3.5 bg-[#fcfbfa]">Payment age</th>
+                      <th className="w-[24%] px-3 py-3.5 bg-[#fcfbfa]">Next action</th>
+                      <th className="w-[118px] px-3 py-3.5 bg-[#fcfbfa]">Status</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
-                    {paymentFollowUps.map((followUp) => {
+                    {sortedPaymentFollowUps.map((followUp) => {
                       const defaultPeriodApplied = followUp.terms.some((term) => term.periodSource === "default");
                       return (
                         <tr className="align-top transition-colors hover:bg-[#fcfbfa]/60" key={followUp.id}>
@@ -1685,57 +1632,26 @@ export function CollectionsDashboardPage({
                           </td>
                           <td className="px-4 py-4 text-right">
                             <div className="tabular-nums text-sm font-semibold text-[#1a1a1a]">{formatMoney(followUp.outstandingAmount)}</div>
-                            {Math.abs(followUp.totalPayableAmount - followUp.outstandingAmount) > 0.01 ? (
-                              <div className="mt-1 text-[11px] font-semibold text-amber-700">
-                                After reversal {formatMoney(followUp.totalPayableAmount)}
-                              </div>
-                            ) : null}
                             {followUp.amountReceived > 0 ? (
                               <div className="mt-1 text-[11px] font-medium text-slate-400">Received {formatMoney(followUp.amountReceived)}</div>
                             ) : null}
                           </td>
-                          <td className="px-4 py-4">
-                            {followUp.reversalPlan ? (
-                              <>
-                                <div className="font-semibold text-[#1a1a1a]">
-                                  Gross basis {formatMoney(followUp.reversalPlan.grossInvoiceAmount)}
-                                </div>
-                                <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
-                                  Initially net after {followUp.reversalPlan.initialDiscount.ratePercent}%.
-                                  {followUp.currentDiscount
-                                    ? ` ${followUp.currentDiscount.ratePercent}% remains until ${formatDate(followUp.currentDiscount.discountDeadline)}.`
-                                    : " All discount tiers have expired."}
-                                </div>
-                                {followUp.pendingTierReversalAmount > 0 ? (
-                                  <div className="mt-1 text-[11px] font-semibold text-amber-700">
-                                    Debit note to create {formatMoney(followUp.pendingTierReversalAmount)}
-                                  </div>
-                                ) : followUp.createdTierReversalAmount > 0 ? (
-                                  <div className="mt-1 text-[11px] font-semibold text-emerald-700">
-                                    Debit note created {formatMoney(followUp.createdTierReversalAmount)}
-                                  </div>
-                                ) : null}
-                              </>
-                            ) : followUp.currentDiscount ? (
-                              <>
-                                <div className="font-semibold text-sky-800">
-                                  {followUp.currentDiscount.ratePercent}% available until {formatDate(followUp.currentDiscount.discountDeadline)}
-                                </div>
-                                <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
-                                  Discount {formatMoney(followUp.currentDiscount.discountAmount)}
-                                  {followUp.paymentAmountIfPaidToday !== null
-                                    ? ` · Payable now ${formatMoney(followUp.paymentAmountIfPaidToday)}`
-                                    : ""}
-                                </div>
-                              </>
-                            ) : (
-                              <>
-                                <div className="font-semibold text-[#1a1a1a]">{followUp.termsLabel || "No discount terms"}</div>
-                                <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
-                                  {followUp.discountDeadline ? `Final window ended ${formatDate(followUp.discountDeadline)}` : "Full outstanding amount is due"}
-                                </div>
-                              </>
-                            )}
+                          <td className="px-3 py-4">
+                            <div className={`font-bold ${followUp.ageBasis === "missing_dates" ? "text-violet-700" : followUp.ageBasis === "due_date" ? "text-red-700" : "text-amber-700"}`}>
+                              {followUp.ageLabel}
+                            </div>
+                            <div className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                              {followUp.ageBasis === "due_date"
+                                ? `Due ${formatDate(followUp.dueDate)}`
+                                : followUp.ageBasis === "invoice_date"
+                                  ? "Due date missing · invoice age used"
+                                  : "Confirm invoice and due dates"}
+                            </div>
+                            {followUp.currentDiscount ? (
+                              <div className="mt-2 text-[10px] font-semibold text-emerald-700">
+                                Cash discount {followUp.currentDiscount.ratePercent}% until {formatDate(followUp.currentDiscount.discountDeadline)}
+                              </div>
+                            ) : null}
                           </td>
                           <td className="px-4 py-4">
                             <div className="text-sm font-semibold text-[#1a1a1a]">{followUp.title}</div>
@@ -1747,8 +1663,8 @@ export function CollectionsDashboardPage({
                             ) : null}
                           </td>
                           <td className="px-4 py-4">
-                            <span className={`inline-flex rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${followUpStatusClass(followUp.kind)}`}>
-                              {followUpStatusLabel(followUp.kind)}
+                            <span className={`inline-flex rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${followUpStatusClass(followUp.followUpStatus)}`}>
+                              {followUpStatusLabel(followUp.followUpStatus)}
                             </span>
                           </td>
                         </tr>
@@ -1757,8 +1673,8 @@ export function CollectionsDashboardPage({
                   </tbody>
                 </table>
               </div>
-              <div className="divide-y divide-[#e5ddd0] lg:hidden">
-                {paymentFollowUps.map((followUp) => {
+              <div className="divide-y divide-[#e5ddd0] xl:hidden">
+                {sortedPaymentFollowUps.map((followUp) => {
                   const defaultPeriodApplied = followUp.terms.some((term) => term.periodSource === "default");
                   return (
                     <article className="p-4 sm:p-5" key={followUp.id}>
@@ -1769,8 +1685,8 @@ export function CollectionsDashboardPage({
                             {followUp.partyPhone ? "WhatsApp ready" : followUp.partyEmail ? "Email only" : "No contact"}
                           </div>
                         </div>
-                        <span className={`shrink-0 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${followUpStatusClass(followUp.kind)}`}>
-                          {followUpStatusLabel(followUp.kind)}
+                        <span className={`shrink-0 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${followUpStatusClass(followUp.followUpStatus)}`}>
+                          {followUpStatusLabel(followUp.followUpStatus)}
                         </span>
                       </div>
 
@@ -1784,26 +1700,29 @@ export function CollectionsDashboardPage({
                         <div className="min-w-0 sm:text-right">
                           <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Outstanding</dt>
                           <dd className="mt-1 tabular-nums text-sm font-extrabold text-[#1a1a1a]">{formatMoney(followUp.outstandingAmount)}</dd>
-                          {Math.abs(followUp.totalPayableAmount - followUp.outstandingAmount) > 0.01 ? (
-                            <dd className="mt-1 text-[11px] font-semibold text-amber-700">After reversal {formatMoney(followUp.totalPayableAmount)}</dd>
-                          ) : null}
                           {followUp.amountReceived > 0 ? <dd className="mt-1 text-[11px] text-slate-400">Received {formatMoney(followUp.amountReceived)}</dd> : null}
                         </div>
                       </dl>
 
                       <div className="mt-3 grid gap-3">
                         <div>
-                          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Discount position</div>
-                          <div className="mt-1 text-xs font-semibold leading-relaxed text-[#1a1a1a]">
-                            {followUp.reversalPlan
-                              ? `Gross basis ${formatMoney(followUp.reversalPlan.grossInvoiceAmount)}. ${followUp.currentDiscount ? `${followUp.currentDiscount.ratePercent}% remains until ${formatDate(followUp.currentDiscount.discountDeadline)}.` : "All discount tiers have expired."}`
-                              : followUp.currentDiscount
-                                ? `${followUp.currentDiscount.ratePercent}% available until ${formatDate(followUp.currentDiscount.discountDeadline)}`
-                                : followUp.termsLabel || "No discount terms"}
+                          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Payment age</div>
+                          <div className={`mt-1 text-xs font-bold leading-relaxed ${followUp.ageBasis === "missing_dates" ? "text-violet-700" : followUp.ageBasis === "due_date" ? "text-red-700" : "text-amber-700"}`}>
+                            {followUp.ageLabel}
                           </div>
+                          <div className="mt-1 text-[11px] text-slate-500">
+                            {followUp.ageBasis === "due_date"
+                              ? `Due ${formatDate(followUp.dueDate)}`
+                              : followUp.ageBasis === "invoice_date"
+                                ? "Due date missing · invoice age used"
+                                : "Confirm invoice and due dates"}
+                          </div>
+                          {followUp.currentDiscount ? (
+                            <div className="mt-1 text-[11px] font-semibold text-emerald-700">Cash discount {followUp.currentDiscount.ratePercent}% until {formatDate(followUp.currentDiscount.discountDeadline)}</div>
+                          ) : null}
                         </div>
                         <div className="rounded-xl bg-[#fcfbfa] px-3 py-2.5">
-                          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Next follow-up</div>
+                          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Next action</div>
                           <div className="mt-1 text-xs font-bold text-[#1a1a1a]">{followUp.title}</div>
                           <div className="mt-1 text-[11px] leading-relaxed text-slate-500">{followUp.nextAction}</div>
                           {followUp.termsLabel ? <div className="mt-1 text-[11px] font-semibold text-emerald-700">{defaultPeriodApplied ? "Deterministic terms · default period applied" : "Deterministic terms from Tally narration"}</div> : null}
@@ -1840,8 +1759,8 @@ export function CollectionsDashboardPage({
             <EmptyState>Nothing completed yet.</EmptyState>
           ) : (
             <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm">
-              <div className="hidden max-h-[calc(100vh-430px)] overflow-auto lg:block">
-                <table className="w-full min-w-[1000px] table-fixed border-collapse text-left">
+              <div className="hidden max-h-[calc(100vh-430px)] overflow-y-auto xl:block">
+                <table className="w-full table-fixed border-collapse text-left">
                   <thead className="sticky top-0 z-10 bg-[#fcfbfa]">
                     <tr className="border-b border-[#e5ddd0] text-[10px] font-bold uppercase tracking-wider text-slate-400">
                       <th className="w-10 px-4 py-3.5 bg-[#fcfbfa]">
@@ -1854,12 +1773,12 @@ export function CollectionsDashboardPage({
                           type="checkbox"
                         />
                       </th>
-                      <th className="w-1/5 px-4 py-3.5 bg-[#fcfbfa]">Customer</th>
-                      <th className="w-[18%] px-4 py-3.5 bg-[#fcfbfa]">Debit note</th>
-                      <th className="w-1/5 px-4 py-3.5 bg-[#fcfbfa]">Linked invoice</th>
-                      <th className="w-32 px-4 py-3.5 text-right bg-[#fcfbfa]">Amount</th>
-                      <th className="w-36 px-4 py-3.5 bg-[#fcfbfa]">Result</th>
-                      <th className="w-56 px-4 py-3.5 text-right bg-[#fcfbfa]">Message</th>
+                      <th className="w-[16%] px-3 py-3.5 bg-[#fcfbfa]">Customer</th>
+                      <th className="w-[12%] px-3 py-3.5 bg-[#fcfbfa]">Debit note</th>
+                      <th className="w-[17%] px-3 py-3.5 bg-[#fcfbfa]">Linked invoice</th>
+                      <th className="w-[92px] px-3 py-3.5 text-right bg-[#fcfbfa]">Amount</th>
+                      <th className="w-[108px] px-3 py-3.5 bg-[#fcfbfa]">Result</th>
+                      <th className="w-[224px] px-3 py-3.5 text-right bg-[#fcfbfa]">Message</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
@@ -1870,7 +1789,7 @@ export function CollectionsDashboardPage({
 
                       return (
                         <tr className="align-top hover:bg-[#fcfbfa]/60 transition-colors" key={proposal.id}>
-                          <td className="px-4 py-4">
+                          <td className="px-3 py-4">
                             <input
                               aria-label={`Select WhatsApp for ${proposal.partyLedgerName}`}
                               checked={selectedCreatedIds.has(proposal.id)}
@@ -1880,13 +1799,13 @@ export function CollectionsDashboardPage({
                               type="checkbox"
                             />
                           </td>
-                          <td className="px-4 py-4">
+                          <td className="px-3 py-4">
                             <div className="break-words text-sm font-semibold leading-snug text-[#1a1a1a]" title={proposal.partyLedgerName}>
                               {proposal.partyLedgerName}
                             </div>
                             <ContactMeta proposal={proposal} />
                           </td>
-                          <td className="px-4 py-4">
+                          <td className="px-3 py-4">
                             <div className="break-words text-sm font-semibold leading-snug text-[#1a1a1a]" title={proposal.tallyVoucherNumber ?? ""}>
                               {shortText(proposal.tallyVoucherNumber, "Debit note created")}
                             </div>
@@ -1894,7 +1813,7 @@ export function CollectionsDashboardPage({
                               {formatDate(proposal.createdInTallyAt ?? proposal.tallyVoucherDate)}
                             </div>
                           </td>
-                          <td className="px-4 py-4">
+                          <td className="px-3 py-4">
                             <div className="break-words text-sm font-semibold leading-snug text-[#1a1a1a]">{shortText(proposal.linkedInvoiceNumber, "No invoice")}</div>
                             <div className="mt-1 text-[11px] text-slate-500">{formatDate(proposal.linkedInvoiceDate)}</div>
                             <div className="mt-1.5 flex flex-wrap gap-1.5 text-[11px]">
@@ -1908,15 +1827,15 @@ export function CollectionsDashboardPage({
                               ) : null}
                             </div>
                           </td>
-                          <td className="px-4 py-4 text-right tabular-nums text-sm font-semibold text-[#1a1a1a]">
+                          <td className="px-3 py-4 text-right tabular-nums text-sm font-semibold text-[#1a1a1a]">
                             {formatMoney(proposal.recoverableAmount)}
                           </td>
-                          <td className="px-4 py-4">
+                          <td className="px-3 py-4">
                             <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${statusClass(proposal.status)}`}>
                               Created in Tally
                             </span>
                           </td>
-                          <td className="px-4 py-4 text-right">
+                          <td className="px-3 py-4 text-right">
                             <div className="flex items-center justify-end gap-2.5">
                               <span
                                 className={`hidden rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider lg:inline-flex ${messageStatusClass(proposal.communicationStatus)}`}
@@ -1955,7 +1874,7 @@ export function CollectionsDashboardPage({
                   </tbody>
                 </table>
               </div>
-              <div className="divide-y divide-[#e5ddd0] lg:hidden">
+              <div className="divide-y divide-[#e5ddd0] xl:hidden">
                 {createdProposals.map((proposal) => {
                   const canMessage = proposal.communicationStatus !== "sent" || needsUpdatedPdfDelivery(proposal);
                   const sending = sendingWhatsappId === proposal.id;

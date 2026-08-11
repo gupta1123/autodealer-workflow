@@ -6,10 +6,27 @@ import {
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
   findBankLedgersFromMasters,
+  findPartyLedgersFromMasters,
   parseTallyImportResult,
   purchaseVoucherReadbackComparison,
   strictBankTransactionCandidates,
 } from "./bridge.mjs";
+
+test("cash discount includes ledgers nested under Sundry Debtors subgroups", () => {
+  const ledgers = [
+    { name: "Direct Customer", parent: "Sundry Debtors" },
+    { name: "Dealer Customer", parent: "North Dealers" },
+    { name: "Supplier", parent: "Sundry Creditors" },
+  ];
+  const groups = [
+    { name: "North Dealers", parent: "Dealers" },
+    { name: "Dealers", parent: "Sundry Debtors" },
+  ];
+  assert.deepEqual(
+    findPartyLedgersFromMasters(ledgers, groups, "Sundry Debtors").map((ledger) => ledger.name),
+    ["Direct Customer", "Dealer Customer"]
+  );
+});
 
 function bankVoucher({ reference = "", party = "Customer A" } = {}) {
   return {

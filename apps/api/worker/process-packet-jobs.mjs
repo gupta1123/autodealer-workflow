@@ -62,6 +62,30 @@ const OPENROUTER_BANK_LEDGER_MODEL =
   process.env.OPENROUTER_BANK_LEDGER_MODEL || "deepseek/deepseek-v4-pro";
 const execFileAsync = promisify(execFile);
 const WORKER_IDLE_LOG_INTERVAL_MS = Number(process.env.WORKER_IDLE_LOG_INTERVAL_MS ?? 30_000);
+const PDF_IMAGE_RENDER_SCRIPT = String.raw`
+import sys
+from pathlib import Path
+
+try:
+    import fitz
+except Exception:
+    sys.exit(7)
+
+input_path = Path(sys.argv[1])
+output_prefix = Path(sys.argv[2])
+dpi = max(72, int(sys.argv[3]))
+start_page = max(1, int(sys.argv[4]))
+end_page = max(start_page, int(sys.argv[5]))
+
+document = fitz.open(str(input_path))
+last_page = min(end_page, document.page_count)
+matrix = fitz.Matrix(dpi / 72, dpi / 72)
+for page_number in range(start_page, last_page + 1):
+    page = document.load_page(page_number - 1)
+    pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+    pixmap.save(str(output_prefix.parent / f"{output_prefix.name}-{page_number}.png"))
+document.close()
+`;
 
 function resolvePdfJsWorkerSrc() {
   const candidates = [
@@ -533,17 +557,58 @@ async function renderBankStatementPdfToImages(data, sourceName, options = {}) {
 
   try {
     fs.writeFileSync(inputPath, Buffer.from(data));
-    await execFileAsync("pdftoppm", [
-      "-r",
-      String(BANK_STATEMENT_PDF_RENDER_DPI),
-      "-png",
-      "-f",
-      String(startPage),
-      "-l",
-      String(endPage),
-      inputPath,
-      outputPrefix,
-    ]);
+    try {
+      await execFileAsync("pdftoppm", [
+        "-r",
+        String(BANK_STATEMENT_PDF_RENDER_DPI),
+        "-png",
+        "-f",
+        String(startPage),
+        "-l",
+        String(endPage),
+        inputPath,
+        outputPrefix,
+      ]);
+    } catch (popplerError) {
+      const configuredPython = process.env.KALIKA_PDF_PYTHON_BIN?.trim();
+      const pythonCandidates = [
+        ...(configuredPython ? [{ command: configuredPython, prefixArgs: [] }] : []),
+        ...(process.platform === "win32"
+          ? [
+              { command: "py", prefixArgs: ["-3"] },
+              { command: "python", prefixArgs: [] },
+              { command: "python3", prefixArgs: [] },
+            ]
+          : [
+              { command: "python3", prefixArgs: [] },
+              { command: "python", prefixArgs: [] },
+            ]),
+      ];
+      let renderedWithPython = false;
+      const attempted = new Set();
+      for (const candidate of pythonCandidates) {
+        const key = `${candidate.command}\u0000${candidate.prefixArgs.join("\u0000")}`;
+        if (attempted.has(key)) continue;
+        attempted.add(key);
+        try {
+          await execFileAsync(candidate.command, [
+            ...candidate.prefixArgs,
+            "-c",
+            PDF_IMAGE_RENDER_SCRIPT,
+            inputPath,
+            outputPrefix,
+            String(BANK_STATEMENT_PDF_RENDER_DPI),
+            String(startPage),
+            String(endPage),
+          ]);
+          renderedWithPython = true;
+          break;
+        } catch {
+          // Try the next Python interpreter before reporting the Poppler failure.
+        }
+      }
+      if (!renderedWithPython) throw popplerError;
+    }
 
     const pageFileNames = fs
       .readdirSync(tmpDir)
@@ -1043,7 +1108,7 @@ async function extractBankStatementTextBatches(fileName, pages, jobId) {
         status: parsed.transactions.length > 0 ? "succeeded" : "empty",
         rowCount: parsed.transactions.length,
       };
-      if (parsed.transactions.length === 0 && hasLikelyRows) {
+      if (parsed.transactions.length === 0) {
         failedBatches.push({ pages: batch, reason: "empty" });
       }
       const completed = diagnostics.filter(Boolean).length;
@@ -1115,7 +1180,14 @@ async function extractBankStatementImageBatches(fileName, bytes, pageCount, jobI
   };
 }
 
-async function recoverSinglePages({ fileName, bytes, textPagesByNumber, failedBatches, jobId }) {
+async function recoverSinglePages({
+  fileName,
+  bytes,
+  textPagesByNumber,
+  failedBatches,
+  jobId,
+  forceRenderedImages = false,
+}) {
   const pageMap = new Map();
   for (const batch of failedBatches) {
     for (const page of batch.pages) {
@@ -1126,7 +1198,12 @@ async function recoverSinglePages({ fileName, bytes, textPagesByNumber, failedBa
     }
   }
   const pages = [...pageMap.values()]
-    .filter((page) => likelyHasTransactionRows(page) || !String(page.text || "").trim())
+    .filter(
+      (page) =>
+        forceRenderedImages ||
+        likelyHasTransactionRows(page) ||
+        !String(page.text || "").trim()
+    )
     .slice(0, BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT);
   if (pages.length === 0) {
     return { parsed: normalizeAiBankStatement({}), diagnostics: [] };
@@ -1136,7 +1213,7 @@ async function recoverSinglePages({ fileName, bytes, textPagesByNumber, failedBa
   const results = await runWithConcurrency(pages, BANK_STATEMENT_BATCH_CONCURRENCY, async (page, index) => {
     try {
       const parsed = await callWithBatchRetries(`recovery page ${page.pageNumber}`, async () => {
-        if (String(page.text || "").trim()) {
+        if (!forceRenderedImages && String(page.text || "").trim()) {
           return extractBankStatementFromTextBatch(fileName, [page]);
         }
         const images = await renderBankStatementPdfToImages(bytes, fileName, {
@@ -1153,7 +1230,9 @@ async function recoverSinglePages({ fileName, bytes, textPagesByNumber, failedBa
       const completed = diagnostics.filter(Boolean).length;
       await updateBankJob(jobId, {
         progress: Math.min(74, 70 + Math.round((completed / Math.max(1, pages.length)) * 4)),
-        stage: `Recovering difficult pages ${completed}/${pages.length}`,
+        stage: forceRenderedImages
+          ? `Checking rendered pages ${completed}/${pages.length}`
+          : `Recovering difficult pages ${completed}/${pages.length}`,
       });
       return parsed;
     } catch (error) {
@@ -1178,6 +1257,7 @@ async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, 
     batchConcurrency: BANK_STATEMENT_BATCH_CONCURRENCY,
     batches: [],
     recovery: [],
+    recoveryMode: null,
     errors: [],
   };
   let parsed = null;
@@ -1238,7 +1318,8 @@ async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, 
   try {
     await updateBankJob(jobId, { progress: 35, stage: "Running batched AI extraction" });
     let batchResult;
-    if (hasUsableBankStatementText(textPages)) {
+    const usedTextBatches = hasUsableBankStatementText(textPages);
+    if (usedTextBatches) {
       batchResult = await extractBankStatementTextBatches(fileName, textPages, jobId);
       extractionSource = "batched_ai_pdf_text";
     } else {
@@ -1251,17 +1332,30 @@ async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, 
     parsed = batchResult.parsed;
 
     if (batchResult.failedBatches.length > 0 && BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT > 0) {
-      await updateBankJob(jobId, { progress: 70, stage: "Recovering difficult pages" });
+      const forceRenderedImages = usedTextBatches;
+      await updateBankJob(jobId, {
+        progress: 70,
+        stage: forceRenderedImages
+          ? "Retrying difficult pages as rendered images"
+          : "Recovering difficult pages",
+      });
       const recovery = await recoverSinglePages({
         fileName,
         bytes,
         textPagesByNumber,
         failedBatches: batchResult.failedBatches,
         jobId,
+        forceRenderedImages,
       });
-      diagnostics.pipeline = "single_page_recovery";
+      diagnostics.pipeline = forceRenderedImages
+        ? "rendered_image_recovery"
+        : "single_page_recovery";
+      diagnostics.recoveryMode = forceRenderedImages ? "rendered_images" : "source_content";
       diagnostics.recovery = recovery.diagnostics;
       parsed = mergeBankStatementResults([parsed, recovery.parsed]);
+      if (forceRenderedImages && recovery.parsed.transactions.length > 0) {
+        extractionSource = "single_page_ai_pdf_images";
+      }
     }
 
     if (parsed.transactions.length > 0) {
@@ -1275,7 +1369,9 @@ async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, 
   diagnostics.pipeline = "manual_review_required";
   extractionError =
     lastItem(diagnostics.errors)?.error ||
-    "No transaction rows were extracted. The file may need manual review or a clearer scan.";
+    (diagnostics.recoveryMode === "rendered_images"
+      ? "Extraction failed after checking both readable PDF text and rendered page images. Review the document or retry extraction."
+      : "No transaction rows were extracted. The file may need manual review or a clearer scan.");
   return {
     parsed: parsed ?? normalizeAiBankStatement({}),
     extractionSource: extractionSource === "none" ? "manual_review_required" : extractionSource,
@@ -1483,8 +1579,11 @@ async function runBankStatementJob(job) {
   await updateBankJob(job.id, { progress: 30, stage: "Preparing pages for AI" });
   const isPdf = mimeType.includes("pdf") || /\.pdf$/i.test(fileName);
   const isImage = mimeType.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(fileName);
+  // AI receives only the already-unlocked stored bytes and a neutral filename.
+  // User filenames such as "password-protected.pdf" can incorrectly bias model output.
+  const analysisFileName = isPdf ? "bank-statement.pdf" : fileName;
   const extraction = await extractBankStatementAdaptive({
-    fileName,
+    fileName: analysisFileName,
     mimeType,
     bytes,
     isPdf,
@@ -1571,6 +1670,8 @@ async function runBankStatementJob(job) {
       ? processingMeta.analysis
       : {};
   const completedAt = new Date().toISOString();
+  const analysisStage =
+    parsed.transactions.length > 0 ? "Statement analyzed" : "Extraction needs attention";
   const finalStatementPeriodStart = parsed.statementPeriodStart || importRow.statement_period_start || null;
   const finalStatementPeriodEnd = parsed.statementPeriodEnd || importRow.statement_period_end || null;
   const { error: importUpdateError } = await supabase
@@ -1600,7 +1701,7 @@ async function runBankStatementJob(job) {
           ...previousAnalysis,
           status: "completed",
           progress: 100,
-          stage: "Statement analyzed",
+          stage: analysisStage,
           error: null,
           statementPeriodStart: finalStatementPeriodStart,
           statementPeriodEnd: finalStatementPeriodEnd,

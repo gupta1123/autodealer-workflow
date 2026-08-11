@@ -9,6 +9,7 @@ import {
   type DebitNoteProposalRow,
 } from "@/lib/collections";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { businessDateText } from "@/lib/business-date";
 
 function isMissingTableError(error: unknown) {
   const message = error instanceof Error ? error.message : String((error as { message?: unknown })?.message ?? "");
@@ -231,7 +232,7 @@ export async function POST(request: Request) {
         toNullableText(body.narration, 1000) ??
         `Cash discount reversal against Sales Invoice ${toText(body.linkedInvoiceNumber, 120) || "-"}.`,
       gst_mode: normalizeGstMode(body.gstMode ?? body.gst_mode),
-      debit_note_date: toDateText(body.debitNoteDate ?? body.debit_note_date) ?? new Date().toISOString().slice(0, 10),
+      debit_note_date: toDateText(body.debitNoteDate ?? body.debit_note_date) ?? businessDateText(),
       status: normalizeStatus(body.status),
       tally_open_reference_name: toNullableText(body.tallyOpenReferenceName ?? body.tally_open_reference_name, 500),
       remaining_recoverable_amount: recoverableAmount,

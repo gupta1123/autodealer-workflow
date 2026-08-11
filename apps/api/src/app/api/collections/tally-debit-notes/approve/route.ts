@@ -4,6 +4,7 @@ import { analyseCashDiscountNarration } from "@/lib/cash-discount-narration";
 import { toNullableText, toNumber, toText } from "@/lib/collections";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { serializeTallyBridgeCommand, type TallyBridgeCommandRow } from "@/lib/tally/commands";
+import { businessDateText } from "@/lib/business-date";
 
 function isLiveConnection(row: { status?: string | null; last_tally_reachable?: boolean | null; last_company_loaded?: boolean | null }) {
   return row.status === "company_loaded" || (row.last_tally_reachable === true && row.last_company_loaded === true);
@@ -202,7 +203,7 @@ export async function POST(request: Request) {
     const originalAmount = toNumber(bill.originalAmount);
     const pendingAmount = toNumber(bill.pendingAmount);
     const invoiceDate = toNullableText(bill.invoiceDate, 20);
-    const today = new Date().toISOString().slice(0, 10);
+    const today = businessDateText();
     if (bill.kind === "advance" || originalAmount <= 0 || pendingAmount <= 0) {
       return jsonWithCors(request, { error: "The latest Tally bill is no longer eligible for a debit note." }, { status: 409 });
     }
@@ -335,6 +336,9 @@ export async function POST(request: Request) {
       gstMode: "finance_review",
       sourceProposal: authoritativeProposal,
     };
+    const idempotencyKey = [companyName, matchingBill.ledgerName, linkedInvoiceNumber]
+      .map((value) => normalizeCompanyName(value))
+      .join("|");
 
     const { data: commandData, error: commandError } = await supabase
       .from("tally_bridge_commands")
@@ -342,6 +346,7 @@ export async function POST(request: Request) {
         connection_id: connection.id,
         owner_user_id: user.id,
         command_type: "create_debit_note",
+        idempotency_key: idempotencyKey,
         status: "queued",
         priority: 35,
         payload: commandPayload,
@@ -349,7 +354,16 @@ export async function POST(request: Request) {
       .select("*")
       .single();
 
-    if (commandError) throw commandError;
+    if (commandError) {
+      if (commandError.code === "23505") {
+        return jsonWithCors(
+          request,
+          { error: "A debit-note command for this invoice is already pending in Tally." },
+          { status: 409 }
+        );
+      }
+      throw commandError;
+    }
 
     await supabase.from("tally_connection_events").insert({
       connection_id: connection.id,

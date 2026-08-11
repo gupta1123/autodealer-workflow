@@ -1,0 +1,289 @@
+import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { requireRequestUser } from "@/lib/api/request-auth";
+import {
+  dedupeDebitNoteProposals,
+  invoiceIdentityKey,
+  normalizeLedgerName,
+  proposalWithLedgerSnapshot,
+  readTallyOpenBills,
+  serializePaymentFollowUp,
+  serializeTallyCandidate,
+  todayText,
+  type OpenBillRow,
+  type TallyLedgerRow,
+} from "@/lib/collections-dashboard";
+import {
+  derivePaymentFollowUpTiming,
+  isCollectionOnlyPaymentFollowUp,
+  sortPaymentFollowUpsByPriority,
+} from "@/lib/payment-follow-up";
+import {
+  analyseCashDiscountNarration,
+  type CashDiscountNarrationAnalysis,
+} from "@/lib/cash-discount-narration";
+import {
+  serializeDebitNoteProposal,
+  toNumber,
+  toText,
+  type DebitNoteProposalRow,
+} from "@/lib/collections";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+
+type LiveLedger = {
+  name?: string | null;
+  parent?: string | null;
+  gstin?: string | null;
+  raw?: Record<string, unknown> | null;
+};
+
+function normalizeCompanyName(value: string | null | undefined) {
+  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function liveLedgerRow(value: LiveLedger): TallyLedgerRow | null {
+  const name = toText(value.name, 500);
+  if (!name) return null;
+  return {
+    tally_name: name,
+    parent_name: toText(value.parent, 500) || null,
+    gstin: toText(value.gstin, 32) || null,
+    raw_payload: value.raw && typeof value.raw === "object" ? value.raw : {},
+  };
+}
+
+export function OPTIONS(request: Request) {
+  return optionsWithCors(request);
+}
+
+export async function POST(request: Request) {
+  try {
+    const user = await requireRequestUser(request);
+    if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
+
+    const body = await request.json().catch(() => ({}));
+    const connectionId = toText(body.connectionId, 80);
+    const companyName = toText(body.companyName, 240);
+    const scan = body.scan && typeof body.scan === "object"
+      ? (body.scan as Record<string, unknown>)
+      : {};
+    const openBillsResult = scan.openBillsResult && typeof scan.openBillsResult === "object"
+      ? (scan.openBillsResult as Record<string, unknown>)
+      : null;
+    const ledgers = Array.isArray(scan.ledgers)
+      ? (scan.ledgers as LiveLedger[]).map(liveLedgerRow).filter((row): row is TallyLedgerRow => Boolean(row))
+      : [];
+
+    if (!connectionId || !companyName || !openBillsResult) {
+      return jsonWithCors(request, { error: "A live Tally company scan is required." }, { status: 400 });
+    }
+
+    const supabase = createSupabaseAdminClient();
+    const [{ data: connection, error: connectionError }, { data: proposalRows, error: proposalError }] =
+      await Promise.all([
+        supabase
+          .from("tally_connections")
+          .select("id, owner_user_id, status, last_company_name, last_heartbeat_at, last_tally_reachable, last_company_loaded")
+          .eq("id", connectionId)
+          .eq("owner_user_id", user.id)
+          .is("revoked_at", null)
+          .maybeSingle(),
+        supabase
+          .from("debit_note_proposals")
+          .select("*")
+          .eq("owner_user_id", user.id)
+          .eq("company_name", companyName)
+          .eq("status", "created_in_tally")
+          .order("created_at", { ascending: false })
+          .limit(500),
+      ]);
+
+    if (connectionError) throw connectionError;
+    if (proposalError) throw proposalError;
+    if (!connection) return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
+    if (
+      connection.last_tally_reachable !== true ||
+      connection.last_company_loaded !== true ||
+      normalizeCompanyName(connection.last_company_name) !== normalizeCompanyName(companyName)
+    ) {
+      return jsonWithCors(
+        request,
+        { error: `Tally is currently open to ${connection.last_company_name || "another company"}. Refresh the connection before calculating Cash Discounts.` },
+        { status: 409 }
+      );
+    }
+
+    const ledgerByName = new Map(ledgers.map((ledger) => [normalizeLedgerName(ledger.tally_name), ledger]));
+    const createdProposals = dedupeDebitNoteProposals(
+      ((proposalRows ?? []) as unknown as DebitNoteProposalRow[]).map((proposal) =>
+        proposalWithLedgerSnapshot(proposal, ledgerByName.get(normalizeLedgerName(proposal.party_ledger_name)))
+      )
+    );
+    const createdReversalByInvoice = new Map<string, number>();
+    for (const proposal of createdProposals) {
+      if (!String(proposal.reason_code || "").startsWith("cash_discount_")) continue;
+      const key = invoiceIdentityKey(proposal.party_ledger_name, proposal.linked_invoice_number);
+      createdReversalByInvoice.set(key, (createdReversalByInvoice.get(key) ?? 0) + toNumber(proposal.recoverable_amount));
+    }
+
+    const today = todayText();
+    const seenBillKeys = new Set<string>();
+    const narrationReviewRows: Array<{
+      ledgerName: string;
+      bill: OpenBillRow;
+      analysis: CashDiscountNarrationAnalysis;
+    }> = [];
+
+    for (const { ledgerName, bill } of readTallyOpenBills(openBillsResult)) {
+      const billKey = `${normalizeLedgerName(ledgerName)}|${normalizeLedgerName(bill.referenceName)}|${normalizeLedgerName(bill.voucherNumber)}`;
+      if (seenBillKeys.has(billKey)) continue;
+      seenBillKeys.add(billKey);
+      const originalAmount = toNumber(bill.originalAmount);
+      const pendingAmount = toNumber(bill.pendingAmount);
+      const invoiceDate = String(bill.invoiceDate ?? "").slice(0, 10);
+      if (!ledgerName || bill.kind === "advance" || originalAmount <= 0 || pendingAmount <= 0) continue;
+      narrationReviewRows.push({
+        ledgerName,
+        bill,
+        analysis: analyseCashDiscountNarration({
+          narration: bill.narration,
+          invoiceDate,
+          originalAmount,
+          pendingAmount,
+          receiptDate: bill.receiptDate,
+          matchedReceiptAmount: toNumber(bill.matchedReceiptAmount, Number.NaN),
+          today,
+        }),
+      });
+    }
+
+    const narratedDiscountRows = narrationReviewRows.filter((row) => row.analysis.terms.length > 0);
+    const narrationAnalysis = narrationReviewRows.map((row) => ({
+      partyLedgerName: row.ledgerName,
+      linkedInvoiceNumber: toText(row.bill.referenceName ?? row.bill.voucherNumber, 240) || null,
+      linkedInvoiceDate: String(row.bill.invoiceDate ?? "").slice(0, 10) || null,
+      originalInvoiceAmount: toNumber(row.bill.originalAmount),
+      pendingAmount: toNumber(row.bill.pendingAmount),
+      analysis: {
+        sourceNarration: row.analysis.sourceNarration,
+        matchedCashDiscountContext: row.analysis.matchedCashDiscountContext,
+        terms: row.analysis.terms,
+        termsLabel: row.analysis.termsLabel,
+        finalEligibilityDays: row.analysis.finalEligibilityDays,
+        discountDeadline: row.analysis.discountDeadline,
+        receiptDate: row.analysis.receiptDate,
+        matchedReceiptAmount: row.analysis.matchedReceiptAmount,
+        expectedDiscounts: row.analysis.expectedDiscounts,
+        reversalPlan: row.analysis.reversalPlan,
+        deterministicStatus: row.analysis.deterministicStatus,
+        deterministicReason: row.analysis.deterministicReason,
+        calculationVersion: "cash_discount_v2",
+      },
+    }));
+
+    const paymentFollowUps = sortPaymentFollowUpsByPriority(narrationReviewRows
+      .filter((row) => row.analysis.deterministicStatus !== "discount_taken_within_window")
+      .filter((row) => derivePaymentFollowUpTiming(row.bill, today).eligible)
+      .map((row) => serializePaymentFollowUp({
+        bill: row.bill,
+        ledgerName: row.ledgerName,
+        ledger: ledgerByName.get(normalizeLedgerName(row.ledgerName)),
+        analysis: row.analysis,
+        today,
+        createdTierReversalAmount: createdReversalByInvoice.get(
+          invoiceIdentityKey(row.ledgerName, toText(row.bill.referenceName ?? row.bill.voucherNumber, 240) || null)
+        ),
+      }))
+      .filter(isCollectionOnlyPaymentFollowUp));
+
+    const tallyCandidates = narratedDiscountRows
+      .filter((row) => ["late_short_payment", "unpaid_discount_tier_expired"].includes(row.analysis.deterministicStatus))
+      .map((row) => {
+        const invoiceNumber = toText(row.bill.referenceName ?? row.bill.voucherNumber, 240) || null;
+        const alreadyCreatedReversalAmount = createdReversalByInvoice.get(
+          invoiceIdentityKey(row.ledgerName, invoiceNumber)
+        ) ?? 0;
+        const requiredReversalAmount = row.analysis.deterministicStatus === "late_short_payment"
+          ? toNumber(row.bill.pendingAmount)
+          : toNumber(row.analysis.reversalPlan?.totalReversalRequired);
+        const stagedReversalAmount = Math.max(
+          0,
+          Math.round((requiredReversalAmount - alreadyCreatedReversalAmount) * 100) / 100
+        );
+        if (stagedReversalAmount <= 0.01) return null;
+        return serializeTallyCandidate({
+          bill: row.bill,
+          ledgerName: row.ledgerName,
+          ledger: ledgerByName.get(normalizeLedgerName(row.ledgerName)),
+          companyName,
+          connectionId,
+          financialYear: null,
+          today,
+          analysis: row.analysis,
+          stagedReversalAmount,
+          alreadyCreatedReversalAmount,
+        });
+      })
+      .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate))
+      .sort((left, right) => {
+        const leftDate = Date.parse(`${left.linkedInvoiceDate ?? ""}T00:00:00.000Z`) || 0;
+        const rightDate = Date.parse(`${right.linkedInvoiceDate ?? ""}T00:00:00.000Z`) || 0;
+        return leftDate !== rightDate
+          ? leftDate - rightDate
+          : String(left.partyLedgerName).localeCompare(String(right.partyLedgerName));
+      });
+
+    const proposals = [...tallyCandidates, ...createdProposals.map(serializeDebitNoteProposal)];
+    const recoverableAmount = tallyCandidates.reduce((sum, row) => sum + row.recoverableAmount, 0);
+    const createdAmount = createdProposals.reduce((sum, row) => sum + toNumber(row.recoverable_amount), 0);
+    const paymentFollowUpAmount = paymentFollowUps.reduce((sum, row) => sum + row.outstandingAmount, 0);
+
+    return jsonWithCors(request, {
+      setupRequired: false,
+      company: {
+        connectionId,
+        companyName,
+        status: connection.status,
+        lastHeartbeatAt: connection.last_heartbeat_at,
+        tallyReachable: true,
+        companyLoaded: true,
+      },
+      filters: { connectionId, compatibleConnectionIds: [connectionId] },
+      kpis: {
+        totalOutstanding: recoverableAmount,
+        overdueOutstanding: null,
+        dueThisWeek: null,
+        cdAtRisk: null,
+        cdExpired: tallyCandidates.length,
+        lateShortPayments: tallyCandidates.length,
+        debitNotesPendingApproval: tallyCandidates.length,
+        narratedDiscountInvoices: narratedDiscountRows.length,
+        unpaidInvoices: paymentFollowUps.filter((row) => Math.abs(row.outstandingAmount - row.originalInvoiceAmount) <= 1).length,
+        partialUnpaidInvoices: paymentFollowUps.filter((row) => row.outstandingAmount < row.originalInvoiceAmount - 1).length,
+        paymentFollowUps: paymentFollowUps.length,
+        paymentFollowUpAmount,
+        needsAttention: tallyCandidates.length,
+        createdDebitNotes: createdProposals.length,
+        createdDebitNoteAmount: createdAmount,
+      },
+      tabs: {
+        overduePayments: [],
+        paymentFollowUps,
+        cashDiscountTracker: proposals,
+        debitNoteQueue: proposals,
+      },
+      narrationAnalysis,
+      notes: [
+        "Cash-discount terms are calculated from a live Tally response held only in memory.",
+        "Debit notes are never created automatically; an eligible result requires a user action and a fresh Tally recheck.",
+        "Only confirmed debit notes are saved as the audit trail.",
+      ],
+    });
+  } catch (error) {
+    console.error("Error in POST /api/collections/live/analyse:", error);
+    return jsonWithCors(
+      request,
+      { error: error instanceof Error ? error.message : "Could not analyse the live Tally data." },
+      { status: 500 }
+    );
+  }
+}
