@@ -9,6 +9,7 @@ import { createClient } from "@supabase/supabase-js";
 import sharp from "sharp";
 
 import { suggestBankLedgersForTransactions } from "../src/lib/bank-statement-ledger-matching.ts";
+import { correctRowsFromRunningBalance } from "./bank-statement-running-balance.mjs";
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -425,61 +426,8 @@ function detectCategory(description, debitAmount, creditAmount) {
   return "unknown";
 }
 
-function toMoneyNumber(value) {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function roundMoney(value) {
-  return Number(value.toFixed(2));
-}
-
-function sameMoney(left, right) {
-  return Math.abs(left - right) < 0.01;
-}
-
-function correctPreviewRowsFromRunningBalance(transactions) {
-  let previousBalance = null;
-
-  return transactions.map((transaction) => {
-    const balance = toMoneyNumber(transaction.balance_amount);
-    const debit = toMoneyNumber(transaction.debit_amount);
-    const credit = toMoneyNumber(transaction.credit_amount);
-    const amount = Math.max(debit && debit > 0 ? debit : 0, credit && credit > 0 ? credit : 0);
-    let next = transaction;
-
-    if (previousBalance !== null && balance !== null && amount > 0) {
-      const delta = roundMoney(balance - previousBalance);
-      const expectedAmount = roundMoney(Math.abs(delta));
-      const hasDirectionMismatch =
-        (delta > 0 && (!credit || !sameMoney(credit, expectedAmount) || (debit ?? 0) > 0)) ||
-        (delta < 0 && (!debit || !sameMoney(debit, expectedAmount) || (credit ?? 0) > 0));
-
-      if (!sameMoney(delta, 0) && sameMoney(expectedAmount, amount) && hasDirectionMismatch) {
-        const correctedDebit = delta < 0 ? expectedAmount : null;
-        const correctedCredit = delta > 0 ? expectedAmount : null;
-        next = {
-          ...transaction,
-          debit_amount: correctedDebit,
-          credit_amount: correctedCredit,
-          category: detectCategory(transaction.description, correctedDebit, correctedCredit),
-          confidence: Math.max(transaction.confidence ?? 0, 0.9),
-          raw_payload: {
-            ...(transaction.raw_payload ?? {}),
-            balanceCorrection: {
-              previousBalance,
-              balanceAmount: balance,
-              delta,
-              originalDebitAmount: debit,
-              originalCreditAmount: credit,
-            },
-          },
-        };
-      }
-    }
-
-    if (balance !== null) previousBalance = balance;
-    return next;
-  });
+function correctPreviewRowsFromRunningBalance(transactions, openingBalance = null) {
+  return correctRowsFromRunningBalance(transactions, { openingBalance, detectCategory });
 }
 
 function safeJsonParse(raw, fallback) {
@@ -696,6 +644,7 @@ function normalizeAiBankStatement(value) {
       account: { bankName: null, accountNumber: null, accountHolderName: null, ifscCode: null },
       statementPeriodStart: null,
       statementPeriodEnd: null,
+      openingBalance: null,
       transactions: [],
     };
   }
@@ -710,6 +659,14 @@ function normalizeAiBankStatement(value) {
       })
     : [];
 
+  const openingBalance = parseAmount(
+    parsed.openingBalance ??
+      parsed.opening_balance ??
+      parsed.balanceForward ??
+      parsed.balance_forward ??
+      parsed.broughtForwardBalance
+  );
+
   return {
     account: {
       bankName: textCell(account.bankName ?? parsed.bankName) || null,
@@ -719,7 +676,8 @@ function normalizeAiBankStatement(value) {
     },
     statementPeriodStart: parseDate(parsed.statementPeriodStart) ?? parseDate(parsed.periodStart),
     statementPeriodEnd: parseDate(parsed.statementPeriodEnd) ?? parseDate(parsed.periodEnd),
-    transactions: correctPreviewRowsFromRunningBalance(transactions),
+    openingBalance,
+    transactions: correctPreviewRowsFromRunningBalance(transactions, openingBalance),
   };
 }
 
@@ -876,6 +834,7 @@ async function extractBankStatementFromImages(fileName, images, bankAccountCandi
       account: { bankName: null, accountNumber: null, accountHolderName: null, ifscCode: null },
       statementPeriodStart: null,
       statementPeriodEnd: null,
+      openingBalance: null,
       transactions: [],
     };
   }
@@ -884,7 +843,8 @@ async function extractBankStatementFromImages(fileName, images, bankAccountCandi
     {
       role: "system",
       content:
-        "Extract bank statement account details and transaction rows. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
+        "Extract bank statement account details and transaction rows. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, openingBalance, and transactions. " +
+        "openingBalance must be a number when an opening, brought-forward, or balance-forward amount is visible; otherwise return null. Keep it as metadata and never add the opening-balance line to transactions. " +
         "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
         "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
         "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
@@ -920,7 +880,8 @@ async function extractBankStatementFromPdfFile(fileName, mimeType, bytes, bankAc
         {
           type: "text",
           text:
-            "Extract bank statement account details and transaction rows from the attached PDF. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
+            "Extract bank statement account details and transaction rows from the attached PDF. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, openingBalance, and transactions. " +
+            "openingBalance must be a number when an opening, brought-forward, or balance-forward amount is visible; otherwise return null. Keep it as metadata and never add the opening-balance line to transactions. " +
             "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
             "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
             "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
@@ -942,7 +903,8 @@ async function extractBankStatementFromText(fileName, pages, bankAccountCandidat
     {
       role: "system",
       content:
-        "Extract bank statement account details and transaction rows from PDF text. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
+        "Extract bank statement account details and transaction rows from PDF text. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, openingBalance, and transactions. " +
+        "openingBalance must be a number when an opening, brought-forward, or balance-forward amount is visible; otherwise return null. Keep it as metadata and never add the opening-balance line to transactions. " +
         "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
         "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
         "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
@@ -974,6 +936,7 @@ function mergeBankStatementResults(results) {
     };
     merged.statementPeriodStart = merged.statementPeriodStart || result.statementPeriodStart || null;
     merged.statementPeriodEnd = merged.statementPeriodEnd || result.statementPeriodEnd || null;
+    merged.openingBalance = merged.openingBalance ?? result.openingBalance ?? null;
     for (const transaction of result.transactions) {
       const key = [
         transaction.transaction_date,
@@ -988,7 +951,7 @@ function mergeBankStatementResults(results) {
       merged.transactions.push(transaction);
     }
   }
-  merged.transactions = correctPreviewRowsFromRunningBalance(merged.transactions);
+  merged.transactions = correctPreviewRowsFromRunningBalance(merged.transactions, merged.openingBalance);
   return merged;
 }
 
@@ -1027,7 +990,8 @@ async function extractBankStatementFromTextBatch(fileName, pages) {
     {
       role: "system",
       content:
-        "Extract bank statement account details and transaction rows from a batch of PDF text pages. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
+        "Extract bank statement account details and transaction rows from a batch of PDF text pages. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, openingBalance, and transactions. " +
+        "openingBalance must be a number when an opening, brought-forward, or balance-forward amount is visible in this batch; otherwise return null. Keep it as metadata and never add the opening-balance line to transactions. " +
         "account must include bankName, accountNumber, accountHolderName, and ifscCode when visible. Dates must be ISO YYYY-MM-DD. " +
         "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
         "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. Do not shorten description to only the party name, and do not include date/value-date/debit/credit/balance columns in description. " +
@@ -1051,7 +1015,8 @@ async function extractBankStatementFromImageBatch(fileName, images, rangeLabel) 
     {
       role: "system",
       content:
-        "Extract bank statement account details and transaction rows from these rendered statement pages. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, and transactions. " +
+        "Extract bank statement account details and transaction rows from these rendered statement pages. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, openingBalance, and transactions. " +
+        "openingBalance must be a number when an opening, brought-forward, or balance-forward amount is visible in these pages; otherwise return null. Keep it as metadata and never add the opening-balance line to transactions. " +
         "Dates must be ISO YYYY-MM-DD. Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, transactionType, category, counterpartyName, and confidence. " +
         "description must be the complete bank narration/description exactly as printed for that transaction, including payment mode, party name, UTR/reference text, and continuation lines. counterpartyName must be only the party/vendor/customer name. " +
         "Ignore BALANCE FORWARD, OPENING BALANCE, CLOSING BALANCE, summary totals, page footers, and bank notices. Do not invent rows.",

@@ -2,15 +2,141 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildCollectionExportXml,
   buildPurchaseVoucherXml,
+  buildRequestedLedgerFormula,
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
   findBankLedgersFromMasters,
   findPartyLedgersFromMasters,
+  fetchCustomerOpenBillsFromTally,
   parseTallyImportResult,
+  openBillBlockRequiresVoucherFallback,
   purchaseVoucherReadbackComparison,
   strictBankTransactionCandidates,
 } from "./bridge.mjs";
+
+test("collection exports apply Tally-side formula filters", () => {
+  const xml = buildCollectionExportXml({
+    collectionName: "Filtered Bills",
+    tallyType: "Bill",
+    fetchFields: "Name,LedgerName,ClosingBalance",
+    companyName: "Solution Nyx",
+    dateTo: "2026-08-17",
+    formulae: [{ name: "RequestedLedger", formula: '$$IsEqual:$LedgerName:"Customer A"' }],
+    filterNames: ["RequestedLedger"],
+  });
+
+  assert.match(xml, /<FILTER>RequestedLedger<\/FILTER>/);
+  assert.match(xml, /<SYSTEM TYPE="Formulae" NAME="RequestedLedger"/);
+  assert.match(xml, /\$\$IsEqual:\$LedgerName:&quot;Customer A&quot;/);
+  assert.match(xml, /<SVTODATE TYPE="Date">20260817<\/SVTODATE>/);
+});
+
+test("ledger filters remain targeted and deduplicated", () => {
+  const ledgerFormula = buildRequestedLedgerFormula(["Customer A", "Customer A", "Customer B"], ["$LedgerName"]);
+  assert.equal((ledgerFormula.match(/Customer A/g) || []).length, 1);
+  assert.equal((ledgerFormula.match(/Customer B/g) || []).length, 1);
+});
+
+test("voucher fallback is required only for incomplete Bill exports", () => {
+  const complete = '<BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><BILLTYPE>New Ref</BILLTYPE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL>';
+  const missingType = '<BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL>';
+  const missingPending = '<BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><BILLTYPE>New Ref</BILLTYPE><OPENINGBALANCE>500</OPENINGBALANCE></BILL>';
+  assert.equal(openBillBlockRequiresVoucherFallback(complete), false);
+  assert.equal(openBillBlockRequiresVoucherFallback(missingType), true);
+  assert.equal(openBillBlockRequiresVoucherFallback(missingPending), true);
+});
+
+test("zero targeted bills returns an authoritative empty result without fetching vouchers", async () => {
+  const calls = [];
+  const result = await fetchCustomerOpenBillsFromTally(
+    { tallyUrl: "http://127.0.0.1:9000" },
+    { companyName: "Solution Nyx", ledgerNames: ["Customer A"], asOfDate: "2026-08-17" },
+    {
+      exportCollection: async (_url, options) => {
+        calls.push(options);
+        return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>";
+      },
+    }
+  );
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].tallyType, "Bill");
+  assert.deepEqual(result.result.openBills, []);
+  assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, false);
+});
+
+test("complete targeted Bill data avoids the voucher fallback", async () => {
+  const calls = [];
+  const result = await fetchCustomerOpenBillsFromTally(
+    { tallyUrl: "http://127.0.0.1:9000" },
+    { ledgerNames: ["Customer A"] },
+    {
+      exportCollection: async (_url, options) => {
+        calls.push(options);
+        return '<ENVELOPE><STATUS>1</STATUS><BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><BILLTYPE>New Ref</BILLTYPE><DATE>20260801</DATE><OPENINGBALANCE>500</OPENINGBALANCE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL></ENVELOPE>';
+      },
+    }
+  );
+
+  assert.equal(calls.length, 1);
+  assert.equal(result.result.openBills.length, 1);
+  assert.equal(result.result.openBills[0].pendingAmount, 500);
+  assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, false);
+});
+
+test("incomplete Bill data performs one targeted sequential voucher fallback", async () => {
+  const calls = [];
+  const result = await fetchCustomerOpenBillsFromTally(
+    { tallyUrl: "http://127.0.0.1:9000" },
+    { ledgerNames: ["Customer A"], asOfDate: "2026-08-17" },
+    {
+      exportCollection: async (_url, options) => {
+        calls.push(options);
+        if (options.tallyType === "Bill") {
+          return '<ENVELOPE><STATUS>1</STATUS><BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><DATE>20260801</DATE><OPENINGBALANCE>500</OPENINGBALANCE></BILL></ENVELOPE>';
+        }
+        return '<ENVELOPE><STATUS>1</STATUS><VOUCHER><DATE>20260801</DATE><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME><VOUCHERNUMBER>INV-1</VOUCHERNUMBER><PARTYLEDGERNAME>Customer A</PARTYLEDGERNAME><ALLLEDGERENTRIES.LIST><LEDGERNAME>Customer A</LEDGERNAME><AMOUNT>-500</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><BILLALLOCATIONS.LIST><NAME>INV-1</NAME><BILLTYPE>New Ref</BILLTYPE><AMOUNT>-500</AMOUNT></BILLALLOCATIONS.LIST></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
+      },
+    }
+  );
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((call) => call.tallyType), ["Bill", "Voucher"]);
+  assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, true);
+  assert.equal(result.result.queryDiagnostics.voucherFallbackLedgerCount, 1);
+});
+
+test("large ledger sets use one full Bill collection instead of repeatedly rescanning Tally", async () => {
+  const calls = [];
+  const ledgerNames = Array.from({ length: 51 }, (_, index) => `Customer ${index + 1}`);
+  const result = await fetchCustomerOpenBillsFromTally(
+    { tallyUrl: "http://127.0.0.1:9000" },
+    { ledgerNames, queryPurpose: "bank_statement_match" },
+    {
+      exportCollection: async (_url, options) => {
+        calls.push(options);
+        return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>";
+      },
+    }
+  );
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].filterNames, undefined);
+  assert.equal(result.result.queryDiagnostics.billQueryMode, "full");
+});
+
+test("a failed Bill query is not misreported as an empty successful result", async () => {
+  await assert.rejects(
+    () => fetchCustomerOpenBillsFromTally(
+      { tallyUrl: "http://127.0.0.1:9000" },
+      { ledgerNames: ["Customer A"], queryPurpose: "bank_statement_match" },
+      { exportCollection: async () => { throw new Error("Tally timed out"); } }
+    ),
+    /Tally timed out/
+  );
+});
 
 test("cash discount includes ledgers nested under Sundry Debtors subgroups", () => {
   const ledgers = [
