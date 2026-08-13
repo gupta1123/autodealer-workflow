@@ -54,6 +54,8 @@ function asNumber(value: unknown) {
 type StoredCaseFileRow = {
   id: string;
   original_name: string;
+  storage_asset_id: string | null;
+  content_sha256: string | null;
   storage_bucket: string | null;
   storage_path: string;
   mime_type: string | null;
@@ -72,16 +74,6 @@ type PreparedCaseGroup = {
   summary: ReturnType<typeof summarizeCase>;
   displayName: string;
 };
-
-function sanitizeFileName(fileName: string) {
-  return (
-    fileName
-      .replace(/[/\\?%*:|"<>]/g, "-")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 180) || "upload"
-  );
-}
 
 function normalizeSourceFileName(value: string | null | undefined) {
   return value?.trim().toLowerCase().replace(/\s+/g, " ") || "";
@@ -240,23 +232,13 @@ async function copyCaseFilesForGroup(params: {
 
   for (const file of sourceFiles) {
     const sourceBucket = file.storage_bucket || STORAGE_BUCKET;
-    const download = await params.supabase.storage.from(sourceBucket).download(file.storage_path);
-    if (download.error) throw download.error;
-
-    const bytes = new Uint8Array(await download.data.arrayBuffer());
-    const storagePath = `${params.caseId}/${Date.now()}-${randomUUID()}-${sanitizeFileName(file.original_name)}`;
-    const { error: uploadError } = await params.supabase.storage.from(STORAGE_BUCKET).upload(storagePath, bytes, {
-      contentType: file.mime_type ?? undefined,
-      upsert: false,
-    });
-    if (uploadError) throw uploadError;
-
-    params.uploadedFiles.push({ bucket: STORAGE_BUCKET, path: storagePath });
     fileRows.push({
       case_id: params.caseId,
       original_name: file.original_name,
-      storage_bucket: STORAGE_BUCKET,
-      storage_path: storagePath,
+      storage_bucket: sourceBucket,
+      storage_path: file.storage_path,
+      storage_asset_id: file.storage_asset_id,
+      content_sha256: file.content_sha256,
       mime_type: file.mime_type,
       size_bytes: file.size_bytes,
     });
@@ -472,7 +454,9 @@ export async function POST(
         .eq("case_id", job.case_id),
       supabase
         .from("packet_case_files")
-        .select("id, original_name, storage_bucket, storage_path, mime_type, size_bytes")
+        .select(
+          "id, original_name, storage_asset_id, content_sha256, storage_bucket, storage_path, mime_type, size_bytes"
+        )
         .eq("case_id", job.case_id),
       supabase.from("packet_documents").delete().eq("case_id", job.case_id),
       supabase.from("packet_mismatches").delete().eq("case_id", job.case_id),

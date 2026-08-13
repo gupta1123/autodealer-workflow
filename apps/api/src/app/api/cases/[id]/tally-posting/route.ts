@@ -7,6 +7,7 @@ import {
   type PurchaseAccountingSettings,
 } from "@/lib/purchase-accounting-settings";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { suggestLedgerFromTallyCatalogue } from "@/lib/bank-statement-ledger-matching";
 import {
   serializeTallyConnectionStatus,
   TALLY_CONNECTION_SELECT,
@@ -836,6 +837,65 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     const { id } = await contextParam.params;
     const body = await request.json().catch(() => ({}));
+    if (body.action === "match_supplier_ledger") {
+      const requestedConnectionId = typeof body.connectionId === "string" ? body.connectionId : null;
+      const requestedCompanyName = typeof body.companyName === "string" ? body.companyName : null;
+      const context = await loadContext(id, user.id, requestedConnectionId, requestedCompanyName);
+      if (!context.connection || !context.syncRun || !hasCompleteMasterSnapshot(context)) {
+        return jsonWithCors(request, { error: "Refresh the selected Tally company's masters before matching the supplier." }, { status: 409 });
+      }
+
+      const supplierName = String(body.supplierName ?? "").trim().slice(0, 300);
+      const supplierGstin = String(body.supplierGstin ?? "").trim().toUpperCase().slice(0, 30);
+      if (!supplierName && !supplierGstin) {
+        return jsonWithCors(request, { error: "A supplier name or GSTIN is required for ledger matching." }, { status: 400 });
+      }
+
+      const ledgerMasters = dedupeLedgerMasters(context.masters);
+      const exactGstinMatches = supplierGstin
+        ? ledgerMasters.filter((master) => master.gstin?.trim().toUpperCase() === supplierGstin)
+        : [];
+      const normalizedSupplierName = supplierName.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      const exactNameMatches = normalizedSupplierName
+        ? ledgerMasters.filter((master) =>
+            master.tally_name.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim() === normalizedSupplierName
+          )
+        : [];
+      const deterministic = exactGstinMatches.length === 1
+        ? exactGstinMatches[0]
+        : exactNameMatches.length === 1
+          ? exactNameMatches[0]
+          : null;
+
+      if (deterministic) {
+        return jsonWithCors(request, {
+          supplierLedgerMatch: {
+            matchType: "direct_match",
+            ledgerName: deterministic.tally_name,
+            candidateLedgerNames: [],
+            confidence: 1,
+            reason: exactGstinMatches.length === 1
+              ? "Unique GSTIN match in the selected Tally company."
+              : "Exact supplier-name match in the selected Tally company.",
+          },
+        });
+      }
+
+      const suggestion = await suggestLedgerFromTallyCatalogue({
+        ledgers: ledgerMasters.map((master) => ({
+          id: master.id,
+          name: master.tally_name,
+          parent: master.parent_name,
+        })),
+        transaction: {
+          description: `Purchase invoice supplier: ${supplierName || "Not available"}${supplierGstin ? `; GSTIN: ${supplierGstin}` : ""}`,
+          category: "Purchase supplier",
+          counterpartyName: supplierName || null,
+          transactionType: "Purchase",
+        },
+      });
+      return jsonWithCors(request, { supplierLedgerMatch: suggestion });
+    }
     if (body.action !== "approve_and_queue") {
       return jsonWithCors(request, { error: "Unsupported Tally posting action." }, { status: 400 });
     }

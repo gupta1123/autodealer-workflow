@@ -8,6 +8,11 @@ import {
 } from "@/lib/case-summary";
 import { getRecycleBinDeletedAt, isCaseRecycled } from "@/lib/recycle-bin";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import {
+  ensureStorageAsset,
+  removeStorageObjectsIfUnreferenced,
+  type StorageObjectCandidate,
+} from "@/lib/storage-assets";
 import { mergeUploadGroupMeta, readUploadGroupMeta } from "@/lib/upload-groups";
 
 const STORAGE_BUCKET = "packet-files";
@@ -38,16 +43,6 @@ function isRecycleBinSchemaMissing(error: unknown) {
 
 function isFileEntry(entry: FormDataEntryValue): entry is File {
   return typeof entry !== "string";
-}
-
-function sanitizeFileName(fileName: string) {
-  const cleaned = fileName
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "");
-
-  return cleaned || "upload";
 }
 
 function inferContentType(file: File) {
@@ -237,7 +232,7 @@ export async function POST(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
-  const uploadedPaths: string[] = [];
+  const uploadedPaths: StorageObjectCandidate[] = [];
   const supabase = createSupabaseAdminClient();
 
   try {
@@ -321,60 +316,49 @@ export async function POST(
       return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
     }
 
+    let oldFiles: Array<{
+      id: string;
+      storage_asset_id: string | null;
+      storage_bucket: string | null;
+      storage_path: string;
+    }> = [];
     if (mode === "overwrite") {
       const names = files.map((file) => file.name);
-      const { data: oldFiles, error: oldFilesError } = await supabase
+      const { data, error: oldFilesError } = await supabase
         .from("packet_case_files")
-        .select("id, storage_bucket, storage_path")
+        .select("id, storage_asset_id, storage_bucket, storage_path")
         .eq("case_id", id)
         .in("original_name", names);
 
       if (oldFilesError) throw oldFilesError;
-
-      const pathsByBucket = new Map<string, string[]>();
-      for (const file of oldFiles ?? []) {
-        const bucket = file.storage_bucket || STORAGE_BUCKET;
-        pathsByBucket.set(bucket, [...(pathsByBucket.get(bucket) ?? []), file.storage_path]);
-      }
-
-      for (const [bucket, paths] of pathsByBucket.entries()) {
-        if (paths.length) {
-          const { error: removeError } = await supabase.storage.from(bucket).remove(paths);
-          if (removeError) throw removeError;
-        }
-      }
-
-      if (oldFiles?.length) {
-        const { error: deleteRowsError } = await supabase
-          .from("packet_case_files")
-          .delete()
-          .in(
-            "id",
-            oldFiles.map((file) => file.id)
-          );
-
-        if (deleteRowsError) throw deleteRowsError;
-      }
+      oldFiles = data ?? [];
     }
 
     const fileRows = [];
     for (const file of files) {
-      const storagePath = `${id}/${Date.now()}-${crypto.randomUUID()}-${sanitizeFileName(file.name)}`;
       const binary = new Uint8Array(await file.arrayBuffer());
       const contentType = inferContentType(file);
-      const { error: uploadError } = await supabase.storage.from(STORAGE_BUCKET).upload(storagePath, binary, {
+      const asset = await ensureStorageAsset({
+        supabase,
+        ownerUserId: user.id,
+        storageBucket: STORAGE_BUCKET,
+        bytes: binary,
         contentType,
-        upsert: false,
       });
-
-      if (uploadError) throw uploadError;
-
-      uploadedPaths.push(storagePath);
+      if (asset.createdObject) {
+        uploadedPaths.push({
+          storageAssetId: asset.id,
+          storageBucket: asset.storageBucket,
+          storagePath: asset.storagePath,
+        });
+      }
       fileRows.push({
         case_id: id,
         original_name: file.name,
-        storage_bucket: STORAGE_BUCKET,
-        storage_path: storagePath,
+        storage_bucket: asset.storageBucket,
+        storage_path: asset.storagePath,
+        storage_asset_id: asset.id,
+        content_sha256: asset.contentSha256,
         mime_type: contentType,
         size_bytes: file.size,
       });
@@ -382,6 +366,26 @@ export async function POST(
 
     const { error: fileInsertError } = await supabase.from("packet_case_files").insert(fileRows);
     if (fileInsertError) throw fileInsertError;
+
+    if (oldFiles.length) {
+      const { error: deleteRowsError } = await supabase
+        .from("packet_case_files")
+        .delete()
+        .in(
+          "id",
+          oldFiles.map((file) => file.id)
+        );
+      if (deleteRowsError) throw deleteRowsError;
+
+      await removeStorageObjectsIfUnreferenced(
+        supabase,
+        oldFiles.map((file) => ({
+          storageAssetId: file.storage_asset_id,
+          storageBucket: file.storage_bucket || STORAGE_BUCKET,
+          storagePath: file.storage_path,
+        }))
+      );
+    }
 
     const { count, error: countError } = await supabase
       .from("packet_case_files")
@@ -476,7 +480,7 @@ export async function POST(
     return jsonWithCors(request, { case: mapCaseRow(updatedCase) });
   } catch (error) {
     if (uploadedPaths.length > 0) {
-      await supabase.storage.from(STORAGE_BUCKET).remove(uploadedPaths);
+      await removeStorageObjectsIfUnreferenced(supabase, uploadedPaths);
     }
 
     return jsonWithCors(request, { error: serializeError(error) }, { status: 500 });

@@ -265,7 +265,7 @@ export function RecycleBinPage() {
                   {status === "loading" ? (
                     <Skeleton className="mt-1 h-3.5 w-60 bg-slate-100" />
                   ) : (
-                    `${totalCount} items • Auto-deleted after 30 days`
+                    `${totalCount} items • Permanently delete to reclaim storage`
                   )}
                 </div>
               </div>
@@ -317,7 +317,7 @@ export function RecycleBinPage() {
                 </div>
                 <h3 className="text-lg font-medium text-[#0f172a]">Recycle Bin is Empty</h3>
                 <p className="mt-2 text-sm font-medium text-[#64748b] max-w-sm">
-                  Items you delete will appear here for 30 days before being permanently removed.
+                  Deleted items remain here until you restore or permanently delete them.
                 </p>
               </div>
             )}

@@ -31,6 +31,8 @@ export type TallyMasterInput = {
   gstin?: unknown;
   bankName?: unknown;
   bankAccountNumber?: unknown;
+  closingBalance?: unknown;
+  closingBalanceType?: unknown;
   ifscCode?: unknown;
   branchName?: unknown;
   accountHolderName?: unknown;
@@ -224,6 +226,14 @@ export function serializeTallyMaster(row: TallyMasterRow) {
     ifscCode: typeof raw.ifscCode === "string" ? raw.ifscCode : null,
     branchName: typeof raw.branchName === "string" ? raw.branchName : null,
     accountHolderName: typeof raw.accountHolderName === "string" ? raw.accountHolderName : null,
+    closingBalance:
+      typeof raw.closingBalance === "number" && Number.isFinite(raw.closingBalance)
+        ? raw.closingBalance
+        : toNullableNumber(raw.closingBalance),
+    closingBalanceType:
+      raw.closingBalanceType === "Dr" || raw.closingBalanceType === "Cr"
+        ? raw.closingBalanceType
+        : null,
     email: typeof raw.email === "string" ? raw.email : null,
     phone: typeof raw.phone === "string" ? raw.phone : null,
     contactPerson: typeof raw.contactPerson === "string" ? raw.contactPerson : null,

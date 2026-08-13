@@ -2,11 +2,14 @@
 
 import fs from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import tls from "node:tls";
 import { fileURLToPath } from "node:url";
+import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.41";
+const BRIDGE_VERSION = "0.1.42";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
@@ -27,6 +30,45 @@ const PURCHASE_DOCUMENT_UDFS = {
 };
 const DEFAULT_TALLY_DATA_ROOT = path.join(process.env.PUBLIC || "C:\\Users\\Public", "TallyPrime", "data");
 const CURRENT_FILE = fileURLToPath(import.meta.url);
+let cachedTrustedCaCertificates = null;
+
+function trustedCaCertificates() {
+  if (cachedTrustedCaCertificates) return cachedTrustedCaCertificates;
+  const certificates = [...tls.rootCertificates];
+  if (typeof tls.getCACertificates === "function") {
+    certificates.push(...tls.getCACertificates("system"));
+  }
+  if (process.platform === "win32") {
+    try {
+      const powershell = path.join(
+        process.env.SystemRoot || "C:\\Windows",
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe"
+      );
+      const script = [
+        "$stores = @('Cert:\\CurrentUser\\Root','Cert:\\LocalMachine\\Root')",
+        "Get-ChildItem -Path $stores -ErrorAction SilentlyContinue | ForEach-Object {",
+        "'-----BEGIN CERTIFICATE-----'",
+        "[Convert]::ToBase64String($_.RawData, [Base64FormattingOptions]::InsertLineBreaks)",
+        "'-----END CERTIFICATE-----'",
+        "}",
+      ].join("; ");
+      const pem = execFileSync(
+        powershell,
+        ["-NoProfile", "-NonInteractive", "-Command", script],
+        { encoding: "utf8", windowsHide: true, timeout: 10_000 }
+      );
+      certificates.push(...(pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || []));
+    } catch {
+      // Bundled and Node-provided roots still cover machines without Windows
+      // PowerShell. A failed wake channel simply falls back to normal polling.
+    }
+  }
+  cachedTrustedCaCertificates = [...new Set(certificates)];
+  return cachedTrustedCaCertificates;
+}
 
 function parseArgs(argv) {
   const args = {};
@@ -861,7 +903,7 @@ function wrapVoucherMessagesXml({
   ].join("");
 }
 
-function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) {
+export function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) {
   const companyName = payload?.companyName || fallbackCompanyName;
   const voucherType = payload?.voucherType || "Payment";
   const voucherDate = toIsoLikeDate(payload?.voucherDate);
@@ -917,15 +959,25 @@ function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) {
           }),
         ]
       : voucherType === "Contra"
-        ? [
-          buildLedgerEntryXml({
-            ledgerName: bankLedgerName,
-            amount,
-            isDebit: true,
-            bankAllocation,
-          }),
-          buildLedgerEntryXml({ ledgerName: counterpartyLedgerName, amount, isDebit: false }),
-        ]
+        ? bankLedgerEntryIsDebit
+          ? [
+              buildLedgerEntryXml({
+                ledgerName: bankLedgerName,
+                amount,
+                isDebit: true,
+                bankAllocation,
+              }),
+              buildLedgerEntryXml({ ledgerName: counterpartyLedgerName, amount, isDebit: false }),
+            ]
+          : [
+              buildLedgerEntryXml({ ledgerName: counterpartyLedgerName, amount, isDebit: true }),
+              buildLedgerEntryXml({
+                ledgerName: bankLedgerName,
+                amount,
+                isDebit: false,
+                bankAllocation,
+              }),
+            ]
         : [
             buildLedgerEntryXml({
               ledgerName: counterpartyLedgerName,
@@ -1758,16 +1810,18 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName) {
 }
 
 async function postBankVoucher(tallyUrl, payload, companyName) {
+  const voucherType = String(payload?.voucherType || "");
+  const expectedDirection = payload?.expectedDirection || (/receipt/i.test(voucherType) ? "incoming" : "outgoing");
   const shouldCheckExisting =
     payload?.preflightVerifyExisting !== false &&
-    /receipt/i.test(String(payload?.voucherType || ""));
+    /receipt|payment|contra|journal/i.test(voucherType);
 
   if (shouldCheckExisting) {
     const existingCheck = await verifyBankTransactionInTally(
       { tallyUrl, companyName },
       {
         ...payload,
-        expectedDirection: "incoming",
+        expectedDirection,
       }
     );
     const existingResult = existingCheck.result || {};
@@ -1796,7 +1850,7 @@ async function postBankVoucher(tallyUrl, payload, companyName) {
       return {
         outcome: {
           success: false,
-          error: "Possible existing receipt found in Tally. Review before posting to avoid a duplicate.",
+          error: "Possible existing bank transaction found in Tally. Review before posting to avoid a duplicate.",
           result: {
             possibleDuplicateInTally: true,
             duplicateCheck: existingResult,
@@ -1970,6 +2024,7 @@ function toMaster(block, tagName) {
     getTagText(block, "RATEOFTAXCALCULATION") ||
     getTagText(block, "GSTTAXRATE") ||
     getTagText(block, "RATEOFVAT");
+  const closingBalance = parseLedgerClosingBalance(getTagText(block, "CLOSINGBALANCE"));
 
   return {
     name,
@@ -1993,6 +2048,8 @@ function toMaster(block, tagName) {
     hsnCode: optionalMasterValue(getTagText(block, "GSTHSNCODE") || getTagText(block, "HSNCODE")),
     unitName: optionalMasterValue(getTagText(block, "BASEUNITS") || getTagText(block, "ORIGINALBASEUNITS")),
     taxRate: optionalMasterValue(taxRate),
+    closingBalance: closingBalance.amount,
+    closingBalanceType: closingBalance.type,
     raw: {
       tallyTag: tagName,
       reservedName: getAttribute(block, "RESERVEDNAME"),
@@ -2004,6 +2061,9 @@ function toMaster(block, tagName) {
       taxType: getTagText(block, "TAXTYPE"),
       gstDutyHead: getTagText(block, "GSTDUTYHEAD"),
       billWiseEnabled: /^yes$/i.test(getTagText(block, "ISBILLWISEON")),
+      closingBalance: closingBalance.amount,
+      closingBalanceType: closingBalance.type,
+      closingBalanceRaw: closingBalance.raw,
       email,
       phone,
       contactPerson,
@@ -2975,6 +3035,21 @@ function classifyOpenBillReferenceKind({
   return "bill";
 }
 
+export function parseLedgerClosingBalance(value) {
+  const raw = String(value ?? "").trim();
+  const parsed = parseTallyAmount(raw);
+  if (parsed === null) return { amount: null, type: null, raw: null };
+  const explicitType = raw.match(/\b(Dr|Cr)\s*$/i)?.[1];
+  const type = explicitType
+    ? explicitType.toLowerCase() === "dr" ? "Dr" : "Cr"
+    : parsed < 0 ? "Dr" : parsed > 0 ? "Cr" : null;
+  return {
+    amount: Math.abs(parsed),
+    type,
+    raw,
+  };
+}
+
 function toOpenBill(block, ledgerName, evidence = {}) {
   const referenceName = getAttribute(block, "NAME") || getTagText(block, "NAME") || getTagText(block, "BILLREF");
   if (!referenceName) return null;
@@ -3026,14 +3101,14 @@ function openBillNarrationKey(ledgerName, referenceName) {
   return `${normalizeLooseName(ledgerName)}|${normalizeLooseName(referenceName)}`;
 }
 
-function isSalesInvoiceVoucher(block) {
+function isPartyInvoiceVoucher(block) {
   const voucherType = (getTagText(block, "VOUCHERTYPENAME") || getAttribute(block, "VCHTYPE") || "").toLowerCase();
-  return /sales|invoice/.test(voucherType) && !/debit|credit|receipt|payment/.test(voucherType);
+  return /sales|purchase|invoice/.test(voucherType) && !/debit|credit|receipt|payment/.test(voucherType);
 }
 
-function isReceiptVoucher(block) {
+function isPartySettlementVoucher(block) {
   const voucherType = (getTagText(block, "VOUCHERTYPENAME") || getAttribute(block, "VCHTYPE") || "").toLowerCase();
-  return /receipt/.test(voucherType);
+  return /receipt|payment/.test(voucherType);
 }
 
 function voucherBillAllocations(entryBlock) {
@@ -3090,7 +3165,7 @@ function indexInvoiceNarrations(xml, requestedLedgerByKey) {
   const salesLedgerByBill = new Map();
 
   for (const voucher of extractBlocks(xml, "VOUCHER")) {
-    if (!isSalesInvoiceVoucher(voucher)) continue;
+    if (!isPartyInvoiceVoucher(voucher)) continue;
     const narration = getTagText(voucher, "NARRATION");
 
     const ledgerNames = [
@@ -3124,7 +3199,7 @@ function indexInvoiceNarrations(xml, requestedLedgerByKey) {
   // which may be absent or may mention several invoices.
   const receiptEvidenceByBill = new Map();
   for (const voucher of extractBlocks(xml, "VOUCHER")) {
-    if (!isReceiptVoucher(voucher)) continue;
+    if (!isPartySettlementVoucher(voucher)) continue;
     const receiptDate = parseTallyDate(getTagText(voucher, "EFFECTIVEDATE") || getTagText(voucher, "DATE"));
     if (!receiptDate) continue;
     const voucherText = [
@@ -3472,6 +3547,8 @@ function toBankLedgerPayload(master) {
     ifscCode: master.ifscCode || null,
     branchName: master.branchName || null,
     accountHolderName: master.accountHolderName || null,
+    closingBalance: Number.isFinite(master.closingBalance) ? master.closingBalance : null,
+    closingBalanceType: master.closingBalanceType || null,
   };
 }
 
@@ -3677,7 +3754,7 @@ async function fetchBankLedgersFromTally(config, commandPayload = {}) {
           collectionName: "Autodealer Bank Ledger Discovery",
           tallyType: "Ledger",
           fetchFields:
-            "Name,Parent,GUID,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName",
+            "Name,Parent,GUID,ClosingBalance,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName",
           companyName,
         }),
         exportTallyCollection(tallyUrl, {
@@ -3728,7 +3805,7 @@ async function collectTallyMasters(config, commandPayload = {}) {
       collectionName: "Autodealer Ledgers Sync",
       tallyType: "Ledger",
       fetchFields:
-        "Name,Parent,GUID,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation",
+        "Name,Parent,GUID,ClosingBalance,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation",
       companyName,
     }),
     exportTallyCollection(tallyUrl, {
@@ -4145,8 +4222,24 @@ async function runCommand(config, command, options = {}) {
 
   if (command.commandType === "fetch_customer_open_bills") {
     try {
-      const outcome = await fetchCustomerOpenBillsFromTally(config, command.payload);
+      const isCashDiscountSnapshot = command.payload?.transport === "cash_discount_snapshot_v2";
+      const outcome = isCashDiscountSnapshot
+        ? {
+            success: true,
+            result: await collectCashDiscountLiveSnapshot(
+              config,
+              command.payload?.operation || "cash_discount_scan",
+              command.payload?.companyName,
+              command.payload?.proposal,
+              (message) => console.log(message)
+            ),
+          }
+        : await fetchCustomerOpenBillsFromTally(config, command.payload);
       await sendCommandResult(config, command, outcome);
+      if (isCashDiscountSnapshot) {
+        console.log(`Command ${command.id} completed: Cash Discount snapshot refreshed.`);
+        return;
+      }
       const fetchedLedgerCount = Array.isArray(outcome.result?.ledgerNames) ? outcome.result.ledgerNames.length : 1;
       console.log(
         `Command ${command.id} completed: fetched open bills for ${fetchedLedgerCount} party ledger(s).`
@@ -4275,7 +4368,7 @@ async function runCommand(config, command, options = {}) {
       console.log(
         outcome.success
           ? outcome.result?.alreadyInTally
-            ? `Command ${command.id} completed: receipt already existed in Tally.`
+            ? `Command ${command.id} completed: bank transaction already existed in Tally.`
             : `Command ${command.id} completed: bank voucher posted.`
           : `Command ${command.id} failed: ${outcome.error || "Tally returned an error."}`
       );
@@ -4722,6 +4815,167 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
   };
 }
 
+async function fetchCommandRealtimeConfig(config) {
+  const url = new URL(`${config.apiBase}/api/tally/bridge/realtime-config`);
+  url.searchParams.set("connectionId", config.connectionId);
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${config.bridgeToken}` },
+  });
+  const payload = await readJsonResponse(response);
+  if (!response.ok) {
+    const error = new Error(payload.error || `Realtime configuration failed with HTTP ${response.status}.`);
+    error.status = response.status;
+    throw error;
+  }
+  return payload.realtime ?? null;
+}
+
+async function drainPendingCommands(config, options = {}) {
+  let processed = 0;
+  // A wake can represent several commands queued together. Drain a bounded
+  // batch so each command starts immediately without monopolising the bridge.
+  while (processed < 25) {
+    const command = await receiveNextCommand(config);
+    if (!command) break;
+    await runCommand(config, command, options);
+    processed += 1;
+  }
+  return processed;
+}
+
+function decodeRealtimeFrame(data) {
+  if (typeof data === "string") return JSON.parse(data);
+  const bytes = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  // Supabase Realtime protocol v2 sends user broadcasts in its compact binary
+  // envelope: kind, topic size, event size, metadata size, encoding.
+  if (bytes.length >= 5 && bytes[0] === 4) {
+    const topicSize = bytes[1];
+    const eventSize = bytes[2];
+    const metadataSize = bytes[3];
+    const payloadEncoding = bytes[4];
+    let offset = 5;
+    const frameTopic = bytes.subarray(offset, offset + topicSize).toString("utf8");
+    offset += topicSize;
+    const userEvent = bytes.subarray(offset, offset + eventSize).toString("utf8");
+    offset += eventSize + metadataSize;
+    const rawPayload = bytes.subarray(offset);
+    const broadcastPayload = payloadEncoding === 1
+      ? JSON.parse(rawPayload.toString("utf8"))
+      : rawPayload;
+    return [null, null, frameTopic, "broadcast", { event: userEvent, payload: broadcastPayload }];
+  }
+  return JSON.parse(bytes.toString("utf8"));
+}
+
+function startCommandWakeChannel(config, executeExclusive, options = {}) {
+  let socket = null;
+  let reconnectTimer = null;
+  let heartbeatTimer = null;
+  let stopped = false;
+  let messageRef = 1;
+  let realtimeConfig = null;
+
+  const log = (level, message) => emitLog(options, level, message);
+  const clearSocketTimers = () => {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  };
+  const sendFrame = (topic, event, payload, joinRef = null) => {
+    if (socket?.readyState !== 1) return;
+    const ref = String(messageRef++);
+    socket.send(JSON.stringify([joinRef, ref, topic, event, payload]));
+    return ref;
+  };
+  const runWake = async (reason) => {
+    try {
+      const processed = await executeExclusive(() => drainPendingCommands(config, options));
+      if (processed > 0) log("info", `Processed ${processed} queued Tally command${processed === 1 ? "" : "s"} after ${reason}.`);
+    } catch (error) {
+      log("error", error instanceof Error ? error.message : "Immediate Tally command check failed.");
+    }
+  };
+  const scheduleReconnect = () => {
+    clearSocketTimers();
+    if (stopped || reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      void connect();
+    }, 3000);
+    reconnectTimer.unref?.();
+  };
+
+  const connect = async () => {
+    if (stopped) return;
+    if (typeof WebSocket !== "function") {
+      log("error", "This connector runtime does not support immediate command notifications; polling fallback remains active.");
+      return;
+    }
+    try {
+      realtimeConfig = await fetchCommandRealtimeConfig(config);
+      if (!realtimeConfig?.websocketUrl || !realtimeConfig?.publishableKey || !realtimeConfig?.topic) {
+        throw new Error("Realtime command notifications are not configured.");
+      }
+      const url = new URL(realtimeConfig.websocketUrl);
+      url.searchParams.set("apikey", realtimeConfig.publishableKey);
+      url.searchParams.set("vsn", "2.0.0");
+      const topic = `realtime:${realtimeConfig.topic}`;
+      socket = new WebSocket(url.toString(), {
+        // The packaged Electron runtime does not inherit Node's
+        // --use-system-ca flag. Include Windows' trusted roots explicitly so
+        // corporate SSL inspection certificates work exactly as they do for
+        // the connector's normal HTTPS requests.
+        ca: trustedCaCertificates(),
+      });
+      socket.addEventListener("open", () => {
+        sendFrame(topic, "phx_join", {
+          config: {
+            broadcast: { ack: false, self: false },
+            presence: { enabled: false },
+            postgres_changes: [],
+          },
+        }, "1");
+        heartbeatTimer = setInterval(() => sendFrame("phoenix", "heartbeat", {}), 25_000);
+        heartbeatTimer.unref?.();
+      });
+      socket.addEventListener("message", (event) => {
+        try {
+          const frame = decodeRealtimeFrame(event.data);
+          if (!Array.isArray(frame) || frame.length < 5) return;
+          const [, , frameTopic, eventName, payload] = frame;
+          if (frameTopic !== topic) return;
+          if (eventName === "phx_reply" && payload?.status === "ok") {
+            log("info", "Immediate Tally command notifications connected; 15-second polling remains as fallback.");
+            void runWake("notification-channel startup");
+            return;
+          }
+          if (eventName === "broadcast" && payload?.event === (realtimeConfig.event || "command_queued")) {
+            void runWake("realtime notification");
+          }
+        } catch (error) {
+          log("error", error instanceof Error ? error.message : "Invalid realtime command notification.");
+        }
+      });
+      socket.addEventListener("error", (event) => {
+        const detail = event?.error?.message || event?.message || "WebSocket connection failed";
+        log("error", `Immediate command notifications are unavailable (${detail}); polling fallback remains active.`);
+      });
+      socket.addEventListener("close", scheduleReconnect);
+    } catch (error) {
+      log("error", `${error instanceof Error ? error.message : "Could not connect command notifications"} Polling fallback remains active.`);
+      scheduleReconnect();
+    }
+  };
+
+  void connect();
+  return () => {
+    stopped = true;
+    clearSocketTimers();
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    socket?.close();
+  };
+}
+
 async function startBridge(args) {
   const config = readConfig();
   if (!config) {
@@ -4764,7 +5018,7 @@ async function startBridge(args) {
   };
 
   await runOnce(config);
-  startCashDiscountLiveChannel(config, executeExclusive);
+  startCommandWakeChannel(config, executeExclusive);
   setInterval(() => {
     runSerially().catch((error) => {
       console.error(error instanceof Error ? error.message : error);
@@ -4808,7 +5062,7 @@ function createBridgeRunner(options = {}) {
   let timer = null;
   let running = false;
   let stopped = false;
-  let stopCashDiscountLiveChannel = null;
+  let stopCommandWakeChannel = null;
 
   const executeExclusive = async (task) => {
     while (running && !stopped) {
@@ -4830,8 +5084,8 @@ function createBridgeRunner(options = {}) {
       clearInterval(timer);
       timer = null;
     }
-    stopCashDiscountLiveChannel?.();
-    stopCashDiscountLiveChannel = null;
+    stopCommandWakeChannel?.();
+    stopCommandWakeChannel = null;
     if (typeof options.onStop === "function") {
       options.onStop({ reason, error, timestamp: new Date().toISOString() });
     }
@@ -4877,7 +5131,7 @@ function createBridgeRunner(options = {}) {
     async start() {
       emitLog(options, "info", `Starting Tally bridge for ${config.tallyUrl}`);
       emitLog(options, "info", `Sending heartbeat every ${intervalMs} ms.`);
-      stopCashDiscountLiveChannel = startCashDiscountLiveChannel(config, executeExclusive, options);
+      stopCommandWakeChannel = startCommandWakeChannel(config, executeExclusive, options);
       await runSerially();
       if (!stopped) {
         timer = setInterval(() => {
@@ -5391,6 +5645,7 @@ export {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_TALLY_URL,
   createBridgeRunner,
+  decodeRealtimeFrame,
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
   buildCollectionExportXml,

@@ -34,6 +34,12 @@ import { assessCaseTermsComplianceDetailed } from "@/lib/processing/pipeline";
 import { appendPacketUploadAiLog } from "@/lib/processing/packet-upload-debug";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import {
+  ensureStorageAsset,
+  processStorageCleanupQueue,
+  removeStorageObjectsIfUnreferenced,
+  type StorageObjectCandidate,
+} from "@/lib/storage-assets";
+import {
   getLegacyHiddenTermsReviewCount,
   isActionableStoredTermsComplianceMismatch,
   isActionableTermsComplianceMismatch,
@@ -712,11 +718,10 @@ function duplicateCaseResponse(request: Request, duplicateCase: DuplicateCaseCan
 
 async function cleanupUploadedFiles(
   supabase: ReturnType<typeof createSupabaseAdminClient>,
-  uploadedPaths: string[]
+  uploadedPaths: StorageObjectCandidate[]
 ) {
   if (uploadedPaths.length === 0) return;
-
-  await supabase.storage.from(STORAGE_BUCKET).remove(uploadedPaths);
+  await removeStorageObjectsIfUnreferenced(supabase, uploadedPaths);
   uploadedPaths.splice(0, uploadedPaths.length);
 }
 
@@ -1095,6 +1100,16 @@ export async function GET(request: Request) {
     const requestedScope = url.searchParams.get("scope");
     const shouldDeriveSummaryFromDocuments = url.searchParams.get("derive") === "documents";
     const scope = requestedScope === "deleted" ? "deleted" : "active";
+
+    // Recycle-bin visits opportunistically retry durable Storage cleanup left
+    // by a transient failure during permanent deletion.
+    if (scope === "deleted") {
+      try {
+        await processStorageCleanupQueue(supabase, user.id, { limit: 25 });
+      } catch (cleanupError) {
+        console.error("Failed to retry pending Storage cleanup", cleanupError);
+      }
+    }
     const cursor = decodeCaseListCursor(url.searchParams.get("cursor"));
     const searchQuery = normalizeCaseSearchQuery(url.searchParams.get("q"));
     const statusFilter = readCaseStatusFilter(url.searchParams.get("status"));
@@ -1320,7 +1335,7 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   let supabase: ReturnType<typeof createSupabaseAdminClient> | null = null;
-  const uploadedPaths: string[] = [];
+  const uploadedPaths: StorageObjectCandidate[] = [];
   let caseId = "";
 
   try {
@@ -1369,22 +1384,27 @@ export async function POST(request: Request) {
 
       const fileRows = [];
       for (const file of preparedFiles) {
-        const storagePath = `${caseId}/${Date.now()}-${crypto.randomUUID()}-${sanitizeFileName(file.originalName)}`;
-        const { error: uploadError } = await supabase.storage.from(STORAGE_BUCKET).upload(storagePath, file.bytes, {
+        const asset = await ensureStorageAsset({
+          supabase,
+          ownerUserId: user.id,
+          storageBucket: STORAGE_BUCKET,
+          bytes: file.bytes,
           contentType: file.contentType,
-          upsert: false,
         });
-
-        if (uploadError) {
-          throw uploadError;
+        if (asset.createdObject) {
+          uploadedPaths.push({
+            storageAssetId: asset.id,
+            storageBucket: asset.storageBucket,
+            storagePath: asset.storagePath,
+          });
         }
-
-        uploadedPaths.push(storagePath);
         fileRows.push({
           case_id: caseId,
           original_name: file.originalName,
-          storage_bucket: STORAGE_BUCKET,
-          storage_path: storagePath,
+          storage_bucket: asset.storageBucket,
+          storage_path: asset.storagePath,
+          storage_asset_id: asset.id,
+          content_sha256: asset.contentSha256,
           mime_type: file.contentType,
           size_bytes: file.sizeBytes,
         });
@@ -1482,22 +1502,27 @@ export async function POST(request: Request) {
 
     const fileRows = [];
     for (const file of preparedFiles) {
-      const storagePath = `${caseId}/${Date.now()}-${crypto.randomUUID()}-${sanitizeFileName(file.originalName)}`;
-      const { error: uploadError } = await supabase.storage.from(STORAGE_BUCKET).upload(storagePath, file.bytes, {
+      const asset = await ensureStorageAsset({
+        supabase,
+        ownerUserId: user.id,
+        storageBucket: STORAGE_BUCKET,
+        bytes: file.bytes,
         contentType: file.contentType,
-        upsert: false,
       });
-
-      if (uploadError) {
-        throw uploadError;
+      if (asset.createdObject) {
+        uploadedPaths.push({
+          storageAssetId: asset.id,
+          storageBucket: asset.storageBucket,
+          storagePath: asset.storagePath,
+        });
       }
-
-      uploadedPaths.push(storagePath);
       fileRows.push({
         case_id: caseId,
         original_name: file.originalName,
-        storage_bucket: STORAGE_BUCKET,
-        storage_path: storagePath,
+        storage_bucket: asset.storageBucket,
+        storage_path: asset.storagePath,
+        storage_asset_id: asset.id,
+        content_sha256: asset.contentSha256,
         mime_type: file.contentType,
         size_bytes: file.sizeBytes,
       });

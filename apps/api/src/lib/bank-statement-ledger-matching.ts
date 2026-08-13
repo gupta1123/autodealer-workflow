@@ -10,6 +10,7 @@ import {
   callOpenRouter,
   getBankLedgerMatchingMaxTokens,
   getBankLedgerMatchingModel,
+  getBankLedgerMatchingReasoning,
   getBankLedgerMatchingTimeoutMs,
 } from "./processing/openrouter.ts";
 import { isSuspenseLedgerIdentity } from "./bank-statement-ledger-safety.ts";
@@ -352,33 +353,6 @@ function findLedgerByNormalizedName(ledgers: TallyMasterRow[], ledgerName?: stri
   return ledgers.find((ledger) => normalizeName(ledger.tally_name) === normalized) ?? null;
 }
 
-function ledgerShortlistScore(ledger: TallyMasterRow, transaction: MatchableTransaction, counterpartyName: string | null) {
-  const candidates = [
-    counterpartyName,
-    transaction.counterpartyName,
-    extractCounterpartyName(transaction.description),
-    transaction.description,
-  ].filter(Boolean) as string[];
-
-  return Math.max(0, ...candidates.map((candidate) => ledgerNameSimilarity(candidate, ledger.tally_name)));
-}
-
-function shortlistLedgersForAi(ledgers: TallyMasterRow[], transaction: MatchableTransaction, counterpartyName: string | null) {
-  if (ledgers.length <= 200) return ledgers;
-
-  const scoredLedgers = ledgers
-    .map((ledger) => ({
-      ledger,
-      score: ledgerShortlistScore(ledger, transaction, counterpartyName),
-    }))
-    .filter((entry) => entry.score >= 0.35)
-    .sort((left, right) => right.score - left.score || left.ledger.tally_name.localeCompare(right.ledger.tally_name))
-    .slice(0, 120)
-    .map((entry) => entry.ledger);
-
-  return scoredLedgers.length > 0 ? scoredLedgers : ledgers.slice(0, 200);
-}
-
 function validateAiLedgerMatch(
   match: Partial<AiLedgerMatch> | undefined,
   candidateLedgers: TallyMasterRow[]
@@ -442,14 +416,13 @@ async function aiMatchLedgersForTransactions(input: {
 }) {
   if (input.transactions.length === 0) return [];
 
-  const candidateLedgersByIndex = input.transactions.map(({ transaction, counterpartyName }) =>
-    shortlistLedgersForAi(input.ledgers, transaction, counterpartyName)
-  );
+  // Every transaction must be evaluated against the complete active Tally
+  // ledger catalogue. De-duplicate the synced catalogue once, but do not
+  // locally rank, shortlist, or exclude ledgers before the AI decision.
   const candidateLedgerByKey = new Map<string, TallyMasterRow>();
-  for (const ledgers of candidateLedgersByIndex) {
-    for (const ledger of ledgers) {
-      candidateLedgerByKey.set(normalizeName(ledger.tally_name), ledger);
-    }
+  for (const ledger of input.ledgers) {
+    const key = normalizeName(ledger.tally_name);
+    if (key && !candidateLedgerByKey.has(key)) candidateLedgerByKey.set(key, ledger);
   }
   const candidateLedgers = Array.from(candidateLedgerByKey.values());
   if (candidateLedgers.length === 0) return input.transactions.map(() => null);
@@ -473,9 +446,6 @@ async function aiMatchLedgersForTransactions(input: {
             transactionType: transaction.transactionType ?? null,
             category: transaction.category,
             counterpartyName: counterpartyName ?? transaction.counterpartyName ?? null,
-            ...(candidateLedgersByIndex[index]?.length < input.ledgers.length
-              ? { allowedLedgerNames: candidateLedgersByIndex[index].map((ledger) => ledger.tally_name) }
-              : {}),
           })),
           tallyLedgers: candidateLedgers.map((ledger) => ({
             name: ledger.tally_name,
@@ -488,6 +458,7 @@ async function aiMatchLedgersForTransactions(input: {
       expectJson: true,
       jsonMode: true,
       model: getBankLedgerMatchingModel(),
+      reasoning: getBankLedgerMatchingReasoning(),
       maxTokens: getBankLedgerMatchingMaxTokens(),
       timeoutMs: getBankLedgerMatchingTimeoutMs(),
     }
@@ -496,10 +467,25 @@ async function aiMatchLedgersForTransactions(input: {
   const parsed = safeJsonParse<{
     matches?: Array<Partial<AiLedgerMatch>>;
   }>(raw, {});
+  if (process.env.OPENROUTER_DEBUG_LOG === "true") {
+    console.log(
+      JSON.stringify({
+        scope: "bank_ledger_parser",
+        event: "parsed_response",
+        transactionCount: input.transactions.length,
+        rawLength: raw.length,
+        matchesIsArray: Array.isArray(parsed.matches),
+        matchCount: Array.isArray(parsed.matches) ? parsed.matches.length : 0,
+        returnedIndexes: Array.isArray(parsed.matches)
+          ? parsed.matches.map((entry) => entry?.index ?? null)
+          : [],
+      })
+    );
+  }
   return input.transactions.map((_, index) =>
     validateAiLedgerMatch(
       parsed.matches?.find((entry) => Number(entry?.index) === index),
-      candidateLedgersByIndex[index] ?? []
+      candidateLedgers
     )
   );
 }
@@ -770,6 +756,61 @@ export async function suggestBankLedgerForTransaction(input: {
     transactions: [{ accountId: input.accountId, transaction: input.transaction }],
   });
   return suggestion;
+}
+
+export async function suggestLedgerFromTallyCatalogue(input: {
+  ledgers: Array<{
+    id: string;
+    name: string;
+    parent?: string | null;
+  }>;
+  transaction: MatchableTransaction;
+}): Promise<BankLedgerSuggestion> {
+  const ledgers = input.ledgers.map((ledger) => ({
+    id: ledger.id,
+    connection_id: "provided-catalogue",
+    owner_user_id: "provided-catalogue",
+    company_name: "provided-catalogue",
+    sync_run_id: null,
+    master_type: "ledger" as const,
+    master_key: normalizeName(ledger.name),
+    tally_guid: null,
+    tally_name: ledger.name,
+    parent_name: ledger.parent ?? null,
+    gstin: null,
+    hsn_code: null,
+    unit_name: null,
+    tax_rate: null,
+    raw_payload: {},
+    is_active: true,
+    last_synced_at: "",
+    created_at: "",
+    updated_at: "",
+  }));
+  const counterpartyName =
+    input.transaction.counterpartyName?.trim() ||
+    extractCounterpartyName(input.transaction.description) ||
+    null;
+  const [aiMatch] = await aiMatchLedgersForTransactions({
+    ledgers,
+    transactions: [{ transaction: input.transaction, counterpartyName }],
+  });
+
+  if (!aiMatch) return deterministicLedgerSuggestion(counterpartyName);
+  return {
+    counterpartyName,
+    ledgerName: aiMatch.ledgerName,
+    confidence: aiMatch.confidence,
+    reason: aiMatch.reason,
+    mappingSource:
+      aiMatch.matchType === "close_match"
+        ? "close_match"
+        : aiMatch.matchType === "direct_match"
+          ? "ai_match"
+          : "none",
+    matchType: aiMatch.matchType,
+    candidateLedgerNames: aiMatch.candidateLedgerNames,
+  };
 }
 
 export function buildLedgerMappingTarget(ledgerName: string) {

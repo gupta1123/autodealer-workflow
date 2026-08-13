@@ -227,6 +227,14 @@ export type TallyMasterOption = {
   taxRate: number | null;
 };
 
+export type SupplierLedgerMatch = {
+  matchType: "direct_match" | "close_match" | "suspense";
+  ledgerName: string | null;
+  candidateLedgerNames: string[];
+  confidence: number;
+  reason: string | null;
+};
+
 async function readResponse(response: Response, fallback: string) {
   const raw = await response.text();
   let payload: Record<string, unknown> = {};
@@ -277,6 +285,33 @@ export async function approveAndQueueTallyPurchasePosting(caseId: string) {
     body: JSON.stringify({ action: "approve_and_queue" }),
   });
   return readResponse(response, "Failed to queue the Purchase voucher.");
+}
+
+export async function matchTallyPurchaseSupplierLedger(
+  caseId: string,
+  input: {
+    connectionId: string;
+    companyName: string;
+    supplierName: string;
+    supplierGstin: string;
+  }
+) {
+  const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "match_supplier_ledger", ...input }),
+  });
+  const raw = await response.text();
+  let payload: Record<string, unknown> = {};
+  try {
+    payload = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+  } catch {
+    payload = {};
+  }
+  if (!response.ok) {
+    throw new Error(typeof payload.error === "string" ? payload.error : raw || "Failed to match the supplier ledger.");
+  }
+  return (payload as { supplierLedgerMatch: SupplierLedgerMatch }).supplierLedgerMatch;
 }
 
 export async function queueTallyMasterRefresh(connectionId: string, companyName: string) {

@@ -21,6 +21,8 @@ const KALIKA_PATTERN = /\bkalika\b|kalika\s+steel|kalika\s+alloys/i;
 export type CaseFileRowForSplit = {
   id: string;
   original_name: string;
+  storage_asset_id?: string | null;
+  content_sha256?: string | null;
   storage_bucket: string | null;
   storage_path: string;
   mime_type: string | null;
@@ -386,50 +388,25 @@ export function previewShipmentSplitGroups(params: {
   }));
 }
 
-function sanitizeFileName(fileName: string) {
-  const cleaned = fileName
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "");
-
-  return cleaned || "upload";
-}
-
 function getFilesForGroup(group: ShipmentGroup, caseFiles: CaseFileRowForSplit[]) {
   const sourceNames = new Set(group.sourceFileNames.map(normalizeSourceName).filter(Boolean));
   return caseFiles.filter((file) => sourceNames.has(normalizeSourceName(file.original_name)));
 }
 
 async function copyCaseFileForChild(
-  supabase: SupabaseAdminClient,
+  _supabase: SupabaseAdminClient,
   file: CaseFileRowForSplit,
   childCaseId: string
 ) {
   const bucket = file.storage_bucket || STORAGE_BUCKET;
-  const nextPath = `${childCaseId}/${Date.now()}-${randomUUID()}-${sanitizeFileName(file.original_name)}`;
-  const storage = supabase.storage.from(bucket);
-  const copyResult = await storage.copy(file.storage_path, nextPath);
-
-  if (copyResult.error) {
-    const download = await storage.download(file.storage_path);
-    if (download.error || !download.data) {
-      throw download.error || copyResult.error;
-    }
-    const upload = await storage.upload(nextPath, download.data, {
-      contentType: file.mime_type ?? undefined,
-      upsert: false,
-    });
-    if (upload.error) {
-      throw upload.error;
-    }
-  }
 
   return {
     case_id: childCaseId,
     original_name: file.original_name,
     storage_bucket: bucket,
-    storage_path: nextPath,
+    storage_path: file.storage_path,
+    storage_asset_id: file.storage_asset_id ?? null,
+    content_sha256: file.content_sha256 ?? null,
     mime_type: file.mime_type,
     size_bytes: file.size_bytes,
   };

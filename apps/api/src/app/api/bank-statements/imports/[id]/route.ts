@@ -399,6 +399,8 @@ export async function GET(
       extractionSource: previewMeta.extractionSource ?? processingMeta.extractionSource ?? null,
       extractionError: previewMeta.extractionError ?? processingMeta.extractionError ?? null,
       extractionDiagnostics: previewMeta.extractionDiagnostics ?? processingMeta.extractionDiagnostics ?? null,
+      ledgerRecommendationError:
+        previewMeta.ledgerRecommendationError ?? processingMeta.ledgerRecommendationError ?? null,
       processing,
       job: jobRow
         ? {

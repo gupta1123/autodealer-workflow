@@ -59,7 +59,8 @@ type OpenRouterContentPart = {
 
 type OpenRouterReasoningOptions = {
   max_tokens?: number;
-  effort?: "low" | "medium" | "high";
+  effort?: "none" | "low" | "medium" | "high" | "max";
+  enabled?: boolean;
   exclude?: boolean;
 };
 
@@ -93,6 +94,11 @@ function timeoutMessage(model: string, timeoutMs: number) {
   return `OpenRouter request timed out after ${Math.round(timeoutMs / 1000)}s for model ${model}.`;
 }
 
+function logOpenRouterDiagnostic(event: Record<string, unknown>) {
+  if (process.env.OPENROUTER_DEBUG_LOG !== "true") return;
+  console.log(JSON.stringify({ scope: "openrouter", ...event }));
+}
+
 export async function callOpenRouter(
   messages: OpenRouterMessage[],
   options?: {
@@ -117,6 +123,7 @@ export async function callOpenRouter(
   let lastError = "OpenRouter request failed";
 
   while (attempt <= MAX_RETRIES) {
+    const requestStartedAt = Date.now();
     const abortController = new AbortController();
     const timeoutId = setTimeout(() => abortController.abort(), timeoutMs);
     try {
@@ -147,6 +154,14 @@ export async function callOpenRouter(
           payload?.message ||
           (response.ok ? "OpenRouter returned an error payload" : `OpenRouter request failed (${response.status})`);
         lastError = errorText;
+        logOpenRouterDiagnostic({
+          event: "response_error",
+          model,
+          attempt: attempt + 1,
+          status: response.status,
+          durationMs: Date.now() - requestStartedAt,
+          error: errorText,
+        });
 
         if (!isRetryableStatus(response.status) || isHardQuotaError(errorText) || attempt === MAX_RETRIES) {
           throw new Error(errorText);
@@ -159,9 +174,21 @@ export async function callOpenRouter(
       }
 
       const message = payload?.choices?.[0]?.message?.content;
-      return Array.isArray(message)
+      const content = Array.isArray(message)
         ? message.map((part: OpenRouterContentPart) => part?.text || "").join("\n")
         : String(message || "");
+      logOpenRouterDiagnostic({
+        event: "response_success",
+        model,
+        attempt: attempt + 1,
+        status: response.status,
+        durationMs: Date.now() - requestStartedAt,
+        finishReason: payload?.choices?.[0]?.finish_reason ?? null,
+        usage: payload?.usage ?? null,
+        contentLength: content.length,
+        content,
+      });
+      return content;
     } catch (error) {
       clearTimeout(timeoutId);
       lastError =
@@ -170,6 +197,13 @@ export async function callOpenRouter(
           : error instanceof Error
             ? error.message
             : String(error ?? "Unknown error");
+      logOpenRouterDiagnostic({
+        event: "request_exception",
+        model,
+        attempt: attempt + 1,
+        durationMs: Date.now() - requestStartedAt,
+        error: lastError,
+      });
       if (attempt === MAX_RETRIES) {
         throw new Error(lastError);
       }
@@ -200,6 +234,18 @@ export function getBankLedgerMatchingTimeoutMs() {
   }
 
   return OPENROUTER_BANK_LEDGER_TIMEOUT_MS;
+}
+
+export function getBankLedgerMatchingReasoning(): OpenRouterReasoningOptions | undefined {
+  const mode = String(process.env.OPENROUTER_BANK_LEDGER_REASONING ?? "").trim().toLowerCase();
+  if (!mode) return undefined;
+  if (["off", "none", "disabled", "false", "0"].includes(mode)) {
+    return { enabled: false, effort: "none" };
+  }
+  if (["low", "medium", "high", "max"].includes(mode)) {
+    return { effort: mode as "low" | "medium" | "high" | "max", exclude: true };
+  }
+  return undefined;
 }
 
 function getConfiguredExtractionReviewProvider() {

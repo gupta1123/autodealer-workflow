@@ -3,18 +3,108 @@ import test from "node:test";
 
 import {
   buildCollectionExportXml,
+  buildBankVoucherXml,
   buildPurchaseVoucherXml,
   buildRequestedLedgerFormula,
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
+  decodeRealtimeFrame,
   findBankLedgersFromMasters,
   findPartyLedgersFromMasters,
   fetchCustomerOpenBillsFromTally,
   parseTallyImportResult,
   openBillBlockRequiresVoucherFallback,
+  parseLedgerClosingBalance,
   purchaseVoucherReadbackComparison,
   strictBankTransactionCandidates,
 } from "./bridge.mjs";
+
+test("Supabase binary broadcast wake frames decode without financial payloads", () => {
+  const topic = "realtime:tally-command:522c18c7-95fa-41ff-a6fe-ed27d8675ed7";
+  const event = "command_queued";
+  const payload = Buffer.from(JSON.stringify({ wake: true }), "utf8");
+  const topicBytes = Buffer.from(topic, "utf8");
+  const eventBytes = Buffer.from(event, "utf8");
+  const frame = Buffer.concat([
+    Buffer.from([4, topicBytes.length, eventBytes.length, 0, 1]),
+    topicBytes,
+    eventBytes,
+    payload,
+  ]);
+
+  assert.deepEqual(decodeRealtimeFrame(frame), [
+    null,
+    null,
+    topic,
+    "broadcast",
+    { event, payload: { wake: true } },
+  ]);
+});
+
+test("ledger closing balances preserve Tally Dr and Cr meaning", () => {
+  assert.deepEqual(parseLedgerClosingBalance("1,24,500.00 Dr"), {
+    amount: 124500,
+    type: "Dr",
+    raw: "1,24,500.00 Dr",
+  });
+  assert.deepEqual(parseLedgerClosingBalance("842300 Cr"), {
+    amount: 842300,
+    type: "Cr",
+    raw: "842300 Cr",
+  });
+  assert.deepEqual(parseLedgerClosingBalance("-950"), {
+    amount: 950,
+    type: "Dr",
+    raw: "-950",
+  });
+  assert.deepEqual(parseLedgerClosingBalance(""), {
+    amount: null,
+    type: null,
+    raw: null,
+  });
+});
+
+test("outgoing supplier payments create Payment vouchers with bill allocations", () => {
+  const xml = buildBankVoucherXml({
+    companyName: "Solution Nyx",
+    voucherType: "Payment",
+    voucherDate: "2026-08-17",
+    bankLedgerName: "State Bank of India",
+    counterpartyLedgerName: "Mahavir Steel Corporation",
+    counterpartyIsPartyLedger: true,
+    bankLedgerEntryIsDebit: false,
+    amount: 94000,
+    referenceNumber: "SB61708260002",
+    billAllocations: [
+      { referenceType: "Agst Ref", referenceName: "MSC/26-27/403", amount: 75000 },
+      { referenceType: "Agst Ref", referenceName: "MSC/26-27/404", amount: 19000 },
+    ],
+  });
+
+  assert.match(xml, /<VOUCHERTYPENAME>Payment<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<LEDGERNAME>Mahavir Steel Corporation<\/LEDGERNAME>/);
+  assert.match(xml, /<NAME>MSC\/26-27\/403<\/NAME>/);
+  assert.match(xml, /<NAME>MSC\/26-27\/404<\/NAME>/);
+  assert.match(xml, /<LEDGERNAME>State Bank of India<\/LEDGERNAME>/);
+});
+
+test("outgoing Contra vouchers debit the destination and credit the statement bank", () => {
+  const xml = buildBankVoucherXml({
+    companyName: "Solution Nyx",
+    voucherType: "Contra",
+    voucherDate: "2026-08-17",
+    bankLedgerName: "State Bank of India",
+    counterpartyLedgerName: "HDFC Bank",
+    bankLedgerEntryIsDebit: false,
+    amount: 50000,
+    referenceNumber: "TRANSFER-1",
+  });
+
+  assert.match(xml, /<VOUCHERTYPENAME>Contra<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<LEDGERNAME>HDFC Bank<\/LEDGERNAME>[\s\S]*?<ISDEEMEDPOSITIVE>Yes<\/ISDEEMEDPOSITIVE>/);
+  assert.match(xml, /<LEDGERNAME>State Bank of India<\/LEDGERNAME>[\s\S]*?<ISDEEMEDPOSITIVE>No<\/ISDEEMEDPOSITIVE>/);
+  assert.ok(xml.indexOf("<LEDGERNAME>HDFC Bank</LEDGERNAME>") < xml.indexOf("<LEDGERNAME>State Bank of India</LEDGERNAME>"));
+});
 
 test("collection exports apply Tally-side formula filters", () => {
   const xml = buildCollectionExportXml({

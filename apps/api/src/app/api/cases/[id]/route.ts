@@ -34,6 +34,10 @@ import {
 } from "@/lib/line-items";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import {
+  enqueueStorageCleanup,
+  processStorageCleanupQueue,
+} from "@/lib/storage-assets";
+import {
   getLegacyHiddenTermsReviewCount,
   isActionableStoredTermsComplianceMismatch,
   TERMS_COMPLIANCE_FIELD,
@@ -631,98 +635,85 @@ export async function DELETE(
 
     if (mode === "hard") {
       let canHardDeleteWithColumn = true;
-
+      let existing: Parameters<typeof mapCaseRow>[0] | null = null;
       try {
-        const { error: schemaCheckError } = await supabase
+        const result = await supabase
           .from("packet_cases")
-          .select("deleted_at")
+          .select(
+            "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
+          )
           .eq("id", id)
-          .limit(1);
-
-        if (schemaCheckError) {
-          throw schemaCheckError;
-        }
+          .eq("owner_user_id", user.id)
+          .not("deleted_at", "is", null)
+          .single();
+        if (result.error) throw result.error;
+        existing = result.data;
       } catch (error) {
         if (!isRecycleBinSchemaMissing(error)) {
+          const record = error as { code?: string };
+          if (record.code === "PGRST116") {
+            return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
+          }
           throw error;
         }
         canHardDeleteWithColumn = false;
+        const fallback = await supabase
+          .from("packet_cases")
+          .select(
+            "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
+          )
+          .eq("id", id)
+          .eq("owner_user_id", user.id)
+          .single();
+        if (fallback.error) {
+          if (fallback.error.code === "PGRST116") {
+            return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
+          }
+          throw fallback.error;
+        }
+        if (!isCaseRecycled(fallback.data.processing_meta)) {
+          return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
+        }
+        existing = fallback.data;
+      }
+
+      if (!existing) {
+        return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
       }
 
       const { data: storedFiles, error: filesError } = await supabase
         .from("packet_case_files")
-        .select("storage_bucket, storage_path")
+        .select("storage_asset_id, storage_bucket, storage_path")
         .eq("case_id", id);
 
       if (filesError) {
         throw filesError;
       }
 
-      const filesByBucket = new Map<string, string[]>();
-      for (const file of storedFiles ?? []) {
-        const bucketName = file.storage_bucket || STORAGE_BUCKET;
-        const currentPaths = filesByBucket.get(bucketName) ?? [];
-        currentPaths.push(file.storage_path);
-        filesByBucket.set(bucketName, currentPaths);
-      }
+      const storageCandidates = (storedFiles ?? []).map((file) => ({
+        storageAssetId: file.storage_asset_id,
+        storageBucket: file.storage_bucket || STORAGE_BUCKET,
+        storagePath: file.storage_path,
+      }));
 
-      for (const [bucketName, paths] of filesByBucket.entries()) {
-        if (!paths.length) continue;
-        const { error: removeError } = await supabase.storage.from(bucketName).remove(paths);
-        if (removeError) {
-          throw removeError;
-        }
-      }
+      // Persist cleanup intent before the cascading database delete. If the
+      // Storage API is temporarily unavailable, a later recycle-bin request
+      // can safely retry without losing the object path.
+      await enqueueStorageCleanup(supabase, user.id, storageCandidates);
 
-      if (!canHardDeleteWithColumn) {
-        const existing = await supabase
-          .from("packet_cases")
-          .select(
-            "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
-          )
-          .eq("id", id)
-          .eq("owner_user_id", user.id)
-          .single();
-
-        if (existing.error) {
-          if (existing.error.code === "PGRST116") {
-            return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
-          }
-          throw existing.error;
-        }
-
-        if (!isCaseRecycled(existing.data.processing_meta)) {
-          return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
-        }
-
-        const removed = await supabase
-          .from("packet_cases")
-          .delete()
-          .eq("id", id)
-          .eq("owner_user_id", user.id)
-          .select(
-            "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
-          )
-          .single();
-
-        if (removed.error) {
-          if (removed.error.code === "PGRST116") {
-            return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
-          }
-          throw removed.error;
-        }
-
-        return jsonWithCors(request, { case: mapCaseRow(existing.data) });
-      }
-
-      const { data, error } = await supabase
+      let deletion = supabase
         .from("packet_cases")
         .delete()
         .eq("id", id)
-        .eq("owner_user_id", user.id)
-        .not("deleted_at", "is", null)
+        .eq("owner_user_id", user.id);
+      if (canHardDeleteWithColumn) {
+        deletion = deletion.not("deleted_at", "is", null);
+      }
+      const { error } = await deletion
         .select(
-          "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
+          canHardDeleteWithColumn
+            ? "id, deleted_at"
+            : "id"
         )
         .single();
 
@@ -733,7 +724,12 @@ export async function DELETE(
         throw error;
       }
 
-      return jsonWithCors(request, { case: mapCaseRow(data) });
+      const cleanup = await processStorageCleanupQueue(supabase, user.id, { limit: 100 });
+
+      return jsonWithCors(request, {
+        case: mapCaseRow(existing),
+        storageCleanupPending: cleanup.failed.length > 0,
+      });
     }
 
     let data:

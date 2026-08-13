@@ -14,7 +14,6 @@ import {
 } from "lucide-react";
 
 import { apiFetch } from "@/lib/api-client";
-import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 
 type CompanyOption = {
@@ -202,6 +201,7 @@ type TallyCommand = {
   connectionId?: string;
   status: "queued" | "claimed" | "succeeded" | "failed" | "canceled";
   error?: string | null;
+  result?: Record<string, unknown> | null;
 };
 
 type LiveTallyConnection = {
@@ -632,7 +632,7 @@ export function CollectionsDashboardPage({
       if (!response.ok) throw new Error(await readError(response));
       const payload = (await response.json()) as { commands?: TallyCommand[] };
       const command = payload.commands?.find((item) => item.id === commandId);
-      if (command?.status === "succeeded") return;
+      if (command?.status === "succeeded") return command;
       if (command?.status === "failed" || command?.status === "canceled") {
         throw new Error(command.error || "Tally command failed.");
       }
@@ -667,14 +667,32 @@ export function CollectionsDashboardPage({
       if (!connectionId || !resolvedCompanyName) {
         throw new Error("Select the live Tally company before refreshing Cash Discounts.");
       }
-      return runCashDiscountLiveRequest<DashboardPayload>({
-        connectionId,
-        companyName: resolvedCompanyName,
-        operation: "scan",
-        onProgress: (text) => setMessage({ tone: "info", text }),
+      setMessage({ tone: "info", text: "Reading customer ledgers and open bills from Tally..." });
+      const queueResponse = await apiFetch("/api/collections/live/queue-scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ connectionId, companyName: resolvedCompanyName, operation: "scan" }),
       });
+      if (!queueResponse.ok) throw new Error(await readError(queueResponse));
+      const queued = (await queueResponse.json()) as { command?: TallyCommand };
+      if (!queued.command?.id) throw new Error("Cash Discount scan could not be queued.");
+      const completed = await pollCommand(connectionId, queued.command.id, {
+        timeoutSeconds: 90,
+        pendingMessage: "The Cash Discount scan is still pending. Check the connector, then refresh.",
+      });
+      const scan = completed.result && typeof completed.result === "object" ? completed.result : null;
+      if (!scan) throw new Error("The connector completed the Cash Discount scan without a result.");
+
+      setMessage({ tone: "info", text: "Applying Cash Discount rules to the latest Tally data..." });
+      const analyseResponse = await apiFetch("/api/collections/live/analyse", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ connectionId, companyName: resolvedCompanyName, scan }),
+      });
+      if (!analyseResponse.ok) throw new Error(await readError(analyseResponse));
+      return (await analyseResponse.json()) as DashboardPayload;
     },
-    []
+    [pollCommand]
   );
 
   const refreshAll = useCallback(
@@ -740,19 +758,50 @@ export function CollectionsDashboardPage({
   async function createDebitNoteForProposal(proposal: DebitNoteProposal) {
     const companyName = selectedCompany?.companyName ?? proposal.companyName ?? "";
     if (!selectedConnectionId || !companyName) throw new Error("The live Tally company is not selected.");
-    return runCashDiscountLiveRequest<{ proposal: DebitNoteProposal }>({
-      connectionId: selectedConnectionId,
+    const proposalIdentity = {
+      connectionId: proposal.connectionId,
       companyName,
-      operation: "create_debit_note",
-      proposal: {
-        connectionId: proposal.connectionId,
+      financialYear: selectedCompany?.financialYear ?? proposal.financialYear,
+      partyLedgerName: proposal.partyLedgerName,
+      linkedInvoiceNumber: proposal.linkedInvoiceNumber,
+      recoverableAmount: proposal.recoverableAmount,
+    };
+
+    setMessage({ tone: "info", text: "Rechecking the customer and invoice in Tally..." });
+    const revalidateResponse = await apiFetch("/api/collections/live/queue-scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        connectionId: selectedConnectionId,
         companyName,
-        financialYear: selectedCompany?.financialYear ?? proposal.financialYear,
-        partyLedgerName: proposal.partyLedgerName,
-        linkedInvoiceNumber: proposal.linkedInvoiceNumber,
-        recoverableAmount: proposal.recoverableAmount,
-      },
-      onProgress: (text) => setMessage({ tone: "info", text }),
+        operation: "revalidate",
+        proposal: proposalIdentity,
+      }),
+    });
+    if (!revalidateResponse.ok) throw new Error(await readError(revalidateResponse));
+    const revalidation = (await revalidateResponse.json()) as { command?: TallyCommand };
+    if (!revalidation.command?.id) throw new Error("The live invoice recheck could not be queued.");
+    const checked = await pollCommand(selectedConnectionId, revalidation.command.id, { timeoutSeconds: 75 });
+    if (!checked.result) throw new Error("The connector completed the invoice recheck without a result.");
+
+    setMessage({ tone: "info", text: "Creating and verifying the Debit Note in Tally..." });
+    const prepareResponse = await apiFetch("/api/collections/live/prepare-debit-note", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        connectionId: selectedConnectionId,
+        companyName,
+        proposal: proposalIdentity,
+        scan: checked.result,
+        queue: true,
+      }),
+    });
+    if (!prepareResponse.ok) throw new Error(await readError(prepareResponse));
+    const prepared = (await prepareResponse.json()) as { command?: TallyCommand };
+    if (!prepared.command?.id) throw new Error("The Debit Note could not be queued.");
+    return pollCommand(selectedConnectionId, prepared.command.id, {
+      timeoutSeconds: 90,
+      pendingMessage: "The Debit Note is still pending. Check the connector, then refresh.",
     });
   }
 

@@ -2,11 +2,15 @@ import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
   BANK_STATEMENT_BUCKET,
-  buildStoragePath,
   type BankAccountInput,
 } from "@/lib/bank-statements";
 import { PdfSecurityError, unlockPdfIfNeeded } from "@/lib/pdf-security";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import {
+  ensureStorageAsset,
+  removeStorageObjectsIfUnreferenced,
+  type StorageObjectCandidate,
+} from "@/lib/storage-assets";
 
 export const runtime = "nodejs";
 
@@ -128,6 +132,8 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
+  let supabase: ReturnType<typeof createSupabaseAdminClient> | null = null;
+  let uploadedAsset: StorageObjectCandidate | null = null;
   try {
     const user = await requireRequestUser(request);
     if (!user) {
@@ -154,23 +160,32 @@ export async function POST(request: Request) {
     }
     const bytes = new Uint8Array(await file.arrayBuffer());
     const uploadBytes = isPdfUpload(file) ? await unlockPdfIfNeeded(bytes, statementPassword) : bytes;
-    const storagePath = buildStoragePath(user.id, file.name || "bank-statement");
-    const supabase = createSupabaseAdminClient();
-
-    const upload = await supabase.storage.from(BANK_STATEMENT_BUCKET).upload(storagePath, uploadBytes, {
+    supabase = createSupabaseAdminClient();
+    const asset = await ensureStorageAsset({
+      supabase,
+      ownerUserId: user.id,
+      storageBucket: BANK_STATEMENT_BUCKET,
+      bytes: uploadBytes,
       contentType: file.type || "application/octet-stream",
-      upsert: false,
     });
-    if (upload.error) throw upload.error;
+    if (asset.createdObject) {
+      uploadedAsset = {
+        storageAssetId: asset.id,
+        storageBucket: asset.storageBucket,
+        storagePath: asset.storagePath,
+      };
+    }
 
     const insertPayload = {
       owner_user_id: user.id,
       bank_account_id: null,
       original_file_name: file.name || "bank-statement",
-      storage_bucket: BANK_STATEMENT_BUCKET,
-      storage_path: storagePath,
+      storage_bucket: asset.storageBucket,
+      storage_path: asset.storagePath,
+      storage_asset_id: asset.id,
+      content_sha256: asset.contentSha256,
       mime_type: file.type || null,
-      size_bytes: file.size,
+      size_bytes: asset.sizeBytes,
       status: "processing",
       statement_period_start: null,
       statement_period_end: null,
@@ -222,6 +237,9 @@ export async function POST(request: Request) {
 
     return jsonWithCors(request, serializePreviewFromMeta(createdImport as Record<string, unknown>));
   } catch (error) {
+    if (supabase && uploadedAsset) {
+      await removeStorageObjectsIfUnreferenced(supabase, [uploadedAsset]);
+    }
     if (error instanceof PdfSecurityError) {
       const status =
         error.code === "BANK_STATEMENT_PASSWORD_REQUIRED"

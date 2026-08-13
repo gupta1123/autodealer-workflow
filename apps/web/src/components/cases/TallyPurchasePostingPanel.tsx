@@ -38,6 +38,7 @@ import { fetchCaseFileSignedUrl } from "@/lib/case-persistence";
 import {
   approveAndQueueTallyPurchasePosting,
   fetchTallyPurchasePosting,
+  matchTallyPurchaseSupplierLedger,
   queueTallyMasterRefresh,
   saveTallyPurchasePosting,
   waitForTallyCommand,
@@ -45,6 +46,7 @@ import {
   type TallyPostingIssue,
   type TallyPostingResponse,
   type TallyPostingReview,
+  type SupplierLedgerMatch,
 } from "@/lib/tally-purchase-posting";
 
 type PanelState = "loading" | "ready" | "error";
@@ -599,7 +601,11 @@ export function TallyPurchasePostingPanel({
   const [refreshingMasters, setRefreshingMasters] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [editingGstRate, setEditingGstRate] = useState(false);
+  const [supplierLedgerMatch, setSupplierLedgerMatch] = useState<SupplierLedgerMatch | null>(null);
+  const [matchingSupplierLedger, setMatchingSupplierLedger] = useState(false);
+  const [supplierLedgerMatchError, setSupplierLedgerMatchError] = useState<string | null>(null);
   const automaticMasterSyncKeyRef = useRef("");
+  const automaticSupplierMatchKeyRef = useRef("");
   const lastPostingStatusRef = useRef<string | null>(null);
 
   const load = useCallback(async (
@@ -703,10 +709,12 @@ export function TallyPurchasePostingPanel({
   );
   const stockItemOptions = payload?.masterOptions.stockItems ?? [];
   const supplierLedgerOptions = useMemo(() => {
-    const creditors = ledgerOptions.filter((option) =>
-      /sundry\s+creditors?|trade\s+payables?/i.test(option.parent ?? "")
+    const preferredNames = new Set(
+      (supplierLedgerMatch?.candidateLedgerNames ?? []).map((name) => name.trim().toLowerCase())
     );
-    return [...creditors].sort((left, right) => {
+    return [...ledgerOptions].sort((left, right) => {
+      const rightSuggested = Number(preferredNames.has(right.name.trim().toLowerCase()));
+      const leftSuggested = Number(preferredNames.has(left.name.trim().toLowerCase()));
       const rightGstinMatch = Number(
         Boolean(review?.supplierGstin) &&
           right.gstin?.toUpperCase() === review?.supplierGstin.toUpperCase()
@@ -715,9 +723,71 @@ export function TallyPurchasePostingPanel({
         Boolean(review?.supplierGstin) &&
           left.gstin?.toUpperCase() === review?.supplierGstin.toUpperCase()
       );
-      return rightGstinMatch - leftGstinMatch || left.name.localeCompare(right.name);
+      const rightCreditor = Number(/sundry\s+creditors?|trade\s+payables?/i.test(right.parent ?? ""));
+      const leftCreditor = Number(/sundry\s+creditors?|trade\s+payables?/i.test(left.parent ?? ""));
+      return rightSuggested - leftSuggested ||
+        rightGstinMatch - leftGstinMatch ||
+        rightCreditor - leftCreditor ||
+        left.name.localeCompare(right.name);
     });
-  }, [ledgerOptions, review?.supplierGstin]);
+  }, [ledgerOptions, review?.supplierGstin, supplierLedgerMatch?.candidateLedgerNames]);
+
+  useEffect(() => {
+    const supplierName = review?.supplierName?.trim() ?? "";
+    const supplierGstin = review?.supplierGstin?.trim() ?? "";
+    if (
+      locked ||
+      review?.supplierLedgerName?.trim() ||
+      (!supplierName && !supplierGstin) ||
+      !payload?.connection?.masterSnapshotFresh ||
+      !payload.connection.masterSnapshotComplete ||
+      !selectedConnectionId ||
+      !selectedCompanyName
+    ) {
+      return;
+    }
+    const key = [
+      selectedConnectionId,
+      selectedCompanyName,
+      payload.connection.masterSyncRunId ?? "",
+      supplierName,
+      supplierGstin,
+    ].join("::");
+    if (automaticSupplierMatchKeyRef.current === key) return;
+    automaticSupplierMatchKeyRef.current = key;
+    setMatchingSupplierLedger(true);
+    setSupplierLedgerMatchError(null);
+    void matchTallyPurchaseSupplierLedger(caseId, {
+      connectionId: selectedConnectionId,
+      companyName: selectedCompanyName,
+      supplierName,
+      supplierGstin,
+    })
+      .then((match) => {
+        setSupplierLedgerMatch(match);
+        if (match.matchType === "direct_match" && match.ledgerName) {
+          setReview((current) => current ? { ...current, supplierLedgerName: match.ledgerName ?? "" } : current);
+          setDirty(true);
+        }
+      })
+      .catch((matchError) => {
+        setSupplierLedgerMatchError(
+          matchError instanceof Error ? matchError.message : "Supplier ledger matching failed."
+        );
+      })
+      .finally(() => setMatchingSupplierLedger(false));
+  }, [
+    caseId,
+    locked,
+    payload?.connection?.masterSnapshotComplete,
+    payload?.connection?.masterSnapshotFresh,
+    payload?.connection?.masterSyncRunId,
+    review?.supplierGstin,
+    review?.supplierLedgerName,
+    review?.supplierName,
+    selectedCompanyName,
+    selectedConnectionId,
+  ]);
   const purchaseTaxOptions = (dutyHead: "cgst" | "sgst" | "igst") =>
     ledgerOptions.filter((option) => {
       const identity = `${option.name} ${option.parent ?? ""}`;
@@ -801,6 +871,11 @@ export function TallyPurchasePostingPanel({
 
   function updateReview<K extends keyof TallyPostingReview>(key: K, value: TallyPostingReview[K]) {
     setReview((current) => current ? { ...current, [key]: value } : current);
+    if (key === "supplierName" || key === "supplierGstin") {
+      setSupplierLedgerMatch(null);
+      setSupplierLedgerMatchError(null);
+      automaticSupplierMatchKeyRef.current = "";
+    }
     setDirty(true);
     setNotice(null);
   }
@@ -1464,15 +1539,49 @@ export function TallyPurchasePostingPanel({
               {...masterContext}
               compact
               disabled={locked || mastersNeedSync}
-              emptyMessage="No Sundry Creditor ledger was returned by Tally."
+              emptyMessage="No ledger matched this search in the selected Tally company."
               id="field-supplier-ledger"
               issues={scopeIssues("invoice", ["SUPPLIER_LEDGER_REQUIRED", "SUPPLIER_LEDGER_GSTIN_MISMATCH"])}
               label="Post against supplier ledger"
               onChange={(value) => updateReview("supplierLedgerName", value)}
               options={supplierLedgerOptions}
-              sourceHint="Only supplier ledgers from the selected Tally company are shown."
+              sourceHint={`Search all ${supplierLedgerOptions.length.toLocaleString("en-IN")} ledgers from the selected Tally company. Likely supplier ledgers appear first.`}
               value={review.supplierLedgerName}
             />
+            {matchingSupplierLedger ? (
+              <div className="mt-3 flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] font-medium text-slate-600">
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-600" />
+                Checking the supplier against all Tally ledgers…
+              </div>
+            ) : null}
+            {supplierLedgerMatch?.matchType === "close_match" && supplierLedgerMatch.candidateLedgerNames.length > 0 ? (
+              <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-amber-800">Close matches — choose one</div>
+                <p className="mt-1 text-[10px] leading-4 text-amber-700">{supplierLedgerMatch.reason || "More than one Tally ledger may represent this supplier."}</p>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {supplierLedgerMatch.candidateLedgerNames.map((ledgerName) => (
+                    <button
+                      className="rounded-lg border border-amber-200 bg-white px-2.5 py-1.5 text-left text-[11px] font-semibold text-slate-800 shadow-sm transition hover:border-emerald-300 hover:bg-emerald-50"
+                      key={ledgerName}
+                      onClick={() => updateReview("supplierLedgerName", ledgerName)}
+                      type="button"
+                    >
+                      {ledgerName}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {supplierLedgerMatch?.matchType === "suspense" ? (
+              <div className="mt-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[10px] leading-4 text-slate-500">
+                No ledger was safe to select automatically. Search the complete ledger list above.
+              </div>
+            ) : null}
+            {supplierLedgerMatchError ? (
+              <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[10px] leading-4 text-rose-700">
+                {supplierLedgerMatchError} You can still search all ledgers manually.
+              </div>
+            ) : null}
             <div className="mt-3">
               <ReviewWarnings warnings={scopeWarnings("invoice")} />
             </div>

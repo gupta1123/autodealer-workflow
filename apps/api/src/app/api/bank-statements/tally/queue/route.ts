@@ -24,7 +24,8 @@ type QueuePayload = {
   accountId?: string;
   bankLedgerName?: string;
   counterpartyLedgerName?: string;
-    transactions?: Array<{
+  outgoingAction?: "verify" | "post";
+  transactions?: Array<{
     transactionId?: string;
     counterpartyLedgerName?: string;
     createLedgerName?: string;
@@ -254,6 +255,7 @@ export async function POST(request: Request) {
     }
 
     const body = (await request.json().catch(() => ({}))) as QueuePayload;
+    const outgoingAction = body.outgoingAction === "post" ? "post" : "verify";
     const submittedConnectionId = toText(body.connectionId, 80);
     const requestedTransactionIds = Array.isArray(body.transactionIds)
       ? body.transactionIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
@@ -687,9 +689,6 @@ export async function POST(request: Request) {
           return skipTransaction(transaction, "invalidDirection");
         }
         const billAllocations = ledgerSelectionByTransactionId.get(transaction.id)?.billAllocations ?? [];
-        if (incomingReceipt && billAllocations.length > 0 && Math.abs(billAllocationTotal(billAllocations) - amount) >= 0.005) {
-          return skipTransaction(transaction, "invalidBillAllocation");
-        }
         const originalVoucherType = getVoucherType(transaction);
         const statementImport = transaction.statement_import_id
           ? importsById.get(transaction.statement_import_id)
@@ -700,7 +699,7 @@ export async function POST(request: Request) {
         const referenceNumber =
           transaction.reference_number || buildVoucherReference(transaction, referenceBankCode);
 
-        if (outgoingPayment) {
+        if (outgoingPayment && outgoingAction === "verify") {
           const nextCommands: TallyCommandInsert[] = [];
           nextCommands.push({
             connection_id: connectionId,
@@ -743,6 +742,20 @@ export async function POST(request: Request) {
         const counterpartyIsPartyLedger = shouldCreateCounterpartyLedger
           ? isPartyParent(createLedgerParentName)
           : isPartyLedger(counterpartyLedgerName);
+        if (
+          (counterpartyIsPartyLedger && billAllocations.length > 0 && Math.abs(billAllocationTotal(billAllocations) - amount) >= 0.005) ||
+          (!counterpartyIsPartyLedger && billAllocations.length > 0)
+        ) {
+          return skipTransaction(transaction, "invalidBillAllocation");
+        }
+        const counterpartyParentName = shouldCreateCounterpartyLedger
+          ? createLedgerParentName
+          : ledgerParentByName.get(normalizeName(counterpartyLedgerName)) || "";
+        const counterpartyIsBankOrCashLedger = ["Bank Accounts", "Bank OD A/c", "Cash-in-Hand"].some(
+          (rootGroupName) =>
+            normalizeName(counterpartyParentName) === normalizeName(rootGroupName) ||
+            masterParentDescendsFromGroup(counterpartyParentName, groupIdentities, rootGroupName)
+        );
         const nextCommands: TallyCommandInsert[] = [];
         const createLedgerKey = normalizeName(createLedgerName);
         if (shouldCreateCounterpartyLedger && createLedgerKey && !queuedCreateLedgerKeys.has(createLedgerKey)) {
@@ -773,7 +786,7 @@ export async function POST(request: Request) {
             bankAccountId: account.id,
             fingerprint: transaction.fingerprint,
             companyName: expectedCompanyName,
-            voucherType: originalVoucherType,
+            voucherType: outgoingPayment && counterpartyIsBankOrCashLedger ? "Contra" : originalVoucherType,
             voucherDate: transaction.transaction_date,
             bankLedgerName,
             counterpartyLedgerName,
@@ -789,7 +802,7 @@ export async function POST(request: Request) {
             counterpartyName: transaction.counterparty_name,
             accountNumberMasked: account.account_number_masked,
             billAllocations,
-            expectedDirection: "incoming",
+            expectedDirection: outgoingPayment ? "outgoing" : "incoming",
             preflightVerifyExisting: true,
           },
         });
@@ -801,22 +814,26 @@ export async function POST(request: Request) {
     const voucherCommands = commands.filter((command) => command.command_type === "post_bank_voucher");
     const verificationCommands = commands.filter((command) => command.command_type === "verify_bank_transaction");
     const expectedReceiptCount = transactions.filter(isIncomingReceipt).length;
-    const expectedPaymentCheckCount = transactions.filter(isOutgoingPayment).length;
+    const outgoingTransactionCount = transactions.filter(isOutgoingPayment).length;
+    const expectedPaymentCheckCount = outgoingAction === "verify" ? outgoingTransactionCount : 0;
+    const expectedPaymentPostCount = outgoingAction === "post" ? outgoingTransactionCount : 0;
+    const expectedVoucherCount = expectedReceiptCount + expectedPaymentPostCount;
 
     if (
-      voucherCommands.length !== expectedReceiptCount ||
+      voucherCommands.length !== expectedVoucherCount ||
       verificationCommands.length !== expectedPaymentCheckCount
     ) {
       return jsonWithCors(
         request,
         {
-          error: `Tally preflight failed: ${voucherCommands.length} of ${expectedReceiptCount} receipt(s) and ${verificationCommands.length} of ${expectedPaymentCheckCount} payment check(s) were ready. Nothing was queued.`,
+          error: `Tally preflight failed: ${voucherCommands.length} of ${expectedVoucherCount} voucher(s) and ${verificationCommands.length} of ${expectedPaymentCheckCount} payment check(s) were ready. Nothing was queued.`,
           queuedCount: 0,
           verificationCount: 0,
           commands: [],
           diagnostics: {
             eligibleTransactionCount: transactions.length,
             expectedReceiptCount,
+            expectedPaymentPostCount,
             expectedPaymentCheckCount,
             companySuspenseLedgerName: companySuspenseLedgerName || null,
             skipped,
@@ -837,6 +854,7 @@ export async function POST(request: Request) {
           diagnostics: {
             eligibleTransactionCount: transactions.length,
             expectedReceiptCount,
+            expectedPaymentPostCount,
             expectedPaymentCheckCount,
             companySuspenseLedgerName: companySuspenseLedgerName || null,
             skipped,
@@ -1067,6 +1085,7 @@ export async function POST(request: Request) {
       diagnostics: {
         eligibleTransactionCount: transactions.length,
         expectedReceiptCount,
+        expectedPaymentPostCount,
         expectedPaymentCheckCount,
         companySuspenseLedgerName: companySuspenseLedgerName || null,
         skipped,

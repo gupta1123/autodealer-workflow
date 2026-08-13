@@ -5,6 +5,8 @@ import { businessDateText } from "@/lib/business-date";
 import { analyseCashDiscountNarration } from "@/lib/cash-discount-narration";
 import { toNumber, toText } from "@/lib/collections";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { wakeTallyConnector } from "@/lib/tally/command-wake";
+import { serializeTallyBridgeCommand, type TallyBridgeCommandRow } from "@/lib/tally/commands";
 
 type LiveLedger = {
   name?: string | null;
@@ -198,7 +200,56 @@ export async function POST(request: Request) {
       },
     };
 
-    return jsonWithCors(request, { commandPayload });
+    if (body.queue !== true) {
+      return jsonWithCors(request, { commandPayload });
+    }
+
+    const idempotencyKey = [companyName, matchingBill.ledgerName, linkedInvoiceNumber]
+      .map(normalized)
+      .join("|");
+    const { data: commandData, error: commandError } = await supabase
+      .from("tally_bridge_commands")
+      .insert({
+        connection_id: connection.id,
+        owner_user_id: user.id,
+        command_type: "create_debit_note",
+        idempotency_key: idempotencyKey,
+        status: "queued",
+        priority: 35,
+        payload: commandPayload,
+      })
+      .select("*")
+      .single();
+    if (commandError) {
+      if (commandError.code === "23505") {
+        return jsonWithCors(
+          request,
+          { error: "A Debit Note for this invoice is already queued or being created." },
+          { status: 409 }
+        );
+      }
+      throw commandError;
+    }
+
+    await Promise.all([
+      supabase.from("tally_connection_events").insert({
+        connection_id: connection.id,
+        owner_user_id: user.id,
+        event_type: "command_queued",
+        message: "Revalidated Cash Discount Debit Note queued for bridge.",
+        payload: {
+          commandType: "create_debit_note",
+          partyLedgerName: matchingBill.ledgerName,
+          amount: recoverableAmount,
+        },
+      }),
+      wakeTallyConnector(connection.id),
+    ]);
+
+    return jsonWithCors(request, {
+      commandPayload,
+      command: serializeTallyBridgeCommand(commandData as unknown as TallyBridgeCommandRow),
+    });
   } catch (error) {
     console.error("Error in POST /api/collections/live/prepare-debit-note:", error);
     return jsonWithCors(
