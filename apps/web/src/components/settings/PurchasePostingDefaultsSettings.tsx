@@ -1,16 +1,37 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { Check, Loader2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Check, Loader2, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { apiFetch } from "@/lib/api-client";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
+import {
+  queueTallyMasterRefresh,
+  waitForTallyCommand,
+} from "@/lib/tally-purchase-posting";
 
 type Connection = { id: string; displayName?: string | null };
 type Company = { id: string; companyName: string };
 type Master = { id: string; type: string; name: string; parent: string | null };
 type Defaults = Record<string, string>;
+
+type LiveMaster = {
+  guid?: unknown;
+  name?: unknown;
+  parent?: unknown;
+};
+
+type LivePurchaseMasterResult = {
+  source?: unknown;
+  companyName?: unknown;
+  fetchedAt?: unknown;
+  masters?: {
+    ledgers?: unknown;
+    stockItems?: unknown;
+  };
+  totals?: Record<string, unknown>;
+};
 
 const SECTIONS = [
   {
@@ -53,6 +74,46 @@ async function errorText(response: Response) {
   return payload.error || `Request failed with status ${response.status}`;
 }
 
+function cleanText(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function mastersFromLiveResult(value: unknown): {
+  masters: Master[];
+  ledgerCount: number;
+  stockItemCount: number;
+  fetchedAt: string;
+} | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const result = value as LivePurchaseMasterResult;
+  if (result.source !== "live_tally" || !result.masters) return null;
+
+  const convert = (values: unknown, type: "ledger" | "stock_item") =>
+    (Array.isArray(values) ? values : []).flatMap((value, index) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+      const row = value as LiveMaster;
+      const name = cleanText(row.name);
+      if (!name) return [];
+      const guid = cleanText(row.guid);
+      return [{
+        id: guid || `live:${type}:${index}:${name.toLocaleLowerCase()}`,
+        type,
+        name,
+        parent: cleanText(row.parent) || null,
+      } satisfies Master];
+    });
+
+  const ledgers = convert(result.masters.ledgers, "ledger");
+  const stockItems = convert(result.masters.stockItems, "stock_item");
+  if (ledgers.length === 0) return null;
+  return {
+    masters: [...ledgers, ...stockItems],
+    ledgerCount: ledgers.length,
+    stockItemCount: stockItems.length,
+    fetchedAt: cleanText(result.fetchedAt),
+  };
+}
+
 export function PurchasePostingDefaultsSettings() {
   const [connections, setConnections] = useState<Connection[]>([]);
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -61,8 +122,11 @@ export function PurchasePostingDefaultsSettings() {
   const [masters, setMasters] = useState<Master[]>([]);
   const [defaults, setDefaults] = useState<Defaults>({});
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [liveSummary, setLiveSummary] = useState("");
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<{ tone: "success" | "error"; text: string } | null>(null);
+  const automaticRefreshKey = useRef("");
 
   useEffect(() => {
     let cancelled = false;
@@ -105,11 +169,50 @@ export function PurchasePostingDefaultsSettings() {
     return () => { cancelled = true; };
   }, [connectionId]);
 
+  const refreshLiveMasters = useCallback(async (options?: { automatic?: boolean; cancelled?: () => boolean }) => {
+    if (!connectionId || !companyName) return;
+    const isCancelled = options?.cancelled ?? (() => false);
+    if (!isCancelled()) {
+      setRefreshing(true);
+      setNotice(null);
+      setLiveSummary("");
+    }
+    try {
+      const queued = await queueTallyMasterRefresh(connectionId, companyName) as {
+        command?: { id?: string };
+      };
+      const commandId = queued.command?.id;
+      if (!commandId) throw new Error("Tally could not start the live master refresh.");
+      const completed = await waitForTallyCommand(connectionId, commandId, { attempts: 45, intervalMs: 1000 });
+      if (!completed) throw new Error("Tally is still reading company masters. Please refresh again.");
+      if (completed.status !== "succeeded") {
+        throw new Error(completed.error || "Tally could not read the company masters.");
+      }
+      const live = mastersFromLiveResult(completed.result);
+      if (!live) throw new Error("Tally returned no usable ledgers for this company.");
+      if (isCancelled()) return;
+      setMasters(live.masters);
+      const summary = `${live.ledgerCount} ledgers and ${live.stockItemCount} items loaded live from Tally`;
+      setLiveSummary(summary);
+      if (!options?.automatic) setNotice({ tone: "success", text: summary + "." });
+    } catch (error) {
+      if (!isCancelled()) {
+        setNotice({
+          tone: "error",
+          text: `${error instanceof Error ? error.message : "Could not refresh live Tally masters."} Any last synced choices remain available below.`,
+        });
+      }
+    } finally {
+      if (!isCancelled()) setRefreshing(false);
+    }
+  }, [companyName, connectionId]);
+
   useEffect(() => {
     if (!connectionId || !companyName) return;
     let cancelled = false;
     setLoading(true);
     setNotice(null);
+    setLiveSummary("");
     const query = new URLSearchParams({ connectionId, companyName });
     void Promise.all([
       apiFetch(`/api/settings/purchase-posting-defaults?${query}`, { cache: "no-store" }),
@@ -119,15 +222,19 @@ export function PurchasePostingDefaultsSettings() {
       if (!mastersResponse.ok) throw new Error(await errorText(mastersResponse));
       const defaultsPayload = await defaultsResponse.json() as { defaults?: Defaults };
       const mastersPayload = await mastersResponse.json() as { masters?: Master[] };
-      if (!cancelled) {
-        setDefaults(defaultsPayload.defaults ?? {});
-        setMasters(mastersPayload.masters ?? []);
+      if (cancelled) return;
+      setDefaults(defaultsPayload.defaults ?? {});
+      setMasters(mastersPayload.masters ?? []);
+      const refreshKey = `${connectionId}:${companyName.toLocaleLowerCase()}`;
+      if (automaticRefreshKey.current !== refreshKey) {
+        automaticRefreshKey.current = refreshKey;
+        await refreshLiveMasters({ automatic: true, cancelled: () => cancelled });
       }
     }).catch((error) => {
       if (!cancelled) setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not load Purchase defaults." });
     }).finally(() => !cancelled && setLoading(false));
     return () => { cancelled = true; };
-  }, [companyName, connectionId]);
+  }, [companyName, connectionId, refreshLiveMasters]);
 
   const ledgerOptions = useMemo(() => masters.filter((master) => ["ledger", "gst_ledger", "tax_ledger"].includes(master.type)), [masters]);
   const stockOptions = useMemo(() => masters.filter((master) => master.type === "stock_item"), [masters]);
@@ -156,7 +263,19 @@ export function PurchasePostingDefaultsSettings() {
       <section className="rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5">
         <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#8a7f72]">Per-company Tally defaults</p>
         <h2 className="mt-1 text-lg font-medium tracking-tight text-[#20201c]">Choose the masters used for Purchase vouchers</h2>
-        <p className="mt-1 text-[13px] leading-5 text-[#6b6a60]">Supplier ledgers remain searchable from the complete Tally catalogue and are remembered by GSTIN after confirmation.</p>
+        <div className="mt-1 flex flex-wrap items-center justify-between gap-3">
+          <p className="text-[13px] leading-5 text-[#6b6a60]">Supplier ledgers remain searchable from the complete Tally catalogue and are remembered by GSTIN after confirmation.</p>
+          <Button
+            disabled={loading || refreshing || !connectionId || !companyName}
+            onClick={() => void refreshLiveMasters()}
+            size="sm"
+            variant="outline"
+          >
+            {refreshing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+            Refresh from Tally
+          </Button>
+        </div>
+        {liveSummary ? <p className="mt-2 text-xs font-medium text-emerald-700"><Check className="mr-1 inline h-4 w-4" />{liveSummary}</p> : null}
         <div className="mt-4 grid gap-3 sm:grid-cols-2">
           <label className="text-xs font-medium text-[#514b43]">Tally workstation
             <select className="mt-1 h-10 w-full rounded-lg border border-[#ddd7cc] bg-white px-3" onChange={(event) => setConnectionId(event.target.value)} value={connectionId}>
@@ -190,7 +309,7 @@ export function PurchasePostingDefaultsSettings() {
       ))}
 
       {notice ? <div className={`rounded-lg border px-4 py-3 text-sm ${notice.tone === "success" ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-rose-200 bg-rose-50 text-rose-700"}`}>{notice.tone === "success" ? <Check className="mr-2 inline h-4 w-4" /> : null}{notice.text}</div> : null}
-      <div className="flex justify-end"><Button disabled={loading || saving || !connectionId || !companyName} onClick={() => void save()}>{saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}Save Purchase defaults</Button></div>
+      <div className="flex justify-end"><Button disabled={loading || refreshing || saving || !connectionId || !companyName} onClick={() => void save()}>{saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}Save Purchase defaults</Button></div>
     </div>
   );
 }

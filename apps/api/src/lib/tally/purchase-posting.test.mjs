@@ -823,6 +823,41 @@ test("visible invoice date and TDS evidence do not enable 194Q without reviewer 
   assert.ok(!result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
 });
 
+test("Tally-style Dated label beside Invoice No recovers a named-month invoice date", () => {
+  const document = invoiceDocument();
+  delete document.extracted_fields.documentDate;
+  document.markdown = [
+    "TAX INVOICE",
+    "Invoice No.",
+    "SSTC-26/27-182",
+    "e-Way Bill No.",
+    "202263373954",
+    "Dated",
+    "11-Aug-26",
+  ].join("\n");
+
+  const result = prepare(document, { savedReview: { sourceReferenceApproved: true } });
+
+  assert.equal(result.source.invoiceDate, "2026-08-11");
+  assert.equal(result.review.invoiceDate, "2026-08-11");
+  assert.ok(!result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
+});
+
+test("manually supplied day-first review dates are normalized before validation", () => {
+  const result = prepare(invoiceDocument(), {
+    savedReview: {
+      sourceReferenceApproved: true,
+      invoiceDate: "11-08-2026",
+      voucherDate: "17/08/2026",
+    },
+  });
+
+  assert.equal(result.review.invoiceDate, "2026-08-11");
+  assert.equal(result.review.voucherDate, "2026-08-17");
+  assert.ok(!result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
+  assert.ok(!result.blockers.some((blocker) => blocker.code === "VOUCHER_DATE_REQUIRED"));
+});
+
 test("linked E-Way Bill supplies one unambiguous missing invoice date", () => {
   const invoice = invoiceDocument();
   delete invoice.extracted_fields.documentDate;
@@ -835,7 +870,7 @@ test("linked E-Way Bill supplies one unambiguous missing invoice date", () => {
     title: "E-Way Bill",
     extracted_fields: {
       referenceInvoiceNumber: "INV-100",
-      documentDate: "20-07-2026",
+      documentDate: "20-07-2026 08:57 PM",
     },
   };
   const result = preparePurchasePosting({
@@ -852,6 +887,67 @@ test("linked E-Way Bill supplies one unambiguous missing invoice date", () => {
   });
   assert.equal(result.review.invoiceDate, "2026-07-20");
   assert.ok(!result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
+});
+
+test("linked E-Way date enables automatic intrastate GST TDS for qualifying scrap", () => {
+  const invoice = invoiceDocument({
+    totalAmount: "492979.60",
+    taxAmount: "75200.40",
+    tdsAmount: "",
+    lines: [{
+      description: "MS SCRAP",
+      hsnSac: "72044900",
+      quantity: "12.66",
+      unit: "MT",
+      rate: "33000.00",
+      taxableAmount: "417780.00",
+      taxAmount: "75200.40",
+    }],
+  });
+  delete invoice.extracted_fields.documentDate;
+  delete invoice.extracted_fields.cgstTdsAmount;
+  delete invoice.extracted_fields.sgstTdsAmount;
+  const eway = {
+    id: "eway-surya-date",
+    document_type: "E-Way Bill",
+    source_file_name: "packet.pdf",
+    source_hint: "packet.pdf (page 5)",
+    title: "E-Way Bill",
+    extracted_fields: {
+      referenceInvoiceNumber: "INV-100",
+      documentDate: "11/08/2026 08:57 PM",
+    },
+  };
+
+  const result = preparePurchasePosting({
+    documents: [invoice, eway],
+    masters: completeMasters,
+    mappings: [],
+    savedReview: { sourceReferenceApproved: true },
+    caseStatus: "accepted",
+    connectionReady: true,
+    masterDataReady: true,
+    companyName: "Test Company",
+    companyGstin: maharashtraBuyerGstin,
+    sourceDocumentReference: "https://app.example/cases/case-1?sourceFileId=file-1",
+    accountingSettings: {
+      purchaseGoodsTdsEnabled: true,
+      transporterTdsEnabled: false,
+      gstTdsEnabled: true,
+    },
+  });
+
+  assert.equal(result.review.invoiceDate, "2026-08-11");
+  assert.equal(result.calculation.scrapGstTdsEligible, true);
+  assert.equal(result.calculation.gstTdsAutomatic, true);
+  assert.equal(result.calculation.cgstTdsAmount, "4177.80");
+  assert.equal(result.calculation.sgstTdsAmount, "4177.80");
+  assert.deepEqual(
+    result.tallyPayload.withholdings
+      .filter((entry) => entry.kind === "cgst_tds" || entry.kind === "sgst_tds")
+      .map((entry) => [entry.kind, entry.amount]),
+    [["cgst_tds", "4177.80"], ["sgst_tds", "4177.80"]]
+  );
 });
 
 test("printed GST, 194Q, and GST TDS reconcile as separate deductions", () => {

@@ -44,6 +44,29 @@ function getContentAddressedPath(ownerUserId: string, sha256: string) {
   return `${ownerUserId}/sha256/${sha256}`;
 }
 
+async function ensureStorageObject(params: {
+  supabase: StorageAssetClient;
+  storageBucket: string;
+  storagePath: string;
+  bytes: Uint8Array;
+  contentType?: string | null;
+}) {
+  const bucket = params.supabase.storage.from(params.storageBucket);
+  const existingObject = await bucket.exists(params.storagePath);
+  if (existingObject.error) throw existingObject.error;
+  if (existingObject.data) return false;
+
+  const upload = await bucket.upload(params.storagePath, params.bytes, {
+    contentType: params.contentType || "application/octet-stream",
+    upsert: false,
+  });
+  if (!upload.error) return true;
+  // Another upload may have recreated the same content-addressed object after
+  // our existence check. In that case the canonical object is now healthy.
+  if (isAlreadyExistsError(upload.error)) return false;
+  throw upload.error;
+}
+
 export async function ensureStorageAsset(params: {
   supabase: StorageAssetClient;
   ownerUserId: string;
@@ -64,23 +87,31 @@ export async function ensureStorageAsset(params: {
 
   if (existing.error) throw existing.error;
   if (existing.data) {
+    const createdObject = await ensureStorageObject({
+      supabase: params.supabase,
+      storageBucket: existing.data.storage_bucket,
+      storagePath: existing.data.storage_path,
+      bytes: params.bytes,
+      contentType: params.contentType,
+    });
     return {
       id: existing.data.id,
       storageBucket: existing.data.storage_bucket,
       storagePath: existing.data.storage_path,
       contentSha256,
       sizeBytes,
-      createdObject: false,
+      createdObject,
     } satisfies StorageAssetReference;
   }
 
   const storagePath = getContentAddressedPath(params.ownerUserId, contentSha256);
-  const upload = await params.supabase.storage.from(params.storageBucket).upload(storagePath, params.bytes, {
-    contentType: params.contentType || "application/octet-stream",
-    upsert: false,
+  const createdObject = await ensureStorageObject({
+    supabase: params.supabase,
+    storageBucket: params.storageBucket,
+    storagePath,
+    bytes: params.bytes,
+    contentType: params.contentType,
   });
-  const createdObject = !upload.error;
-  if (upload.error && !isAlreadyExistsError(upload.error)) throw upload.error;
 
   const inserted = await params.supabase
     .from("storage_assets")

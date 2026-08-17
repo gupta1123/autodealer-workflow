@@ -17,6 +17,7 @@ import {
   compactPurchasePostingReview,
   dedupeLedgerMasters,
   getCanonicalInvoiceDocuments,
+  normalizePurchasePostingDate,
   normalizePurchaseDuplicatePart,
   preparePurchasePosting,
   type PurchasePostingDocumentInput,
@@ -286,7 +287,10 @@ function asSavedReview(value: unknown): Partial<PurchasePostingReview> | null {
   ] as const;
   for (const key of stringKeys) {
     if (typeof input[key] === "string") {
-      output[key] = input[key].trim().slice(0, key === "narration" ? 2000 : 300);
+      const clean = input[key].trim().slice(0, key === "narration" ? 2000 : 300);
+      output[key] = key === "invoiceDate" || key === "voucherDate"
+        ? normalizePurchasePostingDate(clean)
+        : clean;
     }
   }
   for (const key of ["applyTds194q", "tcsReceivable", "sourceReferenceApproved"] as const) {

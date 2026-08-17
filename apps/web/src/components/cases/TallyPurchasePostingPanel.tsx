@@ -112,6 +112,15 @@ function tallyWeekday(value: string | null | undefined) {
     : new Intl.DateTimeFormat("en-IN", { weekday: "long", timeZone: "UTC" }).format(date);
 }
 
+function isValidDateInput(value: string | null | undefined) {
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day;
+}
+
 function moneyOrMissing(value: string | null | undefined) {
   if (value === null || value === undefined || value.trim() === "") return "Not found";
   return money(value);
@@ -1024,8 +1033,16 @@ export function TallyPurchasePostingPanel({
     [payload?.blockers]
   );
   const correctionBlockers = useMemo(
-    () => (payload?.blockers ?? []).filter((issue) => issue.scope !== "case"),
-    [payload?.blockers]
+    () => (payload?.blockers ?? []).filter((issue) => {
+      if (issue.scope === "case") return false;
+      // Server blockers describe the last saved review. Clear date errors as
+      // soon as the current browser value is valid; Save still performs the
+      // authoritative server validation before approval.
+      if (issue.code === "INVOICE_DATE_REQUIRED" && isValidDateInput(review?.invoiceDate)) return false;
+      if (issue.code === "VOUCHER_DATE_REQUIRED" && isValidDateInput(review?.voucherDate)) return false;
+      return true;
+    }),
+    [payload?.blockers, review?.invoiceDate, review?.voucherDate]
   );
   const warningsByScope = useMemo(() => {
     const map = new Map<string, TallyPostingIssue[]>();
@@ -1348,7 +1365,6 @@ export function TallyPurchasePostingPanel({
   };
   useEffect(() => {
     if (
-      !mastersNeedSync ||
       !connectionReadable ||
       !selectedMatchesActive ||
       refreshingMasters ||
@@ -1359,6 +1375,7 @@ export function TallyPurchasePostingPanel({
       return;
     }
     const syncKey = [
+      caseId,
       connection.id,
       connection.companyName.trim().toLowerCase(),
     ].join(":");
@@ -1366,12 +1383,12 @@ export function TallyPurchasePostingPanel({
     automaticMasterSyncKeyRef.current = syncKey;
     void handleRefreshMasters(true);
   }, [
+    caseId,
     connection?.companyName,
     connection?.id,
     connectionReadable,
     handleRefreshMasters,
     locked,
-    mastersNeedSync,
     refreshingMasters,
     selectedMatchesActive,
   ]);

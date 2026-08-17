@@ -328,6 +328,7 @@ function getDocumentSpecificExtractionInstruction(docType: DocType) {
     case "Tax Invoice":
     case "Invoice":
       return (
+        "For invoice documents, extract the supplier invoice date as documentDate. It may be labelled Invoice Date, Date of Invoice, Date, or Dated beside the Invoice No.; return it as YYYY-MM-DD. Do not substitute Ack Date, dispatch date, LR date, e-Way Bill generated date, digitally signed timestamp, or a footer/print date. " +
         "For invoice documents, referencePoNumber must be a value explicitly labelled PO No, P.O. No, Purchase Order No, Buyer PO, or Order No. " +
         "If the same order block contains an internal PO number shaped like IF/25-26/PF25Y-04165 or RM/25-26/PR25Y-00001 and another buyer/document reference, use the internal PO-shaped value as referencePoNumber. " +
         "For invoice documents, eWayBillNumber must be the 12-digit E-Way Bill number only. Do not use transporter document numbers, online order tracking numbers, LR numbers, acknowledgement numbers, or receipt numbers as eWayBillNumber. Do not put a 12-digit E-Way Bill number into irnNumber; IRN is the long invoice reference hash. " +

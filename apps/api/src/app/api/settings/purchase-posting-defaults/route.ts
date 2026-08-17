@@ -24,6 +24,64 @@ function clean(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function normalize(value: unknown) {
+  return clean(value).replace(/\s+/g, " ").toLocaleLowerCase();
+}
+
+function commandMaster(
+  resultValue: unknown,
+  companyName: string,
+  targetName: string,
+  targetTypes: readonly string[]
+) {
+  if (!resultValue || typeof resultValue !== "object" || Array.isArray(resultValue)) return null;
+  const result = resultValue as Record<string, unknown>;
+  if (result.source !== "live_tally" || normalize(result.companyName) !== normalize(companyName)) return null;
+  if (!result.masters || typeof result.masters !== "object" || Array.isArray(result.masters)) return null;
+  const masters = result.masters as Record<string, unknown>;
+  const acceptsStock = targetTypes.includes("stock_item");
+  const values = acceptsStock ? masters.stockItems : masters.ledgers;
+  const masterType = acceptsStock ? "stock_item" : "ledger";
+  for (const value of Array.isArray(values) ? values : []) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const row = value as Record<string, unknown>;
+    const name = clean(row.name);
+    if (normalize(name) !== normalize(targetName)) continue;
+    const guid = clean(row.guid);
+    return {
+      master_type: masterType,
+      master_key: guid || normalize(name),
+      tally_name: name,
+    };
+  }
+  return null;
+}
+
+async function findLiveCommandMaster(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  ownerUserId: string,
+  connectionId: string,
+  companyName: string,
+  targetName: string,
+  targetTypes: readonly string[]
+) {
+  const { data, error } = await supabase
+    .from("tally_bridge_commands")
+    .select("result")
+    .eq("connection_id", connectionId)
+    .eq("owner_user_id", ownerUserId)
+    .eq("command_type", "fetch_purchase_masters")
+    .eq("status", "succeeded")
+    .order("completed_at", { ascending: false })
+    .limit(10);
+  if (error) throw error;
+  for (const row of data ?? []) {
+    const target = commandMaster(row.result, companyName, targetName, targetTypes);
+    if (target) return target;
+  }
+  return null;
+}
+
 async function verifyConnection(ownerUserId: string, connectionId: string) {
   const supabase = createSupabaseAdminClient();
   const { data, error } = await supabase
@@ -105,7 +163,7 @@ export async function PUT(request: Request) {
         if (error) throw error;
         continue;
       }
-      const { data: target, error: targetError } = await supabase
+      const { data: syncedTarget, error: targetError } = await supabase
         .from("tally_masters")
         .select("master_type, master_key, tally_name")
         .eq("connection_id", connectionId)
@@ -117,8 +175,16 @@ export async function PUT(request: Request) {
         .limit(1)
         .maybeSingle();
       if (targetError) throw targetError;
+      const target = syncedTarget ?? await findLiveCommandMaster(
+        supabase,
+        user.id,
+        connectionId,
+        companyName,
+        targetName,
+        definition.targetTypes
+      );
       if (!target) {
-        return jsonWithCors(request, { error: `${targetName} is not an active master in ${companyName}.` }, { status: 409 });
+        return jsonWithCors(request, { error: `${targetName} was not found in the latest live Tally masters for ${companyName}. Refresh from Tally and try again.` }, { status: 409 });
       }
       const { error } = await supabase.from("tally_mapping_settings").upsert({
         connection_id: connectionId,

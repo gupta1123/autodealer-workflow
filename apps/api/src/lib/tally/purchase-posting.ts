@@ -255,15 +255,30 @@ function stateCodeFromGstin(value: unknown) {
   return /^\d{2}/.test(gstin) ? gstin.slice(0, 2) : null;
 }
 
-function parseDate(value: unknown) {
+export function normalizePurchasePostingDate(value: unknown) {
   const raw = text(value);
   if (!raw) return "";
-  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
-  const parts = raw.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
-  if (!parts) return raw;
-  const year = parts[3].length === 2 ? `20${parts[3]}` : parts[3];
-  return `${year}-${parts[2].padStart(2, "0")}-${parts[1].padStart(2, "0")}`;
+  const iso = raw.match(/^(\d{4}-\d{2}-\d{2})(?:[T\s].*)?$/);
+  if (iso) return iso[1];
+  // E-Way Bills commonly expose their document date together with a time,
+  // for example "11/08/2026 08:57 PM". Keep the visible calendar date while
+  // discarding only the time suffix.
+  const parts = raw.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})(?:$|[T\s].*)/);
+  if (parts) {
+    const year = parts[3].length === 2 ? `20${parts[3]}` : parts[3];
+    return `${year}-${parts[2].padStart(2, "0")}-${parts[1].padStart(2, "0")}`;
+  }
+  const named = raw.match(
+    /^(\d{1,2})[\s./-]+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)[\s,./-]+(\d{2,4})(?:$|[T\s].*)/i
+  );
+  if (!named) return raw;
+  const monthNames = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const month = monthNames.indexOf(named[2].slice(0, 3).toLowerCase()) + 1;
+  const year = named[3].length === 2 ? `20${named[3]}` : named[3];
+  return `${year}-${String(month).padStart(2, "0")}-${named[1].padStart(2, "0")}`;
 }
+
+const parseDate = normalizePurchasePostingDate;
 
 function isValidIsoDate(value: string) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
@@ -936,8 +951,8 @@ function buildDefaultReview(
     ...baseReview,
     ...(saved ?? {}),
     lines,
-    invoiceDate: saved?.invoiceDate || baseReview.invoiceDate,
-    voucherDate: saved?.voucherDate || baseReview.voucherDate,
+    invoiceDate: parseDate(saved?.invoiceDate) || baseReview.invoiceDate,
+    voucherDate: parseDate(saved?.voucherDate) || baseReview.voucherDate,
     supplierLedgerName: saved?.supplierLedgerName || baseReview.supplierLedgerName,
     cgstLedgerName: saved?.cgstLedgerName || baseReview.cgstLedgerName,
     sgstLedgerName: saved?.sgstLedgerName || baseReview.sgstLedgerName,

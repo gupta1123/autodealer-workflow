@@ -90,10 +90,14 @@ function amountNearLabel(
 }
 
 function invoiceDateFromText(source: string) {
-  const dateValue = String.raw`(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{2}-\d{2})`;
+  const dateValue = String.raw`(\d{1,2}(?:[./-]\d{1,2}[./-]|[\s./-]+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[\s,./-]+)\d{2,4}|\d{4}-\d{2}-\d{2})`;
   const patterns = [
     new RegExp(String.raw`\bINVOICE\s+DATE\s*[:\-]?\s*${dateValue}\b`, "i"),
     new RegExp(String.raw`\bDATE\s+OF\s+INVOICE\s*[:\-]?\s*${dateValue}\b`, "i"),
+    new RegExp(
+      String.raw`\bINVOICE\s+(?:NO|NUMBER)\.?\s*[:#-]?[\s\S]{0,220}?\b(?:DATED|DATE)\s*[:\-]?\s*${dateValue}\b`,
+      "i"
+    ),
     new RegExp(
       String.raw`\bTAX\s+INVOICE\b[\s\S]{0,220}?\bDATE\s*[:\-]\s*${dateValue}\b`,
       "i"
@@ -102,7 +106,23 @@ function invoiceDateFromText(source: string) {
   ];
   for (const pattern of patterns) {
     const value = source.match(pattern)?.[1];
-    if (value) return value;
+    if (!value) continue;
+    const iso = value.match(/^(\d{4}-\d{2}-\d{2})$/);
+    if (iso) return iso[1];
+    const numeric = value.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/);
+    if (numeric) {
+      const year = numeric[3].length === 2 ? `20${numeric[3]}` : numeric[3];
+      return `${year}-${numeric[2].padStart(2, "0")}-${numeric[1].padStart(2, "0")}`;
+    }
+    const named = value.match(/^(\d{1,2})[\s./-]+([A-Za-z]+)[\s,./-]+(\d{2,4})$/);
+    if (named) {
+      const months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+      const month = months.indexOf(named[2].slice(0, 3).toLowerCase()) + 1;
+      if (month > 0) {
+        const year = named[3].length === 2 ? `20${named[3]}` : named[3];
+        return `${year}-${String(month).padStart(2, "0")}-${named[1].padStart(2, "0")}`;
+      }
+    }
   }
   return "";
 }
