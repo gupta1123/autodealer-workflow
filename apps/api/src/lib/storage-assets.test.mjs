@@ -9,8 +9,8 @@ const bytes = new TextEncoder().encode("bank statement bytes");
 const contentSha256 = getContentSha256(bytes);
 const storagePath = `${ownerUserId}/sha256/${contentSha256}`;
 
-function mockClient({ objectExists, uploadError = null }) {
-  const calls = { exists: [], uploads: [] };
+function mockClient({ uploadError = null }) {
+  const calls = { uploads: [] };
   const existingAsset = {
     id: "asset-1",
     storage_bucket: storageBucket,
@@ -30,12 +30,6 @@ function mockClient({ objectExists, uploadError = null }) {
       from(bucket) {
         assert.equal(bucket, storageBucket);
         return {
-          async exists(path) {
-            calls.exists.push(path);
-            return objectExists instanceof Error || (objectExists && typeof objectExists === "object")
-              ? { data: false, error: objectExists }
-              : { data: objectExists, error: null };
-          },
           async upload(path, body, options) {
             calls.uploads.push({ path, body, options });
             return uploadError
@@ -49,8 +43,10 @@ function mockClient({ objectExists, uploadError = null }) {
   return { client, calls };
 }
 
-test("reuses healthy content-addressed objects without uploading again", async () => {
-  const { client, calls } = mockClient({ objectExists: true });
+test("reuses a healthy content-addressed object without overwriting it", async () => {
+  const { client, calls } = mockClient({
+    uploadError: { statusCode: 409, message: "The resource already exists" },
+  });
 
   const asset = await ensureStorageAsset({
     supabase: client,
@@ -63,12 +59,11 @@ test("reuses healthy content-addressed objects without uploading again", async (
   assert.equal(asset.id, "asset-1");
   assert.equal(asset.storagePath, storagePath);
   assert.equal(asset.createdObject, false);
-  assert.deepEqual(calls.exists, [storagePath]);
-  assert.equal(calls.uploads.length, 0);
+  assert.equal(calls.uploads.length, 1);
 });
 
 test("recreates a missing object when matching storage metadata already exists", async () => {
-  const { client, calls } = mockClient({ objectExists: false });
+  const { client, calls } = mockClient({});
 
   const asset = await ensureStorageAsset({
     supabase: client,
@@ -88,28 +83,8 @@ test("recreates a missing object when matching storage metadata already exists",
   });
 });
 
-test("uploads when Supabase returns Bad Request for a missing object exists check", async () => {
+test("accepts a concurrent upload that wins the atomic create", async () => {
   const { client, calls } = mockClient({
-    objectExists: { status: 400, statusCode: "400", message: "Bad Request" },
-  });
-
-  const asset = await ensureStorageAsset({
-    supabase: client,
-    ownerUserId,
-    storageBucket,
-    bytes,
-    contentType: "application/pdf",
-  });
-
-  assert.equal(asset.createdObject, true);
-  assert.deepEqual(calls.exists, [storagePath]);
-  assert.equal(calls.uploads.length, 1);
-  assert.equal(calls.uploads[0].path, storagePath);
-});
-
-test("accepts a concurrent upload that wins after the existence check", async () => {
-  const { client, calls } = mockClient({
-    objectExists: false,
     uploadError: { statusCode: 409, message: "The resource already exists" },
   });
 

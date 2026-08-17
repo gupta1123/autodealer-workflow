@@ -113,6 +113,14 @@ export const MAPPING_TYPES: TallyMappingType[] = [
   "bank_category_ledger",
 ];
 
+// Saved masters are only a short-lived safety cache. Review and posting flows
+// must refresh Tally rather than silently relying on an old snapshot.
+export const TALLY_MASTER_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
+
+export function tallyMasterFreshnessCutoff(now = Date.now()) {
+  return new Date(now - TALLY_MASTER_CACHE_MAX_AGE_MS).toISOString();
+}
+
 export function toNullableText(value: unknown, maxLength = 500) {
   if (typeof value !== "string") {
     return null;

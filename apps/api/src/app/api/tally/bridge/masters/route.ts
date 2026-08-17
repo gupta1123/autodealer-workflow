@@ -8,10 +8,8 @@ import {
 import {
   MASTER_TYPES,
   normalizeMasterInput,
-  serializeTallyMaster,
   toNullableText,
   type TallyMasterInput,
-  type TallyMasterRow,
   type TallyMasterType,
 } from "@/lib/tally/masters";
 
@@ -24,6 +22,19 @@ const MASTER_INPUT_KEYS: Record<string, TallyMasterType> = {
   gstLedgers: "gst_ledger",
   taxLedgers: "tax_ledger",
 };
+
+// Tally companies can contain several thousand masters. A single giant
+// upsert creates an unnecessarily large PostgREST request and was the source
+// of intermittent generic failures for large client companies.
+const MASTER_UPSERT_BATCH_SIZE = 300;
+
+function errorMessage(error: unknown) {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object" && "message" in error) {
+    return String((error as { message?: unknown }).message || "Master sync failed.");
+  }
+  return String(error || "Master sync failed.");
+}
 
 function getBridgeToken(request: Request) {
   const authorization = request.headers.get("authorization");
@@ -155,20 +166,20 @@ export async function POST(request: Request) {
       );
     }
 
-    let upserted: TallyMasterRow[] = [];
     if (rowsWithRun.length > 0) {
-      const { data: masterData, error: upsertError } = await supabase
-        .from("tally_masters")
-        .upsert(rowsWithRun, {
-          onConflict: "connection_id,company_name,master_type,master_key",
-        })
-        .select("*");
+      for (let start = 0; start < rowsWithRun.length; start += MASTER_UPSERT_BATCH_SIZE) {
+        const batch = rowsWithRun.slice(start, start + MASTER_UPSERT_BATCH_SIZE);
+        const { error: upsertError } = await supabase
+          .from("tally_masters")
+          .upsert(batch, {
+            onConflict: "connection_id,company_name,master_type,master_key",
+          });
 
-      if (upsertError) {
-        throw upsertError;
+        if (upsertError) {
+          const batchNumber = Math.floor(start / MASTER_UPSERT_BATCH_SIZE) + 1;
+          throw new Error(`Could not save Tally masters batch ${batchNumber}: ${errorMessage(upsertError)}`);
+        }
       }
-
-      upserted = (masterData ?? []) as unknown as TallyMasterRow[];
     }
 
     // Only retire the prior snapshot after the new rows have been written.
@@ -223,7 +234,9 @@ export async function POST(request: Request) {
       syncRunId,
       totals,
       accepted: rowsWithRun.length,
-      masters: upserted.slice(0, 50).map(serializeTallyMaster),
+      // The bridge only needs the acceptance count. Do not echo thousands of
+      // rows back over HTTP after a successful sync.
+      masters: [],
       supportedTypes: MASTER_TYPES,
     });
   } catch (error) {
@@ -232,12 +245,14 @@ export async function POST(request: Request) {
         .from("tally_master_sync_runs")
         .update({
           status: "failed",
-          error: error instanceof Error ? error.message.slice(0, 1000) : "Master sync failed.",
+          error: errorMessage(error).slice(0, 1000),
           completed_at: new Date().toISOString(),
         })
         .eq("id", syncFailureContext.syncRunId);
     }
     console.error("Error in POST /api/tally/bridge/masters:", error);
-    return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
+    return jsonWithCors(request, {
+      error: `Master sync failed: ${errorMessage(error).slice(0, 500)}`,
+    }, { status: 500 });
   }
 }

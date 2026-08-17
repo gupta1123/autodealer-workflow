@@ -15,7 +15,6 @@ import {
 } from "lucide-react";
 
 import { apiFetch } from "@/lib/api-client";
-import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 
 type CompanyOption = {
@@ -371,11 +370,6 @@ function normalizeCompanyName(value?: string | null) {
   return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function liveChannelUnavailable(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  return /live cash discount channel|live Tally request timed out|channel closed|connector is not on the live|could not connect to the live|live-session authentication/i.test(message);
-}
-
 function issueLabel(proposal: DebitNoteProposal) {
   if (proposal.lastError) return "Tally action failed";
   if (proposal.status === "queued_in_tally" || proposal.status === "approved") return "Creating debit note";
@@ -674,20 +668,8 @@ export function CollectionsDashboardPage({
       } else if (scopeResponse.status !== 409) {
         throw new Error(await readError(scopeResponse));
       }
-      try {
-        return await runCashDiscountLiveRequest<DashboardPayload>({
-          connectionId,
-          companyName: resolvedCompanyName,
-          financialYear,
-          operation: "scan",
-          customerScope,
-          onProgress: () => setMessage({ tone: "info", text: "Checking eligible candidates…" }),
-        });
-      } catch (error) {
-        if (!liveChannelUnavailable(error)) throw error;
-        setMessage({ tone: "info", text: "Checking eligible candidates…" });
-      }
-
+      // Use the regular bridge command queue for every scan. It still reads
+      // live Tally data, but avoids a separate Cash Discount WebSocket gateway.
       const queueResponse = await apiFetch("/api/collections/live/queue-scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

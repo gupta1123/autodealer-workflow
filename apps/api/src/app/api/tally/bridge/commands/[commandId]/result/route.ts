@@ -15,6 +15,7 @@ import {
 } from "@/lib/tally/commands";
 import { toNullableText } from "@/lib/tally/masters";
 import { normalizeMasterKey } from "@/lib/tally/masters";
+import { releaseTallyMasterSyncLock } from "@/lib/tally/master-sync-lock";
 
 function getBridgeToken(request: Request) {
   const authorization = request.headers.get("authorization");
@@ -135,6 +136,18 @@ export async function POST(
         return jsonWithCors(request, { error: "Tally command not found." }, { status: 404 });
       }
 
+      if (completed.command.command_type === "sync_masters") {
+        const payload = completed.command.payload && typeof completed.command.payload === "object"
+          ? completed.command.payload as Record<string, unknown>
+          : {};
+        await releaseTallyMasterSyncLock({
+          supabase: null,
+          local: true,
+          connectionId,
+          token: typeof payload.syncLockToken === "string" ? payload.syncLockToken : null,
+        });
+      }
+
       return jsonWithCors(request, {
         command: serializeTallyBridgeCommand(completed.command),
       });
@@ -204,6 +217,14 @@ export async function POST(
     }
 
     const command = commandData as unknown as TallyBridgeCommandRow;
+
+    if (command.command_type === "sync_masters") {
+      await releaseTallyMasterSyncLock({
+        supabase,
+        connectionId: connection.id,
+        token: typeof commandPayload.syncLockToken === "string" ? commandPayload.syncLockToken : null,
+      });
+    }
 
     if (success && command.command_type === "alter_ledger") {
       const masterKey = toNullableText(commandPayload.masterKey, 500);

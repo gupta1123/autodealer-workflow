@@ -4952,7 +4952,10 @@ export function BankStatementsPage() {
           commandType: "sync_masters",
           payload: {
             companyName: selectedCompanyName || connection.lastCompanyName,
-            requestedMasterTypes: ["ledger", "group", "voucher_type", "gst_ledger", "tax_ledger"],
+            // A bank-statement refresh needs counterparties and the user's
+            // configured group scope. Purchase stock, units and tax masters
+            // are unrelated and can make a large Tally company sync fragile.
+            requestedMasterTypes: ["ledger", "group"],
           },
         }),
       });

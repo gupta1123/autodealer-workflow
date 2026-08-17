@@ -9,7 +9,7 @@ import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.46";
+const BRIDGE_VERSION = "0.1.48";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
@@ -4141,48 +4141,49 @@ async function fetchBankLedgersFromTally(config, commandPayload = {}) {
 async function collectTallyMasters(config, commandPayload = {}) {
   const companyName = commandPayload.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
-
-  const [ledgerXml, groupXml, stockItemXml, unitXml, voucherTypeXml, companyXml] = await Promise.all([
-    exportTallyCollection(tallyUrl, {
-      collectionName: "Autodealer Ledgers Sync",
-      tallyType: "Ledger",
-      fetchFields:
-        "Name,Parent,GUID,ClosingBalance,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation",
+  const requestedMasterTypes = new Set(
+    Array.isArray(commandPayload.requestedMasterTypes)
+      ? commandPayload.requestedMasterTypes.map((value) => String(value || "").trim())
+      : []
+  );
+  const shouldFetch = (type) => {
+    if (requestedMasterTypes.size === 0 || requestedMasterTypes.has(type)) return true;
+    // GST/tax master rows are classified from Ledger exports, not a separate
+    // Tally collection.
+    return type === "ledger" && (requestedMasterTypes.has("gst_ledger") || requestedMasterTypes.has("tax_ledger"));
+  };
+  const fetches = [];
+  const fetchMaster = (key, type, collectionName, fetchFields) => {
+    if (!shouldFetch(type)) return;
+    fetches.push([key, exportTallyCollection(tallyUrl, {
+      collectionName,
+      tallyType: type === "stock_item" ? "StockItem" : type === "voucher_type" ? "VoucherType" : type[0].toUpperCase() + type.slice(1),
+      fetchFields,
       companyName,
-    }),
-    exportTallyCollection(tallyUrl, {
-      collectionName: "Autodealer Groups Sync",
-      tallyType: "Group",
-      fetchFields: "Name,Parent,GUID",
-      companyName,
-    }),
-    exportTallyCollection(tallyUrl, {
-      collectionName: "Autodealer Stock Items Sync",
-      tallyType: "StockItem",
-      fetchFields:
-        "Name,Parent,GUID,BaseUnits,OriginalBaseUnits,GSTHSNCode,HSNCode,GSTTaxRate,RateOfTaxCalculation,IsGSTApplicable",
-      companyName,
-    }),
-    exportTallyCollection(tallyUrl, {
-      collectionName: "Autodealer Units Sync",
-      tallyType: "Unit",
-      fetchFields: "Name,GUID,OriginalName,DecimalPlaces,IsSimpleUnit",
-      companyName,
-    }),
-    exportTallyCollection(tallyUrl, {
-      collectionName: "Autodealer Voucher Types Sync",
-      tallyType: "VoucherType",
-      fetchFields: "Name,Parent,GUID",
-      companyName,
-    }),
-    exportTallyCollection(tallyUrl, {
+    })]);
+  };
+  fetchMaster("ledgerXml", "ledger", "Autodealer Ledgers Sync",
+    "Name,Parent,GUID,ClosingBalance,PartyGSTIN,IsBillWiseOn,BankName,Bank,BankerName,BankAccountNumber,AccountNumber,BankAccountNo,BankAcNo,AcNumber,IFSCCODE,IFSCODE,IFSC,BankIFSCCODE,BranchName,BankBranchName,Branch,BankAccHolderName,BankAccountName,BankAccountHolderName,AccountHolderName,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode,TaxType,GSTDutyHead,RateOfTaxCalculation");
+  fetchMaster("groupXml", "group", "Autodealer Groups Sync", "Name,Parent,GUID");
+  fetchMaster("stockItemXml", "stock_item", "Autodealer Stock Items Sync",
+    "Name,Parent,GUID,BaseUnits,OriginalBaseUnits,GSTHSNCode,HSNCode,GSTTaxRate,RateOfTaxCalculation,IsGSTApplicable");
+  fetchMaster("unitXml", "unit", "Autodealer Units Sync", "Name,GUID,OriginalName,DecimalPlaces,IsSimpleUnit");
+  fetchMaster("voucherTypeXml", "voucher_type", "Autodealer Voucher Types Sync", "Name,Parent,GUID");
+  if (shouldFetch("ledger")) {
+    fetches.push(["companyXml", exportTallyCollection(tallyUrl, {
       collectionName: "Autodealer Company Profile Sync",
       tallyType: "Company",
-      fetchFields:
-        "Name,GUID,PartyGSTIN,GSTIN,GSTRegistrationNumber,GSTRegNumber,StateName,State,CountryName,Country,IsGSTOn,GSTRegistrationDetails.*",
+      fetchFields: "Name,GUID,PartyGSTIN,GSTIN,GSTRegistrationNumber,GSTRegNumber,StateName,State,CountryName,Country,IsGSTOn,GSTRegistrationDetails.*",
       companyName,
-    }).catch(() => ""),
-  ]);
+    }).catch(() => "")]);
+  }
+  const resolved = Object.fromEntries(await Promise.all(fetches.map(async ([key, request]) => [key, await request])));
+  const ledgerXml = resolved.ledgerXml || "";
+  const groupXml = resolved.groupXml || "";
+  const stockItemXml = resolved.stockItemXml || "";
+  const unitXml = resolved.unitXml || "";
+  const voucherTypeXml = resolved.voucherTypeXml || "";
+  const companyXml = resolved.companyXml || "";
 
   const ledgers = parseMasterCollection(ledgerXml, "LEDGER");
   const groups = parseMasterCollection(groupXml, "GROUP");
@@ -4201,6 +4202,10 @@ async function collectTallyMasters(config, commandPayload = {}) {
   const { gstLedgers, taxLedgers } = classifyTaxLedgers(ledgers);
 
   return {
+    // Keep the requested scope with the result. syncMastersFromTally uses this
+    // to avoid sending omitted master types as empty arrays, which would retire
+    // a previously-good snapshot for those types on the API.
+    requestedMasterTypes: Array.from(requestedMasterTypes),
     ledgers,
     groups,
     stockItems,
@@ -4394,23 +4399,42 @@ async function syncMastersFromTally(config, commandPayload = {}) {
     }
   );
 
-  if (masters.ledgers.length === 0) {
+  const isFullMasterSync = masters.requestedMasterTypes.length === 0;
+  const requestedTypes = new Set(masters.requestedMasterTypes);
+  if ((isFullMasterSync || requestedTypes.has("ledger")) && masters.ledgers.length === 0) {
     throw new Error("Tally returned zero ledgers. Open the correct company and try sync again.");
+  }
+
+  const masterPayload = {};
+  if (isFullMasterSync || requestedTypes.has("ledger")) {
+    masterPayload.ledgers = masters.ledgers;
+  }
+  if (isFullMasterSync || requestedTypes.has("group")) {
+    masterPayload.groups = masters.groups;
+  }
+  if (isFullMasterSync || requestedTypes.has("stock_item")) {
+    masterPayload.stockItems = masters.stockItems;
+  }
+  if (isFullMasterSync || requestedTypes.has("unit")) {
+    masterPayload.units = masters.units;
+  }
+  if (isFullMasterSync || requestedTypes.has("voucher_type")) {
+    masterPayload.voucherTypes = masters.voucherTypes;
+  }
+  // GST and tax ledgers are derived from the Ledger collection. They remain
+  // opt-in so a Bank Statements refresh writes only its ledger/group scope.
+  if (isFullMasterSync || requestedTypes.has("gst_ledger")) {
+    masterPayload.gstLedgers = masters.gstLedgers;
+  }
+  if (isFullMasterSync || requestedTypes.has("tax_ledger")) {
+    masterPayload.taxLedgers = masters.taxLedgers;
   }
 
   const payload = {
     connectionId: config.connectionId,
     companyName: resolvedCompanyName,
     bridgeVersion: BRIDGE_VERSION,
-    masters: {
-      ledgers: masters.ledgers,
-      groups: masters.groups,
-      stockItems: masters.stockItems,
-      units: masters.units,
-      voucherTypes: masters.voucherTypes,
-      gstLedgers: masters.gstLedgers,
-      taxLedgers: masters.taxLedgers,
-    },
+    masters: masterPayload,
     companyProfile: masters.companyProfile,
   };
   const syncResult = await postMastersToBackend(config, payload);
@@ -5543,7 +5567,9 @@ async function startBridge(args) {
 
   await runOnce(config, runtimeOptions);
   startCommandWakeChannel(config, executeExclusive);
-  startCashDiscountLiveChannel(config, executeExclusive);
+  // Cash Discount uses the normal bridge command queue. Do not open the
+  // retired dedicated WebSocket channel: it required a second gateway and
+  // produced a misleading warning even while the connector was healthy.
   setInterval(() => {
     runSerially().catch((error) => {
       console.error(error instanceof Error ? error.message : error);
@@ -5588,7 +5614,6 @@ function createBridgeRunner(options = {}) {
   let running = false;
   let stopped = false;
   let stopCommandWakeChannel = null;
-  let stopCashDiscountLiveChannel = null;
   const runtimeOptions = {
     ...options,
     companyListCache: { availableCompanies: [], nextRefreshAt: 0 },
@@ -5616,8 +5641,6 @@ function createBridgeRunner(options = {}) {
     }
     stopCommandWakeChannel?.();
     stopCommandWakeChannel = null;
-    stopCashDiscountLiveChannel?.();
-    stopCashDiscountLiveChannel = null;
     if (typeof options.onStop === "function") {
       options.onStop({ reason, error, timestamp: new Date().toISOString() });
     }
@@ -5664,7 +5687,8 @@ function createBridgeRunner(options = {}) {
       emitLog(options, "info", `Starting Tally bridge for ${config.tallyUrl}`);
       emitLog(options, "info", `Sending heartbeat every ${intervalMs} ms.`);
       stopCommandWakeChannel = startCommandWakeChannel(config, executeExclusive, options);
-      stopCashDiscountLiveChannel = startCashDiscountLiveChannel(config, executeExclusive, options);
+      // Cash Discount commands are received through the regular bridge queue.
+      // Keeping one transport also means one deployed API is sufficient.
       await runSerially();
       if (!stopped) {
         timer = setInterval(() => {

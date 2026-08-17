@@ -26,6 +26,7 @@ import {
   type PurchasePostingReview,
 } from "@/lib/tally/purchase-posting";
 import { suggestPurchaseLineMasters } from "@/lib/tally/purchase-master-matching";
+import { tallyMasterFreshnessCutoff } from "@/lib/tally/masters";
 
 type PostingRow = {
   id: string;
@@ -748,6 +749,7 @@ async function loadContext(
           .eq("owner_user_id", ownerUserId)
           .eq("company_name", companyName)
           .eq("is_active", true)
+          .gte("last_synced_at", tallyMasterFreshnessCutoff())
           .in("master_type", ["ledger", "group", "stock_item", "unit", "gst_ledger", "tax_ledger"])
           .order("master_type", { ascending: true })
           .order("tally_name", { ascending: true })

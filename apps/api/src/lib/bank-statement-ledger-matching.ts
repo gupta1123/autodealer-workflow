@@ -14,7 +14,12 @@ import {
   getBankLedgerMatchingTimeoutMs,
 } from "./processing/openrouter.ts";
 import { isSuspenseLedgerIdentity } from "./bank-statement-ledger-safety.ts";
-import { normalizeMasterKey, type TallyMappingRow, type TallyMasterRow } from "./tally/masters.ts";
+import {
+  normalizeMasterKey,
+  tallyMasterFreshnessCutoff,
+  type TallyMappingRow,
+  type TallyMasterRow,
+} from "./tally/masters.ts";
 
 export type BankLedgerSuggestion = {
   counterpartyName: string | null;
@@ -580,6 +585,7 @@ async function fetchAllActiveTallyLedgers(input: {
       .eq("connection_id", input.connectionId)
       .eq("master_type", "ledger")
       .eq("is_active", true)
+      .gte("last_synced_at", tallyMasterFreshnessCutoff())
       .order("tally_name", { ascending: true })
       .range(from, from + pageSize - 1);
     if (error) throw error;

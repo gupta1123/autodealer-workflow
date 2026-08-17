@@ -36,15 +36,6 @@ function isAlreadyExistsError(error: unknown) {
   return /already exists|duplicate|409/i.test(text);
 }
 
-function isStorageMissingCheckError(error: unknown) {
-  if (!error || typeof error !== "object") return false;
-  const record = error as Record<string, unknown>;
-  const text = [record.message, record.error, record.statusCode, record.status]
-    .filter((value) => value !== null && value !== undefined)
-    .join(" ");
-  return /\b(400|404)\b|not found|bad request/i.test(text);
-}
-
 export function getContentSha256(bytes: Uint8Array) {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -61,19 +52,18 @@ async function ensureStorageObject(params: {
   contentType?: string | null;
 }) {
   const bucket = params.supabase.storage.from(params.storageBucket);
-  const existingObject = await bucket.exists(params.storagePath);
-  if (existingObject.error && !isStorageMissingCheckError(existingObject.error)) {
-    throw existingObject.error;
-  }
-  if (existingObject.data) return false;
-
+  // Upload first and use the duplicate response as the existence check. The
+  // Storage HEAD endpoint can return a generic 400 "Bad Request" for a
+  // missing object, which makes `exists()` unable to distinguish absence from
+  // a real failure. An upload with upsert disabled is atomic: it recreates a
+  // missing content-addressed object and never overwrites a healthy one.
   const upload = await bucket.upload(params.storagePath, params.bytes, {
     contentType: params.contentType || "application/octet-stream",
     upsert: false,
   });
   if (!upload.error) return true;
-  // Another upload may have recreated the same content-addressed object after
-  // our existence check. In that case the canonical object is now healthy.
+  // The canonical object already exists, possibly because another request
+  // recreated it concurrently.
   if (isAlreadyExistsError(upload.error)) return false;
   throw upload.error;
 }

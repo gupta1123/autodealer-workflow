@@ -15,6 +15,10 @@ import {
 } from "@/lib/tally/commands";
 import { toNullableText, toRequiredText, type TallyMasterRow } from "@/lib/tally/masters";
 import { wakeTallyConnector } from "@/lib/tally/command-wake";
+import {
+  acquireTallyMasterSyncLock,
+  releaseTallyMasterSyncLock,
+} from "@/lib/tally/master-sync-lock";
 
 function parseCommandType(value: unknown): TallyBridgeCommandType | null {
   if (typeof value !== "string") return null;
@@ -212,13 +216,29 @@ export async function POST(
       };
 
       if (isLocalDbMode()) {
-        const command = await createLocalTallyCommand({
+        const lock = await acquireTallyMasterSyncLock({
+          supabase: null,
+          local: true,
           connectionId: id,
           ownerUserId: user.id,
-          commandType,
-          payload,
-          priority: 10,
+          companyName: companyName ?? "Unknown company",
         });
+        if (!lock.acquired) {
+          return jsonWithCors(request, { error: "A Tally company refresh is already running. Wait for it to finish before trying again." }, { status: 409 });
+        }
+        let command;
+        try {
+          command = await createLocalTallyCommand({
+            connectionId: id,
+            ownerUserId: user.id,
+            commandType,
+            payload: { ...payload, syncLockToken: lock.token },
+            priority: 10,
+          });
+        } catch (error) {
+          await releaseTallyMasterSyncLock({ supabase: null, local: true, connectionId: id, token: lock.token });
+          throw error;
+        }
 
         return jsonWithCors(request, {
           command: serializeTallyBridgeCommand(command),
@@ -226,6 +246,15 @@ export async function POST(
       }
 
       const supabase = createSupabaseAdminClient();
+      const lock = await acquireTallyMasterSyncLock({
+        supabase,
+        connectionId: id,
+        ownerUserId: user.id,
+        companyName: companyName ?? "Unknown company",
+      });
+      if (!lock.acquired) {
+        return jsonWithCors(request, { error: "A Tally company refresh is already running. Wait for it to finish before trying again." }, { status: 409 });
+      }
       const { data, error } = await supabase
         .from("tally_bridge_commands")
         .insert({
@@ -234,12 +263,19 @@ export async function POST(
           command_type: commandType,
           status: "queued",
           priority: 10,
-          payload,
+          payload: { ...payload, syncLockToken: lock.token },
         })
         .select("*")
         .single();
 
-      if (error) throw error;
+      if (error) {
+        await releaseTallyMasterSyncLock({
+          supabase,
+          connectionId: id,
+          token: lock.token,
+        });
+        throw error;
+      }
 
       await Promise.all([
         supabase.from("tally_connection_events").insert({
@@ -332,7 +368,7 @@ export async function POST(
       }
 
       const payload = {
-        companyName,
+        companyName: companyName ?? "Unknown company",
         purpose: "purchase_posting_dropdowns",
       };
 
@@ -362,7 +398,9 @@ export async function POST(
         })
         .select("*")
         .single();
-      if (error) throw error;
+      if (error) {
+        throw error;
+      }
 
       await supabase.from("tally_connection_events").insert({
         connection_id: id,

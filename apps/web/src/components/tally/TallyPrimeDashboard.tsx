@@ -380,32 +380,34 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       const payload = (await response.json()) as ConnectionsResponse;
       const nextConnections = payload.connections ?? [];
       setConnections(nextConnections);
-      setSelectedId((current) => {
-        const stored =
-          typeof window !== "undefined"
-            ? (window.localStorage.getItem(SELECTED_CONNECTION_STORAGE_KEY) ??
-              "")
-            : "";
-        const preferred = current || stored;
-        const nextId = nextConnections.some(
-          (connection) => connection.id === preferred,
-        )
-          ? preferred
-          : nextConnections[0]?.id || "";
-        if (typeof window !== "undefined" && nextId) {
-          window.localStorage.setItem(SELECTED_CONNECTION_STORAGE_KEY, nextId);
+      const stored =
+        typeof window !== "undefined"
+          ? (window.localStorage.getItem(SELECTED_CONNECTION_STORAGE_KEY) ?? "")
+          : "";
+      const selectedConnectionId = nextConnections.some(
+        (connection) => connection.id === (selectedId || stored),
+      )
+        ? (selectedId || stored)
+        : nextConnections[0]?.id || "";
+      setSelectedId(() => {
+        if (typeof window !== "undefined" && selectedConnectionId) {
+          window.localStorage.setItem(SELECTED_CONNECTION_STORAGE_KEY, selectedConnectionId);
         }
-        return nextId;
+        return selectedConnectionId;
       });
 
-      const companyResponse = await apiFetch("/api/tally/companies", {
-        method: "GET",
-        cache: "no-store",
-      });
-      if (companyResponse.ok) {
-        const companyPayload =
-          (await companyResponse.json()) as CompaniesResponse;
-        setCompanies(companyPayload.companies ?? []);
+      if (selectedConnectionId) {
+        const companyResponse = await apiFetch(`/api/tally/companies?connectionId=${encodeURIComponent(selectedConnectionId)}`, {
+          method: "GET",
+          cache: "no-store",
+        });
+        if (companyResponse.ok) {
+          const companyPayload =
+            (await companyResponse.json()) as CompaniesResponse;
+          setCompanies(companyPayload.companies ?? []);
+        }
+      } else {
+        setCompanies([]);
       }
     } catch (error) {
       setMessage({
@@ -1060,7 +1062,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
 
           <div className="grid gap-4 md:grid-cols-3">
             <StatusCard
-              detail={`Last seen: ${formatTime(selectedConnection.lastHeartbeatAt)}`}
+              detail={`Version ${selectedConnection.bridgeVersion || "unknown"} · Last seen: ${formatTime(selectedConnection.lastHeartbeatAt)}`}
               ok={connectorActive}
               title="Connector"
               value={connectorActive ? "Connected" : "Waiting"}
