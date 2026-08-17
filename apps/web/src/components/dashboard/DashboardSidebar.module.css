@@ -245,6 +245,117 @@
 }
 
 /* =========================================
+   Tally connection status
+   ========================================= */
+.tallyStatusWrapper {
+  padding: 0 0.75rem 0.75rem;
+}
+
+.tallyStatusChip {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 0.625rem;
+  border: 1px solid;
+  border-radius: 10px;
+  text-decoration: none;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+
+.tallyStatusChip:hover {
+  transform: translateY(-1px);
+}
+
+.tallyStatusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  background: currentColor;
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 13%, transparent);
+}
+
+.tallyStatusText {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: inherit;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tallyStatusIcon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  opacity: 0.65;
+}
+
+.tallyStatus_connected {
+  color: #167451;
+  border-color: #bddfce;
+  background: #e9f6ef;
+}
+
+.tallyStatus_connected:hover {
+  border-color: #91c9ae;
+  background: #def1e7;
+}
+
+.tallyStatus_attention,
+.tallyStatus_checking,
+.tallyStatus_unavailable {
+  color: #946214;
+  border-color: #ead6ac;
+  background: #fbf3df;
+}
+
+.tallyStatus_attention:hover,
+.tallyStatus_checking:hover,
+.tallyStatus_unavailable:hover {
+  border-color: #d9bd80;
+  background: #f8eccf;
+}
+
+.tallyStatus_checking .tallyStatusDot {
+  animation: tallyStatusPulse 1.4s ease-in-out infinite;
+}
+
+.tallyStatus_disconnected {
+  color: #a33d34;
+  border-color: #ebc6c1;
+  background: #faecea;
+}
+
+.tallyStatus_disconnected:hover {
+  border-color: #dda39c;
+  background: #f7e2df;
+}
+
+@keyframes tallyStatusPulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+
+.sidebar.collapsed .tallyStatusWrapper {
+  padding-inline: 0.75rem;
+}
+
+.sidebar.collapsed .tallyStatusChip {
+  justify-content: center;
+  padding-inline: 0;
+}
+
+.sidebar.collapsed .tallyStatusText,
+.sidebar.collapsed .tallyStatusIcon {
+  display: none;
+}
+
+/* =========================================
    User Row Wrapper (for popover positioning)
    ========================================= */
 .userRowWrapper {
@@ -500,6 +611,7 @@
 
   .brandRow,
   .spacer,
+  .tallyStatusWrapper,
   .userRowWrapper {
     display: none;
   }
@@ -606,7 +718,12 @@
 @media (prefers-reduced-motion: reduce) {
   .sidebar,
   .brandTitle,
-  .navTitle {
+  .navTitle,
+  .tallyStatusChip {
     transition: none;
+  }
+
+  .tallyStatus_checking .tallyStatusDot {
+    animation: none;
   }
 }

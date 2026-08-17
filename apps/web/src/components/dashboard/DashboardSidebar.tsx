@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   LayoutDashboard,
   FolderOpen,
@@ -19,6 +19,23 @@ import {
 } from "lucide-react";
 
 import styles from "./DashboardSidebar.module.css";
+import { apiFetch } from "@/lib/api-client";
+import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
+
+type TallyConnectionSummary = {
+  id: string;
+  bridgeConnected?: boolean;
+  tallyReachable?: boolean;
+  companyLoaded?: boolean;
+  lastCompanyName?: string | null;
+};
+
+type TallyStatus =
+  | "checking"
+  | "connected"
+  | "attention"
+  | "disconnected"
+  | "unavailable";
 
 /* ── Sectioned nav ───────────────────────────── */
 const SIDEBAR_SECTIONS = [
@@ -76,7 +93,69 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
   const pathname = usePathname();
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  const [tallyStatus, setTallyStatus] = useState<TallyStatus>("checking");
+  const [tallyCompanyName, setTallyCompanyName] = useState<string | null>(null);
   const userRowRef = useRef<HTMLDivElement>(null);
+
+  const refreshTallyStatus = useCallback(async () => {
+    try {
+      const response = await apiFetch("/api/tally/connections", {
+        method: "GET",
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error("Could not read Tally status");
+
+      const payload = (await response.json()) as {
+        connections?: TallyConnectionSummary[];
+      };
+      const connections = payload.connections ?? [];
+      const preferredConnectionId = readPreferredTallyConnectionId();
+      const connection =
+        connections.find((item) => item.id === preferredConnectionId) ??
+        connections.find(
+          (item) =>
+            item.bridgeConnected === true &&
+            item.tallyReachable === true &&
+            item.companyLoaded === true,
+        ) ??
+        connections[0];
+
+      if (
+        connection?.bridgeConnected === true &&
+        connection.tallyReachable === true &&
+        connection.companyLoaded === true
+      ) {
+        setTallyStatus("connected");
+        setTallyCompanyName(connection.lastCompanyName ?? null);
+        return;
+      }
+
+      setTallyCompanyName(null);
+      setTallyStatus(
+        connection?.bridgeConnected === true
+          ? "attention"
+          : "disconnected",
+      );
+    } catch {
+      setTallyCompanyName(null);
+      setTallyStatus("unavailable");
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshTallyStatus();
+
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshTallyStatus();
+    }, 30_000);
+    const handleFocus = () => void refreshTallyStatus();
+    window.addEventListener("focus", handleFocus);
+
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [refreshTallyStatus]);
 
   const displayUser: UserInfo = user ?? {
     name: "Admin",
@@ -176,6 +255,43 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
       </nav>
 
       <div className={styles.spacer} />
+
+      <div className={styles.tallyStatusWrapper}>
+        <Link
+          href="/tally-prime?view=connection"
+          className={`${styles.tallyStatusChip} ${styles[`tallyStatus_${tallyStatus}`]}`}
+          aria-label={
+            tallyStatus === "connected"
+              ? `Tally connected${tallyCompanyName ? ` to ${tallyCompanyName}` : ""}`
+              : tallyStatus === "checking"
+                ? "Checking Tally connection"
+                : tallyStatus === "attention"
+                  ? "Tally connection needs attention"
+                  : tallyStatus === "unavailable"
+                    ? "Tally status unavailable"
+                    : "Tally disconnected"
+          }
+          title={
+            tallyStatus === "connected" && tallyCompanyName
+              ? `Connected to ${tallyCompanyName}`
+              : "Open Tally Connector"
+          }
+        >
+          <span className={styles.tallyStatusDot} aria-hidden="true" />
+          <span className={styles.tallyStatusText}>
+            {tallyStatus === "connected"
+              ? "Tally connected"
+              : tallyStatus === "checking"
+                ? "Checking Tally…"
+                : tallyStatus === "attention"
+                  ? "Tally not ready"
+                  : tallyStatus === "unavailable"
+                    ? "Status unavailable"
+                    : "Tally disconnected"}
+          </span>
+          <PlugZap className={styles.tallyStatusIcon} aria-hidden="true" />
+        </Link>
+      </div>
 
       {/* ── USER ROW (opens popover) ── */}
       <div className={styles.userRowWrapper} ref={userRowRef}>

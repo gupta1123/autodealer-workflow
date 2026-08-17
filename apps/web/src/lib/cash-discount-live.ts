@@ -5,8 +5,10 @@ import { getApiAccessToken } from "@/lib/api-client";
 type LiveRequest = {
   connectionId: string;
   companyName: string;
+  financialYear?: string | null;
   operation: "scan" | "create_debit_note";
   proposal?: Record<string, unknown>;
+  customerScope?: Record<string, unknown>;
   onProgress?: (message: string) => void;
 };
 
@@ -19,10 +21,23 @@ type LiveResult<T> = {
   message?: string;
 };
 
-function gatewayUrl() {
+async function gatewayUrl() {
   const configured = String(process.env.NEXT_PUBLIC_CASH_DISCOUNT_GATEWAY_URL || "").trim();
   if (configured) return configured;
-  const url = new URL(window.location.href);
+  const apiBaseUrl = String(
+    process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_BRIDGE_API_BASE_URL || ""
+  ).trim();
+  const gatewayBaseUrl = apiBaseUrl;
+  if (!gatewayBaseUrl && !["localhost", "127.0.0.1"].includes(window.location.hostname)) {
+    const response = await fetch("/api/cash-discount-live-url", { cache: "no-store" });
+    const payload = await response.json().catch(() => ({})) as { url?: string; error?: string };
+    if (!response.ok || !payload.url) {
+      throw new Error(payload.error || "The Cash Discount gateway URL is not configured.");
+    }
+    return payload.url;
+  }
+
+  const url = new URL(gatewayBaseUrl || window.location.href);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   if (["localhost", "127.0.0.1"].includes(url.hostname)) {
     url.port = "3002";
@@ -39,10 +54,11 @@ export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
   const accessToken = await getApiAccessToken();
   const localMode = process.env.NEXT_PUBLIC_LOCAL_DB_MODE === "true";
   if (!accessToken && !localMode) throw new Error("Your session has expired. Sign in and try again.");
+  const liveGatewayUrl = await gatewayUrl();
 
   return new Promise<T>((resolve, reject) => {
     const requestId = crypto.randomUUID();
-    const socket = new WebSocket(gatewayUrl());
+    const socket = new WebSocket(liveGatewayUrl);
     let settled = false;
     const finish = (error?: Error, data?: T) => {
       if (settled) return;
@@ -74,7 +90,9 @@ export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
             requestId,
             operation: request.operation,
             companyName: request.companyName,
+            financialYear: request.financialYear,
             proposal: request.proposal,
+            customerScope: request.customerScope,
           }));
         } else if (message.type === "progress" && message.requestId === requestId) {
           request.onProgress?.(message.message || "Reading live Tally data...");

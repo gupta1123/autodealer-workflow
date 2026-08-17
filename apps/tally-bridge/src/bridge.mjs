@@ -9,14 +9,18 @@ import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.42";
+const BRIDGE_VERSION = "0.1.46";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
+const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
 // Exports can be larger than imports, but they must still release the bridge
 // cycle if Tally is busy or has stopped responding.
 const TALLY_EXPORT_TIMEOUT_MS = 60_000;
 const OPEN_BILL_LEDGER_BATCH_SIZE = 50;
+const CASH_DISCOUNT_VOUCHER_DAYS_PER_CHUNK = 31;
+const CASH_DISCOUNT_EVIDENCE_LEDGER_BATCH_SIZE = 20;
+const CASH_DISCOUNT_MAX_VOUCHER_CHUNKS = 60;
 const CONFIG_DIR = path.join(os.homedir(), ".autodealer-tally-bridge");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const INSTALLATION_ID_PATH = path.join(CONFIG_DIR, "installation-id");
@@ -27,6 +31,7 @@ const PURCHASE_DOCUMENT_UDFS = {
   name: { name: "KalikaSourceDocumentName", index: 30002 },
   sha256: { name: "KalikaSourceDocumentSha256", index: 30003 },
   id: { name: "KalikaSourceDocumentId", index: 30004 },
+  vehicle: { name: "KalikaVehicleNumber", index: 30005 },
 };
 const DEFAULT_TALLY_DATA_ROOT = path.join(process.env.PUBLIC || "C:\\Users\\Public", "TallyPrime", "data");
 const CURRENT_FILE = fileURLToPath(import.meta.url);
@@ -263,39 +268,6 @@ function extractBlocks(xml, tagName) {
   }
 
   return blocks;
-}
-
-function buildTallyReadinessXml(companyName) {
-  const companyVariable = companyName
-    ? `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>`
-    : "";
-
-  return [
-    "<ENVELOPE>",
-    "<HEADER>",
-    "<VERSION>1</VERSION>",
-    "<TALLYREQUEST>Export</TALLYREQUEST>",
-    "<TYPE>Collection</TYPE>",
-    "<ID>Autodealer Ledgers Probe</ID>",
-    "</HEADER>",
-    "<BODY>",
-    "<DESC>",
-    "<STATICVARIABLES>",
-    companyVariable,
-    "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>",
-    "</STATICVARIABLES>",
-    "<TDL>",
-    "<TDLMESSAGE>",
-    '<COLLECTION NAME="Autodealer Ledgers Probe" ISMODIFY="No">',
-    "<TYPE>Ledger</TYPE>",
-    "<FETCH>Name,Parent,GUID</FETCH>",
-    "</COLLECTION>",
-    "</TDLMESSAGE>",
-    "</TDL>",
-    "</DESC>",
-    "</BODY>",
-    "</ENVELOPE>",
-  ].join("");
 }
 
 function buildCollectionExportXml({
@@ -1072,19 +1044,24 @@ function buildPurchaseInventoryEntryXml(item) {
 }
 
 function buildPurchaseDocumentUdfXml(payload) {
-  const values = [
+  const documentValues = [
     [PURCHASE_DOCUMENT_UDFS.path, payload?.sourceDocumentPath],
     [PURCHASE_DOCUMENT_UDFS.name, payload?.sourceDocumentName],
     [PURCHASE_DOCUMENT_UDFS.sha256, payload?.sourceDocumentSha256],
     [PURCHASE_DOCUMENT_UDFS.id, payload?.sourceDocumentId],
   ];
 
-  if (values.every(([, value]) => !String(value || "").trim())) {
-    return "";
-  }
-  if (values.some(([, value]) => !String(value || "").trim())) {
+  const hasDocument = documentValues.some(([, value]) => String(value || "").trim());
+  if (hasDocument && documentValues.some(([, value]) => !String(value || "").trim())) {
     throw new Error("Purchase source document metadata is incomplete.");
   }
+  const values = [
+    ...(hasDocument ? documentValues : []),
+    ...(String(payload?.vehicleNumber || "").trim()
+      ? [[PURCHASE_DOCUMENT_UDFS.vehicle, payload.vehicleNumber]]
+      : []),
+  ];
+  if (values.length === 0) return "";
 
   return values.map(([definition, value]) => {
     const tag = definition.name.toUpperCase();
@@ -1334,27 +1311,6 @@ function extractCompanyName(xml) {
   }
 
   return null;
-}
-
-async function fetchActiveCompanyName(tallyUrl) {
-  try {
-    // `$$CurrentCompany` is the actual company active in the Tally UI. A
-    // Company collection can instead return the first loaded company, which
-    // makes multi-company verification incorrect.
-    const xml = await exportTallyXml(
-      tallyUrl,
-      [
-        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>",
-        "<TYPE>Function</TYPE><ID>$$CurrentCompany</ID></HEADER><BODY><DESC>",
-        "<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>",
-        "</DESC></BODY></ENVELOPE>",
-      ].join(""),
-      "Current company"
-    );
-    return getTagText(xml, "RESULT") || extractCompanyName(xml);
-  } catch {
-    return null;
-  }
 }
 
 function normalizeTallyDate(value) {
@@ -1677,6 +1633,12 @@ function purchaseVoucherReadbackComparison(voucher, payload) {
       differences.push("Original invoice document identity differs.");
     }
   }
+  if (
+    payload?.vehicleNumber &&
+    normalizeLooseName(voucher?.vehicleNumber) !== normalizeLooseName(payload.vehicleNumber)
+  ) {
+    differences.push("Vehicle number was not preserved on the Tally voucher.");
+  }
 
   return differences;
 }
@@ -1696,7 +1658,7 @@ async function verifyPurchaseVoucherInTally(config, payload = {}) {
     collectionName: "Autodealer Purchase Voucher Verification",
     tallyType: "Voucher",
     fetchFields:
-      "Date,EffectiveDate,ReferenceDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,AlterID,GUID,Narration,KalikaSourceDocumentPath,KalikaSourceDocumentName,KalikaSourceDocumentSha256,KalikaSourceDocumentId,AllLedgerEntries.*,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.BillDate,AllLedgerEntries.BillAllocations.Amount,AllInventoryEntries.*",
+      "Date,EffectiveDate,ReferenceDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,AlterID,GUID,Narration,KalikaSourceDocumentPath,KalikaSourceDocumentName,KalikaSourceDocumentSha256,KalikaSourceDocumentId,KalikaVehicleNumber,AllLedgerEntries.*,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.BillDate,AllLedgerEntries.BillAllocations.Amount,AllInventoryEntries.*",
     companyName,
     dateFrom: voucherDate,
     dateTo: voucherDate,
@@ -1750,6 +1712,82 @@ async function verifyPurchaseVoucherInTally(config, payload = {}) {
   };
 }
 
+function purchasePayloadMasterNames(payload) {
+  const ledgerNames = [
+    payload?.supplierLedgerName,
+    ...(Array.isArray(payload?.items) ? payload.items.map((item) => item?.purchaseLedgerName) : []),
+    ...(Array.isArray(payload?.charges) ? payload.charges.map((entry) => entry?.name) : []),
+    ...(Array.isArray(payload?.withholdings) ? payload.withholdings.map((entry) => entry?.name) : []),
+    ...Object.values(payload?.ledgers && typeof payload.ledgers === "object" ? payload.ledgers : {})
+      .map((entry) => entry?.name),
+  ].filter(Boolean);
+  const stockItemNames = (Array.isArray(payload?.items) ? payload.items : [])
+    .map((item) => item?.stockItemName)
+    .filter(Boolean);
+  return {
+    ledgerNames: Array.from(new Set(ledgerNames.map((name) => String(name).trim()).filter(Boolean))),
+    stockItemNames: Array.from(new Set(stockItemNames.map((name) => String(name).trim()).filter(Boolean))),
+  };
+}
+
+async function validatePurchasePayloadMasters(tallyUrl, companyName, payload) {
+  const { ledgerNames, stockItemNames } = purchasePayloadMasterNames(payload);
+  if (ledgerNames.length === 0 || stockItemNames.length === 0) {
+    throw new Error("Purchase voucher is missing its selected Tally ledgers or stock items.");
+  }
+
+  const ledgerFilterName = "KalikaRequestedPurchaseLedger";
+  const ledgerXml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Kalika Validate Purchase Ledgers",
+    tallyType: "Ledger",
+    fetchFields: "Name,Parent,GUID,PartyGSTIN,TaxType,GSTDutyHead,RateOfTaxCalculation",
+    companyName,
+    formulae: [{
+      name: ledgerFilterName,
+      formula: buildRequestedLedgerFormula(ledgerNames, ["$Name"]),
+    }],
+    filterNames: [ledgerFilterName],
+  });
+  const stockFilterName = "KalikaRequestedPurchaseStock";
+  const stockXml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Kalika Validate Purchase Stock",
+    tallyType: "StockItem",
+    fetchFields: "Name,Parent,GUID,BaseUnits,OriginalBaseUnits,GSTHSNCode,HSNCode",
+    companyName,
+    formulae: [{
+      name: stockFilterName,
+      formula: buildRequestedLedgerFormula(stockItemNames, ["$Name"]),
+    }],
+    filterNames: [stockFilterName],
+  });
+
+  const liveLedgerNames = new Set(parseMasterCollection(ledgerXml, "LEDGER").map((master) => normalizeLooseName(master.name)));
+  const liveStockByName = new Map(parseMasterCollection(stockXml, "STOCKITEM").map((master) => [normalizeLooseName(master.name), master]));
+  const missingLedgers = ledgerNames.filter((name) => !liveLedgerNames.has(normalizeLooseName(name)));
+  const missingStockItems = stockItemNames.filter((name) => !liveStockByName.has(normalizeLooseName(name)));
+  if (missingLedgers.length > 0 || missingStockItems.length > 0) {
+    throw new Error([
+      missingLedgers.length > 0 ? `Ledger no longer exists in live Tally: ${missingLedgers.join(", ")}.` : "",
+      missingStockItems.length > 0 ? `Stock item no longer exists in live Tally: ${missingStockItems.join(", ")}.` : "",
+      "Refresh Purchase masters and review the changed selection before posting.",
+    ].filter(Boolean).join(" "));
+  }
+
+  for (const item of Array.isArray(payload?.items) ? payload.items : []) {
+    const liveStock = liveStockByName.get(normalizeLooseName(item?.stockItemName));
+    const selectedUnit = normalizeLooseName(item?.unit);
+    const liveUnit = normalizeLooseName(liveStock?.unitName);
+    if (selectedUnit && liveUnit && selectedUnit !== liveUnit) {
+      throw new Error(`${liveStock.name} now uses ${liveStock.unitName} in Tally, not ${item.unit}. Refresh and review the item.`);
+    }
+    const selectedHsn = String(item?.hsn || "").replace(/\D/g, "");
+    const liveHsn = String(liveStock?.hsnCode || "").replace(/\D/g, "");
+    if (selectedHsn && liveHsn && selectedHsn !== liveHsn) {
+      throw new Error(`${liveStock.name} now uses HSN ${liveStock.hsnCode} in Tally, not ${item.hsn}. Refresh and review the item.`);
+    }
+  }
+}
+
 async function postPurchaseVoucher(tallyUrl, payload, companyName) {
   const preflight = await verifyPurchaseVoucherInTally({ tallyUrl, companyName }, payload);
   if (preflight.result?.verificationStatus === "verified") {
@@ -1780,6 +1818,7 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName) {
     };
   }
 
+  await validatePurchasePayloadMasters(tallyUrl, companyName, payload);
   const xml = buildPurchaseVoucherXml(payload, companyName);
   const importOutcome = requireCreatedVoucher(await invokeTallyXml(tallyUrl, xml));
   if (!importOutcome.success) return { outcome: importOutcome, xml };
@@ -2162,6 +2201,7 @@ function toVoucher(block) {
     sourceDocumentName: getUdfTagText(block, "KALIKASOURCEDOCUMENTNAME"),
     sourceDocumentSha256: getUdfTagText(block, "KALIKASOURCEDOCUMENTSHA256"),
     sourceDocumentId: getUdfTagText(block, "KALIKASOURCEDOCUMENTID"),
+    vehicleNumber: getUdfTagText(block, "KALIKAVEHICLENUMBER"),
     rawPreview: previewXml(block),
   };
 }
@@ -3270,6 +3310,75 @@ function chunkValues(values, size) {
   return chunks;
 }
 
+function addUtcDays(date, days) {
+  const value = new Date(`${date}T00:00:00.000Z`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0, 10);
+}
+
+function cashDiscountFinancialYearRange(financialYear, asOfDate) {
+  const normalizedAsOfDate = /^\d{4}-\d{2}-\d{2}$/.test(String(asOfDate || ""))
+    ? String(asOfDate)
+    : new Date().toISOString().slice(0, 10);
+  const match = String(financialYear || "").trim().match(/(\d{4})\D+(\d{2}|\d{4})/);
+  const asOfYear = Number(normalizedAsOfDate.slice(0, 4));
+  const asOfMonth = Number(normalizedAsOfDate.slice(5, 7));
+  const startYear = match ? Number(match[1]) : asOfMonth >= 4 ? asOfYear : asOfYear - 1;
+  const dateFrom = `${startYear}-04-01`;
+  const financialYearEnd = `${startYear + 1}-03-31`;
+  return {
+    financialYear: `${startYear}-${String(startYear + 1).slice(-2)}`,
+    dateFrom,
+    dateTo: normalizedAsOfDate < financialYearEnd ? normalizedAsOfDate : financialYearEnd,
+  };
+}
+
+function cashDiscountVoucherDateChunks(dateFrom, dateTo) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateFrom || "")) || !/^\d{4}-\d{2}-\d{2}$/.test(String(dateTo || ""))) {
+    return [{ dateFrom: dateFrom || null, dateTo: dateTo || null }];
+  }
+  if (dateFrom > dateTo) {
+    return [{ dateFrom, dateTo }];
+  }
+
+  const chunks = [];
+  let cursor = dateFrom;
+  while (cursor <= dateTo) {
+    if (chunks.length >= CASH_DISCOUNT_MAX_VOUCHER_CHUNKS) {
+      throw new Error("The Cash Discount voucher period is too large for one live scan.");
+    }
+    const maximumEnd = addUtcDays(cursor, CASH_DISCOUNT_VOUCHER_DAYS_PER_CHUNK - 1);
+    const chunkEnd = maximumEnd < dateTo ? maximumEnd : dateTo;
+    chunks.push({ dateFrom: cursor, dateTo: chunkEnd });
+    cursor = addUtcDays(chunkEnd, 1);
+  }
+  return chunks;
+}
+
+function openBillPendingFormula() {
+  return [
+    `(NOT $$IsEmpty:$ClosingBalance AND NOT $$IsEqual:$ClosingBalance:0)`,
+    `($$IsEmpty:$ClosingBalance AND NOT $$IsEmpty:$PendingAmount AND NOT $$IsEqual:$PendingAmount:0)`,
+    `($$IsEmpty:$ClosingBalance AND $$IsEmpty:$PendingAmount AND NOT $$IsEmpty:$Balance AND NOT $$IsEqual:$Balance:0)`,
+  ].join(" OR ");
+}
+
+function isTallyExportTimeout(error) {
+  return error?.name === "AbortError" || /timed out after \d+ seconds|tally.*timed out/i.test(String(error?.message || error || ""));
+}
+
+function splitDateChunk(dateChunk) {
+  if (!dateChunk.dateFrom || !dateChunk.dateTo || dateChunk.dateFrom >= dateChunk.dateTo) return null;
+  const fromTime = Date.parse(`${dateChunk.dateFrom}T00:00:00.000Z`);
+  const toTime = Date.parse(`${dateChunk.dateTo}T00:00:00.000Z`);
+  if (!Number.isFinite(fromTime) || !Number.isFinite(toTime) || fromTime >= toTime) return null;
+  const midpoint = new Date(fromTime + Math.floor((toTime - fromTime) / 2)).toISOString().slice(0, 10);
+  return [
+    { dateFrom: dateChunk.dateFrom, dateTo: midpoint },
+    { dateFrom: addUtcDays(midpoint, 1), dateTo: dateChunk.dateTo },
+  ];
+}
+
 function openBillBlockRequiresVoucherFallback(block) {
   const referenceName = getAttribute(block, "NAME") || getTagText(block, "NAME") || getTagText(block, "BILLREF");
   if (!referenceName) return false;
@@ -3289,9 +3398,11 @@ function earliestBillDate(blocks) {
 
 async function exportTargetedOpenBillXml(
   tallyUrl,
-  { companyName, ledgerNames, asOfDate, forceTargeted = false },
+  { companyName, ledgerNames, dateFrom, asOfDate, forceTargeted = false },
   exportCollection = exportTallyCollection
 ) {
+  const pendingFilterName = "AutodealerPendingBill";
+  const pendingFormula = { name: pendingFilterName, formula: openBillPendingFormula() };
   if (!forceTargeted && ledgerNames.length > OPEN_BILL_LEDGER_BATCH_SIZE) {
     const xml = await exportCollection(tallyUrl, {
       collectionName: "Autodealer Customer Open Bills",
@@ -3299,7 +3410,10 @@ async function exportTargetedOpenBillXml(
       fetchFields:
         "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
       companyName,
+      dateFrom,
       dateTo: asOfDate,
+      formulae: [pendingFormula],
+      filterNames: [pendingFilterName],
     });
     return { xml, batchCount: 1, queryMode: "full" };
   }
@@ -3313,14 +3427,16 @@ async function exportTargetedOpenBillXml(
       fetchFields:
         "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
       companyName,
+      dateFrom,
       dateTo: asOfDate,
       formulae: [
+        pendingFormula,
         {
           name: ledgerFilterName,
           formula: buildRequestedLedgerFormula(batch, ["$LedgerName", "$PartyLedgerName", "$Parent"]),
         },
       ],
-      filterNames: [ledgerFilterName],
+      filterNames: [pendingFilterName, ledgerFilterName],
     }));
   }
   return { xml: responses.join("\n"), batchCount: batches.length, queryMode: "targeted" };
@@ -3331,35 +3447,74 @@ async function exportTargetedBillEvidenceXml(
   { companyName, ledgerNames, dateFrom, dateTo },
   exportCollection = exportTallyCollection
 ) {
-  const batches = chunkValues(ledgerNames, OPEN_BILL_LEDGER_BATCH_SIZE);
+  const batches = chunkValues(ledgerNames, CASH_DISCOUNT_EVIDENCE_LEDGER_BATCH_SIZE);
+  const dateChunks = cashDiscountVoucherDateChunks(dateFrom, dateTo);
   const responses = [];
-  for (const [index, batch] of batches.entries()) {
-    const ledgerEntryFilterName = "AutodealerRequestedPartyEntry";
-    const ledgerVoucherFilterName = "AutodealerRequestedPartyVoucher";
-    responses.push(await exportCollection(tallyUrl, {
-      collectionName: `Autodealer Customer Bill Evidence ${index + 1}`,
-      tallyType: "Voucher",
-      fetchFields:
-        "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount",
-      companyName,
-      dateFrom,
-      dateTo,
-      formulae: [
-        {
-          name: ledgerEntryFilterName,
-          formula: buildRequestedLedgerFormula(batch, ["$LedgerName"]),
-        },
-        {
-          name: ledgerVoucherFilterName,
-          formula: `$$FilterCount:AllLedgerEntries:${ledgerEntryFilterName} > 0`,
-        },
-      ],
-      // Keep custom voucher types. The returned vouchers are already limited
-      // to the affected party ledgers and are classified after parsing.
-      filterNames: [ledgerVoucherFilterName],
-    }));
+  const successfulDateChunks = new Set();
+  let requestSequence = 0;
+  let retrySplitCount = 0;
+
+  const exportSlice = async (dateChunk, batch) => {
+    requestSequence += 1;
+    if (requestSequence > CASH_DISCOUNT_MAX_VOUCHER_CHUNKS * 20) {
+      throw new Error("The Cash Discount voucher evidence required too many Tally requests.");
+    }
+    try {
+      const ledgerEntryFilterName = "AutodealerRequestedPartyEntry";
+      const ledgerVoucherFilterName = "AutodealerRequestedPartyVoucher";
+      responses.push(await exportCollection(tallyUrl, {
+        collectionName: `Autodealer Customer Bill Evidence ${requestSequence}`,
+        tallyType: "Voucher",
+        fetchFields:
+          "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount",
+        companyName,
+        dateFrom: dateChunk.dateFrom,
+        dateTo: dateChunk.dateTo,
+        formulae: [
+          {
+            name: ledgerEntryFilterName,
+            formula: buildRequestedLedgerFormula(batch, ["$LedgerName"]),
+          },
+          {
+            name: ledgerVoucherFilterName,
+            formula: `$$FilterCount:AllLedgerEntries:${ledgerEntryFilterName} > 0`,
+          },
+        ],
+        // Keep custom voucher types. The returned vouchers are already limited
+        // to the affected party ledgers and are classified after parsing.
+        filterNames: [ledgerVoucherFilterName],
+      }));
+      successfulDateChunks.add(`${dateChunk.dateFrom}|${dateChunk.dateTo}`);
+    } catch (error) {
+      if (!isTallyExportTimeout(error)) throw error;
+      const splitDates = splitDateChunk(dateChunk);
+      if (splitDates) {
+        retrySplitCount += 1;
+        for (const smallerDateChunk of splitDates) await exportSlice(smallerDateChunk, batch);
+        return;
+      }
+      if (batch.length > 1) {
+        retrySplitCount += 1;
+        const midpoint = Math.ceil(batch.length / 2);
+        await exportSlice(dateChunk, batch.slice(0, midpoint));
+        await exportSlice(dateChunk, batch.slice(midpoint));
+        return;
+      }
+      throw error;
+    }
+  };
+
+  for (const dateChunk of dateChunks) {
+    for (const batch of batches) {
+      await exportSlice(dateChunk, batch);
+    }
   }
-  return { xml: responses.join("\n"), batchCount: batches.length };
+  return {
+    xml: responses.join("\n"),
+    batchCount: responses.length,
+    dateChunkCount: successfulDateChunks.size,
+    retrySplitCount,
+  };
 }
 
 async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, dependencies = {}) {
@@ -3372,6 +3527,7 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
   const companyName = commandPayload.companyName || null;
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const asOfDate = normalizeDateForCompare(commandPayload.asOfDate || commandPayload.dateTo) || null;
+  const requestedDateFrom = normalizeDateForCompare(commandPayload.dateFrom) || null;
   const forceTargeted =
     commandPayload.queryPurpose === "bank_statement_match" && ledgerNames.length <= OPEN_BILL_LEDGER_BATCH_SIZE;
   const exportCollection = dependencies.exportCollection || exportTallyCollection;
@@ -3379,9 +3535,9 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
   // collection exports can leave one request waiting indefinitely, which
   // previously locked the whole connector cycle and surfaced as a dashboard
   // refresh timeout.
-  const billExport = await exportTargetedOpenBillXml(
+  const billExport = dependencies.billExport || await exportTargetedOpenBillXml(
     tallyUrl,
-    { companyName, ledgerNames, asOfDate, forceTargeted },
+    { companyName, ledgerNames, dateFrom: requestedDateFrom, asOfDate, forceTargeted },
     exportCollection
   );
   const billBlocks = extractBlocks(billExport.xml, "BILL").filter((block) =>
@@ -3392,13 +3548,21 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
     const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(billLedgerName(block)));
     return requestedLedgerName ? [requestedLedgerName] : [];
   })));
-  const voucherExport = fallbackLedgerNames.length > 0
+  // Cash Discount calculation always needs invoice narration and receipt
+  // allocation evidence. For other consumers, retain the narrower structural
+  // fallback behaviour.
+  const evidenceLedgerNames = dependencies.forceVoucherEvidence && billBlocks.length > 0
+    ? ledgerNames
+    : fallbackLedgerNames;
+  const voucherExport = evidenceLedgerNames.length > 0
     ? await exportTargetedBillEvidenceXml(
         tallyUrl,
         {
           companyName,
-          ledgerNames: fallbackLedgerNames,
-          dateFrom: earliestBillDate(fallbackBlocks),
+          ledgerNames: evidenceLedgerNames,
+          dateFrom:
+            requestedDateFrom ||
+            earliestBillDate(dependencies.forceVoucherEvidence ? billBlocks : fallbackBlocks),
           dateTo: asOfDate,
         },
         exportCollection
@@ -3481,9 +3645,12 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
         billBatchCount: billExport.batchCount,
         billQueryMode: billExport.queryMode,
         billObjectCount: billBlocks.length,
-        voucherFallbackUsed: fallbackLedgerNames.length > 0,
-        voucherFallbackLedgerCount: fallbackLedgerNames.length,
+        voucherFallbackUsed: evidenceLedgerNames.length > 0,
+        voucherFallbackLedgerCount: evidenceLedgerNames.length,
+        voucherEvidenceMode: dependencies.forceVoucherEvidence ? "required" : "fallback",
         voucherBatchCount: voucherExport.batchCount,
+        voucherDateChunkCount: voucherExport.dateChunkCount ?? 0,
+        voucherRetrySplitCount: voucherExport.retrySplitCount ?? 0,
         asOfDate,
       },
     },
@@ -3610,6 +3777,62 @@ function findPartyLedgersFromMasters(ledgers, groups, rootGroupName) {
   return ledgers.filter((ledger) => descendsFromRoot(ledger.parent));
 }
 
+function normalizeCashDiscountCustomerScope(input) {
+  const value = input && typeof input === "object" ? input : {};
+  const mode = value.mode === "custom" || value.mode === "strict" ? value.mode : "automatic";
+  const selectedGroupNames = uniquePayloadLedgerNames({
+    ledgerNames: Array.isArray(value.selectedGroupNames) && value.selectedGroupNames.length > 0
+      ? value.selectedGroupNames
+      : ["Sundry Debtors"],
+  });
+  return {
+    mode,
+    selectedGroupNames,
+    includeNestedGroups: value.includeNestedGroups !== false,
+    detectSalesLinkedExceptions: mode !== "strict" && value.detectSalesLinkedExceptions !== false,
+    excludedGroupNames: uniquePayloadLedgerNames({ ledgerNames: value.excludedGroupNames || [] }),
+    excludedLedgerNames: uniquePayloadLedgerNames({ ledgerNames: value.excludedLedgerNames || [] }),
+  };
+}
+
+function selectCashDiscountLedgers(ledgers, groups, input) {
+  const scope = normalizeCashDiscountCustomerScope(input);
+  const selectedKeys = new Set(scope.selectedGroupNames.map(normalizeLooseName));
+  const excludedGroupKeys = new Set(scope.excludedGroupNames.map(normalizeLooseName));
+  const excludedLedgerKeys = new Set(scope.excludedLedgerNames.map(normalizeLooseName));
+  const parentByGroup = new Map(groups.filter((group) => group?.name).map((group) => [
+    normalizeLooseName(group.name),
+    group.parent || null,
+  ]));
+
+  const classification = (ledger) => {
+    if (excludedLedgerKeys.has(normalizeLooseName(ledger.name))) return null;
+    const visited = new Set();
+    let groupName = ledger.parent || null;
+    while (groupName) {
+      const key = normalizeLooseName(groupName);
+      if (!key || visited.has(key) || excludedGroupKeys.has(key)) return null;
+      if (selectedKeys.has(key)) {
+        const direct = normalizeLooseName(ledger.parent) === key;
+        if (scope.includeNestedGroups || direct) {
+          return { source: "selected_group", rootGroupName: groupName };
+        }
+        return null;
+      }
+      visited.add(key);
+      groupName = parentByGroup.get(key) || null;
+    }
+    return scope.detectSalesLinkedExceptions
+      ? { source: "sales_linked_exception", rootGroupName: null }
+      : null;
+  };
+
+  return ledgers.flatMap((ledger) => {
+    const match = classification(ledger);
+    return match ? [{ ...ledger, cashDiscountCustomerScope: match }] : [];
+  });
+}
+
 function cashDiscountLiveLedger(master) {
   return {
     name: master.name,
@@ -3622,11 +3845,67 @@ function cashDiscountLiveLedger(master) {
       contactPerson: master.contactPerson || null,
       address: master.address || null,
       billWiseEnabled: master.raw?.billWiseEnabled ?? null,
+      cashDiscountCustomerScope: master.cashDiscountCustomerScope || null,
     },
   };
 }
 
-async function collectCashDiscountLiveSnapshot(config, operation, companyName, proposal, onProgress) {
+const CASH_DISCOUNT_LEDGER_FIELDS =
+  "Name,Parent,GUID,PartyGSTIN,IsBillWiseOn,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode";
+
+async function exportCashDiscountGroups(config, companyName) {
+  const xml = await exportTallyCollection(config.tallyUrl, {
+    collectionName: "Kalika Cash Discount Groups",
+    tallyType: "Group",
+    fetchFields: "Name,Parent,GUID",
+    companyName,
+  });
+  return parseMasterCollection(xml, "GROUP");
+}
+
+async function exportCashDiscountLedgers(config, companyName, ledgerNames) {
+  const names = uniquePayloadLedgerNames({ ledgerNames });
+  if (names.length === 0) return [];
+  const batches = chunkValues(names, OPEN_BILL_LEDGER_BATCH_SIZE);
+  const responses = [];
+  for (const [index, batch] of batches.entries()) {
+    const filterName = "KalikaCashDiscountLedgerName";
+    responses.push(await exportTallyCollection(config.tallyUrl, {
+      collectionName: `Kalika Cash Discount Ledgers ${index + 1}`,
+      tallyType: "Ledger",
+      fetchFields: CASH_DISCOUNT_LEDGER_FIELDS,
+      companyName,
+      formulae: [{
+        name: filterName,
+        formula: buildRequestedLedgerFormula(batch, ["$Name"]),
+      }],
+      filterNames: [filterName],
+    }));
+  }
+  return parseMasterCollection(responses.join("\n"), "LEDGER");
+}
+
+async function exportCashDiscountOpenBillsFirst(config, companyName, dateRange) {
+  const pendingFilterName = "KalikaCashDiscountPendingBill";
+  const xml = await exportTallyCollection(config.tallyUrl, {
+    collectionName: "Kalika Cash Discount Open Bills",
+    tallyType: "Bill",
+    fetchFields:
+      "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
+    companyName,
+    dateFrom: dateRange?.dateFrom,
+    dateTo: dateRange?.dateTo,
+    formulae: [{ name: pendingFilterName, formula: openBillPendingFormula() }],
+    filterNames: [pendingFilterName],
+  });
+  return {
+    xml,
+    batchCount: 1,
+    queryMode: "open_bills_first",
+  };
+}
+
+async function collectCashDiscountLiveSnapshot(config, operation, companyName, proposal, onProgress, financialYear, customerScope) {
   const readiness = await testTally(config.tallyUrl);
   if (!readiness.tallyReachable || !readiness.companyLoaded) {
     throw new Error(readiness.error || "Tally Prime is not ready for Cash Discount analysis.");
@@ -3636,50 +3915,113 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
     throw new Error(`Tally is currently open to ${readiness.companyName || "another company"}. Switch to ${requestedCompany} and refresh.`);
   }
   const resolvedCompany = requestedCompany || readiness.companyName || null;
+  const asOfDate = new Date().toISOString().slice(0, 10);
+  const dateRange = cashDiscountFinancialYearRange(financialYear || proposal?.financialYear, asOfDate);
 
-  onProgress?.("Reading customer ledgers and Sundry Debtors subgroups from Tally...");
-  const ledgerXml = await exportTallyCollection(config.tallyUrl, {
-    collectionName: "Kalika Cash Discount Ledgers",
-    tallyType: "Ledger",
-    fetchFields:
-      "Name,Parent,GUID,PartyGSTIN,IsBillWiseOn,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode",
-    companyName: resolvedCompany,
-  });
-  const groupXml = await exportTallyCollection(config.tallyUrl, {
-    collectionName: "Kalika Cash Discount Groups",
-    tallyType: "Group",
-    fetchFields: "Name,Parent,GUID",
-    companyName: resolvedCompany,
-  });
-  const ledgers = parseMasterCollection(ledgerXml, "LEDGER");
-  const groups = parseMasterCollection(groupXml, "GROUP");
-  const debtorLedgers = findPartyLedgersFromMasters(ledgers, groups, "Sundry Debtors");
   const requestedLedgerName = String(proposal?.partyLedgerName || "").trim();
+
+  let billExport = null;
+  let candidateLedgerNames = [];
+  if (operation === "cash_discount_revalidate") {
+    candidateLedgerNames = requestedLedgerName ? [requestedLedgerName] : [];
+  } else {
+    onProgress?.("Reading open customer bills from Tally...");
+    billExport = await exportCashDiscountOpenBillsFirst(config, resolvedCompany, dateRange);
+    candidateLedgerNames = Array.from(new Set(
+      extractBlocks(billExport.xml, "BILL")
+        .filter((block) => {
+          const ledgerName = billLedgerName(block);
+          return Boolean(ledgerName && toOpenBill(block, ledgerName));
+        })
+        .map(billLedgerName)
+        .filter(Boolean)
+    ));
+  }
+
+  if (candidateLedgerNames.length === 0) {
+    return {
+      companyName: resolvedCompany,
+      financialYear: dateRange.financialYear,
+      dateFrom: dateRange.dateFrom,
+      dateTo: dateRange.dateTo,
+      ledgers: [],
+      openBillsResult: { success: true, result: { ledgerNames: [], byLedger: {}, openBills: [], existingAdvances: [], rawCount: 0 } },
+    };
+  }
+
+  onProgress?.(`Reading ${candidateLedgerNames.length} customer ledger${candidateLedgerNames.length === 1 ? "" : "s"} represented by open bills...`);
+  // Tally's HTTP listener is serial, so keep these reads sequential.
+  const groups = await exportCashDiscountGroups(config, resolvedCompany);
+  const candidateLedgers = await exportCashDiscountLedgers(config, resolvedCompany, candidateLedgerNames);
+  const scopedLedgers = selectCashDiscountLedgers(candidateLedgers, groups, customerScope);
   const ledgersToScan = operation === "cash_discount_revalidate"
-    ? debtorLedgers.filter((ledger) => normalizeLooseName(ledger.name) === normalizeLooseName(requestedLedgerName))
-    : debtorLedgers;
+    ? scopedLedgers.filter((ledger) => normalizeLooseName(ledger.name) === normalizeLooseName(requestedLedgerName))
+    : scopedLedgers;
 
   if (operation === "cash_discount_revalidate" && ledgersToScan.length !== 1) {
-    throw new Error("The selected customer is no longer under Sundry Debtors in Tally.");
+    throw new Error("The selected customer is outside the configured Cash Discount customer scope in Tally.");
   }
 
   if (ledgersToScan.length === 0) {
     return {
       companyName: resolvedCompany,
-      ledgers: debtorLedgers.map(cashDiscountLiveLedger),
+      financialYear: dateRange.financialYear,
+      dateFrom: dateRange.dateFrom,
+      dateTo: dateRange.dateTo,
+      ledgers: scopedLedgers.map(cashDiscountLiveLedger),
       openBillsResult: { success: true, result: { ledgerNames: [], byLedger: {}, openBills: [], existingAdvances: [], rawCount: 0 } },
     };
   }
 
-  onProgress?.(`Reading open bills for ${ledgersToScan.length} customer ledger${ledgersToScan.length === 1 ? "" : "s"}...`);
-  const openBillsResult = await fetchCustomerOpenBillsFromTally(config, {
+  onProgress?.(`Reading invoice narration and receipt evidence for ${ledgersToScan.length} customer ledger${ledgersToScan.length === 1 ? "" : "s"}...`);
+  let openBillsResult = await fetchCustomerOpenBillsFromTally(config, {
     companyName: resolvedCompany,
     ledgerName: ledgersToScan[0].name,
     ledgerNames: ledgersToScan.map((ledger) => ledger.name),
+    dateFrom: dateRange.dateFrom,
+    asOfDate: dateRange.dateTo,
+  }, {
+    ...(billExport ? { billExport } : {}),
+    forceVoucherEvidence: true,
   });
+  const verifiedLedgerKeys = new Set(ledgersToScan.flatMap((ledger) => {
+    if (ledger.cashDiscountCustomerScope?.source !== "sales_linked_exception") {
+      return [normalizeLooseName(ledger.name)];
+    }
+    const bucket = openBillsResult.result?.byLedger?.[ledger.name];
+    const hasSalesEvidence = Array.isArray(bucket?.openBills) &&
+      bucket.openBills.some((bill) => Boolean(String(bill?.sourceSalesLedgerName || "").trim()));
+    return hasSalesEvidence ? [normalizeLooseName(ledger.name)] : [];
+  }));
+  const verifiedLedgers = ledgersToScan.filter((ledger) => verifiedLedgerKeys.has(normalizeLooseName(ledger.name)));
+  if (verifiedLedgers.length !== ledgersToScan.length) {
+    const byLedger = Object.fromEntries(Object.entries(openBillsResult.result?.byLedger || {}).filter(([name]) =>
+      verifiedLedgerKeys.has(normalizeLooseName(name))
+    ));
+    const first = verifiedLedgers[0]?.name;
+    const firstBucket = first ? byLedger[first] : null;
+    openBillsResult = {
+      ...openBillsResult,
+      result: {
+        ...openBillsResult.result,
+        ledgerName: first || null,
+        ledgerNames: verifiedLedgers.map((ledger) => ledger.name),
+        byLedger,
+        openBills: firstBucket?.openBills || [],
+        existingAdvances: firstBucket?.existingAdvances || [],
+        rawCount: Object.values(byLedger).reduce((total, bucket) => total + Number(bucket?.rawCount || 0), 0),
+      },
+    };
+  }
+  if (operation === "cash_discount_revalidate" && verifiedLedgers.length !== 1) {
+    throw new Error("The selected non-standard customer no longer has verified Sales invoice evidence in Tally.");
+  }
   return {
     companyName: resolvedCompany,
-    ledgers: debtorLedgers.map(cashDiscountLiveLedger),
+    financialYear: dateRange.financialYear,
+    dateFrom: dateRange.dateFrom,
+    dateTo: dateRange.dateTo,
+    ledgers: verifiedLedgers.map(cashDiscountLiveLedger),
     openBillsResult,
   };
 }
@@ -3877,6 +4219,104 @@ async function collectTallyMasters(config, commandPayload = {}) {
   };
 }
 
+async function fetchPurchaseMastersFromTally(config, commandPayload = {}) {
+  const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
+  const readiness = await testTally(tallyUrl);
+  if (!readiness.tallyReachable || !readiness.companyLoaded) {
+    throw new Error(readiness.error || "Tally Prime is not ready to read Purchase masters.");
+  }
+
+  const requestedCompany = String(commandPayload.companyName || "").trim();
+  const companyName = requestedCompany || readiness.companyName || null;
+  if (
+    requestedCompany &&
+    normalizeLooseName(requestedCompany) !== normalizeLooseName(readiness.companyName)
+  ) {
+    throw new Error(
+      `Tally is currently open to ${readiness.companyName || "another company"}. Switch to ${requestedCompany} before refreshing Purchase masters.`
+    );
+  }
+
+  // Tally's local HTTP listener processes requests serially. Keep this small,
+  // purpose-built set sequential so opening the review does not make Tally's
+  // UI compete with several large collection exports at once.
+  const ledgerXml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Kalika Live Purchase Ledgers",
+    tallyType: "Ledger",
+    fetchFields:
+      "Name,Parent,GUID,PartyGSTIN,TaxType,GSTDutyHead,RateOfTaxCalculation",
+    companyName,
+  });
+  const groupXml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Kalika Live Purchase Groups",
+    tallyType: "Group",
+    fetchFields: "Name,Parent,GUID",
+    companyName,
+  });
+  const stockItemXml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Kalika Live Purchase Stock Items",
+    tallyType: "StockItem",
+    fetchFields:
+      "Name,Parent,GUID,BaseUnits,OriginalBaseUnits,GSTHSNCode,HSNCode,GSTTaxRate,RateOfTaxCalculation,IsGSTApplicable",
+    companyName,
+  });
+  const unitXml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Kalika Live Purchase Units",
+    tallyType: "Unit",
+    fetchFields: "Name,GUID,OriginalName,DecimalPlaces,IsSimpleUnit",
+    companyName,
+  });
+  const companyXml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Kalika Live Purchase Company",
+    tallyType: "Company",
+    fetchFields:
+      "Name,GUID,PartyGSTIN,GSTIN,GSTRegistrationNumber,GSTRegNumber,StateName,State,CountryName,Country,IsGSTOn,GSTRegistrationDetails.*",
+    companyName,
+  }).catch(() => "");
+
+  const ledgers = parseMasterCollection(ledgerXml, "LEDGER");
+  const groups = parseMasterCollection(groupXml, "GROUP");
+  const stockItems = parseMasterCollection(stockItemXml, "STOCKITEM");
+  const units = parseMasterCollection(unitXml, "UNIT");
+  const companies = parseMasterCollection(companyXml, "COMPANY");
+  const activeCompany = companies.find(
+    (company) => normalizeLooseName(company.name) === normalizeLooseName(companyName)
+  ) || companies[0] || null;
+  const companyGstin = activeCompany?.gstin || null;
+
+  if (ledgers.length === 0) {
+    throw new Error("Tally returned zero ledgers for the active company.");
+  }
+
+  return {
+    success: true,
+    result: {
+      source: "live_tally",
+      purpose: "purchase_posting_dropdowns",
+      companyName: companyName || readiness.companyName || null,
+      fetchedAt: new Date().toISOString(),
+      bridgeVersion: BRIDGE_VERSION,
+      companyProfile: {
+        name: activeCompany?.name || companyName || readiness.companyName || null,
+        guid: activeCompany?.guid || null,
+        gstin: companyGstin,
+        stateCode:
+          String(companyGstin || "").match(/^\d{2}/)?.[0] ||
+          gstStateCodeFromName(activeCompany?.raw?.stateName) ||
+          null,
+        stateName: activeCompany?.raw?.stateName || null,
+      },
+      masters: { ledgers, groups, stockItems, units },
+      totals: {
+        ledger: ledgers.length,
+        group: groups.length,
+        stock_item: stockItems.length,
+        unit: units.length,
+      },
+    },
+  };
+}
+
 async function postMastersToBackend(config, payload) {
   const response = await fetch(`${config.apiBase}/api/tally/bridge/masters`, {
     method: "POST",
@@ -3909,6 +4349,38 @@ async function syncMastersFromTally(config, commandPayload = {}) {
   }
 
   const resolvedCompanyName = companyName || readiness.companyName || null;
+
+  const requestedMasterTypes = new Set(
+    Array.isArray(commandPayload.requestedMasterTypes)
+      ? commandPayload.requestedMasterTypes.map((value) => String(value || "").trim())
+      : []
+  );
+  const groupsOnly = requestedMasterTypes.size === 1 && requestedMasterTypes.has("group");
+
+  if (groupsOnly) {
+    const groups = await exportCashDiscountGroups(config, resolvedCompanyName);
+    if (groups.length === 0) {
+      throw new Error("Tally returned zero groups for the active company.");
+    }
+    const payload = {
+      connectionId: config.connectionId,
+      companyName: resolvedCompanyName,
+      bridgeVersion: BRIDGE_VERSION,
+      masters: { groups },
+      companyProfile: {},
+    };
+    const syncResult = await postMastersToBackend(config, payload);
+    return {
+      success: true,
+      result: {
+        syncRunId: syncResult.syncRunId,
+        totals: syncResult.totals,
+        accepted: syncResult.accepted,
+        companyName: payload.companyName,
+        bridgeVersion: payload.bridgeVersion,
+      },
+    };
+  }
 
   const masters = await collectTallyMasters(
     {
@@ -3964,17 +4436,21 @@ async function testTally(tallyUrl) {
       headers: {
         "Content-Type": "text/xml",
       },
-      // Readiness must always inspect the current Tally session. Supplying
-      // SVCURRENTCOMPANY here would test a remembered/requested company and
-      // could falsely report it as the active UI company.
-      body: buildTallyReadinessXml(null),
+      // A readiness check must stay lightweight. $$CurrentCompany both proves
+      // that Tally's XML endpoint is responding and identifies the active UI
+      // company without exporting the entire ledger catalogue.
+      body: [
+        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>",
+        "<TYPE>Function</TYPE><ID>$$CurrentCompany</ID></HEADER><BODY><DESC>",
+        "<STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>",
+        "</DESC></BODY></ENVELOPE>",
+      ].join(""),
       signal: controller.signal,
     });
 
     const text = await response.text();
     const looksLikeXml = /<\?xml|<ENVELOPE|<RESPONSE|<LISTOF/i.test(text);
     const lineError = text.match(/<LINEERROR[^>]*>([\s\S]*?)<\/LINEERROR>/i)?.[1]?.trim() ?? null;
-    const status = text.match(/<STATUS[^>]*>([^<]+)<\/STATUS>/i)?.[1]?.trim() ?? null;
 
     if (!response.ok) {
       return {
@@ -3994,24 +4470,17 @@ async function testTally(tallyUrl) {
       };
     }
 
-    const possibleCompanyLoaded = !lineError && status === "1";
-    const activeCompanyName = possibleCompanyLoaded
-      ? await fetchActiveCompanyName(normalizeTallyUrl(tallyUrl))
+    const activeCompanyName = !lineError
+      ? getTagText(text, "RESULT") || extractCompanyName(text)
       : null;
-    // The readiness collection can contain ledgers from the first loaded
-    // company in a multi-company Tally session. It is not proof that this is
-    // the UI-active company. Only $$CurrentCompany is authoritative.
-    const companyLoaded = possibleCompanyLoaded && Boolean(activeCompanyName);
+    const companyLoaded = Boolean(activeCompanyName);
 
     return {
       tallyReachable: true,
       companyLoaded,
       companyName: companyLoaded ? activeCompanyName : null,
       error:
-        lineError ??
-        (possibleCompanyLoaded && !activeCompanyName
-          ? "Tally responded but did not identify the active company."
-          : null),
+        lineError ?? (!activeCompanyName ? "Tally responded but no company is active." : null),
     };
   } catch (error) {
     return {
@@ -4231,7 +4700,9 @@ async function runCommand(config, command, options = {}) {
               command.payload?.operation || "cash_discount_scan",
               command.payload?.companyName,
               command.payload?.proposal,
-              (message) => console.log(message)
+              (message) => console.log(message),
+              command.payload?.financialYear,
+              command.payload?.customerScope
             ),
           }
         : await fetchCustomerOpenBillsFromTally(config, command.payload);
@@ -4283,6 +4754,26 @@ async function runCommand(config, command, options = {}) {
           transactionId: command.payload?.transactionId,
           sourceBankTransactionId: command.payload?.transactionId,
         },
+        error: message,
+      });
+      console.log(`Command ${command.id} failed: ${message}`);
+    }
+    return;
+  }
+
+  if (command.commandType === "fetch_purchase_masters") {
+    try {
+      const outcome = await fetchPurchaseMastersFromTally(config, command.payload);
+      await sendCommandResult(config, command, outcome);
+      const totals = outcome.result?.totals || {};
+      console.log(
+        `Command ${command.id} completed: read live Purchase masters ledgers=${totals.ledger ?? 0}, stockItems=${totals.stock_item ?? 0}.`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "Live Purchase master read failed.");
+      await sendCommandResult(config, command, {
+        success: false,
+        result: {},
         error: message,
       });
       console.log(`Command ${command.id} failed: ${message}`);
@@ -4670,9 +5161,37 @@ async function runOnce(config, options = {}) {
   }
 
   const result = await testTally(config.tallyUrl);
-  const availableCompanies = result.tallyReachable
-    ? await fetchAvailableCompanies(config.tallyUrl, result.companyName)
-    : [];
+  const companyListCache = options.companyListCache;
+  let availableCompanies = [];
+  if (result.tallyReachable) {
+    const now = Date.now();
+    const cachedCompanies = Array.isArray(companyListCache?.availableCompanies)
+      ? companyListCache.availableCompanies
+      : [];
+    const activeCompanyIsCached = !result.companyName || cachedCompanies.some(
+      (company) => normalizeLooseName(company.companyName) === normalizeLooseName(result.companyName)
+    );
+    const refreshCompanyList =
+      !companyListCache ||
+      cachedCompanies.length === 0 ||
+      !activeCompanyIsCached ||
+      now >= Number(companyListCache.nextRefreshAt || 0);
+
+    if (refreshCompanyList) {
+      availableCompanies = await fetchAvailableCompanies(config.tallyUrl, result.companyName);
+      if (companyListCache) {
+        companyListCache.availableCompanies = availableCompanies;
+        companyListCache.nextRefreshAt = now + DEFAULT_COMPANY_LIST_INTERVAL_MS;
+      }
+    } else {
+      availableCompanies = cachedCompanies.map((company) => ({
+        ...company,
+        isActive: normalizeLooseName(company.companyName) === normalizeLooseName(result.companyName),
+      }));
+    }
+  } else if (companyListCache) {
+    companyListCache.nextRefreshAt = 0;
+  }
   const heartbeat = await sendHeartbeat(config, result, availableCompanies);
   const company = result.companyName ? ` Company: ${result.companyName}.` : "";
   const companyList =
@@ -4746,7 +5265,9 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
             operation,
             message.companyName,
             message.proposal,
-            (progressMessage) => send({ type: "progress", requestId, message: progressMessage })
+            (progressMessage) => send({ type: "progress", requestId, message: progressMessage }),
+            message.financialYear,
+            message.customerScope
           );
         }
         if (operation === "cash_discount_execute_debit_note") {
@@ -4988,6 +5509,9 @@ async function startBridge(args) {
   }
 
   const intervalMs = Number(args.interval || DEFAULT_HEARTBEAT_INTERVAL_MS);
+  const runtimeOptions = {
+    companyListCache: { availableCompanies: [], nextRefreshAt: 0 },
+  };
   console.log(`Starting Tally bridge for ${config.tallyUrl}`);
   console.log(`Sending heartbeat every ${intervalMs} ms.`);
 
@@ -5011,14 +5535,15 @@ async function startBridge(args) {
 
     running = true;
     try {
-      await runOnce(config);
+      await runOnce(config, runtimeOptions);
     } finally {
       running = false;
     }
   };
 
-  await runOnce(config);
+  await runOnce(config, runtimeOptions);
   startCommandWakeChannel(config, executeExclusive);
+  startCashDiscountLiveChannel(config, executeExclusive);
   setInterval(() => {
     runSerially().catch((error) => {
       console.error(error instanceof Error ? error.message : error);
@@ -5063,6 +5588,11 @@ function createBridgeRunner(options = {}) {
   let running = false;
   let stopped = false;
   let stopCommandWakeChannel = null;
+  let stopCashDiscountLiveChannel = null;
+  const runtimeOptions = {
+    ...options,
+    companyListCache: { availableCompanies: [], nextRefreshAt: 0 },
+  };
 
   const executeExclusive = async (task) => {
     while (running && !stopped) {
@@ -5086,6 +5616,8 @@ function createBridgeRunner(options = {}) {
     }
     stopCommandWakeChannel?.();
     stopCommandWakeChannel = null;
+    stopCashDiscountLiveChannel?.();
+    stopCashDiscountLiveChannel = null;
     if (typeof options.onStop === "function") {
       options.onStop({ reason, error, timestamp: new Date().toISOString() });
     }
@@ -5100,7 +5632,7 @@ function createBridgeRunner(options = {}) {
 
     running = true;
     try {
-      const cycle = await runOnce(config, options);
+      const cycle = await runOnce(config, runtimeOptions);
       if (typeof options.onStatus === "function") {
         options.onStatus(cycle);
       }
@@ -5132,6 +5664,7 @@ function createBridgeRunner(options = {}) {
       emitLog(options, "info", `Starting Tally bridge for ${config.tallyUrl}`);
       emitLog(options, "info", `Sending heartbeat every ${intervalMs} ms.`);
       stopCommandWakeChannel = startCommandWakeChannel(config, executeExclusive, options);
+      stopCashDiscountLiveChannel = startCashDiscountLiveChannel(config, executeExclusive, options);
       await runSerially();
       if (!stopped) {
         timer = setInterval(() => {
@@ -5642,27 +6175,35 @@ export {
   BRIDGE_VERSION,
   CONFIG_DIR,
   CONFIG_PATH,
+  DEFAULT_COMPANY_LIST_INTERVAL_MS,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_TALLY_URL,
   createBridgeRunner,
   decodeRealtimeFrame,
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
+  cashDiscountVoucherDateChunks,
+  collectCashDiscountLiveSnapshot,
   buildCollectionExportXml,
   buildRequestedLedgerFormula,
   buildPurchaseVoucherXml,
+  cashDiscountFinancialYearRange,
   deleteConfig,
   disconnectBridge,
   exportTallyCollection,
+  exportTargetedBillEvidenceXml,
   fetchAvailableCompanies,
   fetchBankLedgersFromTally,
   findBankLedgersFromMasters,
   findPartyLedgersFromMasters,
+  selectCashDiscountLedgers,
   fetchCustomerOpenBillsFromTally,
   normalizeTallyUrl,
+  openBillPendingFormula,
   openBillBlockRequiresVoucherFallback,
   pairBridge,
   parseTallyImportResult,
+  purchasePayloadMasterNames,
   purchaseVoucherReadbackComparison,
   readConfig,
   reconcileBankTransactionsInTally,

@@ -7,6 +7,7 @@ import {
   serializeAccount,
 } from "@/lib/bank-statements";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { createBankStatementJobResult } from "@/lib/bank-statement-worker-pool";
 
 export const runtime = "nodejs";
 
@@ -308,6 +309,10 @@ export async function GET(
     const analysisStatus = typeof analysis.status === "string" ? analysis.status : "";
     const jobStatus = typeof jobRow?.status === "string" ? jobRow.status : "";
     const jobIsTerminal = ["succeeded", "failed", "cancelled"].includes(jobStatus);
+    const publicJobStatus =
+      jobStatus === "succeeded" && effectiveImportStatus === "manual_review_required"
+        ? "partial"
+        : jobStatus;
     const processing =
       !jobIsTerminal &&
       (effectiveImportStatus === "processing" || analysisStatus === "queued" || analysisStatus === "processing");
@@ -321,7 +326,7 @@ export async function GET(
           status: "queued",
           progress: Number(analysis.progress ?? 5),
           stage: typeof analysis.stage === "string" ? analysis.stage : "Statement uploaded",
-          result: {},
+          result: createBankStatementJobResult(),
         })
         .select("*")
         .single();
@@ -405,7 +410,7 @@ export async function GET(
       job: jobRow
         ? {
             id: jobRow.id,
-            status: jobRow.status,
+            status: publicJobStatus,
             progress: jobRow.progress,
             stage: jobRow.stage,
             error: jobRow.error,

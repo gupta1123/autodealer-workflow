@@ -119,6 +119,13 @@ export async function resolveCaseDisplayNameWithAI(
   const candidatePool = externalCandidates.length ? externalCandidates : candidates;
   const deterministicFallback = composeDisplayName(candidatePool[0].name, summary);
 
+  // Case naming is deterministic for normal packets. Keep the optional AI tie-breaker
+  // behind an explicit flag so a cosmetic title cannot add a provider round-trip to
+  // every analysis job.
+  if (process.env.CASE_NAMING_AI_ENABLED !== "true") {
+    return deterministicFallback;
+  }
+
   try {
     const response = await callOpenRouter(
       [

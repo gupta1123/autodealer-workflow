@@ -4,9 +4,23 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { wakeTallyConnector } from "@/lib/tally/command-wake";
 import { serializeTallyBridgeCommand, type TallyBridgeCommandRow } from "@/lib/tally/commands";
 import { toNullableText } from "@/lib/tally/masters";
+import { getCashDiscountCustomerScopeOrDefault } from "@/lib/cash-discount-customer-scope";
 
 function normalize(value: unknown) {
   return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function scanIdempotencyKey(
+  operation: "cash_discount_scan" | "cash_discount_revalidate",
+  companyName: string,
+  financialYear: string | null,
+  proposal: Record<string, unknown> | null
+) {
+  const parts = ["cash-discount-v2", operation, normalize(companyName), normalize(financialYear)];
+  if (operation === "cash_discount_revalidate") {
+    parts.push(normalize(proposal?.partyLedgerName), normalize(proposal?.linkedInvoiceNumber));
+  }
+  return parts.join("|").slice(0, 500);
 }
 
 export function OPTIONS(request: Request) {
@@ -25,6 +39,7 @@ export async function POST(request: Request) {
     const proposal = body.proposal && typeof body.proposal === "object"
       ? (body.proposal as Record<string, unknown>)
       : null;
+    const financialYear = toNullableText(body.financialYear ?? proposal?.financialYear, 20);
     if (!connectionId || !companyName) {
       return jsonWithCors(request, { error: "The live Tally company is required." }, { status: 400 });
     }
@@ -55,7 +70,36 @@ export async function POST(request: Request) {
       );
     }
 
-    const { data: commandData, error: commandError } = await supabase
+    const customerScope = await getCashDiscountCustomerScopeOrDefault({
+      ownerUserId: user.id,
+      connectionId,
+      companyName,
+    });
+
+    const idempotencyKey = scanIdempotencyKey(operation, companyName, financialYear, proposal);
+    const activeCommandQuery = () => supabase
+      .from("tally_bridge_commands")
+      .select("*")
+      .eq("connection_id", connectionId)
+      .eq("owner_user_id", user.id)
+      .eq("command_type", "fetch_customer_open_bills")
+      .eq("idempotency_key", idempotencyKey)
+      .in("status", ["queued", "claimed"])
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const { data: activeCommand, error: activeCommandError } = await activeCommandQuery();
+    if (activeCommandError) throw activeCommandError;
+    if (activeCommand) {
+      await wakeTallyConnector(connectionId);
+      return jsonWithCors(request, {
+        command: serializeTallyBridgeCommand(activeCommand as unknown as TallyBridgeCommandRow),
+        reused: true,
+      });
+    }
+
+    const { data: insertedCommand, error: commandError } = await supabase
       .from("tally_bridge_commands")
       .insert({
         connection_id: connectionId,
@@ -64,18 +108,29 @@ export async function POST(request: Request) {
         // constraints remain compatible. The transport marker selects the
         // optimized one-pass Cash Discount snapshot in the connector.
         command_type: "fetch_customer_open_bills",
+        idempotency_key: idempotencyKey,
         status: "queued",
         priority: operation === "cash_discount_revalidate" ? 40 : 25,
         payload: {
           transport: "cash_discount_snapshot_v2",
           operation,
           companyName,
+          financialYear,
           proposal,
+          customerScope,
         },
       })
       .select("*")
       .single();
-    if (commandError) throw commandError;
+    let commandData = insertedCommand;
+    if (commandError?.code === "23505") {
+      const { data: racedCommand, error: racedCommandError } = await activeCommandQuery();
+      if (racedCommandError) throw racedCommandError;
+      commandData = racedCommand;
+    } else if (commandError) {
+      throw commandError;
+    }
+    if (!commandData) throw new Error("The Cash Discount scan could not be queued.");
 
     await Promise.all([
       supabase.from("tally_connection_events").insert({
@@ -92,6 +147,7 @@ export async function POST(request: Request) {
 
     return jsonWithCors(request, {
       command: serializeTallyBridgeCommand(commandData as unknown as TallyBridgeCommandRow),
+      reused: Boolean(commandError),
     });
   } catch (error) {
     console.error("Error in POST /api/collections/live/queue-scan:", error);

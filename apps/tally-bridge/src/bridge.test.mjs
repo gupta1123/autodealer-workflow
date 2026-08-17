@@ -6,15 +6,21 @@ import {
   buildBankVoucherXml,
   buildPurchaseVoucherXml,
   buildRequestedLedgerFormula,
+  cashDiscountFinancialYearRange,
+  cashDiscountVoucherDateChunks,
   classifyOpenBillReferenceKind,
   classifyTaxLedgers,
   decodeRealtimeFrame,
   findBankLedgersFromMasters,
   findPartyLedgersFromMasters,
+  selectCashDiscountLedgers,
   fetchCustomerOpenBillsFromTally,
+  exportTargetedBillEvidenceXml,
+  openBillPendingFormula,
   parseTallyImportResult,
   openBillBlockRequiresVoucherFallback,
   parseLedgerClosingBalance,
+  purchasePayloadMasterNames,
   purchaseVoucherReadbackComparison,
   strictBankTransactionCandidates,
 } from "./bridge.mjs";
@@ -39,6 +45,35 @@ test("Supabase binary broadcast wake frames decode without financial payloads", 
     "broadcast",
     { event, payload: { wake: true } },
   ]);
+});
+
+test("purchase master preflight covers every selected ledger and stock item once", () => {
+  assert.deepEqual(purchasePayloadMasterNames({
+    supplierLedgerName: "Supplier A",
+    items: [
+      { stockItemName: "Item One", purchaseLedgerName: "Purchase Local" },
+      { stockItemName: "Item One", purchaseLedgerName: "Purchase Local" },
+      { stockItemName: "Item Two", purchaseLedgerName: "Purchase Interstate" },
+    ],
+    charges: [{ name: "Freight Inward" }],
+    withholdings: [{ name: "TDS 194Q" }],
+    ledgers: {
+      cgst: { name: "Input CGST" },
+      sgst: { name: "Input SGST" },
+      repeated: { name: "Supplier A" },
+    },
+  }), {
+    ledgerNames: [
+      "Supplier A",
+      "Purchase Local",
+      "Purchase Interstate",
+      "Freight Inward",
+      "TDS 194Q",
+      "Input CGST",
+      "Input SGST",
+    ],
+    stockItemNames: ["Item One", "Item Two"],
+  });
 });
 
 test("ledger closing balances preserve Tally Dr and Cr meaning", () => {
@@ -88,6 +123,28 @@ test("outgoing supplier payments create Payment vouchers with bill allocations",
   assert.match(xml, /<LEDGERNAME>State Bank of India<\/LEDGERNAME>/);
 });
 
+test("direct party posting creates an Advance without settling an existing bill", () => {
+  const xml = buildBankVoucherXml({
+    companyName: "Solution Nyx",
+    voucherType: "Receipt",
+    voucherDate: "2026-08-17",
+    bankLedgerName: "State Bank of India",
+    counterpartyLedgerName: "Aarohi Steel Distributors",
+    counterpartyIsPartyLedger: true,
+    bankLedgerEntryIsDebit: true,
+    amount: 5977,
+    referenceNumber: "SBS01010900001",
+    billAllocations: [
+      { referenceType: "Advance", referenceName: "ADV-20260817-0900001", amount: 5977 },
+    ],
+  });
+
+  assert.match(xml, /<VOUCHERTYPENAME>Receipt<\/VOUCHERTYPENAME>/);
+  assert.match(xml, /<NAME>ADV-20260817-0900001<\/NAME>/);
+  assert.match(xml, /<BILLTYPE>Advance<\/BILLTYPE>/);
+  assert.doesNotMatch(xml, /<BILLTYPE>Agst Ref<\/BILLTYPE>/);
+});
+
 test("outgoing Contra vouchers debit the destination and credit the statement bank", () => {
   const xml = buildBankVoucherXml({
     companyName: "Solution Nyx",
@@ -127,6 +184,77 @@ test("ledger filters remain targeted and deduplicated", () => {
   const ledgerFormula = buildRequestedLedgerFormula(["Customer A", "Customer A", "Customer B"], ["$LedgerName"]);
   assert.equal((ledgerFormula.match(/Customer A/g) || []).length, 1);
   assert.equal((ledgerFormula.match(/Customer B/g) || []).length, 1);
+});
+
+test("cash discount keeps short voucher periods in one Tally request", () => {
+  assert.deepEqual(cashDiscountVoucherDateChunks("2026-08-01", "2026-08-31"), [
+    { dateFrom: "2026-08-01", dateTo: "2026-08-31" },
+  ]);
+});
+
+test("cash discount splits long voucher periods into bounded sequential requests", () => {
+  const chunks = cashDiscountVoucherDateChunks("2026-01-01", "2026-12-31");
+  assert.equal(chunks.length, 12);
+  assert.equal(chunks[0].dateFrom, "2026-01-01");
+  assert.equal(chunks.at(-1).dateTo, "2026-12-31");
+  for (const [index, chunk] of chunks.entries()) {
+    const days = ((Date.parse(`${chunk.dateTo}T00:00:00.000Z`) - Date.parse(`${chunk.dateFrom}T00:00:00.000Z`)) / 86_400_000) + 1;
+    assert.ok(days <= 31);
+    if (index > 0) assert.equal(chunk.dateFrom, new Date(Date.parse(`${chunks[index - 1].dateTo}T00:00:00.000Z`) + 86_400_000).toISOString().slice(0, 10));
+  }
+});
+
+test("cash discount bounds scans to the selected Indian financial year", () => {
+  assert.deepEqual(cashDiscountFinancialYearRange("2026-27", "2026-08-16"), {
+    financialYear: "2026-27",
+    dateFrom: "2026-04-01",
+    dateTo: "2026-08-16",
+  });
+});
+
+test("open Bill exports filter empty and zero pending balances in Tally", () => {
+  const formula = openBillPendingFormula();
+  assert.match(formula, /\$ClosingBalance/);
+  assert.match(formula, /\$PendingAmount/);
+  assert.match(formula, /\$Balance/);
+  assert.match(formula, /NOT \$\$IsEqual/);
+});
+
+test("timed-out voucher periods split into smaller date slices", async () => {
+  const calls = [];
+  const result = await exportTargetedBillEvidenceXml(
+    "http://127.0.0.1:9000",
+    { companyName: "Solution Nyx", ledgerNames: ["Customer A"], dateFrom: "2026-08-01", dateTo: "2026-08-08" },
+    async (_url, options) => {
+      calls.push(options);
+      if (options.dateFrom === "2026-08-01" && options.dateTo === "2026-08-08") {
+        throw new Error("Tally export timed out after 60 seconds.");
+      }
+      return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>";
+    }
+  );
+  assert.equal(calls.length, 3);
+  assert.equal(result.batchCount, 2);
+  assert.equal(result.retrySplitCount, 1);
+  assert.equal(result.dateChunkCount, 2);
+});
+
+test("one-day timed-out voucher evidence splits the ledger batch", async () => {
+  const calls = [];
+  const result = await exportTargetedBillEvidenceXml(
+    "http://127.0.0.1:9000",
+    { companyName: "Solution Nyx", ledgerNames: ["Customer A", "Customer B"], dateFrom: "2026-08-01", dateTo: "2026-08-01" },
+    async (_url, options) => {
+      calls.push(options);
+      if (options.formulae[0].formula.includes("Customer A") && options.formulae[0].formula.includes("Customer B")) {
+        throw new Error("Tally export timed out after 60 seconds.");
+      }
+      return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>";
+    }
+  );
+  assert.equal(calls.length, 3);
+  assert.equal(result.batchCount, 2);
+  assert.equal(result.retrySplitCount, 1);
 });
 
 test("voucher fallback is required only for incomplete Bill exports", () => {
@@ -176,6 +304,28 @@ test("complete targeted Bill data avoids the voucher fallback", async () => {
   assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, false);
 });
 
+test("cash discount reuses its open-bills-first export and always reads targeted voucher evidence", async () => {
+  const calls = [];
+  const billXml = '<ENVELOPE><STATUS>1</STATUS><BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><BILLTYPE>New Ref</BILLTYPE><DATE>20260801</DATE><OPENINGBALANCE>500</OPENINGBALANCE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL></ENVELOPE>';
+  const result = await fetchCustomerOpenBillsFromTally(
+    { tallyUrl: "http://127.0.0.1:9000" },
+    { companyName: "Solution Nyx", ledgerNames: ["Customer A"], asOfDate: "2026-08-17" },
+    {
+      billExport: { xml: billXml, batchCount: 1, queryMode: "open_bills_first" },
+      forceVoucherEvidence: true,
+      exportCollection: async (_url, options) => {
+        calls.push(options);
+        return '<ENVELOPE><STATUS>1</STATUS><VOUCHER><DATE>20260801</DATE><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME><VOUCHERNUMBER>INV-1</VOUCHERNUMBER><NARRATION>1% cash discount within 15 days</NARRATION><PARTYLEDGERNAME>Customer A</PARTYLEDGERNAME><ALLLEDGERENTRIES.LIST><LEDGERNAME>Customer A</LEDGERNAME><AMOUNT>-500</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><BILLALLOCATIONS.LIST><NAME>INV-1</NAME><BILLTYPE>New Ref</BILLTYPE><AMOUNT>-500</AMOUNT></BILLALLOCATIONS.LIST></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>';
+      },
+    }
+  );
+
+  assert.deepEqual(calls.map((call) => call.tallyType), ["Voucher"]);
+  assert.equal(result.result.queryDiagnostics.billQueryMode, "open_bills_first");
+  assert.equal(result.result.queryDiagnostics.voucherEvidenceMode, "required");
+  assert.equal(result.result.openBills[0].narration, "1% cash discount within 15 days");
+});
+
 test("incomplete Bill data performs one targeted sequential voucher fallback", async () => {
   const calls = [];
   const result = await fetchCustomerOpenBillsFromTally(
@@ -213,7 +363,7 @@ test("large ledger sets use one full Bill collection instead of repeatedly resca
   );
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].filterNames, undefined);
+  assert.deepEqual(calls[0].filterNames, ["AutodealerPendingBill"]);
   assert.equal(result.result.queryDiagnostics.billQueryMode, "full");
 });
 
@@ -242,6 +392,50 @@ test("cash discount includes ledgers nested under Sundry Debtors subgroups", () 
     findPartyLedgersFromMasters(ledgers, groups, "Sundry Debtors").map((ledger) => ledger.name),
     ["Direct Customer", "Dealer Customer"]
   );
+});
+
+test("cash discount customer scope supports custom roots, nesting, and strict mode", () => {
+  const groups = [
+    { name: "Trade Receivables", parent: "Current Assets" },
+    { name: "Export Customers", parent: "Trade Receivables" },
+    { name: "Suppliers", parent: "Current Liabilities" },
+  ];
+  const ledgers = [
+    { name: "Domestic Buyer", parent: "Trade Receivables" },
+    { name: "Overseas Buyer", parent: "Export Customers" },
+    { name: "Vendor", parent: "Suppliers" },
+  ];
+
+  const selected = selectCashDiscountLedgers(ledgers, groups, {
+    mode: "strict",
+    selectedGroupNames: ["Trade Receivables"],
+    includeNestedGroups: true,
+  });
+  assert.deepEqual(selected.map((ledger) => ledger.name), ["Domestic Buyer", "Overseas Buyer"]);
+  assert.ok(selected.every((ledger) => ledger.cashDiscountCustomerScope.source === "selected_group"));
+});
+
+test("cash discount automatic scope marks outside ledgers for Sales-evidence verification", () => {
+  const groups = [
+    { name: "Sundry Debtors", parent: "Current Assets" },
+    { name: "Other Parties", parent: "Current Assets" },
+  ];
+  const ledgers = [
+    { name: "Standard Customer", parent: "Sundry Debtors" },
+    { name: "Unusual Customer", parent: "Other Parties" },
+    { name: "Excluded Customer", parent: "Other Parties" },
+  ];
+
+  const selected = selectCashDiscountLedgers(ledgers, groups, {
+    mode: "automatic",
+    selectedGroupNames: ["Sundry Debtors"],
+    detectSalesLinkedExceptions: true,
+    excludedLedgerNames: ["Excluded Customer"],
+  });
+  assert.deepEqual(selected.map((ledger) => [ledger.name, ledger.cashDiscountCustomerScope.source]), [
+    ["Standard Customer", "selected_group"],
+    ["Unusual Customer", "sales_linked_exception"],
+  ]);
 });
 
 function bankVoucher({ reference = "", party = "Customer A" } = {}) {
@@ -405,6 +599,7 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
     sourceDocumentName: "VIS-0142.pdf",
     sourceDocumentSha256: "ABC123",
     sourceDocumentId: "file-1",
+    vehicleNumber: "MH11AL4972",
     sourceDocumentReference: "https://app.example/cases/case-1?sourceFileId=file-1",
     postingId: "internal-posting-id",
     finalPayableAmount: 292500,
@@ -451,6 +646,7 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
   assert.match(xml, /C:\\Kalika Documents\\VIS-0142\.pdf/);
   assert.match(xml, /<UDF:KALIKASOURCEDOCUMENTSHA256[^>]*>ABC123<\/UDF:KALIKASOURCEDOCUMENTSHA256>/);
   assert.match(xml, /<UDF:KALIKASOURCEDOCUMENTID[^>]*>file-1<\/UDF:KALIKASOURCEDOCUMENTID>/);
+  assert.match(xml, /<UDF:KALIKAVEHICLENUMBER[^>]*>MH11AL4972<\/UDF:KALIKAVEHICLENUMBER>/);
   assert.doesNotMatch(xml, /Source: https:\/\/app\.example/);
   assert.doesNotMatch(xml, /Posting: internal-posting-id/);
 });
@@ -480,6 +676,7 @@ test("Purchase voucher verification includes the attached source PDF identity", 
     sourceDocumentName: "VIS-0142.pdf",
     sourceDocumentSha256: "ABC123",
     sourceDocumentId: "file-1",
+    vehicleNumber: "MH11AL4972",
   };
   const voucher = {
     date: "20260729",
@@ -499,6 +696,7 @@ test("Purchase voucher verification includes the attached source PDF identity", 
     sourceDocumentName: payload.sourceDocumentName,
     sourceDocumentSha256: payload.sourceDocumentSha256,
     sourceDocumentId: payload.sourceDocumentId,
+    vehicleNumber: payload.vehicleNumber,
   };
 
   assert.deepEqual(purchaseVoucherReadbackComparison(voucher, payload), []);
@@ -516,5 +714,11 @@ test("Purchase voucher verification includes the attached source PDF identity", 
       },
       payload
     ).some((difference) => /outstanding bill date/i.test(difference))
+  );
+  assert.ok(
+    purchaseVoucherReadbackComparison(
+      { ...voucher, vehicleNumber: "MH12WRONG" },
+      payload
+    ).some((difference) => /vehicle number/i.test(difference))
   );
 });

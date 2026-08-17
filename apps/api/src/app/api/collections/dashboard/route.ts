@@ -191,12 +191,11 @@ export function serializeTallyCandidate(params: {
   const partyAddress = readRawText(raw, "address", 1000);
   const amountReceived = originalAmount > 0 ? Math.max(originalAmount - pendingAmount, 0) : null;
   const isUnpaidTierReversal = params.analysis.deterministicStatus === "unpaid_discount_tier_expired";
-  const isLateShortPayment = params.analysis.deterministicStatus === "late_short_payment";
   const stagedReversalAmount = Math.max(
     0,
     toNumber(
       params.stagedReversalAmount ??
-        (isLateShortPayment ? pendingAmount : params.analysis.reversalPlan?.totalReversalRequired)
+        params.analysis.reversalPlan?.totalReversalRequired
     )
   );
   const sourceSalesLedgerName = toText(params.bill.sourceSalesLedgerName, 500) || null;
@@ -207,10 +206,10 @@ export function serializeTallyCandidate(params: {
   // Tally, so the recoverable debit note is the actual remaining shortfall.
   // Gross-up is only used for a fully unpaid invoice that was recorded net of
   // its best narrated discount.
-  const expectedDiscount = isLateShortPayment ? pendingAmount : params.analysis.reversalPlan?.totalReversalRequired ?? stagedReversalAmount;
+  const expectedDiscount = params.analysis.reversalPlan?.totalReversalRequired ?? stagedReversalAmount;
   const recoverableAmount = stagedReversalAmount;
   const canCreateDebitNote =
-    ["late_short_payment", "unpaid_discount_tier_expired"].includes(params.analysis.deterministicStatus) &&
+    params.analysis.deterministicStatus === "unpaid_discount_tier_expired" &&
     recoverableAmount > 0 &&
     Boolean(sourceSalesLedgerName);
   const termsLabel = params.analysis.termsLabel ?? "Narrated cash discount";
@@ -766,14 +765,11 @@ export async function GET(request: Request) {
         return String(left.partyLedgerName).localeCompare(String(right.partyLedgerName));
       });
     const tallyCandidates = narratedDiscountRows
-      .filter((row) => ["late_short_payment", "unpaid_discount_tier_expired"].includes(row.analysis.deterministicStatus))
+      .filter((row) => row.analysis.deterministicStatus === "unpaid_discount_tier_expired")
       .map((row) => {
         const invoiceNumber = toText(row.bill.referenceName ?? row.bill.voucherNumber, 240) || null;
         const alreadyCreatedReversalAmount = createdReversalByInvoice.get(invoiceIdentityKey(row.ledgerName, invoiceNumber)) ?? 0;
-        const requiredReversalAmount =
-          row.analysis.deterministicStatus === "late_short_payment"
-            ? toNumber(row.bill.pendingAmount)
-            : toNumber(row.analysis.reversalPlan?.totalReversalRequired);
+        const requiredReversalAmount = toNumber(row.analysis.reversalPlan?.totalReversalRequired);
         const stagedReversalAmount = Math.max(
           0,
           Math.round((requiredReversalAmount - alreadyCreatedReversalAmount) * 100) / 100

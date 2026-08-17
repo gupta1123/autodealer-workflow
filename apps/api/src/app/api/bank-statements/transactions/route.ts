@@ -90,6 +90,11 @@ export async function GET(request: Request) {
     const accountId = url.searchParams.get("accountId")?.trim();
     const importId = url.searchParams.get("importId")?.trim();
     const status = url.searchParams.get("status")?.trim() || "pending";
+    const page = Math.max(1, Number.parseInt(url.searchParams.get("page") || "1", 10) || 1);
+    const pageSize = Math.max(
+      1,
+      Math.min(500, Number.parseInt(url.searchParams.get("pageSize") || "200", 10) || 200)
+    );
 
     if (!accountId) {
       return jsonWithCors(request, { error: "Bank account is required." }, { status: 400 });
@@ -110,29 +115,39 @@ export async function GET(request: Request) {
 
     let builder = supabase
       .from("bank_transactions")
-      .select("*")
+      .select(
+        "id, bank_account_id, statement_import_id, transaction_date, value_date, description, reference_number, debit_amount, credit_amount, balance_amount, transaction_type, category, counterparty_name, suggested_ledger_name, suggestion_confidence, suggestion_reason, confirmed_ledger_name, ledger_mapping_source, tally_status",
+        { count: "exact" }
+      )
       .eq("owner_user_id", user.id)
       .eq("bank_account_id", accountId)
       .order("transaction_date", { ascending: true })
-      .limit(200);
+      .order("id", { ascending: true })
+      .range((page - 1) * pageSize, page * pageSize - 1);
 
     if (importId) {
       builder = builder.eq("statement_import_id", importId);
     }
 
     if (status === "queueable") {
-      builder = builder.in("tally_status", ["pending", "failed", "missing_in_tally", "verification_failed"]);
+      builder = builder
+        .in("tally_status", ["pending", "failed", "missing_in_tally", "verification_failed"])
+        .or("debit_amount.gt.0,credit_amount.gt.0");
     } else if (status) {
       builder = builder.eq("tally_status", status);
     }
 
-    const { data, error } = await builder;
+    const { data, error, count } = await builder;
     if (error) throw error;
 
     const allRows = (data ?? []) as unknown as BankTransactionRow[];
     const rows = status === "queueable" ? allRows.filter(hasPostingAmount) : allRows;
     return jsonWithCors(request, {
       transactions: rows.map((row) => serializeTransaction(row)),
+      page,
+      pageSize,
+      total: count ?? rows.length,
+      hasMore: page * pageSize < (count ?? rows.length),
     });
   } catch (error) {
     console.error("Error in GET /api/bank-statements/transactions:", error);

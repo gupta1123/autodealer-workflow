@@ -163,24 +163,21 @@ const FIELD_MAPPINGS: Partial<Record<FieldKey, string[]>> = {
   buyerName: [
     "buyerName",
     "customerName",
-    "consigneeName",
     "buyer",
     "customer",
-    "consignee",
     "billToName",
-    "shipToName",
     "recipientName",
     "purchaserName",
   ],
   buyerGstin: [
     "buyerGstin",
     "customerGstin",
-    "consigneeGstin",
-    "shipToGstin",
     "billToGstin",
     "recipientGstin",
     "purchaserGstin",
   ],
+  shipToName: ["shipToName", "consigneeName", "shipTo", "consignee"],
+  shipToGstin: ["shipToGstin", "consigneeGstin"],
   poNumber: ["poNumber", "purchaseOrderNumber"],
   poAmendmentNumber: ["poAmendmentNumber", "amendmentNumber", "poVersion", "revisionNumber"],
   invoiceNumber: ["invoiceNumber", "billNumber"],
@@ -1490,7 +1487,7 @@ export async function extractDataFromImages(params: {
               eWayBillExtractionInstruction +
               "For stamp/signature presence fields, return only Yes, No, or Unclear. Use Yes only when the mark is visibly present, No only when the relevant area is visible and clearly absent, otherwise Unclear. " +
               "For FASTag Toll Proof documents, extract statement reference, customer ID/name, statement period/date, vehicle number, tag account number, trip count, opening/credit/debit/closing balances, recharge/payment amount, toll plaza, and a compact toll transaction summary using the canonical FASTag keys. " +
-              "For party roles on seller-issued documents, vendorName is the issuing supplier/seller/consignor and buyerName is the receiving buyer, bill-to party, ship-to party, consignee, customer, or purchaser. " +
+              "For party roles on seller-issued documents, vendorName is the issuing supplier/seller/consignor and buyerName is strictly the billed buyer or bill-to customer. Put a different delivery recipient in shipToName and shipToGstin; never replace the billed buyer with a ship-to party or consignee. " +
               "For Purchase Order or Amended Purchase Order documents, vendorName is the supplier/vendor receiving the order and buyerName is the purchaser issuing the order. Never swap these roles. " +
               "Omit any field that is not visible or not applicable to this document type. If structured fields are hard to identify, still return visibleText. Do not hallucinate.",
             },
@@ -1505,7 +1502,7 @@ export async function extractDataFromImages(params: {
                   `Extract only clearly visible ${documentType}-specific fields from this allowed schema: ${allowedFieldKeysText}. ` +
                   "Also transcribe the visible text into visibleText even if the structured fields object is empty. " +
                   "Treat printed and handwritten entries equally when they are readable. " +
-                  "If both supplier and receiver are visible, map seller-issued documents as seller/consignor to vendorName and receiving buyer/bill-to/ship-to/consignee to buyerName. For purchase orders, map the supplier/vendor receiving the order to vendorName. " +
+                  "If both supplier and receiver are visible, map seller-issued documents as seller/consignor to vendorName and the billed buyer/bill-to party to buyerName. Map a different ship-to or consignee to shipToName and shipToGstin. Never substitute ship-to for buyer. For purchase orders, map the supplier/vendor receiving the order to vendorName. " +
                   "Preserve exact document numbers, vehicle ids, GSTINs, weights, dates, and financial totals.",
               },
               { type: "image_url", image_url: { url: image } },

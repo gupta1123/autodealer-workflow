@@ -32,6 +32,7 @@ export async function GET(
     const url = new URL(request.url);
     const type = parseMasterType(url.searchParams.get("type"));
     const query = url.searchParams.get("q")?.trim() ?? "";
+    const requestedCompanyName = url.searchParams.get("companyName")?.trim() ?? "";
     const limit = Math.min(Number(url.searchParams.get("limit") || 100), 5000);
     const fetchAll = url.searchParams.get("all") === "true";
 
@@ -50,6 +51,7 @@ export async function GET(
     if (!connection) {
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
     }
+    const companyName = requestedCompanyName || connection.last_company_name || "Unknown company";
 
     const buildMasterQuery = () => {
       let builder = supabase
@@ -57,7 +59,7 @@ export async function GET(
         .select("*")
         .eq("connection_id", id)
         .eq("owner_user_id", user.id)
-        .eq("company_name", connection.last_company_name ?? "Unknown company")
+        .eq("company_name", companyName)
         .eq("is_active", true)
         .order("master_type", { ascending: true })
         .order("tally_name", { ascending: true });
@@ -90,6 +92,7 @@ export async function GET(
       .select("id, status, company_name, totals, error, completed_at")
       .eq("connection_id", id)
       .eq("owner_user_id", user.id)
+      .eq("company_name", companyName)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -107,7 +110,7 @@ export async function GET(
           .select("*")
           .eq("connection_id", id)
           .eq("owner_user_id", user.id)
-          .eq("company_name", connection.last_company_name ?? "Unknown company")
+          .eq("company_name", companyName)
           .eq("master_type", "group")
           .eq("is_active", true)
           .order("tally_name", { ascending: true })

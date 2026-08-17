@@ -111,7 +111,7 @@ export async function POST(request: Request) {
       matchedReceiptAmount: toNumber(bill.matchedReceiptAmount, Number.NaN),
       today,
     });
-    if (!["late_short_payment", "unpaid_discount_tier_expired"].includes(analysis.deterministicStatus)) {
+    if (analysis.deterministicStatus !== "unpaid_discount_tier_expired") {
       return jsonWithCors(
         request,
         { error: `The latest Tally data is not eligible for a Debit Note: ${analysis.deterministicReason}` },
@@ -133,9 +133,7 @@ export async function POST(request: Request) {
         normalized(row.party_ledger_name) === normalized(matchingBill.ledgerName) &&
         normalized(row.linked_invoice_number) === normalized(linkedInvoiceNumber))
       .reduce((sum, row) => sum + toNumber(row.recoverable_amount), 0);
-    const requiredReversalAmount = analysis.deterministicStatus === "late_short_payment"
-      ? pendingAmount
-      : toNumber(analysis.reversalPlan?.totalReversalRequired);
+    const requiredReversalAmount = toNumber(analysis.reversalPlan?.totalReversalRequired);
     const recoverableAmount = Math.max(
       0,
       Math.round((requiredReversalAmount - alreadyCreatedReversalAmount) * 100) / 100

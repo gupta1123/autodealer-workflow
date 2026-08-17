@@ -8,12 +8,14 @@ import {
   MessageCircle,
   RefreshCw,
   Send,
+  ShieldCheck,
   Sparkles,
   TriangleAlert,
   X,
 } from "lucide-react";
 
 import { apiFetch } from "@/lib/api-client";
+import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 
 type CompanyOption = {
@@ -348,23 +350,16 @@ function sortPaymentFollowUpRows(rows: PaymentFollowUp[], sort: PaymentFollowUpS
   });
 }
 
-function proposalStatusLabel(value: string) {
-  return value.replace(/_/g, " ");
-}
-
-function actionStatusLabel(proposal: DebitNoteProposal) {
-  if (proposal.lastError) return "Retry";
-  if (proposal.status === "approved" || proposal.status === "queued_in_tally") return "Queued";
-  if (proposal.sourceKind === "tally_open_bill") return "Ready";
-  return proposalStatusLabel(proposal.status);
-}
-
 function isPendingDebitNote(proposal: DebitNoteProposal) {
   return ["draft", "pending_approval", "approved", "queued_in_tally", "failed"].includes(proposal.status);
 }
 
 function isCreatedDebitNote(proposal: DebitNoteProposal) {
   return proposal.status === "created_in_tally";
+}
+
+function proposalInvoiceKey(proposal: DebitNoteProposal) {
+  return `${normalizeCompanyName(proposal.partyLedgerName)}|${normalizeCompanyName(proposal.linkedInvoiceNumber)}`;
 }
 
 function shortText(value?: string | null, fallback = "-") {
@@ -376,41 +371,36 @@ function normalizeCompanyName(value?: string | null) {
   return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+function liveChannelUnavailable(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /live cash discount channel|live Tally request timed out|channel closed|connector is not on the live|could not connect to the live|live-session authentication/i.test(message);
+}
+
 function issueLabel(proposal: DebitNoteProposal) {
   if (proposal.lastError) return "Tally action failed";
   if (proposal.status === "queued_in_tally" || proposal.status === "approved") return "Creating debit note";
-  if (proposal.issueType === "unpaid_discount_tier_reversal") return "Discount expired; payment still open";
+  if (proposal.issueType === "unpaid_discount_tier_reversal") return "Discount period ended";
   if (proposal.issueType === "invoice_unpaid") return "Payment still outstanding";
   if (proposal.issueType === "partial_unpaid") return "Payment still partly outstanding";
-  return "Payment short after discount expiry";
+  return "Collect existing invoice balance";
 }
 
 function conciseTermsLabel(proposal: DebitNoteProposal) {
   const terms = proposal.cashDiscountAnalysis?.terms ?? [];
   if (terms.length > 0) {
-    return `Terms: ${terms.map((term) => `${term.ratePercent}% / ${term.eligibilityDays}d${term.periodSource === "default" ? " default" : ""}`).join(" · ")}`;
+    return `Applied rule: ${terms.map((term) => `${term.ratePercent}% discount · fixed ${term.eligibilityDays}-day period`).join(" · ")}`;
   }
-  return proposal.cashDiscountAnalysis?.termsLabel || proposal.cashDiscountRuleName || "Cash discount terms";
-}
-
-function expiredDiscountLabel(proposal: DebitNoteProposal) {
-  const terms = proposal.cashDiscountAnalysis?.terms ?? [];
-  if (terms.length > 0) {
-    return `${terms.map((term) => `${term.ratePercent}%`).join(" / ")} expired`;
-  }
-  return "Expired discount";
+  return proposal.cashDiscountAnalysis?.termsLabel || proposal.cashDiscountRuleName || "Fixed cash-discount rule";
 }
 
 function whyNowSummary(proposal: DebitNoteProposal, lateByDays: number | null) {
   const lateSuffix = lateByDays && lateByDays > 0 ? ` ${lateByDays} day${lateByDays === 1 ? "" : "s"} late.` : "";
-  const finalTerm = proposal.cashDiscountAnalysis?.terms.at(-1);
 
   if (proposal.issueType === "discount_shortfall") {
-    const deadline = finalTerm ? `${finalTerm.ratePercent}% / ${finalTerm.eligibilityDays}-day` : "cash-discount";
-    return `${formatMoney(proposal.pendingAmount)} remains on the original invoice. Add ${formatMoney(proposal.recoverableAmount)} for the missed discount after the ${deadline} deadline.${lateSuffix}`;
+    return `${formatMoney(proposal.pendingAmount)} is already outstanding in Tally. Collect that balance without adding another debit note.${lateSuffix}`;
   }
   if (proposal.issueType === "unpaid_discount_tier_reversal") {
-    return `${formatMoney(proposal.pendingAmount)} remains unpaid. Reverse the expired discount by ${formatMoney(proposal.recoverableAmount)}.`;
+    return `The invoice remains unpaid after the fixed discount period ended on ${formatDate(proposal.discountDeadline)}.`;
   }
   if (proposal.issueType === "partial_unpaid") {
     return `${formatMoney(proposal.pendingAmount)} remains outstanding after the discount deadline.${lateSuffix}`;
@@ -419,10 +409,10 @@ function whyNowSummary(proposal: DebitNoteProposal, lateByDays: number | null) {
 }
 
 function createButtonLabel(proposal: DebitNoteProposal) {
-  if (proposal.canCreateDebitNote === false) return "Review required";
+  if (proposal.canCreateDebitNote === false) return "Not available";
   const status = proposal.status;
-  if (status === "failed") return "Retry";
-  if (status === "approved" || status === "queued_in_tally") return "Queued";
+  if (status === "failed") return "Retry creation";
+  if (status === "approved" || status === "queued_in_tally") return "Creating…";
   return "Create debit note";
 }
 
@@ -561,6 +551,8 @@ export function CollectionsDashboardPage({
   const [bulkSendingWhatsapp, setBulkSendingWhatsapp] = useState(false);
   const [selectedPendingIds, setSelectedPendingIds] = useState<Set<string>>(() => new Set());
   const [selectedCreatedIds, setSelectedCreatedIds] = useState<Set<string>>(() => new Set());
+  const [reviewingProposal, setReviewingProposal] = useState<DebitNoteProposal | null>(null);
+  const [reviewAcknowledged, setReviewAcknowledged] = useState(false);
   const [whatsappDialogProposals, setWhatsappDialogProposals] = useState<DebitNoteProposal[]>([]);
   const [whatsappPhoneInputs, setWhatsappPhoneInputs] = useState<Record<string, string>>({});
   const [whatsappSaveToTally, setWhatsappSaveToTally] = useState(true);
@@ -662,16 +654,44 @@ export function CollectionsDashboardPage({
   }, []);
 
   const refreshTallyOpenBills = useCallback(
-    async (connectionId: string, companyName?: string | null) => {
+    async (connectionId: string, companyName?: string | null, financialYear?: string | null) => {
       const resolvedCompanyName = String(companyName ?? "").trim();
       if (!connectionId || !resolvedCompanyName) {
         throw new Error("Select the live Tally company before refreshing Cash Discounts.");
       }
-      setMessage({ tone: "info", text: "Reading customer ledgers and open bills from Tally..." });
+      setMessage({ tone: "info", text: "Checking eligible candidates…" });
+      let customerScope: Record<string, unknown> | undefined;
+      const scopeResponse = await apiFetch(
+        `/api/settings/cash-discount-customer-scope?${new URLSearchParams({
+          connectionId,
+          companyName: resolvedCompanyName,
+        }).toString()}`,
+        { cache: "no-store" }
+      );
+      if (scopeResponse.ok) {
+        const scopePayload = await scopeResponse.json() as { settings?: Record<string, unknown> };
+        customerScope = scopePayload.settings;
+      } else if (scopeResponse.status !== 409) {
+        throw new Error(await readError(scopeResponse));
+      }
+      try {
+        return await runCashDiscountLiveRequest<DashboardPayload>({
+          connectionId,
+          companyName: resolvedCompanyName,
+          financialYear,
+          operation: "scan",
+          customerScope,
+          onProgress: () => setMessage({ tone: "info", text: "Checking eligible candidates…" }),
+        });
+      } catch (error) {
+        if (!liveChannelUnavailable(error)) throw error;
+        setMessage({ tone: "info", text: "Checking eligible candidates…" });
+      }
+
       const queueResponse = await apiFetch("/api/collections/live/queue-scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ connectionId, companyName: resolvedCompanyName, operation: "scan" }),
+        body: JSON.stringify({ connectionId, companyName: resolvedCompanyName, financialYear, operation: "scan" }),
       });
       if (!queueResponse.ok) throw new Error(await readError(queueResponse));
       const queued = (await queueResponse.json()) as { command?: TallyCommand };
@@ -683,7 +703,7 @@ export function CollectionsDashboardPage({
       const scan = completed.result && typeof completed.result === "object" ? completed.result : null;
       if (!scan) throw new Error("The connector completed the Cash Discount scan without a result.");
 
-      setMessage({ tone: "info", text: "Applying Cash Discount rules to the latest Tally data..." });
+      setMessage({ tone: "info", text: "Checking eligible candidates…" });
       const analyseResponse = await apiFetch("/api/collections/live/analyse", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -694,6 +714,45 @@ export function CollectionsDashboardPage({
     },
     [pollCommand]
   );
+
+  const refreshCreatedDebitNotesFromStore = useCallback(async (connectionId: string) => {
+    const response = await apiFetch(
+      `/api/collections/debit-note-proposals?${new URLSearchParams({
+        connectionId,
+        status: "created_in_tally",
+      }).toString()}`,
+      { cache: "no-store" }
+    );
+    if (!response.ok) throw new Error(await readError(response));
+    const payload = (await response.json()) as { proposals?: DebitNoteProposal[] };
+    const created = payload.proposals ?? [];
+    const createdKeys = new Set(created.map(proposalInvoiceKey));
+
+    setDashboard((current) => {
+      if (!current) return current;
+      const existing = current.tabs?.debitNoteQueue ?? [];
+      const pending = existing.filter(
+        (proposal) => !isCreatedDebitNote(proposal) && !createdKeys.has(proposalInvoiceKey(proposal))
+      );
+      const proposals = [...pending, ...created];
+      return {
+        ...current,
+        kpis: {
+          ...(current.kpis ?? {}),
+          cdExpired: pending.length,
+          debitNotesPendingApproval: pending.length,
+          needsAttention: pending.length,
+          createdDebitNotes: created.length,
+          createdDebitNoteAmount: sumRecoverable(created),
+        },
+        tabs: {
+          ...(current.tabs ?? {}),
+          cashDiscountTracker: proposals,
+          debitNoteQueue: proposals,
+        },
+      };
+    });
+  }, []);
 
   const refreshAll = useCallback(
     async (options?: { quiet?: boolean; refreshTally?: boolean }) => {
@@ -742,7 +801,7 @@ export function CollectionsDashboardPage({
         // Set this before the asynchronous Tally scan so the selection effect
         // does not start a second, overlapping scan for the same company.
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
-        const nextDashboard = await refreshTallyOpenBills(connectionId, company?.companyName);
+        const nextDashboard = await refreshTallyOpenBills(connectionId, company?.companyName, company?.financialYear);
         setDashboard(nextDashboard);
         setMessage(null);
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
@@ -813,11 +872,17 @@ export function CollectionsDashboardPage({
     const id = proposal.id;
     try {
       setApprovingId(id);
+      setReviewingProposal(null);
+      setReviewAcknowledged(false);
       setMessage({ tone: "info", text: "Creating debit note in Tally..." });
       await createDebitNoteForProposal(proposal);
       if (selectedConnectionId) {
-        const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
-        setDashboard(nextDashboard);
+        try {
+          await refreshCreatedDebitNotesFromStore(selectedConnectionId);
+        } catch {
+          const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName, selectedCompany?.financialYear);
+          setDashboard(nextDashboard);
+        }
       }
       setActiveView("done");
       setMessage({ tone: "success", text: "Debit note created in Tally." });
@@ -875,7 +940,7 @@ export function CollectionsDashboardPage({
       throw new Error("The native Tally PDF export could not be started.");
     }
     if (selectedConnectionId) {
-      const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
+      const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName, selectedCompany?.financialYear);
       setDashboard(nextDashboard);
     }
     return { ...(payload.proposal ?? proposal), nativeTallyPdfVerified: true };
@@ -1001,7 +1066,7 @@ export function CollectionsDashboardPage({
       setWhatsappPhoneInputs({});
       setSelectedCreatedIds(new Set());
       if (selectedConnectionId) {
-        const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
+        const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName, selectedCompany?.financialYear);
         setDashboard(nextDashboard);
       }
     } catch (error) {
@@ -1053,7 +1118,7 @@ export function CollectionsDashboardPage({
       try {
         // A company switch must read a new live snapshot. Loading the old saved
         // scan here can show bills belonging to the previously selected company.
-        const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, company?.companyName);
+        const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, company?.companyName, company?.financialYear);
         setDashboard(nextDashboard);
         setMessage(null);
       } catch (error) {
@@ -1089,6 +1154,7 @@ export function CollectionsDashboardPage({
   );
   const companyContextBlocked = Boolean(selectedCompany && !liveCompanyCheckPending && !tallyCompanyVerified);
   const companyContextLocked = liveCompanyCheckPending || companyContextBlocked;
+  const scanFailed = Boolean(!loading && !dashboard && message?.tone === "error" && !companyContextLocked);
 
   const pendingProposals = proposals.filter(isPendingDebitNote);
   const createdProposals = proposals.filter(isCreatedDebitNote);
@@ -1158,8 +1224,13 @@ export function CollectionsDashboardPage({
       return;
     }
     if (selectedPendingProposals.length === 0) return;
+    const currentOutstanding = selectedPendingProposals.reduce(
+      (sum, proposal) => sum + (Number(proposal.pendingAmount) || 0),
+      0
+    );
+    const proposedReversals = sumRecoverable(selectedPendingProposals);
     const confirmed = window.confirm(
-      `Create ${selectedPendingProposals.length} debit note${selectedPendingProposals.length === 1 ? "" : "s"} in Tally?`
+      `Review ${selectedPendingProposals.length} debit note${selectedPendingProposals.length === 1 ? "" : "s"} before posting.\n\nCurrent Tally outstanding: ${formatMoney(currentOutstanding)}\nNew debit notes: ${formatMoney(proposedReversals)}\nOutstanding after posting: ${formatMoney(currentOutstanding + proposedReversals)}\n\nContinue only if the selected invoices were recorded net of the expired discount.`
     );
     if (!confirmed) return;
 
@@ -1171,7 +1242,7 @@ export function CollectionsDashboardPage({
         await createDebitNoteForProposal(proposal);
       }
       if (selectedConnectionId) {
-        const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName);
+        const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName, selectedCompany?.financialYear);
         setDashboard(nextDashboard);
       }
       setSelectedPendingIds(new Set());
@@ -1289,13 +1360,20 @@ export function CollectionsDashboardPage({
         </div>
       </div>
 
-      {message ? (
+      {message?.tone === "info" ? (
+        <div
+          className="mb-4 inline-flex w-fit items-center gap-2 rounded-full bg-sky-50 px-3 py-1.5 text-xs font-semibold text-sky-800"
+          role="status"
+          aria-live="polite"
+        >
+          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          <span>{message.text}</span>
+        </div>
+      ) : message ? (
         <div
           className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${message.tone === "success"
               ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-              : message.tone === "info"
-                ? "border-sky-200 bg-sky-50 text-sky-800"
-                : "border-red-200 bg-red-50 text-red-800"
+              : "border-red-200 bg-red-50 text-red-800"
             }`}
         >
           {message.text}
@@ -1350,7 +1428,28 @@ export function CollectionsDashboardPage({
         </div>
       ) : null}
 
-      {!companyContextLocked && showWorkflowSummary ? <section className="mb-6">
+      {scanFailed ? (
+        <section className="mb-6 rounded-2xl border border-red-200 bg-red-50 px-5 py-5 shadow-sm">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-sm font-extrabold text-red-900">Cash Discount results are unavailable</h2>
+              <p className="mt-1 text-xs font-medium leading-relaxed text-red-800">
+                The latest Tally scan did not complete, so this page is not reporting zero open bills or zero recoverable amount.
+              </p>
+            </div>
+            <button
+              className="inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-xl border border-red-200 bg-white px-3 text-xs font-bold text-red-800 shadow-sm transition hover:bg-red-100"
+              onClick={() => void refreshAll()}
+              type="button"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              Retry Tally scan
+            </button>
+          </div>
+        </section>
+      ) : null}
+
+      {!companyContextLocked && !scanFailed && showWorkflowSummary ? <section className="mb-6">
         <div className="grid gap-4 md:grid-cols-2">
           <WorkflowButton
             active={activeView === "needsAction"}
@@ -1371,7 +1470,7 @@ export function CollectionsDashboardPage({
 
 
 
-      {!companyContextLocked && activeView === "needsAction" ? (
+      {!companyContextLocked && !scanFailed && activeView === "needsAction" ? (
         <Section
           action={
             selectedPendingProposals.length > 0 ? (
@@ -1382,7 +1481,7 @@ export function CollectionsDashboardPage({
                 type="button"
               >
                 {bulkCreating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
-                Create {selectedPendingProposals.length} debit notes
+                Create {selectedPendingProposals.length} debit note{selectedPendingProposals.length === 1 ? "" : "s"}
               </button>
             ) : null
           }
@@ -1410,11 +1509,10 @@ export function CollectionsDashboardPage({
                         />
                       </th>
                       <th className="w-[15%] px-3 py-3.5 bg-[#fcfbfa]">Customer</th>
-                      <th className="w-[16%] px-3 py-3.5 bg-[#fcfbfa]">Invoice</th>
-                      <th className="w-[27%] px-3 py-3.5 bg-[#fcfbfa]">Why now</th>
-                      <th className="w-[105px] px-3 py-3.5 text-right bg-[#fcfbfa]">Discount reversal</th>
-                      <th className="w-[88px] px-3 py-3.5 bg-[#fcfbfa]">Status</th>
-                      <th className="w-[145px] px-3 py-3.5 text-right bg-[#fcfbfa]">Action</th>
+                      <th className="w-[18%] px-3 py-3.5 bg-[#fcfbfa]">Invoice</th>
+                      <th className="w-[37%] px-3 py-3.5 bg-[#fcfbfa]">Why eligible</th>
+                      <th className="w-[125px] px-3 py-3.5 text-right bg-[#fcfbfa]">Debit note amount</th>
+                      <th className="w-[155px] px-3 py-3.5 text-right bg-[#fcfbfa]">Action</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
@@ -1450,89 +1548,44 @@ export function CollectionsDashboardPage({
                               {shortText(proposal.linkedInvoiceNumber, "No invoice")}
                             </div>
                             <div className="mt-1 text-[11px] text-slate-500">{formatDate(proposal.linkedInvoiceDate)}</div>
-                            <div className="mt-1.5 flex flex-wrap gap-1.5 text-[11px]">
-                              <span className="rounded-full bg-[#f7f4ee] px-2 py-0.5 text-slate-600">
-                                Invoice {formatMoney(proposal.originalInvoiceAmount)}
-                              </span>
-                              {typeof proposal.pendingAmount === "number" ? (
-                                <span className="rounded-full bg-[#fff7ed] px-2 py-0.5 text-amber-800">
-                                  Pending {formatMoney(proposal.pendingAmount)}
-                                </span>
-                              ) : null}
+                            <div className="mt-1.5 text-[11px] font-semibold text-slate-600">
+                              Outstanding {formatMoney(proposal.pendingAmount)}
+                              {Number(proposal.pendingAmount) !== Number(proposal.originalInvoiceAmount)
+                                ? ` · Invoice ${formatMoney(proposal.originalInvoiceAmount)}`
+                                : ""}
                             </div>
                           </td>
                           <td className="px-3 py-4">
                             <div className="text-sm font-semibold text-[#1a1a1a]">{issueLabel(proposal)}</div>
                             <div className="mt-1 text-[11px] leading-relaxed text-slate-500">{whyNowSummary(proposal, lateByDays)}</div>
-                            {proposal.cashDiscountAnalysis ? (
-                              <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                                {proposal.cashDiscountAnalysis.termsLabel ? (
-                                  <span className="rounded-full bg-[#f7f4ee] px-2 py-0.5 text-[10px] font-semibold text-slate-600">
-                                    {conciseTermsLabel(proposal)}
-                                  </span>
-                                ) : null}
-                                <span
-                                  className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700"
-                                  title={proposal.cashDiscountAnalysis.deterministicReason}
-                                >
-                                  Deterministic
-                                </span>
-                                {proposal.cashDiscountAnalysis.terms.some((term) => term.periodSource === "default") ? (
-                                  <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-700">
-                                    Default period applied
-                                  </span>
-                                ) : null}
-                                <details className="group relative">
-                                  <summary className="cursor-pointer list-none rounded-full border border-[#e5ddd0] bg-white px-2 py-0.5 text-[10px] font-semibold text-slate-500 transition hover:border-[#cfc0ad] hover:text-[#1a1a1a]">
-                                    Receipt & narration
-                                  </summary>
-                                  <div className="absolute left-0 top-6 z-20 w-72 rounded-xl border border-[#e5ddd0] bg-white p-3 text-[11px] font-medium leading-relaxed text-slate-600 shadow-xl">
-                                    <div className="font-bold text-[#1a1a1a]">Narration</div>
-                                    <div className="mt-0.5">{proposal.cashDiscountAnalysis.sourceNarration || "No narration returned by Tally."}</div>
-                                    <div className="mt-2 border-t border-[#eee7dc] pt-2">
-                                      Context: {proposal.cashDiscountAnalysis.matchedCashDiscountContext || "payment terms"}
-                                    </div>
-                                    {proposal.cashDiscountAnalysis.receiptDate ? (
-                                      <div className="mt-2 border-t border-[#eee7dc] pt-2">
-                                        Receipt: {formatDate(proposal.cashDiscountAnalysis.receiptDate)}
-                                        {typeof proposal.cashDiscountAnalysis.matchedReceiptAmount === "number"
-                                          ? ` · ${formatMoney(proposal.cashDiscountAnalysis.matchedReceiptAmount)}`
-                                          : ""}
-                                      </div>
-                                    ) : null}
-                                    <div className="mt-2 border-t border-[#eee7dc] pt-2 text-slate-500">
-                                      {proposal.cashDiscountAnalysis.deterministicReason}
-                                    </div>
-                                  </div>
-                                </details>
+                            <div className="mt-2 text-[11px] font-semibold leading-relaxed text-slate-600">
+                              {conciseTermsLabel(proposal)}
+                            </div>
+                            {proposal.cashDiscountAnalysis?.sourceNarration ? (
+                              <div className="mt-1.5 line-clamp-2 text-[11px] font-medium leading-relaxed text-slate-500" title={proposal.cashDiscountAnalysis.sourceNarration}>
+                                <span className="font-bold text-slate-600">Narration:</span> {proposal.cashDiscountAnalysis.sourceNarration}
                               </div>
                             ) : null}
                           </td>
                           <td className="px-3 py-4 text-right">
                             <div className="tabular-nums text-sm font-semibold text-[#1a1a1a]">{formatMoney(displayAmount)}</div>
-                            <div className="mt-1 text-[11px] font-medium text-slate-400">
-                              {expiredDiscountLabel(proposal)}
-                            </div>
-                          </td>
-                          <td className="px-3 py-4">
-                            <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${statusClass(proposal.status)}`}>
-                              {actionStatusLabel(proposal)}
-                            </span>
+                            <div className="mt-1 text-[11px] font-medium text-slate-500">To add in Tally</div>
                           </td>
                           <td className="px-3 py-4 text-right">
                             <button
                               className="inline-flex min-h-9 w-full min-w-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-xl bg-[#2d2d2d] px-2 py-2 text-[11px] font-bold leading-none text-white shadow-sm transition-all hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
                               disabled={!createEnabled || approvingId === proposal.id}
                               onClick={() => {
-                                if (createEnabled) void approveProposal(proposal);
+                                if (createEnabled) {
+                                  setReviewAcknowledged(false);
+                                  setReviewingProposal(proposal);
+                                }
                               }}
                               type="button"
                             >
                               {approvingId === proposal.id ? (
                                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                              ) : (
-                                <Send className="h-3.5 w-3.5" />
-                              )}
+                              ) : <Send className="h-3.5 w-3.5" />}
                               {createButtonLabel(proposal)}
                             </button>
                           </td>
@@ -1564,9 +1617,6 @@ export function CollectionsDashboardPage({
                             {proposal.partyLedgerName}
                           </div>
                         </div>
-                        <span className={`shrink-0 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${statusClass(proposal.status)}`}>
-                          {actionStatusLabel(proposal)}
-                        </span>
                       </div>
 
                       <dl className="mt-4 grid gap-3 border-y border-[#eee7dc] py-3 text-xs sm:grid-cols-2">
@@ -1576,33 +1626,42 @@ export function CollectionsDashboardPage({
                             {shortText(proposal.linkedInvoiceNumber, "No invoice")}
                           </dd>
                           <dd className="mt-1 text-[11px] font-medium text-slate-500">{formatDate(proposal.linkedInvoiceDate)}</dd>
-                          <dd className="mt-2 flex flex-wrap gap-1.5 text-[11px]">
-                            <span className="rounded-full bg-[#f7f4ee] px-2 py-0.5 text-slate-600">Invoice {formatMoney(proposal.originalInvoiceAmount)}</span>
-                            {typeof proposal.pendingAmount === "number" ? (
-                              <span className="rounded-full bg-[#fff7ed] px-2 py-0.5 text-amber-800">Pending {formatMoney(proposal.pendingAmount)}</span>
-                            ) : null}
+                          <dd className="mt-2 text-[11px] font-semibold text-slate-600">
+                            Outstanding {formatMoney(proposal.pendingAmount)}
+                            {Number(proposal.pendingAmount) !== Number(proposal.originalInvoiceAmount)
+                              ? ` · Invoice ${formatMoney(proposal.originalInvoiceAmount)}`
+                              : ""}
                           </dd>
                         </div>
                         <div className="min-w-0">
-                          <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Why now</dt>
+                          <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Why eligible</dt>
                           <dd className="mt-1 font-bold leading-snug text-[#1a1a1a]">{issueLabel(proposal)}</dd>
                           <dd className="mt-1 text-[11px] leading-relaxed text-slate-500">{whyNowSummary(proposal, lateByDays)}</dd>
                           <dd className="mt-1 text-[11px] font-semibold text-slate-600">
                             {conciseTermsLabel(proposal)}
                           </dd>
+                          {proposal.cashDiscountAnalysis?.sourceNarration ? (
+                            <dd className="mt-1.5 line-clamp-2 text-[11px] font-medium leading-relaxed text-slate-500" title={proposal.cashDiscountAnalysis.sourceNarration}>
+                              <span className="font-bold text-slate-600">Narration:</span> {proposal.cashDiscountAnalysis.sourceNarration}
+                            </dd>
+                          ) : null}
                         </div>
                       </dl>
 
                       <div className="mt-3 flex items-center justify-between gap-3">
                         <div>
-                          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Discount reversal</div>
+                          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Debit note amount</div>
                           <div className="mt-0.5 tabular-nums text-sm font-extrabold text-[#1a1a1a]">{formatMoney(displayAmount)}</div>
+                          <div className="mt-0.5 text-[11px] font-medium text-slate-500">To add in Tally</div>
                         </div>
                         <button
                           className="inline-flex min-h-9 min-w-[154px] items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-4 py-2 text-xs font-bold leading-none text-white shadow-sm transition-all hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
                           disabled={!createEnabled || approvingId === proposal.id}
                           onClick={() => {
-                            if (createEnabled) void approveProposal(proposal);
+                            if (createEnabled) {
+                              setReviewAcknowledged(false);
+                              setReviewingProposal(proposal);
+                            }
                           }}
                           type="button"
                         >
@@ -1619,7 +1678,7 @@ export function CollectionsDashboardPage({
         </Section>
       ) : null}
 
-      {!companyContextLocked && activeView === "followUps" ? (
+      {!companyContextLocked && !scanFailed && activeView === "followUps" ? (
         <Section
           action={
             <label className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
@@ -1786,7 +1845,7 @@ export function CollectionsDashboardPage({
         </Section>
       ) : null}
 
-      {!companyContextLocked && activeView === "done" ? (
+      {!companyContextLocked && !scanFailed && activeView === "done" ? (
         <Section
           action={
             selectedCreatedProposals.length > 0 ? (
@@ -1996,6 +2055,131 @@ export function CollectionsDashboardPage({
             </div>
           )}
         </Section>
+      ) : null}
+
+      {reviewingProposal ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-4 backdrop-blur-sm">
+          <div
+            aria-labelledby="debit-note-review-title"
+            aria-modal="true"
+            className="max-h-[calc(100vh-2rem)] w-full max-w-2xl overflow-y-auto rounded-2xl border border-[#e5ddd0] bg-white shadow-[0_24px_56px_-12px_rgba(0,0,0,0.24)] animate-in fade-in zoom-in-95 duration-200"
+            role="dialog"
+          >
+            <div className="flex items-start justify-between gap-4 border-b border-[#e5ddd0] bg-[#fcfbfa] px-5 py-5 sm:px-6">
+              <div className="flex gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-amber-200 bg-amber-50 text-amber-700">
+                  <ShieldCheck className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-extrabold text-[#1a1a1a]" id="debit-note-review-title">Create debit note</h3>
+                  <p className="mt-1 text-xs font-medium leading-relaxed text-slate-600">
+                    Confirm the calculation before adding this debit note to Tally.
+                  </p>
+                </div>
+              </div>
+              <button
+                aria-label="Close debit note review"
+                className="rounded-lg p-2 text-slate-400 transition hover:bg-white hover:text-slate-700"
+                disabled={approvingId === reviewingProposal.id}
+                onClick={() => {
+                  setReviewingProposal(null);
+                  setReviewAcknowledged(false);
+                }}
+                type="button"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="px-5 py-5 sm:px-6">
+              <div className="flex flex-col gap-1 border-b border-[#eee7dc] pb-4">
+                <div>
+                  <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">{reviewingProposal.partyLedgerName}</div>
+                  <div className="mt-1 text-lg font-extrabold text-[#1a1a1a]">{shortText(reviewingProposal.linkedInvoiceNumber, "No invoice reference")}</div>
+                  <div className="mt-1 text-xs font-medium text-slate-500">Invoice date {formatDate(reviewingProposal.linkedInvoiceDate)}</div>
+                </div>
+              </div>
+
+              <dl className="mt-5 grid gap-3 sm:grid-cols-2">
+                <div className="rounded-xl border border-[#e5ddd0] bg-[#fcfbfa] p-3.5">
+                  <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Invoice recorded in Tally</dt>
+                  <dd className="mt-1 tabular-nums text-base font-extrabold text-[#1a1a1a]">{formatMoney(reviewingProposal.originalInvoiceAmount)}</dd>
+                </div>
+                <div className="rounded-xl border border-[#e5ddd0] bg-[#fcfbfa] p-3.5">
+                  <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Current Tally outstanding</dt>
+                  <dd className="mt-1 tabular-nums text-base font-extrabold text-[#1a1a1a]">{formatMoney(reviewingProposal.pendingAmount)}</dd>
+                </div>
+                <div className="rounded-xl border border-amber-200 bg-amber-50 p-3.5">
+                  <dt className="text-[10px] font-bold uppercase tracking-wider text-amber-800">Debit note to add</dt>
+                  <dd className="mt-1 tabular-nums text-base font-extrabold text-amber-950">{formatMoney(reviewingProposal.recoverableAmount)}</dd>
+                </div>
+                <div className="rounded-xl border border-[#2d2d2d] bg-[#2d2d2d] p-3.5 text-white">
+                  <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-300">Outstanding after creation</dt>
+                  <dd className="mt-1 tabular-nums text-base font-extrabold">
+                    {formatMoney((Number(reviewingProposal.pendingAmount) || 0) + reviewingProposal.recoverableAmount)}
+                  </dd>
+                </div>
+              </dl>
+
+              {reviewingProposal.cashDiscountAnalysis?.reversalPlan ? (
+                <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/70 p-4 text-xs font-medium leading-relaxed text-amber-950">
+                  <div className="font-bold">How this amount is calculated</div>
+                  <div className="mt-1">
+                    {formatMoney(reviewingProposal.originalInvoiceAmount)} was recorded after a {reviewingProposal.cashDiscountAnalysis.reversalPlan.initialDiscount.ratePercent}% discount. Gross value {formatMoney(reviewingProposal.cashDiscountAnalysis.reversalPlan.grossInvoiceAmount)} minus the recorded invoice value equals a debit note of {formatMoney(reviewingProposal.recoverableAmount)}.
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="mt-4 rounded-xl border border-[#e5ddd0] bg-white p-4 text-xs font-medium text-slate-600">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div><span className="font-bold text-[#1a1a1a]">Discount deadline:</span> {formatDate(reviewingProposal.discountDeadline)}</div>
+                  <div><span className="font-bold text-[#1a1a1a]">Applied rule:</span> {conciseTermsLabel(reviewingProposal).replace(/^Applied rule:\s*/i, "")}</div>
+                  <div><span className="font-bold text-[#1a1a1a]">Sales ledger:</span> {shortText(reviewingProposal.sourceSalesLedgerName, "Not verified")}</div>
+                  {reviewingProposal.receiptDate || Number(reviewingProposal.amountReceived) > 0 ? (
+                    <div><span className="font-bold text-[#1a1a1a]">Payment received:</span> {formatMoney(reviewingProposal.amountReceived)} on {formatDate(reviewingProposal.receiptDate)}</div>
+                  ) : null}
+                </div>
+                <div className="mt-3 border-t border-[#eee7dc] pt-3">
+                  <div className="font-bold text-[#1a1a1a]">Source narration</div>
+                  <div className="mt-1 leading-relaxed">{reviewingProposal.cashDiscountAnalysis?.sourceNarration || "No narration returned by Tally."}</div>
+                </div>
+              </div>
+
+              <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-amber-200 bg-amber-50/70 p-4 text-xs font-medium leading-relaxed text-amber-950">
+                <input
+                  checked={reviewAcknowledged}
+                  className="mt-0.5 h-5 w-5 shrink-0 rounded border-amber-400 text-[#2d2d2d] focus:ring-2 focus:ring-amber-500"
+                  onChange={(event) => setReviewAcknowledged(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>I confirm that the invoice and debit note amount shown above are correct.</span>
+              </label>
+            </div>
+
+            <div className="flex flex-col-reverse gap-3 border-t border-[#e5ddd0] bg-[#fcfbfa] px-5 py-4 sm:flex-row sm:justify-end sm:px-6">
+              <button
+                className="inline-flex h-10 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-5 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4]"
+                disabled={approvingId === reviewingProposal.id}
+                onClick={() => {
+                  setReviewingProposal(null);
+                  setReviewAcknowledged(false);
+                }}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-[#2d2d2d] px-5 text-xs font-bold text-white shadow-sm transition hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-45"
+                disabled={!reviewAcknowledged || approvingId === reviewingProposal.id}
+                onClick={() => void approveProposal(reviewingProposal)}
+                type="button"
+              >
+                {approvingId === reviewingProposal.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                Create debit note in Tally
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
 
       {whatsappDialogProposals.length > 0 ? (

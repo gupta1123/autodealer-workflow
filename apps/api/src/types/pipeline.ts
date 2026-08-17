@@ -3,6 +3,8 @@ export type FieldKey =
   | "supplierGstin"
   | "buyerName"
   | "buyerGstin"
+  | "shipToName"
+  | "shipToGstin"
   | "poNumber"
   | "poAmendmentNumber"
   | "invoiceNumber"

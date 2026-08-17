@@ -22,6 +22,7 @@ export type TallyPostingLine = {
 };
 
 export type TallyPostingReview = {
+  selectedInvoiceDocumentId: string;
   invoiceNumber: string;
   invoiceDate: string;
   voucherDate: string;
@@ -41,6 +42,9 @@ export type TallyPostingReview = {
   freightLedgerName: string;
   tds194qLedgerName: string;
   tds194qRate: string;
+  applyTds194q: boolean;
+  tds194qBasisAmount: string;
+  tds194qRounding: "paise" | "nearest_rupee";
   transportTdsLedgerName: string;
   transportTdsRate: string;
   cgstTdsLedgerName: string;
@@ -107,7 +111,23 @@ export type TallyPostingResponse = {
     createdAt: string;
     updatedAt: string;
   };
-  eligibility: { eligible: boolean; canonicalInvoiceCount: number };
+  eligibility: {
+    eligible: boolean;
+    canonicalInvoiceCount: number;
+    invoiceCandidates: Array<{
+      documentId: string;
+      invoiceNumber: string;
+      invoiceDate: string;
+      supplierName: string;
+      supplierGstin: string;
+      buyerName: string;
+      buyerGstin: string;
+      sourceFileName: string | null;
+      role: "kalika_facing" | "mother_bill" | "other";
+      recommended: boolean;
+      reason: string;
+    }>;
+  };
   connection: null | {
     id: string;
     displayName: string;
@@ -127,6 +147,7 @@ export type TallyPostingResponse = {
     masterSnapshotFresh: boolean;
     masterSnapshotComplete: boolean;
     masterTotals: Record<string, unknown>;
+    masterSource: "live_purchase" | "synced_fallback" | null;
     companyGstin: string | null;
     companyStateCode: string | null;
   };
@@ -188,6 +209,8 @@ export type TallyPostingResponse = {
     gstDifference: string;
     tdsAmount: string;
     tds194qAmount: string;
+    tds194qBasisAmount: string;
+    tds194qRounding: "paise" | "nearest_rupee";
     transportTdsAmount: string;
     cgstTdsAmount: string;
     sgstTdsAmount: string;
@@ -225,6 +248,9 @@ export type TallyMasterOption = {
   hsnCode: string | null;
   unitName: string | null;
   taxRate: number | null;
+  groupPath: string | null;
+  taxType: string | null;
+  gstDutyHead: string | null;
 };
 
 export type SupplierLedgerMatch = {
@@ -233,6 +259,20 @@ export type SupplierLedgerMatch = {
   candidateLedgerNames: string[];
   confidence: number;
   reason: string | null;
+};
+
+export type PurchaseMasterSuggestion = {
+  matchType: "direct_match" | "close_match" | "unresolved";
+  masterName: string | null;
+  candidateMasterNames: string[];
+  confidence: number;
+  reason: string;
+};
+
+export type PurchaseLineMasterSuggestion = {
+  lineId: string;
+  stockItem: PurchaseMasterSuggestion;
+  purchaseLedger: PurchaseMasterSuggestion;
 };
 
 async function readResponse(response: Response, fallback: string) {
@@ -278,6 +318,24 @@ export async function saveTallyPurchasePosting(
   return readResponse(response, "Failed to save Tally posting review.");
 }
 
+export async function selectTallyPurchaseInvoice(
+  caseId: string,
+  selectedInvoiceDocumentId: string,
+  connectionId: string,
+  companyName: string
+) {
+  const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      review: { selectedInvoiceDocumentId },
+      connectionId,
+      companyName,
+    }),
+  });
+  return readResponse(response, "Failed to select the purchase invoice.");
+}
+
 export async function approveAndQueueTallyPurchasePosting(caseId: string) {
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
     method: "POST",
@@ -314,23 +372,36 @@ export async function matchTallyPurchaseSupplierLedger(
   return (payload as { supplierLedgerMatch: SupplierLedgerMatch }).supplierLedgerMatch;
 }
 
+export async function matchTallyPurchaseLineMasters(
+  caseId: string,
+  input: {
+    connectionId: string;
+    companyName: string;
+    review: TallyPostingReview;
+  }
+) {
+  const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "match_purchase_masters", ...input }),
+  });
+  const raw = await response.text();
+  let payload: Record<string, unknown> = {};
+  try { payload = raw ? JSON.parse(raw) as Record<string, unknown> : {}; } catch { payload = {}; }
+  if (!response.ok) {
+    throw new Error(typeof payload.error === "string" ? payload.error : raw || "Failed to match Purchase masters.");
+  }
+  return ((payload as { lineMasterMatches?: PurchaseLineMasterSuggestion[] }).lineMasterMatches ?? []);
+}
+
 export async function queueTallyMasterRefresh(connectionId: string, companyName: string) {
   const response = await apiFetch(`/api/tally/connections/${connectionId}/commands`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      commandType: "sync_masters",
+      commandType: "fetch_purchase_masters",
       payload: {
         companyName,
-        requestedMasterTypes: [
-          "ledger",
-          "group",
-          "stock_item",
-          "unit",
-          "voucher_type",
-          "gst_ledger",
-          "tax_ledger",
-        ],
       },
     }),
   });
@@ -358,7 +429,7 @@ export async function waitForTallyCommand(
       { cache: "no-store" }
     );
     const raw = await response.text();
-    let payload: { commands?: Array<{ id: string; status: string; error?: string | null }> } = {};
+    let payload: { commands?: Array<{ id: string; status: string; error?: string | null; result?: Record<string, unknown> | null }> } = {};
     try {
       payload = raw ? JSON.parse(raw) : {};
     } catch {

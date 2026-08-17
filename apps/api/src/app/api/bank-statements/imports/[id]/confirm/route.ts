@@ -415,6 +415,30 @@ export async function POST(
       return jsonWithCors(request, { error: "Bank statement import was not found." }, { status: 404 });
     }
 
+    const effectiveImportStatus = getEffectiveImportStatus(importRow as Record<string, unknown>);
+    const importProcessingMeta = readRecord(importRow.processing_meta);
+    const extractionDiagnostics = readRecord(importProcessingMeta.extractionDiagnostics);
+    const extractionCoverageComplete = extractionDiagnostics.coverageComplete;
+    if (
+      ["processing", "manual_review_required", "failed"].includes(effectiveImportStatus) ||
+      extractionCoverageComplete === false
+    ) {
+      const unresolvedPages = Array.isArray(extractionDiagnostics.unresolvedPages)
+        ? extractionDiagnostics.unresolvedPages.map(Number).filter(Number.isFinite)
+        : [];
+      return jsonWithCors(
+        request,
+        {
+          error: "This statement is only partially extracted and cannot be confirmed or sent to Tally.",
+          detail: unresolvedPages.length > 0
+            ? `Unresolved PDF pages: ${unresolvedPages.join(", ")}. Retry analysis before continuing.`
+            : "Retry analysis and verify every PDF page before continuing.",
+          code: "BANK_STATEMENT_COVERAGE_INCOMPLETE",
+        },
+        { status: 409 }
+      );
+    }
+
     const accountIdWasProvided = Object.prototype.hasOwnProperty.call(body, "accountId");
     let accountId = accountIdWasProvided
       ? body.accountId || null
@@ -664,33 +688,29 @@ export async function POST(
     }
 
     if (existingQueueableRows.length > 0) {
-      const updateResults = await Promise.all(
-        existingQueueableRows.map((existingRow) => {
-          const matchingRow = existingRow.fingerprint ? submittedRowsByFingerprint.get(existingRow.fingerprint) : null;
-
-          return supabase
-            .from("bank_transactions")
-            .update({
-              statement_import_id: id,
-              suggested_ledger_name: matchingRow?.suggested_ledger_name ?? null,
-              suggestion_confidence: matchingRow?.suggestion_confidence ?? null,
-              suggestion_reason: matchingRow?.suggestion_reason ?? null,
-              confirmed_ledger_name: matchingRow?.confirmed_ledger_name ?? null,
-              ledger_mapping_source: matchingRow?.ledger_mapping_source ?? null,
-              ...(reconcileAgainstLiveTally
-                ? {
-                    tally_status: "pending",
-                    tally_voucher_id: null,
-                    tally_posted_at: null,
-                  }
-                : {}),
-            })
-            .eq("id", existingRow.id)
-            .eq("owner_user_id", user.id);
-        })
-      );
-      const updateError = updateResults.find((result) => result.error)?.error;
-      if (updateError) throw updateError;
+      const refreshRows = existingQueueableRows.flatMap((existingRow) => {
+        const matchingRow = existingRow.fingerprint
+          ? submittedRowsByFingerprint.get(existingRow.fingerprint)
+          : null;
+        if (!matchingRow) return [];
+        return [{
+          id: existingRow.id,
+          ...matchingRow,
+          statement_import_id: id,
+          tally_status: reconcileAgainstLiveTally ? "pending" : existingRow.tally_status,
+          ...(reconcileAgainstLiveTally
+            ? { tally_voucher_id: null, tally_posted_at: null }
+            : {}),
+        }];
+      });
+      if (refreshRows.length > 0) {
+        const { error: refreshError } = await supabase
+          .from("bank_transactions")
+          .upsert(refreshRows, {
+            onConflict: "owner_user_id,bank_account_id,fingerprint",
+          });
+        if (refreshError) throw refreshError;
+      }
     }
 
     const latestAcceptedRow = latestTransactionRow(rowsAfterCheckpoint);
@@ -769,7 +789,19 @@ export async function POST(
       .filter(Boolean);
 
     if (olderStoragePaths.length > 0) {
-      await supabase.storage.from(BANK_STATEMENT_BUCKET).remove(olderStoragePaths);
+      const { error: cleanupQueueError } = await supabase
+        .from("storage_cleanup_queue")
+        .upsert(
+          olderStoragePaths.map((storagePath) => ({
+            owner_user_id: user.id,
+            storage_bucket: BANK_STATEMENT_BUCKET,
+            storage_path: storagePath,
+            requested_at: new Date().toISOString(),
+            last_error: null,
+          })),
+          { onConflict: "storage_bucket,storage_path" }
+        );
+      if (cleanupQueueError) throw cleanupQueueError;
     }
 
     if ((olderImports ?? []).length > 0) {

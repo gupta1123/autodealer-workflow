@@ -8,6 +8,8 @@ import {
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
+import { CashDiscountCustomerScopeSettings } from "@/components/settings/CashDiscountCustomerScopeSettings";
+import { PurchasePostingDefaultsSettings } from "@/components/settings/PurchasePostingDefaultsSettings";
 import { apiFetch } from "@/lib/api-client";
 import { Button } from "@/components/ui/button";
 import {
@@ -28,7 +30,7 @@ import {
 } from "@/lib/document-schema";
 import type { DocType, FieldKey } from "@/types/pipeline";
 
-type ActiveTab = "documents" | "groups" | "accounting";
+type ActiveTab = "documents" | "groups" | "accounting" | "cashDiscount";
 type BannerState = {
   tone: "success" | "error";
   text: string;
@@ -592,10 +594,12 @@ export default function SettingsPage() {
               <p className="text-[11px] font-medium uppercase tracking-[0.22em] text-[#9b8f82]">
                 Settings
               </p>
-              <h1 className="mt-1 text-[26px] font-medium tracking-tight">Review rules</h1>
+              <h1 className="mt-1 text-[26px] font-medium tracking-tight">
+                {activeTab === "cashDiscount" ? "Cash Discount rules" : "Review rules"}
+              </h1>
             </div>
 
-            <div className="flex flex-wrap gap-2">
+            {activeTab !== "cashDiscount" ? <div className="flex flex-wrap gap-2">
               <Button
                 className="h-10 rounded-lg px-4 font-medium text-[#6f6256]"
                 disabled={loading || saving}
@@ -620,10 +624,10 @@ export default function SettingsPage() {
                   "Save changes"
                 )}
               </Button>
-            </div>
+            </div> : null}
           </header>
 
-          <div className="mb-6 grid gap-3 md:grid-cols-3">
+          {activeTab !== "cashDiscount" ? <div className="mb-6 grid gap-3 md:grid-cols-3">
             {[
               {
                 label: "Documents",
@@ -650,7 +654,7 @@ export default function SettingsPage() {
                 </div>
               </div>
             ))}
-          </div>
+          </div> : null}
 
           {banner ? (
             <div
@@ -697,6 +701,17 @@ export default function SettingsPage() {
               type="button"
             >
               Purchase accounting
+            </button>
+            <button
+              className={`rounded-[7px] px-4 py-2 text-sm font-medium transition ${
+                activeTab === "cashDiscount"
+                  ? "bg-white text-[#20201c] shadow-sm"
+                  : "text-[#6b6a60] hover:text-[#20201c]"
+              }`}
+              onClick={() => setActiveTab("cashDiscount")}
+              type="button"
+            >
+              Cash Discounts
             </button>
           </div>
 
@@ -1155,7 +1170,7 @@ export default function SettingsPage() {
                     )}
                   </main>
                 </>
-              ) : (
+              ) : activeTab === "accounting" ? (
                 <main className="w-full">
                   <section className="rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5">
                     <div className="max-w-3xl">
@@ -1166,7 +1181,7 @@ export default function SettingsPage() {
                         Choose which deductions Kalika should handle
                       </h2>
                       <p className="mt-1 text-[13px] leading-5 text-[#6b6a60]">
-                        Leave a rule off when your business does not use it. When enabled, Kalika uses only the amount shown on the invoice and requires the matching Tally ledger before posting.
+                        Leave a rule off when your business does not use it. GST and transporter deductions follow their evidence rules; Section 194Q is confirmed separately on each Purchase voucher because one invoice cannot prove annual eligibility.
                       </p>
                     </div>
 
@@ -1175,7 +1190,7 @@ export default function SettingsPage() {
                         {
                           key: "purchaseGoodsTdsEnabled" as const,
                           label: "Purchase TDS on goods",
-                          description: "Subtracts the confirmed purchase TDS from the supplier payable and posts it to the purchase TDS ledger in Tally. Enable only when purchase TDS applies to this business.",
+                          description: "Records that this business commonly uses Section 194Q. The reviewer still confirms it on each Purchase voucher; Kalika then calculates 0.1% on the confirmed basis.",
                         },
                         {
                           key: "transporterTdsEnabled" as const,
@@ -1214,7 +1229,10 @@ export default function SettingsPage() {
                       })}
                     </div>
                   </section>
+                  <PurchasePostingDefaultsSettings />
                 </main>
+              ) : (
+                <CashDiscountCustomerScopeSettings />
               )}
             </div>
           </div>

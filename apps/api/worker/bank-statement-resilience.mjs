@@ -12,6 +12,9 @@ export function shouldAttemptBankStatementSingleShot({
 }) {
   if (!isPdf) return true;
   if (!Number.isFinite(pageCount) || pageCount <= 0 || pageCount > maxPages) return false;
+  // A non-empty multi-page response does not prove that every page was read.
+  // Multi-page PDFs must use the page-audited batch pipeline.
+  if (pageCount > 1) return false;
 
   const text = pages.map(pageText).join("\n");
   if (text.length > maxInputChars) return false;
@@ -25,6 +28,133 @@ export function shouldAttemptBankStatementSingleShot({
     }).length;
 
   return likelyRows <= maxLikelyRows;
+}
+
+function positivePageNumber(value) {
+  const page = Number(value);
+  return Number.isInteger(page) && page > 0 ? page : null;
+}
+
+function transactionSourcePage(transaction) {
+  const payload = transaction?.raw_payload;
+  const rawRow = payload?.row && typeof payload.row === "object" ? payload.row : {};
+  return positivePageNumber(
+    rawRow.sourcePage ??
+    rawRow.source_page ??
+    rawRow.pageNumber ??
+    rawRow.page_number ??
+    rawRow.page
+  );
+}
+
+function pageResultStatus(result) {
+  const rawStatus = String(result?.status ?? result?.pageStatus ?? result?.page_status ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z]+/g, "_");
+  if (
+    result?.hasTransactions === true ||
+    result?.has_transactions === true ||
+    ["transactions", "transaction_rows", "succeeded", "has_transactions"].includes(rawStatus)
+  ) {
+    return "transactions";
+  }
+  if (
+    result?.hasTransactions === false ||
+    result?.has_transactions === false ||
+    ["no_transactions", "non_transaction", "empty_non_transaction", "summary", "blank"].includes(rawStatus)
+  ) {
+    return "no_transactions";
+  }
+  return "unknown";
+}
+
+export function validateBankStatementPageCoverage({
+  transactions = [],
+  pageResults = [],
+  pages = [],
+  method = "batch",
+}) {
+  const expectedPages = pages
+    .map((page) => ({
+      pageNumber: positivePageNumber(page?.pageNumber ?? page?.page),
+      likelyHasRows: page?.likelyHasRows === true,
+      canConfirmNoTransactions: page?.canConfirmNoTransactions !== false,
+      expectedMinimumRowCount:
+        Number.isInteger(Number(page?.expectedMinimumRowCount)) && Number(page.expectedMinimumRowCount) > 0
+          ? Number(page.expectedMinimumRowCount)
+          : null,
+    }))
+    .filter((page) => page.pageNumber !== null);
+  const expectedSet = new Set(expectedPages.map((page) => page.pageNumber));
+  const manifest = new Map();
+  for (const result of Array.isArray(pageResults) ? pageResults : []) {
+    const pageNumber = positivePageNumber(
+      result?.pageNumber ?? result?.page_number ?? result?.sourcePage ?? result?.source_page ?? result?.page
+    );
+    if (!pageNumber || !expectedSet.has(pageNumber)) continue;
+    const transactionCount = Number(result?.transactionCount ?? result?.transaction_count ?? result?.rowCount);
+    manifest.set(pageNumber, {
+      status: pageResultStatus(result),
+      transactionCount: Number.isInteger(transactionCount) && transactionCount >= 0 ? transactionCount : null,
+    });
+  }
+
+  const rowsByPage = new Map(expectedPages.map((page) => [page.pageNumber, []]));
+  let droppedUnassignedRowCount = 0;
+  for (const transaction of Array.isArray(transactions) ? transactions : []) {
+    let pageNumber = transactionSourcePage(transaction);
+    if ((!pageNumber || !expectedSet.has(pageNumber)) && expectedPages.length === 1) {
+      pageNumber = expectedPages[0].pageNumber;
+    }
+    if (!pageNumber || !expectedSet.has(pageNumber)) {
+      droppedUnassignedRowCount += 1;
+      continue;
+    }
+    rowsByPage.get(pageNumber).push(transaction);
+  }
+
+  const verifiedTransactions = [];
+  const pageOutcomes = expectedPages.map((page) => {
+    const rows = rowsByPage.get(page.pageNumber) ?? [];
+    const declared = manifest.get(page.pageNumber);
+    const declaredMoreRowsThanUsable =
+      declared?.status === "transactions" &&
+      declared.transactionCount !== null &&
+      declared.transactionCount > rows.length;
+    const visibleRowsMissing =
+      page.expectedMinimumRowCount !== null && rows.length < page.expectedMinimumRowCount;
+    if (rows.length > 0 && !declaredMoreRowsThanUsable && !visibleRowsMissing) {
+      verifiedTransactions.push(...addBankStatementPageProvenance(rows, {
+        startPage: page.pageNumber,
+        endPage: page.pageNumber,
+        method,
+      }));
+      return { page: page.pageNumber, status: "succeeded", rowCount: rows.length };
+    }
+    if (
+      declared?.status === "no_transactions" &&
+      page.canConfirmNoTransactions &&
+      !page.likelyHasRows
+    ) {
+      return { page: page.pageNumber, status: "confirmed_non_transaction", rowCount: 0 };
+    }
+    return {
+      page: page.pageNumber,
+      status: declaredMoreRowsThanUsable || visibleRowsMissing ? "incomplete" : "unverified",
+      rowCount: rows.length,
+      expectedMinimumRowCount: page.expectedMinimumRowCount,
+    };
+  });
+
+  return {
+    transactions: verifiedTransactions,
+    pageOutcomes,
+    unresolvedPages: pageOutcomes
+      .filter((outcome) => !["succeeded", "confirmed_non_transaction"].includes(outcome.status))
+      .map((outcome) => outcome.page),
+    droppedUnassignedRowCount,
+  };
 }
 
 export function classifyBankStatementBatchOutcome({ rowCount, likelyHasRows }) {

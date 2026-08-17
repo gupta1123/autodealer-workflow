@@ -144,12 +144,11 @@ export function serializeTallyCandidate(params: {
   const partyAddress = readRawText(raw, "address", 1000);
   const amountReceived = originalAmount > 0 ? Math.max(originalAmount - pendingAmount, 0) : null;
   const isUnpaidTierReversal = params.analysis.deterministicStatus === "unpaid_discount_tier_expired";
-  const isLateShortPayment = params.analysis.deterministicStatus === "late_short_payment";
   const stagedReversalAmount = Math.max(
     0,
     toNumber(
       params.stagedReversalAmount ??
-        (isLateShortPayment ? pendingAmount : params.analysis.reversalPlan?.totalReversalRequired)
+        params.analysis.reversalPlan?.totalReversalRequired
     )
   );
   const sourceSalesLedgerName = toText(params.bill.sourceSalesLedgerName, 500) || null;
@@ -160,10 +159,10 @@ export function serializeTallyCandidate(params: {
   // Tally, so the recoverable debit note is the actual remaining shortfall.
   // Gross-up is only used for a fully unpaid invoice that was recorded net of
   // its best narrated discount.
-  const expectedDiscount = isLateShortPayment ? pendingAmount : params.analysis.reversalPlan?.totalReversalRequired ?? stagedReversalAmount;
+  const expectedDiscount = params.analysis.reversalPlan?.totalReversalRequired ?? stagedReversalAmount;
   const recoverableAmount = stagedReversalAmount;
   const canCreateDebitNote =
-    ["late_short_payment", "unpaid_discount_tier_expired"].includes(params.analysis.deterministicStatus) &&
+    params.analysis.deterministicStatus === "unpaid_discount_tier_expired" &&
     recoverableAmount > 0 &&
     Boolean(sourceSalesLedgerName);
   const termsLabel = params.analysis.termsLabel ?? "Narrated cash discount";
@@ -275,6 +274,8 @@ export function isPaymentFollowUpStatus(status: CashDiscountNarrationAnalysis["d
     "receipt_date_not_found",
     "receipt_amount_unverified",
     "balance_does_not_match_narrated_discount",
+    "existing_balance_due",
+    "late_short_payment",
   ].includes(status);
 }
 
@@ -301,9 +302,9 @@ export function serializePaymentFollowUp(params: {
   });
   const invoiceIsUnpaid = Math.abs(outstandingAmount - originalInvoiceAmount) <= 1;
   const createdTierReversalAmount = Math.max(0, toNumber(params.createdTierReversalAmount));
-  const totalReversalRequired = params.analysis.deterministicStatus === "late_short_payment"
-    ? outstandingAmount
-    : params.analysis.reversalPlan?.totalReversalRequired ?? 0;
+  const totalReversalRequired = params.analysis.deterministicStatus === "unpaid_discount_tier_expired"
+    ? params.analysis.reversalPlan?.totalReversalRequired ?? 0
+    : 0;
   const pendingTierReversalAmount = Math.max(0, Math.round((totalReversalRequired - createdTierReversalAmount) * 100) / 100);
 
   let followUpStatus: PaymentFollowUpStatus = "needs_follow_up";
@@ -327,6 +328,10 @@ export function serializePaymentFollowUp(params: {
     kind = "discount_window_open";
     title = "Payment pending";
     nextAction = `Follow up for payment. ${timing.ageLabel}; ${currentDiscount.ratePercent}% cash discount remains available until ${currentDiscount.discountDeadline}.`;
+  } else if (["existing_balance_due", "late_short_payment"].includes(params.analysis.deterministicStatus)) {
+    kind = "payment_due";
+    title = "Collect existing balance";
+    nextAction = `Collect the existing Tally outstanding of â‚¹${outstandingAmount.toLocaleString("en-IN")}. Do not create another debit note for the same amount.`;
   } else if (params.analysis.deterministicStatus === "invoice_unpaid") {
     kind = "full_payment_due";
     title = "Payment pending";

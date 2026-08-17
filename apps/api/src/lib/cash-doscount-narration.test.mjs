@@ -23,12 +23,12 @@ test("recognizes CD and C.D. markers without explicit periods", () => {
   ]);
 });
 
-test("explicit periods override defaults", () => {
+test("written periods never override the fixed client windows", () => {
   assert.deepEqual(
     parseCashDiscountTerms("Cash discount 1.5% within 10 days and 1% within 20 days"),
     [
-      { ratePercent: 1.5, eligibilityDays: 10, periodSource: "explicit" },
-      { ratePercent: 1, eligibilityDays: 20, periodSource: "explicit" },
+      { ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" },
+      { ratePercent: 1, eligibilityDays: 15, periodSource: "default" },
     ]
   );
 });
@@ -78,7 +78,7 @@ test("creates a deterministic late-short-payment result using a default period",
     today: "2026-07-01",
   });
   assert.equal(analysis.discountDeadline, "2026-06-08");
-  assert.equal(analysis.deterministicStatus, "late_short_payment");
+  assert.equal(analysis.deterministicStatus, "existing_balance_due");
   assert.equal(analysis.matchedDiscount?.amount, 1_500);
 });
 

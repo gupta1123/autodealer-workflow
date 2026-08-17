@@ -9,6 +9,7 @@ KalikaSourceDocumentPath   : String : 30001
 KalikaSourceDocumentName   : String : 30002
 KalikaSourceDocumentSha256 : String : 30003
 KalikaSourceDocumentId     : String : 30004
+KalikaVehicleNumber        : String : 30005
 
 [#Form : VCH Display]
 Add : Button : Kalika Open Source PDF

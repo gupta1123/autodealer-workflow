@@ -23,14 +23,63 @@ test("recognizes CD and C.D. markers without explicit periods", () => {
   ]);
 });
 
-test("explicit periods override defaults", () => {
+test("written periods never override the fixed client windows", () => {
   assert.deepEqual(
     parseCashDiscountTerms("Cash discount 1.5% within 10 days and 1% within 20 days"),
     [
-      { ratePercent: 1.5, eligibilityDays: 10, periodSource: "explicit" },
-      { ratePercent: 1, eligibilityDays: 20, periodSource: "explicit" },
+      { ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" },
+      { ratePercent: 1, eligibilityDays: 15, periodSource: "default" },
     ]
   );
+});
+
+test("ignores working-day wording and applies the fixed window for the detected rate", () => {
+  assert.deepEqual(
+    parseCashDiscountTerms("Cash Discount 1% within 4 working days"),
+    [{ ratePercent: 1, eligibilityDays: 15, periodSource: "default" }]
+  );
+});
+
+test("normalizes supported rate and period wording variants", () => {
+  assert.deepEqual(
+    parseCashDiscountTerms("C.D. @ 1.00 % if paid in four business days"),
+    [{ ratePercent: 1, eligibilityDays: 15, periodSource: "default" }]
+  );
+  assert.deepEqual(
+    parseCashDiscountTerms("One and a half percent cash discount within seven calendar days"),
+    [{ ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" }]
+  );
+  assert.deepEqual(
+    parseCashDiscountTerms("Cash disc: 1.50 percent"),
+    [{ ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" }]
+  );
+  assert.deepEqual(
+    parseCashDiscountTerms("CD 1½%"),
+    [{ ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" }]
+  );
+});
+
+test("recognizes compact paired cash-discount tiers", () => {
+  assert.deepEqual(
+    parseCashDiscountTerms("Cash discount 1.5/1% for 7/15 days"),
+    [
+      { ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" },
+      { ratePercent: 1, eligibilityDays: 15, periodSource: "default" },
+    ]
+  );
+});
+
+test("uses the fixed 15-day window even when narration says four working days", () => {
+  const analysis = analyseCashDiscountNarration({
+    narration: "Cash Discount 1% within 4 working days",
+    invoiceDate: "2026-08-07",
+    originalAmount: 80_000,
+    pendingAmount: 80_000,
+    today: "2026-08-16",
+  });
+  assert.equal(analysis.discountDeadline, "2026-08-22");
+  assert.equal(analysis.deterministicStatus, "within_eligibility_window");
+  assert.equal(analysis.reversalPlan?.totalReversalRequired, 0);
 });
 
 test("does not treat unrelated percentages as cash discounts", () => {
@@ -67,7 +116,7 @@ test("marks a cash-discount narration with only an unsupported rate for review",
   assert.equal(analysis.deterministicStatus, "unsupported_cash_discount_rate");
 });
 
-test("creates a deterministic late-short-payment result using a default period", () => {
+test("routes a late short payment to collection when the balance is already open", () => {
   const analysis = analyseCashDiscountNarration({
     narration: "Cash discount 1.5%",
     invoiceDate: "2026-06-01",
@@ -78,8 +127,9 @@ test("creates a deterministic late-short-payment result using a default period",
     today: "2026-07-01",
   });
   assert.equal(analysis.discountDeadline, "2026-06-08");
-  assert.equal(analysis.deterministicStatus, "late_short_payment");
+  assert.equal(analysis.deterministicStatus, "existing_balance_due");
   assert.equal(analysis.matchedDiscount?.amount, 1_500);
+  assert.match(analysis.deterministicReason, /without creating another debit note/);
 });
 
 test("keeps the deadline date eligible", () => {

@@ -247,9 +247,23 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
+async function resolveQueueUser(request: Request) {
+  const suppliedWorkerSecret = request.headers.get("x-worker-secret");
+  const workerOwnerId = request.headers.get("x-worker-owner-id")?.trim();
+  if (
+    suppliedWorkerSecret &&
+    process.env.WORKER_SECRET &&
+    suppliedWorkerSecret === process.env.WORKER_SECRET &&
+    workerOwnerId
+  ) {
+    return { id: workerOwnerId };
+  }
+  return requireRequestUser(request);
+}
+
 export async function POST(request: Request) {
   try {
-    const user = await requireRequestUser(request);
+    const user = await resolveQueueUser(request);
     if (!user) {
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }

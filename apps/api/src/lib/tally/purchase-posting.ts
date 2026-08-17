@@ -42,6 +42,8 @@ export type PurchasePostingMasterInput = {
   hsn_code: string | null;
   unit_name: string | null;
   tax_rate: number | null;
+  group_path?: string | null;
+  raw_payload?: Record<string, unknown>;
   is_active: boolean;
 };
 
@@ -65,6 +67,7 @@ export type PurchasePostingReviewLine = {
 };
 
 export type PurchasePostingReview = {
+  selectedInvoiceDocumentId: string;
   invoiceNumber: string;
   invoiceDate: string;
   voucherDate: string;
@@ -84,6 +87,9 @@ export type PurchasePostingReview = {
   freightLedgerName: string;
   tds194qLedgerName: string;
   tds194qRate: string;
+  applyTds194q: boolean;
+  tds194qBasisAmount: string;
+  tds194qRounding: "paise" | "nearest_rupee";
   transportTdsLedgerName: string;
   transportTdsRate: string;
   cgstTdsLedgerName: string;
@@ -164,6 +170,8 @@ export type PurchasePostingCalculation = {
   gstDifference: string;
   tdsAmount: string;
   tds194qAmount: string;
+  tds194qBasisAmount: string;
+  tds194qRounding: "paise" | "nearest_rupee";
   transportTdsAmount: string;
   cgstTdsAmount: string;
   sgstTdsAmount: string;
@@ -180,9 +188,24 @@ export type PurchasePostingCalculation = {
   totalDifference: string;
 };
 
+export type PurchaseInvoiceCandidate = {
+  documentId: string;
+  invoiceNumber: string;
+  invoiceDate: string;
+  supplierName: string;
+  supplierGstin: string;
+  buyerName: string;
+  buyerGstin: string;
+  sourceFileName: string | null;
+  role: "kalika_facing" | "mother_bill" | "other";
+  recommended: boolean;
+  reason: string;
+};
+
 export type PurchasePostingPrepared = {
   eligible: boolean;
   canonicalInvoiceCount: number;
+  invoiceCandidates: PurchaseInvoiceCandidate[];
   source: PurchasePostingSource | null;
   review: PurchasePostingReview | null;
   calculation: PurchasePostingCalculation | null;
@@ -345,6 +368,52 @@ export function getCanonicalInvoiceDocuments(documents: PurchasePostingDocumentI
     }
   }
   return Array.from(byIdentity.values());
+}
+
+export function getPurchaseInvoiceCandidates(
+  documents: PurchasePostingDocumentInput[],
+  companyGstin?: string | null
+): PurchaseInvoiceCandidate[] {
+  const canonicalInvoices = getCanonicalInvoiceDocuments(documents);
+  const activeCompanyGstin = normalizeGstin(companyGstin);
+
+  return canonicalInvoices.map((document) => {
+    const fields = fieldsOf(document);
+    const supplierGstin = normalizeGstin(fields.supplierGstin);
+    const buyerGstin = normalizeGstin(fields.buyerGstin);
+    const isKalikaFacing = Boolean(activeCompanyGstin && buyerGstin === activeCompanyGstin);
+    const isMotherBill = !isKalikaFacing && Boolean(
+      buyerGstin && canonicalInvoices.some((candidate) => {
+        if (candidate.id === document.id) return false;
+        const candidateFields = fieldsOf(candidate);
+        return normalizeGstin(candidateFields.supplierGstin) === buyerGstin &&
+          normalizeGstin(candidateFields.buyerGstin) === activeCompanyGstin;
+      })
+    );
+    const role: PurchaseInvoiceCandidate["role"] = isKalikaFacing
+      ? "kalika_facing"
+      : isMotherBill
+        ? "mother_bill"
+        : "other";
+
+    return {
+      documentId: document.id,
+      invoiceNumber: text(fields.invoiceNumber || fields.referenceInvoiceNumber),
+      invoiceDate: parseDate(fields.invoiceDate || fields.documentDate),
+      supplierName: text(fields.vendorName || fields.supplierName),
+      supplierGstin,
+      buyerName: text(fields.buyerName),
+      buyerGstin,
+      sourceFileName: document.source_file_name,
+      role,
+      recommended: isKalikaFacing,
+      reason: isKalikaFacing
+        ? "Billed to the active Tally company"
+        : isMotherBill
+          ? "Upstream mother bill; its buyer becomes the seller on another invoice"
+          : "Buyer does not match the active Tally company",
+    };
+  });
 }
 
 function supportingInvoiceReference(document: PurchasePostingDocumentInput) {
@@ -607,6 +676,18 @@ function mappedName(mappings: PurchasePostingMappingInput[], type: string, sourc
   )?.target_master_name ?? "";
 }
 
+function mappedItemHsnName(mappings: PurchasePostingMappingInput[], hsnValue: string) {
+  const hsn = normalizeHsn(hsnValue);
+  return mappings
+    .filter((mapping) =>
+      mapping.status === "active" &&
+      mapping.mapping_type === "item_hsn" &&
+      hsn.startsWith(normalizeHsn(mapping.source_key))
+    )
+    .sort((left, right) => normalizeHsn(right.source_key).length - normalizeHsn(left.source_key).length)[0]
+    ?.target_master_name ?? "";
+}
+
 function findLedger(masters: PurchasePostingMasterInput[], patterns: RegExp[]) {
   const matches = dedupeLedgerMasters(
     activeMasters(masters).filter((master) =>
@@ -614,6 +695,106 @@ function findLedger(masters: PurchasePostingMasterInput[], patterns: RegExp[]) {
     )
   );
   return matches.length === 1 ? matches[0].tally_name : "";
+}
+
+function masterIdentity(master: PurchasePostingMasterInput) {
+  const raw = master.raw_payload ?? {};
+  return [
+    master.tally_name,
+    master.parent_name,
+    master.group_path,
+    typeof raw.taxType === "string" ? raw.taxType : "",
+    typeof raw.gstDutyHead === "string" ? raw.gstDutyHead : "",
+  ].filter(Boolean).join(" ");
+}
+
+function mappedRoleName(
+  mappings: PurchasePostingMappingInput[],
+  type: string,
+  sourceKeys: string[]
+) {
+  for (const sourceKey of sourceKeys) {
+    const mapped = mappedName(mappings, type, sourceKey);
+    if (mapped) return mapped;
+  }
+  return "";
+}
+
+function uniqueRankedLedger(
+  masters: PurchasePostingMasterInput[],
+  score: (master: PurchasePostingMasterInput) => number,
+  minimumScore = 50
+) {
+  const ranked = dedupeLedgerMasters(activeMasters(masters))
+    .map((master) => ({ master, score: score(master) }))
+    .filter((entry) => entry.score >= minimumScore)
+    .sort((left, right) => right.score - left.score || left.master.tally_name.localeCompare(right.master.tally_name));
+  if (ranked.length === 0) return "";
+  if (ranked.length > 1 && ranked[0].score === ranked[1].score) return "";
+  return ranked[0].master.tally_name;
+}
+
+function taxRoleLedger(
+  masters: PurchasePostingMasterInput[],
+  dutyHead: "cgst" | "sgst" | "igst",
+  expectedRate: number
+) {
+  return uniqueRankedLedger(masters, (master) => {
+    const identity = masterIdentity(master);
+    if (!new RegExp(`\\b${dutyHead}\\b|${dutyHead === "cgst" ? "central\\s+tax" : dutyHead === "sgst" ? "state\\s+tax" : "integrated\\s+tax"}`, "i").test(identity)) return 0;
+    if (/\b(output|sales|payable)\b/i.test(identity) && !/\binput\b|\bitc\b|purchase/i.test(identity)) return 0;
+    let score = 70;
+    if (/\b(input|itc|purchase)\b/i.test(identity)) score += 25;
+    if (/duties\s*(?:&|and)\s*taxes|gst/i.test(identity)) score += 10;
+    if (master.tax_rate !== null && Math.abs(master.tax_rate - expectedRate) < 0.001) score += 20;
+    else if (new RegExp(`(?:@|\\b)\\s*${String(expectedRate).replace(".", "[.]")}\\s*%`, "i").test(identity)) score += 15;
+    return score;
+  });
+}
+
+function namedRoleLedger(
+  masters: PurchasePostingMasterInput[],
+  patterns: RegExp[],
+  preferredGroups: RegExp[] = []
+) {
+  return uniqueRankedLedger(masters, (master) => {
+    const identity = masterIdentity(master);
+    if (!patterns.every((pattern) => pattern.test(identity))) return 0;
+    return 55 + patterns.length * 20 + preferredGroups.filter((pattern) => pattern.test(identity)).length * 10;
+  });
+}
+
+function purchaseLedgerForLine(
+  masters: PurchasePostingMasterInput[],
+  mappings: PurchasePostingMappingInput[],
+  material: ReturnType<typeof materialFromHsn>["material"],
+  localPurchase: boolean
+) {
+  const geography = localPurchase ? "local" : "interstate";
+  const mapped = mappedRoleName(mappings, "purchase_ledger", [
+    `${material}:${geography}`,
+    `any:${geography}`,
+    geography,
+  ]);
+  if (mapped) return exactMasterName(masters, mapped, ["ledger"]);
+
+  const legacyName = material === "unknown"
+    ? ""
+    : localPurchase ? "M.S. Scrap Purchase" : "O.M.S. Scrap Purchase";
+  const legacy = exactMasterName(masters, legacyName, ["ledger"]);
+  if (legacy) return legacy;
+
+  return uniqueRankedLedger(masters, (master) => {
+    const identity = masterIdentity(master);
+    if (!/purchase/i.test(identity)) return 0;
+    let score = /purchase\s+accounts?/i.test(identity) ? 85 : 60;
+    if (/direct\s+expenses?/i.test(identity)) score += 10;
+    if (material === "ms_scrap" && /scrap/i.test(identity)) score += 20;
+    if (material === "sponge_iron" && /sponge|iron/i.test(identity)) score += 20;
+    if (localPurchase && /local|intra|m[.]?s[.]?\s*scrap/i.test(identity)) score += 10;
+    if (!localPurchase && /interstate|outside|o[.]?m[.]?s[.]?/i.test(identity)) score += 10;
+    return score;
+  }, 70);
 }
 
 function supplierLedgerSuggestion(
@@ -648,8 +829,15 @@ function buildDefaultReview(
     const material = materialFromHsn(prior?.hsn || line.hsn);
     const stockItem =
       prior?.stockItemName ||
-      mappedName(mappings, "item_hsn", prior?.hsn || line.hsn) ||
-      exactMasterName(masters, material.suggestedStockItem, ["stock_item"]);
+      mappedItemHsnName(mappings, prior?.hsn || line.hsn) ||
+      exactMasterName(masters, material.suggestedStockItem, ["stock_item"]) ||
+      (() => {
+        const hsn = normalizeHsn(prior?.hsn || line.hsn);
+        const matches = activeMasters(masters).filter((master) =>
+          master.master_type === "stock_item" && hsn && normalizeHsn(master.hsn_code) === hsn
+        );
+        return matches.length === 1 ? matches[0].tally_name : "";
+      })();
     const savedUnit = prior?.unit ?? "";
     const invoiceUnit =
       line.unit ||
@@ -660,10 +848,6 @@ function buildDefaultReview(
       normalizeUnit(savedUnit) !== normalizeUnit(line.unit)
         ? savedUnit
         : invoiceUnit;
-    const purchaseLedgerSuggestion =
-      material.material === "unknown"
-        ? ""
-        : localPurchase ? "M.S. Scrap Purchase" : "O.M.S. Scrap Purchase";
     return {
       lineId: line.lineId,
       description: prior?.description ?? line.description,
@@ -675,12 +859,12 @@ function buildDefaultReview(
       stockItemName: stockItem,
       purchaseLedgerName:
         prior?.purchaseLedgerName ||
-        mappedName(mappings, "purchase_ledger", `${material.material}:${localPurchase ? "local" : "interstate"}`) ||
-        exactMasterName(masters, purchaseLedgerSuggestion, ["ledger"]),
+        purchaseLedgerForLine(masters, mappings, material.material, localPurchase),
     };
   });
 
   const baseReview: PurchasePostingReview = {
+    selectedInvoiceDocumentId: source.documentId,
     invoiceNumber: source.invoiceNumber,
     invoiceDate: source.invoiceDate,
     voucherDate: new Date().toISOString().slice(0, 10),
@@ -692,19 +876,49 @@ function buildDefaultReview(
     invoiceTotal: source.invoiceTotal,
     gstRate: source.invoiceTaxRate,
     supplierLedgerName: supplierLedgerSuggestion(source, masters, mappings),
-    cgstLedgerName: exactMasterName(masters, "Input ITC CGST 9%", ["ledger", "gst_ledger", "tax_ledger"]),
-    sgstLedgerName: exactMasterName(masters, "Input ITC SGST 9%", ["ledger", "gst_ledger", "tax_ledger"]),
-    igstLedgerName: exactMasterName(masters, "Input ITC IGST 18%", ["ledger", "gst_ledger", "tax_ledger"]),
+    cgstLedgerName:
+      mappedRoleName(mappings, "gst_rate", [`cgst:${Number(source.invoiceTaxRate || 0) / 2}`, "cgst"]) ||
+      exactMasterName(masters, "Input ITC CGST 9%", ["ledger", "gst_ledger", "tax_ledger"]) ||
+      taxRoleLedger(masters, "cgst", Number(source.invoiceTaxRate || 0) / 2),
+    sgstLedgerName:
+      mappedRoleName(mappings, "gst_rate", [`sgst:${Number(source.invoiceTaxRate || 0) / 2}`, "sgst"]) ||
+      exactMasterName(masters, "Input ITC SGST 9%", ["ledger", "gst_ledger", "tax_ledger"]) ||
+      taxRoleLedger(masters, "sgst", Number(source.invoiceTaxRate || 0) / 2),
+    igstLedgerName:
+      mappedRoleName(mappings, "gst_rate", [`igst:${Number(source.invoiceTaxRate || 0)}`, "igst"]) ||
+      exactMasterName(masters, "Input ITC IGST 18%", ["ledger", "gst_ledger", "tax_ledger"]) ||
+      taxRoleLedger(masters, "igst", Number(source.invoiceTaxRate || 0)),
     freightAmount: source.invoiceFreightAmount,
     freightGstRate: source.invoiceFreightGstRate || (moneyPaise(source.invoiceFreightAmount) ? "18" : ""),
-    freightLedgerName: exactMasterName(masters, "Transportation Inward @ 18.00%", ["ledger"]),
-    tds194qLedgerName: exactMasterName(masters, "TDS Payable @ 0.10% (194Q)", ["ledger", "tax_ledger"]),
+    freightLedgerName:
+      mappedName(mappings, "freight_ledger", "purchase") ||
+      exactMasterName(masters, "Transportation Inward @ 18.00%", ["ledger"]) ||
+      namedRoleLedger(masters, [/freight|transportation\s+inward/i], [/direct\s+expenses?|purchase/i]),
+    tds194qLedgerName:
+      mappedRoleName(mappings, "tds_ledger", ["194q", "purchase_goods"]) ||
+      exactMasterName(masters, "TDS Payable @ 0.10% (194Q)", ["ledger", "tax_ledger"]) ||
+      namedRoleLedger(masters, [/tds|withholding|tax\s+deducted/i, /194q|0[.]?10/i]),
     tds194qRate: source.invoiceTds194qRate || "0.1",
-    transportTdsLedgerName: exactMasterName(masters, "Tds on Goods Transport", ["ledger", "tax_ledger"]),
+    applyTds194q: false,
+    tds194qBasisAmount: "",
+    tds194qRounding: "nearest_rupee",
+    transportTdsLedgerName:
+      mappedRoleName(mappings, "tds_ledger", ["transport", "goods_transport"]) ||
+      exactMasterName(masters, "Tds on Goods Transport", ["ledger", "tax_ledger"]) ||
+      namedRoleLedger(masters, [/tds|withholding|tax\s+deducted/i, /transport|freight/i]),
     transportTdsRate: source.invoiceTransportTdsRate || "1",
-    cgstTdsLedgerName: exactMasterName(masters, "CGST TDS PAYABLE 1%", ["ledger", "tax_ledger"]),
-    sgstTdsLedgerName: exactMasterName(masters, "SGST TDS PAYABLE 1%", ["ledger", "tax_ledger"]),
-    igstTdsLedgerName: exactMasterName(masters, "IGST TDS PAYABLE 2%", ["ledger", "tax_ledger"]),
+    cgstTdsLedgerName:
+      mappedRoleName(mappings, "tds_ledger", ["cgst_tds", "gst_tds_cgst"]) ||
+      exactMasterName(masters, "CGST TDS PAYABLE 1%", ["ledger", "tax_ledger"]) ||
+      namedRoleLedger(masters, [/tds|withholding|tax\s+deducted/i, /cgst|central\s+tax/i]),
+    sgstTdsLedgerName:
+      mappedRoleName(mappings, "tds_ledger", ["sgst_tds", "gst_tds_sgst"]) ||
+      exactMasterName(masters, "SGST TDS PAYABLE 1%", ["ledger", "tax_ledger"]) ||
+      namedRoleLedger(masters, [/tds|withholding|tax\s+deducted/i, /sgst|state\s+tax/i]),
+    igstTdsLedgerName:
+      mappedRoleName(mappings, "tds_ledger", ["igst_tds", "gst_tds_igst"]) ||
+      exactMasterName(masters, "IGST TDS PAYABLE 2%", ["ledger", "tax_ledger"]) ||
+      namedRoleLedger(masters, [/tds|withholding|tax\s+deducted/i, /igst|integrated\s+tax/i]),
     gstTdsRate: source.invoiceGstTdsRate || (localPurchase ? "1" : "2"),
     tcsReceivable: false,
     tcsLedgerName: mappedName(mappings, "tcs_ledger", "receivable") || findLedger(masters, [/tcs/i]),
@@ -743,6 +957,10 @@ function buildDefaultReview(
     sgstTdsLedgerName: saved?.sgstTdsLedgerName || baseReview.sgstTdsLedgerName,
     igstTdsLedgerName: saved?.igstTdsLedgerName || baseReview.igstTdsLedgerName,
     tds194qRate: saved?.tds194qRate || saved?.tdsRate || baseReview.tds194qRate,
+    applyTds194q: saved?.applyTds194q === true,
+    tds194qBasisAmount: saved?.tds194qBasisAmount ?? baseReview.tds194qBasisAmount,
+    tds194qRounding:
+      saved?.tds194qRounding === "paise" ? "paise" : "nearest_rupee",
     tcsLedgerName: saved?.tcsLedgerName || baseReview.tcsLedgerName,
     roundOffLedgerName: saved?.roundOffLedgerName || baseReview.roundOffLedgerName,
     roundOffAmount: moneyPaise(source.invoiceRoundOffAmount)
@@ -790,8 +1008,42 @@ function isPurchaseTaxLedger(
   dutyHead: "cgst" | "sgst" | "igst"
 ) {
   if (!master) return false;
-  const identity = `${master.tally_name} ${master.parent_name ?? ""}`.toLowerCase();
-  return identity.includes(dutyHead) && !/\b(output|sales)\b/.test(identity);
+  const identity = masterIdentity(master).toLowerCase();
+  const dutyIdentity = dutyHead === "cgst"
+    ? /\bcgst\b|central\s+tax/
+    : dutyHead === "sgst"
+      ? /\bsgst\b|state\s+tax/
+      : /\bigst\b|integrated\s+tax/;
+  return dutyIdentity.test(identity) && !(
+    /\b(output|sales)\b/.test(identity) && !/\b(input|itc|purchase)\b/.test(identity)
+  );
+}
+
+function mappingSelects(
+  mappings: PurchasePostingMappingInput[],
+  mappingType: string,
+  sourceKeys: string[],
+  masterName: string
+) {
+  return sourceKeys.some((sourceKey) =>
+    normalizeKey(mappedName(mappings, mappingType, sourceKey)) === normalizeKey(masterName)
+  );
+}
+
+function isWithholdingLedger(
+  master: PurchasePostingMasterInput | null,
+  role: "194q" | "transport" | "cgst_tds" | "sgst_tds" | "igst_tds" | "tcs"
+) {
+  if (!master) return false;
+  const identity = masterIdentity(master);
+  const withholding = /\b(tds|tcs)\b|withholding|tax\s+(?:deducted|collected)/i.test(identity);
+  if (!withholding) return false;
+  if (role === "194q") return /194q|0[.]?10/i.test(identity);
+  if (role === "transport") return /transport|freight|goods\s+carriage/i.test(identity);
+  if (role === "cgst_tds") return /cgst|central\s+tax/i.test(identity);
+  if (role === "sgst_tds") return /sgst|state\s+tax/i.test(identity);
+  if (role === "igst_tds") return /igst|integrated\s+tax/i.test(identity);
+  return /\btcs\b|tax\s+collected/i.test(identity);
 }
 
 function issue(
@@ -862,13 +1114,21 @@ function calculate(
     const amount = moneyPaise(value);
     return enabled && amount !== null ? Math.abs(amount) : 0;
   };
-  // Legally conditional deductions are never inferred from an HSN or the full
-  // invoice basic value. They enter the voucher only when the organization has
-  // enabled that rule and the reviewed invoice contains a confirmed amount.
-  const tds194q = confirmedDeduction(
-    accountingSettings.purchaseGoodsTdsEnabled,
-    source.invoiceTds194qAmount
-  );
+  // Section 194Q eligibility depends on buyer-level annual facts that a single
+  // invoice cannot prove. The reviewer explicitly enables it for this voucher;
+  // Kalika then performs the deterministic 0.1% calculation on the confirmed
+  // basis instead of trusting an amount printed (or not printed) on the invoice.
+  const reviewed194qBasis = moneyPaise(review.tds194qBasisAmount);
+  const tds194qBasis = reviewed194qBasis !== null && reviewed194qBasis > 0
+    ? reviewed194qBasis
+    : basic;
+  const tds194qRate = rateBasisPoints(review.tds194qRate) ?? 10;
+  const rawTds194q = review.applyTds194q
+    ? Math.round((tds194qBasis * tds194qRate) / 10000)
+    : 0;
+  const tds194q = review.tds194qRounding === "nearest_rupee"
+    ? Math.round(rawTds194q / 100) * 100
+    : rawTds194q;
   const transportTds = confirmedDeduction(
     accountingSettings.transporterTdsEnabled,
     source.invoiceTransportTdsAmount
@@ -903,10 +1163,18 @@ function calculate(
     : 0;
   const grossInvoiceAmount = basic + freight + gst + tcs + roundOff;
   const payable = beforeRound + roundOff;
-  // Buyer-side scrap GST TDS is not part of the supplier's tax-invoice total.
-  // Reconcile the printed invoice to its gross value, then show the separately
-  // withheld amount in the final supplier payable.
-  const reconciliationAmount = automaticScrapGstTds ? grossInvoiceAmount : payable;
+  // Reconcile only deductions that are visibly included in the supplier's
+  // printed payable. Reviewer-enabled deductions (for example 194Q) alter the
+  // Tally payable without manufacturing a mismatch against an invoice that did
+  // not print that deduction.
+  const printedWithholding = sum([
+    moneyPaise(source.invoiceTds194qAmount) !== null ? tds194q : 0,
+    moneyPaise(source.invoiceTransportTdsAmount) !== null ? transportTds : 0,
+    moneyPaise(source.invoiceCgstTdsAmount) !== null ? cgstTds : 0,
+    moneyPaise(source.invoiceSgstTdsAmount) !== null ? sgstTds : 0,
+    moneyPaise(source.invoiceIgstTdsAmount) !== null ? igstTds : 0,
+  ]);
+  const reconciliationAmount = grossInvoiceAmount - printedWithholding;
 
   return {
     taxMode,
@@ -924,6 +1192,8 @@ function calculate(
     gstDifference: formatPaise(gst - invoiceGst),
     tdsAmount: formatPaise(tds194q + transportTds),
     tds194qAmount: formatPaise(tds194q),
+    tds194qBasisAmount: formatPaise(tds194qBasis),
+    tds194qRounding: review.tds194qRounding,
     transportTdsAmount: formatPaise(transportTds),
     cgstTdsAmount: formatPaise(cgstTds),
     sgstTdsAmount: formatPaise(sgstTds),
@@ -958,19 +1228,19 @@ export function preparePurchasePosting(params: {
   const blockers: PurchasePostingIssue[] = [];
   const warnings: PurchasePostingIssue[] = [];
   const canonicalInvoices = getCanonicalInvoiceDocuments(params.documents);
+  const invoiceCandidates = getPurchaseInvoiceCandidates(params.documents, params.companyGstin);
 
-  if (canonicalInvoices.length !== 1) {
+  if (canonicalInvoices.length === 0) {
     blockers.push(issue(
-      canonicalInvoices.length === 0 ? "NO_INVOICE" : "MULTIPLE_INVOICES",
-      "Single invoice required",
-      canonicalInvoices.length === 0
-        ? "This case does not contain an invoice."
-        : `This case contains ${canonicalInvoices.length} distinct invoices. Tally posting currently supports one invoice per case.`,
+      "NO_INVOICE",
+      "Invoice required",
+      "This case does not contain an invoice.",
       "case"
     ));
     return {
       eligible: false,
       canonicalInvoiceCount: canonicalInvoices.length,
+      invoiceCandidates,
       source: null,
       review: null,
       calculation: null,
@@ -981,7 +1251,38 @@ export function preparePurchasePosting(params: {
     };
   }
 
-  const invoice = canonicalInvoices[0];
+  const requestedDocumentId = text(params.savedReview?.selectedInvoiceDocumentId);
+  const recommendedCandidates = invoiceCandidates.filter((candidate) => candidate.recommended);
+  const selectedCandidate = invoiceCandidates.find((candidate) =>
+    requestedDocumentId && candidate.documentId === requestedDocumentId
+  ) ?? (recommendedCandidates.length === 1
+    ? recommendedCandidates[0]
+    : canonicalInvoices.length === 1
+      ? invoiceCandidates[0]
+      : null);
+
+  if (!selectedCandidate) {
+    blockers.push(issue(
+      "INVOICE_SELECTION_REQUIRED",
+      "Choose the invoice billed to your company",
+      `This packet contains ${canonicalInvoices.length} distinct commercial invoices. Select the invoice whose buyer is the active Tally company; duplicate copies have already been collapsed.`,
+      "case"
+    ));
+    return {
+      eligible: true,
+      canonicalInvoiceCount: canonicalInvoices.length,
+      invoiceCandidates,
+      source: null,
+      review: null,
+      calculation: null,
+      blockers,
+      warnings,
+      tallyPayload: null,
+      suggestedStatus: "correction_required",
+    };
+  }
+
+  const invoice = canonicalInvoices.find((candidate) => candidate.id === selectedCandidate.documentId)!;
   const linkedLineSource = findLinkedLineSource(invoice, params.documents);
   const source = buildSource(invoice, linkedLineSource ?? invoice, params.documents);
   if (!isValidIsoDate(source.invoiceDate)) {
@@ -1002,6 +1303,15 @@ export function preparePurchasePosting(params: {
     normalizeGstin(params.companyGstin) || source.buyerGstin,
     params.savedReview
   );
+  review.selectedInvoiceDocumentId = invoice.id;
+  if (selectedCandidate.role === "mother_bill") {
+    warnings.push(issue(
+      "MOTHER_BILL_SELECTED",
+      "Upstream mother bill selected",
+      "This invoice appears to be billed to the intermediary rather than the active Tally company. Verify the buyer before approval.",
+      "invoice"
+    ));
+  }
   const accountingSettings = params.accountingSettings ?? {
     purchaseGoodsTdsEnabled: false,
     transporterTdsEnabled: false,
@@ -1151,15 +1461,6 @@ export function preparePurchasePosting(params: {
     if (!stockItem) {
       blockers.push(issue("STOCK_ITEM_REQUIRED", "Stock item missing", `Select an existing Tally stock item for ${line.description || line.hsn || "this line"}.`, "line", line.lineId));
     } else {
-      if (normalizeKey(stockItem.tally_name) !== normalizeKey("M S Scrap & Sponge Iron")) {
-        blockers.push(issue(
-          "STOCK_ITEM_CLIENT_RULE_MISMATCH",
-          "Use the client stock item",
-          "This client posts both MS Scrap and Sponge Iron through M S Scrap & Sponge Iron.",
-          "line",
-          line.lineId
-        ));
-      }
       if (stockItem.hsn_code && normalizeHsn(stockItem.hsn_code) !== normalizeHsn(line.hsn)) {
         blockers.push(issue(
           "STOCK_ITEM_HSN_MISMATCH",
@@ -1191,27 +1492,11 @@ export function preparePurchasePosting(params: {
         "line",
         line.lineId
       ));
-    } else {
-      const supplierState = stateCodeFromGstin(review.supplierGstin);
-      const buyerState = stateCodeFromGstin(params.companyGstin || review.buyerGstin);
-      const expectedPurchaseLedger =
-        supplierState && buyerState && supplierState === buyerState
-          ? "M.S. Scrap Purchase"
-          : "O.M.S. Scrap Purchase";
-      if (normalizeKey(purchaseLedger.tally_name) !== normalizeKey(expectedPurchaseLedger)) {
-        blockers.push(issue(
-          "PURCHASE_LEDGER_CLIENT_RULE_MISMATCH",
-          "Use the correct client purchase ledger",
-          `${expectedPurchaseLedger} is required for this supplier state.`,
-          "line",
-          line.lineId
-        ));
-      }
     }
     if (purchaseLedger && (
       purchaseLedger.parent_name &&
       !/purchase|direct\s*expense/i.test(
-        `${purchaseLedger.tally_name} ${purchaseLedger.parent_name}`
+        masterIdentity(purchaseLedger)
       )
     )) {
       warnings.push(issue(
@@ -1242,22 +1527,17 @@ export function preparePurchasePosting(params: {
   } else if (calculation.taxMode === "cgst_sgst") {
     const cgstLedger = selectedMaster(params.masters, review.cgstLedgerName, ["ledger", "gst_ledger", "tax_ledger"]);
     const sgstLedger = selectedMaster(params.masters, review.sgstLedgerName, ["ledger", "gst_ledger", "tax_ledger"]);
-    if (!isPurchaseTaxLedger(cgstLedger, "cgst")) {
+    const halfRate = Number(review.gstRate || 0) / 2;
+    if (!cgstLedger || (!isPurchaseTaxLedger(cgstLedger, "cgst") && !mappingSelects(params.mappings ?? [], "gst_rate", [`cgst:${halfRate}`, "cgst"], review.cgstLedgerName))) {
       blockers.push(issue("CGST_LEDGER_REQUIRED", "Input CGST ledger missing", "Select an existing purchase/input CGST ledger.", "tax"));
-    } else if (cgstLedger && normalizeKey(cgstLedger.tally_name) !== normalizeKey("Input ITC CGST 9%")) {
-      blockers.push(issue("CGST_LEDGER_REQUIRED", "Use the client CGST ledger", "Select Input ITC CGST 9% from live Tally.", "tax"));
     }
-    if (!isPurchaseTaxLedger(sgstLedger, "sgst")) {
+    if (!sgstLedger || (!isPurchaseTaxLedger(sgstLedger, "sgst") && !mappingSelects(params.mappings ?? [], "gst_rate", [`sgst:${halfRate}`, "sgst"], review.sgstLedgerName))) {
       blockers.push(issue("SGST_LEDGER_REQUIRED", "Input SGST ledger missing", "Select an existing purchase/input SGST ledger.", "tax"));
-    } else if (sgstLedger && normalizeKey(sgstLedger.tally_name) !== normalizeKey("Input ITC SGST 9%")) {
-      blockers.push(issue("SGST_LEDGER_REQUIRED", "Use the client SGST ledger", "Select Input ITC SGST 9% from live Tally.", "tax"));
     }
   } else {
     const igstLedger = selectedMaster(params.masters, review.igstLedgerName, ["ledger", "gst_ledger", "tax_ledger"]);
-    if (!isPurchaseTaxLedger(igstLedger, "igst")) {
+    if (!igstLedger || (!isPurchaseTaxLedger(igstLedger, "igst") && !mappingSelects(params.mappings ?? [], "gst_rate", [`igst:${Number(review.gstRate || 0)}`, "igst"], review.igstLedgerName))) {
       blockers.push(issue("IGST_LEDGER_REQUIRED", "Input IGST ledger missing", "Select an existing purchase/input IGST ledger.", "tax"));
-    } else if (igstLedger && normalizeKey(igstLedger.tally_name) !== normalizeKey("Input ITC IGST 18%")) {
-      blockers.push(issue("IGST_LEDGER_REQUIRED", "Use the client IGST ledger", "Select Input ITC IGST 18% from live Tally.", "tax"));
     }
   }
 
@@ -1329,20 +1609,21 @@ export function preparePurchasePosting(params: {
         tdsRateBasisPoints <= 0 ||
         tdsRateBasisPoints > 1000
       ) {
-        blockers.push(issue("TDS_194Q_RATE_REQUIRED", "Purchase TDS rate required", "Confirm the rate printed with the purchase TDS deduction.", "tax"));
+        blockers.push(issue("TDS_194Q_RATE_REQUIRED", "Purchase TDS rate required", "Confirm the Section 194Q deduction rate.", "tax"));
       }
-      if (
-        normalizeKey(review.tds194qLedgerName) !== normalizeKey("TDS Payable @ 0.10% (194Q)") ||
-        !selectedMaster(params.masters, review.tds194qLedgerName, ["ledger", "tax_ledger"])
-      ) {
+      if ((moneyPaise(calculation.tds194qBasisAmount) ?? 0) <= 0) {
+        blockers.push(issue("TDS_194Q_BASIS_REQUIRED", "Purchase TDS basis required", "Confirm the basic amount on which Section 194Q should be calculated.", "tax"));
+      }
+      const tds194qMaster = selectedMaster(params.masters, review.tds194qLedgerName, ["ledger", "tax_ledger"]);
+      if (!tds194qMaster || (!isWithholdingLedger(tds194qMaster, "194q") && !mappingSelects(params.mappings ?? [], "tds_ledger", ["194q", "purchase_goods"], review.tds194qLedgerName))) {
         blockers.push(issue("TDS_194Q_LEDGER_REQUIRED", "Purchase TDS ledger missing", "Select the configured purchase TDS ledger from live Tally.", "tax"));
       }
-      requireMatchingInvoiceDeduction(
-        "TDS_194Q",
-        "Purchase TDS",
-        source.invoiceTds194qAmount,
-        calculation.tds194qAmount
-      );
+      warnings.push(issue(
+        "TDS_194Q_USER_CONFIRMED",
+        "Section 194Q enabled for this voucher",
+        `Kalika calculated ₹${calculation.tds194qAmount} at ${review.tds194qRate}% on ₹${calculation.tds194qBasisAmount}. Eligibility was confirmed by the reviewer, not inferred from this invoice.`,
+        "tax"
+      ));
     }
     if (gstTdsActive) {
       const gstTdsRate = rateBasisPoints(calculation.gstTdsRate);
@@ -1364,16 +1645,12 @@ export function preparePurchasePosting(params: {
         calculation.sgstTdsAmount,
         !calculation.gstTdsAutomatic
       );
-      if (
-        normalizeKey(review.cgstTdsLedgerName) !== normalizeKey("CGST TDS PAYABLE 1%") ||
-        !selectedMaster(params.masters, review.cgstTdsLedgerName, ["ledger", "tax_ledger"])
-      ) {
+      const cgstTdsMaster = selectedMaster(params.masters, review.cgstTdsLedgerName, ["ledger", "tax_ledger"]);
+      if (!cgstTdsMaster || (!isWithholdingLedger(cgstTdsMaster, "cgst_tds") && !mappingSelects(params.mappings ?? [], "tds_ledger", ["cgst_tds", "gst_tds_cgst"], review.cgstTdsLedgerName))) {
         blockers.push(issue("CGST_TDS_LEDGER_REQUIRED", "CGST TDS ledger missing", "Select CGST TDS PAYABLE 1% from live Tally.", "tax"));
       }
-      if (
-        normalizeKey(review.sgstTdsLedgerName) !== normalizeKey("SGST TDS PAYABLE 1%") ||
-        !selectedMaster(params.masters, review.sgstTdsLedgerName, ["ledger", "tax_ledger"])
-      ) {
+      const sgstTdsMaster = selectedMaster(params.masters, review.sgstTdsLedgerName, ["ledger", "tax_ledger"]);
+      if (!sgstTdsMaster || (!isWithholdingLedger(sgstTdsMaster, "sgst_tds") && !mappingSelects(params.mappings ?? [], "tds_ledger", ["sgst_tds", "gst_tds_sgst"], review.sgstTdsLedgerName))) {
         blockers.push(issue("SGST_TDS_LEDGER_REQUIRED", "SGST TDS ledger missing", "Select SGST TDS PAYABLE 1% from live Tally.", "tax"));
       }
       } else if (calculation.taxMode === "igst") {
@@ -1384,10 +1661,8 @@ export function preparePurchasePosting(params: {
         calculation.igstTdsAmount,
         !calculation.gstTdsAutomatic
       );
-      if (
-        normalizeKey(review.igstTdsLedgerName) !== normalizeKey("IGST TDS PAYABLE 2%") ||
-        !selectedMaster(params.masters, review.igstTdsLedgerName, ["ledger", "tax_ledger"])
-      ) {
+      const igstTdsMaster = selectedMaster(params.masters, review.igstTdsLedgerName, ["ledger", "tax_ledger"]);
+      if (!igstTdsMaster || (!isWithholdingLedger(igstTdsMaster, "igst_tds") && !mappingSelects(params.mappings ?? [], "tds_ledger", ["igst_tds", "gst_tds_igst"], review.igstTdsLedgerName))) {
         blockers.push(issue("IGST_TDS_LEDGER_REQUIRED", "IGST TDS ledger missing", "Select IGST TDS PAYABLE 2% from live Tally.", "tax"));
       }
       }
@@ -1395,11 +1670,9 @@ export function preparePurchasePosting(params: {
   }
   const freightAmount = moneyPaise(review.freightAmount) ?? 0;
   if (freightAmount > 0) {
-    if (
-      normalizeKey(review.freightLedgerName) !== normalizeKey("Transportation Inward @ 18.00%") ||
-      !selectedMaster(params.masters, review.freightLedgerName, ["ledger"])
-    ) {
-      blockers.push(issue("FREIGHT_LEDGER_REQUIRED", "Freight ledger missing", "Select Transportation Inward @ 18.00% from live Tally.", "tax"));
+    const freightMaster = selectedMaster(params.masters, review.freightLedgerName, ["ledger"]);
+    if (!freightMaster) {
+      blockers.push(issue("FREIGHT_LEDGER_REQUIRED", "Freight ledger missing", "Select the Purchase freight or inward-transport ledger from live Tally.", "tax"));
     }
     const freightRate = rateBasisPoints(review.freightGstRate);
     if (freightRate === null || freightRate <= 0) {
@@ -1413,10 +1686,8 @@ export function preparePurchasePosting(params: {
     if (transportTdsRate === null || transportTdsRate <= 0) {
       blockers.push(issue("TRANSPORT_TDS_RATE_REQUIRED", "Transport TDS rate required", "Confirm the goods-transport TDS rate.", "tax"));
     }
-    if (
-      normalizeKey(review.transportTdsLedgerName) !== normalizeKey("Tds on Goods Transport") ||
-      !selectedMaster(params.masters, review.transportTdsLedgerName, ["ledger", "tax_ledger"])
-    ) {
+    const transportTdsMaster = selectedMaster(params.masters, review.transportTdsLedgerName, ["ledger", "tax_ledger"]);
+    if (!transportTdsMaster || (!isWithholdingLedger(transportTdsMaster, "transport") && !mappingSelects(params.mappings ?? [], "tds_ledger", ["transport", "goods_transport"], review.transportTdsLedgerName))) {
       blockers.push(issue("TRANSPORT_TDS_LEDGER_REQUIRED", "Transport TDS ledger missing", "Select Tds on Goods Transport from live Tally.", "tax"));
     }
   }
@@ -1504,6 +1775,8 @@ export function preparePurchasePosting(params: {
           kind: "tds_194q",
           name: review.tds194qLedgerName,
           rate: review.tds194qRate,
+          taxableBasis: calculation.tds194qBasisAmount,
+          rounding: calculation.tds194qRounding,
           amount: calculation.tds194qAmount,
         }]
         : []),
@@ -1540,7 +1813,8 @@ export function preparePurchasePosting(params: {
 
   return {
     eligible: true,
-    canonicalInvoiceCount: 1,
+    canonicalInvoiceCount: canonicalInvoices.length,
+    invoiceCandidates,
     source,
     review,
     calculation,
@@ -1559,7 +1833,8 @@ export function compactPurchasePostingReview(
   base: PurchasePostingReview | null,
   reviewed: PurchasePostingReview | null
 ): PurchasePostingReviewPatch {
-  if (!base || !reviewed) return {};
+  if (!reviewed) return {};
+  if (!base) return reviewed;
 
   const patch: PurchasePostingReviewPatch = {};
   const scalarKeys = (Object.keys(reviewed) as Array<keyof PurchasePostingReview>)

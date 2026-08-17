@@ -54,6 +54,10 @@ const PDF_SMART_SPLIT_MAX_PAGES = Number(process.env.PACKET_PDF_SMART_SPLIT_MAX_
 const PROVIDER_IMAGE_HARD_LIMIT_BYTES = Number(process.env.PACKET_PROVIDER_IMAGE_HARD_LIMIT_BYTES ?? 20 * 1024 * 1024);
 const PROVIDER_IMAGE_TARGET_BYTES = Number(process.env.PACKET_PROVIDER_IMAGE_TARGET_BYTES ?? 8 * 1024 * 1024);
 const PROVIDER_IMAGE_MAX_DIMENSION = Number(process.env.PACKET_PROVIDER_IMAGE_MAX_DIMENSION ?? 3200);
+const PACKET_AI_CONCURRENCY = Math.max(
+  1,
+  Math.min(6, Number(process.env.PACKET_AI_CONCURRENCY ?? 3) || 3)
+);
 const PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY = "Vehicle number is not clearly visible in this image.";
 const PO_NUMBER_FIELD_KEYS: FieldKey[] = ["poNumber", "referencePoNumber"];
 const INDENT_LABEL_PATTERN = /\b(?:indent|ind\.?\s*no|indent\s*(?:no|number|form|ref|reference)?)\b/i;
@@ -75,6 +79,29 @@ const DIRECT_BUYER_CONTEXT_PATTERN = /\b(?:buyer|bill\s*to|bill-to|customer|purc
 const STORE_EVIDENCE_DOC_TYPES = new Set<DocType>(["Invoice", "Tax Invoice", "Delivery Challan", "Delivery Note"]);
 const STAMP_SIGNATURE_EXTRACTION_INSTRUCTION =
   "For stamp/signature presence fields, return only Yes, No, or Unclear. Use Yes only when the mark is visibly present, No only when the relevant area is visible and clearly absent, otherwise Unclear. For invoice/delivery receiving evidence, a buyer or receiver stamp block such as Kalika, SMS Division, Store, Gate, or Security with Date and Name & Sign lines means hasStoreStamp=Yes; if handwritten marks or signatures appear on those Name & Sign lines, hasStoreSignature=Yes. Do not confuse the supplier Authorized Signatory with store signature. ";
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  handler: (item: T, index: number) => Promise<R>
+) {
+  if (!items.length) return [] as R[];
+
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(Math.max(1, concurrency), items.length) },
+    async () => {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        results[currentIndex] = await handler(items[currentIndex], currentIndex);
+      }
+    }
+  );
+  await Promise.all(workers);
+  return results;
+}
 
 function resolvePdfJsWorkerSrc() {
   const candidates = [
@@ -1058,6 +1085,17 @@ export async function assessCaseTermsComplianceDetailed(documents: CaseDoc[]): P
   );
   if (!assessableDocuments.length) return { mismatches: [], checklist: [] };
 
+  const hasExplicitTerms = assessableDocuments.some((doc) => {
+    if (TERMS_FIELD_KEYS.some((field) => Boolean(doc.fields[field]?.trim()))) {
+      return true;
+    }
+    const visibleText = getVisibleTextFromMarkdown(doc.md);
+    return /\b(?:terms?\s*(?:&|and)\s*conditions?|payment\s+terms?|delivery\s+terms?|freight\s+terms?|commercial\s+terms?|special\s+terms?|warranty|guarantee|inspection\s+terms?)\b/i.test(
+      visibleText
+    );
+  });
+  if (!hasExplicitTerms) return { mismatches: [], checklist: [] };
+
   const documentsById = new Map(assessableDocuments.map((doc) => [doc.id, doc]));
   const packetContext = buildTermsAssessmentPrompt(assessableDocuments);
   if (!packetContext.trim()) return { mismatches: [], checklist: [] };
@@ -1408,7 +1446,10 @@ function applyExtractionReviewCorrections(
   };
 }
 
-export async function reviewAndCorrectExtractedDocuments(documents: CaseDoc[]): Promise<{
+export async function reviewAndCorrectExtractedDocuments(
+  documents: CaseDoc[],
+  options?: { candidateDocumentIds?: Iterable<string> }
+): Promise<{
   documents: CaseDoc[];
   review: ExtractionReviewSummary;
 }> {
@@ -1424,7 +1465,19 @@ export async function reviewAndCorrectExtractedDocuments(documents: CaseDoc[]): 
     };
   }
 
-  const assessableDocuments = documents.filter((doc) => doc.md?.trim() || Object.keys(doc.fields).length || doc.lineItems?.length);
+  const candidateDocumentIds = new Set(options?.candidateDocumentIds ?? []);
+  const assessableDocuments = documents.filter((doc) => {
+    const hasExtractedContent = Boolean(doc.md?.trim() || Object.keys(doc.fields).length || doc.lineItems?.length);
+    if (!hasExtractedContent) return false;
+
+    return (
+      candidateDocumentIds.has(doc.id) ||
+      doc.type === "Unknown" ||
+      Boolean(doc.qualityIssues?.length) ||
+      isWeakExtraction(doc) ||
+      hasIncompleteVisibleInvoiceLines(doc)
+    );
+  });
   if (!assessableDocuments.length) {
     return {
       documents,
@@ -1436,7 +1489,7 @@ export async function reviewAndCorrectExtractedDocuments(documents: CaseDoc[]): 
         reasoningEffort: getExtractionReviewReasoningEffort(),
         correctionCount: 0,
         corrections: [],
-        warnings: ["Second-pass extraction review skipped because there were no extracted documents to review."],
+        warnings: ["Second-pass extraction review skipped because the first-pass extraction was strong and produced no comparison conflicts."],
       },
     };
   }
@@ -4517,7 +4570,6 @@ async function splitPdfPagesIndividually(params: {
   pageImages: string[];
   pageCount: number;
 }) {
-  const pageGroups: PdfDocumentGroup[] = [];
   const systemPrompt =
     `Classify one page from a procurement packet PDF. Return only JSON with a top-level "documents" array. ` +
     `Each item must contain documentType and confidence. Also include documentNumber, primaryPartyName, vehicleNumber, and splitReason when visible. ` +
@@ -4528,7 +4580,10 @@ async function splitPdfPagesIndividually(params: {
     `Do not infer document type from the file name when the page image/text shows a different document. ` +
     `A page headed Delivery Challan or showing Challan No/Challan Date is Delivery Challan even if it contains PO No as a reference.`;
 
-  for (let index = 0; index < params.pageCount; index += 1) {
+  const pageGroups = await mapWithConcurrency(
+    Array.from({ length: params.pageCount }, (_, index) => index),
+    PACKET_AI_CONCURRENCY,
+    async (index) => {
     const pageNumber = index + 1;
     const pageText = params.textPages[index] || "[No text extracted]";
     const pageImage = params.pageImages[index];
@@ -4600,14 +4655,13 @@ async function splitPdfPagesIndividually(params: {
       }))
       .filter((group) => group.pageStart === pageNumber && group.pageEnd === pageNumber);
 
-    pageGroups.push(
-      ...(normalizedPageGroups.length
+      return normalizedPageGroups.length
         ? normalizedPageGroups
-        : [{ documentType: "Unknown" as DocType, pageStart: pageNumber, pageEnd: pageNumber }])
-    );
-  }
+        : [{ documentType: "Unknown" as DocType, pageStart: pageNumber, pageEnd: pageNumber }];
+    }
+  );
 
-  return compactConsecutivePdfGroups(pageGroups);
+  return compactConsecutivePdfGroups(pageGroups.flat());
 }
 
 async function splitPdfIntoDocumentGroups(params: {
@@ -4652,7 +4706,28 @@ async function splitPdfIntoDocumentGroups(params: {
     return [{ documentType: inferDocTypeFromFilename(params.fileName), pageStart: 1, pageEnd: pageCount }];
   }
 
-  const raw = params.pageImages.length
+  const raw = hasText
+    ? await callOpenRouter(
+        [
+          {
+            role: "system",
+            content: systemPrompt,
+          },
+          {
+            role: "user",
+            content:
+              `File name: ${params.fileName}\n` +
+              `There are ${params.textPages.length} pages. Identify which document is on which pages.\n\n` +
+              pageTextSummary,
+          },
+        ],
+        {
+          expectJson: true,
+          model: getQualityExtractionModel(),
+          reasoning: getQualityExtractionReasoning(),
+        }
+      )
+    : params.pageImages.length
     ? await callOpenRouter(
         [
           {
@@ -4680,23 +4755,6 @@ async function splitPdfIntoDocumentGroups(params: {
           model: getQualityExtractionModel(),
           reasoning: getQualityExtractionReasoning(),
         }
-      )
-    : hasText
-    ? await callOpenRouter(
-        [
-          {
-            role: "system",
-            content: systemPrompt,
-          },
-          {
-            role: "user",
-            content:
-              `File name: ${params.fileName}\n` +
-              `There are ${params.textPages.length} pages. Identify which document is on which pages.\n\n` +
-              pageTextSummary,
-          },
-        ],
-        { expectJson: true }
       )
     : await callOpenRouter(
         [
@@ -4754,11 +4812,9 @@ async function extractPdfDocumentGroups(params: {
   groups: PdfDocumentGroup[];
   onGroupProgress?: (details: { current: number; total: number; group: PdfDocumentGroup }) => Promise<void> | void;
 }) {
-  const documents: CaseDoc[] = [];
   const hasText = hasMeaningfulTextPages(params.textPages);
 
-  for (let index = 0; index < params.groups.length; index += 1) {
-    const group = params.groups[index];
+  return mapWithConcurrency(params.groups, PACKET_AI_CONCURRENCY, async (group, index) => {
     await params.onGroupProgress?.({
       current: index + 1,
       total: params.groups.length,
@@ -4771,18 +4827,19 @@ async function extractPdfDocumentGroups(params: {
     const groupFileName = sourceHint;
     const groupTextPages = params.textPages.slice(pageStartIndex, pageEndIndex);
     const groupPageImages = params.pageImages.slice(pageStartIndex, pageEndIndex);
+    const hasGroupText = groupTextPages.some((page) => page.replace(/\s+/g, "").length > 20);
 
     let document =
-      groupPageImages.length
-        ? await extractDataFromImagePages({
-            fileName: groupFileName,
-            pageImages: groupPageImages,
-            documentType: group.documentType,
-          })
-        : hasText && groupTextPages.some((page) => page.trim())
-          ? await extractDataFromTextPages({
+      hasText && hasGroupText
+        ? await extractDataFromTextPages({
               fileName: groupFileName,
               textPages: groupTextPages,
+              documentType: group.documentType,
+            })
+        : groupPageImages.length
+          ? await extractDataFromImagePages({
+              fileName: groupFileName,
+              pageImages: groupPageImages,
               documentType: group.documentType,
             })
           : fallbackDoc(groupFileName, group.documentType, {
@@ -4790,7 +4847,10 @@ async function extractPdfDocumentGroups(params: {
               visibleTextPages: groupTextPages,
             });
 
-    if (isWeakExtraction(document) && group.documentType !== "Unknown") {
+    const needsQualityRetry = hasGroupText
+      ? needsImageFallbackForTextExtraction(document)
+      : isWeakExtraction(document);
+    if (needsQualityRetry && group.documentType !== "Unknown") {
       const qualityModel = getQualityExtractionModel();
       const qualityReasoning = getQualityExtractionReasoning();
       const retryDocument =
@@ -4825,10 +4885,8 @@ async function extractPdfDocumentGroups(params: {
     document.sourceHint = sourceHint;
     document.sourceFileName = params.fileName;
     document.pages = Math.max(1, group.pageEnd - group.pageStart + 1);
-    documents.push(document);
-  }
-
-  return documents;
+    return document;
+  });
 }
 
 async function extractDataFromImagePages(params: {
@@ -4841,15 +4899,16 @@ async function extractDataFromImagePages(params: {
 }) {
   const allowedFieldKeys = getAllowedFieldKeysForDocType(params.documentType);
   const allowedFieldKeysText = allowedFieldKeys.join(", ");
-  const extracted: Array<{ fields: Record<string, unknown>; lineItems: CommercialLineItem[]; visibleText: string }> = [];
   const lineItemInstruction = getLineItemExtractionInstruction(params.documentType);
   const documentSpecificInstruction = getDocumentSpecificExtractionInstruction(params.documentType);
   const qualityInstruction = params.qualityRetry
     ? "This is a quality retry because the first extraction was incomplete. Re-read the page carefully, including every visible commercial item row, handwritten/manual entries, small text, IDs, stamps, QR-adjacent text, and rotated/cropped regions. If the document has an item table, return each goods or service row in lineItems with its visible description, HSN/SAC, quantity, unit, rate, taxable amount, and tax values. Do not return empty fields when any requested value is visible. "
     : "";
 
-  for (let index = 0; index < params.pageImages.length; index += 1) {
-    const image = params.pageImages[index];
+  const extracted = await mapWithConcurrency(
+    params.pageImages,
+    PACKET_AI_CONCURRENCY,
+    async (image, index) => {
     const raw = await callOpenRouter(
       [
         {
@@ -4886,12 +4945,13 @@ async function extractDataFromImagePages(params: {
     );
 
     const parsed = safeJsonParse<{ fields?: Record<string, unknown>; lineItems?: unknown; visibleText?: unknown; text?: unknown; ocrText?: unknown }>(raw, {});
-    extracted.push({
+      return {
       fields: parsed.fields ?? {},
       lineItems: sanitizeLineItems(parsed.lineItems).map((item) => ({ ...item, sourcePage: item.sourcePage ?? index + 1 })),
       visibleText: toText(parsed.visibleText) || toText(parsed.ocrText) || toText(parsed.text),
-    });
-  }
+      };
+    }
+  );
 
   const combinedFields = extracted.reduce((acc, current) => ({ ...acc, ...current.fields }), {});
   const visibleTextPages = extracted.map((page) => page.visibleText).filter(Boolean);

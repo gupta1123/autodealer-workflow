@@ -24,6 +24,7 @@ export type CashDiscountDeterministicStatus =
   | "discount_taken_within_window"
   | "receipt_amount_unverified"
   | "balance_does_not_match_narrated_discount"
+  | "existing_balance_due"
   | "late_short_payment";
 
 export type CashDiscountReversalPlan = {
@@ -57,11 +58,10 @@ export const DEFAULT_CASH_DISCOUNT_DAYS = {
 } as const;
 
 const SUPPORTED_CASH_DISCOUNT_RATES = [1.5, 1] as const;
-const EXPLICIT_CASH_DISCOUNT_CONTEXT = /(?:\bcash\s*disc(?:ount)?\b|\bc\.?\s*d\.?(?=\s|$|[:;,\-–—]))/i;
+const EXPLICIT_CASH_DISCOUNT_CONTEXT = /(?:\bcash\s*disc(?:ount)?\b|\bc\.?\s*d\.?(?=\W|$))/i;
 const GENERIC_DISCOUNT_CONTEXT = /\bdiscount\b/i;
-const PAYMENT_CONTEXT = /\b(?:pay(?:ment|able|ing)?|within|before|upto|up\s*to|days?)\b/i;
-const RATE_THEN_DAYS = /(\d{1,2}(?:\.\d{1,2})?)\s*%[\s,;:()\-–—]*(?:(?:cash\s*)?(?:discount|c\.?\s*d\.?)\s*)?(?:(?:if|when)\s+(?:the\s+)?(?:customer|client|party)?\s*(?:paid|pays?|payment\s+(?:is\s+)?received)\s*)?(?:within|in|before|upto|up\s*to)\s*(\d{1,3})\s*(?:calendar\s*)?days?\b/gi;
-const DAYS_THEN_RATE = /(?:within|in|before|upto|up\s*to)\s*(\d{1,3})\s*(?:calendar\s*)?days?[^\n.;]{0,80}?(\d{1,2}(?:\.\d{1,2})?)\s*%/gi;
+const PAYMENT_CONTEXT = /\b(?:pay(?:ment|able|ing|s|ed)?|within|before|upto|up\s*to|days?|business|working)\b/i;
+const PAIRED_RATES = /(\d{1,2}(?:\.\d{1,2})?)\s*%?\s*\/\s*(\d{1,2}(?:\.\d{1,2})?)\s*%/gi;
 const PERCENTAGE_TOKEN = /(?:^|[^\d.])(\d{1,2}(?:\.\d{1,2})?)\s*%/gi;
 
 type ParsedCashDiscountNarration = {
@@ -80,6 +80,15 @@ function moneyClose(left: number, right: number) {
   return Math.abs(left - right) <= 1;
 }
 
+function normalizeNarrationText(value: string) {
+  return value
+    .replace(/\b1\s*(?:1\s*\/\s*2|½)\s*%/gi, "1.5%")
+    .replace(/\bone[\s-]+(?:and[\s-]+)?a?[\s-]*half\s+(?:per\s*cent|percent)\b/gi, "1.5%")
+    .replace(/\bone[\s-]+point[\s-]+five\s+(?:per\s*cent|percent)\b/gi, "1.5%")
+    .replace(/\bone\s+(?:per\s*cent|percent)\b/gi, "1%")
+    .replace(/\b(\d{1,2}(?:\.\d{1,2})?)\s*(?:per\s*cent|percent|pct\.?)\b/gi, "$1%");
+}
+
 function addDays(dateText: string, days: number) {
   const date = new Date(`${dateText}T00:00:00.000Z`);
   if (Number.isNaN(date.getTime())) return null;
@@ -92,18 +101,22 @@ function isAfterDate(left: string, right: string) {
 }
 
 function normalizeTerms(terms: CashDiscountTerm[]) {
-  const byDays = new Map<number, CashDiscountTerm>();
+  const byRate = new Map<number, CashDiscountTerm>();
   for (const term of terms) {
     const ratePercent = Number(term.ratePercent);
     const eligibilityDays = Math.trunc(Number(term.eligibilityDays));
     if (!Number.isFinite(ratePercent) || !Number.isFinite(eligibilityDays)) continue;
     if (!isSupportedCashDiscountRate(ratePercent) || eligibilityDays < 0 || eligibilityDays > 365) continue;
-    const existing = byDays.get(eligibilityDays);
-    if (!existing || ratePercent > existing.ratePercent) {
-      byDays.set(eligibilityDays, { ratePercent, eligibilityDays, periodSource: term.periodSource });
+    const existing = byRate.get(ratePercent);
+    if (!existing || (existing.periodSource === "default" && term.periodSource === "explicit")) {
+      byRate.set(ratePercent, {
+        ratePercent,
+        eligibilityDays,
+        periodSource: term.periodSource,
+      });
     }
   }
-  return Array.from(byDays.values()).sort(
+  return Array.from(byRate.values()).sort(
     (left, right) => left.eligibilityDays - right.eligibilityDays || right.ratePercent - left.ratePercent
   );
 }
@@ -144,7 +157,10 @@ export function currentCashDiscountEligibility(input: {
   if (!invoiceDate || !Number.isFinite(input.originalAmount) || input.originalAmount <= 0) return null;
 
   const eligible = normalizeTerms(input.terms)
-    .map((term) => ({ term, discountDeadline: addDays(invoiceDate, term.eligibilityDays) }))
+    .map((term) => ({
+      term,
+      discountDeadline: addDays(invoiceDate, term.eligibilityDays),
+    }))
     .filter((entry): entry is { term: CashDiscountTerm; discountDeadline: string } => Boolean(entry.discountDeadline))
     .filter((entry) => !isAfterDate(input.today, entry.discountDeadline));
   if (eligible.length === 0) return null;
@@ -225,11 +241,12 @@ function createUnpaidReversalPlan(input: {
 }
 
 /**
- * Extract the supported 1% and 1.5% cash-discount terms. An explicit payment
- * period wins; otherwise the centrally configured default period is applied.
+ * Detect only the supported 1% and 1.5% rates from the narration. Written day
+ * counts are intentionally ignored: this client's fixed windows are always
+ * 7 calendar days for 1.5% and 15 calendar days for 1%.
  */
 export function parseCashDiscountNarration(sourceNarration: string | null | undefined): ParsedCashDiscountNarration {
-  const narration = String(sourceNarration ?? "").replace(/\s+/g, " ").trim();
+  const narration = normalizeNarrationText(String(sourceNarration ?? "")).replace(/\s+/g, " ").trim();
   const matchedCashDiscountContext = matchedContextLabel(narration);
   const hasCashDiscountContext = Boolean(matchedCashDiscountContext);
   if (!narration || !hasCashDiscountContext) {
@@ -242,26 +259,14 @@ export function parseCashDiscountNarration(sourceNarration: string | null | unde
     };
   }
 
-  const percentages = uniqueNumbers(Array.from(narration.matchAll(PERCENTAGE_TOKEN), (match) => Number(match[1])));
+  const pairedMatches = Array.from(narration.matchAll(PAIRED_RATES));
+  const percentages = uniqueNumbers([
+    ...Array.from(narration.matchAll(PERCENTAGE_TOKEN), (match) => Number(match[1])),
+    ...pairedMatches.flatMap((match) => [Number(match[1]), Number(match[2])]),
+  ]);
   const supportedRates = percentages.filter(isSupportedCashDiscountRate);
   const unsupportedRates = percentages.filter((rate) => !isSupportedCashDiscountRate(rate));
-  const explicitTerms: CashDiscountTerm[] = [];
-  for (const match of narration.matchAll(RATE_THEN_DAYS)) {
-    const ratePercent = Number(match[1]);
-    if (isSupportedCashDiscountRate(ratePercent)) {
-      explicitTerms.push({ ratePercent, eligibilityDays: Number(match[2]), periodSource: "explicit" });
-    }
-  }
-  for (const match of narration.matchAll(DAYS_THEN_RATE)) {
-    const ratePercent = Number(match[2]);
-    if (isSupportedCashDiscountRate(ratePercent)) {
-      explicitTerms.push({ ratePercent, eligibilityDays: Number(match[1]), periodSource: "explicit" });
-    }
-  }
-
-  const ratesWithExplicitPeriods = new Set(explicitTerms.map((term) => term.ratePercent));
   const defaultedTerms = supportedRates
-    .filter((ratePercent) => !ratesWithExplicitPeriods.has(ratePercent))
     .map((ratePercent) => ({
       ratePercent,
       eligibilityDays: DEFAULT_CASH_DISCOUNT_DAYS[ratePercent],
@@ -273,7 +278,7 @@ export function parseCashDiscountNarration(sourceNarration: string | null | unde
     hasCashDiscountContext,
     supportedRates,
     unsupportedRates,
-    terms: normalizeTerms([...explicitTerms, ...defaultedTerms]),
+    terms: normalizeTerms(defaultedTerms),
   };
 }
 
@@ -300,7 +305,14 @@ export function analyseCashDiscountNarration(input: {
   const matchedReceiptAmount = Number.isFinite(Number(input.matchedReceiptAmount))
     ? asMoney(Number(input.matchedReceiptAmount))
     : null;
-  const discountDeadline = invoiceDate && finalEligibilityDays !== null ? addDays(invoiceDate, finalEligibilityDays) : null;
+  const discountDeadlines = invoiceDate
+    ? terms
+        .map((term) => addDays(invoiceDate, term.eligibilityDays))
+        .filter((value): value is string => Boolean(value))
+    : [];
+  const discountDeadline = discountDeadlines.length > 0
+    ? discountDeadlines.sort((left, right) => left.localeCompare(right)).at(-1) ?? null
+    : null;
   const expectedDiscounts = terms.map((term) => ({
     ratePercent: term.ratePercent,
     amount: asMoney((input.originalAmount * term.ratePercent) / 100),
@@ -425,7 +437,7 @@ export function analyseCashDiscountNarration(input: {
 
   return {
     ...base,
-    deterministicStatus: "late_short_payment",
-    deterministicReason: `The final narrated discount window expired on ${discountDeadline}, and the outstanding balance equals the ${matchedDiscount.ratePercent}% narrated discount.`,
+    deterministicStatus: "existing_balance_due",
+    deterministicReason: `The final narrated discount window expired on ${discountDeadline}. The ${matchedDiscount.ratePercent}% amount is already outstanding on the original invoice, so it should be collected without creating another debit note.`,
   };
 }

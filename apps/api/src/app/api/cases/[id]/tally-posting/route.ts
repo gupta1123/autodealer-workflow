@@ -24,6 +24,7 @@ import {
   type PurchasePostingMasterInput,
   type PurchasePostingReview,
 } from "@/lib/tally/purchase-posting";
+import { suggestPurchaseLineMasters } from "@/lib/tally/purchase-master-matching";
 
 type PostingRow = {
   id: string;
@@ -67,15 +68,16 @@ type LoadedContext = {
   connectionStatus: ReturnType<typeof serializeTallyConnectionStatus> | null;
   liveCompanies: Array<{ companyName: string; isActive: boolean }>;
   selectedCompanyName: string | null;
-  syncRun: {
-    id: string;
-    company_name: string | null;
-    company_gstin: string | null;
-    company_state_code: string | null;
-    totals: Record<string, unknown>;
-    completed_at: string;
-  } | null;
   masters: PurchasePostingMasterInput[];
+  liveMasterCommandId: string | null;
+  liveMasterFetchedAt: string | null;
+  liveMasterTotals: Record<string, unknown>;
+  masterSource: "live_purchase" | "synced_fallback" | null;
+  liveCompanyProfile: {
+    name: string | null;
+    gstin: string | null;
+    stateCode: string | null;
+  } | null;
   mappings: PurchasePostingMappingInput[];
   posting: PostingRow | null;
   sourceFileId: string | null;
@@ -83,7 +85,7 @@ type LoadedContext = {
   purchaseAccountingSettings: PurchaseAccountingSettings;
 };
 
-const MASTER_SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const MASTER_SNAPSHOT_MAX_AGE_MS = 15 * 60 * 1000;
 
 function isPostingLocked(status: string | null | undefined) {
   return ["approved", "queued", "creating", "created", "verification_required"].includes(status ?? "");
@@ -95,20 +97,13 @@ function isFreshTimestamp(value: string | null | undefined, maxAgeMs: number) {
   return Number.isFinite(timestamp) && Date.now() - timestamp <= maxAgeMs;
 }
 
-function hasCompleteMasterSnapshot(context: Pick<LoadedContext, "syncRun" | "masters">) {
-  if (!context.syncRun) return false;
-  const totals = context.syncRun.totals ?? {};
-  const reportedTypes = [
-    "ledger",
-    "group",
-    "stock_item",
-    "unit",
-    "voucher_type",
-    "gst_ledger",
-    "tax_ledger",
-  ];
+function hasCompleteMasterSnapshot(context: Pick<LoadedContext, "liveMasterFetchedAt" | "liveMasterTotals" | "masters">) {
+  if (!context.liveMasterFetchedAt) return false;
+  const totals = context.liveMasterTotals ?? {};
   return (
-    reportedTypes.every((type) => Object.prototype.hasOwnProperty.call(totals, type)) &&
+    ["ledger", "group", "stock_item", "unit"].every((type) =>
+      Object.prototype.hasOwnProperty.call(totals, type)
+    ) &&
     context.masters.some((master) => master.master_type === "ledger")
   );
 }
@@ -214,9 +209,13 @@ function preferredLiveConnection(
 
 function getSourceFile(
   documents: PurchasePostingDocumentInput[],
-  files: LoadedContext["files"]
+  files: LoadedContext["files"],
+  selectedInvoiceDocumentId?: string | null
 ) {
-  const invoice = getCanonicalInvoiceDocuments(documents)[0];
+  const canonicalInvoices = getCanonicalInvoiceDocuments(documents);
+  const invoice = canonicalInvoices.find((candidate) =>
+    selectedInvoiceDocumentId && candidate.id === selectedInvoiceDocumentId
+  ) ?? canonicalInvoices[0];
   if (!invoice) return null;
   const sourceName = normalizeFileName(invoice.source_file_name);
   if (sourceName) {
@@ -249,6 +248,7 @@ function asSavedReview(value: unknown): Partial<PurchasePostingReview> | null {
   const input = value as Record<string, unknown>;
   const output: Record<string, unknown> = {};
   const stringKeys = [
+    "selectedInvoiceDocumentId",
     "invoiceNumber",
     "invoiceDate",
     "voucherDate",
@@ -268,6 +268,8 @@ function asSavedReview(value: unknown): Partial<PurchasePostingReview> | null {
     "freightLedgerName",
     "tds194qLedgerName",
     "tds194qRate",
+    "tds194qBasisAmount",
+    "tds194qRounding",
     "transportTdsLedgerName",
     "transportTdsRate",
     "cgstTdsLedgerName",
@@ -287,7 +289,7 @@ function asSavedReview(value: unknown): Partial<PurchasePostingReview> | null {
       output[key] = input[key].trim().slice(0, key === "narration" ? 2000 : 300);
     }
   }
-  for (const key of ["tcsReceivable", "sourceReferenceApproved"] as const) {
+  for (const key of ["applyTds194q", "tcsReceivable", "sourceReferenceApproved"] as const) {
     if (typeof input[key] === "boolean") output[key] = input[key];
   }
   if (Array.isArray(input.lines)) {
@@ -333,8 +335,8 @@ function serializePosting(
     commandId: row.command_id,
     status: row.status,
     revision: row.revision,
-    companyName: context.syncRun?.company_name ?? null,
-    companyGstin: context.syncRun?.company_gstin ?? null,
+    companyName: context.selectedCompanyName ?? null,
+    companyGstin: context.liveCompanyProfile?.gstin ?? null,
     invoiceNumber: prepared.review?.invoiceNumber ?? null,
     supplierGstin: prepared.review?.supplierGstin ?? null,
     approvedAt: row.approved_at,
@@ -354,6 +356,7 @@ function serializePosting(
 }
 
 function masterOption(master: PurchasePostingMasterInput) {
+  const raw = master.raw_payload ?? {};
   return {
     id: master.id,
     type: master.master_type,
@@ -364,7 +367,207 @@ function masterOption(master: PurchasePostingMasterInput) {
     hsnCode: master.hsn_code,
     unitName: master.unit_name,
     taxRate: master.tax_rate,
+    groupPath: master.group_path ?? master.parent_name,
+    taxType: typeof raw.taxType === "string" ? raw.taxType : null,
+    gstDutyHead: typeof raw.gstDutyHead === "string" ? raw.gstDutyHead : null,
   };
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function textValue(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function numberValue(value: unknown) {
+  const parsed = typeof value === "number" ? value : Number(String(value ?? "").replace(/%/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function livePurchaseMasters(resultValue: unknown): {
+  companyName: string | null;
+  fetchedAt: string | null;
+  totals: Record<string, unknown>;
+  companyProfile: LoadedContext["liveCompanyProfile"];
+  masters: PurchasePostingMasterInput[];
+} | null {
+  const result = recordValue(resultValue);
+  const mastersValue = recordValue(result?.masters);
+  if (!result || result.source !== "live_tally" || !mastersValue) return null;
+
+  const groups = Array.isArray(mastersValue.groups) ? mastersValue.groups : [];
+  const groupParentByName = new Map<string, string | null>();
+  for (const value of groups) {
+    const row = recordValue(value);
+    const name = textValue(row?.name);
+    if (name) groupParentByName.set(normalizeCompanyName(name), textValue(row?.parent));
+  }
+  const groupPath = (parentValue: unknown) => {
+    const path: string[] = [];
+    const visited = new Set<string>();
+    let current = textValue(parentValue);
+    while (current && path.length < 20) {
+      const key = normalizeCompanyName(current);
+      if (!key || visited.has(key)) break;
+      visited.add(key);
+      path.unshift(current);
+      current = groupParentByName.get(key) ?? null;
+    }
+    return path.join(" > ") || null;
+  };
+
+  const convert = (values: unknown, masterType: "ledger" | "group" | "stock_item" | "unit") =>
+    (Array.isArray(values) ? values : []).flatMap((value, index) => {
+      const row = recordValue(value);
+      const name = textValue(row?.name);
+      if (!row || !name) return [];
+      const raw = recordValue(row.raw) ?? {};
+      const guid = textValue(row.guid);
+      return [{
+        id: guid || `live:${masterType}:${index}:${normalizeCompanyName(name)}`,
+        master_type: masterType,
+        master_key: guid || normalizeCompanyName(name),
+        tally_name: name,
+        parent_name: textValue(row.parent),
+        gstin: textValue(row.gstin),
+        hsn_code: textValue(row.hsnCode),
+        unit_name: textValue(row.unitName),
+        tax_rate: numberValue(row.taxRate),
+        group_path: groupPath(row.parent),
+        raw_payload: raw,
+        is_active: true,
+      } satisfies PurchasePostingMasterInput];
+    });
+
+  const profile = recordValue(result.companyProfile);
+  return {
+    companyName: textValue(result.companyName),
+    fetchedAt: textValue(result.fetchedAt),
+    totals: recordValue(result.totals) ?? {},
+    companyProfile: profile ? {
+      name: textValue(profile.name),
+      gstin: textValue(profile.gstin),
+      stateCode: textValue(profile.stateCode),
+    } : null,
+    masters: [
+      ...convert(mastersValue.ledgers, "ledger"),
+      ...convert(mastersValue.groups, "group"),
+      ...convert(mastersValue.stockItems, "stock_item"),
+      ...convert(mastersValue.units, "unit"),
+    ],
+  };
+}
+
+type PurchaseMappingProposal = PurchasePostingMappingInput & {
+  source_label: string;
+  target_master_type: string;
+  target_master_key: string;
+};
+
+function purchaseMappingProposals(
+  context: LoadedContext,
+  review: Partial<PurchasePostingReview>,
+  prepared: ReturnType<typeof preparePurchasePosting>
+): PurchaseMappingProposal[] {
+  const proposals: PurchaseMappingProposal[] = [];
+  const seen = new Set<string>();
+  const masterByName = new Map(
+    context.masters.map((master) => [normalizeCompanyName(master.tally_name), master])
+  );
+  const add = (mappingType: string, sourceKey: string, sourceLabel: string, targetName: unknown) => {
+    const target = masterByName.get(normalizeCompanyName(targetName));
+    const cleanSourceKey = String(sourceKey ?? "").trim().slice(0, 240);
+    if (!target || !cleanSourceKey) return;
+    const key = `${mappingType}:${normalizeCompanyName(cleanSourceKey)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    proposals.push({
+      mapping_type: mappingType,
+      source_key: cleanSourceKey,
+      source_label: sourceLabel.slice(0, 500),
+      target_master_type: target.master_type,
+      target_master_key: target.master_key,
+      target_master_name: target.tally_name,
+      status: "active",
+    });
+  };
+
+  if (review.supplierLedgerName) {
+    add(
+      "supplier_gstin",
+      review.supplierGstin || review.supplierName || "",
+      review.supplierName || review.supplierGstin || "Invoice supplier",
+      review.supplierLedgerName
+    );
+  }
+
+  const calculation = prepared.calculation;
+  const geography = calculation?.taxMode === "cgst_sgst"
+    ? "local"
+    : calculation?.taxMode === "igst"
+      ? "interstate"
+      : null;
+  const hasAmount = (value: unknown) => {
+    const amount = Number(String(value ?? "").replace(/,/g, ""));
+    return Number.isFinite(amount) && Math.abs(amount) > 0.000001;
+  };
+  for (const line of review.lines ?? []) {
+    const hsn = String(line.hsn ?? "").replace(/\D/g, "").slice(0, 8);
+    const material = hsn.startsWith("7204") ? "ms_scrap" : hsn === "72031000" ? "sponge_iron" : "unknown";
+    if (line.stockItemName) {
+      add(
+        hsn ? "item_hsn" : "item_description",
+        hsn || line.description,
+        line.description || hsn || "Invoice item",
+        line.stockItemName
+      );
+    }
+    if (line.purchaseLedgerName && material !== "unknown" && geography) {
+      add(
+        "purchase_ledger",
+        `${material}:${geography}`,
+        `${line.description || material} · ${geography} purchase`,
+        line.purchaseLedgerName
+      );
+    }
+  }
+
+  const gstRate = Number(review.gstRate || 0);
+  if (gstRate > 0 && calculation?.taxMode === "cgst_sgst") {
+    if (review.cgstLedgerName) add("gst_rate", `cgst:${gstRate / 2}`, `Input CGST ${gstRate / 2}%`, review.cgstLedgerName);
+    if (review.sgstLedgerName) add("gst_rate", `sgst:${gstRate / 2}`, `Input SGST ${gstRate / 2}%`, review.sgstLedgerName);
+  } else if (gstRate > 0 && calculation?.taxMode === "igst" && review.igstLedgerName) {
+    add("gst_rate", `igst:${gstRate}`, `Input IGST ${gstRate}%`, review.igstLedgerName);
+  }
+  if (hasAmount(calculation?.freightAmount) && review.freightLedgerName) {
+    add("freight_ledger", "purchase", "Purchase freight", review.freightLedgerName);
+  }
+  if (hasAmount(calculation?.tds194qAmount) && review.tds194qLedgerName) {
+    add("tds_ledger", "194q", "Purchase TDS 194Q", review.tds194qLedgerName);
+  }
+  if (hasAmount(calculation?.transportTdsAmount) && review.transportTdsLedgerName) {
+    add("tds_ledger", "transport", "Transport TDS", review.transportTdsLedgerName);
+  }
+  if (hasAmount(calculation?.cgstTdsAmount) && review.cgstTdsLedgerName) {
+    add("tds_ledger", "cgst_tds", "CGST TDS", review.cgstTdsLedgerName);
+  }
+  if (hasAmount(calculation?.sgstTdsAmount) && review.sgstTdsLedgerName) {
+    add("tds_ledger", "sgst_tds", "SGST TDS", review.sgstTdsLedgerName);
+  }
+  if (hasAmount(calculation?.igstTdsAmount) && review.igstTdsLedgerName) {
+    add("tds_ledger", "igst_tds", "IGST TDS", review.igstTdsLedgerName);
+  }
+  if (review.tcsReceivable && hasAmount(calculation?.tcsAmount) && review.tcsLedgerName) {
+    add("tcs_ledger", "receivable", "TCS receivable", review.tcsLedgerName);
+  }
+  if (hasAmount(calculation?.roundOffAmount) && review.roundOffLedgerName) {
+    add("round_off_ledger", "purchase", "Purchase round-off", review.roundOffLedgerName);
+  }
+  return proposals;
 }
 
 async function loadContext(
@@ -487,27 +690,24 @@ async function loadContext(
     null;
   const companyName = selectedCompanyName;
 
-  let syncRun: LoadedContext["syncRun"] = null;
   let masters: PurchasePostingMasterInput[] = [];
   let mappings: PurchasePostingMappingInput[] = [];
+  let liveMasterCommandId: string | null = null;
+  let liveMasterFetchedAt: string | null = null;
+  let liveMasterTotals: Record<string, unknown> = {};
+  let liveCompanyProfile: LoadedContext["liveCompanyProfile"] = null;
+  let masterSource: LoadedContext["masterSource"] = null;
   if (connection && companyName) {
-    const [syncResult, mastersResult, mappingsResult] = await Promise.all([
+    const [liveMastersResult, mappingsResult] = await Promise.all([
       supabase
-        .from("tally_master_sync_runs")
-        .select("id, company_name, company_gstin, company_state_code, totals, completed_at")
+        .from("tally_bridge_commands")
+        .select("id, result, completed_at")
         .eq("connection_id", connection.id)
-        .ilike("company_name", companyName)
-        .eq("status", "completed")
+        .eq("owner_user_id", ownerUserId)
+        .eq("command_type", "fetch_purchase_masters")
+        .eq("status", "succeeded")
         .order("completed_at", { ascending: false })
-        .limit(1)
-        .maybeSingle(),
-      supabase
-        .from("tally_masters")
-        .select("id, master_type, master_key, tally_name, parent_name, gstin, hsn_code, unit_name, tax_rate, is_active")
-        .eq("connection_id", connection.id)
-        .ilike("company_name", companyName)
-        .eq("is_active", true)
-        .order("tally_name", { ascending: true }),
+        .limit(10),
       supabase
         .from("tally_mapping_settings")
         .select("mapping_type, source_key, target_master_name, status")
@@ -515,15 +715,74 @@ async function loadContext(
         .ilike("company_name", companyName)
         .eq("status", "active"),
     ]);
-    if (syncResult.error) throw syncResult.error;
-    if (mastersResult.error) throw mastersResult.error;
+    if (liveMastersResult.error) throw liveMastersResult.error;
     if (mappingsResult.error) throw mappingsResult.error;
-    syncRun = syncResult.data;
-    masters = (mastersResult.data ?? []) as PurchasePostingMasterInput[];
+    for (const row of liveMastersResult.data ?? []) {
+      const live = livePurchaseMasters(row.result);
+      if (
+        live &&
+        normalizeCompanyName(live.companyName) === normalizeCompanyName(companyName)
+      ) {
+        liveMasterCommandId = row.id;
+        liveMasterFetchedAt = live.fetchedAt ?? row.completed_at;
+        liveMasterTotals = live.totals;
+        liveCompanyProfile = live.companyProfile;
+        masters = live.masters;
+        masterSource = "live_purchase";
+        break;
+      }
+    }
     mappings = (mappingsResult.data ?? []) as PurchasePostingMappingInput[];
+
+    if (masters.length === 0) {
+      const pageSize = 1000;
+      for (let from = 0; from < 20_000; from += pageSize) {
+        const { data, error } = await supabase
+          .from("tally_masters")
+          .select("*")
+          .eq("connection_id", connection.id)
+          .eq("owner_user_id", ownerUserId)
+          .eq("company_name", companyName)
+          .eq("is_active", true)
+          .in("master_type", ["ledger", "group", "stock_item", "unit", "gst_ledger", "tax_ledger"])
+          .order("master_type", { ascending: true })
+          .order("tally_name", { ascending: true })
+          .range(from, from + pageSize - 1);
+        if (error) throw error;
+        const page = (data ?? []) as unknown as PurchasePostingMasterInput[];
+        masters.push(...page);
+        if (page.length < pageSize) break;
+        if (from + pageSize >= 20_000) {
+          throw new Error("Tally master list exceeds the supported 20,000-master safety limit.");
+        }
+      }
+      if (masters.length > 0) {
+        masterSource = "synced_fallback";
+        liveMasterTotals = masters.reduce<Record<string, number>>((totals, master) => {
+          totals[master.master_type] = (totals[master.master_type] ?? 0) + 1;
+          return totals;
+        }, {});
+        const { data: latestRun, error: latestRunError } = await supabase
+          .from("tally_master_sync_runs")
+          .select("id, completed_at")
+          .eq("connection_id", connection.id)
+          .eq("owner_user_id", ownerUserId)
+          .eq("company_name", companyName)
+          .order("completed_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (latestRunError) throw latestRunError;
+        liveMasterCommandId = latestRun?.id ?? "synced-fallback";
+        liveMasterFetchedAt = latestRun?.completed_at ?? null;
+      }
+    }
   }
 
-  const sourceFile = getSourceFile(documents, files);
+  const sourceFile = getSourceFile(
+    documents,
+    files,
+    asSavedReview(posting?.review_patch)?.selectedInvoiceDocumentId
+  );
   const webBase = String(
     process.env.WEB_BASE_URL ||
     process.env.NEXT_PUBLIC_WEB_BASE_URL ||
@@ -543,8 +802,12 @@ async function loadContext(
     connectionStatus,
     liveCompanies,
     selectedCompanyName,
-    syncRun,
     masters,
+    liveMasterCommandId,
+    liveMasterFetchedAt,
+    liveMasterTotals,
+    masterSource,
+    liveCompanyProfile,
     mappings,
     posting,
     sourceFileId: sourceFile?.id ?? null,
@@ -571,11 +834,61 @@ async function hasDuplicateClaim(params: {
   return (data ?? []).length > 0;
 }
 
-async function prepareContext(context: LoadedContext, ownerUserId: string, savedReview?: Partial<PurchasePostingReview> | null) {
+function prepareLoadedContext(
+  context: LoadedContext,
+  savedReview: Partial<PurchasePostingReview> | null | undefined,
+  duplicateExists: boolean
+) {
   const companyName = context.selectedCompanyName ?? "";
   const activeCompanyName = context.connectionStatus?.lastCompanyName ?? "";
-  const companyGstin = context.syncRun?.company_gstin ?? "";
-  const source = getCanonicalInvoiceDocuments(context.documents)[0];
+  const companyGstin = context.liveCompanyProfile?.gstin ?? "";
+  const masterSnapshotComplete = hasCompleteMasterSnapshot(context);
+  const selectedSourceFile = getSourceFile(
+    context.documents,
+    context.files,
+    savedReview?.selectedInvoiceDocumentId
+  );
+  const webBase = String(
+    process.env.WEB_BASE_URL ||
+    process.env.NEXT_PUBLIC_WEB_BASE_URL ||
+    "http://localhost:3000"
+  ).replace(/\/$/, "");
+  const selectedSourceReference = selectedSourceFile
+    ? `${webBase}/cases/${context.caseRow.id}?sourceFileId=${encodeURIComponent(selectedSourceFile.id)}`
+    : null;
+  return preparePurchasePosting({
+    documents: context.documents,
+    masters: context.masters,
+    mappings: context.mappings,
+    savedReview,
+    caseStatus: context.caseRow.status,
+    connectionReady: Boolean(
+      context.connectionStatus?.bridgeConnected &&
+      context.connectionStatus?.tallyReachable &&
+      context.connectionStatus?.companyLoaded &&
+      companyName &&
+      normalizeCompanyName(companyName) ===
+        normalizeCompanyName(activeCompanyName)
+    ),
+    masterDataReady: Boolean(
+      context.liveMasterCommandId &&
+      isFreshTimestamp(context.liveMasterFetchedAt, MASTER_SNAPSHOT_MAX_AGE_MS) &&
+      masterSnapshotComplete
+    ),
+    companyName,
+    companyGstin,
+    sourceDocumentReference: selectedSourceReference,
+    duplicateExists,
+    accountingSettings: context.purchaseAccountingSettings,
+  });
+}
+
+async function prepareContext(context: LoadedContext, ownerUserId: string, savedReview?: Partial<PurchasePostingReview> | null) {
+  const companyGstin = context.liveCompanyProfile?.gstin ?? "";
+  const canonicalInvoices = getCanonicalInvoiceDocuments(context.documents);
+  const source = canonicalInvoices.find((candidate) =>
+    savedReview?.selectedInvoiceDocumentId === candidate.id
+  ) ?? canonicalInvoices[0];
   const sourceFields = source?.extracted_fields && typeof source.extracted_fields === "object"
     ? source.extracted_fields as Record<string, unknown>
     : {};
@@ -585,36 +898,10 @@ async function prepareContext(context: LoadedContext, ownerUserId: string, saved
     ? duplicateKey(companyGstin, draftSupplier, draftInvoice)
     : null;
   const duplicateExists = await hasDuplicateClaim({ context, ownerUserId, duplicate });
-  const masterSnapshotComplete = hasCompleteMasterSnapshot(context);
   return {
-    prepared: preparePurchasePosting({
-      documents: context.documents,
-      masters: context.masters,
-      mappings: context.mappings,
-      savedReview,
-      caseStatus: context.caseRow.status,
-      connectionReady: Boolean(
-        context.connectionStatus?.bridgeConnected &&
-        context.connectionStatus?.tallyReachable &&
-        context.connectionStatus?.companyLoaded &&
-        companyName &&
-        normalizeCompanyName(companyName) ===
-          normalizeCompanyName(activeCompanyName)
-      ),
-      masterDataReady: Boolean(
-        context.syncRun?.id &&
-        context.syncRun.company_name &&
-        context.syncRun.company_name.trim().toLowerCase() === companyName.trim().toLowerCase() &&
-        isFreshTimestamp(context.syncRun.completed_at, MASTER_SNAPSHOT_MAX_AGE_MS) &&
-        masterSnapshotComplete
-      ),
-      companyName,
-      companyGstin,
-      sourceDocumentReference: context.sourceDocumentReference,
-      duplicateExists,
-      accountingSettings: context.purchaseAccountingSettings,
-    }),
+    prepared: prepareLoadedContext(context, savedReview, duplicateExists),
     duplicate,
+    duplicateExists,
   };
 }
 
@@ -646,6 +933,7 @@ function responseBody(context: LoadedContext, prepared: Awaited<ReturnType<typeo
     eligibility: {
       eligible: prepared.eligible,
       canonicalInvoiceCount: prepared.canonicalInvoiceCount,
+      invoiceCandidates: prepared.invoiceCandidates,
     },
     selectedConnectionId: context.connection?.id ?? null,
     selectedCompanyName: context.selectedCompanyName,
@@ -664,16 +952,17 @@ function responseBody(context: LoadedContext, prepared: Awaited<ReturnType<typeo
       tallyReachable: context.connectionStatus.tallyReachable,
       companyLoaded: context.connectionStatus.companyLoaded,
       lastHeartbeatAt: context.connectionStatus.lastHeartbeatAt,
-      masterSyncRunId: context.syncRun?.id ?? null,
-      masterSyncedAt: context.syncRun?.completed_at ?? null,
+      masterSyncRunId: context.liveMasterCommandId,
+      masterSyncedAt: context.liveMasterFetchedAt,
       masterSnapshotFresh: isFreshTimestamp(
-        context.syncRun?.completed_at,
+        context.liveMasterFetchedAt,
         MASTER_SNAPSHOT_MAX_AGE_MS
       ),
       masterSnapshotComplete: hasCompleteMasterSnapshot(context),
-      masterTotals: context.syncRun?.totals ?? {},
-      companyGstin: context.syncRun?.company_gstin ?? null,
-      companyStateCode: context.syncRun?.company_state_code ?? null,
+      masterTotals: context.liveMasterTotals,
+      masterSource: context.masterSource,
+      companyGstin: context.liveCompanyProfile?.gstin ?? null,
+      companyStateCode: context.liveCompanyProfile?.stateCode ?? null,
     } : null,
     sourceFileId: context.sourceFileId,
     sourceDocumentReference: context.sourceDocumentReference,
@@ -766,10 +1055,32 @@ export async function PATCH(request: Request, contextParam: { params: Promise<{ 
     if (!context.connection) {
       return jsonWithCors(request, { error: "Select the exact Tally company before saving this review." }, { status: 409 });
     }
-    const [{ prepared: defaults }, { prepared, duplicate }] = await Promise.all([
+    const [defaultsResult, preliminaryResult] = await Promise.all([
       prepareContext(context, user.id),
       prepareContext(context, user.id, requestedReview),
     ]);
+    const mappingProposals = purchaseMappingProposals(
+      context,
+      requestedReview,
+      preliminaryResult.prepared
+    );
+    const proposalKeys = new Set(
+      mappingProposals.map((mapping) => `${mapping.mapping_type}:${normalizeCompanyName(mapping.source_key)}`)
+    );
+    const effectiveContext: LoadedContext = {
+      ...context,
+      mappings: [
+        ...mappingProposals,
+        ...context.mappings.filter((mapping) =>
+          !proposalKeys.has(`${mapping.mapping_type}:${normalizeCompanyName(mapping.source_key)}`)
+        ),
+      ],
+    };
+    const defaults = defaultsResult.prepared;
+    const duplicate = preliminaryResult.duplicate;
+    const prepared = mappingProposals.length > 0
+      ? prepareLoadedContext(effectiveContext, requestedReview, preliminaryResult.duplicateExists)
+      : preliminaryResult.prepared;
     if (!prepared.source || !prepared.review) {
       return jsonWithCors(request, responseBody(context, prepared), { status: 409 });
     }
@@ -780,7 +1091,7 @@ export async function PATCH(request: Request, contextParam: { params: Promise<{ 
       invoice_document_id: prepared.source.documentId,
       owner_user_id: user.id,
       connection_id: context.connection?.id ?? null,
-      master_sync_run_id: context.syncRun?.id ?? null,
+      master_sync_run_id: null,
       command_id: null,
       status: prepared.suggestedStatus,
       revision: nextRevision,
@@ -807,6 +1118,27 @@ export async function PATCH(request: Request, contextParam: { params: Promise<{ 
           .select("*")
           .single();
     if (result.error) throw result.error;
+    if (mappingProposals.length > 0) {
+      const { error: mappingError } = await context.supabase
+        .from("tally_mapping_settings")
+        .upsert(
+          mappingProposals.map((mapping) => ({
+            connection_id: context.connection!.id,
+            owner_user_id: user.id,
+            company_name: context.selectedCompanyName ?? "Unknown company",
+            mapping_type: mapping.mapping_type,
+            source_key: mapping.source_key,
+            source_label: mapping.source_label,
+            target_master_type: mapping.target_master_type,
+            target_master_key: mapping.target_master_key,
+            target_master_name: mapping.target_master_name,
+            status: "active",
+            notes: "Confirmed from Purchase posting review.",
+          })),
+          { onConflict: "connection_id,company_name,mapping_type,source_key" }
+        );
+      if (mappingError) throw mappingError;
+    }
     const posting = result.data as PostingRow;
     const refreshed = await loadContext(
       id,
@@ -837,11 +1169,52 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     const { id } = await contextParam.params;
     const body = await request.json().catch(() => ({}));
+    if (body.action === "match_purchase_masters") {
+      const requestedConnectionId = typeof body.connectionId === "string" ? body.connectionId : null;
+      const requestedCompanyName = typeof body.companyName === "string" ? body.companyName : null;
+      const context = await loadContext(id, user.id, requestedConnectionId, requestedCompanyName);
+      if (
+        !context.connection ||
+        !hasCompleteMasterSnapshot(context) ||
+        !isFreshTimestamp(context.liveMasterFetchedAt, MASTER_SNAPSHOT_MAX_AGE_MS)
+      ) {
+        return jsonWithCors(request, { error: "Refresh the live Tally company data before matching invoice items." }, { status: 409 });
+      }
+      const review = asSavedReview(body.review);
+      const lines = Array.isArray(review?.lines) ? review.lines.slice(0, 50) : [];
+      const unresolved = lines.filter((line) =>
+        !line.stockItemName?.trim() || !line.purchaseLedgerName?.trim()
+      );
+      if (unresolved.length === 0) {
+        return jsonWithCors(request, { lineMasterMatches: [] });
+      }
+      const supplierStateCode = String(review?.supplierGstin ?? "").match(/^\d{2}/)?.[0] ?? null;
+      const buyerStateCode = String(context.liveCompanyProfile?.gstin ?? review?.buyerGstin ?? "").match(/^\d{2}/)?.[0] ?? null;
+      const lineMasterMatches = await suggestPurchaseLineMasters({
+        lines: unresolved.map((line) => ({
+          lineId: line.lineId,
+          description: line.description ?? "",
+          hsn: line.hsn ?? "",
+          unit: line.unit ?? "",
+          supplierStateCode,
+          buyerStateCode,
+          needsStockItem: !line.stockItemName?.trim(),
+          needsPurchaseLedger: !line.purchaseLedgerName?.trim(),
+        })),
+        stockItems: context.masters.filter((master) => master.master_type === "stock_item"),
+        ledgers: dedupeLedgerMasters(context.masters),
+      });
+      return jsonWithCors(request, { lineMasterMatches });
+    }
     if (body.action === "match_supplier_ledger") {
       const requestedConnectionId = typeof body.connectionId === "string" ? body.connectionId : null;
       const requestedCompanyName = typeof body.companyName === "string" ? body.companyName : null;
       const context = await loadContext(id, user.id, requestedConnectionId, requestedCompanyName);
-      if (!context.connection || !context.syncRun || !hasCompleteMasterSnapshot(context)) {
+      if (
+        !context.connection ||
+        !hasCompleteMasterSnapshot(context) ||
+        !isFreshTimestamp(context.liveMasterFetchedAt, MASTER_SNAPSHOT_MAX_AGE_MS)
+      ) {
         return jsonWithCors(request, { error: "Refresh the selected Tally company's masters before matching the supplier." }, { status: 409 });
       }
 
@@ -964,7 +1337,8 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
       revision: context.posting.revision,
       idempotencyKey: idem,
       duplicateKey: duplicate,
-      masterSyncRunId: context.syncRun?.id ?? null,
+      masterSyncRunId: null,
+      purchaseMasterCommandId: context.liveMasterCommandId,
       approvedAt: now,
     };
     const approvedPayloadHash = createHash("sha256")
@@ -974,7 +1348,7 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
       p_posting_id: context.posting.id,
       p_owner_user_id: user.id,
       p_connection_id: context.connection.id,
-      p_master_sync_run_id: context.syncRun?.id ?? null,
+      p_master_sync_run_id: null,
       p_duplicate_key: duplicate,
       p_idempotency_key: idem,
       p_approved_payload_hash: approvedPayloadHash,

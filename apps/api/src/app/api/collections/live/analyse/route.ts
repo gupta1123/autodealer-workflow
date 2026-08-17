@@ -66,6 +66,7 @@ export async function POST(request: Request) {
     const scan = body.scan && typeof body.scan === "object"
       ? (body.scan as Record<string, unknown>)
       : {};
+    const financialYear = toText(scan.financialYear, 20) || null;
     const openBillsResult = scan.openBillsResult && typeof scan.openBillsResult === "object"
       ? (scan.openBillsResult as Record<string, unknown>)
       : null;
@@ -196,15 +197,13 @@ export async function POST(request: Request) {
       .filter(isCollectionOnlyPaymentFollowUp));
 
     const tallyCandidates = narratedDiscountRows
-      .filter((row) => ["late_short_payment", "unpaid_discount_tier_expired"].includes(row.analysis.deterministicStatus))
+      .filter((row) => row.analysis.deterministicStatus === "unpaid_discount_tier_expired")
       .map((row) => {
         const invoiceNumber = toText(row.bill.referenceName ?? row.bill.voucherNumber, 240) || null;
         const alreadyCreatedReversalAmount = createdReversalByInvoice.get(
           invoiceIdentityKey(row.ledgerName, invoiceNumber)
         ) ?? 0;
-        const requiredReversalAmount = row.analysis.deterministicStatus === "late_short_payment"
-          ? toNumber(row.bill.pendingAmount)
-          : toNumber(row.analysis.reversalPlan?.totalReversalRequired);
+        const requiredReversalAmount = toNumber(row.analysis.reversalPlan?.totalReversalRequired);
         const stagedReversalAmount = Math.max(
           0,
           Math.round((requiredReversalAmount - alreadyCreatedReversalAmount) * 100) / 100
@@ -216,7 +215,7 @@ export async function POST(request: Request) {
           ledger: ledgerByName.get(normalizeLedgerName(row.ledgerName)),
           companyName,
           connectionId,
-          financialYear: null,
+          financialYear,
           today,
           analysis: row.analysis,
           stagedReversalAmount,
@@ -254,7 +253,9 @@ export async function POST(request: Request) {
         dueThisWeek: null,
         cdAtRisk: null,
         cdExpired: tallyCandidates.length,
-        lateShortPayments: tallyCandidates.length,
+        lateShortPayments: narrationReviewRows.filter((row) =>
+          ["existing_balance_due", "late_short_payment"].includes(row.analysis.deterministicStatus)
+        ).length,
         debitNotesPendingApproval: tallyCandidates.length,
         narratedDiscountInvoices: narratedDiscountRows.length,
         unpaidInvoices: paymentFollowUps.filter((row) => Math.abs(row.outstandingAmount - row.originalInvoiceAmount) <= 1).length,

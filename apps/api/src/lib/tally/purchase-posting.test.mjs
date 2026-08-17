@@ -37,6 +37,7 @@ const {
   compactPurchasePostingReview,
   preparePurchasePosting,
   getCanonicalInvoiceDocuments,
+  getPurchaseInvoiceCandidates,
 } = await loadPurchasePostingModule();
 
 const supplierGstin = "27AAAAA0000A1Z5";
@@ -127,8 +128,13 @@ function prepare(document, options = {}) {
   const base = preparePurchasePosting({
     documents: [document],
     masters: options.masters ?? completeMasters,
-    mappings: [],
-    savedReview: options.savedReview ?? { sourceReferenceApproved: true },
+    mappings: options.mappings ?? [],
+    savedReview: options.savedReview ?? {
+      sourceReferenceApproved: true,
+      applyTds194q: Boolean(document.extracted_fields.tds194qAmount) &&
+        options.accountingSettings?.purchaseGoodsTdsEnabled !== false,
+      tds194qRounding: "paise",
+    },
     caseStatus: "accepted",
     connectionReady: true,
     companyName: "Test Company",
@@ -165,6 +171,58 @@ test("72044900 maps to the combined client stock and Maharashtra purchase rules"
   assert.ok(result.tallyPayload.withholdings
     .filter((entry) => entry.kind === "cgst_tds" || entry.kind === "sgst_tds")
     .every((entry) => entry.rate === "1"));
+  assert.equal(result.blockers.length, 0);
+});
+
+test("live Tally metadata discovers non-client-specific purchase, GST, and withholding masters", () => {
+  const genericMasters = [
+    master("ledger", "Vendor Ledger A", {
+      gstin: supplierGstin,
+      parent_name: "Regional Trade Creditors",
+      group_path: "Primary > Sundry Creditors > Regional Trade Creditors",
+    }),
+    master("ledger", "Local Raw Material Purchases", {
+      parent_name: "Purchase Accounts",
+      group_path: "Primary > Purchase Accounts",
+    }),
+    master("stock_item", "Ferrous Metal Scrap", {
+      parent_name: "Scrap Materials",
+      hsn_code: "72044900",
+      unit_name: "MTS",
+    }),
+    master("gst_ledger", "Central Input Credit 9", {
+      parent_name: "Duties & Taxes",
+      group_path: "Primary > Duties & Taxes > GST",
+      tax_rate: 9,
+      raw_payload: { taxType: "GST", gstDutyHead: "CGST" },
+    }),
+    master("gst_ledger", "State Input Credit 9", {
+      parent_name: "Duties & Taxes",
+      group_path: "Primary > Duties & Taxes > GST",
+      tax_rate: 9,
+      raw_payload: { taxType: "GST", gstDutyHead: "SGST" },
+    }),
+    master("gst_ledger", "Integrated Input Credit 18", {
+      parent_name: "Duties & Taxes",
+      group_path: "Primary > Duties & Taxes > GST",
+      tax_rate: 18,
+      raw_payload: { taxType: "GST", gstDutyHead: "IGST" },
+    }),
+    master("tax_ledger", "Purchase withholding section 194Q 0.10%"),
+    master("tax_ledger", "Central tax deducted on scrap"),
+    master("tax_ledger", "State tax deducted on scrap"),
+  ];
+
+  const result = prepare(invoiceDocument(), { masters: genericMasters });
+
+  assert.equal(result.review.supplierLedgerName, "Vendor Ledger A");
+  assert.equal(result.review.lines[0].stockItemName, "Ferrous Metal Scrap");
+  assert.equal(result.review.lines[0].purchaseLedgerName, "Local Raw Material Purchases");
+  assert.equal(result.review.cgstLedgerName, "Central Input Credit 9");
+  assert.equal(result.review.sgstLedgerName, "State Input Credit 9");
+  assert.equal(result.review.tds194qLedgerName, "Purchase withholding section 194Q 0.10%");
+  assert.equal(result.review.cgstTdsLedgerName, "Central tax deducted on scrap");
+  assert.equal(result.review.sgstTdsLedgerName, "State tax deducted on scrap");
   assert.equal(result.blockers.length, 0);
 });
 
@@ -445,7 +503,7 @@ test("TCS is opt-in and changes the visible payable only when selected", () => {
   assert.equal(selected.blockers.length, 0);
 });
 
-test("mixed-item invoices use the confirmed deduction amounts instead of inferring from HSN", () => {
+test("mixed-item invoices calculate reviewer-enabled 194Q on the confirmed voucher basis", () => {
   const document = invoiceDocument({
     totalAmount: "1169.50",
     tdsAmount: "0.50",
@@ -465,7 +523,7 @@ test("mixed-item invoices use the confirmed deduction amounts instead of inferri
       lines: initial.review.lines,
     },
   });
-  assert.equal(result.calculation.tds194qAmount, "0.50");
+  assert.equal(result.calculation.tds194qAmount, "1.00");
   assert.equal(result.calculation.cgstTdsAmount, "5.00");
   assert.equal(result.calculation.sgstTdsAmount, "5.00");
   assert.equal(result.blockers.length, 0);
@@ -512,6 +570,85 @@ test("duplicate copies of the same invoice are collapsed, distinct invoices are 
   const other = invoiceDocument({ id: "invoice-2" });
   other.extracted_fields = { ...other.extracted_fields, invoiceNumber: "INV-101" };
   assert.equal(getCanonicalInvoiceDocuments([first, other]).length, 2);
+});
+
+test("mother bills are identified and the one invoice billed to the active company is selected", () => {
+  const intermediaryGstin = "27CCCCC0000C1Z5";
+  const mother = invoiceDocument({ id: "mother" });
+  mother.extracted_fields = {
+    ...mother.extracted_fields,
+    invoiceNumber: "AURA-001",
+    vendorName: "Aura Supplier",
+    supplierGstin,
+    buyerName: "Ankit Intermediary",
+    buyerGstin: intermediaryGstin,
+  };
+  const downstream = invoiceDocument({ id: "downstream" });
+  downstream.extracted_fields = {
+    ...downstream.extracted_fields,
+    invoiceNumber: "ANKIT-001",
+    vendorName: "Ankit Intermediary",
+    supplierGstin: intermediaryGstin,
+    buyerName: "Configured Buyer",
+    buyerGstin: maharashtraBuyerGstin,
+  };
+  const candidates = getPurchaseInvoiceCandidates([mother, downstream], maharashtraBuyerGstin);
+  assert.equal(candidates.find((candidate) => candidate.documentId === "mother").role, "mother_bill");
+  assert.equal(candidates.find((candidate) => candidate.documentId === "downstream").recommended, true);
+
+  const result = preparePurchasePosting({
+    documents: [mother, downstream],
+    masters: [
+      ...completeMasters,
+      master("ledger", "Ankit Intermediary", { gstin: intermediaryGstin }),
+    ],
+    savedReview: { sourceReferenceApproved: true },
+    caseStatus: "accepted",
+    connectionReady: true,
+    companyName: "Configured Buyer",
+    companyGstin: maharashtraBuyerGstin,
+    sourceDocumentReference: "https://app.example/cases/mother-bill",
+    accountingSettings: {
+      purchaseGoodsTdsEnabled: true,
+      transporterTdsEnabled: true,
+      gstTdsEnabled: true,
+    },
+  });
+  assert.equal(result.canonicalInvoiceCount, 2);
+  assert.equal(result.source.documentId, "downstream");
+  assert.equal(result.review.selectedInvoiceDocumentId, "downstream");
+  assert.ok(!result.blockers.some((blocker) => blocker.code === "MULTIPLE_INVOICES"));
+});
+
+test("voucher-level 194Q toggle calculates 0.1% and rounds to the nearest rupee", () => {
+  const document = invoiceDocument({
+    hsn: "72031000",
+    totalAmount: "472755.20",
+    taxAmount: "72115.20",
+    tdsAmount: "",
+    lines: [{
+      description: "Sponge Iron",
+      hsnSac: "72031000",
+      quantity: "12.52",
+      unit: "MTS",
+      rate: "32000",
+      taxableAmount: "400640.00",
+      taxAmount: "72115.20",
+    }],
+  });
+  const result = prepare(document, {
+    savedReview: {
+      sourceReferenceApproved: true,
+      applyTds194q: true,
+      tds194qBasisAmount: "400640.00",
+      tds194qRate: "0.1",
+      tds194qRounding: "nearest_rupee",
+    },
+  });
+  assert.equal(result.calculation.tds194qBasisAmount, "400640.00");
+  assert.equal(result.calculation.tds194qAmount, "401.00");
+  assert.equal(result.tallyPayload.withholdings.find((entry) => entry.kind === "tds_194q").amount, "401.00");
+  assert.ok(result.warnings.some((warning) => warning.code === "TDS_194Q_USER_CONFIRMED"));
 });
 
 test("missing invoice lines recover only from one strongly linked supporting document", () => {
@@ -665,7 +802,7 @@ test("review persistence keeps only user changes and reconstructs the full revie
   assert.deepEqual(reconstructed.review, reviewed);
 });
 
-test("visible invoice date and TDS in source text fill missing structured fields", () => {
+test("visible invoice date and TDS evidence do not enable 194Q without reviewer confirmation", () => {
   const document = invoiceDocument({
     totalAmount: "1170.00",
     tdsAmount: "",
@@ -681,7 +818,8 @@ test("visible invoice date and TDS in source text fill missing structured fields
   const result = prepare(document, { savedReview: { sourceReferenceApproved: true } });
   assert.equal(result.review.invoiceDate, "2026-07-27");
   assert.equal(result.review.tds194qRate, "0.1");
-  assert.equal(result.calculation.tds194qAmount, "10.00");
+  assert.equal(result.source.invoiceTds194qAmount, "10.00");
+  assert.equal(result.calculation.tds194qAmount, "0.00");
   assert.ok(!result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
 });
 
@@ -746,7 +884,13 @@ test("printed GST, 194Q, and GST TDS reconcile as separate deductions", () => {
   ].join("\n");
 
   const result = prepare(document, {
-    savedReview: { sourceReferenceApproved: true },
+    savedReview: {
+      sourceReferenceApproved: true,
+      applyTds194q: true,
+      tds194qBasisAmount: "250000.00",
+      tds194qRate: "0.1",
+      tds194qRounding: "paise",
+    },
   });
 
   assert.equal(result.source.invoiceTaxAmount, "45000");

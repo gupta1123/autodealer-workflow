@@ -4,6 +4,7 @@ import {
   BANK_STATEMENT_BUCKET,
   type BankAccountInput,
 } from "@/lib/bank-statements";
+import { createBankStatementJobResult } from "@/lib/bank-statement-worker-pool";
 import { PdfSecurityError, unlockPdfIfNeeded } from "@/lib/pdf-security";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import {
@@ -13,6 +14,10 @@ import {
 } from "@/lib/storage-assets";
 
 export const runtime = "nodejs";
+const BANK_STATEMENT_MAX_UPLOAD_BYTES = Math.max(
+  1,
+  Number(process.env.BANK_STATEMENT_MAX_UPLOAD_BYTES ?? 50 * 1024 * 1024)
+);
 
 function readJsonField<T>(value: FormDataEntryValue | null, fallback: T): T {
   if (typeof value !== "string" || !value.trim()) return fallback;
@@ -145,6 +150,16 @@ export async function POST(request: Request) {
     if (!(file instanceof File)) {
       return jsonWithCors(request, { error: "Upload a bank statement file." }, { status: 400 });
     }
+    if (file.size <= 0) {
+      return jsonWithCors(request, { error: "The bank statement file is empty." }, { status: 400 });
+    }
+    if (file.size > BANK_STATEMENT_MAX_UPLOAD_BYTES) {
+      return jsonWithCors(
+        request,
+        { error: `The bank statement is larger than the ${Math.round(BANK_STATEMENT_MAX_UPLOAD_BYTES / (1024 * 1024))} MB upload limit.` },
+        { status: 413 }
+      );
+    }
 
     const manualAccount = readJsonField<BankAccountInput>(formData.get("account"), {});
     const connectionId = readTextField(formData.get("connectionId"));
@@ -230,7 +245,7 @@ export async function POST(request: Request) {
       status: "queued",
       progress: 5,
       stage: "Statement uploaded",
-      result: {},
+      result: createBankStatementJobResult(),
     });
 
     if (jobInsertError) throw jobInsertError;

@@ -38,15 +38,18 @@ import { fetchCaseFileSignedUrl } from "@/lib/case-persistence";
 import {
   approveAndQueueTallyPurchasePosting,
   fetchTallyPurchasePosting,
+  matchTallyPurchaseLineMasters,
   matchTallyPurchaseSupplierLedger,
   queueTallyMasterRefresh,
   saveTallyPurchasePosting,
+  selectTallyPurchaseInvoice,
   waitForTallyCommand,
   type TallyMasterOption,
   type TallyPostingIssue,
   type TallyPostingResponse,
   type TallyPostingReview,
   type SupplierLedgerMatch,
+  type PurchaseLineMasterSuggestion,
 } from "@/lib/tally-purchase-posting";
 
 type PanelState = "loading" | "ready" | "error";
@@ -171,6 +174,111 @@ function dedupeMasterOptions(options: TallyMasterOption[]) {
   }
 
   return [...byName.values()];
+}
+
+type LedgerRole =
+  | "purchase"
+  | "cgst"
+  | "sgst"
+  | "igst"
+  | "freight"
+  | "tds_194q"
+  | "transport_tds"
+  | "cgst_tds"
+  | "sgst_tds"
+  | "igst_tds"
+  | "tcs"
+  | "round_off";
+
+function optionIdentity(option: TallyMasterOption) {
+  return [
+    option.name,
+    option.parent,
+    option.groupPath,
+    option.taxType,
+    option.gstDutyHead,
+  ].filter(Boolean).join(" ");
+}
+
+function rankLedgerRole(
+  options: TallyMasterOption[],
+  role: LedgerRole,
+  expectedRate = 0,
+  aiCandidates: string[] = []
+) {
+  const aiNames = new Set(aiCandidates.map((name) => name.trim().toLowerCase()));
+  const score = (option: TallyMasterOption) => {
+    const identity = optionIdentity(option);
+    let value = aiNames.has(option.name.trim().toLowerCase()) ? 300 : 0;
+    if (role === "purchase") {
+      if (/purchase\s+accounts?/i.test(identity)) value += 120;
+      else if (/\bpurchase\b/i.test(identity)) value += 80;
+      if (/direct\s+expenses?/i.test(identity)) value += 25;
+      if (/\b(sales|output|bank|cash|sundry\s+(?:debtors?|creditors?))\b/i.test(identity)) value -= 120;
+    } else if (["cgst", "sgst", "igst"].includes(role)) {
+      const component = role === "cgst"
+        ? /\bcgst\b|central\s+tax/i
+        : role === "sgst"
+          ? /\bsgst\b|state\s+tax/i
+          : /\bigst\b|integrated\s+tax/i;
+      if (component.test(identity)) value += 120;
+      if (/\b(input|itc|purchase)\b/i.test(identity)) value += 50;
+      if (/\b(output|sales)\b/i.test(identity)) value -= 150;
+      if (option.taxRate !== null && expectedRate > 0 && Math.abs(option.taxRate - expectedRate) < 0.001) value += 30;
+    } else if (role === "freight") {
+      if (/freight|transportation\s+inward/i.test(identity)) value += 130;
+      if (/direct\s+expenses?|purchase/i.test(identity)) value += 25;
+    } else if (role === "tds_194q") {
+      if (/\btds\b|withholding|tax\s+deducted/i.test(identity)) value += 80;
+      if (/194q|0[.]?10/i.test(identity)) value += 100;
+    } else if (role === "transport_tds") {
+      if (/\btds\b|withholding|tax\s+deducted/i.test(identity)) value += 80;
+      if (/transport|freight|goods\s+carriage/i.test(identity)) value += 100;
+    } else if (["cgst_tds", "sgst_tds", "igst_tds"].includes(role)) {
+      if (/\btds\b|withholding|tax\s+deducted/i.test(identity)) value += 80;
+      const component = role === "cgst_tds"
+        ? /\bcgst\b|central\s+tax/i
+        : role === "sgst_tds"
+          ? /\bsgst\b|state\s+tax/i
+          : /\bigst\b|integrated\s+tax/i;
+      if (component.test(identity)) value += 100;
+    } else if (role === "tcs") {
+      if (/\btcs\b|tax\s+collected/i.test(identity)) value += 150;
+      if (/receivable/i.test(identity)) value += 25;
+    } else if (role === "round_off") {
+      if (/round[\s-]*off/i.test(identity)) value += 150;
+    }
+    return value;
+  };
+  const ranked = [...options]
+    .map((option) => ({ option, score: score(option) }))
+    .sort((left, right) => right.score - left.score || left.option.name.localeCompare(right.option.name));
+  return {
+    options: ranked.map((entry) => entry.option),
+    suggestedNames: ranked.filter((entry) => entry.score >= 100).slice(0, 8).map((entry) => entry.option.name),
+  };
+}
+
+function rankStockItems(
+  options: TallyMasterOption[],
+  line: TallyPostingReview["lines"][number],
+  aiCandidates: string[]
+) {
+  const aiNames = new Set(aiCandidates.map((name) => name.trim().toLowerCase()));
+  const normalizedHsn = line.hsn.replace(/\D/g, "");
+  const descriptionTokens = line.description.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length > 2);
+  const ranked = [...options].map((option) => {
+    let score = aiNames.has(option.name.trim().toLowerCase()) ? 300 : 0;
+    if (normalizedHsn && option.hsnCode?.replace(/\D/g, "") === normalizedHsn) score += 140;
+    const identity = optionIdentity(option).toLowerCase();
+    score += descriptionTokens.filter((token) => identity.includes(token)).length * 15;
+    if (line.unit && option.unitName && normalizeUnitFamily(line.unit) === normalizeUnitFamily(option.unitName)) score += 20;
+    return { option, score };
+  }).sort((left, right) => right.score - left.score || left.option.name.localeCompare(right.option.name));
+  return {
+    options: ranked.map((entry) => entry.option),
+    suggestedNames: ranked.filter((entry) => entry.score >= 100).slice(0, 8).map((entry) => entry.option.name),
+  };
 }
 
 function caseStatusLabel(status: string | undefined) {
@@ -330,6 +438,8 @@ function MasterCombobox({
   hideLabel = false,
   sourceHint,
   emptyMessage = "No matching option was returned by Tally.",
+  suggestedNames = [],
+  suggestedLabel = "Suggested",
 }: {
   id?: string;
   label: string;
@@ -346,6 +456,8 @@ function MasterCombobox({
   hideLabel?: boolean;
   sourceHint?: string;
   emptyMessage?: string;
+  suggestedNames?: string[];
+  suggestedLabel?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -360,6 +472,7 @@ function MasterCombobox({
       [
         option.name,
         option.parent,
+        option.groupPath,
         option.gstin,
         option.hsnCode,
         option.unitName,
@@ -373,12 +486,16 @@ function MasterCombobox({
   }, [options, search]);
   const detail = (option: TallyMasterOption) =>
     [
-      option.parent,
+      option.groupPath || option.parent,
       option.gstin ? `GSTIN ${option.gstin}` : null,
       option.hsnCode ? `HSN ${option.hsnCode}` : null,
       option.unitName ? `Unit ${option.unitName}` : null,
       option.taxRate !== null ? `${option.taxRate}%` : null,
     ].filter(Boolean);
+  const suggestedNameSet = useMemo(
+    () => new Set(suggestedNames.map((name) => name.trim().toLowerCase())),
+    [suggestedNames]
+  );
 
   return (
     <div className={`scroll-mt-24 ${compact ? `w-full max-w-[280px] ${hideLabel ? "" : "space-y-1"}` : "space-y-1.5"}`} id={id}>
@@ -469,6 +586,11 @@ function MasterCombobox({
                 ) : null}
               </span>
             </div>
+            <p className="mt-1 text-[10px] text-slate-400">
+              {suggestedNameSet.size > 0
+                ? `${suggestedNameSet.size} ${suggestedLabel.toLowerCase()} first · search all ${options.length.toLocaleString("en-IN")} live masters`
+                : `Search all ${options.length.toLocaleString("en-IN")} live masters`}
+            </p>
           </div>
           <ScrollArea className="min-h-0 flex-1 overflow-hidden">
             <div className="p-1.5">
@@ -491,6 +613,11 @@ function MasterCombobox({
                           {option.name}
                         </span>
                         <span className="mt-1 flex flex-wrap gap-1">
+                          {suggestedNameSet.has(option.name.trim().toLowerCase()) ? (
+                            <span className={`rounded-full bg-emerald-100 px-2 py-0.5 font-semibold text-emerald-700 ${compact ? "text-[9px]" : "text-[10px]"}`}>
+                              {suggestedLabel}
+                            </span>
+                          ) : null}
                           {detail(option).map((item) => (
                             <span
                               className={`rounded-full bg-slate-100 px-2 py-0.5 font-medium text-slate-500 ${compact ? "text-[9px]" : "text-[10px]"}`}
@@ -596,6 +723,7 @@ export function TallyPurchasePostingPanel({
   const [dirty, setDirty] = useState(false);
   const [connectionDirty, setConnectionDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [selectingInvoiceId, setSelectingInvoiceId] = useState<string | null>(null);
   const [approvingPacket, setApprovingPacket] = useState(false);
   const [queueing, setQueueing] = useState(false);
   const [refreshingMasters, setRefreshingMasters] = useState(false);
@@ -604,8 +732,12 @@ export function TallyPurchasePostingPanel({
   const [supplierLedgerMatch, setSupplierLedgerMatch] = useState<SupplierLedgerMatch | null>(null);
   const [matchingSupplierLedger, setMatchingSupplierLedger] = useState(false);
   const [supplierLedgerMatchError, setSupplierLedgerMatchError] = useState<string | null>(null);
+  const [lineMasterMatches, setLineMasterMatches] = useState<PurchaseLineMasterSuggestion[]>([]);
+  const [matchingLineMasters, setMatchingLineMasters] = useState(false);
+  const [lineMasterMatchError, setLineMasterMatchError] = useState<string | null>(null);
   const automaticMasterSyncKeyRef = useRef("");
   const automaticSupplierMatchKeyRef = useRef("");
+  const automaticLineMasterMatchKeyRef = useRef("");
   const lastPostingStatusRef = useRef<string | null>(null);
 
   const load = useCallback(async (
@@ -788,34 +920,105 @@ export function TallyPurchasePostingPanel({
     selectedCompanyName,
     selectedConnectionId,
   ]);
-  const purchaseTaxOptions = (dutyHead: "cgst" | "sgst" | "igst") =>
-    ledgerOptions.filter((option) => {
-      const identity = `${option.name} ${option.parent ?? ""}`;
-      return new RegExp(dutyHead, "i").test(identity) && !/\b(output|sales)\b/i.test(identity);
-    });
-  const cgstOptions = purchaseTaxOptions("cgst");
-  const sgstOptions = purchaseTaxOptions("sgst");
-  const igstOptions = purchaseTaxOptions("igst");
-  const tdsOptions = ledgerOptions.filter((option) =>
-    /\btds\b|tax\s+deducted/i.test(`${option.name} ${option.parent ?? ""}`)
-  );
-  const freightOptions = ledgerOptions.filter((option) =>
-    /transportation\s+inward|freight/i.test(option.name)
-  );
-  const tds194qOptions = tdsOptions.filter((option) => /194q|0[.]10/i.test(option.name));
-  const transportTdsOptions = tdsOptions.filter((option) => /goods\s+transport/i.test(option.name));
-  const cgstTdsOptions = tdsOptions.filter((option) => /cgst\s+tds/i.test(option.name));
-  const sgstTdsOptions = tdsOptions.filter((option) => /sgst\s+tds/i.test(option.name));
-  const igstTdsOptions = tdsOptions.filter((option) => /igst\s+tds/i.test(option.name));
-  const tcsOptions = ledgerOptions.filter((option) =>
-    /\btcs\b|tax\s+collected/i.test(`${option.name} ${option.parent ?? ""}`)
-  );
-  const roundOffOptions = ledgerOptions.filter((option) =>
-    /round[\s-]*off/i.test(`${option.name} ${option.parent ?? ""}`)
-  );
-  const purchaseOptions = ledgerOptions.filter((option) =>
-    /purchase\s+accounts?/i.test(option.parent ?? "")
-  );
+
+  useEffect(() => {
+    if (
+      locked ||
+      !review ||
+      !selectedConnectionId ||
+      !selectedCompanyName ||
+      !payload?.connection?.masterSnapshotFresh ||
+      !payload.connection.masterSnapshotComplete ||
+      !review.lines.some((line) => !line.stockItemName.trim() || !line.purchaseLedgerName.trim())
+    ) {
+      return;
+    }
+    const key = [
+      selectedConnectionId,
+      selectedCompanyName,
+      payload.connection.masterSyncRunId ?? "",
+      ...review.lines.map((line) => [
+        line.lineId,
+        line.description,
+        line.hsn,
+        line.unit,
+        line.stockItemName,
+        line.purchaseLedgerName,
+      ].join("|")),
+    ].join("::");
+    if (automaticLineMasterMatchKeyRef.current === key) return;
+    automaticLineMasterMatchKeyRef.current = key;
+    setMatchingLineMasters(true);
+    setLineMasterMatchError(null);
+    void matchTallyPurchaseLineMasters(caseId, {
+      connectionId: selectedConnectionId,
+      companyName: selectedCompanyName,
+      review,
+    })
+      .then((matches) => {
+        setLineMasterMatches(matches);
+        const directByLine = new Map(matches.map((match) => [match.lineId, match]));
+        const hasDirect = matches.some((match) =>
+          match.stockItem.matchType === "direct_match" ||
+          match.purchaseLedger.matchType === "direct_match"
+        );
+        if (!hasDirect) return;
+        setReview((current) => current ? {
+          ...current,
+          lines: current.lines.map((line) => {
+            const match = directByLine.get(line.lineId);
+            if (!match) return line;
+            return {
+              ...line,
+              stockItemName:
+                line.stockItemName ||
+                (match.stockItem.matchType === "direct_match" ? match.stockItem.masterName ?? "" : ""),
+              purchaseLedgerName:
+                line.purchaseLedgerName ||
+                (match.purchaseLedger.matchType === "direct_match" ? match.purchaseLedger.masterName ?? "" : ""),
+            };
+          }),
+        } : current);
+        setDirty(true);
+      })
+      .catch((matchError) => {
+        setLineMasterMatchError(
+          matchError instanceof Error ? matchError.message : "Purchase master matching failed."
+        );
+      })
+      .finally(() => setMatchingLineMasters(false));
+  }, [
+    caseId,
+    locked,
+    payload?.connection?.masterSnapshotComplete,
+    payload?.connection?.masterSnapshotFresh,
+    payload?.connection?.masterSyncRunId,
+    review,
+    selectedCompanyName,
+    selectedConnectionId,
+  ]);
+  const cgstRanked = rankLedgerRole(ledgerOptions, "cgst", Number(review?.gstRate || 0) / 2);
+  const sgstRanked = rankLedgerRole(ledgerOptions, "sgst", Number(review?.gstRate || 0) / 2);
+  const igstRanked = rankLedgerRole(ledgerOptions, "igst", Number(review?.gstRate || 0));
+  const freightRanked = rankLedgerRole(ledgerOptions, "freight", Number(review?.freightGstRate || 0));
+  const tds194qRanked = rankLedgerRole(ledgerOptions, "tds_194q");
+  const transportTdsRanked = rankLedgerRole(ledgerOptions, "transport_tds");
+  const cgstTdsRanked = rankLedgerRole(ledgerOptions, "cgst_tds");
+  const sgstTdsRanked = rankLedgerRole(ledgerOptions, "sgst_tds");
+  const igstTdsRanked = rankLedgerRole(ledgerOptions, "igst_tds");
+  const tcsRanked = rankLedgerRole(ledgerOptions, "tcs");
+  const roundOffRanked = rankLedgerRole(ledgerOptions, "round_off");
+  const cgstOptions = cgstRanked.options;
+  const sgstOptions = sgstRanked.options;
+  const igstOptions = igstRanked.options;
+  const freightOptions = freightRanked.options;
+  const tds194qOptions = tds194qRanked.options;
+  const transportTdsOptions = transportTdsRanked.options;
+  const cgstTdsOptions = cgstTdsRanked.options;
+  const sgstTdsOptions = sgstTdsRanked.options;
+  const igstTdsOptions = igstTdsRanked.options;
+  const tcsOptions = tcsRanked.options;
+  const roundOffOptions = roundOffRanked.options;
   const prerequisiteIssues = useMemo(
     () => (payload?.blockers ?? []).filter((issue) => issue.scope === "case"),
     [payload?.blockers]
@@ -944,6 +1147,28 @@ export function TallyPurchasePostingPanel({
       setError(saveError instanceof Error ? saveError.message : "Could not save your changes.");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleInvoiceSelection(documentId: string) {
+    if (!selectedConnectionId || !selectedCompanyName || locked) return;
+    setSelectingInvoiceId(documentId);
+    setError(null);
+    try {
+      const next = await selectTallyPurchaseInvoice(
+        caseId,
+        documentId,
+        selectedConnectionId,
+        selectedCompanyName
+      );
+      setPayload(next);
+      setReview(next.review);
+      setDirty(false);
+      setNotice("Purchase invoice selected. Review the accounting before posting.");
+    } catch (selectionError) {
+      setError(selectionError instanceof Error ? selectionError.message : "Failed to select the invoice.");
+    } finally {
+      setSelectingInvoiceId(null);
     }
   }
 
@@ -1123,6 +1348,7 @@ export function TallyPurchasePostingPanel({
   };
   useEffect(() => {
     if (
+      !mastersNeedSync ||
       !connectionReadable ||
       !selectedMatchesActive ||
       refreshingMasters ||
@@ -1145,6 +1371,7 @@ export function TallyPurchasePostingPanel({
     connectionReadable,
     handleRefreshMasters,
     locked,
+    mastersNeedSync,
     refreshingMasters,
     selectedMatchesActive,
   ]);
@@ -1171,13 +1398,53 @@ export function TallyPurchasePostingPanel({
     );
   }
 
-  if (!payload || !payload.eligibility.eligible || !review) {
+  if (!payload || !payload.eligibility.eligible) {
     return (
       <div className="mx-auto mt-8 max-w-2xl rounded-2xl border border-amber-200 bg-white p-6 shadow-sm">
-        <h2 className="text-lg font-semibold text-slate-950">One invoice is required</h2>
+        <h2 className="text-lg font-semibold text-slate-950">Purchase invoice required</h2>
         <p className="mt-2 text-sm text-slate-600">
-          This case contains {payload?.eligibility.canonicalInvoiceCount ?? 0} canonical invoices. Purchase posting supports exactly one invoice per case.
+          No readable purchase invoice was found in this case.
         </p>
+      </div>
+    );
+  }
+
+  if (!review) {
+    const candidates = payload.eligibility.invoiceCandidates;
+    return (
+      <div className="mx-auto mt-8 max-w-4xl rounded-2xl border border-amber-200 bg-white p-6 shadow-sm">
+        <h2 className="text-lg font-semibold text-slate-950">Choose the invoice Kalika should post</h2>
+        <p className="mt-2 text-sm text-slate-600">
+          Duplicate copies have already been combined. Select the invoice billed to the active Tally company; an upstream mother bill should normally be left unselected.
+        </p>
+        <div className="mt-5 grid gap-3">
+          {candidates.map((candidate) => (
+            <div className={`rounded-xl border p-4 ${candidate.recommended ? "border-emerald-300 bg-emerald-50/60" : "border-slate-200"}`} key={candidate.documentId}>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-semibold text-slate-950">{candidate.invoiceNumber || "Invoice number missing"}</span>
+                    {candidate.recommended ? <Badge className="bg-emerald-100 text-emerald-800">Recommended</Badge> : null}
+                    {candidate.role === "mother_bill" ? <Badge variant="outline">Mother bill</Badge> : null}
+                  </div>
+                  <p className="mt-1 text-sm text-slate-700">{candidate.supplierName || "Unknown supplier"} → {candidate.buyerName || "Unknown buyer"}</p>
+                  <p className="mt-1 text-xs text-slate-500">{candidate.reason}</p>
+                </div>
+                <Button
+                  disabled={!selectedConnectionId || !selectedCompanyName || selectingInvoiceId !== null}
+                  onClick={() => void handleInvoiceSelection(candidate.documentId)}
+                  variant={candidate.recommended ? "default" : "outline"}
+                >
+                  {selectingInvoiceId === candidate.documentId ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  Use this invoice
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+        {!selectedConnectionId || !selectedCompanyName ? (
+          <p className="mt-4 text-sm font-medium text-amber-700">Select the Tally workstation and company above before choosing the invoice.</p>
+        ) : null}
       </div>
     );
   }
@@ -1185,7 +1452,6 @@ export function TallyPurchasePostingPanel({
   const calculation = payload.calculation;
   const invoiceTaxKnown = Boolean(payload.source?.invoiceTaxAmount?.trim());
   const invoiceTotalKnown = Boolean(payload.source?.invoiceTotal?.trim());
-  const invoiceTds194qKnown = Boolean(payload.source?.invoiceTds194qAmount?.trim());
   const invoiceCgstTdsKnown = Boolean(payload.source?.invoiceCgstTdsAmount?.trim());
   const invoiceSgstTdsKnown = Boolean(payload.source?.invoiceSgstTdsAmount?.trim());
   const invoiceIgstTdsKnown = Boolean(payload.source?.invoiceIgstTdsAmount?.trim());
@@ -1209,7 +1475,14 @@ export function TallyPurchasePostingPanel({
       Number(review.gstRate) > 0 &&
       Number(calculation.basicAmount) > 0
   );
-  const purchaseGoodsTdsActive = Number(calculation?.tds194qAmount || 0) > 0;
+  const purchaseGoodsTdsActive = review.applyTds194q;
+  const tds194qBasisPreview = Number(review.tds194qBasisAmount || calculation?.basicAmount || 0);
+  const tds194qRawPreview = Number.isFinite(tds194qBasisPreview)
+    ? tds194qBasisPreview * Number(review.tds194qRate || 0) / 100
+    : 0;
+  const tds194qAmountPreview = review.tds194qRounding === "nearest_rupee"
+    ? Math.round(tds194qRawPreview)
+    : Math.round(tds194qRawPreview * 100) / 100;
   const cgstTdsActive = Number(calculation?.cgstTdsAmount || 0) > 0;
   const sgstTdsActive = Number(calculation?.sgstTdsAmount || 0) > 0;
   const igstTdsActive = Number(calculation?.igstTdsAmount || 0) > 0;
@@ -1419,6 +1692,29 @@ export function TallyPurchasePostingPanel({
         ))}
       </nav>
 
+      {payload.eligibility.invoiceCandidates.length > 1 ? (
+        <section className="rounded-xl border border-slate-200 bg-white p-3">
+          <div className="mb-2 text-xs font-semibold text-slate-900">Invoice selected for this Purchase voucher</div>
+          <div className="flex flex-wrap gap-2">
+            {payload.eligibility.invoiceCandidates.map((candidate) => {
+              const selected = candidate.documentId === review.selectedInvoiceDocumentId;
+              return (
+                <Button
+                  className="h-auto min-h-9 whitespace-normal px-3 py-2 text-left"
+                  disabled={locked || selectingInvoiceId !== null}
+                  key={candidate.documentId}
+                  onClick={() => void handleInvoiceSelection(candidate.documentId)}
+                  variant={selected ? "default" : "outline"}
+                >
+                  {selectingInvoiceId === candidate.documentId ? <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" /> : null}
+                  {candidate.invoiceNumber || "Invoice number missing"}{candidate.role === "mother_bill" ? " · Mother bill" : ""}
+                </Button>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+
       {payload.posting?.status === "created" ? (
         <section className="flex items-center gap-2.5 rounded-xl border border-emerald-200 bg-emerald-50 px-3.5 py-2.5">
           <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
@@ -1546,6 +1842,10 @@ export function TallyPurchasePostingPanel({
               onChange={(value) => updateReview("supplierLedgerName", value)}
               options={supplierLedgerOptions}
               sourceHint={`Search all ${supplierLedgerOptions.length.toLocaleString("en-IN")} ledgers from the selected Tally company. Likely supplier ledgers appear first.`}
+              suggestedNames={[
+                ...(supplierLedgerMatch?.ledgerName ? [supplierLedgerMatch.ledgerName] : []),
+                ...(supplierLedgerMatch?.candidateLedgerNames ?? []),
+              ]}
               value={review.supplierLedgerName}
             />
             {matchingSupplierLedger ? (
@@ -1594,6 +1894,13 @@ export function TallyPurchasePostingPanel({
           <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-emerald-700">Step 2</div>
           <h3 className="mt-1 font-semibold text-slate-950">Items and Tally mappings</h3>
           <p className="mt-1 text-xs text-slate-500">Check each invoice item and select its stock item and purchase ledger from Tally.</p>
+          {matchingLineMasters ? (
+            <p className="mt-2 flex items-center gap-1.5 text-[10px] font-medium text-emerald-700">
+              <Loader2 className="h-3 w-3 animate-spin" /> Matching unresolved items against all live Tally masters…
+            </p>
+          ) : lineMasterMatchError ? (
+            <p className="mt-2 text-[10px] text-rose-600">{lineMasterMatchError} You can still search every live master manually.</p>
+          ) : null}
         </div>
         {payload.source?.lineRecovery === "linked_document" ? (
           <div className="flex items-start gap-2 border-b border-amber-100 bg-amber-50/70 px-4 py-2.5 text-xs text-amber-900 sm:px-5">
@@ -1607,6 +1914,11 @@ export function TallyPurchasePostingPanel({
           <ReviewWarnings warnings={scopeWarnings("line")} />
           {review.lines.map((line, index) => {
             const sourceLine = sourceLineById.get(line.lineId);
+            const masterMatch = lineMasterMatches.find((match) => match.lineId === line.lineId);
+            const stockCandidates = masterMatch?.stockItem.candidateMasterNames ?? [];
+            const purchaseCandidates = masterMatch?.purchaseLedger.candidateMasterNames ?? [];
+            const rankedStockItems = rankStockItems(stockItemOptions, line, stockCandidates);
+            const rankedPurchaseLedgers = rankLedgerRole(ledgerOptions, "purchase", 0, purchaseCandidates);
             const selectedStockItem = stockItemOptions.find(
               (option) =>
                 option.name.trim().toLowerCase() ===
@@ -1653,13 +1965,24 @@ export function TallyPurchasePostingPanel({
                     compact
                     disabled={locked || mastersNeedSync}
                     emptyMessage="No stock item was returned by Tally."
-                    issues={lineIssues(line.lineId, ["STOCK_ITEM_REQUIRED", "STOCK_ITEM_CLIENT_RULE_MISMATCH", "STOCK_ITEM_HSN_MISMATCH", "STOCK_ITEM_UNIT_MISMATCH"])}
+                    issues={lineIssues(line.lineId, ["STOCK_ITEM_REQUIRED", "STOCK_ITEM_HSN_MISMATCH", "STOCK_ITEM_UNIT_MISMATCH"])}
                     label="Map to Tally stock item"
                     onChange={(value) => updateLine(index, "stockItemName", value)}
-                    options={stockItemOptions}
+                    options={rankedStockItems.options}
+                    suggestedNames={rankedStockItems.suggestedNames}
                     sourceHint={`Invoice: HSN ${line.hsn || "missing"} · Unit ${invoiceUnit || "missing"}`}
                     value={line.stockItemName}
                   />
+                  {masterMatch?.stockItem.matchType === "close_match" ? (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] text-amber-900">
+                      <div className="font-semibold">Choose the matching stock item</div>
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {stockCandidates.map((name) => (
+                          <button className="rounded-full border border-amber-200 bg-white px-2 py-1 font-medium hover:border-emerald-300 hover:text-emerald-700" key={name} onClick={() => updateLine(index, "stockItemName", name)} type="button">{name}</button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
                   {equivalentUnitAlias ? (
                     <div className="flex flex-wrap items-center gap-2 rounded-lg border border-emerald-100 bg-emerald-50/70 px-2.5 py-2 text-[10px] text-emerald-900">
                       <span>Invoice unit <strong>{invoiceUnit}</strong></span>
@@ -1672,14 +1995,25 @@ export function TallyPurchasePostingPanel({
                     {...masterContext}
                     compact
                     disabled={locked || mastersNeedSync}
-                    emptyMessage="No Purchase Accounts ledger was returned by Tally."
-                    issues={lineIssues(line.lineId, ["PURCHASE_LEDGER_REQUIRED", "PURCHASE_LEDGER_CLIENT_RULE_MISMATCH"])}
+                    emptyMessage="No ledger was returned by live Tally."
+                    issues={lineIssues(line.lineId, ["PURCHASE_LEDGER_REQUIRED"])}
                     label="Post to purchase ledger"
                     onChange={(value) => updateLine(index, "purchaseLedgerName", value)}
-                    options={purchaseOptions}
-                    sourceHint="Only ledgers under Purchase Accounts are shown."
+                    options={rankedPurchaseLedgers.options}
+                    sourceHint={`Likely Purchase Accounts ledgers appear first; all ${ledgerOptions.length.toLocaleString("en-IN")} live ledgers remain searchable.`}
+                    suggestedNames={rankedPurchaseLedgers.suggestedNames}
                     value={line.purchaseLedgerName}
                   />
+                  {masterMatch?.purchaseLedger.matchType === "close_match" ? (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] text-amber-900">
+                      <div className="font-semibold">Choose the purchase ledger</div>
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {purchaseCandidates.map((name) => (
+                          <button className="rounded-full border border-amber-200 bg-white px-2 py-1 font-medium hover:border-emerald-300 hover:text-emerald-700" key={name} onClick={() => updateLine(index, "purchaseLedgerName", name)} type="button">{name}</button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               </div>
             </article>
@@ -1761,6 +2095,56 @@ export function TallyPurchasePostingPanel({
             ) : null}
           </div>
 
+          <div className={`rounded-xl border p-4 ${review.applyTds194q ? "border-emerald-200 bg-emerald-50/60" : "border-slate-200 bg-white"}`}>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <div className="text-sm font-semibold text-slate-950">Apply Section 194Q purchase TDS</div>
+                <p className="mt-1 max-w-2xl text-xs leading-5 text-slate-600">
+                  Turn this on only after confirming that your organisation meets the annual eligibility conditions. Kalika cannot decide that from one invoice.
+                </p>
+              </div>
+              <button
+                aria-checked={review.applyTds194q}
+                className={`relative h-6 w-11 shrink-0 rounded-full transition ${review.applyTds194q ? "bg-emerald-700" : "bg-slate-300"}`}
+                disabled={locked}
+                onClick={() => updateReview("applyTds194q", !review.applyTds194q)}
+                role="switch"
+                type="button"
+              >
+                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition ${review.applyTds194q ? "left-[22px]" : "left-0.5"}`} />
+              </button>
+            </div>
+            {review.applyTds194q ? (
+              <div className="mt-4 grid gap-3 border-t border-emerald-200 pt-4 sm:grid-cols-3">
+                <Field
+                  disabled={locked}
+                  issues={scopeIssues("tax", ["TDS_194Q_BASIS_REQUIRED"])}
+                  label="Taxable basis"
+                  onChange={(value) => updateReview("tds194qBasisAmount", value)}
+                  sourceValue={calculation?.basicAmount}
+                  value={review.tds194qBasisAmount || calculation?.basicAmount || ""}
+                />
+                <Field
+                  disabled={locked}
+                  issues={scopeIssues("tax", ["TDS_194Q_RATE_REQUIRED"])}
+                  label="TDS rate %"
+                  onChange={(value) => updateReview("tds194qRate", value)}
+                  value={review.tds194qRate}
+                />
+                <label className="block text-xs font-medium text-slate-700">
+                  Rounding
+                  <select className={`${inputClass} mt-1`} disabled={locked} onChange={(event) => updateReview("tds194qRounding", event.target.value as TallyPostingReview["tds194qRounding"])} value={review.tds194qRounding}>
+                    <option value="nearest_rupee">Nearest rupee</option>
+                    <option value="paise">Exact paise</option>
+                  </select>
+                </label>
+                <div className="sm:col-span-3 text-xs font-medium text-emerald-800">
+                  Preview: {review.tds194qRate}% on {money(String(tds194qBasisPreview))} = {money(String(tds194qAmountPreview))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+
           {!calculationReady ? (
             <div className="flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex items-start gap-3">
@@ -1804,7 +2188,7 @@ export function TallyPurchasePostingPanel({
                       <Field id="field-freight-rate" disabled={locked} issues={scopeIssues("tax", ["FREIGHT_GST_RATE_REQUIRED"])} label="GST rate %" onChange={(value) => updateReview("freightGstRate", value)} sourceValue={payload.source?.invoiceFreightGstRate} value={review.freightGstRate} />
                       <div className="pt-1 text-xs text-slate-700">{moneyOrMissing(payload.source?.invoiceFreightAmount)}</div>
                       <Field disabled={locked} label="Freight amount" onChange={(value) => updateReview("freightAmount", value)} sourceValue={payload.source?.invoiceFreightAmount} value={review.freightAmount} />
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-freight-ledger" disabled={locked || mastersNeedSync} emptyMessage="Transportation Inward @ 18.00% was not returned by Tally." issues={scopeIssues("tax", ["FREIGHT_LEDGER_REQUIRED"])} label="Freight ledger" onChange={(value) => updateReview("freightLedgerName", value)} options={freightOptions} value={review.freightLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-freight-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["FREIGHT_LEDGER_REQUIRED"])} label="Freight ledger" onChange={(value) => updateReview("freightLedgerName", value)} options={freightOptions} suggestedNames={freightRanked.suggestedNames} value={review.freightLedgerName} />
                       <div className="pt-1 text-xs font-semibold text-slate-400">Charge</div>
                     </div>
                   ) : null}
@@ -1819,7 +2203,7 @@ export function TallyPurchasePostingPanel({
                         <div className="pt-1 text-xs text-slate-700">{money(calculation.gstTaxableAmount)}</div>
                         <div className={`pt-1 text-xs ${invoiceTaxKnown ? "text-slate-700" : "font-medium text-amber-700"}`}>{moneyOrMissing(cgstInvoiceAmount)}</div>
                         <div className="pt-1 text-xs font-semibold text-slate-900">{money(calculation.cgstAmount)}</div>
-                        <MasterCombobox {...masterContext} compact hideLabel id="field-cgst-ledger" disabled={locked || mastersNeedSync} emptyMessage="No compatible input CGST ledger was returned by Tally." issues={scopeIssues("tax", ["CGST_LEDGER_REQUIRED"])} label="CGST purchase ledger" onChange={(value) => updateReview("cgstLedgerName", value)} options={cgstOptions} value={review.cgstLedgerName} />
+                        <MasterCombobox {...masterContext} compact hideLabel id="field-cgst-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["CGST_LEDGER_REQUIRED"])} label="CGST purchase ledger" onChange={(value) => updateReview("cgstLedgerName", value)} options={cgstOptions} suggestedNames={cgstRanked.suggestedNames} value={review.cgstLedgerName} />
                         <div className={`pt-1 text-xs font-semibold ${invoiceTaxKnown && Math.abs(Number(numericDifference(cgstInvoiceAmount, calculation.cgstAmount))) > 1 ? "text-rose-600" : invoiceTaxKnown ? "text-emerald-700" : "text-slate-400"}`}>
                           {invoiceTaxKnown ? money(numericDifference(cgstInvoiceAmount, calculation.cgstAmount)) : "—"}
                         </div>
@@ -1832,7 +2216,7 @@ export function TallyPurchasePostingPanel({
                         <div className="pt-1 text-xs text-slate-700">{money(calculation.gstTaxableAmount)}</div>
                         <div className={`pt-1 text-xs ${invoiceTaxKnown ? "text-slate-700" : "font-medium text-amber-700"}`}>{moneyOrMissing(sgstInvoiceAmount)}</div>
                         <div className="pt-1 text-xs font-semibold text-slate-900">{money(calculation.sgstAmount)}</div>
-                        <MasterCombobox {...masterContext} compact hideLabel id="field-sgst-ledger" disabled={locked || mastersNeedSync} emptyMessage="No compatible input SGST ledger was returned by Tally." issues={scopeIssues("tax", ["SGST_LEDGER_REQUIRED"])} label="SGST purchase ledger" onChange={(value) => updateReview("sgstLedgerName", value)} options={sgstOptions} value={review.sgstLedgerName} />
+                        <MasterCombobox {...masterContext} compact hideLabel id="field-sgst-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["SGST_LEDGER_REQUIRED"])} label="SGST purchase ledger" onChange={(value) => updateReview("sgstLedgerName", value)} options={sgstOptions} suggestedNames={sgstRanked.suggestedNames} value={review.sgstLedgerName} />
                         <div className={`pt-1 text-xs font-semibold ${invoiceTaxKnown && Math.abs(Number(numericDifference(sgstInvoiceAmount, calculation.sgstAmount))) > 1 ? "text-rose-600" : invoiceTaxKnown ? "text-emerald-700" : "text-slate-400"}`}>
                           {invoiceTaxKnown ? money(numericDifference(sgstInvoiceAmount, calculation.sgstAmount)) : "—"}
                         </div>
@@ -1847,7 +2231,7 @@ export function TallyPurchasePostingPanel({
                       <div className="pt-1 text-xs text-slate-700">{money(calculation?.gstTaxableAmount)}</div>
                       <div className={`pt-1 text-xs ${invoiceTaxKnown ? "text-slate-700" : "font-medium text-amber-700"}`}>{moneyOrMissing(igstInvoiceAmount)}</div>
                       <div className="pt-1 text-xs font-semibold text-slate-900">{money(calculation?.igstAmount)}</div>
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-igst-ledger" disabled={locked || mastersNeedSync} emptyMessage="No compatible input IGST ledger was returned by Tally." issues={scopeIssues("tax", ["IGST_LEDGER_REQUIRED"])} label="IGST purchase ledger" onChange={(value) => updateReview("igstLedgerName", value)} options={igstOptions} value={review.igstLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-igst-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["IGST_LEDGER_REQUIRED"])} label="IGST purchase ledger" onChange={(value) => updateReview("igstLedgerName", value)} options={igstOptions} suggestedNames={igstRanked.suggestedNames} value={review.igstLedgerName} />
                       <div className={`pt-1 text-xs font-semibold ${invoiceTaxKnown && Math.abs(Number(numericDifference(igstInvoiceAmount, calculation?.igstAmount))) > 1 ? "text-rose-600" : invoiceTaxKnown ? "text-emerald-700" : "text-slate-400"}`}>
                         {invoiceTaxKnown ? money(numericDifference(igstInvoiceAmount, calculation?.igstAmount)) : "—"}
                       </div>
@@ -1873,13 +2257,11 @@ export function TallyPurchasePostingPanel({
                           <span>%</span>
                         </label>
                       </div>
-                      <div className="text-[11px] font-medium leading-4 text-slate-500">Invoice-confirmed</div>
-                      <div className="pt-1 text-xs text-slate-700">{moneyOrMissing(payload.source?.invoiceTds194qAmount)}</div>
-                      <div className="pt-1 text-xs font-semibold text-slate-900">{money(calculation?.tds194qAmount)}</div>
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-tds-194q-ledger" disabled={locked || mastersNeedSync} emptyMessage="The configured purchase TDS ledger was not returned by Tally." issues={scopeIssues("tax", ["TDS_194Q_LEDGER_REQUIRED"])} label="Purchase TDS ledger" onChange={(value) => updateReview("tds194qLedgerName", value)} options={tds194qOptions} value={review.tds194qLedgerName} />
-                      <div className={`pt-1 text-xs font-semibold ${invoiceTds194qKnown && Math.abs(Number(numericDifference(payload.source?.invoiceTds194qAmount, calculation?.tds194qAmount))) > 1 ? "text-rose-600" : invoiceTds194qKnown ? "text-emerald-700" : "text-slate-400"}`}>
-                        {invoiceTds194qKnown ? money(numericDifference(payload.source?.invoiceTds194qAmount, calculation?.tds194qAmount)) : "—"}
-                      </div>
+                      <div className="text-[11px] font-medium leading-4 text-slate-500">Reviewer confirmed</div>
+                      <div className="pt-1 text-xs text-slate-700">{money(String(tds194qBasisPreview))}</div>
+                      <div className="pt-1 text-xs font-semibold text-slate-900">{money(String(tds194qAmountPreview))}</div>
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-tds-194q-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["TDS_194Q_LEDGER_REQUIRED"])} label="Purchase TDS ledger" onChange={(value) => updateReview("tds194qLedgerName", value)} options={tds194qOptions} suggestedNames={tds194qRanked.suggestedNames} value={review.tds194qLedgerName} />
+                      <div className="pt-1 text-[10px] font-semibold text-emerald-700">Enabled</div>
                     </div>
                   ) : null}
 
@@ -1894,7 +2276,7 @@ export function TallyPurchasePostingPanel({
                           <div className="pt-1 text-[11px] font-medium text-slate-500">{calculation?.gstTdsAutomatic ? `Scrap basis ${money(calculation.gstTdsBasisAmount)}` : "Confirmed on invoice"}</div>
                           <div className="pt-1 text-xs text-slate-700">{calculation?.gstTdsAutomatic ? "Automatic" : moneyOrMissing(payload.source?.invoiceCgstTdsAmount)}</div>
                           <div className="text-xs font-semibold text-slate-900">{money(calculation?.cgstTdsAmount)}</div>
-                          <MasterCombobox {...masterContext} compact hideLabel id="field-cgst-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="CGST TDS PAYABLE 1% was not returned by Tally." issues={scopeIssues("tax", ["CGST_TDS_LEDGER_REQUIRED"])} label="CGST TDS ledger" onChange={(value) => updateReview("cgstTdsLedgerName", value)} options={cgstTdsOptions} value={review.cgstTdsLedgerName} />
+                          <MasterCombobox {...masterContext} compact hideLabel id="field-cgst-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["CGST_TDS_LEDGER_REQUIRED"])} label="CGST TDS ledger" onChange={(value) => updateReview("cgstTdsLedgerName", value)} options={cgstTdsOptions} suggestedNames={cgstTdsRanked.suggestedNames} value={review.cgstTdsLedgerName} />
                           <div className={`pt-1 text-xs font-semibold ${invoiceCgstTdsKnown && Math.abs(Number(numericDifference(payload.source?.invoiceCgstTdsAmount, calculation?.cgstTdsAmount))) > 1 ? "text-rose-600" : invoiceCgstTdsKnown ? "text-emerald-700" : "text-slate-400"}`}>
                             {invoiceCgstTdsKnown ? money(numericDifference(payload.source?.invoiceCgstTdsAmount, calculation?.cgstTdsAmount)) : "—"}
                           </div>
@@ -1909,7 +2291,7 @@ export function TallyPurchasePostingPanel({
                           <div className="pt-1 text-[11px] font-medium text-slate-500">{calculation?.gstTdsAutomatic ? `Scrap basis ${money(calculation.gstTdsBasisAmount)}` : "Confirmed on invoice"}</div>
                           <div className="pt-1 text-xs text-slate-700">{calculation?.gstTdsAutomatic ? "Automatic" : moneyOrMissing(payload.source?.invoiceSgstTdsAmount)}</div>
                           <div className="pt-1 text-xs font-semibold text-slate-900">{money(calculation?.sgstTdsAmount)}</div>
-                          <MasterCombobox {...masterContext} compact hideLabel id="field-sgst-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="SGST TDS PAYABLE 1% was not returned by Tally." issues={scopeIssues("tax", ["SGST_TDS_LEDGER_REQUIRED"])} label="SGST TDS ledger" onChange={(value) => updateReview("sgstTdsLedgerName", value)} options={sgstTdsOptions} value={review.sgstTdsLedgerName} />
+                          <MasterCombobox {...masterContext} compact hideLabel id="field-sgst-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["SGST_TDS_LEDGER_REQUIRED"])} label="SGST TDS ledger" onChange={(value) => updateReview("sgstTdsLedgerName", value)} options={sgstTdsOptions} suggestedNames={sgstTdsRanked.suggestedNames} value={review.sgstTdsLedgerName} />
                           <div className={`pt-1 text-xs font-semibold ${invoiceSgstTdsKnown && Math.abs(Number(numericDifference(payload.source?.invoiceSgstTdsAmount, calculation?.sgstTdsAmount))) > 1 ? "text-rose-600" : invoiceSgstTdsKnown ? "text-emerald-700" : "text-slate-400"}`}>
                             {invoiceSgstTdsKnown ? money(numericDifference(payload.source?.invoiceSgstTdsAmount, calculation?.sgstTdsAmount)) : "—"}
                           </div>
@@ -1925,7 +2307,7 @@ export function TallyPurchasePostingPanel({
                       <div className="pt-1 text-[11px] font-medium text-slate-500">{calculation?.gstTdsAutomatic ? `Scrap basis ${money(calculation.gstTdsBasisAmount)}` : "Confirmed on invoice"}</div>
                       <div className="pt-1 text-xs text-slate-700">{calculation?.gstTdsAutomatic ? "Automatic" : moneyOrMissing(payload.source?.invoiceIgstTdsAmount)}</div>
                       <div className="text-xs font-semibold text-slate-900">{money(calculation?.igstTdsAmount)}</div>
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-igst-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="IGST TDS PAYABLE 2% was not returned by Tally." issues={scopeIssues("tax", ["IGST_TDS_LEDGER_REQUIRED"])} label="IGST TDS ledger" onChange={(value) => updateReview("igstTdsLedgerName", value)} options={igstTdsOptions} value={review.igstTdsLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-igst-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["IGST_TDS_LEDGER_REQUIRED"])} label="IGST TDS ledger" onChange={(value) => updateReview("igstTdsLedgerName", value)} options={igstTdsOptions} suggestedNames={igstTdsRanked.suggestedNames} value={review.igstTdsLedgerName} />
                       <div className={`pt-1 text-xs font-semibold ${invoiceIgstTdsKnown && Math.abs(Number(numericDifference(payload.source?.invoiceIgstTdsAmount, calculation?.igstTdsAmount))) > 1 ? "text-rose-600" : invoiceIgstTdsKnown ? "text-emerald-700" : "text-slate-400"}`}>
                         {invoiceIgstTdsKnown ? money(numericDifference(payload.source?.invoiceIgstTdsAmount, calculation?.igstTdsAmount)) : "—"}
                       </div>
@@ -1938,7 +2320,7 @@ export function TallyPurchasePostingPanel({
                       <div className="pt-1 text-xs text-slate-700">{money(calculation?.freightAmount)}</div>
                       <div className="pt-1 text-xs text-slate-700">{moneyOrMissing(payload.source?.invoiceTransportTdsAmount)}</div>
                       <Field id="field-transport-tds-rate" disabled={locked} issues={scopeIssues("tax", ["TRANSPORT_TDS_RATE_REQUIRED"])} label={`Calculated ${money(calculation?.transportTdsAmount)} · rate %`} onChange={(value) => updateReview("transportTdsRate", value)} sourceValue={payload.source?.invoiceTransportTdsRate} value={review.transportTdsRate} />
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-transport-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="Tds on Goods Transport was not returned by Tally." issues={scopeIssues("tax", ["TRANSPORT_TDS_LEDGER_REQUIRED"])} label="Transport TDS ledger" onChange={(value) => updateReview("transportTdsLedgerName", value)} options={transportTdsOptions} value={review.transportTdsLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-transport-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["TRANSPORT_TDS_LEDGER_REQUIRED"])} label="Transport TDS ledger" onChange={(value) => updateReview("transportTdsLedgerName", value)} options={transportTdsOptions} suggestedNames={transportTdsRanked.suggestedNames} value={review.transportTdsLedgerName} />
                       <div className="pt-1 text-xs font-semibold text-slate-400">Deduction</div>
                     </div>
                   ) : null}
@@ -1949,7 +2331,7 @@ export function TallyPurchasePostingPanel({
                       <div className="pt-1 text-xs text-slate-400">Adjustment</div>
                       <div className={`pt-1 text-xs ${invoiceTcsKnown ? "text-slate-700" : "font-medium text-amber-700"}`}>{moneyOrMissing(payload.source?.invoiceTcsAmount)}</div>
                       <Field compact hideLabel id="field-tcs-amount" disabled={locked} issues={scopeIssues("tax", ["TCS_AMOUNT_REQUIRED"])} label="Confirmed TCS amount" onChange={(value) => updateReview("tcsAmount", value)} sourceValue={payload.source?.invoiceTcsAmount} value={review.tcsAmount} />
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-tcs-ledger" disabled={locked || mastersNeedSync} emptyMessage="No TCS ledger was returned by Tally." issues={scopeIssues("tax", ["TCS_LEDGER_REQUIRED"])} label="TCS Receivable ledger" onChange={(value) => updateReview("tcsLedgerName", value)} options={tcsOptions} value={review.tcsLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-tcs-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["TCS_LEDGER_REQUIRED"])} label="TCS Receivable ledger" onChange={(value) => updateReview("tcsLedgerName", value)} options={tcsOptions} suggestedNames={tcsRanked.suggestedNames} value={review.tcsLedgerName} />
                       <div className={`pt-1 text-xs font-semibold ${invoiceTcsKnown && Math.abs(Number(numericDifference(payload.source?.invoiceTcsAmount, review.tcsAmount))) > 1 ? "text-rose-600" : invoiceTcsKnown ? "text-emerald-700" : "text-slate-400"}`}>
                         {invoiceTcsKnown ? money(numericDifference(payload.source?.invoiceTcsAmount, review.tcsAmount)) : "—"}
                       </div>
@@ -1962,7 +2344,7 @@ export function TallyPurchasePostingPanel({
                       <div className="pt-1 text-xs text-slate-400">After tax</div>
                       <div className={`pt-1 text-xs ${invoiceRoundOffKnown ? "text-slate-700" : "font-medium text-amber-700"}`}>{moneyOrMissing(payload.source?.invoiceRoundOffAmount)}</div>
                       <Field compact hideLabel disabled={locked} label="Confirmed round-off amount" onChange={(value) => updateReview("roundOffAmount", value)} sourceValue={payload.source?.invoiceRoundOffAmount} value={review.roundOffAmount} />
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-round-off-ledger" disabled={locked || mastersNeedSync} emptyMessage="No round-off ledger was returned by Tally." issues={scopeIssues("tax", ["ROUND_OFF_LEDGER_REQUIRED"])} label="Round-off ledger" onChange={(value) => updateReview("roundOffLedgerName", value)} options={roundOffOptions} value={review.roundOffLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-round-off-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["ROUND_OFF_LEDGER_REQUIRED"])} label="Round-off ledger" onChange={(value) => updateReview("roundOffLedgerName", value)} options={roundOffOptions} suggestedNames={roundOffRanked.suggestedNames} value={review.roundOffLedgerName} />
                       <div className={`pt-1 text-xs font-semibold ${invoiceRoundOffKnown && Math.abs(Number(numericDifference(payload.source?.invoiceRoundOffAmount, review.roundOffAmount))) > 1 ? "text-rose-600" : invoiceRoundOffKnown ? "text-emerald-700" : "text-slate-400"}`}>
                         {invoiceRoundOffKnown ? money(numericDifference(payload.source?.invoiceRoundOffAmount, review.roundOffAmount)) : "—"}
                       </div>

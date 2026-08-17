@@ -34,6 +34,7 @@
     "test:purchase-posting": "node --test apps/api/src/lib/tally/purchase-posting.test.mjs",
     "test:pdf-security": "node --experimental-strip-types --test apps/api/src/lib/pdf-security.test.mjs",
     "quality:packet-regressions": "node scripts/packet-quality-regressions.mjs",
+    "storage:dedupe": "node --use-system-ca --env-file=apps/api/.env scripts/deduplicate-storage.mjs",
     "worker": "npm run worker --workspace @autodealer/api",
     "worker:local": "npm run worker:local --workspace @autodealer/api"
   },

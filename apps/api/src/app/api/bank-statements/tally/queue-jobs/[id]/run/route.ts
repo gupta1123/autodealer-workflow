@@ -1,9 +1,11 @@
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
-import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { POST as runTallyQueue } from "../../../queue/route";
 
-const QUEUE_JOB_BATCH_SIZE = Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_BATCH_SIZE ?? 20);
+const QUEUE_JOB_BATCH_SIZE = Math.max(
+  1,
+  Math.min(10, Number(process.env.BANK_STATEMENT_TALLY_QUEUE_JOB_BATCH_SIZE ?? 5))
+);
 
 type QueueJobPayload = {
   connectionId?: string;
@@ -95,6 +97,10 @@ function buildInternalQueueHeaders(request: Request) {
   const cookie = request.headers.get("cookie");
   if (authorization) headers.set("Authorization", authorization);
   if (cookie) headers.set("Cookie", cookie);
+  const workerSecret = request.headers.get("x-worker-secret");
+  const workerOwnerId = request.headers.get("x-worker-owner-id");
+  if (workerSecret) headers.set("x-worker-secret", workerSecret);
+  if (workerOwnerId) headers.set("x-worker-owner-id", workerOwnerId);
   return headers;
 }
 
@@ -107,8 +113,13 @@ export async function POST(
   context: { params: Promise<{ id: string }> }
 ) {
   try {
-    const user = await requireRequestUser(request);
-    if (!user) {
+    const suppliedWorkerSecret = request.headers.get("x-worker-secret");
+    const workerRequest = Boolean(
+      suppliedWorkerSecret &&
+      process.env.WORKER_SECRET &&
+      suppliedWorkerSecret === process.env.WORKER_SECRET
+    );
+    if (!workerRequest) {
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }
 
@@ -118,13 +129,13 @@ export async function POST(
       .from("bank_statement_tally_queue_jobs")
       .select("*")
       .eq("id", id)
-      .eq("owner_user_id", user.id)
       .maybeSingle();
 
     if (jobError) throw jobError;
     if (!job) {
       return jsonWithCors(request, { error: "Tally queue job not found." }, { status: 404 });
     }
+    const user = { id: String(job.owner_user_id) };
     if (terminal(job.status)) {
       return jsonWithCors(request, {
         job: serializeQueueJob(job as Record<string, unknown>),
@@ -186,7 +197,11 @@ export async function POST(
 
     const queueRequest = new Request(request.url, {
       method: "POST",
-      headers: buildInternalQueueHeaders(request),
+      headers: (() => {
+        const headers = buildInternalQueueHeaders(request);
+        if (workerRequest) headers.set("x-worker-owner-id", user.id);
+        return headers;
+      })(),
       body: JSON.stringify(batchPayload),
     });
     const queueResponse = await runTallyQueue(queueRequest);

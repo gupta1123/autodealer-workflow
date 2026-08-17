@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env.CASH_DISCOUNT_GATEWAY_PORT || 3002);
 const HOST = process.env.CASH_DISCOUNT_GATEWAY_HOST || "0.0.0.0";
-const API_BASE_URL = (process.env.CASH_DISCOUNT_API_BASE_URL || "http://localhost:3001").replace(/\/+$/, "");
+let apiBaseUrl = (process.env.CASH_DISCOUNT_API_BASE_URL || "http://localhost:3001").replace(/\/+$/, "");
 const AUTH_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 4 * 60_000;
 const MAX_MESSAGE_BYTES = 30 * 1024 * 1024;
@@ -26,7 +27,7 @@ async function apiRequest(path, { accessToken, bridgeToken, body }) {
   const headers = { "Content-Type": "application/json" };
   if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
   if (bridgeToken) headers["X-Bridge-Token"] = bridgeToken;
-  const response = await fetch(`${API_BASE_URL}${path}`, {
+  const response = await fetch(`${apiBaseUrl}${path}`, {
     method: "POST",
     headers,
     body: JSON.stringify(body),
@@ -161,7 +162,9 @@ async function handleBrowserRequest(socket, message, meta) {
     requestId,
     operation: operation === "scan" ? "cash_discount_scan" : "cash_discount_revalidate",
     companyName: String(message.companyName ?? "").trim(),
+    financialYear: String(message.financialYear ?? "").trim() || null,
     proposal,
+    customerScope: message.customerScope && typeof message.customerScope === "object" ? message.customerScope : null,
   });
 }
 
@@ -237,9 +240,22 @@ async function handleConnectorResult(socket, message, meta) {
   }
 }
 
-const server = new WebSocketServer({ host: HOST, port: PORT, maxPayload: MAX_MESSAGE_BYTES });
+export function startCashDiscountGateway(options = {}) {
+  const attachedServer = options.server;
+  const gatewayPath = options.path ?? (attachedServer ? "/cash-discount-live" : "/");
+  apiBaseUrl = String(options.apiBaseUrl || process.env.CASH_DISCOUNT_API_BASE_URL || "http://localhost:3001")
+    .replace(/\/+$/, "");
 
-server.on("connection", (socket) => {
+  const server = attachedServer
+    ? new WebSocketServer({ server: attachedServer, path: gatewayPath, maxPayload: MAX_MESSAGE_BYTES })
+    : new WebSocketServer({
+        host: options.host || HOST,
+        port: Number(options.port ?? PORT),
+        path: gatewayPath,
+        maxPayload: MAX_MESSAGE_BYTES,
+      });
+
+  server.on("connection", (socket) => {
   metadata.set(socket, { authenticated: false, alive: true });
   const authTimer = setTimeout(() => {
     if (!metadata.get(socket)?.authenticated) closeWithError(socket, "Live-session authentication timed out.");
@@ -284,19 +300,27 @@ server.on("connection", (socket) => {
       else if (item.connector === socket) failPending(requestId, new Error("The Tally connector disconnected during the live request."));
     }
   });
-});
+  });
 
-const heartbeat = setInterval(() => {
-  for (const socket of server.clients) {
-    const meta = metadata.get(socket);
-    if (meta?.alive === false) {
-      socket.terminate();
-      continue;
+  const heartbeat = setInterval(() => {
+    for (const socket of server.clients) {
+      const meta = metadata.get(socket);
+      if (meta?.alive === false) {
+        socket.terminate();
+        continue;
+      }
+      if (meta) meta.alive = false;
+      socket.ping();
     }
-    if (meta) meta.alive = false;
-    socket.ping();
-  }
-}, 30_000);
+  }, 30_000);
 
-server.on("close", () => clearInterval(heartbeat));
-console.log(`Cash Discount live gateway listening on ws://${HOST}:${PORT}`);
+  server.on("close", () => clearInterval(heartbeat));
+  const location = attachedServer
+    ? gatewayPath
+    : `ws://${options.host || HOST}:${Number(options.port ?? PORT)}${gatewayPath}`;
+  console.log(`Cash Discount live gateway listening on ${location}`);
+  return server;
+}
+
+const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isDirectRun) startCashDiscountGateway();

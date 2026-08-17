@@ -9,6 +9,8 @@ node_modules/
 node_modules.*/
 .next/
 **/.next/
+.next-build/
+**/.next-build/
 dist/
 **/dist/
 build/

@@ -404,6 +404,13 @@ export async function POST(
   };
 
   try {
+    const runStartedAt = Date.now();
+    const performance = {
+      extractionMs: 0,
+      reviewMs: 0,
+      finalizeMs: 0,
+      totalMs: 0,
+    };
     await updateCurrentJob({
       stage: "Preparing files",
       progress: 2,
@@ -420,6 +427,7 @@ export async function POST(
     const comparisonOptions = jobResult.comparisonOptions;
     const fieldConfiguration = await getPersistedPacketFieldConfiguration();
 
+    const extractionStartedAt = Date.now();
     const processed = await processStoredCaseFiles({
       caseId: job.case_id,
       analysisMode,
@@ -432,6 +440,7 @@ export async function POST(
         });
       },
     });
+    performance.extractionMs = Date.now() - extractionStartedAt;
 
     await assertCurrentRun();
 
@@ -482,8 +491,19 @@ export async function POST(
     });
     await assertCurrentRun();
 
-    const extractionReview = await reviewAndCorrectExtractedDocuments(documents);
+    const reviewStartedAt = Date.now();
+    const preliminaryVerification = verifyProcessedDocuments(documents, processed.comparisonOptions);
+    const reviewCandidateDocumentIds = new Set(
+      preliminaryVerification.mismatches.flatMap((mismatch) =>
+        mismatch.values.map((value) => value.docId)
+      )
+    );
+    const extractionReview = await reviewAndCorrectExtractedDocuments(documents, {
+      candidateDocumentIds: reviewCandidateDocumentIds,
+    });
     documents = enrichProcessedDocuments(extractionReview.documents);
+    performance.reviewMs = Date.now() - reviewStartedAt;
+    const finalizeStartedAt = Date.now();
 
     await updateCurrentJob({
       stage: "Saving reviewed results",
@@ -640,6 +660,10 @@ export async function POST(
       await Promise.all(preparedGroups.map((group) => deleteDuplicateAnalysisRows(group.caseId)));
       await assertCurrentRun();
 
+      performance.finalizeMs = Date.now() - finalizeStartedAt;
+      performance.totalMs = Date.now() - runStartedAt;
+      console.info("[packet-performance]", JSON.stringify({ jobId: id, caseId: job.case_id, analysisMode, ...performance }));
+
       await updateCurrentJob({
         status: "succeeded",
         progress: 100,
@@ -655,6 +679,7 @@ export async function POST(
             sourceCaseId: job.case_id,
           },
           extractionReview: extractionReview.review,
+          performance,
         },
         finished_at: new Date().toISOString(),
       });
@@ -713,6 +738,10 @@ export async function POST(
       throw updateCaseError;
     }
 
+    performance.finalizeMs = Date.now() - finalizeStartedAt;
+    performance.totalMs = Date.now() - runStartedAt;
+    console.info("[packet-performance]", JSON.stringify({ jobId: id, caseId: job.case_id, analysisMode, ...performance }));
+
     await updateCurrentJob({
       status: "succeeded",
       progress: 100,
@@ -725,6 +754,7 @@ export async function POST(
         mismatchCount: verified.mismatches.length,
         verificationGroupCount: verified.verificationGroups.length,
         extractionReview: extractionReview.review,
+        performance,
       },
       finished_at: new Date().toISOString(),
     });

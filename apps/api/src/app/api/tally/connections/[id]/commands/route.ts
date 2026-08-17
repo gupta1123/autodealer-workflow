@@ -14,6 +14,7 @@ import {
   type TallyBridgeCommandType,
 } from "@/lib/tally/commands";
 import { toNullableText, toRequiredText, type TallyMasterRow } from "@/lib/tally/masters";
+import { wakeTallyConnector } from "@/lib/tally/command-wake";
 
 function parseCommandType(value: unknown): TallyBridgeCommandType | null {
   if (typeof value !== "string") return null;
@@ -197,9 +198,13 @@ export async function POST(
       if (liveCompanyError) {
         return jsonWithCors(request, { error: liveCompanyError }, { status: 409 });
       }
+      const supportedMasterTypes = new Set(["ledger", "group", "stock_item", "unit", "voucher_type", "gst_ledger", "tax_ledger"]);
       const requestedMasterTypes = Array.isArray(rawPayload.requestedMasterTypes)
-        ? rawPayload.requestedMasterTypes.filter((value): value is string => typeof value === "string")
+        ? rawPayload.requestedMasterTypes.filter((value): value is string => typeof value === "string" && supportedMasterTypes.has(value))
         : ["ledger", "group", "stock_item", "unit", "voucher_type", "gst_ledger", "tax_ledger"];
+      if (requestedMasterTypes.length === 0) {
+        return jsonWithCors(request, { error: "Choose at least one supported Tally master type." }, { status: 400 });
+      }
       const payload = {
         companyName,
         requestedMasterTypes,
@@ -236,17 +241,20 @@ export async function POST(
 
       if (error) throw error;
 
-      await supabase.from("tally_connection_events").insert({
-        connection_id: id,
-        owner_user_id: user.id,
-        event_type: "command_queued",
-        message: "Tally master sync queued for bridge.",
-        payload: {
-          commandType,
-          companyName,
-          requestedMasterTypes,
-        },
-      });
+      await Promise.all([
+        supabase.from("tally_connection_events").insert({
+          connection_id: id,
+          owner_user_id: user.id,
+          event_type: "command_queued",
+          message: "Tally master sync queued for bridge.",
+          payload: {
+            commandType,
+            companyName,
+            requestedMasterTypes,
+          },
+        }),
+        wakeTallyConnector(id),
+      ]);
 
       return jsonWithCors(request, {
         command: serializeTallyBridgeCommand(data as unknown as TallyBridgeCommandRow),
@@ -307,6 +315,61 @@ export async function POST(
           commandType,
           companyNames: requestedCompanyNames,
         },
+      });
+
+      return jsonWithCors(request, {
+        command: serializeTallyBridgeCommand(data as unknown as TallyBridgeCommandRow),
+      });
+    }
+
+    if (commandType === "fetch_purchase_masters") {
+      const companyName =
+        toNullableText(rawPayload.companyName, 240) ??
+        toNullableText(connection.last_company_name, 240);
+      const liveCompanyError = activeTallyCompanyError(connection, companyName);
+      if (liveCompanyError) {
+        return jsonWithCors(request, { error: liveCompanyError }, { status: 409 });
+      }
+
+      const payload = {
+        companyName,
+        purpose: "purchase_posting_dropdowns",
+      };
+
+      if (isLocalDbMode()) {
+        const command = await createLocalTallyCommand({
+          connectionId: id,
+          ownerUserId: user.id,
+          commandType,
+          payload,
+          priority: 18,
+        });
+        return jsonWithCors(request, {
+          command: serializeTallyBridgeCommand(command),
+        });
+      }
+
+      const supabase = createSupabaseAdminClient();
+      const { data, error } = await supabase
+        .from("tally_bridge_commands")
+        .insert({
+          connection_id: id,
+          owner_user_id: user.id,
+          command_type: commandType,
+          status: "queued",
+          priority: 18,
+          payload,
+        })
+        .select("*")
+        .single();
+      if (error) throw error;
+
+      await supabase.from("tally_connection_events").insert({
+        connection_id: id,
+        owner_user_id: user.id,
+        event_type: "command_queued",
+        message: "Live Purchase-posting masters requested from Tally.",
+        payload: { commandType, companyName },
       });
 
       return jsonWithCors(request, {
