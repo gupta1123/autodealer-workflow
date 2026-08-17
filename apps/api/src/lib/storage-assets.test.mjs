@@ -32,7 +32,9 @@ function mockClient({ objectExists, uploadError = null }) {
         return {
           async exists(path) {
             calls.exists.push(path);
-            return { data: objectExists, error: null };
+            return objectExists instanceof Error || (objectExists && typeof objectExists === "object")
+              ? { data: false, error: objectExists }
+              : { data: objectExists, error: null };
           },
           async upload(path, body, options) {
             calls.uploads.push({ path, body, options });
@@ -84,6 +86,25 @@ test("recreates a missing object when matching storage metadata already exists",
     contentType: "application/pdf",
     upsert: false,
   });
+});
+
+test("uploads when Supabase returns Bad Request for a missing object exists check", async () => {
+  const { client, calls } = mockClient({
+    objectExists: { status: 400, statusCode: "400", message: "Bad Request" },
+  });
+
+  const asset = await ensureStorageAsset({
+    supabase: client,
+    ownerUserId,
+    storageBucket,
+    bytes,
+    contentType: "application/pdf",
+  });
+
+  assert.equal(asset.createdObject, true);
+  assert.deepEqual(calls.exists, [storagePath]);
+  assert.equal(calls.uploads.length, 1);
+  assert.equal(calls.uploads[0].path, storagePath);
 });
 
 test("accepts a concurrent upload that wins after the existence check", async () => {

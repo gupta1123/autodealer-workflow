@@ -36,6 +36,15 @@ function isAlreadyExistsError(error: unknown) {
   return /already exists|duplicate|409/i.test(text);
 }
 
+function isStorageMissingCheckError(error: unknown) {
+  if (!error || typeof error !== "object") return false;
+  const record = error as Record<string, unknown>;
+  const text = [record.message, record.error, record.statusCode, record.status]
+    .filter((value) => value !== null && value !== undefined)
+    .join(" ");
+  return /\b(400|404)\b|not found|bad request/i.test(text);
+}
+
 export function getContentSha256(bytes: Uint8Array) {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -53,7 +62,9 @@ async function ensureStorageObject(params: {
 }) {
   const bucket = params.supabase.storage.from(params.storageBucket);
   const existingObject = await bucket.exists(params.storagePath);
-  if (existingObject.error) throw existingObject.error;
+  if (existingObject.error && !isStorageMissingCheckError(existingObject.error)) {
+    throw existingObject.error;
+  }
   if (existingObject.data) return false;
 
   const upload = await bucket.upload(params.storagePath, params.bytes, {
