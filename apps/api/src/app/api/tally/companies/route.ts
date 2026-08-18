@@ -423,20 +423,29 @@ export async function GET(request: Request) {
         }
       }
 
-      const { data: eventRows, error: eventError } = await supabase
-        .from("tally_connection_events")
-        .select("connection_id, created_at, payload")
-        .eq("owner_user_id", user.id)
-        .in("connection_id", connectionIds)
-        .eq("event_type", "bridge_heartbeat")
-        .order("created_at", { ascending: false })
-        .limit(200);
+      const legacyConnectionIds = connections
+        .filter(
+          (connection) =>
+            !Array.isArray(connection.last_companies_snapshot) ||
+            connection.last_companies_snapshot.length === 0
+        )
+        .map((connection) => connection.id);
+      if (legacyConnectionIds.length > 0) {
+        const { data: eventRows, error: eventError } = await supabase
+          .from("tally_connection_events")
+          .select("connection_id, created_at, payload")
+          .eq("owner_user_id", user.id)
+          .in("connection_id", legacyConnectionIds)
+          .eq("event_type", "bridge_heartbeat")
+          .order("created_at", { ascending: false })
+          .limit(200);
 
-      if (eventError) throw eventError;
+        if (eventError) throw eventError;
 
-      for (const row of (eventRows ?? []) as unknown as HeartbeatEventRow[]) {
-        if (!latestHeartbeatByConnection.has(row.connection_id)) {
-          latestHeartbeatByConnection.set(row.connection_id, row);
+        for (const row of (eventRows ?? []) as unknown as HeartbeatEventRow[]) {
+          if (!latestHeartbeatByConnection.has(row.connection_id)) {
+            latestHeartbeatByConnection.set(row.connection_id, row);
+          }
         }
       }
     }
@@ -444,9 +453,8 @@ export async function GET(request: Request) {
     const companyEntries = connections.flatMap((connection) => {
       const latestSync = latestSyncByConnection.get(connection.id) ?? null;
       const status = serializeTallyConnectionStatus(connection);
-      const latestHeartbeat =
-        latestHeartbeatByConnection.get(connection.id) ?? null;
-      const heartbeatAt = timestampValue(latestHeartbeat?.created_at);
+      const latestHeartbeat = latestHeartbeatByConnection.get(connection.id) ?? null;
+      const heartbeatAt = timestampValue(connection.last_heartbeat_at);
       const heartbeatFresh =
         heartbeatAt > 0 && Date.now() - heartbeatAt <= 45_000;
       if (
@@ -456,9 +464,11 @@ export async function GET(request: Request) {
       ) {
         return [];
       }
-      const heartbeatCompanies = companiesFromPayload(
-        latestHeartbeat?.payload
-      );
+      const heartbeatCompanies =
+        Array.isArray(connection.last_companies_snapshot) &&
+        connection.last_companies_snapshot.length > 0
+          ? companiesFromPayload({ companies: connection.last_companies_snapshot })
+          : companiesFromPayload(latestHeartbeat?.payload);
 
       return heartbeatCompanies.map((metadata) => ({
         company: serializeCompany(

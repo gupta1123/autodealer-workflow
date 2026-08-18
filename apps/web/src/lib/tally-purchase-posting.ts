@@ -45,6 +45,7 @@ export type TallyPostingReview = {
   applyTds194q: boolean;
   tds194qBasisAmount: string;
   tds194qRounding: "paise" | "nearest_rupee";
+  applyTransportTds: boolean;
   transportTdsLedgerName: string;
   transportTdsRate: string;
   cgstTdsLedgerName: string;

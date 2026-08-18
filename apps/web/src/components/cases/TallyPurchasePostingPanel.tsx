@@ -1503,7 +1503,7 @@ export function TallyPurchasePostingPanel({
   const cgstTdsActive = Number(calculation?.cgstTdsAmount || 0) > 0;
   const sgstTdsActive = Number(calculation?.sgstTdsAmount || 0) > 0;
   const igstTdsActive = Number(calculation?.igstTdsAmount || 0) > 0;
-  const transporterTdsActive = Number(calculation?.transportTdsAmount || 0) > 0;
+  const transporterTdsActive = review.applyTransportTds;
   const invoiceFreightPresent = Number(payload.source?.invoiceFreightAmount) > 0;
   const freightRelevant =
     invoiceFreightPresent ||
@@ -1553,6 +1553,9 @@ export function TallyPurchasePostingPanel({
     : previewPurchaseLedgers.length > 1
       ? "Multiple purchase ledgers"
       : "Purchase ledger not selected";
+  const purchaseReference = review.invoiceNumber
+    ? `${review.invoiceNumber} / ${tallyDate(review.invoiceDate)}`
+    : "Invoice number / date missing";
   const previewTotalQuantity = review.lines.reduce(
     (total, line) => total + (Number.isFinite(Number(line.quantity)) ? Number(line.quantity) : 0),
     0
@@ -2162,6 +2165,48 @@ export function TallyPurchasePostingPanel({
             ) : null}
           </div>
 
+          <div className={`rounded-xl border p-4 ${review.applyTransportTds ? "border-emerald-200 bg-emerald-50/60" : "border-slate-200 bg-white"}`}>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <div className="text-sm font-semibold text-slate-950">Apply transporter TDS</div>
+                <p className="mt-1 max-w-2xl text-xs leading-5 text-slate-600">
+                  Turn this on when the invoice includes transporter TDS. Kalika will use the extracted invoice amount and selected Tally ledger.
+                </p>
+              </div>
+              <button
+                aria-checked={review.applyTransportTds}
+                className={`relative h-6 w-11 shrink-0 rounded-full transition ${review.applyTransportTds ? "bg-emerald-700" : "bg-slate-300"}`}
+                disabled={locked}
+                onClick={() => updateReview("applyTransportTds", !review.applyTransportTds)}
+                role="switch"
+                type="button"
+              >
+                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition ${review.applyTransportTds ? "left-[22px]" : "left-0.5"}`} />
+              </button>
+            </div>
+            {review.applyTransportTds ? (
+              <div className="mt-4 grid gap-3 border-t border-emerald-200 pt-4 sm:grid-cols-3">
+                <div className="text-xs text-emerald-800">
+                  <div className="font-semibold">Invoice amount</div>
+                  <div className="mt-1 text-sm font-semibold">{moneyOrMissing(payload.source?.invoiceTransportTdsAmount)}</div>
+                </div>
+                <Field
+                  id="field-transport-tds-rate-toggle"
+                  disabled={locked}
+                  issues={scopeIssues("tax", ["TRANSPORT_TDS_RATE_REQUIRED"])}
+                  label="TDS rate %"
+                  onChange={(value) => updateReview("transportTdsRate", value)}
+                  sourceValue={payload.source?.invoiceTransportTdsRate}
+                  value={review.transportTdsRate}
+                />
+                <MasterCombobox {...masterContext} id="field-transport-tds-ledger-toggle" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["TRANSPORT_TDS_LEDGER_REQUIRED"])} label="Transport TDS ledger" onChange={(value) => updateReview("transportTdsLedgerName", value)} options={transportTdsOptions} suggestedNames={transportTdsRanked.suggestedNames} value={review.transportTdsLedgerName} />
+                <div className="sm:col-span-3 text-xs font-medium text-emerald-800">
+                  Preview: {money(calculation?.transportTdsAmount)} will be deducted from the supplier payable.
+                </div>
+              </div>
+            ) : null}
+          </div>
+
           {!calculationReady ? (
             <div className="flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex items-start gap-3">
@@ -2480,10 +2525,7 @@ export function TallyPurchasePostingPanel({
                 <div className="flex items-center gap-2">
                   <span className="inline-flex h-5 items-center bg-[#173b70] px-3 text-[11px] font-bold text-white">Purchase</span>
                   <span className="font-semibold">No.</span>
-                  <span className="font-bold tabular-nums">{payload.posting?.tallyVoucherNumber || "Auto"}</span>
-                  {!payload.posting?.tallyVoucherNumber ? (
-                    <span className="text-[9px] text-[#677386]">assigned by Tally</span>
-                  ) : null}
+                  <span className="font-bold tabular-nums">{purchaseReference}</span>
                 </div>
                 <div className="min-w-48 border border-[#d7c700] bg-[#fffbd1] px-4 py-2 text-right">
                   <div className="font-bold tabular-nums">{tallyDate(review.voucherDate)}</div>
@@ -2568,7 +2610,7 @@ export function TallyPurchasePostingPanel({
             </div>
           </div>
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-500">
-            <span>Preview mirrors the Item Invoice layout; Tally assigns the final voucher number.</span>
+            <span>Purchase number uses the supplier invoice number / date; Tally assigns its internal voucher number when posted.</span>
             <span className={`font-semibold ${Math.abs(liveTotalDifference) > 1 ? "text-rose-600" : "text-emerald-700"}`}>
               Invoice difference {money(String(liveTotalDifference))}
             </span>
@@ -2673,10 +2715,10 @@ export function TallyPurchasePostingPanel({
                   payload.calculation?.taxMode === "cgst_sgst"
                     ? ["Input SGST", review.sgstLedgerName, payload.calculation.sgstAmount]
                     : null,
-                  Number(payload.calculation?.tds194qAmount || 0)
+                  review.applyTds194q
                     ? ["Purchase TDS", review.tds194qLedgerName, payload.calculation?.tds194qAmount]
                     : null,
-                  Number(payload.calculation?.transportTdsAmount || 0)
+                  review.applyTransportTds
                     ? ["Transport TDS", review.transportTdsLedgerName, payload.calculation?.transportTdsAmount]
                     : null,
                   Number(payload.calculation?.cgstTdsAmount || 0)

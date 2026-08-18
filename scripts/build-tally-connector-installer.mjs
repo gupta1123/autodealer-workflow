@@ -13,7 +13,7 @@ const connector = {
   installDir: "C:\\Autodealer\\tally-bridge",
   runtimeEnvironmentVariable: "KALIKA_CONNECTOR_RUNTIME",
   runtimePackageName: "@autodealer/tally-bridge-runtime",
-  version: "0.1.43",
+  version: "0.1.48",
   tdlFileNames: [
     "kalika-native-debit-note-export.tdl",
     "kalika-purchase-document-attachment.tdl",

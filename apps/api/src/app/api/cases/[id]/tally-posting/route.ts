@@ -26,7 +26,6 @@ import {
   type PurchasePostingReview,
 } from "@/lib/tally/purchase-posting";
 import { suggestPurchaseLineMasters } from "@/lib/tally/purchase-master-matching";
-import { tallyMasterFreshnessCutoff } from "@/lib/tally/masters";
 
 type PostingRow = {
   id: string;
@@ -294,7 +293,7 @@ function asSavedReview(value: unknown): Partial<PurchasePostingReview> | null {
         : clean;
     }
   }
-  for (const key of ["applyTds194q", "tcsReceivable", "sourceReferenceApproved"] as const) {
+  for (const key of ["applyTds194q", "applyTransportTds", "tcsReceivable", "sourceReferenceApproved"] as const) {
     if (typeof input[key] === "boolean") output[key] = input[key];
   }
   if (Array.isArray(input.lines)) {
@@ -749,7 +748,6 @@ async function loadContext(
           .eq("owner_user_id", ownerUserId)
           .eq("company_name", companyName)
           .eq("is_active", true)
-          .gte("last_synced_at", tallyMasterFreshnessCutoff())
           .in("master_type", ["ledger", "group", "stock_item", "unit", "gst_ledger", "tax_ledger"])
           .order("master_type", { ascending: true })
           .order("tally_name", { ascending: true })

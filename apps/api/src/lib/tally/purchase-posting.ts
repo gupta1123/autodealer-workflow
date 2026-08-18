@@ -90,6 +90,7 @@ export type PurchasePostingReview = {
   applyTds194q: boolean;
   tds194qBasisAmount: string;
   tds194qRounding: "paise" | "nearest_rupee";
+  applyTransportTds: boolean;
   transportTdsLedgerName: string;
   transportTdsRate: string;
   cgstTdsLedgerName: string;
@@ -878,6 +879,16 @@ function buildDefaultReview(
     };
   });
 
+  const narrationHsns = Array.from(new Set(
+    lines
+      .map((line) => normalizeHsn(line.hsn))
+      .filter(Boolean)
+  ));
+  const defaultNarration = [
+    source.vehicleNumber,
+    narrationHsns.length > 0 ? `HSN: ${narrationHsns.join(", ")}` : null,
+  ].filter(Boolean).join(" ") || "Purchase invoice details";
+
   const baseReview: PurchasePostingReview = {
     selectedInvoiceDocumentId: source.documentId,
     invoiceNumber: source.invoiceNumber,
@@ -917,6 +928,7 @@ function buildDefaultReview(
     applyTds194q: false,
     tds194qBasisAmount: "",
     tds194qRounding: "nearest_rupee",
+    applyTransportTds: false,
     transportTdsLedgerName:
       mappedRoleName(mappings, "tds_ledger", ["transport", "goods_transport"]) ||
       exactMasterName(masters, "Tds on Goods Transport", ["ledger", "tax_ledger"]) ||
@@ -941,9 +953,7 @@ function buildDefaultReview(
     roundOffLedgerName: mappedName(mappings, "round_off_ledger", "purchase") || findLedger(masters, [/round\s*off/i]),
     roundOffAmount: source.invoiceRoundOffAmount,
     sourceReferenceApproved: true,
-    narration: `Purchase invoice ${source.invoiceNumber || "(number pending)"}${
-      source.invoiceDate ? ` dated ${source.invoiceDate}` : ""
-    }.`,
+    narration: defaultNarration,
     lines,
   };
 
@@ -976,6 +986,7 @@ function buildDefaultReview(
     tds194qBasisAmount: saved?.tds194qBasisAmount ?? baseReview.tds194qBasisAmount,
     tds194qRounding:
       saved?.tds194qRounding === "paise" ? "paise" : "nearest_rupee",
+    applyTransportTds: saved?.applyTransportTds === true,
     tcsLedgerName: saved?.tcsLedgerName || baseReview.tcsLedgerName,
     roundOffLedgerName: saved?.roundOffLedgerName || baseReview.roundOffLedgerName,
     roundOffAmount: moneyPaise(source.invoiceRoundOffAmount)
@@ -987,7 +998,8 @@ function buildDefaultReview(
     sourceReferenceApproved: true,
     narration:
       saved?.narration &&
-      !/^Purchase invoice .+ imported from the packet-matching case\.$/i.test(saved.narration.trim())
+      !/^Purchase invoice .+ imported from the packet-matching case\.$/i.test(saved.narration.trim()) &&
+      !/^Purchase invoice .+ dated .*\.$/i.test(saved.narration.trim())
         ? saved.narration
         : baseReview.narration,
   };
@@ -1145,7 +1157,7 @@ function calculate(
     ? Math.round(rawTds194q / 100) * 100
     : rawTds194q;
   const transportTds = confirmedDeduction(
-    accountingSettings.transporterTdsEnabled,
+    accountingSettings.transporterTdsEnabled && review.applyTransportTds,
     source.invoiceTransportTdsAmount
   );
   const cgstTds = taxMode === "cgst_sgst"

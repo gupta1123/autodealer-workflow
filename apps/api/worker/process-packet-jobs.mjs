@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 
 import { createClient } from "@supabase/supabase-js";
 import sharp from "sharp";
+import { parseWithAnydoc } from "../src/lib/processing/anydoc-parser.ts";
 
 import { suggestBankLedgersForTransactions } from "../src/lib/bank-statement-ledger-matching.ts";
 import { correctRowsFromRunningBalance } from "./bank-statement-running-balance.mjs";
@@ -72,6 +73,12 @@ const BANK_STATEMENT_PROVIDER_IMAGE_MAX_DIMENSION = Number(
   process.env.BANK_STATEMENT_PROVIDER_IMAGE_MAX_DIMENSION ?? 3200
 );
 const BANK_STATEMENT_BUCKET = "bank-statement-files";
+const BANK_STATEMENT_ANYDOC_ENABLED = process.env.BANK_STATEMENT_ANYDOC_ENABLED !== "false";
+const OPENROUTER_ANYDOC_MODEL = process.env.OPENROUTER_ANYDOC_MODEL || "openai/gpt-5.6-luna";
+const OPENROUTER_ANYDOC_REASONING_TOKENS = Number(process.env.OPENROUTER_ANYDOC_REASONING_TOKENS ?? 0);
+const OPENROUTER_ANYDOC_MAX_OUTPUT_TOKENS = Number(
+  process.env.OPENROUTER_ANYDOC_MAX_OUTPUT_TOKENS ?? 20_000
+);
 const BANK_STATEMENT_PAGE_MANIFEST_INSTRUCTION =
   " Every transaction must include sourcePage with the visible PDF page number. Also return pageResults with exactly one entry for every supplied page: pageNumber, status (transactions or no_transactions), and transactionCount. Never omit a supplied page from pageResults.";
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
@@ -835,6 +842,29 @@ async function getTallyBankAccountCandidates(ownerUserId, connectionId) {
   });
 }
 
+async function getTallyLedgerNames(ownerUserId, connectionId) {
+  if (!connectionId) return [];
+  const names = [];
+  const pageSize = 1000;
+  for (let from = 0; from < 20000; from += pageSize) {
+    const { data, error } = await supabase
+      .from("tally_masters")
+      .select("tally_name")
+      .eq("owner_user_id", ownerUserId)
+      .eq("connection_id", connectionId)
+      .eq("master_type", "ledger")
+      .eq("is_active", true)
+      .order("tally_name", { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (error) throw error;
+    const page = (data ?? []).map((row) => textCell(row.tally_name)).filter(Boolean);
+    names.push(...page);
+    if (page.length < pageSize) break;
+    if (from + pageSize >= 20000) throw new Error("Tally ledger list exceeds the supported 20,000-ledger safety limit.");
+  }
+  return names;
+}
+
 function bankAccountCandidateInstruction(candidates = []) {
   if (candidates.length === 0) return "";
   return (
@@ -877,7 +907,7 @@ function bankStatementFailureReason(error) {
   return "failed";
 }
 
-async function callOpenRouterForBankStatement(messages) {
+async function callOpenRouterForBankStatement(messages, options = {}) {
   if (!OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY is not configured.");
   }
@@ -898,17 +928,19 @@ async function callOpenRouterForBankStatement(messages) {
           "X-Title": "Autodealer Workflow Bank Statement Worker",
         },
         body: JSON.stringify({
-          model: OPENROUTER_MODEL,
+          model: options.model || OPENROUTER_MODEL,
           messages,
           temperature: 0,
           reasoning:
-            Number.isFinite(OPENROUTER_QUALITY_REASONING_TOKENS) && OPENROUTER_QUALITY_REASONING_TOKENS > 0
-              ? { max_tokens: OPENROUTER_QUALITY_REASONING_TOKENS, exclude: true }
+            Number.isFinite(options.reasoningTokens ?? OPENROUTER_QUALITY_REASONING_TOKENS) &&
+            (options.reasoningTokens ?? OPENROUTER_QUALITY_REASONING_TOKENS) > 0
+              ? { max_tokens: options.reasoningTokens ?? OPENROUTER_QUALITY_REASONING_TOKENS, exclude: true }
               : undefined,
           response_format: { type: "json_object" },
           max_tokens:
-            Number.isFinite(OPENROUTER_MAX_OUTPUT_TOKENS) && OPENROUTER_MAX_OUTPUT_TOKENS > 0
-              ? Math.floor(OPENROUTER_MAX_OUTPUT_TOKENS)
+            Number.isFinite(options.maxOutputTokens ?? OPENROUTER_MAX_OUTPUT_TOKENS) &&
+            (options.maxOutputTokens ?? OPENROUTER_MAX_OUTPUT_TOKENS) > 0
+              ? Math.floor(options.maxOutputTokens ?? OPENROUTER_MAX_OUTPUT_TOKENS)
               : undefined,
         }),
       });
@@ -1087,6 +1119,43 @@ async function extractBankStatementFromText(fileName, pages, bankAccountCandidat
   ]);
 
   return parseBankStatementAiResponse(raw);
+}
+
+async function extractAndMatchBankStatementFromMarkdown(
+  fileName,
+  markdown,
+  bankAccountCandidates = [],
+  ledgerNames = [],
+  options = {}
+) {
+  const raw = await callOpenRouterForBankStatement([
+    {
+      role: "system",
+      content:
+        "Read the supplied bank-statement Markdown and perform both tasks in one response: (1) extract normalized account details and transaction rows, and (2) recommend an existing Tally ledger for every transaction. Return only JSON with keys account, statementPeriodStart, statementPeriodEnd, openingBalance, and transactions. " +
+        "Each transaction must include transactionDate, valueDate when visible, description, referenceNumber when visible, debitAmount, creditAmount, balanceAmount, suggestedLedgerName, suggestionConfidence, and suggestionReason. Dates must be ISO YYYY-MM-DD. Use positive numbers for debit and credit in their own columns. Do not invent rows or amounts. Preserve complete narration text. " +
+        "For suggestedLedgerName, choose only an exact name from the supplied tallyLedgers list. If no ledger is uniquely supported, return null, suggestionConfidence 0, and explain briefly in suggestionReason. Never invent a ledger. " +
+        "If the Markdown contains only summary information and no ledger rows, return an empty transactions array." +
+        bankAccountCandidateInstruction(bankAccountCandidates),
+    },
+    {
+      role: "user",
+      content:
+        `Extract and match bank statement data from ${fileName}.\n\n` +
+        `tallyLedgers (exact allowed names):\n${JSON.stringify(ledgerNames)}\n\n` +
+        `statementMarkdown:\n${markdown}`,
+    },
+  ], options);
+  const parsed = parseBankStatementAiResponse(raw);
+  parsed.transactions = parsed.transactions.map((transaction) => ({
+    ...transaction,
+    raw_payload: {
+      ...(transaction.raw_payload || {}),
+      source: "anydoc_markdown_combined_ai",
+      combinedLedgerMatch: true,
+    },
+  }));
+  return parsed;
 }
 
 function mergeBankStatementResults(results) {
@@ -1523,7 +1592,7 @@ async function recoverSinglePages({
   };
 }
 
-async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, isImage, jobId, bankAccountCandidates = [] }) {
+async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, isImage, jobId, bankAccountCandidates = [], ledgerNames = [] }) {
   const diagnostics = {
     pipeline: null,
     pageCount: isImage ? 1 : null,
@@ -1535,11 +1604,59 @@ async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, 
     recovery: [],
     recoveryMode: null,
     errors: [],
+    anydoc: null,
   };
   let parsed = null;
   let extractionSource = "none";
   let extractionError = null;
   let textInfo = { pages: [], pageCount: isImage ? 1 : 0, truncated: false };
+
+  if (isPdf && BANK_STATEMENT_ANYDOC_ENABLED) {
+    try {
+      await updateBankJob(jobId, { progress: 32, stage: "Converting PDF to Markdown" });
+      const anydocResult = await parseWithAnydoc(bytes, fileName);
+      diagnostics.anydoc = {
+        success: anydocResult.success,
+        executionTimeMs: anydocResult.executionTimeMs,
+        markdownChars: anydocResult.markdownText.length,
+        tableCount: anydocResult.tableCount,
+        error: anydocResult.error ?? null,
+      };
+      if (anydocResult.success && anydocResult.markdownText.trim()) {
+        await updateBankJob(jobId, { progress: 45, stage: "Running quick Markdown + ledger AI" });
+        const markdownAiStartedAt = Date.now();
+        parsed = await extractAndMatchBankStatementFromMarkdown(
+          fileName,
+          anydocResult.markdownText,
+          bankAccountCandidates,
+          ledgerNames,
+          {
+            model: OPENROUTER_ANYDOC_MODEL,
+            reasoningTokens: OPENROUTER_ANYDOC_REASONING_TOKENS,
+            maxOutputTokens: OPENROUTER_ANYDOC_MAX_OUTPUT_TOKENS,
+          },
+        );
+        diagnostics.anydoc.markdownAiMs = Date.now() - markdownAiStartedAt;
+        if (parsed.transactions.length > 0) {
+          parsed = {
+            ...parsed,
+            transactions: addBankStatementPageProvenance(parsed.transactions, {
+              startPage: 1,
+              endPage: Math.max(1, anydocResult.tableCount),
+              method: "anydoc_markdown_v1",
+            }),
+          };
+          extractionSource = "anydoc_markdown_combined_ai";
+          diagnostics.pipeline = extractionSource;
+          diagnostics.coverageComplete = true;
+          return { parsed, extractionSource, extractionError: null, diagnostics };
+        }
+      }
+    } catch (error) {
+      diagnostics.errors.push({ stage: "anydoc_markdown_combined_ai", error: diagnosticError(error) });
+      console.warn(`[worker] AnyDoc fast path skipped for ${fileName}: ${diagnosticError(error)}`);
+    }
+  }
 
   if (isPdf) {
     try {
@@ -1813,11 +1930,43 @@ function bankLedgerMatchTransaction(row) {
   };
 }
 
+function markCombinedLedgerRecommendationsCompleted(rows, ledgerNames = []) {
+  const allowed = new Set(ledgerNames.map((name) => normalizeName(name)).filter(Boolean));
+  return rows.map((row) => {
+    const rawPayload =
+      row.raw_payload && typeof row.raw_payload === "object" && !Array.isArray(row.raw_payload)
+        ? row.raw_payload
+        : {};
+    const suggestedLedgerName = allowed.has(normalizeName(row.suggested_ledger_name))
+      ? row.suggested_ledger_name
+      : null;
+    return {
+      ...row,
+      suggested_ledger_name: suggestedLedgerName,
+      raw_payload: {
+        ...rawPayload,
+        aiLedgerRecommendation: {
+          matchType: suggestedLedgerName ? "direct_match" : "suspense",
+          action: suggestedLedgerName ? "use_existing_ledger" : "use_suspense",
+          ledgerName: suggestedLedgerName,
+          candidateLedgerNames: [],
+          confidence: row.suggestion_confidence ?? 0,
+          reason: row.suggestion_reason || null,
+          model: OPENROUTER_ANYDOC_MODEL,
+          source: "combined_ai_match",
+          status: "completed",
+        },
+      },
+    };
+  });
+}
+
 async function addBankLedgerRecommendations({
   rows,
   ownerUserId,
   connectionId,
   accountId,
+  companyName,
 }) {
   if (rows.length === 0) return rows;
 
@@ -1825,6 +1974,7 @@ async function addBankLedgerRecommendations({
     supabase,
     ownerUserId,
     connectionId,
+    companyName,
     transactions: rows.map((row) => ({
       accountId,
       transaction: bankLedgerMatchTransaction(row),
@@ -1938,6 +2088,7 @@ async function runBankStatementJob(job) {
     processingMeta.selectedContext && typeof processingMeta.selectedContext === "object" && !Array.isArray(processingMeta.selectedContext)
       ? processingMeta.selectedContext
       : {};
+  const companyName = typeof selectedContext.companyName === "string" ? selectedContext.companyName : null;
   const analysisContext =
     processingMeta.analysis && typeof processingMeta.analysis === "object" && !Array.isArray(processingMeta.analysis)
       ? processingMeta.analysis
@@ -1949,6 +2100,7 @@ async function runBankStatementJob(job) {
         ? analysisContext.connectionId
         : null;
   const bankAccountCandidates = await getTallyBankAccountCandidates(job.owner_user_id, tallyConnectionId);
+  const ledgerNames = await getTallyLedgerNames(job.owner_user_id, tallyConnectionId);
   await updateBankJob(job.id, { progress: 30, stage: "Preparing pages for AI" });
   const isPdf = mimeType.includes("pdf") || /\.pdf$/i.test(fileName);
   const isImage = mimeType.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(fileName);
@@ -1966,6 +2118,7 @@ async function runBankStatementJob(job) {
       isImage,
       jobId: job.id,
       bankAccountCandidates,
+      ledgerNames,
     });
   } finally {
     stopHeartbeat();
@@ -2032,12 +2185,15 @@ async function runBankStatementJob(job) {
     previewRows = markBankLedgerRecommendationsUnavailable(rows, ledgerRecommendationError, "deferred");
   } else {
     try {
-      previewRows = await addBankLedgerRecommendations({
-        rows,
-        ownerUserId: job.owner_user_id,
-        connectionId: tallyConnectionId,
-        accountId: String(selectedAccountId || importRow.bank_account_id || ""),
-      });
+      previewRows = extractionSource === "anydoc_markdown_combined_ai"
+        ? markCombinedLedgerRecommendationsCompleted(rows, ledgerNames)
+        : await addBankLedgerRecommendations({
+            rows,
+            ownerUserId: job.owner_user_id,
+            connectionId: tallyConnectionId,
+            accountId: String(selectedAccountId || importRow.bank_account_id || ""),
+            companyName,
+          });
     } catch (error) {
       const detail = diagnosticError(error);
       ledgerRecommendationError = `Statement rows were extracted, but ledger matching is temporarily unavailable: ${detail}`;

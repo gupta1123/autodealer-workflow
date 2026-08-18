@@ -344,7 +344,7 @@ test("source PDF attachment is automatic and legacy link approval no longer bloc
   assert.equal(result.review.sourceReferenceApproved, true);
   assert.equal(
     result.review.narration,
-    `Purchase invoice ${document.extracted_fields.invoiceNumber} dated ${result.source.invoiceDate}.`
+    "MH12AB1234 HSN: 72044900"
   );
   assert.ok(!result.blockers.some((blocker) => blocker.code === "SOURCE_REFERENCE_APPROVAL_REQUIRED"));
   assert.equal("sourceDocumentReference" in result.tallyPayload, false);
@@ -458,12 +458,12 @@ test("freight is a separate charge, expands the GST basis, and has its own TDS",
   document.extracted_fields.transportTdsAmount = "1.00";
   document.extracted_fields.transportTdsRate = "1";
 
-  const result = prepare(document);
+  const result = prepare(document, { savedReview: { applyTransportTds: true } });
   assert.equal(result.review.freightLedgerName, "Transportation Inward @ 18.00%");
   assert.equal(result.calculation.gstTaxableAmount, "1100.00");
   assert.equal(result.calculation.gstAmount, "198.00");
   assert.equal(result.calculation.transportTdsAmount, "1.00");
-  assert.equal(result.calculation.calculatedPayable, "1276.00");
+  assert.equal(result.calculation.calculatedPayable, "1277.00");
   assert.ok(result.tallyPayload.charges.some((entry) => entry.kind === "freight"));
   assert.ok(result.tallyPayload.withholdings.some((entry) => entry.kind === "transport_tds"));
   assert.equal(result.blockers.length, 0);

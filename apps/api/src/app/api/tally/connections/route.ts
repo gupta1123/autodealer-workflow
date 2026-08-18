@@ -35,6 +35,31 @@ function normalizeDisplayName(value: unknown) {
   return value.trim().slice(0, 120);
 }
 
+function errorText(error: unknown) {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object") {
+    const record = error as Record<string, unknown>;
+    return [record.message, record.details, record.hint]
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .join(" ");
+  }
+  return String(error ?? "").trim();
+}
+
+function tallyConnectionErrorPayload(error: unknown) {
+  const message = errorText(error);
+  if (/tally_connections|tally_connection_events|relation .*does not exist|schema cache/i.test(message)) {
+    return {
+      error: "Tally Connector setup is not ready.",
+      userAction: "Run the latest Kalika Tally connector database migration, then try again.",
+    };
+  }
+  return {
+    error: message || "Could not load Tally connections.",
+    userAction: "Check the API server logs if this continues.",
+  };
+}
+
 function connectionSortTime(connection: ReturnType<typeof serializeTallyConnectionStatus>) {
   const heartbeatTime = connection.lastHeartbeatAt
     ? new Date(connection.lastHeartbeatAt).getTime()
@@ -50,10 +75,9 @@ function pickRelevantConnections(rows: TallyConnectionRow[]) {
     // in the workstation list.
     .filter(
       (row) =>
-        Boolean(row.bridge_token_hash) &&
         Boolean(row.installation_id) &&
-        Boolean(row.paired_at) &&
-        !row.revoked_at
+        !row.revoked_at &&
+        (Boolean(row.bridge_token_hash) || row.status === "waiting_for_bridge")
     )
     .map(serializeTallyConnectionStatus);
   // A user can legitimately have connectors on multiple Tally machines.
@@ -148,7 +172,7 @@ export async function GET(request: Request) {
     });
   } catch (error) {
     console.error("Error in GET /api/tally/connections:", error);
-    return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
+    return jsonWithCors(request, tallyConnectionErrorPayload(error), { status: 500 });
   }
 }
 
@@ -182,6 +206,51 @@ export async function POST(request: Request) {
     const pairingCode = createPairingCode();
     const controlToken = createBridgeToken();
     const supabase = createSupabaseAdminClient();
+    const reuseConnectionId =
+      typeof body.reuseConnectionId === "string" && body.reuseConnectionId.trim()
+        ? body.reuseConnectionId.trim()
+        : null;
+
+    if (reuseConnectionId) {
+      const { data: existing, error: existingError } = await supabase
+        .from("tally_connections")
+        .select(TALLY_CONNECTION_SELECT)
+        .eq("id", reuseConnectionId)
+        .eq("owner_user_id", user.id)
+        .is("revoked_at", null)
+        .is("bridge_token_hash", null)
+        .maybeSingle();
+      if (existingError) throw existingError;
+      if (existing) {
+        const { data: resumed, error: resumeError } = await supabase
+          .from("tally_connections")
+          .update({
+            status: "waiting_for_bridge",
+            pairing_code_hash: hashSecret(pairingCode),
+            pairing_code_expires_at: createPairingExpiry(),
+            control_token_hash: hashSecret(controlToken),
+            last_error: null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", reuseConnectionId)
+          .select(TALLY_CONNECTION_SELECT)
+          .single();
+        if (resumeError) throw resumeError;
+        await logConnectionEvent(
+          reuseConnectionId,
+          user.id,
+          "connection_resume_requested",
+          "Temporary Kalika Tally connection resume requested.",
+          { reused: true },
+        );
+        return jsonWithCors(request, {
+          connection: serializeTallyConnection(resumed as unknown as TallyConnectionRow),
+          pairingCode,
+          controlToken,
+          reused: true,
+        });
+      }
+    }
     const retiredAt = new Date().toISOString();
     const { error: retirePendingError } = await supabase
       .from("tally_connections")
@@ -240,6 +309,6 @@ export async function POST(request: Request) {
     );
   } catch (error) {
     console.error("Error in POST /api/tally/connections:", error);
-    return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
+    return jsonWithCors(request, tallyConnectionErrorPayload(error), { status: 500 });
   }
 }

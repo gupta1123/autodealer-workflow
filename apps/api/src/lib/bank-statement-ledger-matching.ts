@@ -14,12 +14,7 @@ import {
   getBankLedgerMatchingTimeoutMs,
 } from "./processing/openrouter.ts";
 import { isSuspenseLedgerIdentity } from "./bank-statement-ledger-safety.ts";
-import {
-  normalizeMasterKey,
-  tallyMasterFreshnessCutoff,
-  type TallyMappingRow,
-  type TallyMasterRow,
-} from "./tally/masters.ts";
+import { normalizeMasterKey, type TallyMappingRow, type TallyMasterRow } from "./tally/masters.ts";
 
 export type BankLedgerSuggestion = {
   counterpartyName: string | null;
@@ -109,6 +104,15 @@ A shortened, OCR-damaged, misspelled, or incomplete party name can still be a di
 Do not call something a close match only because the bank narration does not exactly equal the ledger name.
 Use close_match only when there is a real collision.
 If the narration contains only a shared party root and multiple ledgers extend or vary that root, return close_match and keep the posting ledger in Suspense, even when one candidate has a somewhat stronger textual similarity.
+
+Company-context rule:
+The supplied companyName is the owner of the bank statement. When the raw
+narration contains both an external party and companyName (or a clear legal,
+spacing, or abbreviation variant of companyName), treat the company occurrence
+as account-owner context, not as a competing counterparty. Do not add the
+company's own ledger to candidateLedgerNames unless the narration explicitly
+describes a self-transfer, own-account transfer, inter-company transfer, or
+company loan. Match the external party named before or alongside that context.
 
 Exact complete-name precedence:
 After removing bank-system noise and normalizing only case, spacing, and punctuation, if the narrated party identity exactly equals one complete allowed ledger name, treat that ledger as a direct_match.
@@ -414,6 +418,7 @@ function validateAiLedgerMatch(
 
 async function aiMatchLedgersForTransactions(input: {
   ledgers: TallyMasterRow[];
+  companyName?: string | null;
   transactions: Array<{
     transaction: MatchableTransaction;
     counterpartyName: string | null;
@@ -441,6 +446,7 @@ async function aiMatchLedgersForTransactions(input: {
       {
         role: "user",
         content: compactPromptJson({
+          companyName: input.companyName ?? null,
           transactions: input.transactions.map(({ transaction, counterpartyName }, index) => ({
             index,
             transactionDate: transaction.transactionDate ?? null,
@@ -585,7 +591,6 @@ async function fetchAllActiveTallyLedgers(input: {
       .eq("connection_id", input.connectionId)
       .eq("master_type", "ledger")
       .eq("is_active", true)
-      .gte("last_synced_at", tallyMasterFreshnessCutoff())
       .order("tally_name", { ascending: true })
       .range(from, from + pageSize - 1);
     if (error) throw error;
@@ -601,6 +606,7 @@ export async function suggestBankLedgersForTransactions(input: {
   supabase: SupabaseClient;
   ownerUserId: string;
   connectionId?: string | null;
+  companyName?: string | null;
   transactions: BankLedgerSuggestionTransaction[];
 }): Promise<BankLedgerSuggestion[]> {
   if (input.transactions.length === 0) return [];
@@ -687,6 +693,7 @@ export async function suggestBankLedgersForTransactions(input: {
       try {
         const aiMatches = await aiMatchLedgersForTransactions({
           ledgers,
+          companyName: input.companyName,
           transactions: chunk.map((item) => ({
             transaction: item.transaction,
             counterpartyName: item.counterpartyName,

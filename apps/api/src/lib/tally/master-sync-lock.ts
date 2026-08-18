@@ -1,8 +1,6 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
-
 const LOCK_TTL_MS = 10 * 60 * 1000;
 
-type LockClient = SupabaseClient;
+type LockClient = { from: (table: string) => any };
 type LockResult = { acquired: true; token: string } | { acquired: false };
 
 const localLocks = new Map<string, { token: string; expiresAt: number }>();
@@ -11,14 +9,10 @@ function lockKey(connectionId: string, companyName: string) {
   return `${connectionId}::${companyName.trim().toLowerCase().replace(/\s+/g, " ")}`;
 }
 
-function lockTableMissing(error: unknown) {
+function lockTableMissing(error: any) {
   return /tally_master_sync_locks|relation .* does not exist|schema cache/i.test(
-    String(error && typeof error === "object" && "message" in error ? error.message : (error ?? ""))
+    String(error?.message ?? error ?? "")
   );
-}
-
-function errorCode(error: unknown) {
-  return error && typeof error === "object" && "code" in error ? String(error.code ?? "") : "";
 }
 
 function acquireLocalLock(connectionId: string, companyName: string, token: string, expiresAt: Date): LockResult {
@@ -61,7 +55,7 @@ export async function acquireTallyMasterSyncLock(args: {
     expires_at: expiresAt.toISOString(),
   });
   if (!error) return { acquired: true, token };
-  if (errorCode(error) === "23505") return { acquired: false };
+  if (error.code === "23505") return { acquired: false };
   if (lockTableMissing(error)) {
     return acquireLocalLock(args.connectionId, args.companyName, token, expiresAt);
   }
