@@ -11,6 +11,7 @@ import { parseWithAnydoc } from "../src/lib/processing/anydoc-parser.ts";
 
 import { suggestBankLedgersForTransactions } from "../src/lib/bank-statement-ledger-matching.ts";
 import { correctRowsFromRunningBalance } from "./bank-statement-running-balance.mjs";
+import { validateRunningBalanceContinuity } from "./bank-statement-balance-validation.mjs";
 import {
   addBankStatementPageProvenance,
   shouldAttemptBankStatementSingleShot,
@@ -1206,37 +1207,6 @@ function mergeBankStatementResults(results) {
   return merged;
 }
 
-function validateRunningBalanceContinuity(transactions, openingBalance = null) {
-  let previousBalance = typeof openingBalance === "number" && Number.isFinite(openingBalance)
-    ? openingBalance
-    : null;
-  const breaks = [];
-  for (const transaction of transactions) {
-    const balance = transaction.balance_amount;
-    const debit = transaction.debit_amount ?? 0;
-    const credit = transaction.credit_amount ?? 0;
-    if (
-      previousBalance !== null &&
-      typeof balance === "number" && Number.isFinite(balance)
-    ) {
-      const expectedBalance = Number((previousBalance - debit + credit).toFixed(2));
-      if (Math.abs(expectedBalance - balance) >= 0.01) {
-        const provenance = transaction?.raw_payload?.extractionProvenance ?? {};
-        breaks.push({
-          page: Number(provenance.startPage) || null,
-          sourceIndex: Number(provenance.sourceIndex) || 0,
-          previousBalance,
-          expectedBalance,
-          actualBalance: balance,
-          referenceNumber: transaction.reference_number ?? null,
-        });
-      }
-    }
-    if (typeof balance === "number" && Number.isFinite(balance)) previousBalance = balance;
-  }
-  return { valid: breaks.length === 0, checkedTransitions: Math.max(0, transactions.length - 1), breaks };
-}
-
 function likelyHasTransactionRows(page) {
   const text = String(typeof page === "string" ? page : page?.text || "").replace(/\s+/g, " ").trim();
   if (!text) return false;
@@ -2127,7 +2097,18 @@ async function runBankStatementJob(job) {
   const extractionSource = extraction.extractionSource;
   let extractionError = extraction.extractionError;
   const extractionDiagnostics = extraction.diagnostics;
-  const balanceValidation = validateRunningBalanceContinuity(parsed.transactions, parsed.openingBalance);
+  let balanceValidation = validateRunningBalanceContinuity(parsed.transactions, parsed.openingBalance);
+  // Many bank PDFs print newest-first. Apply the existing balance-based
+  // debit/credit correction in chronological order, then restore the PDF
+  // order used by the preview and ledger workflow.
+  if (balanceValidation.orientation === "reverse") {
+    parsed.transactions = correctPreviewRowsFromRunningBalance(
+      [...parsed.transactions].reverse(),
+      parsed.openingBalance,
+    ).reverse();
+    balanceValidation = validateRunningBalanceContinuity(parsed.transactions, parsed.openingBalance);
+    balanceValidation.correctedForReverseOrder = true;
+  }
   extractionDiagnostics.balanceValidation = balanceValidation;
   if (!balanceValidation.valid) {
     extractionDiagnostics.coverageComplete = false;

@@ -46,3 +46,18 @@ test("continues validating later rows from the preceding running balance", () =>
   assert.equal(rows[1].debit_amount, null);
   assert.equal(rows[1].credit_amount, 5000);
 });
+
+test("can correct direction after a newest-first statement is reversed", () => {
+  const newestFirst = [
+    { description: "LATEST RECEIPT", debit_amount: null, credit_amount: 10000, balance_amount: 140000 },
+    { description: "EARLIER PAYMENT", debit_amount: 20000, credit_amount: null, balance_amount: 130000 },
+    { description: "EARLIEST RECEIPT", debit_amount: 50000, credit_amount: null, balance_amount: 150000 },
+  ];
+  const chronological = correctRowsFromRunningBalance([...newestFirst].reverse(), { openingBalance: 100000 });
+  const restoredPdfOrder = chronological.reverse();
+
+  assert.equal(restoredPdfOrder[0].credit_amount, 10000);
+  assert.equal(restoredPdfOrder[1].debit_amount, 20000);
+  assert.equal(restoredPdfOrder[2].debit_amount, null);
+  assert.equal(restoredPdfOrder[2].credit_amount, 50000);
+});
