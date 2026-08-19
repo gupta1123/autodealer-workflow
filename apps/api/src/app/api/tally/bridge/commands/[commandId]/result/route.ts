@@ -208,15 +208,25 @@ export async function POST(
       .eq("id", commandId)
       .eq("connection_id", connection.id)
       .in("status", ["claimed", "queued"])
-      .select("*")
-      .maybeSingle();
+        // Return only the id here. The full command payload was already read
+        // above; returning it again made result callbacks unnecessarily large
+        // and could hit Supabase statement timeouts for voucher commands.
+        .select("id")
+        .maybeSingle();
 
     if (updateError) throw updateError;
     if (!commandData) {
       return jsonWithCors(request, { error: "Tally command not found." }, { status: 404 });
     }
 
-    const command = commandData as unknown as TallyBridgeCommandRow;
+    const command = {
+      ...pendingCommand,
+      status: success ? "succeeded" : "failed",
+      payload: isPurchaseVoucher ? compactPurchaseCommandPayload(commandPayload) : commandPayload,
+      result: isPurchaseVoucher ? compactPurchaseResult(result) : result,
+      error: errorMessage,
+      completed_at: now,
+    } as TallyBridgeCommandRow;
 
     if (command.command_type === "sync_masters") {
       await releaseTallyMasterSyncLock({
