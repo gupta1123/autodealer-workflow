@@ -540,6 +540,16 @@ function maskAccountNumber(value) {
   return `${"*".repeat(Math.max(0, normalized.length - 4))}${normalized.slice(-4)}`;
 }
 
+// Account numbers are often present in rendered Markdown even when the
+// combined extraction model omits the account object.
+function extractStatementAccountNumberFromText(value) {
+  const text = String(value ?? "");
+  const match = text.match(/(?:account\s*(?:number|no\.?|#)|a\/c\s*(?:number|no\.?|#))\s*[:\-]?\s*([A-Z0-9][A-Z0-9 ./-]{5,30})/i);
+  if (!match) return null;
+  const candidate = normalizeAccountNumber(match[1]);
+  return candidate.length >= 6 && candidate.length <= 24 ? candidate : null;
+}
+
 async function imageBytesToProviderDataUrl(data, mimeType, label) {
   const normalizedMimeType = normalizeImageMimeType(mimeType);
   const input = Buffer.from(data);
@@ -1148,6 +1158,9 @@ async function extractAndMatchBankStatementFromMarkdown(
     },
   ], options);
   const parsed = parseBankStatementAiResponse(raw);
+  if (!parsed.account.accountNumber) {
+    parsed.account.accountNumber = extractStatementAccountNumberFromText(markdown);
+  }
   parsed.transactions = parsed.transactions.map((transaction) => ({
     ...transaction,
     raw_payload: {
@@ -2069,8 +2082,33 @@ async function runBankStatementJob(job) {
       : typeof analysisContext.connectionId === "string"
         ? analysisContext.connectionId
         : null;
-  const bankAccountCandidates = await getTallyBankAccountCandidates(job.owner_user_id, tallyConnectionId);
-  const ledgerNames = await getTallyLedgerNames(job.owner_user_id, tallyConnectionId);
+  // An upload can outlive the browser connection that created it. Never use a
+  // revoked session for master lookup; resolve the newest live session for the
+  // same company before analysis continues.
+  let effectiveTallyConnectionId = tallyConnectionId;
+  if (tallyConnectionId) {
+    const { data: selectedConnection } = await supabase
+      .from("tally_connections")
+      .select("id, revoked_at, last_company_name")
+      .eq("id", tallyConnectionId)
+      .eq("owner_user_id", job.owner_user_id)
+      .maybeSingle();
+    if (selectedConnection?.revoked_at) {
+      const { data: replacement } = await supabase
+        .from("tally_connections")
+        .select("id")
+        .eq("owner_user_id", job.owner_user_id)
+        .is("revoked_at", null)
+        .in("status", ["company_loaded", "tally_reachable", "bridge_connected"])
+        .eq("last_company_name", companyName)
+        .order("updated_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      effectiveTallyConnectionId = replacement?.id || null;
+    }
+  }
+  const bankAccountCandidates = await getTallyBankAccountCandidates(job.owner_user_id, effectiveTallyConnectionId);
+  const ledgerNames = await getTallyLedgerNames(job.owner_user_id, effectiveTallyConnectionId);
   await updateBankJob(job.id, { progress: 30, stage: "Preparing pages for AI" });
   const isPdf = mimeType.includes("pdf") || /\.pdf$/i.test(fileName);
   const isImage = mimeType.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(fileName);
@@ -2171,7 +2209,7 @@ async function runBankStatementJob(job) {
         : await addBankLedgerRecommendations({
             rows,
             ownerUserId: job.owner_user_id,
-            connectionId: tallyConnectionId,
+            connectionId: effectiveTallyConnectionId,
             accountId: String(selectedAccountId || importRow.bank_account_id || ""),
             companyName,
           });
@@ -2232,6 +2270,10 @@ async function runBankStatementJob(job) {
       status: finalStatus,
       processing_meta: {
         ...processingMeta,
+        selectedContext: {
+          ...selectedContext,
+          connectionId: effectiveTallyConnectionId,
+        },
         parser: "openrouter_bank_statement_v1",
         extractionSource,
         jobStatus: "completed",
