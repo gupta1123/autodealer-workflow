@@ -1325,7 +1325,9 @@ export function TallyPurchasePostingPanel({
       setError(null);
       const next = await approveAndQueueTallyPurchasePosting(
         caseId,
-        acknowledgementWarnings.map((warning) => warning.code)
+        acknowledgementWarnings.map((warning) => warning.code),
+        selectedConnectionId,
+        selectedCompanyName
       );
       setPayload(next);
       setReview(next.review);

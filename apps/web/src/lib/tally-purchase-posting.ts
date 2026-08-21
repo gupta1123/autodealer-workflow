@@ -346,12 +346,19 @@ export async function selectTallyPurchaseInvoice(
 
 export async function approveAndQueueTallyPurchasePosting(
   caseId: string,
-  acknowledgedWarningCodes: string[] = []
+  acknowledgedWarningCodes: string[] = [],
+  connectionId?: string | null,
+  companyName?: string | null
 ) {
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "approve_and_queue", acknowledgedWarningCodes }),
+    body: JSON.stringify({
+      action: "approve_and_queue",
+      acknowledgedWarningCodes,
+      connectionId,
+      companyName,
+    }),
   });
   return readResponse(response, "Failed to queue the Purchase voucher.");
 }

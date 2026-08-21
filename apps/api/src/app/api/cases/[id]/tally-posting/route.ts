@@ -647,14 +647,23 @@ async function loadContext(
     );
   const posting = postingResult.data as PostingRow | null;
   const lockedConnectionId = isPostingLocked(posting?.status) ? posting?.connection_id : null;
+  const usableConnectionIds = new Set(connections.map((candidate) => candidate.id));
+  const requestedUsableConnectionId =
+    requestedConnectionId && usableConnectionIds.has(requestedConnectionId)
+      ? requestedConnectionId
+      : null;
+  const savedUsableConnectionId =
+    posting?.connection_id && usableConnectionIds.has(posting.connection_id)
+      ? posting.connection_id
+      : null;
   const buyerMatchedConnection = preferredLiveConnection(
     connections,
     invoiceBuyerName(documents)
   );
   const selectedConnectionId =
     lockedConnectionId ||
-    requestedConnectionId ||
-    posting?.connection_id ||
+    requestedUsableConnectionId ||
+    savedUsableConnectionId ||
     buyerMatchedConnection?.id ||
     (connections.length === 1 ? connections[0].id : null);
   const connection = selectedConnectionId
@@ -1297,8 +1306,21 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
     if (body.action !== "approve_and_queue") {
       return jsonWithCors(request, { error: "Unsupported Tally posting action." }, { status: 400 });
     }
-    const initial = await loadContext(id, user.id);
-    const context = initial.posting?.connection_id
+    const requestedConnectionId =
+      typeof body.connectionId === "string" && body.connectionId.trim()
+        ? body.connectionId.trim()
+        : null;
+    const requestedCompanyName =
+      typeof body.companyName === "string" && body.companyName.trim()
+        ? body.companyName.trim()
+        : null;
+    const initial = await loadContext(
+      id,
+      user.id,
+      requestedConnectionId,
+      requestedCompanyName
+    );
+    const context = initial.posting?.connection_id && isPostingLocked(initial.posting.status)
       ? await loadContext(id, user.id, initial.posting.connection_id)
       : initial;
     if (!context.posting) {
