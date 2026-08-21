@@ -672,7 +672,7 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
   assert.match(xml, /<DATA><TALLYMESSAGE/);
   assert.match(xml, /<LEDGERENTRIES\.LIST>/);
   assert.doesNotMatch(xml, /<ALLLEDGERENTRIES\.LIST>/);
-  assert.match(xml, /<BATCHALLOCATIONS\.LIST><GODOWNNAME>Main Location<\/GODOWNNAME>/);
+  assert.doesNotMatch(xml, /Main Location|Primary Batch|BATCHALLOCATIONS\.LIST|GODOWNNAME/);
   assert.match(xml, /<GSTHSNINFERAPPLICABILITY>Specify Details Here<\/GSTHSNINFERAPPLICABILITY>/);
   assert.match(xml, /<GSTHSNNAME>72044900<\/GSTHSNNAME>/);
   assert.match(xml, /<DATE>20260729<\/DATE>/);
@@ -691,6 +691,33 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
   assert.match(xml, /<UDF:KALIKAVEHICLENUMBER[^>]*>MH11AL4972<\/UDF:KALIKAVEHICLENUMBER>/);
   assert.doesNotMatch(xml, /Source: https:\/\/app\.example/);
   assert.doesNotMatch(xml, /Posting: internal-posting-id/);
+});
+
+test("Purchase vouchers only include an explicitly selected Tally godown", () => {
+  const xml = buildPurchaseVoucherXml({
+    companyName: "Solution Nyx",
+    voucherDate: "2026-08-21",
+    supplierInvoiceDate: "2026-08-20",
+    supplierInvoiceNumber: "TEST/1",
+    supplierLedgerName: "Supplier",
+    finalPayableAmount: 100,
+    items: [{
+      stockItemName: "MS Scrap",
+      purchaseLedgerName: "Scrap Purchase",
+      hsn: "72044900",
+      quantity: 1,
+      unit: "MTS",
+      rate: 100,
+      taxableAmount: 100,
+      godownName: "Warehouse A",
+      batchName: "Lot 1",
+    }],
+  });
+
+  assert.match(
+    xml,
+    /<BATCHALLOCATIONS\.LIST><GODOWNNAME>Warehouse A<\/GODOWNNAME><BATCHNAME>Lot 1<\/BATCHNAME><DESTINATIONGODOWNNAME>Warehouse A<\/DESTINATIONGODOWNNAME>/
+  );
 });
 
 test("Purchase duplicate checks cover the complete Indian financial year", () => {

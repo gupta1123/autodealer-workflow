@@ -9,7 +9,7 @@ import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.52";
+const BRIDGE_VERSION = "0.1.53";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
@@ -1015,8 +1015,20 @@ function buildPurchaseInventoryEntryXml(item) {
   const formattedQuantity = `${quantity} ${unit}`;
   const formattedRate = `${rate.toFixed(2)}/${unit}`;
   const formattedAmount = amount.toFixed(2);
-  const godownName = String(item?.godownName || "Main Location").trim();
-  const batchName = String(item?.batchName || "Primary Batch").trim();
+  const godownName = String(item?.godownName || "").trim();
+  const batchName = String(item?.batchName || "").trim();
+  const batchAllocation = godownName || batchName
+    ? [
+        "<BATCHALLOCATIONS.LIST>",
+        godownName ? `<GODOWNNAME>${escapeXml(godownName)}</GODOWNNAME>` : "",
+        batchName ? `<BATCHNAME>${escapeXml(batchName)}</BATCHNAME>` : "",
+        godownName ? `<DESTINATIONGODOWNNAME>${escapeXml(godownName)}</DESTINATIONGODOWNNAME>` : "",
+        `<AMOUNT>-${formattedAmount}</AMOUNT>`,
+        `<ACTUALQTY>${escapeXml(formattedQuantity)}</ACTUALQTY>`,
+        `<BILLEDQTY>${escapeXml(formattedQuantity)}</BILLEDQTY>`,
+        "</BATCHALLOCATIONS.LIST>",
+      ].join("")
+    : "";
 
   return [
     "<ALLINVENTORYENTRIES.LIST>",
@@ -1030,14 +1042,7 @@ function buildPurchaseInventoryEntryXml(item) {
     `<AMOUNT>-${formattedAmount}</AMOUNT>`,
     `<ACTUALQTY>${escapeXml(formattedQuantity)}</ACTUALQTY>`,
     `<BILLEDQTY>${escapeXml(formattedQuantity)}</BILLEDQTY>`,
-    "<BATCHALLOCATIONS.LIST>",
-    `<GODOWNNAME>${escapeXml(godownName)}</GODOWNNAME>`,
-    `<BATCHNAME>${escapeXml(batchName)}</BATCHNAME>`,
-    `<DESTINATIONGODOWNNAME>${escapeXml(godownName)}</DESTINATIONGODOWNNAME>`,
-    `<AMOUNT>-${formattedAmount}</AMOUNT>`,
-    `<ACTUALQTY>${escapeXml(formattedQuantity)}</ACTUALQTY>`,
-    `<BILLEDQTY>${escapeXml(formattedQuantity)}</BILLEDQTY>`,
-    "</BATCHALLOCATIONS.LIST>",
+    batchAllocation,
     "<ACCOUNTINGALLOCATIONS.LIST>",
     `<LEDGERNAME>${escapeXml(purchaseLedgerName)}</LEDGERNAME>`,
     "<ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>",
