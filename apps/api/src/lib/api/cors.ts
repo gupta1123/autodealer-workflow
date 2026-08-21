@@ -35,7 +35,13 @@ export function applyCorsHeaders(response: NextResponse, request: Request) {
     response.headers.set("Access-Control-Allow-Origin", origin);
     response.headers.set("Vary", "Origin, Access-Control-Request-Headers, Access-Control-Request-Method");
     response.headers.set("Access-Control-Allow-Credentials", "false");
-    response.headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    // The Tally pause/disconnect action uses a browser-scoped control token.
+    // Include it in the preflight response so direct API calls from the web
+    // app are not rejected by the browser before the route can authenticate.
+    response.headers.set(
+      "Access-Control-Allow-Headers",
+      "Authorization, Content-Type, X-Tally-Control-Token"
+    );
     response.headers.set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
     response.headers.set("Access-Control-Max-Age", "86400");
   }

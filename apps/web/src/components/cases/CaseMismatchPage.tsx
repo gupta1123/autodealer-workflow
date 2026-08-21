@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   Check,
@@ -735,6 +735,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
   const [decisionError, setDecisionError] = useState<string | null>(null);
   const [tallyHeaderState, setTallyHeaderState] = useState<TallyPurchaseHeaderState | null>(null);
   const [refreshingTallyHeader, setRefreshingTallyHeader] = useState(false);
+  const tallyPurchaseRefreshRef = useRef<(() => Promise<void>) | null>(null);
   const [selectedMismatchIds, setSelectedMismatchIds] = useState<Set<string>>(() => new Set());
   const [comparisonGroups, setComparisonGroups] = useState<ComparisonFieldGroup[]>(
     () => DEFAULT_COMPARISON_FIELD_GROUPS
@@ -1005,6 +1006,14 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
   async function refreshTallyHeader() {
     try {
       setRefreshingTallyHeader(true);
+      // The purchase panel owns the live Tally master refresh. Use it when it
+      // is mounted so this header button performs the same real refresh as the
+      // controls beside the missing-ledger fields. The old implementation only
+      // re-read the API snapshot, which made the button appear to do nothing.
+      if (tallyPurchaseRefreshRef.current) {
+        await tallyPurchaseRefreshRef.current();
+        return;
+      }
       const payload = await fetchTallyPurchasePosting(
         caseId,
         tallyHeaderState?.selectedConnectionId
@@ -1052,20 +1061,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
   const tallyCompanyContextMismatch = Boolean(
     tallyConnectionReady && !tallyCompanyNameMatches
   );
-  const tallyCompanyGstin = normalizeGstin(selectedTallyConnection?.companyGstin);
-  const invoiceBuyerGstin = normalizeGstin(tallyHeaderState?.buyerGstin);
-  const tallyCompanyContextVerified = Boolean(
-    tallyCompanyNameMatches &&
-      tallyCompanyGstin &&
-      invoiceBuyerGstin &&
-      tallyCompanyGstin === invoiceBuyerGstin
-  );
-  const tallyCompanyIdentityMismatch = Boolean(
-    tallyCompanyNameMatches &&
-      tallyCompanyGstin &&
-      invoiceBuyerGstin &&
-      tallyCompanyGstin !== invoiceBuyerGstin
-  );
+  const tallyCompanyContextVerified = tallyCompanyNameMatches;
   const tallyHeaderTitle = refreshingTallyHeader
     ? "Checking Tally company"
     : !tallyHeaderState?.selectedConnectionId
@@ -1074,13 +1070,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
         ? "Tally company verified"
         : tallyCompanyContextMismatch
           ? "Switch company in Tally"
-          : tallyCompanyIdentityMismatch
-            ? "Buyer GSTIN does not match Tally"
-            : tallyCompanyNameMatches && !tallyCompanyGstin
-              ? "Company GSTIN missing in Tally"
-              : tallyCompanyNameMatches && !invoiceBuyerGstin
-                ? "Invoice buyer GSTIN missing"
-                : "Tally unavailable";
+          : "Tally unavailable";
   const tallyHeaderToneClass = tallyCompanyContextVerified
     ? "border-emerald-200 bg-emerald-50/80"
     : tallyHeaderState?.selectedConnectionId
@@ -1088,7 +1078,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
       : "border-[#e5ddd0] bg-white";
 
   return (
-    <AppShell>
+    <AppShell defaultSidebarCollapsed>
       <div className="flex h-full flex-col bg-slate-50 animate-in fade-in duration-500">
 
         {/* Header */}
@@ -1183,7 +1173,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
               </button>
               <Link
                 className="inline-flex h-8 items-center gap-1.5 rounded-xl bg-[#2d2d2d] px-3.5 text-xs font-bold text-white shadow-sm transition hover:bg-[#1a1a1a]"
-                href="/tally-prime"
+                href="/tally-prime?view=connection"
               >
                 <PlugZap className="h-3.5 w-3.5" />
                 {tallyConnectionReady ? "Manage Tally" : "Connect Tally"}
@@ -1413,6 +1403,9 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                         : undefined
                     }
                     onHeaderStateChange={setTallyHeaderState}
+                    onRefreshReady={(refresh) => {
+                      tallyPurchaseRefreshRef.current = refresh;
+                    }}
                   />
                 ) : (
                 <div className="mx-auto max-w-4xl p-3 sm:p-4 lg:p-5">

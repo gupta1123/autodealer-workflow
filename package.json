@@ -13,6 +13,8 @@
   "scripts": {
     "dev:web": "npm run dev --workspace @autodealer/web",
     "dev:api": "npm run dev --workspace @autodealer/api",
+    "dev:local": "node --use-system-ca scripts/dev-local-stack.mjs",
+    "start:local": "node --use-system-ca scripts/start-local-stack.mjs",
     "dev:cash-discount-gateway": "npm run dev --workspace @autodealer/cash-discount-gateway",
     "dev:tally-desktop": "npm run dev --workspace @autodealer/tally-desktop",
     "build:web": "npm run build --workspace @autodealer/web",
@@ -31,6 +33,7 @@
     "typecheck": "npm run typecheck:web && npm run typecheck:api",
     "test:cash-discount": "node --test --experimental-strip-types apps/api/src/lib/cash-discount-narration.test.mjs",
     "test:tally-bridge": "node --test apps/tally-bridge/src/bridge.test.mjs",
+    "test:cash-discount-gateway": "node --test apps/cash-discount-gateway/src/server.test.mjs",
     "test:purchase-posting": "node --test apps/api/src/lib/tally/purchase-posting.test.mjs",
     "test:storage-assets": "node --experimental-strip-types --test apps/api/src/lib/storage-assets.test.mjs",
     "test:pdf-security": "node --experimental-strip-types --test apps/api/src/lib/pdf-security.test.mjs",

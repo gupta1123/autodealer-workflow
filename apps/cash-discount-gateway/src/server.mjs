@@ -61,7 +61,7 @@ function failPending(requestId, error) {
   });
 }
 
-function startPending({ requestId, browser, connector, connectionId, ownerUserId, accessToken, operation, proposal }) {
+function startPending({ requestId, browser, connector, connectionId, ownerUserId, accessToken, operation, proposal, payload }) {
   const timeout = setTimeout(() => failPending(requestId, new Error("The live Tally request timed out.")), REQUEST_TIMEOUT_MS);
   const item = {
     requestId,
@@ -72,7 +72,14 @@ function startPending({ requestId, browser, connector, connectionId, ownerUserId
     accessToken,
     operation,
     proposal,
-    phase: operation === "scan" ? "scanning" : "revalidating",
+    payload,
+    phase: operation === "company_check"
+    ? "company_check"
+    : operation === "bank_ledgers" || operation === "ledger_masters" || operation === "verify_bank_transaction" || operation === "fetch_customer_open_bills"
+      ? operation
+      : operation === "scan"
+        ? "scanning"
+        : "revalidating",
     commandPayload: null,
     debitNoteKey: operation === "create_debit_note"
       ? `${connectionId}|${String(proposal?.partyLedgerName ?? "").trim().toLowerCase()}|${String(proposal?.linkedInvoiceNumber ?? "").trim().toLowerCase()}`
@@ -93,7 +100,11 @@ async function authenticate(socket, message) {
   const session = await apiRequest("/api/collections/live/session", {
     accessToken: role === "browser" ? token : null,
     bridgeToken: role === "connector" ? token : null,
-    body: { role, connectionId },
+    body: {
+      role,
+      connectionId,
+      companyName: role === "browser" ? String(message.companyName ?? "").trim() : null,
+    },
   });
   const meta = {
     authenticated: true,
@@ -103,6 +114,11 @@ async function authenticate(socket, message) {
     accessToken: role === "browser" ? token : null,
     bridgeToken: role === "connector" ? token : null,
     alive: true,
+    customerScope: session.customerScope ?? null,
+    customerScopes: session.customerScopes && typeof session.customerScopes === "object"
+      ? session.customerScopes
+      : null,
+    defaultCustomerScope: session.defaultCustomerScope ?? null,
   };
   metadata.set(socket, meta);
 
@@ -117,7 +133,7 @@ async function authenticate(socket, message) {
 async function handleBrowserRequest(socket, message, meta) {
   const requestId = String(message.requestId || randomUUID());
   const operation = String(message.operation ?? "");
-  if (!['scan', 'create_debit_note'].includes(operation)) {
+  if (!['company_check', 'bank_ledgers', 'ledger_masters', 'verify_bank_transaction', 'fetch_customer_open_bills', 'scan', 'create_debit_note'].includes(operation)) {
     send(socket, { type: "result", requestId, success: false, error: "Unsupported Cash Discount operation." });
     return;
   }
@@ -155,16 +171,37 @@ async function handleBrowserRequest(socket, message, meta) {
     accessToken: meta.accessToken,
     operation,
     proposal,
+    payload: message.payload && typeof message.payload === "object" ? message.payload : undefined,
   });
   if (item.debitNoteKey) activeDebitNotes.add(item.debitNoteKey);
+  const requestedCompanyName = String(message.companyName ?? "").trim();
+  const companyKey = requestedCompanyName.toLowerCase().replace(/\s+/g, " ");
   send(connector, {
     type: "operation",
     requestId,
-    operation: operation === "scan" ? "cash_discount_scan" : "cash_discount_revalidate",
-    companyName: String(message.companyName ?? "").trim(),
+      operation: operation === "company_check"
+        ? "company_check"
+        : operation === "bank_ledgers"
+          ? "bank_ledgers"
+          : operation === "ledger_masters"
+            ? "ledger_masters"
+            : operation === "verify_bank_transaction"
+              ? "verify_bank_transaction"
+              : operation === "fetch_customer_open_bills"
+                ? "fetch_customer_open_bills"
+        : operation === "scan"
+        ? "cash_discount_scan"
+        : "cash_discount_revalidate",
+    companyName: requestedCompanyName,
+    companyNames: Array.isArray(message.companyNames)
+      ? message.companyNames.map((value) => String(value || "").trim()).filter(Boolean)
+      : undefined,
     financialYear: String(message.financialYear ?? "").trim() || null,
     proposal,
-    customerScope: message.customerScope && typeof message.customerScope === "object" ? message.customerScope : null,
+    payload: item.payload,
+    customerScope: message.customerScope && typeof message.customerScope === "object"
+      ? message.customerScope
+      : meta.customerScope ?? meta.customerScopes?.[companyKey] ?? meta.defaultCustomerScope,
   });
 }
 
@@ -174,6 +211,18 @@ async function handleConnectorResult(socket, message, meta) {
   if (!item || item.connector !== socket || item.connectionId !== meta.connectionId) return;
   if (message.success !== true) {
     failPending(requestId, new Error(String(message.error ?? "Tally could not complete the live request.")));
+    return;
+  }
+
+  if (item.phase === "company_check") {
+    clearPending(requestId);
+    send(item.browser, { type: "result", requestId, success: true, data: message.data });
+    return;
+  }
+
+  if (["bank_ledgers", "ledger_masters", "verify_bank_transaction", "fetch_customer_open_bills"].includes(item.phase)) {
+    clearPending(requestId);
+    send(item.browser, { type: "result", requestId, success: true, data: message.data });
     return;
   }
 

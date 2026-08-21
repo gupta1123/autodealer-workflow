@@ -357,7 +357,8 @@ export async function POST(
         ? result.verification as Record<string, unknown>
         : result;
       const verificationStatus = toNullableText(verification.verificationStatus, 80);
-      const verified = success && verificationStatus === "verified";
+      const alreadyInTally = success && Boolean(result.alreadyInTally);
+      const verified = success && (verificationStatus === "verified" || alreadyInTally);
       const correctionRequired = Boolean(
         result.voucherCreatedButVerificationFailed ||
         result.possibleDuplicateInTally ||
@@ -394,9 +395,9 @@ export async function POST(
             tally_voucher_number: voucherNumber,
             tally_master_id: masterId,
             tally_guid: tallyGuid,
-            tally_created_at: voucherWasCreated ? now : null,
+            tally_created_at: voucherWasCreated && !alreadyInTally ? now : null,
             verified_at: verified ? now : null,
-            verification_status: verificationStatus,
+            verification_status: alreadyInTally ? "already_in_tally" : verificationStatus,
             last_error: verified ? null : purchaseVerificationError(errorMessage, verification),
           })
           .eq("id", postingId)

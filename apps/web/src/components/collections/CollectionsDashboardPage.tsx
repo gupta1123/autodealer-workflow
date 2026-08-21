@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import { apiFetch } from "@/lib/api-client";
+import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 
 type CompanyOption = {
@@ -211,6 +212,21 @@ type LiveTallyConnection = {
   lastCompanyName?: string | null;
   companyLoaded?: boolean;
   tallyReachable?: boolean;
+};
+
+type TallyCompanyCheck = {
+  activeCompany: string;
+  selectedCompany: string;
+  companies: Array<{
+    companyName: string;
+    financialYear?: string | null;
+    isActive?: boolean;
+  }>;
+  timings?: {
+    activeCompanyMs?: number;
+    companiesMs?: number;
+    totalMs?: number;
+  };
 };
 
 function isLiveTallyCompanyMatch(
@@ -571,31 +587,54 @@ export function CollectionsDashboardPage({
       setCompanies([]);
       setSelectedCompanyId("");
       setSelectedConnectionId("");
-      return [];
+      setLiveTallyConnection(null);
+      setCheckingLiveTallyCompany(false);
+      return { companies: [] as CompanyOption[], liveConnection: null as LiveTallyConnection | null };
     }
-    const response = await apiFetch(
-      `/api/tally/companies?connectionId=${encodeURIComponent(connectionId)}`,
-      { cache: "no-store" }
-    );
-    if (!response.ok) throw new Error(await readError(response));
-    const payload = (await response.json()) as { companies?: CompanyOption[]; selectedCompanyId?: string | null };
-    const nextCompanies = uniqueCompanyOptions(payload.companies ?? []);
-    setCompanies(nextCompanies);
-    setSelectedCompanyId((current) =>
-      current && nextCompanies.some((company) => company.id === current)
-        ? current
-        : payload.selectedCompanyId || nextCompanies[0]?.id || ""
-    );
-    setSelectedConnectionId((current) => {
-      const selectedOption =
-        nextCompanies.find((company) => company.id === selectedCompanyId) ??
-        nextCompanies.find((company) => company.id === payload.selectedCompanyId) ??
-        nextCompanies[0];
-      if (selectedOption) return selectedOption.connectionId;
-      return nextCompanies.some((company) => company.connectionId === current) ? current : "";
-    });
-    return nextCompanies;
-  }, [selectedCompanyId, selectedConnectionId]);
+    setCheckingLiveTallyCompany(true);
+    try {
+      // Match Finora's fast path: ask the local Electron connector which
+      // company is open and read the available companies directly from Tally.
+      // No Supabase company/status request blocks this bootstrap.
+      const payload = await runCashDiscountLiveRequest<TallyCompanyCheck>({
+        connectionId,
+        companyName: "",
+        operation: "company_check",
+      });
+      const activeCompanyName = String(payload.activeCompany ?? "").trim();
+      const nextCompanies = uniqueCompanyOptions((payload.companies ?? []).map((company) => ({
+        id: `${connectionId}::${encodeURIComponent(company.companyName)}`,
+        connectionId,
+        companyName: company.companyName,
+        financialYear: company.financialYear ?? "",
+        status: "company_loaded",
+        bridgeConnected: true,
+        tallyReachable: true,
+        companyLoaded: true,
+        bankAccountCount: null,
+        lastSyncAt: null,
+        lastHeartbeatAt: null,
+        lastError: null,
+      })));
+      const activeCompany = nextCompanies.find(
+        (company) => normalizeCompanyName(company.companyName) === normalizeCompanyName(activeCompanyName)
+      ) ?? nextCompanies[0] ?? null;
+      const nextConnection: LiveTallyConnection | null = activeCompanyName ? {
+        id: connectionId,
+        status: "company_loaded",
+        lastCompanyName: activeCompanyName,
+        companyLoaded: true,
+        tallyReachable: true,
+      } : null;
+      setCompanies(nextCompanies);
+      setLiveTallyConnection(nextConnection);
+      setSelectedCompanyId(activeCompany?.id || "");
+      setSelectedConnectionId(activeCompany?.connectionId || connectionId);
+      return { companies: nextCompanies, liveConnection: nextConnection };
+    } finally {
+      setCheckingLiveTallyCompany(false);
+    }
+  }, [selectedConnectionId]);
 
   const pollCommand = useCallback(async (
     connectionId: string,
@@ -606,18 +645,18 @@ export function CollectionsDashboardPage({
     // Give that one bounded extra time instead of reporting a false timeout
     // while the bridge is still within its own 60-second safety limit.
     const timeoutSeconds = options?.timeoutSeconds ?? 45;
-    for (let attempt = 0; attempt < timeoutSeconds; attempt += 1) {
-      await wait(1000);
+    const maximumAttempts = Math.max(1, timeoutSeconds * 2);
+    for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+      // The optimized connector usually finishes Tally work in under 250 ms.
+      // Poll quickly at first, then settle at one request per second.
+      await wait(Math.min(1000, 250 * (2 ** Math.min(attempt, 2))));
       const response = await apiFetch(
-        `/api/tally/connections/${connectionId}/commands?${new URLSearchParams({
-          ids: commandId,
-          limit: "1",
-        }).toString()}`,
+        `/api/tally/connections/${connectionId}/commands/${commandId}`,
         { cache: "no-store" }
       );
       if (!response.ok) throw new Error(await readError(response));
-      const payload = (await response.json()) as { commands?: TallyCommand[] };
-      const command = payload.commands?.find((item) => item.id === commandId);
+      const payload = (await response.json()) as { command?: TallyCommand | null };
+      const command = payload.command?.id === commandId ? payload.command : null;
       if (command?.status === "succeeded") return command;
       if (command?.status === "failed" || command?.status === "canceled") {
         throw new Error(command.error || "Tally command failed.");
@@ -628,25 +667,6 @@ export function CollectionsDashboardPage({
     );
   }, []);
 
-  const refreshLiveTallyCompany = useCallback(async (connectionId: string) => {
-    if (!connectionId) {
-      setLiveTallyConnection(null);
-      setCheckingLiveTallyCompany(false);
-      return null;
-    }
-    setCheckingLiveTallyCompany(true);
-    try {
-      const response = await apiFetch(`/api/tally/connections/${connectionId}/status`, { cache: "no-store" });
-      if (!response.ok) throw new Error(await readError(response));
-      const payload = (await response.json()) as { connection?: LiveTallyConnection };
-      const nextConnection = payload.connection ?? null;
-      setLiveTallyConnection(nextConnection);
-      return nextConnection;
-    } finally {
-      setCheckingLiveTallyCompany(false);
-    }
-  }, []);
-
   const refreshTallyOpenBills = useCallback(
     async (connectionId: string, companyName?: string | null, financialYear?: string | null) => {
       const resolvedCompanyName = String(companyName ?? "").trim();
@@ -654,47 +674,17 @@ export function CollectionsDashboardPage({
         throw new Error("Select the live Tally company before refreshing Cash Discounts.");
       }
       setMessage({ tone: "info", text: "Checking eligible candidates…" });
-      let customerScope: Record<string, unknown> | undefined;
-      const scopeResponse = await apiFetch(
-        `/api/settings/cash-discount-customer-scope?${new URLSearchParams({
-          connectionId,
-          companyName: resolvedCompanyName,
-        }).toString()}`,
-        { cache: "no-store" }
-      );
-      if (scopeResponse.ok) {
-        const scopePayload = await scopeResponse.json() as { settings?: Record<string, unknown> };
-        customerScope = scopePayload.settings;
-      } else if (scopeResponse.status !== 409) {
-        throw new Error(await readError(scopeResponse));
-      }
-      // Use the regular bridge command queue for every scan. It still reads
-      // live Tally data, but avoids a separate Cash Discount WebSocket gateway.
-      const queueResponse = await apiFetch("/api/collections/live/queue-scan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ connectionId, companyName: resolvedCompanyName, financialYear, operation: "scan" }),
+      return runCashDiscountLiveRequest<DashboardPayload>({
+        connectionId,
+        companyName: resolvedCompanyName,
+        financialYear,
+        operation: "scan",
+        onProgress: (progressMessage) => {
+          setMessage({ tone: "info", text: progressMessage });
+        },
       });
-      if (!queueResponse.ok) throw new Error(await readError(queueResponse));
-      const queued = (await queueResponse.json()) as { command?: TallyCommand };
-      if (!queued.command?.id) throw new Error("Cash Discount scan could not be queued.");
-      const completed = await pollCommand(connectionId, queued.command.id, {
-        timeoutSeconds: 90,
-        pendingMessage: "The Cash Discount scan is still pending. Check the connector, then refresh.",
-      });
-      const scan = completed.result && typeof completed.result === "object" ? completed.result : null;
-      if (!scan) throw new Error("The connector completed the Cash Discount scan without a result.");
-
-      setMessage({ tone: "info", text: "Checking eligible candidates…" });
-      const analyseResponse = await apiFetch("/api/collections/live/analyse", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ connectionId, companyName: resolvedCompanyName, scan }),
-      });
-      if (!analyseResponse.ok) throw new Error(await readError(analyseResponse));
-      return (await analyseResponse.json()) as DashboardPayload;
     },
-    [pollCommand]
+    []
   );
 
   const refreshCreatedDebitNotesFromStore = useCallback(async (connectionId: string) => {
@@ -742,14 +732,15 @@ export function CollectionsDashboardPage({
         if (!options?.quiet) setLoading(true);
         setMessage(null);
         setDashboard(null);
-        const nextCompanies = await loadCompanies();
+        const bootstrap = await loadCompanies();
+        const nextCompanies = bootstrap.companies;
         let company =
           nextCompanies.find((item) => item.id === selectedCompanyId) ??
           nextCompanies.find((item) => item.connectionId === selectedConnectionId) ??
           nextCompanies[0] ??
           null;
         let connectionId = company?.connectionId || selectedConnectionId || "";
-        const liveConnection = connectionId ? await refreshLiveTallyCompany(connectionId) : null;
+        const liveConnection = bootstrap.liveConnection;
 
         // The live company in Tally is the source of truth. On every full
         // refresh, move the initial/stale Kalika selection to the company that
@@ -793,7 +784,7 @@ export function CollectionsDashboardPage({
         setLoading(false);
       }
     },
-    [loadCompanies, refreshLiveTallyCompany, refreshTallyOpenBills, selectedCompanyId, selectedConnectionId]
+    [loadCompanies, refreshTallyOpenBills, selectedCompanyId, selectedConnectionId]
   );
 
   async function createDebitNoteForProposal(proposal: DebitNoteProposal) {
@@ -808,41 +799,15 @@ export function CollectionsDashboardPage({
       recoverableAmount: proposal.recoverableAmount,
     };
 
-    setMessage({ tone: "info", text: "Rechecking the customer and invoice in Tally..." });
-    const revalidateResponse = await apiFetch("/api/collections/live/queue-scan", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        connectionId: selectedConnectionId,
-        companyName,
-        operation: "revalidate",
-        proposal: proposalIdentity,
-      }),
-    });
-    if (!revalidateResponse.ok) throw new Error(await readError(revalidateResponse));
-    const revalidation = (await revalidateResponse.json()) as { command?: TallyCommand };
-    if (!revalidation.command?.id) throw new Error("The live invoice recheck could not be queued.");
-    const checked = await pollCommand(selectedConnectionId, revalidation.command.id, { timeoutSeconds: 75 });
-    if (!checked.result) throw new Error("The connector completed the invoice recheck without a result.");
-
-    setMessage({ tone: "info", text: "Creating and verifying the Debit Note in Tally..." });
-    const prepareResponse = await apiFetch("/api/collections/live/prepare-debit-note", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        connectionId: selectedConnectionId,
-        companyName,
-        proposal: proposalIdentity,
-        scan: checked.result,
-        queue: true,
-      }),
-    });
-    if (!prepareResponse.ok) throw new Error(await readError(prepareResponse));
-    const prepared = (await prepareResponse.json()) as { command?: TallyCommand };
-    if (!prepared.command?.id) throw new Error("The Debit Note could not be queued.");
-    return pollCommand(selectedConnectionId, prepared.command.id, {
-      timeoutSeconds: 90,
-      pendingMessage: "The Debit Note is still pending. Check the connector, then refresh.",
+    return runCashDiscountLiveRequest<{ proposal?: DebitNoteProposal }>({
+      connectionId: selectedConnectionId,
+      companyName,
+      financialYear: selectedCompany?.financialYear ?? proposal.financialYear,
+      operation: "create_debit_note",
+      proposal: proposalIdentity,
+      onProgress: (progressMessage) => {
+        setMessage({ tone: "info", text: progressMessage });
+      },
     });
   }
 
@@ -1070,15 +1035,6 @@ export function CollectionsDashboardPage({
     initialLoadStartedRef.current = true;
     void refreshAll();
   }, [refreshAll]);
-
-  useEffect(() => {
-    if (!selectedConnectionId) {
-      setLiveTallyConnection(null);
-      setCheckingLiveTallyCompany(false);
-      return;
-    }
-    void refreshLiveTallyCompany(selectedConnectionId).catch(() => undefined);
-  }, [refreshLiveTallyCompany, selectedConnectionId]);
 
   useEffect(() => {
     if (!selectedConnectionId) return;

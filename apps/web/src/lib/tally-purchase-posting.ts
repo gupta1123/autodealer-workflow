@@ -7,6 +7,8 @@ export type TallyPostingIssue = {
   message: string;
   scope: "case" | "company" | "invoice" | "line" | "tax" | "source";
   lineId?: string;
+  requiresAcknowledgement?: boolean;
+  policyRule?: string;
 };
 
 export type TallyPostingLine = {
@@ -46,6 +48,7 @@ export type TallyPostingReview = {
   tds194qBasisAmount: string;
   tds194qRounding: "paise" | "nearest_rupee";
   applyTransportTds: boolean;
+  applyGstTds: boolean;
   transportTdsLedgerName: string;
   transportTdsRate: string;
   cgstTdsLedgerName: string;
@@ -66,10 +69,12 @@ export type TallyPostingReview = {
 
 export type TallyPostingResponse = {
   caseStatus: string;
+  hasSavedReview: boolean;
   accountingSettings: {
     purchaseGoodsTdsEnabled: boolean;
     transporterTdsEnabled: boolean;
     gstTdsEnabled: boolean;
+    validationPolicy: Record<string, "block" | "warn" | "off">;
   };
   selectedConnectionId: string | null;
   selectedCompanyName: string | null;
@@ -252,6 +257,8 @@ export type TallyMasterOption = {
   groupPath: string | null;
   taxType: string | null;
   gstDutyHead: string | null;
+  closingBalance: number | null;
+  closingBalanceType: "Dr" | "Cr" | null;
 };
 
 export type SupplierLedgerMatch = {
@@ -337,11 +344,14 @@ export async function selectTallyPurchaseInvoice(
   return readResponse(response, "Failed to select the purchase invoice.");
 }
 
-export async function approveAndQueueTallyPurchasePosting(caseId: string) {
+export async function approveAndQueueTallyPurchasePosting(
+  caseId: string,
+  acknowledgedWarningCodes: string[] = []
+) {
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "approve_and_queue" }),
+    body: JSON.stringify({ action: "approve_and_queue", acknowledgedWarningCodes }),
   });
   return readResponse(response, "Failed to queue the Purchase voucher.");
 }
@@ -424,13 +434,12 @@ export async function waitForTallyCommand(
   const intervalMs = options?.intervalMs ?? 2000;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
-    const params = new URLSearchParams({ ids: commandId, limit: "1" });
     const response = await apiFetch(
-      `/api/tally/connections/${connectionId}/commands?${params.toString()}`,
+      `/api/tally/connections/${connectionId}/commands/${commandId}`,
       { cache: "no-store" }
     );
     const raw = await response.text();
-    let payload: { commands?: Array<{ id: string; status: string; error?: string | null; result?: Record<string, unknown> | null }> } = {};
+    let payload: { command?: { id: string; status: string; error?: string | null } | null } = {};
     try {
       payload = raw ? JSON.parse(raw) : {};
     } catch {
@@ -439,7 +448,7 @@ export async function waitForTallyCommand(
     if (!response.ok) {
       throw new Error(raw || "Failed to read Tally command status.");
     }
-    const command = (payload.commands ?? []).find((item) => item.id === commandId);
+    const command = payload.command;
     if (!command) continue;
     if (["succeeded", "failed", "canceled"].includes(command.status)) return command;
   }

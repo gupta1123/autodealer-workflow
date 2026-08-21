@@ -46,7 +46,66 @@ type PurchaseAccountingSettings = {
   purchaseGoodsTdsEnabled: boolean;
   transporterTdsEnabled: boolean;
   gstTdsEnabled: boolean;
+  validationPolicy: PurchaseValidationPolicy;
 };
+
+type PurchaseValidationSeverity = "block" | "warn" | "off";
+type PurchaseValidationRuleKey =
+  | "buyerGstinMissing"
+  | "supplierGstinMissing"
+  | "supplierLedgerGstinMismatch"
+  | "hsnMissing"
+  | "stockItemHsnMismatch"
+  | "stockItemUnitMismatch"
+  | "sourceDocumentMissing"
+  | "caseNotAccepted"
+  | "staleTallyMasters"
+  | "possibleDuplicate";
+type PurchaseValidationPolicy = Record<PurchaseValidationRuleKey, PurchaseValidationSeverity>;
+
+const DEFAULT_PURCHASE_VALIDATION_POLICY: PurchaseValidationPolicy = {
+  buyerGstinMissing: "warn",
+  supplierGstinMissing: "warn",
+  supplierLedgerGstinMismatch: "block",
+  hsnMissing: "warn",
+  stockItemHsnMismatch: "warn",
+  stockItemUnitMismatch: "warn",
+  sourceDocumentMissing: "warn",
+  caseNotAccepted: "block",
+  staleTallyMasters: "warn",
+  possibleDuplicate: "block",
+};
+
+const PURCHASE_VALIDATION_GROUPS = [
+  {
+    title: "GST identity",
+    rules: [
+      ["buyerGstinMissing", "Buyer GSTIN missing", "Unregistered and non-GST purchases can remain valid."],
+      ["supplierGstinMissing", "Supplier GSTIN missing", "Unregistered suppliers can be posted without a GSTIN."],
+      ["supplierLedgerGstinMismatch", "Supplier and ledger GSTIN differ", "Protects against selecting the wrong supplier ledger."],
+    ],
+  },
+  {
+    title: "Item mapping",
+    rules: [
+      ["hsnMissing", "HSN missing", "The selected Tally item or group may already supply the HSN."],
+      ["stockItemHsnMismatch", "Stock-item HSN differs", "Ask for review when invoice and Tally classification differ."],
+      ["stockItemUnitMismatch", "Stock-item unit differs", "Tally may support an alternate unit or conversion."],
+    ],
+  },
+  {
+    title: "Workflow",
+    rules: [
+      ["sourceDocumentMissing", "Source invoice missing", "Controls the Kalika audit attachment, not voucher balancing."],
+      ["caseNotAccepted", "Packet approval pending", "Keeps packet approval separate from accounting approval."],
+      ["staleTallyMasters", "Tally snapshot is old", "Allows a reviewer to acknowledge an older master snapshot."],
+      ["possibleDuplicate", "Possible duplicate invoice", "Protects against sending the same invoice twice."],
+    ],
+  },
+] as const satisfies ReadonlyArray<{
+  title: string;
+  rules: ReadonlyArray<readonly [PurchaseValidationRuleKey, string, string]>;
+}>;
 
 type PurchaseAccountingResponse = {
   settings?: PurchaseAccountingSettings;
@@ -60,6 +119,7 @@ const DEFAULT_PURCHASE_ACCOUNTING_SETTINGS: PurchaseAccountingSettings = {
   purchaseGoodsTdsEnabled: false,
   transporterTdsEnabled: false,
   gstTdsEnabled: false,
+  validationPolicy: { ...DEFAULT_PURCHASE_VALIDATION_POLICY },
 };
 
 const AVAILABLE_DOC_TYPES = (Object.keys(DOC_TYPE_EXTRACTION_FIELDS) as DocType[]).filter(
@@ -149,6 +209,20 @@ function serializeComparisonGroups(groups: ComparisonFieldGroup[]) {
 
 function serializePurchaseAccountingSettings(settings: PurchaseAccountingSettings) {
   return JSON.stringify(settings);
+}
+
+function normalizePurchaseAccountingSettings(
+  settings: PurchaseAccountingSettings | undefined
+): PurchaseAccountingSettings {
+  return {
+    purchaseGoodsTdsEnabled: Boolean(settings?.purchaseGoodsTdsEnabled),
+    transporterTdsEnabled: Boolean(settings?.transporterTdsEnabled),
+    gstTdsEnabled: Boolean(settings?.gstTdsEnabled),
+    validationPolicy: {
+      ...DEFAULT_PURCHASE_VALIDATION_POLICY,
+      ...(settings?.validationPolicy ?? {}),
+    },
+  };
 }
 
 const AVAILABLE_GROUP_FIELDS = FIELD_DEFINITIONS.filter(
@@ -255,8 +329,9 @@ export default function SettingsPage() {
         let accountingLoadError: string | null = null;
         if (accountingResponse.ok) {
           const accountingPayload = (await accountingResponse.json()) as PurchaseAccountingResponse;
-          loadedAccountingSettings =
-            accountingPayload.settings ?? DEFAULT_PURCHASE_ACCOUNTING_SETTINGS;
+          loadedAccountingSettings = normalizePurchaseAccountingSettings(
+            accountingPayload.settings
+          );
         } else {
           accountingLoadError = await getResponseError(accountingResponse);
         }
@@ -396,12 +471,26 @@ export default function SettingsPage() {
   }
 
   function handleTogglePurchaseAccountingRule(
-    key: keyof PurchaseAccountingSettings
+    key: "purchaseGoodsTdsEnabled" | "transporterTdsEnabled" | "gstTdsEnabled"
   ) {
     setBanner(null);
     setPurchaseAccountingSettings((current) => ({
       ...current,
       [key]: !current[key],
+    }));
+  }
+
+  function handleSetPurchaseValidationSeverity(
+    key: PurchaseValidationRuleKey,
+    severity: PurchaseValidationSeverity
+  ) {
+    setBanner(null);
+    setPurchaseAccountingSettings((current) => ({
+      ...current,
+      validationPolicy: {
+        ...current.validationPolicy,
+        [key]: severity,
+      },
     }));
   }
 
@@ -549,8 +638,9 @@ export default function SettingsPage() {
       }
 
       const accountingPayload = (await accountingResponse.json()) as PurchaseAccountingResponse;
-      const savedAccountingSettings =
-        accountingPayload.settings ?? purchaseAccountingSettings;
+      const savedAccountingSettings = normalizePurchaseAccountingSettings(
+        accountingPayload.settings ?? purchaseAccountingSettings
+      );
 
       setPacketFieldConfiguration(
         buildPacketFieldConfiguration({
@@ -1228,6 +1318,63 @@ export default function SettingsPage() {
                         );
                       })}
                     </div>
+                  </section>
+                  <section className="mt-5 overflow-hidden rounded-[10px] border border-[#e8e5de] bg-white">
+                    <div className="flex flex-col gap-2 border-b border-[#e8e5de] px-6 py-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#8a7f72]">Validation policy</p>
+                        <h2 className="mt-1 text-base font-semibold tracking-tight text-[#20201c]">Choose what blocks a Purchase voucher</h2>
+                      </div>
+                      <div className="flex items-center gap-4 text-[11px] font-medium text-[#746d63]" aria-label="Validation severity legend">
+                        <span><span className="mr-1 inline-block h-2 w-2 rounded-full bg-rose-500" />Block</span>
+                        <span><span className="mr-1 inline-block h-2 w-2 rounded-full bg-amber-400" />Warn</span>
+                        <span><span className="mr-1 inline-block h-2 w-2 rounded-full bg-slate-300" />Off</span>
+                      </div>
+                    </div>
+                    <div className="divide-y divide-[#e8e5de]">
+                      {PURCHASE_VALIDATION_GROUPS.map((group) => (
+                        <div className="grid gap-1 px-6 py-3 lg:grid-cols-[150px_1fr]" key={group.title}>
+                          <h3 className="pt-2 text-xs font-semibold text-[#5e574d]">{group.title}</h3>
+                          <div className="divide-y divide-[#eeeae3]">
+                            {group.rules.map(([key, label, description]) => {
+                              const selected = purchaseAccountingSettings.validationPolicy[key];
+                              return (
+                                <div className="flex flex-col gap-2 py-2.5 sm:flex-row sm:items-center sm:justify-between" key={key}>
+                                  <div className="min-w-0 pr-3">
+                                    <p className="text-[13px] font-medium text-[#20201c]">{label}</p>
+                                    <p className="mt-0.5 text-[11px] leading-4 text-[#837b70]">{description}</p>
+                                  </div>
+                                  <div className="grid shrink-0 grid-cols-3 rounded-lg bg-[#f2efe9] p-0.5" role="group" aria-label={`${label} severity`}>
+                                    {(["block", "warn", "off"] as const).map((severity) => (
+                                      <button
+                                        aria-pressed={selected === severity}
+                                        className={`min-w-[58px] rounded-md px-2.5 py-1.5 text-[11px] font-semibold capitalize transition ${
+                                          selected === severity
+                                            ? severity === "block"
+                                              ? "bg-white text-rose-700 shadow-sm"
+                                              : severity === "warn"
+                                                ? "bg-white text-amber-700 shadow-sm"
+                                                : "bg-white text-slate-600 shadow-sm"
+                                            : "text-[#92887c] hover:text-[#4e4942]"
+                                        }`}
+                                        key={severity}
+                                        onClick={() => handleSetPurchaseValidationSeverity(key, severity)}
+                                        type="button"
+                                      >
+                                        {severity}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <p className="border-t border-[#e8e5de] bg-[#faf9f6] px-6 py-2.5 text-[11px] text-[#746d63]">
+                      Accounting integrity checks—balanced totals, valid dates, and required posting ledgers—always block and cannot be disabled.
+                    </p>
                   </section>
                   <PurchasePostingDefaultsSettings />
                 </main>

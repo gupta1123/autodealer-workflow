@@ -2107,8 +2107,26 @@ async function runBankStatementJob(job) {
       effectiveTallyConnectionId = replacement?.id || null;
     }
   }
-  const bankAccountCandidates = await getTallyBankAccountCandidates(job.owner_user_id, effectiveTallyConnectionId);
-  const ledgerNames = await getTallyLedgerNames(job.owner_user_id, effectiveTallyConnectionId);
+  const liveTallyLedgerNames = Array.isArray(analysisContext.liveTallyLedgerNames)
+    ? Array.from(new Set(analysisContext.liveTallyLedgerNames.map((name) => textCell(name)).filter(Boolean))).slice(0, 20_000)
+    : [];
+  const liveTallyBankAccountCandidates = Array.isArray(analysisContext.liveTallyBankAccountCandidates)
+    ? analysisContext.liveTallyBankAccountCandidates.flatMap((candidate) => {
+        if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+        const ledgerName = textCell(candidate.ledgerName);
+        const accountNumber = textCell(candidate.accountNumber).replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+        return ledgerName && accountNumber ? [{ ledgerName, accountNumber }] : [];
+      }).slice(0, 1_000)
+    : [];
+  const bankAccountCandidates = liveTallyBankAccountCandidates.length > 0
+    ? liveTallyBankAccountCandidates
+    : await getTallyBankAccountCandidates(job.owner_user_id, effectiveTallyConnectionId);
+  const ledgerNames = liveTallyLedgerNames.length > 0
+    ? liveTallyLedgerNames
+    : await getTallyLedgerNames(job.owner_user_id, effectiveTallyConnectionId);
+  console.log(
+    `[worker] using ${ledgerNames.length} Tally ledger name(s) and ${bankAccountCandidates.length} bank candidate(s) for ${fileName}`
+  );
   await updateBankJob(job.id, { progress: 30, stage: "Preparing pages for AI" });
   const isPdf = mimeType.includes("pdf") || /\.pdf$/i.test(fileName);
   const isImage = mimeType.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(fileName);

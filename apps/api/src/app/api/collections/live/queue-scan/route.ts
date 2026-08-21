@@ -48,12 +48,22 @@ export async function POST(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
-    const { data: connection, error: connectionError } = await supabase
-      .from("tally_connections")
-      .select("id, owner_user_id, last_company_name, last_tally_reachable, last_company_loaded, revoked_at")
-      .eq("id", connectionId)
-      .eq("owner_user_id", user.id)
-      .maybeSingle();
+    // These reads are independent. Running them together saves one full
+    // Supabase round trip on every refresh.
+    const [connectionResult, customerScope] = await Promise.all([
+      supabase
+        .from("tally_connections")
+        .select("id, owner_user_id, last_company_name, last_tally_reachable, last_company_loaded, revoked_at")
+        .eq("id", connectionId)
+        .eq("owner_user_id", user.id)
+        .maybeSingle(),
+      getCashDiscountCustomerScopeOrDefault({
+        ownerUserId: user.id,
+        connectionId,
+        companyName,
+      }),
+    ]);
+    const { data: connection, error: connectionError } = connectionResult;
     if (connectionError) throw connectionError;
     if (!connection || connection.revoked_at) {
       return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
@@ -70,12 +80,6 @@ export async function POST(request: Request) {
       );
     }
 
-    const customerScope = await getCashDiscountCustomerScopeOrDefault({
-      ownerUserId: user.id,
-      connectionId,
-      companyName,
-    });
-
     const idempotencyKey = scanIdempotencyKey(operation, companyName, financialYear, proposal);
     const activeCommandQuery = () => supabase
       .from("tally_bridge_commands")
@@ -89,16 +93,8 @@ export async function POST(request: Request) {
       .limit(1)
       .maybeSingle();
 
-    const { data: activeCommand, error: activeCommandError } = await activeCommandQuery();
-    if (activeCommandError) throw activeCommandError;
-    if (activeCommand) {
-      await wakeTallyConnector(connectionId);
-      return jsonWithCors(request, {
-        command: serializeTallyBridgeCommand(activeCommand as unknown as TallyBridgeCommandRow),
-        reused: true,
-      });
-    }
-
+    // Insert first. The partial unique index is the concurrency guard; doing a
+    // read before every insert added a cloud round trip to the normal path.
     const { data: insertedCommand, error: commandError } = await supabase
       .from("tally_bridge_commands")
       .insert({

@@ -21,6 +21,7 @@ import {
   openBillBlockRequiresVoucherFallback,
   parseLedgerClosingBalance,
   purchasePayloadMasterNames,
+  purchaseVoucherFinancialYearRange,
   purchaseVoucherReadbackComparison,
   strictBankTransactionCandidates,
 } from "./bridge.mjs";
@@ -304,7 +305,7 @@ test("complete targeted Bill data avoids the voucher fallback", async () => {
   assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, false);
 });
 
-test("cash discount reuses its open-bills-first export and always reads targeted voucher evidence", async () => {
+test("cash discount reuses its open-bills-first export and reads one compact voucher collection", async () => {
   const calls = [];
   const billXml = '<ENVELOPE><STATUS>1</STATUS><BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><BILLTYPE>New Ref</BILLTYPE><DATE>20260801</DATE><OPENINGBALANCE>500</OPENINGBALANCE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL></ENVELOPE>';
   const result = await fetchCustomerOpenBillsFromTally(
@@ -321,9 +322,50 @@ test("cash discount reuses its open-bills-first export and always reads targeted
   );
 
   assert.deepEqual(calls.map((call) => call.tallyType), ["Voucher"]);
+  assert.equal(calls[0].collectionName, "Kalika Cash Discount Voucher Evidence");
+  assert.equal(calls[0].timeoutMs, 20_000);
+  assert.deepEqual(calls[0].filterNames, undefined);
   assert.equal(result.result.queryDiagnostics.billQueryMode, "open_bills_first");
   assert.equal(result.result.queryDiagnostics.voucherEvidenceMode, "required");
+  assert.equal(result.result.queryDiagnostics.voucherQueryMode, "compact_full_period");
+  assert.equal(result.result.queryDiagnostics.voucherBatchCount, 1);
   assert.equal(result.result.openBills[0].narration, "1% cash discount within 15 days");
+});
+
+test("cash discount scans a full financial year and many customers in one voucher request", async () => {
+  const calls = [];
+  const ledgerNames = Array.from({ length: 45 }, (_, index) => `Customer ${index + 1}`);
+  const billXml = ledgerNames.map((ledgerName, index) =>
+    `<BILL NAME="INV-${index + 1}"><LEDGERNAME>${ledgerName}</LEDGERNAME><BILLTYPE>New Ref</BILLTYPE><DATE>20260401</DATE><OPENINGBALANCE>500</OPENINGBALANCE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL>`
+  ).join("");
+  const result = await fetchCustomerOpenBillsFromTally(
+    { tallyUrl: "http://127.0.0.1:9000" },
+    {
+      companyName: "Solution Nyx",
+      ledgerNames,
+      dateFrom: "2026-04-01",
+      asOfDate: "2027-03-31",
+    },
+    {
+      billExport: {
+        xml: `<ENVELOPE><STATUS>1</STATUS>${billXml}</ENVELOPE>`,
+        batchCount: 1,
+        queryMode: "open_bills_first",
+      },
+      forceVoucherEvidence: true,
+      exportCollection: async (_url, options) => {
+        calls.push(options);
+        return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>";
+      },
+    }
+  );
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].dateFrom, "2026-04-01");
+  assert.equal(calls[0].dateTo, "2027-03-31");
+  assert.equal(result.result.queryDiagnostics.requestedLedgerCount, 45);
+  assert.equal(result.result.queryDiagnostics.voucherBatchCount, 1);
+  assert.equal(result.result.queryDiagnostics.voucherDateChunkCount, 1);
 });
 
 test("incomplete Bill data performs one targeted sequential voucher fallback", async () => {
@@ -651,6 +693,44 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
   assert.doesNotMatch(xml, /Posting: internal-posting-id/);
 });
 
+test("Purchase duplicate checks cover the complete Indian financial year", () => {
+  assert.deepEqual(purchaseVoucherFinancialYearRange("2026-08-21"), {
+    dateFrom: "2026-04-01",
+    dateTo: "2027-03-31",
+  });
+  assert.deepEqual(purchaseVoucherFinancialYearRange("2027-02-15"), {
+    dateFrom: "2026-04-01",
+    dateTo: "2027-03-31",
+  });
+});
+
+test("Purchase narration does not append a vehicle already present in the review narration", () => {
+  const xml = buildPurchaseVoucherXml({
+    companyName: "Solution Nyx",
+    voucherDate: "2026-08-21",
+    supplierInvoiceDate: "2026-07-20",
+    supplierInvoiceNumber: "DSM/26-27/087",
+    supplierLedgerName: "Deccan Sponge and Minerals",
+    vehicleNumber: "KA34AB2094",
+    narration: "KA34AB2094 HSN: 72031000",
+    finalPayableAmount: 327096,
+    items: [{
+      stockItemName: "M S Scrap & Sponge Iron",
+      purchaseLedgerName: "O.M.S. Scrap Purchase",
+      description: "Sponge Iron Lumps",
+      hsn: "72031000",
+      quantity: 12,
+      unit: "MTS",
+      rate: 23100,
+      taxableAmount: 277200,
+    }],
+    charges: [{ kind: "igst", name: "Input ITC IGST 18%", amount: 49896 }],
+    withholdings: [],
+  });
+  assert.match(xml, /<NARRATION>KA34AB2094 HSN: 72031000<\/NARRATION>/);
+  assert.doesNotMatch(xml, /Vehicle: KA34AB2094/);
+});
+
 test("Tally import exceptions are reported as failures", () => {
   const outcome = parseTallyImportResult(
     "<RESPONSE><CREATED>0</CREATED><ALTERED>0</ALTERED><ERRORS>0</ERRORS><EXCEPTIONS>1</EXCEPTIONS></RESPONSE>",
@@ -720,5 +800,27 @@ test("Purchase voucher verification includes the attached source PDF identity", 
       { ...voucher, vehicleNumber: "MH12WRONG" },
       payload
     ).some((difference) => /vehicle number/i.test(difference))
+  );
+  assert.deepEqual(
+    purchaseVoucherReadbackComparison(
+      {
+        ...voucher,
+        date: "20260821",
+        billAllocations: [{ ...voucher.billAllocations[0], billDate: "20260821" }],
+        sourceDocumentPath: null,
+        sourceDocumentName: null,
+        sourceDocumentSha256: null,
+        sourceDocumentId: null,
+        vehicleNumber: null,
+        narration: "Vehicle MH11AL4972",
+      },
+      payload,
+      {
+        ignoreVoucherDate: true,
+        ignoreBillDate: true,
+        ignoreSourceDocumentIdentity: true,
+      }
+    ),
+    []
   );
 });

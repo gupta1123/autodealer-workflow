@@ -6,6 +6,9 @@ const nextConfig = {
   turbopack: {
     root: `${process.cwd()}/../..`,
   },
+  typescript: {
+    ignoreBuildErrors: process.env.KALIKA_SKIP_BUILD_TYPECHECK === "1",
+  },
 };
 
 module.exports = nextConfig;

@@ -112,7 +112,7 @@ export async function GET(request: Request) {
     if (!exists) return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
     const { data, error } = await supabase
       .from("tally_mapping_settings")
-      .select("mapping_type, source_key, target_master_name, status")
+      .select("mapping_type, source_key, target_master_type, target_master_key, target_master_name, status")
       .eq("connection_id", connectionId)
       .eq("owner_user_id", user.id)
       .ilike("company_name", companyName)

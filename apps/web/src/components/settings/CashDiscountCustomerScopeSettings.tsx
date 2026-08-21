@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
   Building2,
@@ -18,6 +18,7 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { apiFetch } from "@/lib/api-client";
+import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 
 type Mode = "automatic" | "custom" | "strict";
@@ -62,46 +63,15 @@ async function responseError(response: Response) {
 }
 
 async function refreshTallyGroups(connectionId: string, companyName: string) {
-  const queueResponse = await apiFetch(`/api/tally/connections/${connectionId}/commands`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      commandType: "sync_masters",
-      payload: { companyName, requestedMasterTypes: ["group"] },
-    }),
+  const live = await runCashDiscountLiveRequest<{ groups?: Group[] }>({
+    connectionId,
+    companyName,
+    operation: "ledger_masters",
   });
-  if (!queueResponse.ok) throw new Error(await responseError(queueResponse));
-  const queued = await queueResponse.json() as { command?: { id?: string } };
-  if (!queued.command?.id) throw new Error("The Tally group refresh could not be queued.");
-
-  let completed = false;
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    await new Promise((resolve) => window.setTimeout(resolve, 1_000));
-    const commandResponse = await apiFetch(
-      `/api/tally/connections/${connectionId}/commands?ids=${encodeURIComponent(queued.command.id)}`,
-      { cache: "no-store" }
-    );
-    if (!commandResponse.ok) throw new Error(await responseError(commandResponse));
-    const commandPayload = await commandResponse.json() as {
-      commands?: Array<{ status?: string; error?: string | null }>;
-    };
-    const command = commandPayload.commands?.[0];
-    if (command?.status === "failed" || command?.status === "canceled") {
-      throw new Error(command.error || "Tally could not refresh the customer groups.");
-    }
-    if (command?.status === "succeeded") {
-      completed = true;
-      break;
-    }
-  }
-  if (!completed) throw new Error("Tally group refresh is still pending. Keep the connector open and try again.");
-
-  const refreshedResponse = await apiFetch(
-    `/api/tally/connections/${connectionId}/masters?type=group&all=true`,
-    { cache: "no-store" }
-  );
-  if (!refreshedResponse.ok) throw new Error(await responseError(refreshedResponse));
-  return refreshedResponse.json() as Promise<GroupMastersPayload>;
+  return {
+    masters: live.groups ?? [],
+    latestSync: { completed_at: new Date().toISOString() },
+  } satisfies GroupMastersPayload;
 }
 
 function formatGroupRefreshTime(value: string | null) {
@@ -142,7 +112,6 @@ export function CashDiscountCustomerScopeSettings() {
   const [groupRefreshError, setGroupRefreshError] = useState<string | null>(null);
   const [groupsRefreshedAt, setGroupsRefreshedAt] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ tone: "success" | "error" | "info"; text: string } | null>(null);
-  const attemptedGroupSync = useRef(new Set<string>());
 
   useEffect(() => {
     let cancelled = false;
@@ -215,7 +184,6 @@ export function CashDiscountCustomerScopeSettings() {
       if (!groupsResponse.ok) throw new Error(await responseError(groupsResponse));
       const groupPayload = await groupsResponse.json() as GroupMastersPayload;
       let loadedGroups = groupPayload.masters ?? [];
-      const syncKey = `${connectionId}::${companyName.toLowerCase()}`;
       if (!cancelled) {
         setScope(nextScope);
         setSavedScope(nextScope);
@@ -223,57 +191,18 @@ export function CashDiscountCustomerScopeSettings() {
         setGroupsRefreshedAt(groupPayload.latestSync?.completed_at ?? null);
         setLoading(false);
       }
-      if (!attemptedGroupSync.current.has(syncKey)) {
-        attemptedGroupSync.current.add(syncKey);
+      if (loadedGroups.length === 0 && !cancelled) {
         setRefreshingGroups(true);
-        setGroupRefreshError(null);
-        setNotice({ tone: "info", text: `Reading customer groups from live Tally for ${companyName}…` });
-        const queueResponse = await apiFetch(`/api/tally/connections/${connectionId}/commands`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            commandType: "sync_masters",
-            payload: { companyName, requestedMasterTypes: ["group"] },
-          }),
-        });
-        if (!queueResponse.ok) throw new Error(await responseError(queueResponse));
-        const queued = await queueResponse.json() as { command?: { id?: string } };
-        if (!queued.command?.id) throw new Error("The Tally group refresh could not be queued.");
-
-        let completed = false;
-        for (let attempt = 0; attempt < 60; attempt += 1) {
-          await new Promise((resolve) => window.setTimeout(resolve, 1_000));
-          if (cancelled) return;
-          const commandResponse = await apiFetch(
-            `/api/tally/connections/${connectionId}/commands?ids=${encodeURIComponent(queued.command.id)}`,
-            { cache: "no-store" }
-          );
-          if (!commandResponse.ok) throw new Error(await responseError(commandResponse));
-          const commandPayload = await commandResponse.json() as {
-            commands?: Array<{ status?: string; error?: string | null }>;
-          };
-          const command = commandPayload.commands?.[0];
-          if (command?.status === "failed" || command?.status === "canceled") {
-            throw new Error(command.error || "Tally could not refresh the customer groups.");
-          }
-          if (command?.status === "succeeded") {
-            completed = true;
-            break;
-          }
+        setNotice({ tone: "info", text: `Reading customer groups live from Tally for ${companyName}…` });
+        try {
+          const refreshedPayload = await refreshTallyGroups(connectionId, companyName);
+          loadedGroups = refreshedPayload.masters ?? [];
+          setGroupsRefreshedAt(refreshedPayload.latestSync?.completed_at ?? new Date().toISOString());
+        } catch (refreshError) {
+          setGroupRefreshError(refreshError instanceof Error ? refreshError.message : "Could not read live Tally groups.");
+        } finally {
+          setRefreshingGroups(false);
         }
-        if (!completed) throw new Error("Tally group refresh is still pending. Keep the connector open and try again.");
-
-        const refreshedResponse = await apiFetch(
-          `/api/tally/connections/${connectionId}/masters?type=group&all=true`,
-          { cache: "no-store" }
-        );
-        if (!refreshedResponse.ok) throw new Error(await responseError(refreshedResponse));
-        const refreshedPayload = await refreshedResponse.json() as GroupMastersPayload;
-        loadedGroups = refreshedPayload.masters ?? [];
-        setGroupsRefreshedAt(refreshedPayload.latestSync?.completed_at ?? new Date().toISOString());
-        setNotice(loadedGroups.length > 0
-          ? { tone: "success", text: `${loadedGroups.length} Tally groups loaded for ${companyName}.` }
-          : { tone: "error", text: `Tally returned no groups for ${companyName}.` });
       }
       if (!cancelled) {
         setScope(nextScope);
@@ -644,7 +573,7 @@ export function CashDiscountCustomerScopeSettings() {
               </span>
             </div>
             <div>
-              {loading ? <div className="flex items-center justify-center gap-2 py-10 text-sm text-[#656860]"><Loader2 className="h-4 w-4 animate-spin" />Reading company groups</div> : groupView.visible.map(({ group, depth, childCount, expanded }) => {
+              {loading ? <div className="flex items-center justify-center gap-2 py-10 text-sm text-[#656860]"><Loader2 className="h-4 w-4 animate-spin" />Loading saved company groups</div> : groupView.visible.map(({ group, depth, childCount, expanded }) => {
                 const explicitlySelected = scope.selectedGroupNames.some((item) => normalizedName(item) === normalizedName(group.name));
                 const inheritedFrom = inheritedSelectionByGroup.get(normalizedName(group.name));
                 const effectivelySelected = explicitlySelected || Boolean(inheritedFrom);

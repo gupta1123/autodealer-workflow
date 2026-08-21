@@ -26,6 +26,7 @@ import {
   type PurchasePostingReview,
 } from "@/lib/tally/purchase-posting";
 import { suggestPurchaseLineMasters } from "@/lib/tally/purchase-master-matching";
+import { wakeTallyConnector } from "@/lib/tally/command-wake";
 
 type PostingRow = {
   id: string;
@@ -293,7 +294,7 @@ function asSavedReview(value: unknown): Partial<PurchasePostingReview> | null {
         : clean;
     }
   }
-  for (const key of ["applyTds194q", "applyTransportTds", "tcsReceivable", "sourceReferenceApproved"] as const) {
+  for (const key of ["applyTds194q", "applyTransportTds", "applyGstTds", "tcsReceivable", "sourceReferenceApproved"] as const) {
     if (typeof input[key] === "boolean") output[key] = input[key];
   }
   if (Array.isArray(input.lines)) {
@@ -361,6 +362,9 @@ function serializePosting(
 
 function masterOption(master: PurchasePostingMasterInput) {
   const raw = master.raw_payload ?? {};
+  const parsedClosingBalance = raw.closingBalance === null || raw.closingBalance === undefined
+    ? Number.NaN
+    : Number(raw.closingBalance);
   return {
     id: master.id,
     type: master.master_type,
@@ -374,6 +378,11 @@ function masterOption(master: PurchasePostingMasterInput) {
     groupPath: master.group_path ?? master.parent_name,
     taxType: typeof raw.taxType === "string" ? raw.taxType : null,
     gstDutyHead: typeof raw.gstDutyHead === "string" ? raw.gstDutyHead : null,
+    closingBalance: Number.isFinite(parsedClosingBalance) ? parsedClosingBalance : null,
+    closingBalanceType:
+      raw.closingBalanceType === "Dr" || raw.closingBalanceType === "Cr"
+        ? raw.closingBalanceType
+        : null,
   };
 }
 
@@ -442,7 +451,11 @@ function livePurchaseMasters(resultValue: unknown): {
         unit_name: textValue(row.unitName),
         tax_rate: numberValue(row.taxRate),
         group_path: groupPath(row.parent),
-        raw_payload: raw,
+        raw_payload: {
+          ...raw,
+          closingBalance: row.closingBalance ?? raw.closingBalance,
+          closingBalanceType: row.closingBalanceType ?? raw.closingBalanceType,
+        },
         is_active: true,
       } satisfies PurchasePostingMasterInput];
     });
@@ -714,7 +727,7 @@ async function loadContext(
         .limit(10),
       supabase
         .from("tally_mapping_settings")
-        .select("mapping_type, source_key, target_master_name, status")
+        .select("mapping_type, source_key, target_master_type, target_master_key, target_master_name, status")
         .eq("connection_id", connection.id)
         .ilike("company_name", companyName)
         .eq("status", "active"),
@@ -898,8 +911,15 @@ async function prepareContext(context: LoadedContext, ownerUserId: string, saved
     : {};
   const draftInvoice = String(savedReview?.invoiceNumber ?? sourceFields.invoiceNumber ?? "");
   const draftSupplier = String(savedReview?.supplierGstin ?? sourceFields.supplierGstin ?? "");
-  const duplicate = companyGstin && draftInvoice && draftSupplier
-    ? duplicateKey(companyGstin, draftSupplier, draftInvoice)
+  const companyIdentity = companyGstin || context.selectedCompanyName || "";
+  const supplierIdentity = draftSupplier || String(
+    savedReview?.supplierLedgerName ??
+    sourceFields.supplierName ??
+    sourceFields.vendorName ??
+    ""
+  );
+  const duplicate = companyIdentity && draftInvoice && supplierIdentity
+    ? duplicateKey(companyIdentity, supplierIdentity, draftInvoice)
     : null;
   const duplicateExists = await hasDuplicateClaim({ context, ownerUserId, duplicate });
   return {
@@ -933,6 +953,7 @@ function responseBody(context: LoadedContext, prepared: Awaited<ReturnType<typeo
     : [];
   return {
     caseStatus: context.caseRow.status,
+    hasSavedReview: Boolean(context.posting?.review_patch),
     posting: serializePosting(context.posting, prepared, context),
     eligibility: {
       eligible: prepared.eligible,
@@ -1305,6 +1326,25 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
         blockers: prepared.blockers,
       }, { status: 409 });
     }
+    const acknowledgedWarningCodes = new Set(
+      Array.isArray(body.acknowledgedWarningCodes)
+        ? body.acknowledgedWarningCodes.filter(
+            (code: unknown): code is string => typeof code === "string" && Boolean(code.trim())
+          )
+        : []
+    );
+    const acknowledgementWarnings = prepared.warnings.filter(
+      (warning) => warning.requiresAcknowledgement
+    );
+    const unacknowledgedWarnings = acknowledgementWarnings.filter(
+      (warning) => !acknowledgedWarningCodes.has(warning.code)
+    );
+    if (unacknowledgedWarnings.length > 0) {
+      return jsonWithCors(request, {
+        error: "Acknowledge every configured validation warning before approval.",
+        warnings: unacknowledgedWarnings,
+      }, { status: 409 });
+    }
     if (!context.connection || !duplicate) {
       return jsonWithCors(request, { error: "An active Tally company and invoice identity are required." }, { status: 409 });
     }
@@ -1344,6 +1384,15 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
       masterSyncRunId: null,
       purchaseMasterCommandId: context.liveMasterCommandId,
       approvedAt: now,
+      validationAcknowledgement: acknowledgementWarnings.length > 0 ? {
+        acknowledgedBy: user.id,
+        acknowledgedAt: now,
+        warnings: acknowledgementWarnings.map((warning) => ({
+          code: warning.code,
+          label: warning.label,
+          policyRule: warning.policyRule ?? null,
+        })),
+      } : null,
     };
     const approvedPayloadHash = createHash("sha256")
       .update(JSON.stringify(frozenPayload))
@@ -1368,13 +1417,25 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
     }
 
     const commandId = String(commandResult.data);
-    await context.supabase.from("tally_connection_events").insert({
-      connection_id: context.connection.id,
-      owner_user_id: user.id,
-      event_type: "command_queued",
-      message: "Purchase voucher creation queued from packet review.",
-      payload: { commandType: "create_purchase_voucher", commandId, caseId: id, postingId: context.posting.id },
-    });
+    await Promise.all([
+      context.supabase.from("tally_connection_events").insert({
+        connection_id: context.connection.id,
+        owner_user_id: user.id,
+        event_type: "command_queued",
+        message: "Purchase voucher creation queued from packet review.",
+        payload: {
+          commandType: "create_purchase_voucher",
+          commandId,
+          caseId: id,
+          postingId: context.posting.id,
+          validationAcknowledgement: acknowledgementWarnings.length > 0 ? {
+            warningCodes: acknowledgementWarnings.map((warning) => warning.code),
+            policyRules: acknowledgementWarnings.map((warning) => warning.policyRule).filter(Boolean),
+          } : null,
+        },
+      }),
+      wakeTallyConnector(context.connection.id),
+    ]);
 
     const refreshed = await loadContext(id, user.id, context.connection.id);
     const { prepared: refreshedPrepared } = await prepareContext(refreshed, user.id, asSavedReview(refreshed.posting?.review_patch));

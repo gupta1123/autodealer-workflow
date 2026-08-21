@@ -3,8 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
-  ArrowRight,
-  Building2,
   CheckCircle2,
   ChevronDown,
   Database,
@@ -33,8 +31,8 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { fetchCaseFileSignedUrl } from "@/lib/case-persistence";
+import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import {
   approveAndQueueTallyPurchasePosting,
   fetchTallyPurchasePosting,
@@ -63,12 +61,26 @@ function formatDateTime(value: string | null | undefined) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
+function formatShortDate(value: string | null | undefined) {
+  if (!value) return "Missing";
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return value;
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", year: "numeric" }).format(date);
+}
+
 function money(value: string | null | undefined) {
   if (!value) return "₹0.00";
   const parsed = Number(value);
   return Number.isFinite(parsed)
     ? new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(parsed)
     : value;
+}
+
+function closingBalanceLabel(option: TallyMasterOption) {
+  if (typeof option.closingBalance !== "number" || !Number.isFinite(option.closingBalance)) return null;
+  const balanceType = option.closingBalanceType || (option.closingBalance < 0 ? "Dr" : option.closingBalance > 0 ? "Cr" : null);
+  return `Closing ${money(String(Math.abs(option.closingBalance)))}${balanceType ? ` ${balanceType}` : ""}`;
 }
 
 function tallyAmount(
@@ -299,8 +311,9 @@ function caseStatusLabel(status: string | undefined) {
   return "Pending";
 }
 
-function statusLabel(status: string | undefined) {
+function statusLabel(status: string | undefined, verificationStatus?: unknown) {
   if (!status) return "Draft";
+  if (status === "created" && verificationStatus === "already_in_tally") return "Already in Tally";
   const labels: Record<string, string> = {
     draft: "Draft",
     correction_required: "Needs attention",
@@ -316,23 +329,16 @@ function statusLabel(status: string | undefined) {
   return status.replaceAll("_", " ").replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
-function postingProgressMessage(status: string | undefined) {
+function postingProgressMessage(status: string | undefined, verificationStatus?: unknown) {
   if (status === "approved") return "Voucher approved. Preparing the Tally command…";
   if (status === "queued") return "Voucher approved and queued. Waiting for Tally…";
   if (status === "creating") return "Tally is creating and verifying the Purchase voucher…";
+  if (status === "created" && verificationStatus === "already_in_tally") {
+    return "The existing Purchase voucher was found and linked; no duplicate was created.";
+  }
   if (status === "created") return "Purchase voucher created and verified in Tally.";
   if (status === "verification_required") return "Tally created the voucher, but verification needs attention.";
   return null;
-}
-
-function statusClass(status: string | undefined) {
-  if (status === "created" || status === "ready_for_approval") {
-    return "border-emerald-200 bg-emerald-50 text-emerald-700";
-  }
-  if (status === "failed" || status === "correction_required" || status === "verification_required") {
-    return "border-rose-200 bg-rose-50 text-rose-700";
-  }
-  return "border-amber-200 bg-amber-50 text-amber-700";
 }
 
 function FieldIssues({ issues }: { issues?: TallyPostingIssue[] }) {
@@ -445,6 +451,7 @@ function MasterCombobox({
   syncing = false,
   compact = false,
   hideLabel = false,
+  hideSourceBadge = false,
   sourceHint,
   emptyMessage = "No matching option was returned by Tally.",
   suggestedNames = [],
@@ -463,6 +470,7 @@ function MasterCombobox({
   syncing?: boolean;
   compact?: boolean;
   hideLabel?: boolean;
+  hideSourceBadge?: boolean;
   sourceHint?: string;
   emptyMessage?: string;
   suggestedNames?: string[];
@@ -486,6 +494,8 @@ function MasterCombobox({
         option.hsnCode,
         option.unitName,
         option.taxRate,
+        option.closingBalance,
+        option.closingBalanceType,
       ]
         .filter((item) => item !== null && item !== undefined)
         .join(" ")
@@ -494,13 +504,22 @@ function MasterCombobox({
     );
   }, [options, search]);
   const detail = (option: TallyMasterOption) =>
-    [
-      option.groupPath || option.parent,
-      option.gstin ? `GSTIN ${option.gstin}` : null,
-      option.hsnCode ? `HSN ${option.hsnCode}` : null,
-      option.unitName ? `Unit ${option.unitName}` : null,
-      option.taxRate !== null ? `${option.taxRate}%` : null,
-    ].filter(Boolean);
+    option.type === "ledger"
+      ? [option.groupPath || option.parent, closingBalanceLabel(option)].filter(Boolean)
+      : [
+          option.groupPath || option.parent,
+          option.hsnCode ? `HSN ${option.hsnCode}` : null,
+          option.unitName ? `Unit ${option.unitName}` : null,
+          option.taxRate !== null ? `${option.taxRate}%` : null,
+        ].filter(Boolean);
+  const optionTags = (option: TallyMasterOption) =>
+    option.type === "ledger"
+      ? [closingBalanceLabel(option)].filter(Boolean)
+      : [
+          option.hsnCode ? `HSN ${option.hsnCode}` : null,
+          option.unitName ? `Unit ${option.unitName}` : null,
+          option.taxRate !== null ? `${option.taxRate}%` : null,
+        ].filter(Boolean);
   const suggestedNameSet = useMemo(
     () => new Set(suggestedNames.map((name) => name.trim().toLowerCase())),
     [suggestedNames]
@@ -511,9 +530,11 @@ function MasterCombobox({
       {!hideLabel ? (
         <span className={`flex items-center justify-between gap-2 font-medium text-slate-600 ${compact ? "text-[11px]" : "text-xs"}`}>
           <span>{label}</span>
-          <span className={`${compact ? "text-[8px]" : "text-[9px]"} font-semibold uppercase tracking-wide text-emerald-700`}>
-            From Tally
-          </span>
+          {!hideSourceBadge ? (
+            <span className={`${compact ? "text-[8px]" : "text-[9px]"} font-semibold uppercase tracking-wide text-emerald-700`}>
+              From Tally
+            </span>
+          ) : null}
         </span>
       ) : null}
       <Popover
@@ -561,7 +582,7 @@ function MasterCombobox({
           align="start"
           collisionPadding={16}
           className={`${compact
-            ? "w-[var(--radix-popover-trigger-width)] max-w-[calc(100vw-2rem)]"
+            ? "w-[max(var(--radix-popover-trigger-width),360px)] max-w-[calc(100vw-2rem)]"
             : "w-[min(430px,calc(100vw-2rem))]"
           } z-[100] flex max-h-[min(26rem,var(--radix-popover-content-available-height))] flex-col overflow-hidden rounded-xl border-slate-200 p-0 shadow-xl`}
           sideOffset={6}
@@ -573,35 +594,37 @@ function MasterCombobox({
                 autoFocus
                 className={`${compact ? "h-8 text-xs" : "h-9 text-sm"} w-full rounded-lg border border-slate-200 bg-slate-50 pl-9 pr-3 outline-none focus:border-emerald-500 focus:bg-white focus:ring-2 focus:ring-emerald-100`}
                 onChange={(event) => setSearch(event.target.value)}
-                placeholder={`Search ${companyName || "Tally"}`}
+                placeholder={`Search ${options.length.toLocaleString("en-IN")} live masters`}
                 value={search}
               />
             </div>
-            <div className="mt-2 flex items-center justify-between gap-3 text-[10px] font-medium text-slate-400">
-              <span className="truncate">Company: {companyName || "Not selected"}</span>
-              <span className="flex shrink-0 items-center gap-2">
-                <span>{syncedAt ? `Synced ${formatDateTime(syncedAt)}` : "Not synced"}</span>
-                {value ? (
-                  <button
-                    className="font-semibold text-slate-600 hover:text-rose-700"
-                    onClick={() => {
-                      onChange("");
-                      setOpen(false);
-                    }}
-                    type="button"
-                  >
-                    Clear
-                  </button>
-                ) : null}
-              </span>
+            <div className="mt-2 flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="truncate text-[10px] font-semibold text-slate-600">{companyName || "No Tally company selected"}</div>
+                <div className="mt-0.5 text-[9px] leading-4 text-slate-400">
+                  {suggestedNameSet.size > 0 ? `${suggestedNameSet.size} ${suggestedLabel.toLowerCase()} first · ` : ""}
+                  {syncedAt ? `Synced ${formatDateTime(syncedAt)}` : "Not synced"}
+                </div>
+              </div>
+              {value ? (
+                <button
+                  className="shrink-0 text-[10px] font-semibold text-slate-500 hover:text-rose-700"
+                  onClick={() => {
+                    onChange("");
+                    setOpen(false);
+                  }}
+                  type="button"
+                >
+                  Clear selection
+                </button>
+              ) : null}
             </div>
-            <p className="mt-1 text-[10px] text-slate-400">
-              {suggestedNameSet.size > 0
-                ? `${suggestedNameSet.size} ${suggestedLabel.toLowerCase()} first · search all ${options.length.toLocaleString("en-IN")} live masters`
-                : `Search all ${options.length.toLocaleString("en-IN")} live masters`}
-            </p>
           </div>
-          <ScrollArea className="min-h-0 flex-1 overflow-hidden">
+          <div
+            className="min-h-0 flex-1 overflow-y-auto overscroll-contain [scrollbar-gutter:stable]"
+            onWheel={(event) => event.stopPropagation()}
+            style={{ maxHeight: "min(20rem, calc(var(--radix-popover-content-available-height) - 7rem))" }}
+          >
             <div className="p-1.5">
               {filtered.length > 0 ? (
                 filtered.map((option) => (
@@ -621,13 +644,21 @@ function MasterCombobox({
                         <span className={`block truncate font-semibold text-slate-900 ${compact ? "text-xs" : "text-sm"}`}>
                           {option.name}
                         </span>
+                        {option.groupPath || option.parent ? (
+                          <span
+                            className={`${compact ? "text-[9px]" : "text-[10px]"} mt-0.5 block w-full overflow-hidden text-ellipsis whitespace-nowrap text-slate-400`}
+                            title={option.groupPath || option.parent || undefined}
+                          >
+                            {option.groupPath || option.parent}
+                          </span>
+                        ) : null}
                         <span className="mt-1 flex flex-wrap gap-1">
                           {suggestedNameSet.has(option.name.trim().toLowerCase()) ? (
                             <span className={`rounded-full bg-emerald-100 px-2 py-0.5 font-semibold text-emerald-700 ${compact ? "text-[9px]" : "text-[10px]"}`}>
                               {suggestedLabel}
                             </span>
                           ) : null}
-                          {detail(option).map((item) => (
+                          {optionTags(option).map((item) => (
                             <span
                               className={`rounded-full bg-slate-100 px-2 py-0.5 font-medium text-slate-500 ${compact ? "text-[9px]" : "text-[10px]"}`}
                               key={String(item)}
@@ -653,7 +684,7 @@ function MasterCombobox({
                 </div>
               )}
             </div>
-          </ScrollArea>
+          </div>
         </PopoverContent>
       </Popover>
       {sourceHint ? <p className="text-[10px] leading-4 text-slate-400">{sourceHint}</p> : null}
@@ -717,10 +748,12 @@ export function TallyPurchasePostingPanel({
   caseId,
   onApprovePacket,
   onHeaderStateChange,
+  onRefreshReady,
 }: {
   caseId: string;
   onApprovePacket?: () => Promise<void>;
   onHeaderStateChange?: (state: TallyPurchaseHeaderState) => void;
+  onRefreshReady?: (refresh: () => Promise<void>) => void;
 }) {
   const [payload, setPayload] = useState<TallyPostingResponse | null>(null);
   const [review, setReview] = useState<TallyPostingReview | null>(null);
@@ -737,6 +770,7 @@ export function TallyPurchasePostingPanel({
   const [queueing, setQueueing] = useState(false);
   const [refreshingMasters, setRefreshingMasters] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [warningsAcknowledged, setWarningsAcknowledged] = useState(false);
   const [editingGstRate, setEditingGstRate] = useState(false);
   const [supplierLedgerMatch, setSupplierLedgerMatch] = useState<SupplierLedgerMatch | null>(null);
   const [matchingSupplierLedger, setMatchingSupplierLedger] = useState(false);
@@ -744,10 +778,10 @@ export function TallyPurchasePostingPanel({
   const [lineMasterMatches, setLineMasterMatches] = useState<PurchaseLineMasterSuggestion[]>([]);
   const [matchingLineMasters, setMatchingLineMasters] = useState(false);
   const [lineMasterMatchError, setLineMasterMatchError] = useState<string | null>(null);
-  const automaticMasterSyncKeyRef = useRef("");
   const automaticSupplierMatchKeyRef = useRef("");
   const automaticLineMasterMatchKeyRef = useRef("");
   const lastPostingStatusRef = useRef<string | null>(null);
+  const automaticLiveRefreshRef = useRef<string | null>(null);
 
   const load = useCallback(async (
     quiet = false,
@@ -780,22 +814,93 @@ export function TallyPurchasePostingPanel({
     void load(false, null, true);
   }, [caseId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // A new case has no trusted review yet. Load the current company masters
+  // once before matching so defaults are based on live Tally data, while a
+  // saved review remains stable and does not create a refresh loop.
+  useEffect(() => {
+    if (automaticLiveRefreshRef.current === caseId) return;
+    automaticLiveRefreshRef.current = caseId;
+    void (async () => {
+      const next = await load(true, null, true);
+      const connection = next?.connection;
+      if (
+        !next ||
+        next.hasSavedReview ||
+        !next.selectedConnectionId ||
+        !next.selectedCompanyName ||
+        !connection?.bridgeConnected ||
+        !connection.tallyReachable ||
+        !connection.companyLoaded ||
+        (connection.masterSnapshotFresh && connection.masterSource === "live_purchase")
+      ) return;
+      try {
+        setRefreshingMasters(true);
+        setNotice("Reading the latest masters from Tally…");
+        const queued = await queueTallyMasterRefresh(
+          next.selectedConnectionId,
+          next.selectedCompanyName
+        ) as { command?: { id?: string } };
+        const commandId = queued.command?.id;
+        if (commandId) {
+          await waitForTallyCommand(next.selectedConnectionId, commandId, {
+            attempts: 30,
+            intervalMs: 1000,
+          });
+          await load(true, next.selectedConnectionId, true, next.selectedCompanyName);
+        }
+      } catch (refreshError) {
+        setNotice(refreshError instanceof Error ? refreshError.message : "Live Tally refresh is unavailable.");
+      } finally {
+        setRefreshingMasters(false);
+      }
+    })();
+  }, [caseId, load]);
+
   useEffect(() => {
     const postingStatus = payload?.posting?.status;
     if (!["approved", "queued", "creating"].includes(postingStatus ?? "")) return;
-    const interval = window.setInterval(
-      () =>
-        void load(
-          true,
-          payload?.selectedConnectionId,
-          false,
-          payload?.selectedCompanyName
-        ),
-      3000
-    );
-    return () => window.clearInterval(interval);
+    const connectionId = payload?.selectedConnectionId;
+    const commandId = payload?.posting?.commandId;
+    let cancelled = false;
+    let fallbackTimer: number | null = null;
+
+    if (connectionId && commandId) {
+      void (async () => {
+        try {
+          while (!cancelled) {
+            const terminal = await waitForTallyCommand(connectionId, commandId, {
+              attempts: 1,
+              intervalMs: 1000,
+            });
+            if (!terminal) continue;
+            if (!cancelled) {
+              await load(true, connectionId, false, payload?.selectedCompanyName);
+            }
+            return;
+          }
+        } catch {
+          if (!cancelled) {
+            fallbackTimer = window.setTimeout(
+              () => void load(true, connectionId, false, payload?.selectedCompanyName),
+              3000
+            );
+          }
+        }
+      })();
+    } else {
+      fallbackTimer = window.setTimeout(
+        () => void load(true, connectionId, false, payload?.selectedCompanyName),
+        3000
+      );
+    }
+
+    return () => {
+      cancelled = true;
+      if (fallbackTimer !== null) window.clearTimeout(fallbackTimer);
+    };
   }, [
     load,
+    payload?.posting?.commandId,
     payload?.posting?.status,
     payload?.selectedCompanyName,
     payload?.selectedConnectionId,
@@ -826,12 +931,15 @@ export function TallyPurchasePostingPanel({
       return;
     }
 
-    const progressMessage = postingProgressMessage(status);
+    const progressMessage = postingProgressMessage(
+      status,
+      payload?.posting?.verificationResult?.verificationStatus
+    );
     if (progressMessage) {
       setError(null);
       setNotice(progressMessage);
     }
-  }, [payload?.posting?.lastError, payload?.posting?.status]);
+  }, [payload?.posting?.lastError, payload?.posting?.status, payload?.posting?.verificationResult]);
 
   useEffect(() => {
     if (!payload) return;
@@ -1028,13 +1136,9 @@ export function TallyPurchasePostingPanel({
   const igstTdsOptions = igstTdsRanked.options;
   const tcsOptions = tcsRanked.options;
   const roundOffOptions = roundOffRanked.options;
-  const prerequisiteIssues = useMemo(
-    () => (payload?.blockers ?? []).filter((issue) => issue.scope === "case"),
-    [payload?.blockers]
-  );
   const correctionBlockers = useMemo(
     () => (payload?.blockers ?? []).filter((issue) => {
-      if (issue.scope === "case") return false;
+      if (issue.scope === "case" || issue.scope === "company") return false;
       // Server blockers describe the last saved review. Clear date errors as
       // soon as the current browser value is valid; Save still performs the
       // authoritative server validation before approval.
@@ -1044,6 +1148,17 @@ export function TallyPurchasePostingPanel({
     }),
     [payload?.blockers, review?.invoiceDate, review?.voucherDate]
   );
+  const acknowledgementWarnings = useMemo(
+    () => (payload?.warnings ?? []).filter((warning) => warning.requiresAcknowledgement),
+    [payload?.warnings]
+  );
+  const acknowledgementWarningKey = acknowledgementWarnings
+    .map((warning) => warning.code)
+    .sort()
+    .join("|");
+  useEffect(() => {
+    setWarningsAcknowledged(false);
+  }, [acknowledgementWarningKey, payload?.posting?.revision]);
   const warningsByScope = useMemo(() => {
     const map = new Map<string, TallyPostingIssue[]>();
     for (const warning of payload?.warnings ?? []) {
@@ -1078,17 +1193,6 @@ export function TallyPurchasePostingPanel({
     return warningsByScope.get(`line:${lineId}`) ?? [];
   }
 
-  const issueCounts = useMemo(() => {
-    const counts = { invoice: 0, line: 0, tax: 0, source: 0 };
-    for (const issue of correctionBlockers) {
-      if (issue.scope === "invoice") counts.invoice += 1;
-      else if (issue.scope === "line") counts.line += 1;
-      else if (issue.scope === "tax") counts.tax += 1;
-      else if (issue.scope === "source") counts.source += 1;
-    }
-    return counts;
-  }, [correctionBlockers]);
-
   function updateReview<K extends keyof TallyPostingReview>(key: K, value: TallyPostingReview[K]) {
     setReview((current) => current ? { ...current, [key]: value } : current);
     if (key === "supplierName" || key === "supplierGstin") {
@@ -1100,54 +1204,14 @@ export function TallyPurchasePostingPanel({
     setNotice(null);
   }
 
-  function updateLine(index: number, key: keyof TallyPostingReview["lines"][number], value: string) {
-    setReview((current) => {
-      if (!current) return current;
-      return {
-        ...current,
-        lines: current.lines.map((line, lineIndex) =>
-          lineIndex === index ? { ...line, [key]: value } : line
-        ),
-      };
-    });
-    setDirty(true);
-    setNotice(null);
-  }
-
-  async function handleCompanyChange(nextCompanyName: string) {
-    if (
-      !nextCompanyName ||
-      nextCompanyName === selectedCompanyName ||
-      !selectedConnectionId
-    ) {
-      return;
-    }
-    if ((dirty || connectionDirty) && !window.confirm("Discard unsaved Tally review changes and switch company?")) return;
-    setDirty(false);
-    setConnectionDirty(false);
-    setNotice(null);
-    const next = await load(
-      false,
-      selectedConnectionId,
-      true,
-      nextCompanyName
-    );
-    if (next) {
-      setConnectionDirty(
-        next.posting?.connectionId !== selectedConnectionId ||
-          next.posting?.companyName !== nextCompanyName
-      );
-    }
-  }
-
-  async function handleSave() {
-    if (!review || !selectedConnectionId || !selectedCompanyName || locked) return;
+  async function persistReview(nextReview: TallyPostingReview) {
+    if (!selectedConnectionId || !selectedCompanyName || locked) return;
     try {
       setSaving(true);
       setError(null);
       const next = await saveTallyPurchasePosting(
         caseId,
-        review,
+        nextReview,
         selectedConnectionId,
         selectedCompanyName
       );
@@ -1165,6 +1229,36 @@ export function TallyPurchasePostingPanel({
     } finally {
       setSaving(false);
     }
+  }
+
+  async function handleAdjustmentToggle(
+    key: "applyTds194q" | "applyTransportTds" | "applyGstTds" | "tcsReceivable"
+  ) {
+    if (!review || locked || saving) return;
+    const nextReview = { ...review, [key]: !review[key] };
+    setReview(nextReview);
+    setDirty(true);
+    setNotice("Recalculating voucher…");
+    await persistReview(nextReview);
+  }
+
+  function updateLine(index: number, key: keyof TallyPostingReview["lines"][number], value: string) {
+    setReview((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        lines: current.lines.map((line, lineIndex) =>
+          lineIndex === index ? { ...line, [key]: value } : line
+        ),
+      };
+    });
+    setDirty(true);
+    setNotice(null);
+  }
+
+  async function handleSave() {
+    if (!review || !selectedConnectionId || !selectedCompanyName || locked) return;
+    await persistReview(review);
   }
 
   async function handleInvoiceSelection(documentId: string) {
@@ -1222,22 +1316,27 @@ export function TallyPurchasePostingPanel({
       connectionDirty ||
       locked ||
       refreshingMasters ||
-      !payload.connection?.masterSnapshotFresh ||
-      !payload.connection?.masterSnapshotComplete
+      (acknowledgementWarnings.length > 0 && !warningsAcknowledged)
     ) {
       return;
     }
     try {
       setQueueing(true);
       setError(null);
-      const next = await approveAndQueueTallyPurchasePosting(caseId);
+      const next = await approveAndQueueTallyPurchasePosting(
+        caseId,
+        acknowledgementWarnings.map((warning) => warning.code)
+      );
       setPayload(next);
       setReview(next.review);
       setDirty(false);
       setConnectionDirty(false);
       setConfirmOpen(false);
       setNotice(
-        postingProgressMessage(next.posting?.status) ||
+        postingProgressMessage(
+          next.posting?.status,
+          next.posting?.verificationResult?.verificationStatus
+        ) ||
         "Voucher approved. Preparing the Tally command…"
       );
     } catch (queueError) {
@@ -1256,19 +1355,18 @@ export function TallyPurchasePostingPanel({
       if (automatic) {
         setNotice(`Reading the latest data from ${connection.companyName}…`);
       }
-      const queued = await queueTallyMasterRefresh(connection.id, connection.companyName) as {
-        command?: { id?: string };
-      };
-      const commandId = queued.command?.id;
-      if (!commandId) throw new Error("Tally could not start the refresh.");
       if (!automatic) {
-        setNotice("Refreshing company data from Tally…");
+        setNotice("Reading live company data from Tally…");
       }
-      const completed = await waitForTallyCommand(connection.id, commandId);
-      if (!completed) throw new Error("Tally is still refreshing. Check the Tally connection and try again.");
-      if (completed.status !== "succeeded") {
-        throw new Error(completed.error || "Tally could not refresh the company data.");
-      }
+      await runCashDiscountLiveRequest({
+        connectionId: connection.id,
+        companyName: connection.companyName,
+        operation: "ledger_masters",
+        payload: {
+          requestedMasterTypes: ["ledger", "group", "stock_item", "unit", "gst_ledger", "tax_ledger"],
+        },
+        onProgress: (message) => setNotice(message),
+      });
       await load(true, connection.id, !dirty, connection.companyName);
       setNotice("Latest company data loaded from Tally.");
     } catch (refreshError) {
@@ -1277,6 +1375,14 @@ export function TallyPurchasePostingPanel({
       setRefreshingMasters(false);
     }
   }, [dirty, load, payload?.connection]);
+
+  // Let the page-level Tally header invoke the exact same refresh path. This
+  // keeps one source of truth and, importantly, persists the live company
+  // profile/master snapshot before the header is re-rendered.
+  useEffect(() => {
+    onRefreshReady?.(() => handleRefreshMasters(false));
+    return () => onRefreshReady?.(() => Promise.resolve());
+  }, [handleRefreshMasters, onRefreshReady]);
 
   async function handleOpenSource() {
     if (!payload?.sourceFileId) return;
@@ -1288,37 +1394,10 @@ export function TallyPurchasePostingPanel({
     }
   }
 
-  const sourceMaterialByLine = useMemo(
-    () => new Map(payload?.source?.lines.map((line) => [line.lineId, line.materialLabel]) ?? []),
-    [payload?.source?.lines]
-  );
   const sourceLineById = useMemo(
     () => new Map(payload?.source?.lines.map((line) => [line.lineId, line]) ?? []),
     [payload?.source?.lines]
   );
-  const liveCompanyOptions = useMemo(() => {
-    const seenCompanies = new Set<string>();
-    return [...(payload?.connectionOptions ?? [])]
-      .sort((left, right) => {
-        if (left.companyName === selectedCompanyName) return -1;
-        if (right.companyName === selectedCompanyName) return 1;
-        return 0;
-      })
-      .filter(
-        (option) =>
-          option.bridgeConnected &&
-          option.tallyReachable &&
-          option.companyLoaded &&
-          !option.heartbeatStale &&
-          Boolean(option.companyName?.trim())
-      )
-      .filter((option) => {
-        const companyKey = option.companyName!.trim().toLowerCase();
-        if (seenCompanies.has(companyKey)) return false;
-        seenCompanies.add(companyKey);
-        return true;
-      });
-  }, [payload?.connectionOptions, selectedCompanyName]);
   const hasUnsavedChanges = dirty || connectionDirty;
   const canSave = Boolean(
     review &&
@@ -1341,6 +1420,7 @@ export function TallyPurchasePostingPanel({
       connection.companyName &&
       (!connection.masterSnapshotFresh || !connection.masterSnapshotComplete)
   );
+  const masterSelectionDisabled = locked || refreshingMasters;
   const selectedMatchesActive = Boolean(
     connectionReadable &&
       connection?.companyName &&
@@ -1348,7 +1428,13 @@ export function TallyPurchasePostingPanel({
       connection.companyName.trim().toLowerCase() ===
         connection.activeCompanyName.trim().toLowerCase()
   );
-  const tallyReviewRefreshing = refreshingMasters || mastersNeedSync;
+  // A stale snapshot should block approval, but it is not an active refresh.
+  // Keep the page idle until the reviewer explicitly asks for a full Tally
+  // master refresh instead of queueing one on every page open.
+  const tallyReviewRefreshing = refreshingMasters;
+  const staleMastersBlocking = Boolean(
+    payload?.blockers.some((blocker) => blocker.code === "TALLY_MASTERS_STALE")
+  );
   const canApprove = Boolean(
     payload?.readyForApproval &&
     payload?.posting &&
@@ -1363,35 +1449,6 @@ export function TallyPurchasePostingPanel({
     syncedAt: connection?.masterSyncedAt,
     syncing: refreshingMasters,
   };
-  useEffect(() => {
-    if (
-      !connectionReadable ||
-      !selectedMatchesActive ||
-      refreshingMasters ||
-      locked ||
-      !connection?.id ||
-      !connection.companyName
-    ) {
-      return;
-    }
-    const syncKey = [
-      caseId,
-      connection.id,
-      connection.companyName.trim().toLowerCase(),
-    ].join(":");
-    if (automaticMasterSyncKeyRef.current === syncKey) return;
-    automaticMasterSyncKeyRef.current = syncKey;
-    void handleRefreshMasters(true);
-  }, [
-    caseId,
-    connection?.companyName,
-    connection?.id,
-    connectionReadable,
-    handleRefreshMasters,
-    locked,
-    refreshingMasters,
-    selectedMatchesActive,
-  ]);
   if (state === "loading" && !payload) {
     return (
       <div className="flex min-h-[420px] items-center justify-center text-sm text-slate-500">
@@ -1605,113 +1662,7 @@ export function TallyPurchasePostingPanel({
   }>;
 
   return (
-    <div className="tally-purchase-workflow mx-auto max-w-6xl space-y-4 p-3 pb-32 sm:p-5 sm:pb-32">
-      <div
-        className="flex flex-col gap-3 px-1 py-0.5 sm:flex-row sm:items-start sm:justify-between"
-        id="tally-header"
-      >
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <h2 className="text-base font-semibold tracking-tight text-slate-950">Tally Purchase voucher</h2>
-            <Badge variant="outline" className={statusClass(payload.posting?.status)}>
-              {statusLabel(payload.posting?.status)}
-            </Badge>
-          </div>
-          <p className="mt-1 text-xs leading-5 text-slate-500">
-            Accounting approval is separate from the packet decision.
-          </p>
-        </div>
-
-        <div className="flex min-w-0 items-center gap-2 sm:w-auto">
-          <label className="min-w-0 flex-1 sm:w-[300px] sm:flex-none">
-            <span className="sr-only">Active Tally company</span>
-            <select
-              className={`${inputClass} h-9 text-xs font-semibold ${
-                selectedMatchesActive
-                  ? "border-emerald-200 bg-emerald-50/60"
-                  : connectionReadable
-                    ? "border-amber-300 bg-amber-50"
-                    : ""
-              }`}
-              disabled={locked || state === "loading"}
-              onChange={(event) => void handleCompanyChange(event.target.value)}
-              title="Active Tally company"
-              value={selectedCompanyName}
-            >
-              <option value="">
-                {liveCompanyOptions.length > 0
-                  ? "Select active Tally company"
-                  : "No readable Tally company"}
-              </option>
-              {liveCompanyOptions.map((option) => (
-                <option key={option.id} value={option.companyName ?? ""}>
-                  {option.companyName}{option.isActive ? " — active in Tally" : ""}
-                </option>
-              ))}
-            </select>
-            <span className={`mt-1 block truncate text-[10px] font-medium ${
-              selectedMatchesActive ? "text-emerald-700" : "text-amber-700"
-            }`}>
-              {selectedMatchesActive
-                ? "Connected to the selected Tally company"
-                : connectionReadable
-                  ? `Tally is active on ${connection?.activeCompanyName || "another company"}`
-                  : "Cannot reach the selected Tally company"}
-            </span>
-          </label>
-
-          {mastersNeedSync ? (
-            <Button
-              aria-label={refreshingMasters ? "Refreshing Tally data" : "Refresh Tally data"}
-              className="h-9 w-9 shrink-0 border-amber-200 text-amber-700 hover:bg-amber-50 hover:text-amber-800"
-              disabled={
-                !connection?.id ||
-                !connection.companyName ||
-                refreshingMasters ||
-                locked
-              }
-              onClick={() => void handleRefreshMasters()}
-              size="icon"
-              title={refreshingMasters ? "Refreshing Tally data…" : "Refresh Tally data"}
-              variant="outline"
-            >
-              {refreshingMasters ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <RefreshCw className="h-4 w-4" />
-              )}
-            </Button>
-          ) : null}
-        </div>
-      </div>
-
-      <nav
-        aria-label="Purchase voucher review sections"
-        className="grid overflow-hidden rounded-xl border border-slate-200 bg-white sm:grid-cols-4"
-      >
-        {[
-          { href: "#tally-invoice", number: "1", label: "Invoice", issues: issueCounts.invoice },
-          { href: "#tally-items", number: "2", label: "Mappings", issues: issueCounts.line },
-          { href: "#tally-taxes", number: "3", label: "Taxes", issues: issueCounts.tax },
-          { href: "#tally-preview", number: "4", label: "Tally preview", issues: issueCounts.source },
-        ].map((step) => (
-          <a
-            className="flex items-center gap-2 border-b border-slate-100 px-3 py-2.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-950 sm:border-b-0 sm:border-r sm:last:border-r-0"
-            href={step.href}
-            key={step.href}
-          >
-            <span className={`flex h-5 w-5 items-center justify-center rounded-full text-[10px] ${
-              step.issues > 0
-                ? "bg-rose-50 text-rose-700"
-                : "bg-emerald-50 text-emerald-700"
-            }`}>
-              {step.issues > 0 ? step.issues : <CheckCircle2 className="h-3 w-3" />}
-            </span>
-            <span>{step.number}. {step.label}</span>
-          </a>
-        ))}
-      </nav>
-
+    <div className="tally-purchase-workflow mx-auto max-w-6xl space-y-3 p-3 pb-32 sm:p-4 sm:pb-32" id="tally-header">
       {payload.eligibility.invoiceCandidates.length > 1 ? (
         <section className="rounded-xl border border-slate-200 bg-white p-3">
           <div className="mb-2 text-xs font-semibold text-slate-900">Invoice selected for this Purchase voucher</div>
@@ -1745,16 +1696,6 @@ export function TallyPurchasePostingPanel({
             </p>
           </div>
         </section>
-      ) : null}
-
-      {prerequisiteIssues.length > 0 && !onApprovePacket ? (
-        <div className="flex items-start gap-2 rounded-xl border border-blue-200 bg-blue-50 px-3.5 py-2.5 text-xs text-blue-800">
-          <Database className="mt-0.5 h-4 w-4 shrink-0" />
-          <div>
-            <span className="font-semibold">This voucher cannot be approved yet.</span>{" "}
-            {prerequisiteIssues[0]?.message}
-          </div>
-        </div>
       ) : null}
 
       {payload.posting?.status === "created" ? null : correctionBlockers.length > 0 ? (
@@ -1791,9 +1732,9 @@ export function TallyPurchasePostingPanel({
           </div>
         </section>
       ) : tallyReviewRefreshing ? (
-        <section className="flex items-center gap-2 rounded-2xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          Rechecking the voucher against the latest Tally data…
+        <section className="flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-[11px] text-blue-800">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          Checking latest Tally data…
         </section>
       ) : payload.posting?.status === "verification_required" ? (
         <section className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
@@ -1807,61 +1748,67 @@ export function TallyPurchasePostingPanel({
             </div>
           </div>
         </section>
-      ) : (
-        <section className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
-          <CheckCircle2 className="mr-2 inline h-4 w-4" /> All accounting checks passed.
-        </section>
-      )}
+      ) : null}
 
       <ReviewWarnings warnings={scopeWarnings("case")} />
 
       <section className="scroll-mt-24 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" id="tally-invoice">
-        <div className="flex items-start justify-between gap-4">
-          <div className="px-4 pt-4 sm:px-5 sm:pt-5">
-            <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-emerald-700">Step 1</div>
-            <h3 className="mt-1 font-semibold text-slate-950">Source invoice</h3>
-            <p className="mt-1 text-xs text-slate-500">Check the invoice details, then select the matching supplier ledger in Tally.</p>
+        <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2.5 sm:px-5">
+          <h3 className="text-sm font-semibold text-slate-950">Source invoice</h3>
+          <div className="flex items-center gap-2">
+            <Button className="h-7 shrink-0 px-2.5 text-[10px]" disabled={!payload.sourceFileId} onClick={() => void handleOpenSource()} size="sm" variant="outline">
+              <ExternalLink className="h-3.5 w-3.5" /> View
+            </Button>
           </div>
-          <Button className="mr-4 mt-4 sm:mr-5 sm:mt-5" disabled={!payload.sourceFileId} onClick={() => void handleOpenSource()} size="sm" variant="outline">
-            <ExternalLink className="h-4 w-4" /> View invoice
-          </Button>
-        </div>
-        <div className="mt-4 grid border-t border-slate-100 lg:grid-cols-[minmax(0,1.55fr)_minmax(300px,0.8fr)]">
-          <div className="grid gap-4 p-4 sm:grid-cols-2 sm:p-5 lg:grid-cols-3">
-            <Field id="field-invoice-number" disabled={locked} issues={scopeIssues("invoice", ["INVOICE_NUMBER_REQUIRED"])} label="Invoice number" onChange={(value) => updateReview("invoiceNumber", value)} sourceValue={payload.source?.invoiceNumber} value={review.invoiceNumber} />
-            <Field id="field-invoice-date" disabled={locked} issues={scopeIssues("invoice", ["INVOICE_DATE_REQUIRED"])} label="Supplier invoice date" onChange={(value) => updateReview("invoiceDate", value)} sourceValue={payload.source?.invoiceDate} type="date" value={review.invoiceDate} />
-            <Field id="field-voucher-date" disabled={locked} issues={scopeIssues("invoice", ["VOUCHER_DATE_REQUIRED"])} label="Tally voucher date" onChange={(value) => updateReview("voucherDate", value)} type="date" value={review.voucherDate} />
-            <Field disabled={locked} label="Vehicle number" onChange={(value) => updateReview("vehicleNumber", value)} sourceValue={payload.source?.vehicleNumber} value={review.vehicleNumber} />
-            <Field id="field-invoice-total" disabled={locked} issues={scopeIssues("invoice", ["INVOICE_TOTAL_REQUIRED"])} label="Final invoice payable" onChange={(value) => updateReview("invoiceTotal", value)} sourceValue={payload.source?.invoiceTotal} value={review.invoiceTotal} />
-            <Field disabled={locked} label="Supplier name" onChange={(value) => updateReview("supplierName", value)} sourceValue={payload.source?.supplierName} value={review.supplierName} />
-            <Field id="field-supplier-gstin" disabled={locked} issues={scopeIssues("invoice", ["SUPPLIER_GSTIN_REQUIRED"])} label="Supplier GSTIN" onChange={(value) => updateReview("supplierGstin", value.toUpperCase())} sourceValue={payload.source?.supplierGstin} value={review.supplierGstin} />
-            <Field disabled={locked} label="Buyer name" onChange={(value) => updateReview("buyerName", value)} sourceValue={payload.source?.buyerName} value={review.buyerName} />
-            <Field id="field-buyer-gstin" disabled={locked} issues={scopeIssues("invoice", ["BUYER_GSTIN_REQUIRED"])} label="Buyer GSTIN" onChange={(value) => updateReview("buyerGstin", value.toUpperCase())} sourceValue={payload.source?.buyerGstin} value={review.buyerGstin} />
+        </header>
+        <div>
+          <div className={`grid grid-cols-2 gap-x-4 gap-y-2 px-4 py-2.5 sm:px-5 ${review.vehicleNumber ? "sm:grid-cols-5" : "sm:grid-cols-4"}`}>
+            <div>
+              <div className="text-[8px] font-semibold uppercase tracking-[0.12em] text-slate-400">Invoice no.</div>
+              <div className="mt-0.5 text-[11px] font-semibold text-slate-950">
+                {review.invoiceNumber || "Missing"}
+              </div>
+            </div>
+            <div>
+              <div className="text-[8px] font-semibold uppercase tracking-[0.12em] text-slate-400">Invoice date</div>
+              <div className="mt-0.5 text-[11px] text-slate-700">{formatShortDate(review.invoiceDate)}</div>
+            </div>
+            <div>
+              <div className="text-[8px] font-semibold uppercase tracking-[0.12em] text-slate-400">Voucher date</div>
+              <div className="mt-0.5 text-[11px] text-slate-700">{formatShortDate(review.voucherDate)}</div>
+            </div>
+            {review.vehicleNumber ? (
+              <div>
+                <div className="text-[8px] font-semibold uppercase tracking-[0.12em] text-slate-400">Vehicle</div>
+                <div className="mt-0.5 text-[11px] text-slate-700">{review.vehicleNumber}</div>
+              </div>
+            ) : null}
+            <div>
+              <div className="text-[8px] font-semibold uppercase tracking-[0.12em] text-slate-400">Invoice total</div>
+              <div className="mt-0.5 text-[11px] font-semibold text-slate-950">{money(review.invoiceTotal)}</div>
+            </div>
           </div>
-          <aside className="border-t border-slate-100 bg-slate-50/70 p-4 sm:p-5 lg:border-l lg:border-t-0">
-            <div className="flex items-center gap-2 text-xs font-semibold text-slate-900">
-              <Building2 className="h-4 w-4 text-emerald-700" />
-              Supplier accounting mapping
-            </div>
-            <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3">
-              <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Invoice supplier</div>
-              <div className="mt-1 truncate text-sm font-semibold text-slate-900">{review.supplierName || "Not extracted"}</div>
-              <div className="mt-0.5 truncate text-[11px] text-slate-500">{review.supplierGstin || "GSTIN not available"}</div>
-            </div>
-            <div className="flex h-8 items-center justify-center">
-              <ArrowRight className="h-4 w-4 rotate-90 text-emerald-600" />
+
+          <div className="grid gap-3 border-t border-slate-100 bg-slate-50/60 px-4 py-3 sm:px-5 lg:grid-cols-[minmax(0,1fr)_280px] lg:items-center">
+            <div className="min-w-0">
+              <div className="truncate text-sm font-semibold text-slate-950">{review.supplierName || "Supplier missing"}</div>
+              <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[10px] text-slate-500">
+                <span>{review.supplierGstin || "Supplier GSTIN missing"}</span>
+                <span className="text-slate-300">→</span>
+                <span>{review.buyerName || "Buyer missing"}</span>
+                <span>{review.buyerGstin || "Buyer GSTIN missing"}</span>
+              </div>
             </div>
             <MasterCombobox
               {...masterContext}
               compact
-              disabled={locked || mastersNeedSync}
+              disabled={masterSelectionDisabled}
               emptyMessage="No ledger matched this search in the selected Tally company."
               id="field-supplier-ledger"
               issues={scopeIssues("invoice", ["SUPPLIER_LEDGER_REQUIRED", "SUPPLIER_LEDGER_GSTIN_MISMATCH"])}
-              label="Post against supplier ledger"
+              label="Supplier ledger"
               onChange={(value) => updateReview("supplierLedgerName", value)}
               options={supplierLedgerOptions}
-              sourceHint={`Search all ${supplierLedgerOptions.length.toLocaleString("en-IN")} ledgers from the selected Tally company. Likely supplier ledgers appear first.`}
               suggestedNames={[
                 ...(supplierLedgerMatch?.ledgerName ? [supplierLedgerMatch.ledgerName] : []),
                 ...(supplierLedgerMatch?.candidateLedgerNames ?? []),
@@ -1869,13 +1816,13 @@ export function TallyPurchasePostingPanel({
               value={review.supplierLedgerName}
             />
             {matchingSupplierLedger ? (
-              <div className="mt-3 flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] font-medium text-slate-600">
+              <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] font-medium text-slate-600 lg:col-span-2">
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-600" />
                 Checking the supplier against all Tally ledgers…
               </div>
             ) : null}
             {supplierLedgerMatch?.matchType === "close_match" && supplierLedgerMatch.candidateLedgerNames.length > 0 ? (
-              <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3">
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 lg:col-span-2">
                 <div className="text-[10px] font-semibold uppercase tracking-wide text-amber-800">Close matches — choose one</div>
                 <p className="mt-1 text-[10px] leading-4 text-amber-700">{supplierLedgerMatch.reason || "More than one Tally ledger may represent this supplier."}</p>
                 <div className="mt-2 flex flex-wrap gap-1.5">
@@ -1893,35 +1840,50 @@ export function TallyPurchasePostingPanel({
               </div>
             ) : null}
             {supplierLedgerMatch?.matchType === "suspense" ? (
-              <div className="mt-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[10px] leading-4 text-slate-500">
+              <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-[10px] leading-4 text-slate-500 lg:col-span-2">
                 No ledger was safe to select automatically. Search the complete ledger list above.
               </div>
             ) : null}
             {supplierLedgerMatchError ? (
-              <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[10px] leading-4 text-rose-700">
+              <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[10px] leading-4 text-rose-700 lg:col-span-2">
                 {supplierLedgerMatchError} You can still search all ledgers manually.
               </div>
             ) : null}
-            <div className="mt-3">
+            <div className="lg:col-span-2">
               <ReviewWarnings warnings={scopeWarnings("invoice")} />
             </div>
-          </aside>
+          </div>
+
+          <details className="group border-t border-slate-100" open={scopeIssues("invoice").some((issue) => issue.code !== "SUPPLIER_LEDGER_REQUIRED" && issue.code !== "SUPPLIER_LEDGER_GSTIN_MISMATCH") || undefined}>
+            <summary className="flex cursor-pointer list-none items-center gap-1.5 px-4 py-2 text-[10px] font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-800 sm:px-5">
+              Edit invoice details <ChevronDown className="h-3 w-3 transition group-open:rotate-180" />
+            </summary>
+            <div className="grid gap-3 border-t border-slate-100 bg-white p-4 sm:grid-cols-2 sm:px-5 lg:grid-cols-3">
+              <Field compact id="field-invoice-number" disabled={locked} issues={scopeIssues("invoice", ["INVOICE_NUMBER_REQUIRED"])} label="Invoice number" onChange={(value) => updateReview("invoiceNumber", value)} sourceValue={payload.source?.invoiceNumber} value={review.invoiceNumber} />
+              <Field compact id="field-invoice-date" disabled={locked} issues={scopeIssues("invoice", ["INVOICE_DATE_REQUIRED"])} label="Supplier invoice date" onChange={(value) => updateReview("invoiceDate", value)} sourceValue={payload.source?.invoiceDate} type="date" value={review.invoiceDate} />
+              <Field compact id="field-voucher-date" disabled={locked} issues={scopeIssues("invoice", ["VOUCHER_DATE_REQUIRED"])} label="Tally voucher date" onChange={(value) => updateReview("voucherDate", value)} type="date" value={review.voucherDate} />
+              <Field compact disabled={locked} label="Vehicle number" onChange={(value) => updateReview("vehicleNumber", value)} sourceValue={payload.source?.vehicleNumber} value={review.vehicleNumber} />
+              <Field compact id="field-invoice-total" disabled={locked} issues={scopeIssues("invoice", ["INVOICE_TOTAL_REQUIRED"])} label="Final invoice payable" onChange={(value) => updateReview("invoiceTotal", value)} sourceValue={payload.source?.invoiceTotal} value={review.invoiceTotal} />
+              <Field compact disabled={locked} label="Supplier name" onChange={(value) => updateReview("supplierName", value)} sourceValue={payload.source?.supplierName} value={review.supplierName} />
+              <Field compact id="field-supplier-gstin" disabled={locked} issues={scopeIssues("invoice", ["SUPPLIER_GSTIN_REQUIRED"])} label="Supplier GSTIN" onChange={(value) => updateReview("supplierGstin", value.toUpperCase())} sourceValue={payload.source?.supplierGstin} value={review.supplierGstin} />
+              <Field compact disabled={locked} label="Buyer name" onChange={(value) => updateReview("buyerName", value)} sourceValue={payload.source?.buyerName} value={review.buyerName} />
+              <Field compact id="field-buyer-gstin" disabled={locked} issues={scopeIssues("invoice", ["BUYER_GSTIN_REQUIRED"])} label="Buyer GSTIN" onChange={(value) => updateReview("buyerGstin", value.toUpperCase())} sourceValue={payload.source?.buyerGstin} value={review.buyerGstin} />
+            </div>
+          </details>
         </div>
       </section>
 
       <section className="scroll-mt-4 rounded-2xl border border-slate-200 bg-white shadow-sm" id="tally-items">
-        <div className="border-b border-slate-100 px-4 py-4 sm:px-5">
-          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-emerald-700">Step 2</div>
-          <h3 className="mt-1 font-semibold text-slate-950">Items and Tally mappings</h3>
-          <p className="mt-1 text-xs text-slate-500">Check each invoice item and select its stock item and purchase ledger from Tally.</p>
+        <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2.5 sm:px-5">
+          <h3 className="text-sm font-semibold text-slate-950">Items and Tally mappings</h3>
           {matchingLineMasters ? (
-            <p className="mt-2 flex items-center gap-1.5 text-[10px] font-medium text-emerald-700">
-              <Loader2 className="h-3 w-3 animate-spin" /> Matching unresolved items against all live Tally masters…
+            <p className="flex items-center gap-1.5 text-[10px] font-medium text-emerald-700">
+              <Loader2 className="h-3 w-3 animate-spin" /> Matching…
             </p>
           ) : lineMasterMatchError ? (
-            <p className="mt-2 text-[10px] text-rose-600">{lineMasterMatchError} You can still search every live master manually.</p>
+            <p className="text-[10px] text-rose-600">Matching failed</p>
           ) : null}
-        </div>
+        </header>
         {payload.source?.lineRecovery === "linked_document" ? (
           <div className="flex items-start gap-2 border-b border-amber-100 bg-amber-50/70 px-4 py-2.5 text-xs text-amber-900 sm:px-5">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
@@ -1939,62 +1901,56 @@ export function TallyPurchasePostingPanel({
             const purchaseCandidates = masterMatch?.purchaseLedger.candidateMasterNames ?? [];
             const rankedStockItems = rankStockItems(stockItemOptions, line, stockCandidates);
             const rankedPurchaseLedgers = rankLedgerRole(ledgerOptions, "purchase", 0, purchaseCandidates);
-            const selectedStockItem = stockItemOptions.find(
-              (option) =>
-                option.name.trim().toLowerCase() ===
-                line.stockItemName.trim().toLowerCase()
-            );
-            const invoiceUnit = sourceLine?.unit || line.unit;
-            const tallyUnit = selectedStockItem?.unitName?.trim() || "";
-            const equivalentUnitAlias = Boolean(
-              invoiceUnit &&
-              tallyUnit &&
-              invoiceUnit.trim().toLowerCase() !== tallyUnit.toLowerCase() &&
-              normalizeUnitFamily(invoiceUnit) === normalizeUnitFamily(tallyUnit)
-            );
             return (
-            <article className="scroll-mt-24 overflow-hidden rounded-xl border border-slate-200 bg-white" id={`tally-line-${line.lineId}`} key={line.lineId}>
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="px-4 pt-4">
-                  <div className="text-xs font-semibold text-slate-900">Line {index + 1} · {sourceMaterialByLine.get(line.lineId) || "Manual"}</div>
-                  <div className="mt-0.5 text-[11px] text-slate-500">Invoice details are on the left; Tally selections are on the right.</div>
+            <article className="scroll-mt-24 overflow-hidden border-b border-slate-100 bg-white last:border-b-0" id={`tally-line-${line.lineId}`} key={line.lineId}>
+              <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5 sm:px-4">
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-xs font-semibold text-slate-950">{line.description || `Item ${index + 1}`}</div>
+                  <div className="mt-1 grid grid-cols-2 gap-x-5 gap-y-1 sm:grid-cols-4">
+                    <div>
+                      <div className="text-[8px] font-semibold uppercase tracking-[0.1em] text-slate-400">HSN</div>
+                      <div className="text-[10px] text-slate-600">{line.hsn || "Missing"}</div>
+                    </div>
+                    <div>
+                      <div className="text-[8px] font-semibold uppercase tracking-[0.1em] text-slate-400">Quantity</div>
+                      <div className="text-[10px] text-slate-600">{line.quantity || "0"} {line.unit || "units"}</div>
+                    </div>
+                    <div>
+                      <div className="text-[8px] font-semibold uppercase tracking-[0.1em] text-slate-400">Rate / unit</div>
+                      <div className="text-[10px] text-slate-600">{money(line.rate)}</div>
+                    </div>
+                    <div>
+                      <div className="text-[8px] font-semibold uppercase tracking-[0.1em] text-slate-400">Taxable amount</div>
+                      <div className="text-[10px] font-semibold text-slate-700">{money(line.taxableAmount)}</div>
+                    </div>
+                  </div>
                 </div>
                 {lineIssues(line.lineId).length > 0 ? (
-                  <Badge variant="outline" className="mr-4 mt-4 border-rose-200 bg-rose-50 text-rose-700">{lineIssues(line.lineId).length} corrections</Badge>
-                ) : (
-                  <Badge variant="outline" className="mr-4 mt-4 border-emerald-200 bg-emerald-50 text-emerald-700">Line ready</Badge>
-                )}
+                  <Badge variant="outline" className="border-rose-200 bg-rose-50 text-rose-700">{lineIssues(line.lineId).length} corrections</Badge>
+                ) : null}
               </div>
               {lineWarnings(line.lineId).length > 0 ? (
                 <div className="px-4 pt-3">
                   <ReviewWarnings warnings={lineWarnings(line.lineId)} />
                 </div>
               ) : null}
-              <div className="mt-4 grid border-t border-slate-100 lg:grid-cols-[minmax(0,1.55fr)_minmax(310px,0.8fr)]">
-                <div className="grid gap-4 bg-slate-50/50 p-4 sm:grid-cols-2 lg:grid-cols-3">
-                  <Field disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED"])} label="Description" onChange={(value) => updateLine(index, "description", value)} sourceValue={sourceLine?.description} value={line.description} />
-                  <Field disabled={locked} issues={lineIssues(line.lineId, ["HSN_MAPPING_REQUIRED"])} label="HSN" onChange={(value) => updateLine(index, "hsn", value)} sourceValue={sourceLine?.hsn} value={line.hsn} />
-                  <Field disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED"])} label="Quantity" onChange={(value) => updateLine(index, "quantity", value)} sourceValue={sourceLine?.quantity} value={line.quantity} />
-                  <Field disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED", "STOCK_ITEM_UNIT_MISMATCH"])} label="Unit" onChange={(value) => updateLine(index, "unit", value)} sourceValue={sourceLine?.unit} value={line.unit} />
-                  <Field disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED"])} label="Rate" onChange={(value) => updateLine(index, "rate", value)} sourceValue={sourceLine?.rate} value={line.rate} />
-                  <Field disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED", "LINE_TAXABLE_MISMATCH"])} label="Taxable amount" onChange={(value) => updateLine(index, "taxableAmount", value)} sourceValue={sourceLine?.taxableAmount} value={line.taxableAmount} />
-                </div>
-                <div className="space-y-4 p-4">
+              <div className="grid gap-3 border-t border-slate-100 bg-slate-50/50 p-3 sm:grid-cols-2 sm:p-4">
+                <div>
                   <MasterCombobox
                     {...masterContext}
                     compact
-                    disabled={locked || mastersNeedSync}
+                    disabled={masterSelectionDisabled}
                     emptyMessage="No stock item was returned by Tally."
+                    hideSourceBadge
                     issues={lineIssues(line.lineId, ["STOCK_ITEM_REQUIRED", "STOCK_ITEM_HSN_MISMATCH", "STOCK_ITEM_UNIT_MISMATCH"])}
-                    label="Map to Tally stock item"
+                    label="Stock item"
                     onChange={(value) => updateLine(index, "stockItemName", value)}
                     options={rankedStockItems.options}
                     suggestedNames={rankedStockItems.suggestedNames}
-                    sourceHint={`Invoice: HSN ${line.hsn || "missing"} · Unit ${invoiceUnit || "missing"}`}
                     value={line.stockItemName}
                   />
                   {masterMatch?.stockItem.matchType === "close_match" ? (
-                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] text-amber-900">
+                    <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] text-amber-900">
                       <div className="font-semibold">Choose the matching stock item</div>
                       <div className="mt-1 flex flex-wrap gap-1">
                         {stockCandidates.map((name) => (
@@ -2003,29 +1959,23 @@ export function TallyPurchasePostingPanel({
                       </div>
                     </div>
                   ) : null}
-                  {equivalentUnitAlias ? (
-                    <div className="flex flex-wrap items-center gap-2 rounded-lg border border-emerald-100 bg-emerald-50/70 px-2.5 py-2 text-[10px] text-emerald-900">
-                      <span>Invoice unit <strong>{invoiceUnit}</strong></span>
-                      <ArrowRight className="h-3 w-3 text-emerald-600" />
-                      <span>Tally unit <strong>{tallyUnit}</strong></span>
-                      <span className="rounded-full bg-white px-1.5 py-0.5 font-semibold text-emerald-700">1:1</span>
-                    </div>
-                  ) : null}
+                </div>
+                <div>
                   <MasterCombobox
                     {...masterContext}
                     compact
-                    disabled={locked || mastersNeedSync}
+                    disabled={masterSelectionDisabled}
                     emptyMessage="No ledger was returned by live Tally."
+                    hideSourceBadge
                     issues={lineIssues(line.lineId, ["PURCHASE_LEDGER_REQUIRED"])}
-                    label="Post to purchase ledger"
+                    label="Purchase ledger"
                     onChange={(value) => updateLine(index, "purchaseLedgerName", value)}
                     options={rankedPurchaseLedgers.options}
-                    sourceHint={`Likely Purchase Accounts ledgers appear first; all ${ledgerOptions.length.toLocaleString("en-IN")} live ledgers remain searchable.`}
                     suggestedNames={rankedPurchaseLedgers.suggestedNames}
                     value={line.purchaseLedgerName}
                   />
                   {masterMatch?.purchaseLedger.matchType === "close_match" ? (
-                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] text-amber-900">
+                    <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] text-amber-900">
                       <div className="font-semibold">Choose the purchase ledger</div>
                       <div className="mt-1 flex flex-wrap gap-1">
                         {purchaseCandidates.map((name) => (
@@ -2036,70 +1986,62 @@ export function TallyPurchasePostingPanel({
                   ) : null}
                 </div>
               </div>
+              <details className="group border-t border-slate-100" open={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED", "HSN_MAPPING_REQUIRED", "LINE_TAXABLE_MISMATCH"]).length > 0 || undefined}>
+                <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-[10px] font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-800 sm:px-4">
+                  Edit item values <ChevronDown className="h-3 w-3 transition group-open:rotate-180" />
+                </summary>
+                <div className="grid gap-3 border-t border-slate-100 p-3 sm:grid-cols-2 sm:p-4 lg:grid-cols-3">
+                  <Field compact disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED"])} label="Description" onChange={(value) => updateLine(index, "description", value)} sourceValue={sourceLine?.description} value={line.description} />
+                  <Field compact disabled={locked} issues={lineIssues(line.lineId, ["HSN_MAPPING_REQUIRED"])} label="HSN" onChange={(value) => updateLine(index, "hsn", value)} sourceValue={sourceLine?.hsn} value={line.hsn} />
+                  <Field compact disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED"])} label="Quantity" onChange={(value) => updateLine(index, "quantity", value)} sourceValue={sourceLine?.quantity} value={line.quantity} />
+                  <Field compact disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED", "STOCK_ITEM_UNIT_MISMATCH"])} label="Unit" onChange={(value) => updateLine(index, "unit", value)} sourceValue={sourceLine?.unit} value={line.unit} />
+                  <Field compact disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED"])} label="Rate" onChange={(value) => updateLine(index, "rate", value)} sourceValue={sourceLine?.rate} value={line.rate} />
+                  <Field compact disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED", "LINE_TAXABLE_MISMATCH"])} label="Taxable amount" onChange={(value) => updateLine(index, "taxableAmount", value)} sourceValue={sourceLine?.taxableAmount} value={line.taxableAmount} />
+                </div>
+              </details>
             </article>
           )})}
         </div>
       </section>
 
       <section className="scroll-mt-4 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" id="tally-taxes">
-        <header className="flex flex-col gap-3 border-b border-slate-100 px-4 py-4 sm:flex-row sm:items-start sm:justify-between sm:px-5">
-          <div>
-            <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-emerald-700">Step 3</div>
-            <h3 className="mt-1 font-semibold text-slate-950">Taxes and reconciliation</h3>
-            <p className="mt-1 text-xs text-slate-500">Compare the invoice with the calculated taxes and select the matching Tally ledgers.</p>
-          </div>
+        <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2.5 sm:px-5">
+          <h3 className="text-sm font-semibold text-slate-950">Taxes</h3>
           {(missingApplicableTaxMasters || mastersNeedSync) ? (
             <Button
+              aria-label="Refresh Tally tax ledgers"
+              className="h-7 w-7"
               disabled={!connection?.id || !connection.companyName || refreshingMasters || locked}
               onClick={() => void handleRefreshMasters()}
-              size="sm"
+              size="icon"
+              title="Refresh Tally tax ledgers"
               variant="outline"
             >
-              {refreshingMasters ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-              Refresh Tally data
+              {refreshingMasters ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
             </Button>
           ) : null}
         </header>
 
-        <div className="space-y-4 p-4 sm:p-5">
+        <div className="space-y-1 px-4 pb-4 sm:px-5">
           <ReviewWarnings warnings={scopeWarnings("tax")} />
-          <div className="rounded-xl border border-slate-200 bg-slate-50">
-            <div className="grid gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-center">
-              <div className="flex items-start gap-3">
-                <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-emerald-700" />
-                <div>
-                  <div className="text-xs font-semibold text-slate-900">
-                    {calculation?.taxMode === "cgst_sgst"
-                      ? "Intrastate purchase · CGST + SGST"
-                      : calculation?.taxMode === "igst"
-                        ? "Interstate purchase · IGST"
-                        : "Tax jurisdiction needs confirmation"}
-                  </div>
-                  <div className="mt-1 text-[11px] text-slate-500">
-                    Supplier: {stateLabel(calculation?.supplierStateCode)}
-                  </div>
-                </div>
-              </div>
-              <div className="sm:border-l sm:border-slate-200 sm:pl-4">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Buyer registration</div>
-                <div className="mt-1 text-xs font-semibold text-slate-800">{stateLabel(calculation?.buyerStateCode)}</div>
-              </div>
-              <div className="flex scroll-mt-24 items-center justify-between gap-3 sm:justify-end" id="field-gst-rate">
-                <div className="text-left sm:text-right">
-                  <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Confirmed GST rate</div>
-                  <div className={`mt-0.5 text-sm font-semibold ${review.gstRate ? "text-slate-900" : "text-rose-600"}`}>
-                    {review.gstRate ? `${review.gstRate}%` : "Missing"}
-                  </div>
-                </div>
-                {!locked ? (
-                  <Button onClick={() => setEditingGstRate((current) => !current)} size="sm" variant="ghost">
-                    {editingGstRate ? "Done" : "Change"}
-                  </Button>
-                ) : null}
-              </div>
+          <div className="border-b border-slate-100 py-2.5" id="field-gst-rate">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
+              <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-emerald-700" />
+              <strong className="text-slate-900">
+                {calculation?.taxMode === "cgst_sgst" ? "CGST + SGST" : calculation?.taxMode === "igst" ? "IGST" : "Tax mode missing"}
+              </strong>
+              <span className="text-slate-400">·</span>
+              <span className="text-slate-600">{stateLabel(calculation?.supplierStateCode)} → {stateLabel(calculation?.buyerStateCode)}</span>
+              <span className="text-slate-400">·</span>
+              <strong className={review.gstRate ? "text-slate-900" : "text-rose-600"}>{review.gstRate ? `${review.gstRate}% GST` : "GST rate missing"}</strong>
+              {!locked ? (
+                <button className="ml-auto font-semibold text-emerald-700 hover:text-emerald-900" onClick={() => setEditingGstRate((current) => !current)} type="button">
+                  {editingGstRate ? "Done" : "Edit"}
+                </button>
+              ) : null}
             </div>
             {editingGstRate ? (
-              <div className="border-t border-slate-200 bg-white px-4 py-3">
+              <div className="mt-2 border-t border-slate-100 pt-3">
                 <div className="max-w-xs">
                   <Field
                     id="field-gst-rate-input"
@@ -2115,96 +2057,83 @@ export function TallyPurchasePostingPanel({
             ) : null}
           </div>
 
-          <div className={`rounded-xl border p-4 ${review.applyTds194q ? "border-emerald-200 bg-emerald-50/60" : "border-slate-200 bg-white"}`}>
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-              <div>
-                <div className="text-sm font-semibold text-slate-950">Apply Section 194Q purchase TDS</div>
-                <p className="mt-1 max-w-2xl text-xs leading-5 text-slate-600">
-                  Turn this on only after confirming that your organisation meets the annual eligibility conditions. Kalika cannot decide that from one invoice.
-                </p>
-              </div>
-              <button
-                aria-checked={review.applyTds194q}
-                className={`relative h-6 w-11 shrink-0 rounded-full transition ${review.applyTds194q ? "bg-emerald-700" : "bg-slate-300"}`}
-                disabled={locked}
-                onClick={() => updateReview("applyTds194q", !review.applyTds194q)}
-                role="switch"
-                type="button"
-              >
-                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition ${review.applyTds194q ? "left-[22px]" : "left-0.5"}`} />
-              </button>
+          <div className="border-b border-slate-100">
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2 py-2.5">
+              <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
+                <button
+                  aria-checked={review.applyTds194q}
+                  className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.applyTds194q ? "bg-emerald-700" : "bg-slate-300"}`}
+                  disabled={locked || saving}
+                  onClick={() => void handleAdjustmentToggle("applyTds194q")}
+                  role="switch"
+                  type="button"
+                >
+                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.applyTds194q ? "left-[18px]" : "left-0.5"}`} />
+                </button>
+                194Q TDS
+              </label>
+              <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
+                <button
+                  aria-checked={review.applyTransportTds}
+                  className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.applyTransportTds ? "bg-emerald-700" : "bg-slate-300"}`}
+                  disabled={locked || saving}
+                  onClick={() => void handleAdjustmentToggle("applyTransportTds")}
+                  role="switch"
+                  type="button"
+                >
+                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.applyTransportTds ? "left-[18px]" : "left-0.5"}`} />
+                </button>
+                Transport TDS
+              </label>
+              <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
+                <button
+                  aria-checked={review.applyGstTds}
+                  className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.applyGstTds ? "bg-emerald-700" : "bg-slate-300"}`}
+                  disabled={locked || saving}
+                  onClick={() => void handleAdjustmentToggle("applyGstTds")}
+                  role="switch"
+                  type="button"
+                >
+                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.applyGstTds ? "left-[18px]" : "left-0.5"}`} />
+                </button>
+                {calculation?.taxMode === "cgst_sgst"
+                  ? "GST TDS (CGST + SGST)"
+                  : calculation?.taxMode === "igst"
+                    ? "GST TDS (IGST)"
+                    : "GST TDS"}
+              </label>
+              <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
+                <button
+                  aria-checked={review.tcsReceivable}
+                  className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.tcsReceivable ? "bg-emerald-700" : "bg-slate-300"}`}
+                  disabled={locked || saving}
+                  onClick={() => void handleAdjustmentToggle("tcsReceivable")}
+                  role="switch"
+                  type="button"
+                >
+                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.tcsReceivable ? "left-[18px]" : "left-0.5"}`} />
+                </button>
+                TCS Receivable
+              </label>
+              {review.applyTds194q ? (
+                <details className="group basis-full border-t border-slate-100 pt-2">
+                  <summary className="cursor-pointer list-none text-[10px] font-semibold text-slate-500 hover:text-slate-800">
+                    194Q basis and rounding <ChevronDown className="ml-1 inline h-3 w-3 transition group-open:rotate-180" />
+                  </summary>
+                  <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                    <Field compact disabled={locked} issues={scopeIssues("tax", ["TDS_194Q_BASIS_REQUIRED"])} label="Taxable basis" onChange={(value) => updateReview("tds194qBasisAmount", value)} sourceValue={calculation?.basicAmount} value={review.tds194qBasisAmount || calculation?.basicAmount || ""} />
+                    <Field compact disabled={locked} issues={scopeIssues("tax", ["TDS_194Q_RATE_REQUIRED"])} label="TDS rate %" onChange={(value) => updateReview("tds194qRate", value)} value={review.tds194qRate} />
+                    <label className="block text-[11px] font-medium text-slate-600">
+                      Rounding
+                      <select className={`${inputClass} mt-1 h-8 text-xs`} disabled={locked} onChange={(event) => updateReview("tds194qRounding", event.target.value as TallyPostingReview["tds194qRounding"])} value={review.tds194qRounding}>
+                        <option value="nearest_rupee">Nearest rupee</option>
+                        <option value="paise">Exact paise</option>
+                      </select>
+                    </label>
+                  </div>
+                </details>
+              ) : null}
             </div>
-            {review.applyTds194q ? (
-              <div className="mt-4 grid gap-3 border-t border-emerald-200 pt-4 sm:grid-cols-3">
-                <Field
-                  disabled={locked}
-                  issues={scopeIssues("tax", ["TDS_194Q_BASIS_REQUIRED"])}
-                  label="Taxable basis"
-                  onChange={(value) => updateReview("tds194qBasisAmount", value)}
-                  sourceValue={calculation?.basicAmount}
-                  value={review.tds194qBasisAmount || calculation?.basicAmount || ""}
-                />
-                <Field
-                  disabled={locked}
-                  issues={scopeIssues("tax", ["TDS_194Q_RATE_REQUIRED"])}
-                  label="TDS rate %"
-                  onChange={(value) => updateReview("tds194qRate", value)}
-                  value={review.tds194qRate}
-                />
-                <label className="block text-xs font-medium text-slate-700">
-                  Rounding
-                  <select className={`${inputClass} mt-1`} disabled={locked} onChange={(event) => updateReview("tds194qRounding", event.target.value as TallyPostingReview["tds194qRounding"])} value={review.tds194qRounding}>
-                    <option value="nearest_rupee">Nearest rupee</option>
-                    <option value="paise">Exact paise</option>
-                  </select>
-                </label>
-                <div className="sm:col-span-3 text-xs font-medium text-emerald-800">
-                  Preview: {review.tds194qRate}% on {money(String(tds194qBasisPreview))} = {money(String(tds194qAmountPreview))}
-                </div>
-              </div>
-            ) : null}
-          </div>
-
-          <div className={`rounded-xl border p-4 ${review.applyTransportTds ? "border-emerald-200 bg-emerald-50/60" : "border-slate-200 bg-white"}`}>
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-              <div>
-                <div className="text-sm font-semibold text-slate-950">Apply transporter TDS</div>
-                <p className="mt-1 max-w-2xl text-xs leading-5 text-slate-600">
-                  Turn this on when the invoice includes transporter TDS. Kalika will use the extracted invoice amount and selected Tally ledger.
-                </p>
-              </div>
-              <button
-                aria-checked={review.applyTransportTds}
-                className={`relative h-6 w-11 shrink-0 rounded-full transition ${review.applyTransportTds ? "bg-emerald-700" : "bg-slate-300"}`}
-                disabled={locked}
-                onClick={() => updateReview("applyTransportTds", !review.applyTransportTds)}
-                role="switch"
-                type="button"
-              >
-                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition ${review.applyTransportTds ? "left-[22px]" : "left-0.5"}`} />
-              </button>
-            </div>
-            {review.applyTransportTds ? (
-              <div className="mt-4 grid gap-3 border-t border-emerald-200 pt-4 sm:grid-cols-3">
-                <div className="text-xs text-emerald-800">
-                  <div className="font-semibold">Invoice amount</div>
-                  <div className="mt-1 text-sm font-semibold">{moneyOrMissing(payload.source?.invoiceTransportTdsAmount)}</div>
-                </div>
-                <Field
-                  id="field-transport-tds-rate-toggle"
-                  disabled={locked}
-                  issues={scopeIssues("tax", ["TRANSPORT_TDS_RATE_REQUIRED"])}
-                  label="TDS rate %"
-                  onChange={(value) => updateReview("transportTdsRate", value)}
-                  sourceValue={payload.source?.invoiceTransportTdsRate}
-                  value={review.transportTdsRate}
-                />
-                <MasterCombobox {...masterContext} id="field-transport-tds-ledger-toggle" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["TRANSPORT_TDS_LEDGER_REQUIRED"])} label="Transport TDS ledger" onChange={(value) => updateReview("transportTdsLedgerName", value)} options={transportTdsOptions} suggestedNames={transportTdsRanked.suggestedNames} value={review.transportTdsLedgerName} />
-                <div className="sm:col-span-3 text-xs font-medium text-emerald-800">
-                  Preview: {money(calculation?.transportTdsAmount)} will be deducted from the supplier payable.
-                </div>
-              </div>
-            ) : null}
           </div>
 
           {!calculationReady ? (
@@ -2223,8 +2152,20 @@ export function TallyPurchasePostingPanel({
               </Button>
             </div>
           ) : (
-            <>
-              <div className="overflow-x-auto rounded-xl border border-slate-200">
+            <div>
+              <div className="flex items-center justify-between gap-3 py-2.5 text-[11px]">
+                <span className="font-semibold text-slate-700">Ledger reconciliation</span>
+                <span className="ml-auto text-slate-500">
+                  Payable <strong className="text-slate-900">{money(String(liveCalculatedPayable))}</strong>
+                  {invoiceTotalKnown ? (
+                    <span className={`ml-2 font-semibold ${Math.abs(liveTotalDifference) > 1 ? "text-rose-600" : "text-emerald-700"}`}>
+                      Δ {money(String(liveTotalDifference))}
+                    </span>
+                  ) : null}
+                </span>
+              </div>
+              <div className="space-y-3 border-t border-slate-100">
+              <div className="overflow-x-auto">
                 <div className="min-w-[740px]">
                   <div className="grid grid-cols-[100px_105px_95px_100px_minmax(200px,1fr)_72px] items-center gap-2 bg-slate-50 px-3 py-2 text-[9px] font-semibold uppercase tracking-wide text-slate-500">
                     <div>Component</div>
@@ -2250,7 +2191,7 @@ export function TallyPurchasePostingPanel({
                       <Field id="field-freight-rate" disabled={locked} issues={scopeIssues("tax", ["FREIGHT_GST_RATE_REQUIRED"])} label="GST rate %" onChange={(value) => updateReview("freightGstRate", value)} sourceValue={payload.source?.invoiceFreightGstRate} value={review.freightGstRate} />
                       <div className="pt-1 text-xs text-slate-700">{moneyOrMissing(payload.source?.invoiceFreightAmount)}</div>
                       <Field disabled={locked} label="Freight amount" onChange={(value) => updateReview("freightAmount", value)} sourceValue={payload.source?.invoiceFreightAmount} value={review.freightAmount} />
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-freight-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["FREIGHT_LEDGER_REQUIRED"])} label="Freight ledger" onChange={(value) => updateReview("freightLedgerName", value)} options={freightOptions} suggestedNames={freightRanked.suggestedNames} value={review.freightLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-freight-ledger" disabled={masterSelectionDisabled} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["FREIGHT_LEDGER_REQUIRED"])} label="Freight ledger" onChange={(value) => updateReview("freightLedgerName", value)} options={freightOptions} suggestedNames={freightRanked.suggestedNames} value={review.freightLedgerName} />
                       <div className="pt-1 text-xs font-semibold text-slate-400">Charge</div>
                     </div>
                   ) : null}
@@ -2265,7 +2206,7 @@ export function TallyPurchasePostingPanel({
                         <div className="pt-1 text-xs text-slate-700">{money(calculation.gstTaxableAmount)}</div>
                         <div className={`pt-1 text-xs ${invoiceTaxKnown ? "text-slate-700" : "font-medium text-amber-700"}`}>{moneyOrMissing(cgstInvoiceAmount)}</div>
                         <div className="pt-1 text-xs font-semibold text-slate-900">{money(calculation.cgstAmount)}</div>
-                        <MasterCombobox {...masterContext} compact hideLabel id="field-cgst-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["CGST_LEDGER_REQUIRED"])} label="CGST purchase ledger" onChange={(value) => updateReview("cgstLedgerName", value)} options={cgstOptions} suggestedNames={cgstRanked.suggestedNames} value={review.cgstLedgerName} />
+                        <MasterCombobox {...masterContext} compact hideLabel id="field-cgst-ledger" disabled={masterSelectionDisabled} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["CGST_LEDGER_REQUIRED"])} label="CGST purchase ledger" onChange={(value) => updateReview("cgstLedgerName", value)} options={cgstOptions} suggestedNames={cgstRanked.suggestedNames} value={review.cgstLedgerName} />
                         <div className={`pt-1 text-xs font-semibold ${invoiceTaxKnown && Math.abs(Number(numericDifference(cgstInvoiceAmount, calculation.cgstAmount))) > 1 ? "text-rose-600" : invoiceTaxKnown ? "text-emerald-700" : "text-slate-400"}`}>
                           {invoiceTaxKnown ? money(numericDifference(cgstInvoiceAmount, calculation.cgstAmount)) : "—"}
                         </div>
@@ -2278,7 +2219,7 @@ export function TallyPurchasePostingPanel({
                         <div className="pt-1 text-xs text-slate-700">{money(calculation.gstTaxableAmount)}</div>
                         <div className={`pt-1 text-xs ${invoiceTaxKnown ? "text-slate-700" : "font-medium text-amber-700"}`}>{moneyOrMissing(sgstInvoiceAmount)}</div>
                         <div className="pt-1 text-xs font-semibold text-slate-900">{money(calculation.sgstAmount)}</div>
-                        <MasterCombobox {...masterContext} compact hideLabel id="field-sgst-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["SGST_LEDGER_REQUIRED"])} label="SGST purchase ledger" onChange={(value) => updateReview("sgstLedgerName", value)} options={sgstOptions} suggestedNames={sgstRanked.suggestedNames} value={review.sgstLedgerName} />
+                        <MasterCombobox {...masterContext} compact hideLabel id="field-sgst-ledger" disabled={masterSelectionDisabled} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["SGST_LEDGER_REQUIRED"])} label="SGST purchase ledger" onChange={(value) => updateReview("sgstLedgerName", value)} options={sgstOptions} suggestedNames={sgstRanked.suggestedNames} value={review.sgstLedgerName} />
                         <div className={`pt-1 text-xs font-semibold ${invoiceTaxKnown && Math.abs(Number(numericDifference(sgstInvoiceAmount, calculation.sgstAmount))) > 1 ? "text-rose-600" : invoiceTaxKnown ? "text-emerald-700" : "text-slate-400"}`}>
                           {invoiceTaxKnown ? money(numericDifference(sgstInvoiceAmount, calculation.sgstAmount)) : "—"}
                         </div>
@@ -2293,7 +2234,7 @@ export function TallyPurchasePostingPanel({
                       <div className="pt-1 text-xs text-slate-700">{money(calculation?.gstTaxableAmount)}</div>
                       <div className={`pt-1 text-xs ${invoiceTaxKnown ? "text-slate-700" : "font-medium text-amber-700"}`}>{moneyOrMissing(igstInvoiceAmount)}</div>
                       <div className="pt-1 text-xs font-semibold text-slate-900">{money(calculation?.igstAmount)}</div>
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-igst-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["IGST_LEDGER_REQUIRED"])} label="IGST purchase ledger" onChange={(value) => updateReview("igstLedgerName", value)} options={igstOptions} suggestedNames={igstRanked.suggestedNames} value={review.igstLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-igst-ledger" disabled={masterSelectionDisabled} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["IGST_LEDGER_REQUIRED"])} label="IGST purchase ledger" onChange={(value) => updateReview("igstLedgerName", value)} options={igstOptions} suggestedNames={igstRanked.suggestedNames} value={review.igstLedgerName} />
                       <div className={`pt-1 text-xs font-semibold ${invoiceTaxKnown && Math.abs(Number(numericDifference(igstInvoiceAmount, calculation?.igstAmount))) > 1 ? "text-rose-600" : invoiceTaxKnown ? "text-emerald-700" : "text-slate-400"}`}>
                         {invoiceTaxKnown ? money(numericDifference(igstInvoiceAmount, calculation?.igstAmount)) : "—"}
                       </div>
@@ -2322,7 +2263,7 @@ export function TallyPurchasePostingPanel({
                       <div className="text-[11px] font-medium leading-4 text-slate-500">Reviewer confirmed</div>
                       <div className="pt-1 text-xs text-slate-700">{money(String(tds194qBasisPreview))}</div>
                       <div className="pt-1 text-xs font-semibold text-slate-900">{money(String(tds194qAmountPreview))}</div>
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-tds-194q-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["TDS_194Q_LEDGER_REQUIRED"])} label="Purchase TDS ledger" onChange={(value) => updateReview("tds194qLedgerName", value)} options={tds194qOptions} suggestedNames={tds194qRanked.suggestedNames} value={review.tds194qLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-tds-194q-ledger" disabled={masterSelectionDisabled} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["TDS_194Q_LEDGER_REQUIRED"])} label="Purchase TDS ledger" onChange={(value) => updateReview("tds194qLedgerName", value)} options={tds194qOptions} suggestedNames={tds194qRanked.suggestedNames} value={review.tds194qLedgerName} />
                       <div className="pt-1 text-[10px] font-semibold text-emerald-700">Enabled</div>
                     </div>
                   ) : null}
@@ -2338,7 +2279,7 @@ export function TallyPurchasePostingPanel({
                           <div className="pt-1 text-[11px] font-medium text-slate-500">{calculation?.gstTdsAutomatic ? `Scrap basis ${money(calculation.gstTdsBasisAmount)}` : "Confirmed on invoice"}</div>
                           <div className="pt-1 text-xs text-slate-700">{calculation?.gstTdsAutomatic ? "Automatic" : moneyOrMissing(payload.source?.invoiceCgstTdsAmount)}</div>
                           <div className="text-xs font-semibold text-slate-900">{money(calculation?.cgstTdsAmount)}</div>
-                          <MasterCombobox {...masterContext} compact hideLabel id="field-cgst-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["CGST_TDS_LEDGER_REQUIRED"])} label="CGST TDS ledger" onChange={(value) => updateReview("cgstTdsLedgerName", value)} options={cgstTdsOptions} suggestedNames={cgstTdsRanked.suggestedNames} value={review.cgstTdsLedgerName} />
+                          <MasterCombobox {...masterContext} compact hideLabel id="field-cgst-tds-ledger" disabled={masterSelectionDisabled} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["CGST_TDS_LEDGER_REQUIRED"])} label="CGST TDS ledger" onChange={(value) => updateReview("cgstTdsLedgerName", value)} options={cgstTdsOptions} suggestedNames={cgstTdsRanked.suggestedNames} value={review.cgstTdsLedgerName} />
                           <div className={`pt-1 text-xs font-semibold ${invoiceCgstTdsKnown && Math.abs(Number(numericDifference(payload.source?.invoiceCgstTdsAmount, calculation?.cgstTdsAmount))) > 1 ? "text-rose-600" : invoiceCgstTdsKnown ? "text-emerald-700" : "text-slate-400"}`}>
                             {invoiceCgstTdsKnown ? money(numericDifference(payload.source?.invoiceCgstTdsAmount, calculation?.cgstTdsAmount)) : "—"}
                           </div>
@@ -2353,7 +2294,7 @@ export function TallyPurchasePostingPanel({
                           <div className="pt-1 text-[11px] font-medium text-slate-500">{calculation?.gstTdsAutomatic ? `Scrap basis ${money(calculation.gstTdsBasisAmount)}` : "Confirmed on invoice"}</div>
                           <div className="pt-1 text-xs text-slate-700">{calculation?.gstTdsAutomatic ? "Automatic" : moneyOrMissing(payload.source?.invoiceSgstTdsAmount)}</div>
                           <div className="pt-1 text-xs font-semibold text-slate-900">{money(calculation?.sgstTdsAmount)}</div>
-                          <MasterCombobox {...masterContext} compact hideLabel id="field-sgst-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["SGST_TDS_LEDGER_REQUIRED"])} label="SGST TDS ledger" onChange={(value) => updateReview("sgstTdsLedgerName", value)} options={sgstTdsOptions} suggestedNames={sgstTdsRanked.suggestedNames} value={review.sgstTdsLedgerName} />
+                          <MasterCombobox {...masterContext} compact hideLabel id="field-sgst-tds-ledger" disabled={masterSelectionDisabled} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["SGST_TDS_LEDGER_REQUIRED"])} label="SGST TDS ledger" onChange={(value) => updateReview("sgstTdsLedgerName", value)} options={sgstTdsOptions} suggestedNames={sgstTdsRanked.suggestedNames} value={review.sgstTdsLedgerName} />
                           <div className={`pt-1 text-xs font-semibold ${invoiceSgstTdsKnown && Math.abs(Number(numericDifference(payload.source?.invoiceSgstTdsAmount, calculation?.sgstTdsAmount))) > 1 ? "text-rose-600" : invoiceSgstTdsKnown ? "text-emerald-700" : "text-slate-400"}`}>
                             {invoiceSgstTdsKnown ? money(numericDifference(payload.source?.invoiceSgstTdsAmount, calculation?.sgstTdsAmount)) : "—"}
                           </div>
@@ -2369,7 +2310,7 @@ export function TallyPurchasePostingPanel({
                       <div className="pt-1 text-[11px] font-medium text-slate-500">{calculation?.gstTdsAutomatic ? `Scrap basis ${money(calculation.gstTdsBasisAmount)}` : "Confirmed on invoice"}</div>
                       <div className="pt-1 text-xs text-slate-700">{calculation?.gstTdsAutomatic ? "Automatic" : moneyOrMissing(payload.source?.invoiceIgstTdsAmount)}</div>
                       <div className="text-xs font-semibold text-slate-900">{money(calculation?.igstTdsAmount)}</div>
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-igst-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["IGST_TDS_LEDGER_REQUIRED"])} label="IGST TDS ledger" onChange={(value) => updateReview("igstTdsLedgerName", value)} options={igstTdsOptions} suggestedNames={igstTdsRanked.suggestedNames} value={review.igstTdsLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-igst-tds-ledger" disabled={masterSelectionDisabled} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["IGST_TDS_LEDGER_REQUIRED"])} label="IGST TDS ledger" onChange={(value) => updateReview("igstTdsLedgerName", value)} options={igstTdsOptions} suggestedNames={igstTdsRanked.suggestedNames} value={review.igstTdsLedgerName} />
                       <div className={`pt-1 text-xs font-semibold ${invoiceIgstTdsKnown && Math.abs(Number(numericDifference(payload.source?.invoiceIgstTdsAmount, calculation?.igstTdsAmount))) > 1 ? "text-rose-600" : invoiceIgstTdsKnown ? "text-emerald-700" : "text-slate-400"}`}>
                         {invoiceIgstTdsKnown ? money(numericDifference(payload.source?.invoiceIgstTdsAmount, calculation?.igstTdsAmount)) : "—"}
                       </div>
@@ -2382,7 +2323,7 @@ export function TallyPurchasePostingPanel({
                       <div className="pt-1 text-xs text-slate-700">{money(calculation?.freightAmount)}</div>
                       <div className="pt-1 text-xs text-slate-700">{moneyOrMissing(payload.source?.invoiceTransportTdsAmount)}</div>
                       <Field id="field-transport-tds-rate" disabled={locked} issues={scopeIssues("tax", ["TRANSPORT_TDS_RATE_REQUIRED"])} label={`Calculated ${money(calculation?.transportTdsAmount)} · rate %`} onChange={(value) => updateReview("transportTdsRate", value)} sourceValue={payload.source?.invoiceTransportTdsRate} value={review.transportTdsRate} />
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-transport-tds-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["TRANSPORT_TDS_LEDGER_REQUIRED"])} label="Transport TDS ledger" onChange={(value) => updateReview("transportTdsLedgerName", value)} options={transportTdsOptions} suggestedNames={transportTdsRanked.suggestedNames} value={review.transportTdsLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-transport-tds-ledger" disabled={masterSelectionDisabled} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["TRANSPORT_TDS_LEDGER_REQUIRED"])} label="Transport TDS ledger" onChange={(value) => updateReview("transportTdsLedgerName", value)} options={transportTdsOptions} suggestedNames={transportTdsRanked.suggestedNames} value={review.transportTdsLedgerName} />
                       <div className="pt-1 text-xs font-semibold text-slate-400">Deduction</div>
                     </div>
                   ) : null}
@@ -2393,7 +2334,7 @@ export function TallyPurchasePostingPanel({
                       <div className="pt-1 text-xs text-slate-400">Adjustment</div>
                       <div className={`pt-1 text-xs ${invoiceTcsKnown ? "text-slate-700" : "font-medium text-amber-700"}`}>{moneyOrMissing(payload.source?.invoiceTcsAmount)}</div>
                       <Field compact hideLabel id="field-tcs-amount" disabled={locked} issues={scopeIssues("tax", ["TCS_AMOUNT_REQUIRED"])} label="Confirmed TCS amount" onChange={(value) => updateReview("tcsAmount", value)} sourceValue={payload.source?.invoiceTcsAmount} value={review.tcsAmount} />
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-tcs-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["TCS_LEDGER_REQUIRED"])} label="TCS Receivable ledger" onChange={(value) => updateReview("tcsLedgerName", value)} options={tcsOptions} suggestedNames={tcsRanked.suggestedNames} value={review.tcsLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-tcs-ledger" disabled={masterSelectionDisabled} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["TCS_LEDGER_REQUIRED"])} label="TCS Receivable ledger" onChange={(value) => updateReview("tcsLedgerName", value)} options={tcsOptions} suggestedNames={tcsRanked.suggestedNames} value={review.tcsLedgerName} />
                       <div className={`pt-1 text-xs font-semibold ${invoiceTcsKnown && Math.abs(Number(numericDifference(payload.source?.invoiceTcsAmount, review.tcsAmount))) > 1 ? "text-rose-600" : invoiceTcsKnown ? "text-emerald-700" : "text-slate-400"}`}>
                         {invoiceTcsKnown ? money(numericDifference(payload.source?.invoiceTcsAmount, review.tcsAmount)) : "—"}
                       </div>
@@ -2406,25 +2347,13 @@ export function TallyPurchasePostingPanel({
                       <div className="pt-1 text-xs text-slate-400">After tax</div>
                       <div className={`pt-1 text-xs ${invoiceRoundOffKnown ? "text-slate-700" : "font-medium text-amber-700"}`}>{moneyOrMissing(payload.source?.invoiceRoundOffAmount)}</div>
                       <Field compact hideLabel disabled={locked} label="Confirmed round-off amount" onChange={(value) => updateReview("roundOffAmount", value)} sourceValue={payload.source?.invoiceRoundOffAmount} value={review.roundOffAmount} />
-                      <MasterCombobox {...masterContext} compact hideLabel id="field-round-off-ledger" disabled={locked || mastersNeedSync} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["ROUND_OFF_LEDGER_REQUIRED"])} label="Round-off ledger" onChange={(value) => updateReview("roundOffLedgerName", value)} options={roundOffOptions} suggestedNames={roundOffRanked.suggestedNames} value={review.roundOffLedgerName} />
+                      <MasterCombobox {...masterContext} compact hideLabel id="field-round-off-ledger" disabled={masterSelectionDisabled} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["ROUND_OFF_LEDGER_REQUIRED"])} label="Round-off ledger" onChange={(value) => updateReview("roundOffLedgerName", value)} options={roundOffOptions} suggestedNames={roundOffRanked.suggestedNames} value={review.roundOffLedgerName} />
                       <div className={`pt-1 text-xs font-semibold ${invoiceRoundOffKnown && Math.abs(Number(numericDifference(payload.source?.invoiceRoundOffAmount, review.roundOffAmount))) > 1 ? "text-rose-600" : invoiceRoundOffKnown ? "text-emerald-700" : "text-slate-400"}`}>
                         {invoiceRoundOffKnown ? money(numericDifference(payload.source?.invoiceRoundOffAmount, review.roundOffAmount)) : "—"}
                       </div>
                     </div>
                   ) : null}
                 </div>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  disabled={locked}
-                  onClick={() => updateReview("tcsReceivable", !review.tcsReceivable)}
-                  size="sm"
-                  variant="outline"
-                >
-                  {review.tcsReceivable ? "Remove TCS Receivable" : "Add TCS Receivable"}
-                </Button>
-                <span className="text-[11px] text-slate-500">Optional adjustments are shown only when they apply.</span>
               </div>
 
               <div className="rounded-xl border border-[#e5ddd0] bg-[#f5f0e8] px-3.5 py-3 text-slate-900">
@@ -2471,24 +2400,16 @@ export function TallyPurchasePostingPanel({
                   </div>
                 </div>
               </div>
-            </>
+              </div>
+            </div>
           )}
         </div>
       </section>
 
       <section className="scroll-mt-24 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" id="tally-preview">
-        <header className="flex flex-col gap-3 border-b border-slate-100 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
-          <div className="flex items-start gap-3">
-            <div className="rounded-lg bg-emerald-50 p-2 text-emerald-700">
-              <FileCheck2 className="h-5 w-5" />
-            </div>
-            <div>
-              <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-emerald-700">Step 4</div>
-              <h3 className="mt-0.5 font-semibold text-slate-950">Confirm the Purchase voucher</h3>
-              <p className="mt-0.5 text-xs leading-5 text-slate-500">Review the Purchase voucher that will be sent to Tally.</p>
-            </div>
-          </div>
-          <div className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold ${
+        <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2.5 sm:px-5">
+          <h3 className="text-sm font-semibold text-slate-950">Confirm Purchase voucher</h3>
+          <div className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-semibold ${
             correctionBlockers.length > 0
               ? "border-rose-200 bg-rose-50 text-rose-700"
               : hasUnsavedChanges
@@ -2617,235 +2538,29 @@ export function TallyPurchasePostingPanel({
           </div>
         </div>
 
-        <details className="group border-b border-slate-100">
-          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 sm:px-5">
-            <span>View detailed accounting breakdown</span>
-            <ChevronDown className="h-4 w-4 transition group-open:rotate-180" />
-          </summary>
-          <div className="grid border-t border-slate-100 lg:grid-cols-[minmax(0,1fr)_280px]">
-          <div className="min-w-0">
-            <div className="flex flex-col gap-3 border-b border-slate-100 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
-              <div className="min-w-0">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Voucher destination</div>
-                <div className="mt-1 flex min-w-0 items-center gap-2 text-sm font-semibold text-slate-950">
-                  <span>Purchase</span>
-                  <ArrowRight className="h-4 w-4 shrink-0 text-emerald-600" />
-                  <span className="truncate">{connection?.companyName || "Select a Tally company"}</span>
-                </div>
-              </div>
-              <div className="text-left sm:text-right">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Supplier invoice</div>
-                <div className="mt-1 text-sm font-semibold text-slate-950">{review.invoiceNumber || "Missing invoice number"}</div>
-                <div className="mt-0.5 text-[10px] text-slate-400">
-                  Invoice {review.invoiceDate || "date missing"} · Voucher {review.voucherDate || "date missing"}
-                </div>
-              </div>
-            </div>
-
-            <div className="border-b border-slate-100 px-4 py-4 sm:px-5">
-              <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Supplier account</div>
-              <div className="mt-1 flex flex-col gap-1 sm:flex-row sm:items-baseline sm:justify-between sm:gap-4">
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-semibold text-slate-950">{review.supplierLedgerName || "Supplier ledger not selected"}</div>
-                  <div className="mt-0.5 truncate text-[11px] text-slate-500">{review.supplierName || "Supplier name missing"} · {review.supplierGstin || "GSTIN missing"}</div>
-                </div>
-                <div className="shrink-0 text-[10px] font-medium text-emerald-700">From {connection?.companyName || "Tally"}</div>
-              </div>
-            </div>
-
-            <div className="px-4 py-4 sm:px-5">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <h4 className="text-sm font-semibold text-slate-950">Items and accounting mappings</h4>
-                  <p className="mt-0.5 text-[11px] text-slate-500">Invoice item → stock item → purchase ledger</p>
-                </div>
-                <span className="text-xs font-semibold text-slate-400">{review.lines.length} item{review.lines.length === 1 ? "" : "s"}</span>
-              </div>
-              {review.lines.length > 0 ? (
-                <div className="mt-3 overflow-hidden rounded-xl border border-slate-200">
-                  <div className="hidden grid-cols-[minmax(0,1.15fr)_minmax(0,0.75fr)_minmax(0,1fr)_90px] gap-2 bg-slate-50 px-3 py-2 text-[9px] font-semibold uppercase tracking-wide text-slate-400 sm:grid">
-                    <div>Invoice item</div>
-                    <div>Stock item</div>
-                    <div>Purchase ledger</div>
-                    <div className="text-right">Taxable</div>
-                  </div>
-                  {review.lines.map((line) => (
-                    <div className="grid grid-cols-[minmax(0,1fr)_90px] gap-x-3 gap-y-2 border-t border-slate-100 px-3 py-2.5 text-[11px] sm:grid-cols-[minmax(0,1.15fr)_minmax(0,0.75fr)_minmax(0,1fr)_90px] sm:gap-2" key={line.lineId}>
-                      <div className="col-start-1 row-start-1 min-w-0 sm:col-auto sm:row-auto">
-                        <div className="break-words font-semibold leading-4 text-slate-900">{line.description || "Description missing"}</div>
-                        <div className="mt-0.5 break-words text-[9px] leading-4 text-slate-400">HSN {line.hsn || "missing"} · {line.quantity || "0"} {line.unit}</div>
-                      </div>
-                      <div className={`col-start-1 row-start-2 min-w-0 break-words leading-4 sm:col-auto sm:row-auto ${line.stockItemName ? "font-medium text-slate-800" : "font-medium text-rose-600"}`}>
-                        <span className="mr-1 text-[8px] font-semibold uppercase tracking-wide text-slate-400 sm:hidden">Stock:</span>
-                        {line.stockItemName || "Not mapped"}
-                      </div>
-                      <div className={`col-start-1 row-start-3 min-w-0 break-words leading-4 sm:col-auto sm:row-auto ${line.purchaseLedgerName ? "font-medium text-slate-800" : "font-medium text-rose-600"}`}>
-                        <span className="mr-1 text-[8px] font-semibold uppercase tracking-wide text-slate-400 sm:hidden">Ledger:</span>
-                        {line.purchaseLedgerName || "Not mapped"}
-                      </div>
-                      <div className="col-start-2 row-start-1 whitespace-nowrap text-right font-semibold text-slate-900 sm:col-auto sm:row-auto">{money(line.taxableAmount)}</div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <button
-                  className="mt-3 flex w-full items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-left"
-                  onClick={() => document.getElementById("tally-items")?.scrollIntoView({ behavior: "smooth", block: "start" })}
-                  type="button"
-                >
-                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-700" />
-                  <span>
-                    <span className="block text-xs font-semibold text-amber-950">No invoice items are ready</span>
-                    <span className="mt-0.5 block text-[11px] text-amber-800">Complete the item details and mappings in Step 2.</span>
-                  </span>
-                </button>
-              )}
-            </div>
-
-            <div className="border-t border-slate-100 px-4 py-4 sm:px-5">
-              <h4 className="text-sm font-semibold text-slate-950">Taxes and adjustments</h4>
-              <div className="mt-3 divide-y divide-slate-100 rounded-xl border border-slate-200">
-                {[
-                  Number(payload.calculation?.freightAmount || 0)
-                    ? ["Freight inward", review.freightLedgerName, payload.calculation?.freightAmount]
-                    : null,
-                  payload.calculation?.taxMode === "cgst_sgst"
-                    ? ["Input CGST", review.cgstLedgerName, payload.calculation.cgstAmount]
-                    : ["Input IGST", review.igstLedgerName, payload.calculation?.igstAmount],
-                  payload.calculation?.taxMode === "cgst_sgst"
-                    ? ["Input SGST", review.sgstLedgerName, payload.calculation.sgstAmount]
-                    : null,
-                  review.applyTds194q
-                    ? ["Purchase TDS", review.tds194qLedgerName, payload.calculation?.tds194qAmount]
-                    : null,
-                  review.applyTransportTds
-                    ? ["Transport TDS", review.transportTdsLedgerName, payload.calculation?.transportTdsAmount]
-                    : null,
-                  Number(payload.calculation?.cgstTdsAmount || 0)
-                    ? ["CGST TDS", review.cgstTdsLedgerName, payload.calculation?.cgstTdsAmount]
-                    : null,
-                  Number(payload.calculation?.sgstTdsAmount || 0)
-                    ? ["SGST TDS", review.sgstTdsLedgerName, payload.calculation?.sgstTdsAmount]
-                    : null,
-                  Number(payload.calculation?.igstTdsAmount || 0)
-                    ? ["IGST TDS", review.igstTdsLedgerName, payload.calculation?.igstTdsAmount]
-                    : null,
-                  review.tcsReceivable
-                    ? ["TCS Receivable", review.tcsLedgerName, String(liveTcsAmount)]
-                    : null,
-                  Number(payload.calculation?.roundOffAmount || 0)
-                    ? ["Round-off", review.roundOffLedgerName, payload.calculation?.roundOffAmount]
-                    : null,
-                ].filter(Boolean).map((entry) => {
-                  const [label, ledger, amount] = entry as [string, string, string | undefined];
-                  return (
-                    <div className="grid grid-cols-[110px_minmax(0,1fr)_90px] items-center gap-3 px-3 py-2.5 text-xs" key={label}>
-                      <span className="font-medium text-slate-500">{label}</span>
-                      <span className={`truncate font-medium ${ledger ? "text-slate-800" : "text-rose-600"}`}>{ledger || "Ledger not selected"}</span>
-                      <span className="text-right font-semibold text-slate-900">{money(amount)}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
+        <div className="flex flex-col gap-2 border-t border-slate-100 px-4 py-3 sm:flex-row sm:items-center sm:px-5">
+          <div className={`flex shrink-0 items-center gap-1.5 text-[11px] font-semibold ${
+            payload.sourceFileId ? "text-emerald-700" : "text-rose-700"
+          }`}>
+            {payload.sourceFileId ? <FileCheck2 className="h-3.5 w-3.5" /> : <AlertTriangle className="h-3.5 w-3.5" />}
+            <span>{payload.sourceFileId ? "Invoice PDF attached" : "Invoice PDF missing"}</span>
+            <button
+              className="ml-1 text-slate-500 underline decoration-slate-300 underline-offset-2 hover:text-slate-900 disabled:no-underline disabled:opacity-40"
+              disabled={!payload.sourceFileId}
+              onClick={() => void handleOpenSource()}
+              type="button"
+            >
+              Open
+            </button>
           </div>
-
-          <aside className="border-t border-slate-100 bg-slate-50/70 px-4 py-5 lg:border-l lg:border-t-0">
-            <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Amount payable</div>
-            <div className={`mt-1 text-2xl font-semibold tracking-tight ${
-              liveCalculatedPayable > 0 ? "text-slate-950" : "text-amber-700"
-            }`}>
-              {money(String(liveCalculatedPayable))}
-            </div>
-            {liveCalculatedPayable <= 0 ? (
-              <p className="mt-1 text-[11px] leading-4 text-amber-700">Complete the item values before this voucher can be approved.</p>
-            ) : null}
-            <div className="mt-5 space-y-2 text-xs">
-              {[
-                ["Basic value", payload.calculation?.basicAmount],
-                Number(payload.calculation?.freightAmount || 0)
-                  ? ["Freight", payload.calculation?.freightAmount]
-                  : null,
-                ["GST", payload.calculation?.gstAmount],
-                ["Total deductions", payload.calculation?.totalWithholdingAmount],
-                ["TCS", String(liveTcsAmount)],
-                Number(payload.calculation?.roundOffAmount || 0)
-                  ? ["Round-off", payload.calculation?.roundOffAmount]
-                  : null,
-              ].filter(Boolean).map((entry) => {
-                const [label, amount] = entry as [string, string | undefined];
-                return (
-                <div className="flex items-center justify-between gap-3" key={label}>
-                  <span className="text-slate-500">{label}</span>
-                  <span className="font-semibold text-slate-900">{money(amount)}</span>
-                </div>
-                );
-              })}
-            </div>
-            <div className="mt-5 border-t border-slate-200 pt-4">
-              <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">Invoice comparison</div>
-              <div className="mt-2 flex items-center justify-between gap-3 text-xs">
-                <span className="text-slate-500">Invoice payable</span>
-                <span className="font-semibold text-slate-900">{money(payload.calculation?.invoiceTotal)}</span>
-              </div>
-              <div className="mt-2 flex items-center justify-between gap-3 text-xs">
-                <span className="text-slate-500">Difference</span>
-                <span className={`font-semibold ${
-                  Math.abs(liveTotalDifference) > 1 ? "text-rose-600" : "text-emerald-700"
-                }`}>{money(String(liveTotalDifference))}</span>
-              </div>
-            </div>
-          </aside>
-        </div>
-        </details>
-
-        <div className="grid border-t border-slate-100 lg:grid-cols-2">
-          <div className="p-4 sm:p-5 lg:border-r lg:border-slate-100">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <h4 className="text-sm font-semibold text-slate-950">Original invoice</h4>
-                <p className="mt-0.5 text-[11px] text-slate-500">The source PDF travels with this accounting approval.</p>
-              </div>
-              <Button disabled={!payload.sourceFileId} onClick={() => void handleOpenSource()} size="sm" variant="outline">
-                <ExternalLink className="h-3.5 w-3.5" /> Open
-              </Button>
-            </div>
-            <div className={`mt-3 flex items-start gap-3 rounded-xl border p-3 ${
-              payload.sourceFileId
-                ? "border-emerald-200 bg-emerald-50"
-                : "border-rose-200 bg-rose-50"
-            }`}>
-              {payload.sourceFileId ? (
-                <FileCheck2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700" />
-              ) : (
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-700" />
-              )}
-              <span>
-                <span className={`block text-xs font-semibold ${
-                  payload.sourceFileId ? "text-emerald-950" : "text-rose-950"
-                }`}>
-                  {payload.posting?.status === "created"
-                    ? "PDF attached and verified"
-                    : payload.sourceFileId
-                      ? "PDF will be attached to the Tally voucher"
-                      : "Original invoice PDF unavailable"}
-                </span>
-                <span className={`mt-0.5 block text-[11px] leading-4 ${
-                  payload.sourceFileId ? "text-emerald-700" : "text-rose-700"
-                }`}>
-                  {payload.posting?.status === "created"
-                    ? "Tally returned the same document identity and checksum."
-                    : payload.sourceFileId
-                      ? "Kalika verifies the document identity after the voucher is created."
-                      : "Restore the source invoice before approving this voucher."}
-                </span>
-              </span>
-            </div>
-          </div>
-          <label className="block p-4 sm:p-5">
-            <span className="text-sm font-semibold text-slate-950">Voucher narration</span>
-            <span className="mt-0.5 block text-[11px] text-slate-500">Edit the description that will appear in Tally.</span>
-            <textarea className="mt-3 min-h-24 w-full rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm leading-5 outline-none transition focus:border-emerald-500 focus:bg-white focus:ring-2 focus:ring-emerald-100 disabled:text-slate-500" disabled={locked} onChange={(event) => updateReview("narration", event.target.value)} value={review.narration} />
+          <label className="flex min-w-0 flex-1 items-center gap-2 sm:ml-4">
+            <span className="shrink-0 text-[11px] font-semibold text-slate-500">Narration</span>
+            <input
+              className="h-8 min-w-0 flex-1 rounded-lg border border-slate-200 bg-slate-50 px-2.5 text-xs outline-none transition focus:border-emerald-500 focus:bg-white focus:ring-2 focus:ring-emerald-100 disabled:text-slate-500"
+              disabled={locked}
+              onChange={(event) => updateReview("narration", event.target.value)}
+              value={review.narration}
+            />
           </label>
         </div>
       </section>
@@ -2873,7 +2588,10 @@ export function TallyPurchasePostingPanel({
             {payload.posting?.status !== "created" ? (
               <>
                 <span>·</span>
-                <span>Tally voucher: <strong>{statusLabel(payload.posting?.status)}</strong></span>
+                <span>Tally voucher: <strong>{statusLabel(
+                  payload.posting?.status,
+                  payload.posting?.verificationResult?.verificationStatus
+                )}</strong></span>
               </>
             ) : null}
             {hasUnsavedChanges ? <Badge variant="outline" className="border-amber-200 bg-amber-50 text-amber-700">Unsaved</Badge> : null}
@@ -2907,14 +2625,18 @@ export function TallyPurchasePostingPanel({
                   className={canApprove ? "bg-emerald-700 text-white hover:bg-emerald-800" : "bg-slate-200 text-slate-500"}
                   disabled={!canApprove || queueing}
                   onClick={() => setConfirmOpen(true)}
-                  title={tallyReviewRefreshing ? "Wait for the latest Tally data to finish loading." : undefined}
+                  title={staleMastersBlocking ? "Refresh Tally data before approving this voucher." : undefined}
                 >
                   {tallyReviewRefreshing ? (
                     <Loader2 className="h-4 w-4 animate-spin" />
                   ) : (
                     <Send className="h-4 w-4" />
                   )}
-                  {tallyReviewRefreshing ? "Checking Tally data" : "Approve and send"}
+                  {tallyReviewRefreshing
+                    ? "Checking Tally data"
+                    : staleMastersBlocking
+                      ? "Refresh Tally data first"
+                      : "Approve and send"}
                 </Button>
               )}
             </div>
@@ -2944,11 +2666,33 @@ export function TallyPurchasePostingPanel({
               </div>
             ))}
           </div>
+          {acknowledgementWarnings.length > 0 ? (
+            <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-3">
+              <input
+                checked={warningsAcknowledged}
+                className="mt-0.5 h-4 w-4 rounded border-amber-300 accent-amber-700"
+                onChange={(event) => setWarningsAcknowledged(event.target.checked)}
+                type="checkbox"
+              />
+              <span className="min-w-0">
+                <span className="block text-xs font-semibold text-amber-950">
+                  Acknowledge {acknowledgementWarnings.length} validation warning{acknowledgementWarnings.length === 1 ? "" : "s"}
+                </span>
+                <span className="mt-1 block text-[11px] leading-4 text-amber-800">
+                  {acknowledgementWarnings.map((warning) => warning.label).join(" · ")}
+                </span>
+              </span>
+            </label>
+          ) : null}
           <DialogFooter>
             <Button disabled={queueing} onClick={() => setConfirmOpen(false)} variant="outline">Cancel</Button>
-            <Button className="bg-emerald-700 text-white hover:bg-emerald-800" disabled={queueing || tallyReviewRefreshing} onClick={() => void handleApproveAndQueue()}>
+            <Button className="bg-emerald-700 text-white hover:bg-emerald-800" disabled={queueing || tallyReviewRefreshing || staleMastersBlocking || (acknowledgementWarnings.length > 0 && !warningsAcknowledged)} onClick={() => void handleApproveAndQueue()}>
               {queueing || tallyReviewRefreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-              {tallyReviewRefreshing ? "Checking Tally data" : "Approve and send"}
+              {tallyReviewRefreshing
+                ? "Checking Tally data"
+                : staleMastersBlocking
+                  ? "Refresh Tally data first"
+                  : "Approve and send"}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -12,6 +12,7 @@ export type CashDiscountCustomerScope = {
 };
 
 type ScopeRow = {
+  company_name_key?: string;
   mode: CashDiscountCustomerScopeMode;
   selected_group_names: string[] | null;
   include_nested_groups: boolean;
@@ -120,6 +121,28 @@ export async function getCashDiscountCustomerScopeOrDefault(params: {
     }
     throw error;
   }
+}
+
+export async function getCashDiscountCustomerScopesByCompany(params: {
+  ownerUserId: string;
+  connectionId: string;
+}) {
+  const supabase = createSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("cash_discount_customer_scope_settings")
+    .select("company_name_key, mode, selected_group_names, include_nested_groups, detect_sales_linked_exceptions, excluded_group_names, excluded_ledger_names")
+    .eq("owner_user_id", params.ownerUserId)
+    .eq("connection_id", params.connectionId);
+  if (error) {
+    if (isCashDiscountCustomerScopeSchemaMissing(error)) return {};
+    throw error;
+  }
+  return Object.fromEntries(
+    ((data ?? []) as ScopeRow[]).flatMap((row) => {
+      const key = String(row.company_name_key ?? "").trim();
+      return key ? [[key, fromRow(row)] as const] : [];
+    })
+  );
 }
 
 export async function saveCashDiscountCustomerScope(params: {

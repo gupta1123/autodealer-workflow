@@ -1,15 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Check, Loader2, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { apiFetch } from "@/lib/api-client";
+import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
-import {
-  queueTallyMasterRefresh,
-  waitForTallyCommand,
-} from "@/lib/tally-purchase-posting";
 
 type Connection = { id: string; displayName?: string | null };
 type Company = { id: string; companyName: string };
@@ -126,7 +123,6 @@ export function PurchasePostingDefaultsSettings() {
   const [liveSummary, setLiveSummary] = useState("");
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<{ tone: "success" | "error"; text: string } | null>(null);
-  const automaticRefreshKey = useRef("");
 
   useEffect(() => {
     let cancelled = false;
@@ -169,41 +165,31 @@ export function PurchasePostingDefaultsSettings() {
     return () => { cancelled = true; };
   }, [connectionId]);
 
-  const refreshLiveMasters = useCallback(async (options?: { automatic?: boolean; cancelled?: () => boolean }) => {
+  const refreshLiveMasters = useCallback(async () => {
     if (!connectionId || !companyName) return;
-    const isCancelled = options?.cancelled ?? (() => false);
-    if (!isCancelled()) {
-      setRefreshing(true);
-      setNotice(null);
-      setLiveSummary("");
-    }
+    setRefreshing(true);
+    setNotice(null);
+    setLiveSummary("");
     try {
-      const queued = await queueTallyMasterRefresh(connectionId, companyName) as {
-        command?: { id?: string };
-      };
-      const commandId = queued.command?.id;
-      if (!commandId) throw new Error("Tally could not start the live master refresh.");
-      const completed = await waitForTallyCommand(connectionId, commandId, { attempts: 45, intervalMs: 1000 });
-      if (!completed) throw new Error("Tally is still reading company masters. Please refresh again.");
-      if (completed.status !== "succeeded") {
-        throw new Error(completed.error || "Tally could not read the company masters.");
-      }
-      const live = mastersFromLiveResult(completed.result);
+      const livePayload = await runCashDiscountLiveRequest<LivePurchaseMasterResult>({
+        connectionId,
+        companyName,
+        operation: "ledger_masters",
+        payload: { requestedMasterTypes: ["ledger", "group", "stock_item"] },
+      });
+      const live = mastersFromLiveResult(livePayload);
       if (!live) throw new Error("Tally returned no usable ledgers for this company.");
-      if (isCancelled()) return;
       setMasters(live.masters);
       const summary = `${live.ledgerCount} ledgers and ${live.stockItemCount} items loaded live from Tally`;
       setLiveSummary(summary);
-      if (!options?.automatic) setNotice({ tone: "success", text: summary + "." });
+      setNotice({ tone: "success", text: summary + "." });
     } catch (error) {
-      if (!isCancelled()) {
-        setNotice({
-          tone: "error",
-          text: `${error instanceof Error ? error.message : "Could not refresh live Tally masters."} Any last synced choices remain available below.`,
-        });
-      }
+      setNotice({
+        tone: "error",
+        text: `${error instanceof Error ? error.message : "Could not refresh live Tally masters."} Any last synced choices remain available below.`,
+      });
     } finally {
-      if (!isCancelled()) setRefreshing(false);
+      setRefreshing(false);
     }
   }, [companyName, connectionId]);
 
@@ -224,11 +210,13 @@ export function PurchasePostingDefaultsSettings() {
       const mastersPayload = await mastersResponse.json() as { masters?: Master[] };
       if (cancelled) return;
       setDefaults(defaultsPayload.defaults ?? {});
-      setMasters(mastersPayload.masters ?? []);
-      const refreshKey = `${connectionId}:${companyName.toLocaleLowerCase()}`;
-      if (automaticRefreshKey.current !== refreshKey) {
-        automaticRefreshKey.current = refreshKey;
-        await refreshLiveMasters({ automatic: true, cancelled: () => cancelled });
+      const cachedMasters = mastersPayload.masters ?? [];
+      setMasters(cachedMasters);
+      // A new company may not have a persisted snapshot yet. Populate the
+      // controls once through the direct live channel, never by queueing a
+      // background command and polling old command rows.
+      if (cachedMasters.length === 0) {
+        await refreshLiveMasters();
       }
     }).catch((error) => {
       if (!cancelled) setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not load Purchase defaults." });
@@ -290,7 +278,7 @@ export function PurchasePostingDefaultsSettings() {
         </div>
       </section>
 
-      {loading ? <div className="flex items-center justify-center rounded-lg border border-[#e8e5de] bg-white p-8 text-sm text-[#6b6a60]"><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading live Tally masters…</div> : SECTIONS.map((section) => (
+      {loading ? <div className="flex items-center justify-center rounded-lg border border-[#e8e5de] bg-white p-8 text-sm text-[#6b6a60]"><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading saved Tally masters…</div> : SECTIONS.map((section) => (
         <section className="rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5" key={section.title}>
           <h3 className="text-sm font-semibold text-[#20201c]">{section.title}</h3>
           <p className="mt-1 text-xs text-[#6b6a60]">{section.description}</p>

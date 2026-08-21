@@ -129,12 +129,14 @@ function prepare(document, options = {}) {
     documents: [document],
     masters: options.masters ?? completeMasters,
     mappings: options.mappings ?? [],
-    savedReview: options.savedReview ?? {
-      sourceReferenceApproved: true,
-      applyTds194q: Boolean(document.extracted_fields.tds194qAmount) &&
-        options.accountingSettings?.purchaseGoodsTdsEnabled !== false,
-      tds194qRounding: "paise",
-    },
+    savedReview: Object.prototype.hasOwnProperty.call(options, "savedReview")
+      ? options.savedReview
+      : {
+          sourceReferenceApproved: true,
+          applyTds194q: Boolean(document.extracted_fields.tds194qAmount) &&
+            options.accountingSettings?.purchaseGoodsTdsEnabled !== false,
+          tds194qRounding: "paise",
+        },
     caseStatus: "accepted",
     connectionReady: true,
     companyName: "Test Company",
@@ -172,6 +174,139 @@ test("72044900 maps to the combined client stock and Maharashtra purchase rules"
     .filter((entry) => entry.kind === "cgst_tds" || entry.kind === "sgst_tds")
     .every((entry) => entry.rate === "1"));
   assert.equal(result.blockers.length, 0);
+});
+
+test("reviewer can disable all applicable GST TDS deductions for a voucher", () => {
+  const document = invoiceDocument();
+  const result = prepare(document, {
+    savedReview: {
+      sourceReferenceApproved: true,
+      applyGstTds: false,
+    },
+  });
+
+  assert.equal(result.review.applyGstTds, false);
+  assert.equal(result.calculation.cgstTdsAmount, "0.00");
+  assert.equal(result.calculation.sgstTdsAmount, "0.00");
+  assert.equal(result.calculation.igstTdsAmount, "0.00");
+  assert.equal(
+    result.tallyPayload.withholdings.some((entry) =>
+      ["cgst_tds", "sgst_tds", "igst_tds"].includes(entry.kind)
+    ),
+    false
+  );
+});
+
+test("invoice evidence automatically selects every applicable purchase adjustment", () => {
+  const document = invoiceDocument({ totalAmount: "1157.00" });
+  document.extracted_fields.transportTdsAmount = "7.00";
+  document.extracted_fields.transportTdsRate = "1";
+  document.extracted_fields.tcsAmount = "5.00";
+
+  const result = prepare(document, { savedReview: null });
+
+  assert.equal(result.review.applyTds194q, true);
+  assert.equal(result.review.applyTransportTds, true);
+  assert.equal(result.review.applyGstTds, true);
+  assert.equal(result.review.tcsReceivable, true);
+  assert.equal(result.calculation.tds194qAmount, "1.00");
+  assert.equal(result.calculation.transportTdsAmount, "7.00");
+  assert.equal(result.calculation.cgstTdsAmount, "10.00");
+  assert.equal(result.calculation.sgstTdsAmount, "10.00");
+  assert.equal(result.calculation.tcsAmount, "5.00");
+  assert.deepEqual(
+    result.tallyPayload.withholdings.map((entry) => entry.kind).sort(),
+    ["cgst_tds", "sgst_tds", "tds_194q", "transport_tds"]
+  );
+  assert.deepEqual(result.tallyPayload.ledgers.tcs, {
+    name: "TCS Receivable",
+    amount: "5.00",
+  });
+  assert.equal(result.calculation.calculatedPayable, "1157.00");
+  assert.equal(result.blockers.length, 0);
+});
+
+test("manual switches remove and restore every optional adjustment in the Tally payload", () => {
+  const document = invoiceDocument({ totalAmount: "1157.00" });
+  document.extracted_fields.transportTdsAmount = "7.00";
+  document.extracted_fields.transportTdsRate = "1";
+  document.extracted_fields.tcsAmount = "5.00";
+  const detected = prepare(document, { savedReview: null });
+
+  const removed = prepare(document, {
+    savedReview: {
+      ...detected.review,
+      applyTds194q: false,
+      applyTransportTds: false,
+      applyGstTds: false,
+      tcsReceivable: false,
+    },
+  });
+  assert.equal(removed.calculation.tds194qAmount, "0.00");
+  assert.equal(removed.calculation.transportTdsAmount, "0.00");
+  assert.equal(removed.calculation.cgstTdsAmount, "0.00");
+  assert.equal(removed.calculation.sgstTdsAmount, "0.00");
+  assert.equal(removed.calculation.igstTdsAmount, "0.00");
+  assert.equal(removed.calculation.tcsAmount, "0.00");
+  assert.deepEqual(removed.tallyPayload.withholdings, []);
+  assert.equal(removed.tallyPayload.ledgers.tcs, null);
+
+  const restored = prepare(document, {
+    savedReview: {
+      ...removed.review,
+      applyTds194q: true,
+      applyTransportTds: true,
+      applyGstTds: true,
+      tcsReceivable: true,
+    },
+  });
+  assert.deepEqual(
+    restored.tallyPayload.withholdings.map((entry) => entry.kind).sort(),
+    ["cgst_tds", "sgst_tds", "tds_194q", "transport_tds"]
+  );
+  assert.equal(restored.tallyPayload.ledgers.tcs?.amount, "5.00");
+  assert.equal(restored.calculation.calculatedPayable, "1157.00");
+});
+
+test("enabled optional adjustments with no invoice amount do not block or create zero-value entries", () => {
+  const document = invoiceDocument({
+    hsn: "72031000",
+    buyerGstin: gujaratBuyerGstin,
+    totalAmount: "1180.00",
+    tdsAmount: "",
+  });
+  const result = prepare(document, {
+    companyGstin: gujaratBuyerGstin,
+    savedReview: {
+      sourceReferenceApproved: true,
+      applyTransportTds: true,
+      applyGstTds: true,
+      tcsReceivable: true,
+      tcsAmount: "",
+      tcsLedgerName: "",
+    },
+  });
+
+  assert.equal(result.calculation.transportTdsAmount, "0.00");
+  assert.equal(result.calculation.igstTdsAmount, "0.00");
+  assert.equal(result.calculation.tcsAmount, "0.00");
+  assert.equal(
+    result.blockers.some((entry) =>
+      ["TCS_AMOUNT_REQUIRED", "TCS_LEDGER_REQUIRED"].includes(entry.code)
+    ),
+    false
+  );
+  assert.equal(
+    result.tallyPayload.withholdings.some((entry) =>
+      ["transport_tds", "cgst_tds", "sgst_tds", "igst_tds"].includes(entry.kind)
+    ),
+    false
+  );
+  assert.equal(result.tallyPayload.ledgers.tcs, null);
+  assert.equal(
+    result.tallyPayload.charges.some((entry) => entry.kind === "tcs"),
+    false
+  );
 });
 
 test("live Tally metadata discovers non-client-specific purchase, GST, and withholding masters", () => {
@@ -463,7 +598,7 @@ test("freight is a separate charge, expands the GST basis, and has its own TDS",
   assert.equal(result.calculation.gstTaxableAmount, "1100.00");
   assert.equal(result.calculation.gstAmount, "198.00");
   assert.equal(result.calculation.transportTdsAmount, "1.00");
-  assert.equal(result.calculation.calculatedPayable, "1277.00");
+  assert.equal(result.calculation.calculatedPayable, "1276.00");
   assert.ok(result.tallyPayload.charges.some((entry) => entry.kind === "freight"));
   assert.ok(result.tallyPayload.withholdings.some((entry) => entry.kind === "transport_tds"));
   assert.equal(result.blockers.length, 0);
@@ -551,9 +686,21 @@ test("optional deductions and their prompts are omitted when organization rules 
   assert.ok(!result.warnings.some((warning) => warning.code.includes("TDS_DISABLED")));
 });
 
-test("unknown HSN, missing masters, and an existing duplicate block posting", () => {
+test("validation policy warns for unknown HSN while structural and duplicate checks block", () => {
   const unknown = prepare(invoiceDocument({ hsn: "99999999", totalAmount: "1180.00", tdsAmount: "" }));
-  assert.ok(unknown.blockers.some((blocker) => blocker.code === "HSN_MAPPING_REQUIRED"));
+  assert.ok(unknown.warnings.some((warning) =>
+    warning.code === "HSN_MAPPING_REQUIRED" && warning.requiresAcknowledgement
+  ));
+
+  const strictUnknown = prepare(invoiceDocument({ hsn: "99999999", totalAmount: "1180.00", tdsAmount: "" }), {
+    accountingSettings: {
+      purchaseGoodsTdsEnabled: true,
+      transporterTdsEnabled: true,
+      gstTdsEnabled: true,
+      validationPolicy: { hsnMissing: "block" },
+    },
+  });
+  assert.ok(strictUnknown.blockers.some((blocker) => blocker.code === "HSN_MAPPING_REQUIRED"));
 
   const missingMaster = prepare(invoiceDocument(), { masters: [] });
   assert.ok(missingMaster.blockers.some((blocker) => blocker.code === "STOCK_ITEM_REQUIRED"));
@@ -802,7 +949,7 @@ test("review persistence keeps only user changes and reconstructs the full revie
   assert.deepEqual(reconstructed.review, reviewed);
 });
 
-test("visible invoice date and TDS evidence do not enable 194Q without reviewer confirmation", () => {
+test("generic TDS evidence is not misclassified as Section 194Q", () => {
   const document = invoiceDocument({
     totalAmount: "1170.00",
     tdsAmount: "",
@@ -818,7 +965,9 @@ test("visible invoice date and TDS evidence do not enable 194Q without reviewer 
   const result = prepare(document, { savedReview: { sourceReferenceApproved: true } });
   assert.equal(result.review.invoiceDate, "2026-07-27");
   assert.equal(result.review.tds194qRate, "0.1");
-  assert.equal(result.source.invoiceTds194qAmount, "10.00");
+  assert.equal(result.source.invoiceTdsAmount, "10.00");
+  assert.equal(result.source.invoiceTds194qAmount, "");
+  assert.equal(result.review.applyTds194q, false);
   assert.equal(result.calculation.tds194qAmount, "0.00");
   assert.ok(!result.blockers.some((blocker) => blocker.code === "INVOICE_DATE_REQUIRED"));
 });
@@ -1004,7 +1153,7 @@ test("printed GST, 194Q, and GST TDS reconcile as separate deductions", () => {
   assert.equal(result.calculation.totalDifference, "0.00");
 });
 
-test("line arithmetic, stock HSN, and supplier GSTIN mismatches are blocked", () => {
+test("line arithmetic and supplier identity block while stock HSN follows warning policy", () => {
   const document = invoiceDocument();
   const initial = prepare(document);
   const mismatchedMasters = completeMasters.map((item) => {
@@ -1021,7 +1170,9 @@ test("line arithmetic, stock HSN, and supplier GSTIN mismatches are blocked", ()
     },
   });
   assert.ok(result.blockers.some((blocker) => blocker.code === "SUPPLIER_LEDGER_GSTIN_MISMATCH"));
-  assert.ok(result.blockers.some((blocker) => blocker.code === "STOCK_ITEM_HSN_MISMATCH"));
+  assert.ok(result.warnings.some((warning) =>
+    warning.code === "STOCK_ITEM_HSN_MISMATCH" && warning.requiresAcknowledgement
+  ));
   assert.ok(result.blockers.some((blocker) => blocker.code === "LINE_TAXABLE_MISMATCH"));
 });
 

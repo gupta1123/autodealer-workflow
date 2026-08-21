@@ -1,6 +1,6 @@
 {
   "name": "kalika-tally-connector-wrapper",
-  "version": "0.1.48",
+  "version": "0.1.52",
   "private": true,
   "type": "module",
   "main": "main.mjs",

@@ -2,13 +2,14 @@ import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
   getPurchaseAccountingSettings,
+  isCompletePurchaseValidationPolicy,
   isPurchaseAccountingSettingsSchemaMissing,
   savePurchaseAccountingSettings,
   type PurchaseAccountingSettings,
 } from "@/lib/purchase-accounting-settings";
 
 const MIGRATION_FILE =
-  "supabase/migrations/20260731160143_purchase_accounting_settings.sql";
+  "supabase/migrations/202608200001_purchase_validation_policy.sql";
 
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
@@ -39,10 +40,12 @@ function parseSettings(input: unknown): PurchaseAccountingSettings | null {
     "gstTdsEnabled",
   ] as const;
   if (keys.some((key) => typeof record[key] !== "boolean")) return null;
+  if (!isCompletePurchaseValidationPolicy(record.validationPolicy)) return null;
   return {
     purchaseGoodsTdsEnabled: record.purchaseGoodsTdsEnabled as boolean,
     transporterTdsEnabled: record.transporterTdsEnabled as boolean,
     gstTdsEnabled: record.gstTdsEnabled as boolean,
+    validationPolicy: record.validationPolicy,
   };
 }
 
@@ -76,7 +79,7 @@ export async function PUT(request: Request) {
     if (!settings) {
       return jsonWithCors(
         request,
-        { error: "All purchase accounting settings must be true or false." },
+        { error: "Purchase accounting switches and every validation severity are required." },
         { status: 400 }
       );
     }

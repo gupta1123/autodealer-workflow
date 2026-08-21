@@ -2,6 +2,11 @@ import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { hashSecret, TALLY_CONNECTION_SELECT, type TallyConnectionRow } from "@/lib/tally/connections";
+import {
+  DEFAULT_CASH_DISCOUNT_CUSTOMER_SCOPE,
+  getCashDiscountCustomerScopeOrDefault,
+  getCashDiscountCustomerScopesByCompany,
+} from "@/lib/cash-discount-customer-scope";
 
 function bearerToken(request: Request) {
   return request.headers.get("x-bridge-token") ??
@@ -18,6 +23,7 @@ export async function POST(request: Request) {
     const body = await request.json().catch(() => ({}));
     const role = String(body.role ?? "");
     const connectionId = String(body.connectionId ?? "").trim();
+    const companyName = String(body.companyName ?? "").trim();
     if (!connectionId || !["browser", "connector"].includes(role)) {
       return jsonWithCors(request, { error: "A valid live-session role and connection are required." }, { status: 400 });
     }
@@ -26,16 +32,36 @@ export async function POST(request: Request) {
     if (role === "browser") {
       const user = await requireRequestUser(request);
       if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
-      const { data, error } = await supabase
-        .from("tally_connections")
-        .select("id, owner_user_id, revoked_at")
-        .eq("id", connectionId)
-        .eq("owner_user_id", user.id)
-        .is("revoked_at", null)
-        .maybeSingle();
+      const [connectionResult, customerScopeResult] = await Promise.all([
+        supabase
+          .from("tally_connections")
+          .select("id, owner_user_id, revoked_at")
+          .eq("id", connectionId)
+          .eq("owner_user_id", user.id)
+          .is("revoked_at", null)
+          .maybeSingle(),
+        companyName
+          ? getCashDiscountCustomerScopeOrDefault({
+              ownerUserId: user.id,
+              connectionId,
+              companyName,
+            })
+          : getCashDiscountCustomerScopesByCompany({
+              ownerUserId: user.id,
+              connectionId,
+            }),
+      ]);
+      const { data, error } = connectionResult;
       if (error) throw error;
       if (!data) return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
-      return jsonWithCors(request, { authenticated: true, ownerUserId: user.id, connectionId });
+      return jsonWithCors(request, {
+        authenticated: true,
+        ownerUserId: user.id,
+        connectionId,
+        customerScope: companyName ? customerScopeResult : null,
+        customerScopes: companyName ? null : customerScopeResult,
+        defaultCustomerScope: DEFAULT_CASH_DISCOUNT_CUSTOMER_SCOPE,
+      });
     }
 
     const token = bearerToken(request);
