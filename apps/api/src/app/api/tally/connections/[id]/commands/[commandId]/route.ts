@@ -20,7 +20,7 @@ export async function GET(
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_bridge_commands")
-      .select("id, status, error, updated_at")
+      .select("id, status, result, error, completed_at, updated_at")
       .eq("id", commandId)
       .eq("connection_id", id)
       .eq("owner_user_id", user.id)
@@ -31,7 +31,9 @@ export async function GET(
       command: data ? {
         id: data.id,
         status: data.status,
+        result: data.result,
         error: data.error,
+        completedAt: data.completed_at,
         updatedAt: data.updated_at,
       } : null,
     });

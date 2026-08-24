@@ -1,5 +1,5 @@
 #define AppName "Kalika Tally Connector"
-#define AppVersion "0.1.53"
+#define AppVersion "0.1.56"
 #define AppPublisher "Kalika"
 #define AppInstallDir "C:\Autodealer\tally-bridge"
 #define AppExeName "Kalika Tally Connector.exe"

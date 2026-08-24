@@ -645,6 +645,11 @@ export async function completeLocalTallyCommand(input: {
   command.error = input.error;
   command.completed_at = nowIso();
   command.updated_at = command.completed_at;
+  // A command result is an authenticated message from the running connector.
+  // Keep its session alive even when a long Tally operation occupied the
+  // connector beyond the normal heartbeat freshness window.
+  row.last_heartbeat_at = command.completed_at;
+  row.updated_at = command.completed_at;
   await writeState(state);
   return { command };
 }

@@ -636,6 +636,7 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
     voucherDate: "2026-07-29",
     supplierInvoiceDate: "2026-07-28",
     supplierInvoiceNumber: "VIS/26-27/0142",
+    voucherNumber: "VIS/26-27/0142 / 28-Jul-26",
     supplierLedgerName: "Vertex Industrial Supplies",
     sourceDocumentPath: "C:\\Kalika Documents\\VIS-0142.pdf",
     sourceDocumentName: "VIS-0142.pdf",
@@ -666,6 +667,9 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
       { kind: "cgst_tds", name: "CGST TDS PAYABLE 1%", amount: 2500 },
       { kind: "sgst_tds", name: "SGST TDS PAYABLE 1%", amount: 2500 },
     ],
+    ledgers: {
+      roundOff: { name: "Round Off", amount: -0.4 },
+    },
   });
 
   assert.match(xml, /<TALLYREQUEST>Import<\/TALLYREQUEST><TYPE>Data<\/TYPE><ID>Vouchers<\/ID>/);
@@ -677,6 +681,7 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
   assert.match(xml, /<GSTHSNNAME>72044900<\/GSTHSNNAME>/);
   assert.match(xml, /<DATE>20260729<\/DATE>/);
   assert.match(xml, /<REFERENCEDATE>20260728<\/REFERENCEDATE>/);
+  assert.match(xml, /<VOUCHERNUMBER>VIS\/26-27\/0142 \/ 28-Jul-26<\/VOUCHERNUMBER>/);
   assert.match(
     xml,
     /<BILLALLOCATIONS\.LIST><NAME>VIS\/26-27\/0142<\/NAME><BILLTYPE>New Ref<\/BILLTYPE><BILLDATE>20260729<\/BILLDATE><AMOUNT>292500\.00<\/AMOUNT><\/BILLALLOCATIONS\.LIST>/
@@ -684,6 +689,14 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
   assert.match(xml, /<LEDGERNAME>Transportation Inward @ 18\.00%<\/LEDGERNAME>/);
   assert.match(xml, /<LEDGERNAME>TDS Payable @ 0\.10% \(194Q\)<\/LEDGERNAME>/);
   assert.match(xml, /<LEDGERNAME>CGST TDS PAYABLE 1%<\/LEDGERNAME>/);
+  assert.ok(
+    xml.indexOf("<LEDGERNAME>Input ITC SGST 9%</LEDGERNAME>") <
+      xml.indexOf("<LEDGERNAME>TDS Payable @ 0.10% (194Q)</LEDGERNAME>")
+  );
+  assert.ok(
+    xml.indexOf("<LEDGERNAME>SGST TDS PAYABLE 1%</LEDGERNAME>") <
+      xml.indexOf("<LEDGERNAME>Round Off</LEDGERNAME>")
+  );
   assert.match(xml, /<UDF:KALIKASOURCEDOCUMENTPATH\.LIST[^>]*INDEX="30001">/);
   assert.match(xml, /C:\\Kalika Documents\\VIS-0142\.pdf/);
   assert.match(xml, /<UDF:KALIKASOURCEDOCUMENTSHA256[^>]*>ABC123<\/UDF:KALIKASOURCEDOCUMENTSHA256>/);
@@ -807,6 +820,14 @@ test("Purchase voucher verification includes the attached source PDF identity", 
   };
 
   assert.deepEqual(purchaseVoucherReadbackComparison(voucher, payload), []);
+  assert.deepEqual(
+    purchaseVoucherReadbackComparison(
+      { ...voucher, voucherNumber: "3285" },
+      { ...payload, voucherNumber: "VIS/26-27/0142 / 28-Jul-26" }
+    ),
+    [],
+    "Tally automatic numbering must not fail an otherwise verified voucher"
+  );
   assert.ok(
     purchaseVoucherReadbackComparison(
       { ...voucher, sourceDocumentSha256: null },

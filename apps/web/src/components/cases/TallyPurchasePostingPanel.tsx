@@ -38,7 +38,8 @@ import {
   fetchTallyPurchasePosting,
   matchTallyPurchaseLineMasters,
   matchTallyPurchaseSupplierLedger,
-  queueTallyMasterRefresh,
+  prepareLiveTallyCatalogue,
+  prepareTallyPurchasePostingFromLive,
   saveTallyPurchasePosting,
   selectTallyPurchaseInvoice,
   waitForTallyCommand,
@@ -742,6 +743,10 @@ export type TallyPurchaseHeaderState = {
   connection: TallyPostingResponse["connection"];
   connectionOptions: TallyPostingResponse["connectionOptions"];
   buyerGstin: string | null;
+  postingStatus: string | null;
+  tallyVoucherNumber: string | null;
+  invoiceNumber: string | null;
+  verifiedAt: string | null;
 };
 
 export function TallyPurchasePostingPanel({
@@ -769,6 +774,7 @@ export function TallyPurchasePostingPanel({
   const [approvingPacket, setApprovingPacket] = useState(false);
   const [queueing, setQueueing] = useState(false);
   const [refreshingMasters, setRefreshingMasters] = useState(false);
+  const [liveMastersReady, setLiveMastersReady] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [warningsAcknowledged, setWarningsAcknowledged] = useState(false);
   const [editingGstRate, setEditingGstRate] = useState(false);
@@ -782,6 +788,13 @@ export function TallyPurchasePostingPanel({
   const automaticLineMasterMatchKeyRef = useRef("");
   const lastPostingStatusRef = useRef<string | null>(null);
   const automaticLiveRefreshRef = useRef<string | null>(null);
+  const liveMasterResultRef = useRef<unknown>(null);
+  const liveMasterOptionsRef = useRef<TallyPostingResponse["masterOptions"] | null>(null);
+
+  const withLiveMasterOptions = useCallback((next: TallyPostingResponse) =>
+    liveMasterOptionsRef.current
+      ? { ...next, masterOptions: liveMasterOptionsRef.current }
+      : next, []);
 
   const load = useCallback(async (
     quiet = false,
@@ -796,65 +809,76 @@ export function TallyPurchasePostingPanel({
         connectionId,
         companyName
       );
-      setPayload(next);
-      setSelectedConnectionId(next.selectedConnectionId ?? connectionId ?? "");
-      setSelectedCompanyName(next.selectedCompanyName ?? companyName ?? "");
-      if (replaceReview || (!dirty && !review)) setReview(next.review);
+      const hydrated = withLiveMasterOptions(next);
+      setPayload(hydrated);
+      setSelectedConnectionId(hydrated.selectedConnectionId ?? connectionId ?? "");
+      setSelectedCompanyName(hydrated.selectedCompanyName ?? companyName ?? "");
+      if (replaceReview || (!dirty && !review)) setReview(hydrated.review);
       setError(null);
       setState("ready");
-      return next;
+      return hydrated;
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Failed to load Tally posting review.");
       setState("error");
       return null;
     }
-  }, [caseId, dirty, review]);
+  }, [caseId, dirty, review, withLiveMasterOptions]);
 
-  useEffect(() => {
-    void load(false, null, true);
-  }, [caseId]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // A new case has no trusted review yet. Load the current company masters
-  // once before matching so defaults are based on live Tally data, while a
-  // saved review remains stable and does not create a refresh loop.
+  // Resolve the selected connection once, then read a brand-new catalogue
+  // directly through the local gateway. This replaces the old Supabase
+  // command queue + one-second polling loop and also prevents two initial
+  // tally-posting requests from racing each other.
   useEffect(() => {
     if (automaticLiveRefreshRef.current === caseId) return;
     automaticLiveRefreshRef.current = caseId;
+    setLiveMastersReady(false);
     void (async () => {
-      const next = await load(true, null, true);
+      const next = await load(false, null, true);
       const connection = next?.connection;
       if (
         !next ||
-        next.hasSavedReview ||
         !next.selectedConnectionId ||
         !next.selectedCompanyName ||
         !connection?.bridgeConnected ||
         !connection.tallyReachable ||
-        !connection.companyLoaded ||
-        (connection.masterSnapshotFresh && connection.masterSource === "live_purchase")
+        !connection.companyLoaded
       ) return;
       try {
         setRefreshingMasters(true);
         setNotice("Reading the latest masters from Tally…");
-        const queued = await queueTallyMasterRefresh(
+        const liveMasters = await runCashDiscountLiveRequest({
+          connectionId: next.selectedConnectionId,
+          companyName: next.selectedCompanyName,
+          operation: "ledger_masters",
+          payload: {
+            persist: false,
+            requestedMasterTypes: ["ledger", "group", "stock_item", "unit", "gst_ledger", "tax_ledger"],
+          },
+          onProgress: (message) => setNotice(message),
+        });
+        const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, next.review);
+        liveMasterResultRef.current = liveCatalogue.compactResult;
+        liveMasterOptionsRef.current = liveCatalogue.masterOptions;
+        const prepared = await prepareTallyPurchasePostingFromLive(
+          caseId,
           next.selectedConnectionId,
-          next.selectedCompanyName
-        ) as { command?: { id?: string } };
-        const commandId = queued.command?.id;
-        if (commandId) {
-          await waitForTallyCommand(next.selectedConnectionId, commandId, {
-            attempts: 30,
-            intervalMs: 1000,
-          });
-          await load(true, next.selectedConnectionId, true, next.selectedCompanyName);
-        }
+          next.selectedCompanyName,
+          liveCatalogue.compactResult
+        );
+        const hydrated = withLiveMasterOptions(prepared);
+        setPayload(hydrated);
+        setReview(hydrated.review);
+        setSupplierLedgerMatch(hydrated.supplierLedgerMatch ?? null);
+        setLineMasterMatches(hydrated.lineMasterMatches ?? []);
+        setLiveMastersReady(true);
+        setNotice("Latest live Tally data loaded.");
       } catch (refreshError) {
         setNotice(refreshError instanceof Error ? refreshError.message : "Live Tally refresh is unavailable.");
       } finally {
         setRefreshingMasters(false);
       }
     })();
-  }, [caseId, load]);
+  }, [caseId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const postingStatus = payload?.posting?.status;
@@ -866,15 +890,56 @@ export function TallyPurchasePostingPanel({
 
     if (connectionId && commandId) {
       void (async () => {
+        let pollAttempt = 0;
         try {
           while (!cancelled) {
+            const intervalMs = Math.min(1500 + pollAttempt * 500, 4000);
             const terminal = await waitForTallyCommand(connectionId, commandId, {
               attempts: 1,
-              intervalMs: 1000,
+              intervalMs,
             });
+            pollAttempt += 1;
             if (!terminal) continue;
             if (!cancelled) {
-              await load(true, connectionId, false, payload?.selectedCompanyName);
+              if (terminal.status !== "succeeded") {
+                // Failure and verification-required states carry richer server
+                // diagnostics than the compact command result. They are rare,
+                // so retain the full refresh only for those paths.
+                await load(true, connectionId, false, payload?.selectedCompanyName);
+                setNotice(null);
+                setError(terminal.error ?? "Tally could not create the Purchase voucher.");
+                return;
+              }
+              const result = terminal.result ?? {};
+              const textResult = (key: string) =>
+                typeof result[key] === "string" && result[key].trim()
+                  ? result[key].trim()
+                  : null;
+              setPayload((current) => {
+                if (!current?.posting) return current;
+                return {
+                  ...current,
+                  blockers: [],
+                  warnings: [],
+                  readyForApproval: true,
+                  posting: {
+                    ...current.posting,
+                    status: "created",
+                    tallyVoucherNumber: textResult("voucherNumber") ?? current.posting.tallyVoucherNumber,
+                    tallyMasterId: textResult("masterId") ?? current.posting.tallyMasterId,
+                    tallyGuid: textResult("guid") ?? current.posting.tallyGuid,
+                    tallyCreatedAt: terminal.completedAt ?? current.posting.tallyCreatedAt,
+                    verifiedAt: terminal.completedAt ?? current.posting.verifiedAt,
+                    verificationResult: {
+                      verificationStatus: textResult("verificationStatus") ?? "verified",
+                    },
+                    lastError: null,
+                    updatedAt: terminal.updatedAt ?? current.posting.updatedAt,
+                  },
+                };
+              });
+              setError(null);
+              setNotice("Purchase voucher created and verified in Tally.");
             }
             return;
           }
@@ -948,6 +1013,10 @@ export function TallyPurchasePostingPanel({
       connection: payload.connection,
       connectionOptions: payload.connectionOptions,
       buyerGstin: payload.review?.buyerGstin || payload.source?.buyerGstin || null,
+      postingStatus: payload.posting?.status ?? null,
+      tallyVoucherNumber: payload.posting?.tallyVoucherNumber ?? null,
+      invoiceNumber: payload.posting?.invoiceNumber ?? payload.review?.invoiceNumber ?? null,
+      verifiedAt: payload.posting?.verifiedAt ?? null,
     });
   }, [onHeaderStateChange, payload]);
 
@@ -957,6 +1026,34 @@ export function TallyPurchasePostingPanel({
     [payload?.masterOptions.ledgers]
   );
   const stockItemOptions = payload?.masterOptions.stockItems ?? [];
+  const godownOptions = useMemo(() => {
+    const liveOptions = payload?.masterOptions.godowns ?? [];
+    const inferredNames = Array.from(new Set(
+      [payload?.source?.godownName, ...(payload?.source?.lines ?? []).map((line) => line.godownName)]
+        .map((name) => name?.trim())
+        .filter((name): name is string => Boolean(name))
+    ));
+    const existing = new Set(liveOptions.map((option) => option.name.trim().toLowerCase()));
+    const inferredOptions: TallyMasterOption[] = inferredNames
+      .filter((name) => !existing.has(name.toLowerCase()))
+      .map((name) => ({
+        id: `packet-godown:${name}`,
+        type: "godown",
+        key: name.toLowerCase(),
+        name,
+        parent: null,
+        gstin: null,
+        hsnCode: null,
+        unitName: null,
+        taxRate: null,
+        groupPath: "From purchase packet",
+        taxType: null,
+        gstDutyHead: null,
+        closingBalance: null,
+        closingBalanceType: null,
+      }));
+    return [...liveOptions, ...inferredOptions];
+  }, [payload?.masterOptions.godowns, payload?.source?.godownName, payload?.source?.lines]);
   const supplierLedgerOptions = useMemo(() => {
     const preferredNames = new Set(
       (supplierLedgerMatch?.candidateLedgerNames ?? []).map((name) => name.trim().toLowerCase())
@@ -986,10 +1083,12 @@ export function TallyPurchasePostingPanel({
     const supplierGstin = review?.supplierGstin?.trim() ?? "";
     if (
       locked ||
+      payload?.liveMatchingComplete ||
       review?.supplierLedgerName?.trim() ||
       (!supplierName && !supplierGstin) ||
       !payload?.connection?.masterSnapshotFresh ||
       !payload.connection.masterSnapshotComplete ||
+      !liveMastersReady ||
       !selectedConnectionId ||
       !selectedCompanyName
     ) {
@@ -1028,9 +1127,11 @@ export function TallyPurchasePostingPanel({
   }, [
     caseId,
     locked,
+    payload?.liveMatchingComplete,
     payload?.connection?.masterSnapshotComplete,
     payload?.connection?.masterSnapshotFresh,
     payload?.connection?.masterSyncRunId,
+    liveMastersReady,
     review?.supplierGstin,
     review?.supplierLedgerName,
     review?.supplierName,
@@ -1041,11 +1142,13 @@ export function TallyPurchasePostingPanel({
   useEffect(() => {
     if (
       locked ||
+      payload?.liveMatchingComplete ||
       !review ||
       !selectedConnectionId ||
       !selectedCompanyName ||
       !payload?.connection?.masterSnapshotFresh ||
       !payload.connection.masterSnapshotComplete ||
+      !liveMastersReady ||
       !review.lines.some((line) => !line.stockItemName.trim() || !line.purchaseLedgerName.trim())
     ) {
       return;
@@ -1107,9 +1210,11 @@ export function TallyPurchasePostingPanel({
   }, [
     caseId,
     locked,
+    payload?.liveMatchingComplete,
     payload?.connection?.masterSnapshotComplete,
     payload?.connection?.masterSnapshotFresh,
     payload?.connection?.masterSyncRunId,
+    liveMastersReady,
     review,
     selectedCompanyName,
     selectedConnectionId,
@@ -1137,7 +1242,9 @@ export function TallyPurchasePostingPanel({
   const tcsOptions = tcsRanked.options;
   const roundOffOptions = roundOffRanked.options;
   const correctionBlockers = useMemo(
-    () => (payload?.blockers ?? []).filter((issue) => {
+    () => ["created", "verification_required"].includes(payload?.posting?.status ?? "")
+      ? []
+      : (payload?.blockers ?? []).filter((issue) => {
       if (issue.scope === "case" || issue.scope === "company") return false;
       // Server blockers describe the last saved review. Clear date errors as
       // soon as the current browser value is valid; Save still performs the
@@ -1146,7 +1253,7 @@ export function TallyPurchasePostingPanel({
       if (issue.code === "VOUCHER_DATE_REQUIRED" && isValidDateInput(review?.voucherDate)) return false;
       return true;
     }),
-    [payload?.blockers, review?.invoiceDate, review?.voucherDate]
+    [payload?.blockers, payload?.posting?.status, review?.invoiceDate, review?.voucherDate]
   );
   const acknowledgementWarnings = useMemo(
     () => (payload?.warnings ?? []).filter((warning) => warning.requiresAcknowledgement),
@@ -1213,15 +1320,17 @@ export function TallyPurchasePostingPanel({
         caseId,
         nextReview,
         selectedConnectionId,
-        selectedCompanyName
+        selectedCompanyName,
+        liveMasterResultRef.current
       );
-      setPayload(next);
-      setReview(next.review);
-      setSelectedConnectionId(next.selectedConnectionId ?? selectedConnectionId);
-      setSelectedCompanyName(next.selectedCompanyName ?? selectedCompanyName);
+      const hydrated = withLiveMasterOptions(next);
+      setPayload(hydrated);
+      setReview(hydrated.review);
+      setSelectedConnectionId(hydrated.selectedConnectionId ?? selectedConnectionId);
+      setSelectedCompanyName(hydrated.selectedCompanyName ?? selectedCompanyName);
       setDirty(false);
       setConnectionDirty(false);
-      setNotice(next.readyForApproval
+      setNotice(hydrated.readyForApproval
         ? "Changes saved. This voucher is ready to send to Tally."
         : "Changes saved. Complete the highlighted items before approval.");
     } catch (saveError) {
@@ -1270,10 +1379,12 @@ export function TallyPurchasePostingPanel({
         caseId,
         documentId,
         selectedConnectionId,
-        selectedCompanyName
+        selectedCompanyName,
+        liveMasterResultRef.current
       );
-      setPayload(next);
-      setReview(next.review);
+      const hydrated = withLiveMasterOptions(next);
+      setPayload(hydrated);
+      setReview(hydrated.review);
       setDirty(false);
       setNotice("Purchase invoice selected. Review the accounting before posting.");
     } catch (selectionError) {
@@ -1323,21 +1434,30 @@ export function TallyPurchasePostingPanel({
     try {
       setQueueing(true);
       setError(null);
+      if (!selectedConnectionId || !selectedCompanyName) {
+        throw new Error("Select the active Tally company before posting.");
+      }
+      if (!liveMasterResultRef.current) {
+        throw new Error("Refresh the live Tally data once before posting.");
+      }
+      setNotice("Validating the selected masters and sending to Tally…");
       const next = await approveAndQueueTallyPurchasePosting(
         caseId,
         acknowledgementWarnings.map((warning) => warning.code),
         selectedConnectionId,
-        selectedCompanyName
+        selectedCompanyName,
+        liveMasterResultRef.current
       );
-      setPayload(next);
-      setReview(next.review);
+      const hydrated = withLiveMasterOptions(next);
+      setPayload(hydrated);
+      setReview(hydrated.review);
       setDirty(false);
       setConnectionDirty(false);
       setConfirmOpen(false);
       setNotice(
         postingProgressMessage(
-          next.posting?.status,
-          next.posting?.verificationResult?.verificationStatus
+          hydrated.posting?.status,
+          hydrated.posting?.verificationResult?.verificationStatus
         ) ||
         "Voucher approved. Preparing the Tally command…"
       );
@@ -1360,27 +1480,41 @@ export function TallyPurchasePostingPanel({
       if (!automatic) {
         setNotice("Reading live company data from Tally…");
       }
-      await runCashDiscountLiveRequest({
+      const liveMasters = await runCashDiscountLiveRequest({
         connectionId: connection.id,
         companyName: connection.companyName,
         operation: "ledger_masters",
         payload: {
+          persist: false,
           requestedMasterTypes: ["ledger", "group", "stock_item", "unit", "gst_ledger", "tax_ledger"],
         },
         onProgress: (message) => setNotice(message),
       });
-      await load(true, connection.id, !dirty, connection.companyName);
+      const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, review);
+      liveMasterResultRef.current = liveCatalogue.compactResult;
+      liveMasterOptionsRef.current = liveCatalogue.masterOptions;
+      const prepared = await prepareTallyPurchasePostingFromLive(
+        caseId,
+        connection.id,
+        connection.companyName,
+        liveCatalogue.compactResult
+      );
+      const hydrated = withLiveMasterOptions(prepared);
+      setPayload(hydrated);
+      if (!dirty) setReview(hydrated.review);
+      setSupplierLedgerMatch(hydrated.supplierLedgerMatch ?? null);
+      setLineMasterMatches(hydrated.lineMasterMatches ?? []);
+      setLiveMastersReady(true);
       setNotice("Latest company data loaded from Tally.");
     } catch (refreshError) {
       setError(refreshError instanceof Error ? refreshError.message : "Could not refresh data from Tally.");
     } finally {
       setRefreshingMasters(false);
     }
-  }, [dirty, load, payload?.connection]);
+  }, [caseId, dirty, payload?.connection, review, withLiveMasterOptions]);
 
   // Let the page-level Tally header invoke the exact same refresh path. This
-  // keeps one source of truth and, importantly, persists the live company
-  // profile/master snapshot before the header is re-rendered.
+  // keeps one source of truth without persisting the full live catalogue.
   useEffect(() => {
     onRefreshReady?.(() => handleRefreshMasters(false));
     return () => onRefreshReady?.(() => Promise.resolve());
@@ -1694,7 +1828,9 @@ export function TallyPurchasePostingPanel({
           <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
             <h3 className="text-xs font-semibold text-emerald-950">Purchase voucher created</h3>
             <p className="text-[11px] text-emerald-700">
-                Voucher {payload.posting.tallyVoucherNumber || "—"} · Verified {formatDateTime(payload.posting.verifiedAt)}
+              Tally voucher {payload.posting.tallyVoucherNumber || "—"}
+              {payload.posting.invoiceNumber ? ` · Supplier invoice ${payload.posting.invoiceNumber}` : ""}
+              {` · Verified ${formatDateTime(payload.posting.verifiedAt)}`}
             </p>
           </div>
         </section>
@@ -1936,7 +2072,7 @@ export function TallyPurchasePostingPanel({
                   <ReviewWarnings warnings={lineWarnings(line.lineId)} />
                 </div>
               ) : null}
-              <div className="grid gap-3 border-t border-slate-100 bg-slate-50/50 p-3 sm:grid-cols-2 sm:p-4">
+              <div className="grid gap-3 border-t border-slate-100 bg-slate-50/50 p-3 sm:grid-cols-2 sm:p-4 lg:grid-cols-3">
                 <div>
                   <MasterCombobox
                     {...masterContext}
@@ -1987,6 +2123,23 @@ export function TallyPurchasePostingPanel({
                     </div>
                   ) : null}
                 </div>
+                <div>
+                  <MasterCombobox
+                    {...masterContext}
+                    compact
+                    disabled={masterSelectionDisabled}
+                    emptyMessage="No godown was returned by live Tally."
+                    hideSourceBadge
+                    issues={lineIssues(line.lineId, ["GODOWN_REQUIRED"])}
+                    label="Godown"
+                    onChange={(value) => updateLine(index, "godownName", value)}
+                    options={godownOptions}
+                    placeholder="No godown allocation"
+                    sourceHint={sourceLine?.godownName}
+                    suggestedNames={sourceLine?.godownName ? [sourceLine.godownName] : []}
+                    value={line.godownName}
+                  />
+                </div>
               </div>
               <details className="group border-t border-slate-100" open={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED", "HSN_MAPPING_REQUIRED", "LINE_TAXABLE_MISMATCH"]).length > 0 || undefined}>
                 <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-[10px] font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-800 sm:px-4">
@@ -1999,6 +2152,7 @@ export function TallyPurchasePostingPanel({
                   <Field compact disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED", "STOCK_ITEM_UNIT_MISMATCH"])} label="Unit" onChange={(value) => updateLine(index, "unit", value)} sourceValue={sourceLine?.unit} value={line.unit} />
                   <Field compact disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED"])} label="Rate" onChange={(value) => updateLine(index, "rate", value)} sourceValue={sourceLine?.rate} value={line.rate} />
                   <Field compact disabled={locked} issues={lineIssues(line.lineId, ["LINE_ACCOUNTING_FIELDS_REQUIRED", "LINE_TAXABLE_MISMATCH"])} label="Taxable amount" onChange={(value) => updateLine(index, "taxableAmount", value)} sourceValue={sourceLine?.taxableAmount} value={line.taxableAmount} />
+                  <Field compact disabled={locked} label="Batch / lot (optional)" onChange={(value) => updateLine(index, "batchName", value)} sourceValue={sourceLine?.batchName} value={line.batchName} />
                 </div>
               </details>
             </article>
@@ -2533,7 +2687,7 @@ export function TallyPurchasePostingPanel({
             </div>
           </div>
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-500">
-            <span>Purchase number uses the supplier invoice number / date; Tally assigns its internal voucher number when posted.</span>
+            <span>Purchase number: {purchaseReference}</span>
             <span className={`font-semibold ${Math.abs(liveTotalDifference) > 1 ? "text-rose-600" : "text-emerald-700"}`}>
               Invoice difference {money(String(liveTotalDifference))}
             </span>
@@ -2601,7 +2755,10 @@ export function TallyPurchasePostingPanel({
           {payload.posting?.status === "created" ? (
             <div className="flex items-center justify-end gap-2 text-xs font-medium text-emerald-700">
               <CheckCircle2 className="h-4 w-4" />
-              <span>Voucher {payload.posting.tallyVoucherNumber || "—"} created and verified</span>
+              <span>
+                Tally voucher {payload.posting.tallyVoucherNumber || "—"} created and verified
+                {payload.posting.invoiceNumber ? ` · Invoice ${payload.posting.invoiceNumber}` : ""}
+              </span>
             </div>
           ) : (
             <div className="flex justify-end gap-2">

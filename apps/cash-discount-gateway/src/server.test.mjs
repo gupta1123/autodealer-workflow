@@ -44,6 +44,10 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
       response.end(JSON.stringify({ setupRequired: false, tabs: { cashDiscountTracker: [] } }));
       return;
     }
+    if (request.url === "/api/collections/live/analyse-preview") {
+      response.end(JSON.stringify({ setupRequired: false, preview: true, tabs: { cashDiscountTracker: [] } }));
+      return;
+    }
     response.statusCode = 404;
     response.end(JSON.stringify({ error: "Not found" }));
   });
@@ -157,6 +161,11 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
     data: { financialYear: "2026-27", ledgers: [], openBillsResult: {} },
   }));
 
+  const preview = await nextMessage(
+    browser,
+    (message) => message.type === "preview" && message.requestId === "request-1"
+  );
+  assert.equal(preview.data.preview, true);
   const result = await nextMessage(browser, (message) => message.type === "result");
   assert.equal(result.success, true);
   assert.deepEqual(result.data.tabs.cashDiscountTracker, []);
@@ -190,6 +199,7 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
   // scans; repeat refreshes do not re-run the live-session database checks.
   assert.equal(requests.filter((request) => request.url === "/api/collections/live/session").length, 2);
   assert.equal(requests.filter((request) => request.url === "/api/collections/live/analyse").length, 2);
+  assert.equal(requests.filter((request) => request.url === "/api/collections/live/analyse-preview").length, 2);
 
   browser.close();
   connector.close();

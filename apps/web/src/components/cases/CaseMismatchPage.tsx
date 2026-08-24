@@ -1023,6 +1023,10 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
         connection: payload.connection,
         connectionOptions: payload.connectionOptions,
         buyerGstin: payload.review?.buyerGstin || payload.source?.buyerGstin || null,
+        postingStatus: payload.posting?.status ?? null,
+        tallyVoucherNumber: payload.posting?.tallyVoucherNumber ?? null,
+        invoiceNumber: payload.posting?.invoiceNumber ?? payload.review?.invoiceNumber ?? null,
+        verifiedAt: payload.posting?.verifiedAt ?? null,
       });
     } finally {
       setRefreshingTallyHeader(false);
@@ -1062,8 +1066,14 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
     tallyConnectionReady && !tallyCompanyNameMatches
   );
   const tallyCompanyContextVerified = tallyCompanyNameMatches;
+  const tallyVoucherVerified = Boolean(
+    tallyHeaderState?.tallyVoucherNumber &&
+      ["created", "verification_required"].includes(tallyHeaderState?.postingStatus ?? "")
+  );
   const tallyHeaderTitle = refreshingTallyHeader
     ? "Checking Tally company"
+    : tallyVoucherVerified
+      ? `Tally voucher ${tallyHeaderState?.tallyVoucherNumber || "created"}`
     : !tallyHeaderState?.selectedConnectionId
       ? "Select Tally company"
       : tallyCompanyContextVerified
@@ -1071,7 +1081,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
         : tallyCompanyContextMismatch
           ? "Switch company in Tally"
           : "Tally unavailable";
-  const tallyHeaderToneClass = tallyCompanyContextVerified
+  const tallyHeaderToneClass = tallyVoucherVerified || tallyCompanyContextVerified
     ? "border-emerald-200 bg-emerald-50/80"
     : tallyHeaderState?.selectedConnectionId
       ? "border-amber-300 bg-amber-50"
@@ -1131,14 +1141,14 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
               <div className="flex min-w-0 items-center gap-2">
                 {refreshingTallyHeader ? (
                   <Loader2 className="h-4 w-4 shrink-0 animate-spin text-slate-500" />
-                ) : tallyCompanyContextVerified ? (
+                ) : tallyVoucherVerified || tallyCompanyContextVerified ? (
                   <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
                 ) : (
                   <ShieldAlert className="h-4 w-4 shrink-0 text-amber-700" />
                 )}
                 <div className="min-w-0">
                   <div className={`text-xs font-bold ${
-                    tallyCompanyContextVerified
+                    tallyVoucherVerified || tallyCompanyContextVerified
                       ? "text-emerald-950"
                       : tallyHeaderState?.selectedConnectionId
                         ? "text-amber-950"
@@ -1146,15 +1156,19 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                   }`}>{tallyHeaderTitle}</div>
                   <div
                     className={`mt-0.5 max-w-[285px] truncate text-[11px] font-semibold ${
-                      tallyCompanyContextVerified
+                      tallyVoucherVerified || tallyCompanyContextVerified
                         ? "text-emerald-700"
                         : tallyHeaderState?.selectedConnectionId
                           ? "text-amber-700"
                           : "text-slate-400"
                     }`}
-                    title={`Kalika: ${kalikaCompanyName} - Tally: ${activeTallyCompanyName}`}
+                    title={tallyVoucherVerified
+                      ? `Supplier invoice ${tallyHeaderState?.invoiceNumber || "—"} was verified in Tally.`
+                      : `Kalika: ${kalikaCompanyName} - Tally: ${activeTallyCompanyName}`}
                   >
-                    Kalika: {kalikaCompanyName} - Tally: {activeTallyCompanyName}
+                    {tallyVoucherVerified
+                      ? `Supplier invoice ${tallyHeaderState?.invoiceNumber || "—"} · verified`
+                      : `Kalika: ${kalikaCompanyName} - Tally: ${activeTallyCompanyName}`}
                   </div>
                 </div>
               </div>

@@ -12,6 +12,7 @@ type LiveRequest = {
   proposal?: Record<string, unknown>;
   customerScope?: Record<string, unknown>;
   onProgress?: (message: string) => void;
+  onPreview?: (data: unknown) => void;
 };
 
 type LiveResult<T> = {
@@ -27,6 +28,7 @@ type PendingRequest = {
   resolve: (data: unknown) => void;
   reject: (error: Error) => void;
   onProgress?: (message: string) => void;
+  onPreview?: (data: unknown) => void;
   timeout: number;
 };
 
@@ -157,6 +159,8 @@ function createSession(params: {
       const pending = requestId ? session.pending.get(requestId) : null;
       if (message.type === "progress" && pending) {
         pending.onProgress?.(message.message || "Reading live Tally data...");
+      } else if (message.type === "preview" && pending) {
+        pending.onPreview?.(message.data);
       } else if (message.type === "result" && pending) {
         window.clearTimeout(pending.timeout);
         session.pending.delete(requestId);
@@ -222,6 +226,7 @@ export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
       resolve: (data) => resolve(data as T),
       reject,
       onProgress: request.onProgress,
+      onPreview: request.onPreview,
       timeout,
     });
     session.socket.send(JSON.stringify({

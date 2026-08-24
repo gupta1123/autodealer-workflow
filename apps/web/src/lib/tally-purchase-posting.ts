@@ -21,6 +21,8 @@ export type TallyPostingLine = {
   taxableAmount: string;
   stockItemName: string;
   purchaseLedgerName: string;
+  godownName: string;
+  batchName: string;
 };
 
 export type TallyPostingReview = {
@@ -68,6 +70,9 @@ export type TallyPostingReview = {
 };
 
 export type TallyPostingResponse = {
+  liveMatchingComplete?: boolean;
+  supplierLedgerMatch?: SupplierLedgerMatch;
+  lineMasterMatches?: PurchaseLineMasterSuggestion[];
   caseStatus: string;
   hasSavedReview: boolean;
   accountingSettings: {
@@ -192,6 +197,8 @@ export type TallyPostingResponse = {
     invoiceGstTdsRate: string;
     invoiceTcsAmount: string;
     invoiceRoundOffAmount: string;
+    godownName: string;
+    batchName: string;
     lines: Array<TallyPostingLine & {
       material: "ms_scrap" | "sponge_iron" | "unknown";
       materialLabel: string;
@@ -240,6 +247,7 @@ export type TallyPostingResponse = {
     ledgers: TallyMasterOption[];
     stockItems: TallyMasterOption[];
     units: TallyMasterOption[];
+    godowns: TallyMasterOption[];
   };
   events: Array<Record<string, unknown>>;
 };
@@ -283,6 +291,273 @@ export type PurchaseLineMasterSuggestion = {
   purchaseLedger: PurchaseMasterSuggestion;
 };
 
+function liveRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function liveText(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function liveNumber(value: unknown) {
+  const parsed = typeof value === "number" ? value : Number(String(value ?? "").replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function liveKey(value: unknown) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function liveWords(value: unknown) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/\bm[\s.]+s\b/g, "ms")
+    .replace(/\bo[\s.]+m[\s.]+s\b/g, "oms")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter((token) => token.length > 1 && !["and", "the", "for", "from"].includes(token));
+}
+
+function liveTokenAffinity(left: unknown, right: unknown) {
+  const leftTokens = new Set(liveWords(left));
+  const rightTokens = new Set(liveWords(right));
+  if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
+  let common = 0;
+  for (const token of leftTokens) if (rightTokens.has(token)) common += 1;
+  return (2 * common) / (leftTokens.size + rightTokens.size);
+}
+
+/**
+ * Keeps the complete live catalogue in browser memory for dropdown search,
+ * while producing a small accounting-only subset for server validation.
+ */
+export function prepareLiveTallyCatalogue(
+  resultValue: unknown,
+  review?: TallyPostingReview | null
+): { compactResult: unknown; masterOptions: TallyPostingResponse["masterOptions"] } {
+  const result = liveRecord(resultValue);
+  const masters = liveRecord(result?.masters);
+  if (!result || result.source !== "live_tally" || !masters) {
+    throw new Error("The connector returned an invalid live Tally catalogue.");
+  }
+  const groups = Array.isArray(masters.groups) ? masters.groups : [];
+  const groupParentByName = new Map<string, string | null>();
+  for (const value of groups) {
+    const row = liveRecord(value);
+    const name = liveText(row?.name);
+    if (name) groupParentByName.set(liveKey(name), liveText(row?.parent));
+  }
+  const groupPath = (parentValue: unknown) => {
+    const values: string[] = [];
+    const seen = new Set<string>();
+    let current = liveText(parentValue);
+    while (current && values.length < 20) {
+      const key = liveKey(current);
+      if (!key || seen.has(key)) break;
+      seen.add(key);
+      values.unshift(current);
+      current = groupParentByName.get(key) ?? null;
+    }
+    return values.join(" > ") || null;
+  };
+  const convert = (values: unknown, type: "ledger" | "stock_item" | "unit" | "godown") =>
+    (Array.isArray(values) ? values : []).flatMap((value, index) => {
+      const row = liveRecord(value);
+      const name = liveText(row?.name);
+      if (!row || !name) return [];
+      const raw = liveRecord(row.raw) ?? {};
+      const balance = liveNumber(row.closingBalance ?? raw.closingBalance);
+      const balanceType = liveText(row.closingBalanceType ?? raw.closingBalanceType);
+      return [{
+        id: liveText(row.guid) ?? `live:${type}:${index}:${liveKey(name)}`,
+        type,
+        key: liveText(row.guid) ?? liveKey(name),
+        name,
+        parent: liveText(row.parent),
+        gstin: liveText(row.gstin),
+        hsnCode: liveText(row.hsnCode),
+        unitName: liveText(row.unitName),
+        taxRate: liveNumber(row.taxRate),
+        groupPath: groupPath(row.parent),
+        taxType: liveText(row.taxType ?? raw.taxType),
+        gstDutyHead: liveText(row.gstDutyHead ?? raw.gstDutyHead),
+        closingBalance: balance,
+        closingBalanceType: balanceType === "Dr" || balanceType === "Cr" ? balanceType : null,
+      } satisfies TallyMasterOption];
+    });
+  const ledgerRows = Array.isArray(masters.ledgers) ? masters.ledgers : [];
+  const ledgerOptions = convert(ledgerRows, "ledger");
+  const stockItemOptions = convert(masters.stockItems, "stock_item");
+  const unitOptions = convert(masters.units, "unit");
+  const godownOptions = convert(masters.godowns, "godown");
+
+  const selectedNames = new Set([
+    review?.supplierLedgerName,
+    review?.cgstLedgerName,
+    review?.sgstLedgerName,
+    review?.igstLedgerName,
+    review?.freightLedgerName,
+    review?.tds194qLedgerName,
+    review?.transportTdsLedgerName,
+    review?.cgstTdsLedgerName,
+    review?.sgstTdsLedgerName,
+    review?.igstTdsLedgerName,
+    review?.tcsLedgerName,
+    review?.roundOffLedgerName,
+    ...(review?.lines ?? []).map((line) => line.purchaseLedgerName),
+  ].filter((value): value is string => Boolean(value?.trim())).map(liveKey));
+  const supplierName = liveKey(review?.supplierName);
+  const supplierGstin = String(review?.supplierGstin ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const rankedSupplier = ledgerRows
+    .map((value, index) => {
+      const row = liveRecord(value);
+      const name = liveText(row?.name) ?? "";
+      const gstin = String(row?.gstin ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+      const nameKey = liveKey(name);
+      const score = supplierGstin && gstin === supplierGstin
+        ? 100
+        : supplierName && nameKey === supplierName
+          ? 90
+          : supplierName && (nameKey.includes(supplierName) || supplierName.includes(nameKey))
+            ? 70
+            : 0;
+      return { value, index, score };
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 12);
+  type CompactLedgerCandidate = {
+    value: unknown;
+    index: number;
+    key: string;
+    name: string;
+    identity: string;
+  };
+  const ledgerCandidates: CompactLedgerCandidate[] = ledgerRows.flatMap((value, index) => {
+    const row = liveRecord(value);
+    const name = liveText(row?.name);
+    if (!row || !name) return [];
+    const raw = liveRecord(row.raw) ?? {};
+    const path = groupPath(row.parent);
+    return [{
+      value,
+      index,
+      key: liveKey(name),
+      name,
+      identity: [
+        name,
+        liveText(row.parent),
+        path,
+        liveText(row.taxType ?? raw.taxType),
+        liveText(row.gstDutyHead ?? raw.gstDutyHead),
+      ].filter(Boolean).join(" "),
+    }];
+  });
+  const ledgerCandidateByIndex = new Map(
+    ledgerCandidates.map((candidate) => [candidate.index, candidate])
+  );
+  const compactByName = new Map<string, unknown>();
+  const addCandidates = (
+    values: CompactLedgerCandidate[],
+    limit: number,
+    score: (candidate: CompactLedgerCandidate) => number = () => 0
+  ) => {
+    values
+      .map((candidate) => ({ candidate, score: score(candidate) }))
+      .sort((left, right) =>
+        right.score - left.score ||
+        left.candidate.name.localeCompare(right.candidate.name) ||
+        left.candidate.index - right.candidate.index
+      )
+      .slice(0, limit)
+      .forEach(({ candidate }) => compactByName.set(candidate.key, candidate.value));
+  };
+  const matching = (pattern: RegExp) =>
+    ledgerCandidates.filter((candidate) => pattern.test(candidate.identity));
+  const inputTaxScore = (candidate: CompactLedgerCandidate) =>
+    Number(/\b(input|itc|purchase)\b/i.test(candidate.identity)) * 4 +
+    Number(!/\b(output|sales)\b/i.test(candidate.identity)) * 2 +
+    Number(/\b9\s*%?|9%\b/i.test(candidate.identity));
+  const lineIdentity = (review?.lines ?? [])
+    .map((line) => `${line.description} ${line.hsn}`)
+    .join(" ");
+  const purchaseScore = (candidate: CompactLedgerCandidate) =>
+    liveTokenAffinity(lineIdentity, candidate.identity) * 10 +
+    Number(/\bpurchase\b/i.test(candidate.name)) * 3 +
+    Number(/\b(scrap|sponge|raw materials?)\b/i.test(candidate.identity)) * 2 +
+    Number(/\b(indigenous|local|m\.?\s*s\.?)\b/i.test(candidate.identity));
+
+  // Never let Tally's alphabetical/master order decide which accounting roles
+  // reach server validation. Selected and supplier masters are guaranteed,
+  // then each required voucher role receives a small independent allowance.
+  addCandidates(
+    ledgerCandidates.filter((candidate) => selectedNames.has(candidate.key)),
+    Math.max(selectedNames.size, 1)
+  );
+  addCandidates(
+    rankedSupplier.flatMap((entry) => {
+      const candidate = ledgerCandidateByIndex.get(entry.index);
+      return candidate ? [candidate] : [];
+    }),
+    12,
+    (candidate) => rankedSupplier.find((entry) => entry.index === candidate.index)?.score ?? 0
+  );
+  addCandidates(
+    ledgerCandidates.filter((candidate) =>
+      /\b(purchase|purchases|direct expenses?|raw materials?|scrap|sponge)\b/i.test(candidate.identity) &&
+      !/\b(sales?|bank|cash|gst|tds|tcs|tax|dut(?:y|ies)|round[ -]?off)\b/i.test(candidate.identity)
+    ),
+    32,
+    purchaseScore
+  );
+  addCandidates(matching(/\b(cgst|central\s+tax)\b/i), 16, inputTaxScore);
+  addCandidates(matching(/\b(sgst|state\s+tax)\b/i), 16, inputTaxScore);
+  addCandidates(matching(/\b(igst|integrated\s+tax)\b/i), 16, inputTaxScore);
+  addCandidates(matching(/\b194q\b|0[.]?10\s*%/i), 12);
+  addCandidates(matching(/\b(cgst|central\s+tax)\b.*\btds\b|\btds\b.*\b(cgst|central\s+tax)\b/i), 12);
+  addCandidates(matching(/\b(sgst|state\s+tax)\b.*\btds\b|\btds\b.*\b(sgst|state\s+tax)\b/i), 12);
+  addCandidates(matching(/\b(igst|integrated\s+tax)\b.*\btds\b|\btds\b.*\b(igst|integrated\s+tax)\b/i), 12);
+  addCandidates(matching(/\b(freight|transport|goods\s+carriage)\b/i), 16);
+  addCandidates(matching(/\b(tcs|tax\s+collected)\b/i), 12);
+  addCandidates(matching(/\bround[ -]?off\b|\broundoff\b/i), 12);
+  addCandidates(
+    matching(/\b(input|purchase|gst|tds|tcs|tax|dut(?:y|ies)|freight|transport|round[ -]?off|roundoff)\b/i),
+    20
+  );
+  const compactLedgers = Array.from(compactByName.values()).map((value) => {
+    const row = liveRecord(value) ?? {};
+    return { ...row, groupPath: groupPath(row.parent) };
+  });
+  const compactStockItems = (Array.isArray(masters.stockItems) ? masters.stockItems : []).map((value) => {
+    const row = liveRecord(value) ?? {};
+    return { ...row, groupPath: groupPath(row.parent) };
+  });
+
+  return {
+    compactResult: {
+      ...result,
+      persisted: false,
+      masters: {
+        ledgers: compactLedgers,
+        groups: [],
+        stockItems: compactStockItems,
+        units: Array.isArray(masters.units) ? masters.units : [],
+        godowns: Array.isArray(masters.godowns) ? masters.godowns : [],
+      },
+    },
+    masterOptions: {
+      ledgers: ledgerOptions,
+      stockItems: stockItemOptions,
+      units: unitOptions,
+      godowns: godownOptions,
+    },
+  };
+}
+
 async function readResponse(response: Response, fallback: string) {
   const raw = await response.text();
   let payload: Record<string, unknown> = {};
@@ -316,12 +591,13 @@ export async function saveTallyPurchasePosting(
   caseId: string,
   review: TallyPostingReview,
   connectionId: string,
-  companyName: string
+  companyName: string,
+  liveMasters?: unknown
 ) {
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ review, connectionId, companyName }),
+    body: JSON.stringify({ review, connectionId, companyName, liveMasters, compactResponse: true }),
   });
   return readResponse(response, "Failed to save Tally posting review.");
 }
@@ -330,7 +606,8 @@ export async function selectTallyPurchaseInvoice(
   caseId: string,
   selectedInvoiceDocumentId: string,
   connectionId: string,
-  companyName: string
+  companyName: string,
+  liveMasters?: unknown
 ) {
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
     method: "PATCH",
@@ -339,6 +616,8 @@ export async function selectTallyPurchaseInvoice(
       review: { selectedInvoiceDocumentId },
       connectionId,
       companyName,
+      liveMasters,
+      compactResponse: true,
     }),
   });
   return readResponse(response, "Failed to select the purchase invoice.");
@@ -348,7 +627,8 @@ export async function approveAndQueueTallyPurchasePosting(
   caseId: string,
   acknowledgedWarningCodes: string[] = [],
   connectionId?: string | null,
-  companyName?: string | null
+  companyName?: string | null,
+  liveMasters?: unknown
 ) {
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
     method: "POST",
@@ -358,9 +638,31 @@ export async function approveAndQueueTallyPurchasePosting(
       acknowledgedWarningCodes,
       connectionId,
       companyName,
+      liveMasters,
+      compactResponse: true,
     }),
   });
   return readResponse(response, "Failed to queue the Purchase voucher.");
+}
+
+export async function prepareTallyPurchasePostingFromLive(
+  caseId: string,
+  connectionId: string,
+  companyName: string,
+  liveMasters: unknown
+) {
+  const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "prepare_live_context",
+      connectionId,
+      companyName,
+      liveMasters,
+      compactResponse: true,
+    }),
+  });
+  return readResponse(response, "Failed to prepare the live Tally review.");
 }
 
 export async function matchTallyPurchaseSupplierLedger(
@@ -446,7 +748,16 @@ export async function waitForTallyCommand(
       { cache: "no-store" }
     );
     const raw = await response.text();
-    let payload: { command?: { id: string; status: string; error?: string | null } | null } = {};
+    let payload: {
+      command?: {
+        id: string;
+        status: string;
+        result?: Record<string, unknown> | null;
+        error?: string | null;
+        completedAt?: string | null;
+        updatedAt?: string | null;
+      } | null;
+    } = {};
     try {
       payload = raw ? JSON.parse(raw) : {};
     } catch {

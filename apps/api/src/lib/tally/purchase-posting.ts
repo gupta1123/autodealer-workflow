@@ -73,6 +73,8 @@ export type PurchasePostingReviewLine = {
   taxableAmount: string;
   stockItemName: string;
   purchaseLedgerName: string;
+  godownName: string;
+  batchName: string;
 };
 
 export type PurchasePostingReview = {
@@ -162,6 +164,8 @@ export type PurchasePostingSource = {
   invoiceGstTdsRate: string;
   invoiceTcsAmount: string;
   invoiceRoundOffAmount: string;
+  godownName: string;
+  batchName: string;
   lines: PurchasePostingSourceLine[];
 };
 
@@ -232,6 +236,7 @@ type PurchasePostingReviewPatch = Omit<Partial<PurchasePostingReview>, "lines"> 
 
 const TAX_TOLERANCE_PAISE = 100;
 const TOTAL_TOLERANCE_PAISE = 100;
+const MAX_ROUND_OFF_PAISE = 100;
 const SCRAP_GST_TDS_EFFECTIVE_DATE = "2024-10-10";
 const GST_TDS_CONTRACT_THRESHOLD_PAISE = 250_000 * 100;
 const DEFAULT_PURCHASE_VALIDATION_POLICY: PurchaseValidationPolicy = {
@@ -583,6 +588,8 @@ function sourceLine(documentId: string, item: CommercialLineItem, index: number)
     taxableAmount: "",
     stockItemName: "",
     purchaseLedgerName: "",
+    godownName: "",
+    batchName: "",
   }));
   return {
     lineId: `${documentId}:${index + 1}`,
@@ -594,6 +601,8 @@ function sourceLine(documentId: string, item: CommercialLineItem, index: number)
     taxableAmount: taxable,
     stockItemName: material.suggestedStockItem,
     purchaseLedgerName: "",
+    godownName: "",
+    batchName: "",
     material: material.material,
     materialLabel: material.label,
     invoiceCgstAmount: text(item.cgstAmount),
@@ -602,6 +611,100 @@ function sourceLine(documentId: string, item: CommercialLineItem, index: number)
     invoiceTaxAmount: text(item.taxAmount),
     sourcePage: typeof item.sourcePage === "number" ? item.sourcePage : null,
   };
+}
+
+function packetInventoryText(
+  invoice: PurchasePostingDocumentInput,
+  documents: PurchasePostingDocumentInput[],
+  kind: "godown" | "batch"
+) {
+  const usableValue = (value: unknown) => {
+    const candidate = text(value);
+    return /^(?:not\s+(?:stated|applicable|available)|none|n\/?a|nil|-+)$/i.test(candidate)
+      ? ""
+      : candidate;
+  };
+  const fieldNames = kind === "godown"
+    ? ["godownName", "godown", "warehouseName", "warehouse", "storageLocation"]
+    : ["batchName", "batchNumber", "batchNo", "lotNumber"];
+  const label = kind === "godown"
+    ? "(?:godown|warehouse|storage(?:\\s*\\/\\s*delivery)?\\s+location|delivery\\s+destination)"
+    : "(?:batch(?:\\s+(?:name|number|no\\.?))?|lot(?:\\s+(?:number|no\\.?))?)";
+  const candidates = documents.flatMap((document) => {
+    const fields = fieldsOf(document);
+    for (const fieldName of fieldNames) {
+      const value = usableValue(fields[fieldName]);
+      if (value) return [value];
+    }
+    const searchableText = [
+      text(fields.termsAndConditions),
+      String(document.markdown ?? ""),
+    ].filter(Boolean).join("\n");
+    const match = searchableText.match(new RegExp(
+      `\\b${label}\\s*(?:name\\s*)?(?:[:\\-]\\s*|\\s+)([a-z0-9][a-z0-9 ._()/&-]{1,79}?)(?=\\s*(?:;|\\n|\\||\\*\\*|supplier\\s+batch|commercial\\s+classification|delivery\\s+mode|inspection|document\\s+value|$))`,
+      "i"
+    ));
+    const value = usableValue(match?.[1]);
+    return value ? [value] : [];
+  });
+  const unique = Array.from(new Set(candidates.map((value) => normalizeKey(value))));
+  if (unique.length !== 1) return "";
+  return candidates.find((value) => normalizeKey(value) === unique[0]) ?? "";
+}
+
+export function purchaseVoucherNumber(invoiceNumber: unknown, invoiceDate: unknown) {
+  const invoice = text(invoiceNumber);
+  const normalizedDate = normalizePurchasePostingDate(invoiceDate);
+  if (!invoice || !/^\d{4}-\d{2}-\d{2}$/.test(normalizedDate)) return invoice;
+  const [year, month, day] = normalizedDate.split("-");
+  const monthName = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+  ][Number(month) - 1];
+  if (!monthName) return invoice;
+  return `${invoice} / ${day}-${monthName}-${year.slice(-2)}`;
+}
+
+function invoiceRoundOffAmount(
+  fields: Record<string, unknown>,
+  commercialFields: ReturnType<typeof extractInvoiceCommercialFieldsFromText>,
+  lines: PurchasePostingSourceLine[]
+) {
+  const total = moneyPaise(fields.totalAmount);
+  const explicitCandidates = [fields.roundOffAmount, commercialFields.roundOffAmount];
+  for (const candidate of explicitCandidates) {
+    const amount = moneyPaise(candidate);
+    if (
+      amount !== null &&
+      Math.abs(amount) <= MAX_ROUND_OFF_PAISE &&
+      (total === null || Math.abs(amount - total) > TOTAL_TOLERANCE_PAISE)
+    ) {
+      return formatPaise(amount);
+    }
+  }
+
+  // OCR/AI commonly reads "invoice total after round-off" as the round-off
+  // amount itself. Recover only a genuine sub-rupee balancing difference from
+  // complete printed arithmetic; never invent a larger adjustment.
+  const lineTaxable = sum(lines.map((line) => moneyPaise(line.taxableAmount)));
+  const taxable = moneyPaise(fields.totalTaxableAmount ?? fields.subtotal) ?? lineTaxable;
+  const tax = moneyPaise(fields.taxAmount) ?? moneyPaise(commercialFields.taxAmount);
+  if (total === null || taxable === null || tax === null) return "";
+
+  const freight = moneyPaise(fields.freightAmount) ?? moneyPaise(commercialFields.freightAmount) ?? 0;
+  const tcs = moneyPaise(fields.tcsAmount) ?? moneyPaise(commercialFields.tcsAmount) ?? 0;
+  const typedWithholding = sum([
+    moneyPaise(fields.tds194qAmount) ?? moneyPaise(commercialFields.tds194qAmount),
+    moneyPaise(fields.transportTdsAmount) ?? moneyPaise(commercialFields.transportTdsAmount),
+    moneyPaise(fields.cgstTdsAmount) ?? moneyPaise(commercialFields.cgstTdsAmount),
+    moneyPaise(fields.sgstTdsAmount) ?? moneyPaise(commercialFields.sgstTdsAmount),
+    moneyPaise(fields.igstTdsAmount) ?? moneyPaise(commercialFields.igstTdsAmount),
+  ]);
+  const genericWithholding = typedWithholding === 0
+    ? moneyPaise(fields.tdsAmount) ?? moneyPaise(commercialFields.tdsAmount) ?? 0
+    : 0;
+  const derived = total - taxable - freight - tax - tcs + typedWithholding + genericWithholding;
+  return Math.abs(derived) <= MAX_ROUND_OFF_PAISE ? formatPaise(derived) : "";
 }
 
 function buildSource(
@@ -658,8 +761,9 @@ function buildSource(
     invoiceGstTdsRate:
       text(fields.gstTdsRate) || commercialFields.gstTdsRate,
     invoiceTcsAmount: text(fields.tcsAmount) || commercialFields.tcsAmount,
-    invoiceRoundOffAmount:
-      text(fields.roundOffAmount) || commercialFields.roundOffAmount,
+    invoiceRoundOffAmount: invoiceRoundOffAmount(fields, commercialFields, lines),
+    godownName: packetInventoryText(document, documents, "godown"),
+    batchName: packetInventoryText(document, documents, "batch"),
     lines,
   };
 }
@@ -903,7 +1007,7 @@ function buildDefaultReview(
     const prior = savedLines.get(line.lineId);
     const material = materialFromHsn(prior?.hsn || line.hsn);
     const stockItem =
-      prior?.stockItemName ||
+      exactMasterName(masters, prior?.stockItemName || "", ["stock_item"]) ||
       mappedItemHsnName(masters, mappings, prior?.hsn || line.hsn) ||
       exactMasterName(masters, material.suggestedStockItem, ["stock_item"]) ||
       (() => {
@@ -933,8 +1037,13 @@ function buildDefaultReview(
       taxableAmount: prior?.taxableAmount ?? line.taxableAmount,
       stockItemName: stockItem,
       purchaseLedgerName:
-        prior?.purchaseLedgerName ||
+        exactMasterName(masters, prior?.purchaseLedgerName || "", ["ledger"]) ||
         purchaseLedgerForLine(masters, mappings, material.material, localPurchase),
+      godownName:
+        exactMasterName(masters, prior?.godownName || "", ["godown"]) ||
+        exactMasterName(masters, source.godownName, ["godown"]) ||
+        source.godownName,
+      batchName: prior?.batchName ?? source.batchName,
     };
   });
 
@@ -1044,24 +1153,24 @@ function buildDefaultReview(
     lines,
     invoiceDate: parseDate(saved?.invoiceDate) || baseReview.invoiceDate,
     voucherDate: parseDate(saved?.voucherDate) || baseReview.voucherDate,
-    supplierLedgerName: saved?.supplierLedgerName || baseReview.supplierLedgerName,
-    cgstLedgerName: saved?.cgstLedgerName || baseReview.cgstLedgerName,
-    sgstLedgerName: saved?.sgstLedgerName || baseReview.sgstLedgerName,
-    igstLedgerName: saved?.igstLedgerName || baseReview.igstLedgerName,
+    supplierLedgerName: exactMasterName(masters, saved?.supplierLedgerName || "", ["ledger"]) || baseReview.supplierLedgerName,
+    cgstLedgerName: exactMasterName(masters, saved?.cgstLedgerName || "", ["ledger", "gst_ledger", "tax_ledger"]) || baseReview.cgstLedgerName,
+    sgstLedgerName: exactMasterName(masters, saved?.sgstLedgerName || "", ["ledger", "gst_ledger", "tax_ledger"]) || baseReview.sgstLedgerName,
+    igstLedgerName: exactMasterName(masters, saved?.igstLedgerName || "", ["ledger", "gst_ledger", "tax_ledger"]) || baseReview.igstLedgerName,
     freightAmount: moneyPaise(source.invoiceFreightAmount)
       ? saved?.freightAmount ?? baseReview.freightAmount
       : "",
     freightGstRate: moneyPaise(source.invoiceFreightAmount)
       ? saved?.freightGstRate ?? baseReview.freightGstRate
       : "",
-    freightLedgerName: saved?.freightLedgerName || baseReview.freightLedgerName,
+    freightLedgerName: exactMasterName(masters, saved?.freightLedgerName || "", ["ledger"]) || baseReview.freightLedgerName,
     tds194qLedgerName:
-      saved?.tds194qLedgerName || saved?.tdsLedgerName || baseReview.tds194qLedgerName,
+      exactMasterName(masters, saved?.tds194qLedgerName || saved?.tdsLedgerName || "", ["ledger", "tax_ledger"]) || baseReview.tds194qLedgerName,
     transportTdsLedgerName:
-      saved?.transportTdsLedgerName || baseReview.transportTdsLedgerName,
-    cgstTdsLedgerName: saved?.cgstTdsLedgerName || baseReview.cgstTdsLedgerName,
-    sgstTdsLedgerName: saved?.sgstTdsLedgerName || baseReview.sgstTdsLedgerName,
-    igstTdsLedgerName: saved?.igstTdsLedgerName || baseReview.igstTdsLedgerName,
+      exactMasterName(masters, saved?.transportTdsLedgerName || "", ["ledger", "tax_ledger"]) || baseReview.transportTdsLedgerName,
+    cgstTdsLedgerName: exactMasterName(masters, saved?.cgstTdsLedgerName || "", ["ledger", "tax_ledger"]) || baseReview.cgstTdsLedgerName,
+    sgstTdsLedgerName: exactMasterName(masters, saved?.sgstTdsLedgerName || "", ["ledger", "tax_ledger"]) || baseReview.sgstTdsLedgerName,
+    igstTdsLedgerName: exactMasterName(masters, saved?.igstTdsLedgerName || "", ["ledger", "tax_ledger"]) || baseReview.igstTdsLedgerName,
     tds194qRate: saved?.tds194qRate || saved?.tdsRate || baseReview.tds194qRate,
     applyTds194q:
       typeof saved?.applyTds194q === "boolean"
@@ -1078,8 +1187,8 @@ function buildDefaultReview(
       typeof saved?.applyGstTds === "boolean"
         ? saved.applyGstTds
         : baseReview.applyGstTds,
-    tcsLedgerName: saved?.tcsLedgerName || baseReview.tcsLedgerName,
-    roundOffLedgerName: saved?.roundOffLedgerName || baseReview.roundOffLedgerName,
+    tcsLedgerName: exactMasterName(masters, saved?.tcsLedgerName || "", ["ledger", "tax_ledger"]) || baseReview.tcsLedgerName,
+    roundOffLedgerName: exactMasterName(masters, saved?.roundOffLedgerName || "", ["ledger"]) || baseReview.roundOffLedgerName,
     roundOffAmount: moneyPaise(source.invoiceRoundOffAmount)
       ? saved?.roundOffAmount ?? baseReview.roundOffAmount
       : "",
@@ -1658,6 +1767,30 @@ export function preparePurchasePosting(params: {
         line.lineId
       ));
     }
+    const liveGodowns = activeMasters(params.masters).filter(
+      (master) => master.master_type === "godown"
+    );
+    if (
+      line.godownName &&
+      liveGodowns.length > 0 &&
+      !selectedMaster(params.masters, line.godownName, ["godown"])
+    ) {
+      blockers.push(issue(
+        "GODOWN_REQUIRED",
+        "Godown missing",
+        "Select an existing godown from the active Tally company.",
+        "line",
+        line.lineId
+      ));
+    } else if (source.godownName && !line.godownName) {
+      blockers.push(issue(
+        "GODOWN_REQUIRED",
+        "Godown missing",
+        `Select the live Tally godown matching ${source.godownName}.`,
+        "line",
+        line.lineId
+      ));
+    }
   }
 
   const gstRateBasisPoints = rateBasisPoints(review.gstRate);
@@ -1873,6 +2006,7 @@ export function preparePurchasePosting(params: {
   const tallyPayload = {
     companyName: params.companyName,
     voucherType: "Purchase",
+    voucherNumber: purchaseVoucherNumber(review.invoiceNumber, review.invoiceDate),
     supplierInvoiceNumber: review.invoiceNumber,
     supplierInvoiceDate: review.invoiceDate,
     voucherDate: review.voucherDate,
@@ -1898,6 +2032,8 @@ export function preparePurchasePosting(params: {
         unit: postingUnit,
         rate: line.rate,
         taxableAmount: line.taxableAmount || formatPaise(calculateLineTaxable(line)),
+        godownName: line.godownName,
+        batchName: line.batchName,
       };
     }),
     charges: [

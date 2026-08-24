@@ -228,6 +228,26 @@ async function handleConnectorResult(socket, message, meta) {
 
   if (item.phase === "scanning") {
     try {
+      // Match Meenakshi's fast display path: calculate from the live in-memory
+      // snapshot without waiting for connection/proposal database reads. The
+      // authoritative response below still validates the connection and
+      // reconciles confirmed debit-note history before enabling actions.
+      try {
+        const preview = await apiRequest("/api/collections/live/analyse-preview", {
+          accessToken: item.accessToken,
+          body: {
+            connectionId: item.connectionId,
+            companyName: message.companyName,
+            scan: message.data,
+          },
+        });
+        send(item.browser, { type: "preview", requestId, data: preview });
+      } catch (previewError) {
+        console.warn(
+          `Cash Discount preview failed for ${requestId}; continuing with authoritative analysis:`,
+          previewError instanceof Error ? previewError.message : previewError
+        );
+      }
       const dashboard = await apiRequest("/api/collections/live/analyse", {
         accessToken: item.accessToken,
         body: {

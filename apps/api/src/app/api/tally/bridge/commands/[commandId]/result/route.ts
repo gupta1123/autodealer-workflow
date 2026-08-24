@@ -54,6 +54,17 @@ function compactPurchaseResult(result: Record<string, unknown>) {
     ignored: result.ignored ?? null,
     cancelled: result.cancelled ?? null,
   };
+  const rawTimings = result.timings && typeof result.timings === "object"
+    ? result.timings as Record<string, unknown>
+    : {};
+  const timings = Object.fromEntries(
+    Object.entries(rawTimings).flatMap(([key, value]) => {
+      const milliseconds = Number(value);
+      return /^[a-z][a-zA-Z]*Ms$/.test(key) && Number.isFinite(milliseconds) && milliseconds >= 0
+        ? [[key, Math.round(milliseconds)]]
+        : [];
+    })
+  );
   return {
     verificationStatus: verification.verificationStatus ?? null,
     differences: Array.isArray(verification.differences)
@@ -77,6 +88,7 @@ function compactPurchaseResult(result: Record<string, unknown>) {
       positiveTallyId(result.lastVchId)
     ),
     importSummary,
+    timings,
     tallyResponse: toNullableText(result.response, 4000),
   };
 }
@@ -218,6 +230,20 @@ export async function POST(
     if (!commandData) {
       return jsonWithCors(request, { error: "Tally command not found." }, { status: 404 });
     }
+
+    // Completing a command proves that the paired connector is still alive.
+    // Purchase posting/read-back can exceed the 45-second heartbeat window;
+    // without this touch the UI incorrectly changes to "Tally unavailable"
+    // immediately after receiving a valid result.
+    const { error: connectionTouchError } = await supabase
+      .from("tally_connections")
+      .update({
+        last_heartbeat_at: now,
+        updated_at: now,
+      })
+      .eq("id", connection.id)
+      .is("revoked_at", null);
+    if (connectionTouchError) throw connectionTouchError;
 
     const command = {
       ...pendingCommand,

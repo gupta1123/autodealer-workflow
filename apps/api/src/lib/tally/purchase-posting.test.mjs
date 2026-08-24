@@ -38,7 +38,15 @@ const {
   preparePurchasePosting,
   getCanonicalInvoiceDocuments,
   getPurchaseInvoiceCandidates,
+  purchaseVoucherNumber,
 } = await loadPurchasePostingModule();
+
+test("purchase voucher number matches the frontend invoice/date reference", () => {
+  assert.equal(
+    purchaseVoucherNumber("SSTC/INV/26-27/G01", "2026-08-21"),
+    "SSTC/INV/26-27/G01 / 21-Aug-26"
+  );
+});
 
 const supplierGstin = "27AAAAA0000A1Z5";
 const maharashtraBuyerGstin = "27BBBBB0000B1Z5";
@@ -152,6 +160,25 @@ function prepare(document, options = {}) {
   return base;
 }
 
+test("invoice total after round-off is not mistaken for the round-off amount", () => {
+  const document = invoiceDocument({
+    totalAmount: "1179.60",
+    taxAmount: "180.00",
+    tdsAmount: "",
+  });
+  document.extracted_fields.roundOffAmount = "1179.60";
+  document.extracted_fields.cgstTdsAmount = "";
+  document.extracted_fields.sgstTdsAmount = "";
+  document.markdown = "Invoice total after round-off INR 1,179.60";
+
+  const result = prepare(document);
+
+  assert.equal(result.source.invoiceRoundOffAmount, "-0.40");
+  assert.equal(result.review.roundOffAmount, "-0.40");
+  assert.equal(result.calculation.roundOffAmount, "-0.40");
+  assert.equal(result.calculation.totalDifference, "0.00");
+});
+
 test("72044900 maps to the combined client stock and Maharashtra purchase rules", () => {
   const document = invoiceDocument();
   // Some invoices/OCR return the combined GST-TDS rate as 2%. Tally's
@@ -174,6 +201,38 @@ test("72044900 maps to the combined client stock and Maharashtra purchase rules"
     .filter((entry) => entry.kind === "cgst_tds" || entry.kind === "sgst_tds")
     .every((entry) => entry.rate === "1"));
   assert.equal(result.blockers.length, 0);
+});
+
+test("printed G02 godown is matched from live Tally and reaches the voucher payload", () => {
+  const document = invoiceDocument();
+  document.extracted_fields.termsAndConditions =
+    "PAYMENT TERMS: 30 days; STORAGE / DELIVERY LOCATION: Main Location; COMMERCIAL CLASSIFICATION: Local purchase";
+  document.markdown = `${document.markdown ?? ""}\n## Visible Text\nDELIVERY LOCATION Main Location SUPPLIER BATCH / LOT Not stated`;
+  const result = prepare(document, {
+    masters: [
+      ...completeMasters,
+      master("godown", "Main Location"),
+    ],
+  });
+
+  assert.equal(result.source.godownName, "Main Location");
+  assert.equal(result.review.lines[0].godownName, "Main Location");
+  assert.equal(result.tallyPayload.items[0].godownName, "Main Location");
+  assert.equal(result.tallyPayload.items[0].batchName, "");
+  assert.equal(result.blockers.some((blocker) => blocker.code === "GODOWN_REQUIRED"), false);
+});
+
+test("printed G02 godown auto-selects when the live godown catalogue is temporarily empty", () => {
+  const document = invoiceDocument();
+  document.extracted_fields.termsAndConditions =
+    "PAYMENT TERMS: 30 days; STORAGE / DELIVERY LOCATION: Main Location; COMMERCIAL CLASSIFICATION: Local purchase";
+
+  const result = prepare(document);
+
+  assert.equal(result.source.godownName, "Main Location");
+  assert.equal(result.review.lines[0].godownName, "Main Location");
+  assert.equal(result.tallyPayload.items[0].godownName, "Main Location");
+  assert.equal(result.blockers.some((blocker) => blocker.code === "GODOWN_REQUIRED"), false);
 });
 
 test("reviewer can disable all applicable GST TDS deductions for a voucher", () => {
