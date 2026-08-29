@@ -1,4 +1,5 @@
 import { apiFetch } from "@/lib/api-client";
+import { liveValidationMasterRow, liveValidationMetadata } from "@/lib/tally-purchase-live-envelope";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 
 export type TallyPostingIssue = {
@@ -528,25 +529,23 @@ export function prepareLiveTallyCatalogue(
     matching(/\b(input|purchase|gst|tds|tcs|tax|dut(?:y|ies)|freight|transport|round[ -]?off|roundoff)\b/i),
     20
   );
-  const compactLedgers = Array.from(compactByName.values()).map((value) => {
-    const row = liveRecord(value) ?? {};
-    return { ...row, groupPath: groupPath(row.parent) };
+  const ledgerOptionByName = new Map(ledgerOptions.map((option) => [liveKey(option.name), option]));
+  const compactLedgers = Array.from(compactByName.keys()).flatMap((key) => {
+    const option = ledgerOptionByName.get(key);
+    return option ? [liveValidationMasterRow(option)] : [];
   });
-  const compactStockItems = (Array.isArray(masters.stockItems) ? masters.stockItems : []).map((value) => {
-    const row = liveRecord(value) ?? {};
-    return { ...row, groupPath: groupPath(row.parent) };
-  });
+  const compactStockItems = stockItemOptions.map(liveValidationMasterRow);
 
   return {
     compactResult: {
-      ...result,
+      ...liveValidationMetadata(result),
       persisted: false,
       masters: {
         ledgers: compactLedgers,
         groups: [],
         stockItems: compactStockItems,
-        units: Array.isArray(masters.units) ? masters.units : [],
-        godowns: Array.isArray(masters.godowns) ? masters.godowns : [],
+        units: unitOptions.map(liveValidationMasterRow),
+        godowns: godownOptions.map(liveValidationMasterRow),
       },
     },
     masterOptions: {
@@ -600,50 +599,30 @@ export function prepareLiveTallyApprovalContext(
   );
 
   const selectedRows = (
-    existingValues: unknown,
     options: TallyMasterOption[],
     selectedNames: Set<string>
   ) => {
     const rows = new Map<string, Record<string, unknown>>();
-    for (const value of Array.isArray(existingValues) ? existingValues : []) {
-      const row = liveRecord(value);
-      const name = liveText(row?.name);
-      if (row && name && selectedNames.has(liveKey(name))) rows.set(liveKey(name), row);
-    }
     for (const option of options) {
       const key = liveKey(option.name);
-      if (!selectedNames.has(key) || rows.has(key)) continue;
-      rows.set(key, {
-        name: option.name,
-        guid: option.id.startsWith("live:") ? null : option.id,
-        parent: option.parent,
-        gstin: option.gstin,
-        hsnCode: option.hsnCode,
-        unitName: option.unitName,
-        taxRate: option.taxRate,
-        groupPath: option.groupPath,
-        taxType: option.taxType,
-        gstDutyHead: option.gstDutyHead,
-        closingBalance: option.closingBalance,
-        closingBalanceType: option.closingBalanceType,
-      });
+      if (!selectedNames.has(key)) continue;
+      rows.set(key, liveValidationMasterRow(option));
     }
     return Array.from(rows.values());
   };
 
   const approvalContext = {
-    ...result,
+    ...liveValidationMetadata(result),
     persisted: false,
     masters: {
-      ledgers: selectedRows(masters.ledgers, masterOptions.ledgers, selectedLedgerNames),
+      ledgers: selectedRows(masterOptions.ledgers, selectedLedgerNames),
       groups: [],
       stockItems: selectedRows(
-        masters.stockItems,
         masterOptions.stockItems,
         selectedStockItemNames
       ),
-      units: selectedRows(masters.units, masterOptions.units, selectedUnitNames),
-      godowns: selectedRows(masters.godowns, masterOptions.godowns, selectedGodownNames),
+      units: selectedRows(masterOptions.units, selectedUnitNames),
+      godowns: selectedRows(masterOptions.godowns, selectedGodownNames),
     },
   };
 
