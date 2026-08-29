@@ -8,7 +8,7 @@ import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.61";
+const BRIDGE_VERSION = "0.1.62";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
@@ -647,13 +647,24 @@ function buildLedgerEntryXml({
   amount,
   isDebit,
   isPartyLedger = false,
+  invoiceRate = null,
   bankAllocation = null,
   billAllocations = null,
   listTag = "ALLLEDGERENTRIES.LIST",
 }) {
   const signedAmount = isDebit ? `-${amount}` : amount;
+  const numericInvoiceRate = Number(invoiceRate);
+  const invoiceRateXml = Number.isFinite(numericInvoiceRate) && numericInvoiceRate !== 0
+    ? [
+        '<BASICRATEOFINVOICETAX.LIST TYPE="Number">',
+        `<BASICRATEOFINVOICETAX>${(-Math.abs(numericInvoiceRate)).toFixed(2)}</BASICRATEOFINVOICETAX>`,
+        "</BASICRATEOFINVOICETAX.LIST>",
+        "<ROUNDTYPE/>",
+      ].join("")
+    : "";
   return [
     `<${listTag}>`,
+    invoiceRateXml,
     `<LEDGERNAME>${escapeXml(ledgerName)}</LEDGERNAME>`,
     `<ISPARTYLEDGER>${isPartyLedger ? "Yes" : "No"}</ISPARTYLEDGER>`,
     "<REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>",
@@ -1140,6 +1151,7 @@ function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
         ledgerName: name,
         amount: amount.toFixed(2),
         isDebit: false,
+        invoiceRate: deduction?.rate,
         listTag: "LEDGERENTRIES.LIST",
       }));
     }

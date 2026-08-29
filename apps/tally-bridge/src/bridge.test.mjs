@@ -665,10 +665,10 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
       { kind: "sgst", name: "Input ITC SGST 9%", amount: 22590 },
     ],
     withholdings: [
-      { kind: "tds_194q", name: "TDS Payable @ 0.10% (194Q)", amount: 250 },
-      { kind: "transport_tds", name: "Tds on Goods Transport", amount: 10 },
-      { kind: "cgst_tds", name: "CGST TDS PAYABLE 1%", amount: 2500 },
-      { kind: "sgst_tds", name: "SGST TDS PAYABLE 1%", amount: 2500 },
+      { kind: "tds_194q", name: "TDS Payable @ 0.10% (194Q)", rate: "0.10", amount: 250 },
+      { kind: "transport_tds", name: "Tds on Goods Transport", rate: "0.10", amount: 10 },
+      { kind: "cgst_tds", name: "CGST TDS PAYABLE 1%", rate: "1", amount: 2500 },
+      { kind: "sgst_tds", name: "SGST TDS PAYABLE 1%", rate: "1", amount: 2500 },
     ],
     ledgers: {
       roundOff: { name: "Round Off", amount: -0.4 },
@@ -692,6 +692,14 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
   assert.match(xml, /<LEDGERNAME>Transportation Inward @ 18\.00%<\/LEDGERNAME>/);
   assert.match(xml, /<LEDGERNAME>TDS Payable @ 0\.10% \(194Q\)<\/LEDGERNAME>/);
   assert.match(xml, /<LEDGERNAME>CGST TDS PAYABLE 1%<\/LEDGERNAME>/);
+  assert.match(
+    xml,
+    /<BASICRATEOFINVOICETAX\.LIST TYPE="Number"><BASICRATEOFINVOICETAX>-0\.10<\/BASICRATEOFINVOICETAX><\/BASICRATEOFINVOICETAX\.LIST><ROUNDTYPE\/><LEDGERNAME>TDS Payable @ 0\.10% \(194Q\)<\/LEDGERNAME>/
+  );
+  assert.match(
+    xml,
+    /<BASICRATEOFINVOICETAX\.LIST TYPE="Number"><BASICRATEOFINVOICETAX>-1\.00<\/BASICRATEOFINVOICETAX><\/BASICRATEOFINVOICETAX\.LIST><ROUNDTYPE\/><LEDGERNAME>CGST TDS PAYABLE 1%<\/LEDGERNAME>/
+  );
   assert.ok(
     xml.indexOf("<LEDGERNAME>Input ITC SGST 9%</LEDGERNAME>") <
       xml.indexOf("<LEDGERNAME>TDS Payable @ 0.10% (194Q)</LEDGERNAME>")

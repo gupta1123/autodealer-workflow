@@ -12,12 +12,14 @@ KalikaSourceDocumentId     : String : 30004
 KalikaVehicleNumber        : String : 30005
 
 [#Form : VCH Display]
-Add : Button : Kalika Open Source PDF
+Add : Button : Kalika Purchase Source PDF Button 30001
 
 [#Form : Voucher]
-Add : Button : Kalika Open Source PDF
+Add : Button : Kalika Purchase Source PDF Button 30001
 
-[Button : Kalika Open Source PDF]
+;; Keep the definition name unique. Tally treats Button and Key definitions as
+;; the same family, so a generic name can collide with another loaded add-on.
+[Button : Kalika Purchase Source PDF Button 30001]
 Title    : "Open Source PDF"
 Key      : Ctrl + Alt + D
 Action   : BrowseURL Ex : $KalikaSourceDocumentPath
