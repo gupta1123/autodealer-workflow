@@ -203,6 +203,39 @@ test("72044900 maps to the combined client stock and Maharashtra purchase rules"
   assert.equal(result.blockers.length, 0);
 });
 
+test("supplier ledger cannot also be selected as an item purchase ledger", () => {
+  const document = invoiceDocument();
+  const initial = prepare(document);
+  const result = prepare(document, {
+    savedReview: {
+      ...initial.review,
+      lines: initial.review.lines.map((line) => ({
+        ...line,
+        purchaseLedgerName: initial.review.supplierLedgerName,
+      })),
+    },
+  });
+
+  assert.ok(
+    result.blockers.some((blocker) => blocker.code === "PURCHASE_LEDGER_MATCHES_SUPPLIER")
+  );
+});
+
+test("supplier ledger cannot be reused as an active tax ledger", () => {
+  const document = invoiceDocument();
+  const initial = prepare(document);
+  const result = prepare(document, {
+    savedReview: {
+      ...initial.review,
+      cgstLedgerName: initial.review.supplierLedgerName,
+    },
+  });
+
+  assert.ok(
+    result.blockers.some((blocker) => blocker.code === "SUPPLIER_LEDGER_ROLE_COLLISION")
+  );
+});
+
 test("printed G02 godown is matched from live Tally and reaches the voucher payload", () => {
   const document = invoiceDocument();
   document.extracted_fields.termsAndConditions =

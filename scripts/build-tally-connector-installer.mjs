@@ -13,7 +13,7 @@ const connector = {
   installDir: "C:\\Autodealer\\tally-bridge",
   runtimeEnvironmentVariable: "KALIKA_CONNECTOR_RUNTIME",
   runtimePackageName: "@autodealer/tally-bridge-runtime",
-  version: "0.1.56",
+  version: "0.1.57",
   tdlFileNames: [
     "kalika-native-debit-note-export.tdl",
     "kalika-purchase-document-attachment.tdl",
@@ -65,10 +65,22 @@ function validateSources() {
   for (const fileName of connector.tdlFileNames) {
     ensureFile(path.join(tdlSource, fileName), `Kalika TDL ${fileName}`);
   }
+  ensureContains(
+    path.join(tdlSource, connector.tdlFileNames[1]),
+    "Key      : Ctrl + Alt + D",
+    "Purchase document TDL safe shortcut"
+  );
+  ensureContains(
+    path.join(tdlSource, connector.tdlFileNames[1]),
+    "Action   : Browse URL Ex : $KalikaSourceDocumentPath",
+    "Purchase document TDL file action"
+  );
   ensureContains(dashboardSource, `${connector.protocolName}://connect`, "Kalika web connector protocol");
   ensureContains(bridgeSource, connector.configFolderName, "Kalika bridge configuration folder");
   ensureContains(innoDefinition, connector.connectorName, "Inno Setup product name");
   ensureContains(innoDefinition, connector.protocolName, "Inno Setup protocol");
+  ensureContains(innoDefinition, "PrivilegesRequired=admin", "Tally TDL installer elevation");
+  ensureContains(innoDefinition, "EnsureTdlConfigured", "Tally TDL configuration updater");
   ensureContains(path.join(electronAppSource, "main.mjs"), connector.connectorName, "Electron product name");
   console.log(`Installer sources validated for ${connector.connectorName} (${connector.protocolName}://).`);
 }

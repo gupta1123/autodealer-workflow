@@ -1,5 +1,5 @@
 #define AppName "Kalika Tally Connector"
-#define AppVersion "0.1.56"
+#define AppVersion "0.1.57"
 #define AppPublisher "Kalika"
 #define AppInstallDir "C:\Autodealer\tally-bridge"
 #define AppExeName "Kalika Tally Connector.exe"
@@ -22,7 +22,7 @@ OutputBaseFilename=KalikaTallyConnectorSetup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 Uninstallable=yes
 CloseApplications=yes
@@ -77,8 +77,60 @@ begin
     if CopyFile(SourceTdl, TargetTdl, False) then
       Log('Copied TDL to ' + TargetTdl)
     else
-      Log('Could not copy TDL to ' + TargetTdl + '; canonical copy remains at ' + SourceTdl);
+      RaiseException('Could not update the required Tally TDL: ' + TargetTdl);
   end;
+end;
+
+procedure EnsureTdlConfigured(const FileName: String);
+var
+  TallyIni: String;
+  TargetTdl: String;
+  TdlLine: String;
+  Lines: TArrayOfString;
+  I: Integer;
+  UserTdlFound: Boolean;
+  TdlFound: Boolean;
+begin
+  TallyIni := ExpandConstant('{pf}\TallyPrime\tally.ini');
+  TargetTdl := ExpandConstant('{pf}\TallyPrime\') + FileName;
+  TdlLine := 'TDL=' + TargetTdl;
+  if not FileExists(TallyIni) then
+    Exit;
+  if not LoadStringsFromFile(TallyIni, Lines) then
+    RaiseException('Could not read Tally configuration: ' + TallyIni);
+
+  UserTdlFound := False;
+  TdlFound := False;
+  for I := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    if CompareText(Trim(Lines[I]), 'User TDL=Yes') = 0 then
+      UserTdlFound := True
+    else if CompareText(Trim(Lines[I]), 'User TDL=No') = 0 then
+    begin
+      Lines[I] := 'User TDL=Yes';
+      UserTdlFound := True;
+    end;
+
+    if (Pos('tdl=', Lowercase(Trim(Lines[I]))) = 1) and
+       (Pos(Lowercase(FileName), Lowercase(Lines[I])) > 0) then
+    begin
+      Lines[I] := TdlLine;
+      TdlFound := True;
+    end;
+  end;
+
+  if not UserTdlFound then
+  begin
+    SetArrayLength(Lines, GetArrayLength(Lines) + 1);
+    Lines[GetArrayLength(Lines) - 1] := 'User TDL=Yes';
+  end;
+  if not TdlFound then
+  begin
+    SetArrayLength(Lines, GetArrayLength(Lines) + 1);
+    Lines[GetArrayLength(Lines) - 1] := TdlLine;
+  end;
+  if not SaveStringsToFile(TallyIni, Lines, False) then
+    RaiseException('Could not update Tally configuration: ' + TallyIni);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -87,5 +139,7 @@ begin
   begin
     CopyTdlToTally('{#DebitNoteTdl}');
     CopyTdlToTally('{#PurchaseDocumentTdl}');
+    EnsureTdlConfigured('{#DebitNoteTdl}');
+    EnsureTdlConfigured('{#PurchaseDocumentTdl}');
   end;
 end;

@@ -14,8 +14,11 @@ KalikaVehicleNumber        : String : 30005
 [#Form : VCH Display]
 Add : Button : Kalika Open Source PDF
 
+[#Form : Voucher]
+Add : Button : Kalika Open Source PDF
+
 [Button : Kalika Open Source PDF]
 Title    : "Open Source PDF"
-Key      : Alt + D
-Action   : Browse URL : $KalikaSourceDocumentPath
+Key      : Ctrl + Alt + D
+Action   : Browse URL Ex : $KalikaSourceDocumentPath
 Inactive : $$IsEmpty:$KalikaSourceDocumentPath

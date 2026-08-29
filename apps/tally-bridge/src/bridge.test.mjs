@@ -16,6 +16,7 @@ import {
   selectCashDiscountLedgers,
   fetchCustomerOpenBillsFromTally,
   exportTargetedBillEvidenceXml,
+  existingPurchaseVoucherAttachmentDifferences,
   openBillPendingFormula,
   parseTallyImportResult,
   openBillBlockRequiresVoucherFallback,
@@ -704,6 +705,39 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
   assert.match(xml, /<UDF:KALIKAVEHICLENUMBER[^>]*>MH11AL4972<\/UDF:KALIKAVEHICLENUMBER>/);
   assert.doesNotMatch(xml, /Source: https:\/\/app\.example/);
   assert.doesNotMatch(xml, /Posting: internal-posting-id/);
+  assert.equal(
+    [...xml.matchAll(/<LEDGERNAME>Vertex Industrial Supplies<\/LEDGERNAME>/g)].length,
+    1,
+    "the supplier must be represented by exactly one party ledger entry"
+  );
+  assert.ok(
+    xml.indexOf("<LEDGERNAME>Vertex Industrial Supplies</LEDGERNAME>") <
+      xml.indexOf("<ALLINVENTORYENTRIES.LIST>"),
+    "the supplier party entry must precede invoice allocations"
+  );
+});
+
+test("Purchase vouchers reject a supplier reused as another accounting ledger", () => {
+  assert.throws(
+    () => buildPurchaseVoucherXml({
+      companyName: "Solution Nyx",
+      voucherDate: "2026-08-21",
+      supplierInvoiceDate: "2026-08-20",
+      supplierInvoiceNumber: "TEST/ROLE-COLLISION",
+      supplierLedgerName: "Supplier A",
+      finalPayableAmount: 100,
+      items: [{
+        stockItemName: "MS Scrap",
+        purchaseLedgerName: "Supplier A",
+        hsn: "72044900",
+        quantity: 1,
+        unit: "MTS",
+        rate: 100,
+        taxableAmount: 100,
+      }],
+    }),
+    /selected as both the supplier and purchase ledger/i
+  );
 });
 
 test("Purchase vouchers only include an explicitly selected Tally godown", () => {
@@ -820,6 +854,13 @@ test("Purchase voucher verification includes the attached source PDF identity", 
   };
 
   assert.deepEqual(purchaseVoucherReadbackComparison(voucher, payload), []);
+  assert.ok(
+    existingPurchaseVoucherAttachmentDifferences(
+      { ...voucher, sourceDocumentPath: null },
+      payload
+    ).some((difference) => /pdf path was not attached/i.test(difference)),
+    "a duplicate voucher without the approved PDF must require attachment repair"
+  );
   assert.deepEqual(
     purchaseVoucherReadbackComparison(
       { ...voucher, voucherNumber: "3285" },
@@ -833,6 +874,15 @@ test("Purchase voucher verification includes the attached source PDF identity", 
       { ...voucher, sourceDocumentSha256: null },
       payload
     ).some((difference) => /checksum/i.test(difference))
+  );
+  assert.ok(
+    purchaseVoucherReadbackComparison(
+      {
+        ...voucher,
+        ledgerEntries: [...voucher.ledgerEntries, { ...voucher.ledgerEntries[0] }],
+      },
+      payload
+    ).some((difference) => /expected one supplier ledger allocation/i.test(difference))
   );
   assert.ok(
     purchaseVoucherReadbackComparison(

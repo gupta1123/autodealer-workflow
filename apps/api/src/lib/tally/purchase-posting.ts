@@ -1753,6 +1753,18 @@ export function preparePurchasePosting(params: {
         line.lineId
       ));
     }
+    if (
+      purchaseLedger &&
+      normalizeKey(purchaseLedger.tally_name) === normalizeKey(review.supplierLedgerName)
+    ) {
+      blockers.push(issue(
+        "PURCHASE_LEDGER_MATCHES_SUPPLIER",
+        "Purchase ledger cannot be the supplier",
+        "Select a Purchase Accounts ledger for the item. The supplier ledger is posted separately as the party payable.",
+        "line",
+        line.lineId
+      ));
+    }
     if (purchaseLedger && (
       purchaseLedger.parent_name &&
       !/purchase|direct\s*expense/i.test(
@@ -1995,6 +2007,43 @@ export function preparePurchasePosting(params: {
     blockers.push(issue("ROUND_OFF_LEDGER_REQUIRED", "Round-off ledger missing", "Select an existing round-off ledger.", "tax"));
   } else if (review.roundOffLedgerName && !hasMaster(params.masters, review.roundOffLedgerName, ["ledger"])) {
     blockers.push(issue("ROUND_OFF_LEDGER_REQUIRED", "Round-off ledger missing", "The selected round-off ledger is not present in the active Tally company.", "tax"));
+  }
+  const supplierLedgerKey = normalizeKey(review.supplierLedgerName);
+  const activeNonPartyLedgers = [
+    ...(freightAmount > 0 ? [{ role: "freight", name: review.freightLedgerName }] : []),
+    ...(calculation.taxMode === "cgst_sgst"
+      ? [
+        { role: "CGST", name: review.cgstLedgerName },
+        { role: "SGST", name: review.sgstLedgerName },
+      ]
+      : calculation.taxMode === "igst"
+        ? [{ role: "IGST", name: review.igstLedgerName }]
+        : []),
+    ...(purchaseGoodsTdsActive ? [{ role: "Section 194Q TDS", name: review.tds194qLedgerName }] : []),
+    ...(transportTdsActive ? [{ role: "transport TDS", name: review.transportTdsLedgerName }] : []),
+    ...(gstTdsActive && calculation.taxMode === "cgst_sgst"
+      ? [
+        { role: "CGST TDS", name: review.cgstTdsLedgerName },
+        { role: "SGST TDS", name: review.sgstTdsLedgerName },
+      ]
+      : gstTdsActive && calculation.taxMode === "igst"
+        ? [{ role: "IGST TDS", name: review.igstTdsLedgerName }]
+        : []),
+    ...(tcsReceivableActive ? [{ role: "TCS", name: review.tcsLedgerName }] : []),
+    ...(moneyPaise(calculation.roundOffAmount)
+      ? [{ role: "round-off", name: review.roundOffLedgerName }]
+      : []),
+  ].filter(
+    (entry) => entry.name && normalizeKey(entry.name) === supplierLedgerKey
+  );
+  if (activeNonPartyLedgers.length > 0) {
+    const roles = Array.from(new Set(activeNonPartyLedgers.map((entry) => entry.role)));
+    blockers.push(issue(
+      "SUPPLIER_LEDGER_ROLE_COLLISION",
+      "Supplier ledger is reused",
+      `Select separate ${roles.join(", ")} ledger${roles.length === 1 ? "" : "s"}. The supplier ledger is reserved for the final party payable.`,
+      "tax"
+    ));
   }
   if (!params.sourceDocumentReference) {
     blockers.push(issue("SOURCE_DOCUMENT_REQUIRED", "Source invoice unavailable", "The original invoice file must remain available from the Tally entry.", "source"));

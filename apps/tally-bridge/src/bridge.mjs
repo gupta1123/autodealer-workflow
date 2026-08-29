@@ -9,7 +9,7 @@ import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.56";
+const BRIDGE_VERSION = "0.1.57";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
@@ -1119,6 +1119,26 @@ function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
   const debitCharges = charges.length > 0
     ? charges
     : ["cgst", "sgst", "igst", "tcs"].map((key) => ledgers[key]).filter(Boolean);
+  const deductionEntries = withholdings.length > 0
+    ? withholdings
+    : ledgers.tds ? [ledgers.tds] : [];
+  const supplierIdentity = normalizeLooseName(supplierLedgerName);
+  const conflictingSupplierRoles = [
+    ...items.map((item) => ({ role: "purchase ledger", name: item?.purchaseLedgerName })),
+    ...debitCharges.map((entry) => ({ role: "charge or tax ledger", name: entry?.name })),
+    ...deductionEntries.map((entry) => ({ role: "withholding ledger", name: entry?.name })),
+    ...(ledgers.roundOff ? [{ role: "round-off ledger", name: ledgers.roundOff.name }] : []),
+  ].filter(
+    (entry) => entry.name && normalizeLooseName(entry.name) === supplierIdentity
+  );
+  if (conflictingSupplierRoles.length > 0) {
+    const roles = Array.from(new Set(conflictingSupplierRoles.map((entry) => entry.role)));
+    throw new Error(
+      `${supplierLedgerName} is selected as both the supplier and ${roles.join(" / ")}. ` +
+      "Choose a separate Purchase, tax, deduction, or round-off ledger before posting."
+    );
+  }
+
   for (const ledger of debitCharges) {
     if (!ledger) continue;
     const name = String(ledger.name || "").trim();
@@ -1132,9 +1152,6 @@ function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
     }));
   }
 
-  const deductionEntries = withholdings.length > 0
-    ? withholdings
-    : ledgers.tds ? [ledgers.tds] : [];
   for (const deduction of deductionEntries) {
     const name = String(deduction?.name || "").trim();
     const amount = toSignedMoney(deduction?.amount, "withholding amount", { allowZero: true });
@@ -1148,8 +1165,8 @@ function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
     }
   }
 
-  // Match the review preview: item lines, GST/charges, deductions,
-  // round-off, and finally the supplier payable.
+  // Match the review preview: item lines, GST/charges, deductions and
+  // round-off. The supplier party entry is emitted separately and first.
   const roundOff = ledgers.roundOff;
   if (roundOff) {
     const name = String(roundOff.name || "").trim();
@@ -1167,7 +1184,7 @@ function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
     }
   }
 
-  ledgerEntries.push(buildLedgerEntryXml({
+  const supplierLedgerEntry = buildLedgerEntryXml({
     ledgerName: supplierLedgerName,
     amount: finalPayable.toFixed(2),
     isDebit: false,
@@ -1184,7 +1201,7 @@ function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
       }],
       isDebit: false,
     }),
-  }));
+  });
 
   const message = [
     '<TALLYMESSAGE xmlns:UDF="TallyUDF">',
@@ -1205,8 +1222,13 @@ function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
     "<ISOPTIONAL>No</ISOPTIONAL>",
     "<DIFFACTUALQTY>No</DIFFACTUALQTY>",
     `<NARRATION>${escapeXml(narration)}</NARRATION>`,
-    ...inventoryEntries,
+    // Tally's invoice schema expects the party allocation before the other
+    // accounting and inventory allocations. If it arrives last, Tally can
+    // materialize PARTYLEDGERNAME first and treat the trailing party row as a
+    // second supplier allocation.
+    supplierLedgerEntry,
     ...ledgerEntries,
+    ...inventoryEntries,
     buildPurchaseDocumentUdfXml(payload),
     "</VOUCHER>",
     "</TALLYMESSAGE>",
@@ -1548,9 +1570,10 @@ function purchaseVoucherReadbackComparison(voucher, payload, options = {}) {
   const expectedItems = Array.isArray(payload?.items) ? payload.items : [];
   const actualItems = Array.isArray(voucher?.inventoryEntries) ? voucher.inventoryEntries : [];
   const expectedPayable = Number(payload?.finalPayableAmount);
-  const partyEntry = (voucher?.ledgerEntries || []).find(
+  const partyEntries = (voucher?.ledgerEntries || []).filter(
     (entry) => normalizeLooseName(entry.ledgerName) === normalizeLooseName(payload?.supplierLedgerName)
   );
+  const partyEntry = partyEntries[0];
   const expectedAllocations = [
     ...(Array.isArray(payload?.charges) ? payload.charges : []),
     ...(Array.isArray(payload?.withholdings) ? payload.withholdings : []),
@@ -1586,6 +1609,10 @@ function purchaseVoucherReadbackComparison(voucher, payload, options = {}) {
 
   if (!partyEntry) {
     differences.push("Supplier ledger allocation was not returned by Tally.");
+  } else if (partyEntries.length !== 1) {
+    differences.push(
+      `Expected one supplier ledger allocation, Tally returned ${partyEntries.length}.`
+    );
   } else if (Number.isFinite(expectedPayable) && Math.abs(Math.abs(Number(partyEntry.amount || 0)) - expectedPayable) > 0.01) {
     differences.push("Final supplier payable differs.");
   }
@@ -1677,6 +1704,13 @@ function purchaseVoucherReadbackComparison(voucher, payload, options = {}) {
   }
 
   return differences;
+}
+
+function existingPurchaseVoucherAttachmentDifferences(voucher, payload) {
+  return purchaseVoucherReadbackComparison(voucher, payload, {
+    ignoreVoucherDate: true,
+    ignoreBillDate: true,
+  });
 }
 
 function purchaseVoucherFinancialYearRange(value) {
@@ -1882,12 +1916,35 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName) {
   );
   if (preflight.result?.verificationStatus === "verified") {
     timings.totalMs = Date.now() - totalStartedAt;
+    const exactDifferences = existingPurchaseVoucherAttachmentDifferences(
+      preflight.result.voucher,
+      payload
+    );
+    if (exactDifferences.length > 0) {
+      return {
+        outcome: {
+          success: false,
+          error:
+            "The Purchase voucher already exists in Tally, but its source PDF attachment does not match. " +
+            "Repair the existing voucher instead of creating a duplicate.",
+          result: {
+            possibleDuplicateInTally: true,
+            attachmentRepairRequired: true,
+            differences: exactDifferences,
+            verification: preflight.result,
+            timings,
+          },
+        },
+        xml: null,
+      };
+    }
     return {
       outcome: {
         success: true,
         result: {
           ...preflight.result,
           alreadyInTally: true,
+          sourceDocumentVerified: Boolean(payload?.sourceDocumentPath),
           created: 0,
           altered: 0,
           timings,
@@ -1939,6 +1996,7 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName) {
             ...(importOutcome.result || {}),
             ...readback.result,
             verification: readback.result,
+            sourceDocumentVerified: Boolean(payload?.sourceDocumentPath),
             timings,
           },
         }
@@ -5061,7 +5119,10 @@ async function runCommand(config, command, options = {}) {
           caseId: command.payload?.caseId,
           revision: command.payload?.revision,
           idempotencyKey: command.payload?.idempotencyKey,
-          sourceDocumentAttached: Boolean(purchasePayload.sourceDocumentPath),
+          sourceDocumentAttached: Boolean(
+            purchasePayload.sourceDocumentPath &&
+            posted.outcome.result?.sourceDocumentVerified
+          ),
           sourceDocumentName: purchasePayload.sourceDocumentName || null,
           sourceDocumentSha256: purchasePayload.sourceDocumentSha256 || null,
           timings: {
@@ -6533,6 +6594,7 @@ export {
   disconnectBridge,
   exportTallyCollection,
   exportTargetedBillEvidenceXml,
+  existingPurchaseVoucherAttachmentDifferences,
   fetchAvailableCompanies,
   fetchBankLedgersFromTally,
   findBankLedgersFromMasters,
