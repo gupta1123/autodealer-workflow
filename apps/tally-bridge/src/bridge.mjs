@@ -9,7 +9,7 @@ import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.58";
+const BRIDGE_VERSION = "0.1.59";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
@@ -1222,10 +1222,9 @@ function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
     "<ISOPTIONAL>No</ISOPTIONAL>",
     "<DIFFACTUALQTY>No</DIFFACTUALQTY>",
     `<NARRATION>${escapeXml(narration)}</NARRATION>`,
-    // Solution Nyx rejects Item Invoice imports with a silent EXCEPTIONS=1
-    // when accounting allocations precede inventory allocations. Preserve the
-    // order accepted by Tally: inventory first, then the accounting rows. The
-    // role-collision guard above still guarantees a single supplier row.
+    // Preserve Tally's stored Item Invoice order: inventory first, then the
+    // accounting rows. The role-collision guard above still guarantees a
+    // single supplier row.
     ...inventoryEntries,
     ...ledgerEntries,
     supplierLedgerEntry,
@@ -1713,6 +1712,38 @@ function existingPurchaseVoucherAttachmentDifferences(voucher, payload) {
   });
 }
 
+function purchaseImportNeedsDefaultBatchRetry(outcome, payload) {
+  const result = outcome?.result || {};
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+  return (
+    !outcome?.success &&
+    Number(result.created ?? 0) === 0 &&
+    Number(result.altered ?? 0) === 0 &&
+    Number(result.errors ?? 0) === 0 &&
+    Number(result.exceptions ?? 0) > 0 &&
+    items.some((item) =>
+      !String(item?.godownName || "").trim() &&
+      !String(item?.batchName || "").trim()
+    )
+  );
+}
+
+function withDefaultPurchaseBatchAllocations(payload) {
+  return {
+    ...payload,
+    items: (Array.isArray(payload?.items) ? payload.items : []).map((item) => {
+      if (String(item?.godownName || "").trim() || String(item?.batchName || "").trim()) {
+        return item;
+      }
+      return {
+        ...item,
+        godownName: "Main Location",
+        batchName: "Primary Batch",
+      };
+    }),
+  };
+}
+
 function purchaseVoucherFinancialYearRange(value) {
   const normalized = normalizeTallyDate(value);
   const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -1972,13 +2003,30 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName) {
   await measure("masterValidation", () =>
     validatePurchasePayloadMasters(tallyUrl, companyName, payload)
   );
-  const xml = buildPurchaseVoucherXml(payload, companyName);
-  const importOutcome = requireCreatedVoucher(
+  let postingPayload = payload;
+  let xml = buildPurchaseVoucherXml(postingPayload, companyName);
+  let importOutcome = requireCreatedVoucher(
     await measure("voucherImport", () => invokeTallyXml(tallyUrl, xml))
   );
+  let retriedWithDefaultInventoryAllocation = false;
+  if (purchaseImportNeedsDefaultBatchRetry(importOutcome, postingPayload)) {
+    postingPayload = withDefaultPurchaseBatchAllocations(postingPayload);
+    xml = buildPurchaseVoucherXml(postingPayload, companyName);
+    importOutcome = requireCreatedVoucher(
+      await measure("voucherImportDefaultBatch", () => invokeTallyXml(tallyUrl, xml))
+    );
+    retriedWithDefaultInventoryAllocation = true;
+  }
   if (!importOutcome.success) {
+    const explained = explainVoucherTallyError(importOutcome, payload);
     return {
-      outcome: explainVoucherTallyError(importOutcome, payload),
+      outcome: {
+        ...explained,
+        result: {
+          ...(explained.result || {}),
+          retriedWithDefaultInventoryAllocation,
+        },
+      },
       xml,
     };
   }
@@ -1997,6 +2045,7 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName) {
             ...readback.result,
             verification: readback.result,
             sourceDocumentVerified: Boolean(payload?.sourceDocumentPath),
+            retriedWithDefaultInventoryAllocation,
             timings,
           },
         }
@@ -2007,6 +2056,7 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName) {
             ...(importOutcome.result || {}),
             voucherCreatedButVerificationFailed: true,
             verification: readback.result,
+            retriedWithDefaultInventoryAllocation,
             timings,
           },
         },
@@ -6606,6 +6656,7 @@ export {
   openBillBlockRequiresVoucherFallback,
   pairBridge,
   parseTallyImportResult,
+  purchaseImportNeedsDefaultBatchRetry,
   purchasePayloadMasterNames,
   purchaseVoucherFinancialYearRange,
   purchaseVoucherReadbackComparison,
@@ -6617,6 +6668,7 @@ export {
   testBridge,
   testTally,
   verifyPurchaseVoucherInTally,
+  withDefaultPurchaseBatchAllocations,
   writeConfig,
 };
 

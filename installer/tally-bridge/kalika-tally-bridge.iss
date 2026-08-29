@@ -1,5 +1,5 @@
 #define AppName "Kalika Tally Connector"
-#define AppVersion "0.1.58"
+#define AppVersion "0.1.59"
 #define AppPublisher "Kalika"
 #define AppInstallDir "C:\Autodealer\tally-bridge"
 #define AppExeName "Kalika Tally Connector.exe"
@@ -24,6 +24,7 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 Uninstallable=yes
 CloseApplications=yes
 RestartApplications=no
@@ -55,6 +56,16 @@ Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+function TallyInstallDir(): String;
+begin
+  if IsWin64 and DirExists(ExpandConstant('{pf64}\TallyPrime')) then
+    Result := ExpandConstant('{pf64}\TallyPrime')
+  else if DirExists(ExpandConstant('{pf32}\TallyPrime')) then
+    Result := ExpandConstant('{pf32}\TallyPrime')
+  else
+    Result := '';
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
@@ -69,7 +80,7 @@ var
   SourceTdl: String;
   TargetTdl: String;
 begin
-  TallyDir := ExpandConstant('{pf}\TallyPrime');
+  TallyDir := TallyInstallDir();
   SourceTdl := ExpandConstant('{app}\tdl\') + FileName;
   TargetTdl := TallyDir + '\' + FileName;
   if DirExists(TallyDir) and FileExists(SourceTdl) then
@@ -91,8 +102,10 @@ var
   UserTdlFound: Boolean;
   TdlFound: Boolean;
 begin
-  TallyIni := ExpandConstant('{pf}\TallyPrime\tally.ini');
-  TargetTdl := ExpandConstant('{pf}\TallyPrime\') + FileName;
+  if TallyInstallDir() = '' then
+    Exit;
+  TallyIni := TallyInstallDir() + '\tally.ini';
+  TargetTdl := TallyInstallDir() + '\' + FileName;
   TdlLine := 'TDL=' + TargetTdl;
   if not FileExists(TallyIni) then
     Exit;

@@ -21,10 +21,12 @@ import {
   parseTallyImportResult,
   openBillBlockRequiresVoucherFallback,
   parseLedgerClosingBalance,
+  purchaseImportNeedsDefaultBatchRetry,
   purchasePayloadMasterNames,
   purchaseVoucherFinancialYearRange,
   purchaseVoucherReadbackComparison,
   strictBankTransactionCandidates,
+  withDefaultPurchaseBatchAllocations,
 } from "./bridge.mjs";
 
 test("Supabase binary broadcast wake frames decode without financial payloads", () => {
@@ -765,6 +767,35 @@ test("Purchase vouchers only include an explicitly selected Tally godown", () =>
     xml,
     /<BATCHALLOCATIONS\.LIST><GODOWNNAME>Warehouse A<\/GODOWNNAME><BATCHNAME>Lot 1<\/BATCHNAME><DESTINATIONGODOWNNAME>Warehouse A<\/DESTINATIONGODOWNNAME>/
   );
+});
+
+test("silent Purchase import exceptions retry only missing inventory allocations", () => {
+  const payload = {
+    items: [
+      { stockItemName: "MS Scrap", godownName: "", batchName: "" },
+      { stockItemName: "Sponge Iron", godownName: "Scrap Yard", batchName: "Lot 7" },
+    ],
+  };
+  assert.equal(purchaseImportNeedsDefaultBatchRetry({
+    success: false,
+    result: { created: 0, altered: 0, errors: 0, exceptions: 1 },
+  }, payload), true);
+  assert.equal(purchaseImportNeedsDefaultBatchRetry({
+    success: false,
+    result: { created: 0, altered: 0, errors: 1, exceptions: 0 },
+  }, payload), false);
+  assert.deepEqual(withDefaultPurchaseBatchAllocations(payload).items, [
+    {
+      stockItemName: "MS Scrap",
+      godownName: "Main Location",
+      batchName: "Primary Batch",
+    },
+    {
+      stockItemName: "Sponge Iron",
+      godownName: "Scrap Yard",
+      batchName: "Lot 7",
+    },
+  ]);
 });
 
 test("Purchase duplicate checks cover the complete Indian financial year", () => {
