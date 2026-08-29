@@ -38,6 +38,7 @@ import {
   fetchTallyPurchasePosting,
   matchTallyPurchaseLineMasters,
   matchTallyPurchaseSupplierLedger,
+  prepareLiveTallyApprovalContext,
   prepareLiveTallyCatalogue,
   prepareTallyPurchasePostingFromLive,
   saveTallyPurchasePosting,
@@ -1440,13 +1441,21 @@ export function TallyPurchasePostingPanel({
       if (!liveMasterResultRef.current) {
         throw new Error("Refresh the live Tally data once before posting.");
       }
+      if (!liveMasterOptionsRef.current || !review) {
+        throw new Error("Refresh the live Tally data once before posting.");
+      }
+      const approvalContext = prepareLiveTallyApprovalContext(
+        liveMasterResultRef.current,
+        review,
+        liveMasterOptionsRef.current
+      );
       setNotice("Validating the selected masters and sending to Tally…");
       const next = await approveAndQueueTallyPurchasePosting(
         caseId,
         acknowledgementWarnings.map((warning) => warning.code),
         selectedConnectionId,
         selectedCompanyName,
-        liveMasterResultRef.current
+        approvalContext
       );
       const hydrated = withLiveMasterOptions(next);
       setPayload(hydrated);

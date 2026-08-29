@@ -558,6 +558,101 @@ export function prepareLiveTallyCatalogue(
   };
 }
 
+/**
+ * Approval only needs proof for the masters selected on this voucher. Keep the
+ * full searchable catalogue in browser memory, but send a small validation
+ * envelope through the hosted API proxy.
+ */
+export function prepareLiveTallyApprovalContext(
+  resultValue: unknown,
+  review: TallyPostingReview,
+  masterOptions: TallyPostingResponse["masterOptions"]
+) {
+  const result = liveRecord(resultValue);
+  const masters = liveRecord(result?.masters);
+  if (!result || result.source !== "live_tally" || !masters) {
+    throw new Error("Refresh the live Tally data before approving this voucher.");
+  }
+
+  const selectedLedgerNames = new Set([
+    review.supplierLedgerName,
+    review.cgstLedgerName,
+    review.sgstLedgerName,
+    review.igstLedgerName,
+    review.freightLedgerName,
+    review.tds194qLedgerName,
+    review.transportTdsLedgerName,
+    review.cgstTdsLedgerName,
+    review.sgstTdsLedgerName,
+    review.igstTdsLedgerName,
+    review.tcsLedgerName,
+    review.roundOffLedgerName,
+    ...review.lines.map((line) => line.purchaseLedgerName),
+  ].filter(Boolean).map(liveKey));
+  const selectedStockItemNames = new Set(
+    review.lines.map((line) => line.stockItemName).filter(Boolean).map(liveKey)
+  );
+  const selectedUnitNames = new Set(
+    review.lines.map((line) => line.unit).filter(Boolean).map(liveKey)
+  );
+  const selectedGodownNames = new Set(
+    review.lines.map((line) => line.godownName).filter(Boolean).map(liveKey)
+  );
+
+  const selectedRows = (
+    existingValues: unknown,
+    options: TallyMasterOption[],
+    selectedNames: Set<string>
+  ) => {
+    const rows = new Map<string, Record<string, unknown>>();
+    for (const value of Array.isArray(existingValues) ? existingValues : []) {
+      const row = liveRecord(value);
+      const name = liveText(row?.name);
+      if (row && name && selectedNames.has(liveKey(name))) rows.set(liveKey(name), row);
+    }
+    for (const option of options) {
+      const key = liveKey(option.name);
+      if (!selectedNames.has(key) || rows.has(key)) continue;
+      rows.set(key, {
+        name: option.name,
+        guid: option.id.startsWith("live:") ? null : option.id,
+        parent: option.parent,
+        gstin: option.gstin,
+        hsnCode: option.hsnCode,
+        unitName: option.unitName,
+        taxRate: option.taxRate,
+        groupPath: option.groupPath,
+        taxType: option.taxType,
+        gstDutyHead: option.gstDutyHead,
+        closingBalance: option.closingBalance,
+        closingBalanceType: option.closingBalanceType,
+      });
+    }
+    return Array.from(rows.values());
+  };
+
+  const approvalContext = {
+    ...result,
+    persisted: false,
+    masters: {
+      ledgers: selectedRows(masters.ledgers, masterOptions.ledgers, selectedLedgerNames),
+      groups: [],
+      stockItems: selectedRows(
+        masters.stockItems,
+        masterOptions.stockItems,
+        selectedStockItemNames
+      ),
+      units: selectedRows(masters.units, masterOptions.units, selectedUnitNames),
+      godowns: selectedRows(masters.godowns, masterOptions.godowns, selectedGodownNames),
+    },
+  };
+
+  if (JSON.stringify(approvalContext).length > 256 * 1024) {
+    throw new Error("The selected Tally validation data is unexpectedly large. Refresh and try again.");
+  }
+  return approvalContext;
+}
+
 async function readResponse(response: Response, fallback: string) {
   const raw = await response.text();
   let payload: Record<string, unknown> = {};
