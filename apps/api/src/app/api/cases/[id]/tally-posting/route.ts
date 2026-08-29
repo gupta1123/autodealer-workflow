@@ -626,8 +626,17 @@ async function loadContext(
       !row.revoked_at
     );
   const posting = postingResult.data as PostingRow | null;
-  const lockedConnectionId = isPostingLocked(posting?.status) ? posting?.connection_id : null;
   const usableConnectionIds = new Set(connections.map((candidate) => candidate.id));
+  // Keep an in-flight or completed posting on its original connector while that
+  // connector still exists. If it has been superseded/revoked, allow the page
+  // to recover onto the owner's current live connector instead of selecting an
+  // ID that was intentionally excluded above and returning a false 409.
+  const lockedConnectionId =
+    isPostingLocked(posting?.status) &&
+    posting?.connection_id &&
+    usableConnectionIds.has(posting.connection_id)
+      ? posting.connection_id
+      : null;
   const requestedUsableConnectionId =
     requestedConnectionId && usableConnectionIds.has(requestedConnectionId)
       ? requestedConnectionId

@@ -2,14 +2,13 @@
 
 import fs from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.59";
+const BRIDGE_VERSION = "0.1.60";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
@@ -51,30 +50,11 @@ function trustedCaCertificates() {
   }
   if (process.platform === "win32") {
     try {
-      const powershell = path.join(
-        process.env.SystemRoot || "C:\\Windows",
-        "System32",
-        "WindowsPowerShell",
-        "v1.0",
-        "powershell.exe"
-      );
-      const script = [
-        "$stores = @('Cert:\\CurrentUser\\Root','Cert:\\LocalMachine\\Root')",
-        "Get-ChildItem -Path $stores -ErrorAction SilentlyContinue | ForEach-Object {",
-        "'-----BEGIN CERTIFICATE-----'",
-        "[Convert]::ToBase64String($_.RawData, [Base64FormattingOptions]::InsertLineBreaks)",
-        "'-----END CERTIFICATE-----'",
-        "}",
-      ].join("; ");
-      const pem = execFileSync(
-        powershell,
-        ["-NoProfile", "-NonInteractive", "-Command", script],
-        { encoding: "utf8", windowsHide: true, timeout: 10_000 }
-      );
+      const pem = fs.readFileSync(path.join(CONFIG_DIR, "windows-ca-bundle.pem"), "utf8");
       certificates.push(...(pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || []));
     } catch {
-      // Bundled and Node-provided roots still cover machines without Windows
-      // PowerShell. A failed wake channel simply falls back to normal polling.
+      // Bundled and Node-provided roots remain available before the desktop
+      // wrapper creates the Windows trust bundle on first launch.
     }
   }
   cachedTrustedCaCertificates = [...new Set(certificates)];

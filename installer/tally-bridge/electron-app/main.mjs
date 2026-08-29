@@ -1,5 +1,7 @@
 import { app, BrowserWindow, dialog } from "electron";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pairBridge, createBridgeRunner, disconnectBridge } from "./src/bridge.mjs";
@@ -12,6 +14,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const installDir = path.resolve(__dirname, "..", "..");
 const logPath = path.join(installDir, "bridge.log");
 const errPath = path.join(installDir, "bridge.err.log");
+const WINDOWS_CA_READY = "KALIKA_CONNECTOR_WINDOWS_CA_READY";
 
 let mainWindow = null;
 let runner = null;
@@ -21,6 +24,82 @@ let lastStatus = {
   detail: "Open Kalika and click Connect.",
   state: "idle",
 };
+
+function relaunchWithWindowsCertificateStore() {
+  if (process.platform !== "win32" || process.env[WINDOWS_CA_READY] === "1") {
+    return false;
+  }
+
+  try {
+    const configDir = path.join(os.homedir(), ".autodealer-tally-bridge");
+    const certificatePath = path.join(configDir, "windows-ca-bundle.pem");
+    const powershell = path.join(
+      process.env.SystemRoot || "C:\\Windows",
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe"
+    );
+    const windowsModulePath = path.join(
+      process.env.SystemRoot || "C:\\Windows",
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "Modules"
+    );
+    const exporter = path.join(installDir, "powershell", "export-windows-ca.ps1");
+    fs.mkdirSync(configDir, { recursive: true });
+    execFileSync(
+      powershell,
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        exporter,
+        "-OutputPath",
+        certificatePath,
+      ],
+      {
+        windowsHide: true,
+        timeout: 10_000,
+        env: {
+          ...process.env,
+          PSModulePath: [windowsModulePath, process.env.PSModulePath].filter(Boolean).join(";"),
+        },
+      }
+    );
+    if (!fs.readFileSync(certificatePath, "utf8").includes("-----BEGIN CERTIFICATE-----")) {
+      return false;
+    }
+
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      detached: true,
+      windowsHide: false,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        NODE_EXTRA_CA_CERTS: certificatePath,
+        [WINDOWS_CA_READY]: "1",
+      },
+    });
+    child.unref();
+    return true;
+  } catch (error) {
+    try {
+      fs.appendFileSync(
+        path.join(installDir, "bridge.bootstrap.log"),
+        `[${new Date().toISOString()}] ${error instanceof Error ? error.stack || error.message : String(error)}\n`
+      );
+    } catch {
+      // The normal connector window remains the fallback error surface.
+    }
+    // Public certificate authorities remain available if Windows certificate
+    // export is restricted. The connector UI will surface any network error.
+    return false;
+  }
+}
 
 function appendLog(filePath, message) {
   const line = `[${new Date().toISOString()}] ${message}\n`;
@@ -237,13 +316,15 @@ function createWindow() {
   });
 }
 
-app.setName(CONNECTOR_NAME);
-app.setAppUserModelId(APP_USER_MODEL_ID);
+function startApplication() {
+  app.setName(CONNECTOR_NAME);
+  app.setAppUserModelId(APP_USER_MODEL_ID);
 
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
-  app.quit();
-} else {
+  const gotLock = app.requestSingleInstanceLock();
+  if (!gotLock) {
+    app.quit();
+    return;
+  }
   app.setAsDefaultProtocolClient(PROTOCOL_NAME);
   app.on("second-instance", (_event, argv) => {
     const protocolArg = argv.find((entry) => entry.startsWith("kalika-tally://"));
@@ -273,4 +354,10 @@ if (!gotLock) {
   app.on("window-all-closed", (event) => {
     event.preventDefault();
   });
+}
+
+if (relaunchWithWindowsCertificateStore()) {
+  app.exit(0);
+} else {
+  startApplication();
 }
