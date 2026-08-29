@@ -20,5 +20,5 @@ Add : Button : Kalika Open Source PDF
 [Button : Kalika Open Source PDF]
 Title    : "Open Source PDF"
 Key      : Ctrl + Alt + D
-Action   : Browse URL Ex : $KalikaSourceDocumentPath
+Action   : BrowseURL Ex : $KalikaSourceDocumentPath
 Inactive : $$IsEmpty:$KalikaSourceDocumentPath

@@ -13,7 +13,7 @@ const connector = {
   installDir: "C:\\Autodealer\\tally-bridge",
   runtimeEnvironmentVariable: "KALIKA_CONNECTOR_RUNTIME",
   runtimePackageName: "@autodealer/tally-bridge-runtime",
-  version: "0.1.60",
+  version: "0.1.61",
   tdlFileNames: [
     "kalika-native-debit-note-export.tdl",
     "kalika-purchase-document-attachment.tdl",
@@ -73,7 +73,7 @@ function validateSources() {
   );
   ensureContains(
     path.join(tdlSource, connector.tdlFileNames[1]),
-    "Action   : Browse URL Ex : $KalikaSourceDocumentPath",
+    "Action   : BrowseURL Ex : $KalikaSourceDocumentPath",
     "Purchase document TDL file action"
   );
   ensureContains(dashboardSource, `${connector.protocolName}://connect`, "Kalika web connector protocol");

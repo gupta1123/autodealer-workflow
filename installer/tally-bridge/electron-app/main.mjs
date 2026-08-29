@@ -25,6 +25,14 @@ let lastStatus = {
   state: "idle",
 };
 
+function hasWindowsCertificateBundle(filePath) {
+  try {
+    return fs.readFileSync(filePath, "utf8").includes("-----BEGIN CERTIFICATE-----");
+  } catch {
+    return false;
+  }
+}
+
 function relaunchWithWindowsCertificateStore() {
   if (process.platform !== "win32" || process.env[WINDOWS_CA_READY] === "1") {
     return false;
@@ -49,28 +57,34 @@ function relaunchWithWindowsCertificateStore() {
     );
     const exporter = path.join(installDir, "powershell", "export-windows-ca.ps1");
     fs.mkdirSync(configDir, { recursive: true });
-    execFileSync(
-      powershell,
-      [
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        exporter,
-        "-OutputPath",
-        certificatePath,
-      ],
-      {
-        windowsHide: true,
-        timeout: 10_000,
-        env: {
-          ...process.env,
-          PSModulePath: [windowsModulePath, process.env.PSModulePath].filter(Boolean).join(";"),
+    // Reuse the previously exported Windows trust store. Importing the
+    // certificate provider can take longer than ten seconds on some machines,
+    // and making every launch wait for it caused the connector to fall back to
+    // Electron's incomplete CA set even when a valid bundle already existed.
+    if (!hasWindowsCertificateBundle(certificatePath)) {
+      execFileSync(
+        powershell,
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          exporter,
+          "-OutputPath",
+          certificatePath,
+        ],
+        {
+          windowsHide: true,
+          timeout: 30_000,
+          env: {
+            ...process.env,
+            PSModulePath: [windowsModulePath, process.env.PSModulePath].filter(Boolean).join(";"),
+          },
         },
-      }
-    );
-    if (!fs.readFileSync(certificatePath, "utf8").includes("-----BEGIN CERTIFICATE-----")) {
+      );
+    }
+    if (!hasWindowsCertificateBundle(certificatePath)) {
       return false;
     }
 

@@ -8,7 +8,7 @@ import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.60";
+const BRIDGE_VERSION = "0.1.61";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
@@ -1202,12 +1202,14 @@ function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
     "<ISOPTIONAL>No</ISOPTIONAL>",
     "<DIFFACTUALQTY>No</DIFFACTUALQTY>",
     `<NARRATION>${escapeXml(narration)}</NARRATION>`,
-    // Preserve Tally's stored Item Invoice order: inventory first, then the
-    // accounting rows. The role-collision guard above still guarantees a
-    // single supplier row.
+    // Tally's canonical Invoice Voucher XML puts the party allocation before
+    // inventory and charge rows. PARTYLEDGERNAME alone is not enough because
+    // bill allocations belong to this entry. Keeping it first lets Tally bind
+    // it to the Party A/c header instead of rendering it as an extra line at
+    // the bottom of the Item Invoice form.
+    supplierLedgerEntry,
     ...inventoryEntries,
     ...ledgerEntries,
-    supplierLedgerEntry,
     buildPurchaseDocumentUdfXml(payload),
     "</VOUCHER>",
     "</TALLYMESSAGE>",
