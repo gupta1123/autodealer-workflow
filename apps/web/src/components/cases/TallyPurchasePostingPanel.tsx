@@ -1719,7 +1719,9 @@ export function TallyPurchasePostingPanel({
     : 0;
   const savedTcsAmount = Number(calculation?.tcsAmount || 0);
   const liveTcsDelta = liveTcsAmount - (Number.isFinite(savedTcsAmount) ? savedTcsAmount : 0);
+  const liveCalculatedInvoiceTotal = Number(calculation?.calculatedInvoiceTotal || 0) + liveTcsDelta;
   const liveCalculatedPayable = Number(calculation?.calculatedPayable || 0) + liveTcsDelta;
+  const liveWithholdingTotal = Number(calculation?.totalWithholdingAmount || 0);
   const liveTotalDifference = Number(calculation?.totalDifference || 0) + liveTcsDelta;
   const halfInvoiceGst = invoiceTaxKnown
     ? String(Number(payload.source?.invoiceTaxAmount) / 2)
@@ -2688,8 +2690,13 @@ export function TallyPurchasePostingPanel({
                   <span>Narration</span>
                   <strong className="whitespace-pre-wrap">: &nbsp; {review.narration || "No narration"}</strong>
                 </div>
-                <div className="mt-4 ml-auto grid w-[46%] min-w-[360px] grid-cols-2 border-y border-[#9da5b2] py-1 font-bold">
-                  <span className="text-center tabular-nums">{previewQuantityLabel}</span>
+                <div className="mt-4 ml-auto grid w-[62%] min-w-[520px] grid-cols-[minmax(120px,1fr)_180px_145px] items-center border-y border-[#9da5b2] py-1 font-bold">
+                  <span className="row-span-3 text-center tabular-nums">{previewQuantityLabel}</span>
+                  <span className="text-right text-[10px] uppercase tracking-wide text-[#657186]">Supplier invoice total</span>
+                  <span className="text-right tabular-nums">{tallyAmount(String(liveCalculatedInvoiceTotal))}</span>
+                  <span className="text-right text-[10px] uppercase tracking-wide text-[#657186]">Less: TDS / withholding</span>
+                  <span className="text-right tabular-nums">{tallyAmount(String(liveWithholdingTotal), { credit: true })}</span>
+                  <span className="text-right text-[10px] uppercase tracking-wide">Net payable</span>
                   <span className="text-right text-[14px] tabular-nums">{tallyAmount(String(liveCalculatedPayable))}</span>
                 </div>
               </div>
@@ -2698,7 +2705,7 @@ export function TallyPurchasePostingPanel({
           <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-500">
             <span>Purchase number: {purchaseReference}</span>
             <span className={`font-semibold ${Math.abs(liveTotalDifference) > 1 ? "text-rose-600" : "text-emerald-700"}`}>
-              Invoice difference {money(String(liveTotalDifference))}
+              Supplier invoice difference {money(String(liveTotalDifference))}
             </span>
           </div>
         </div>

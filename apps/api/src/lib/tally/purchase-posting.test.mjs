@@ -1191,6 +1191,42 @@ test("linked E-Way date enables automatic intrastate GST TDS for qualifying scra
   );
 });
 
+test("supplier invoice total stays separate from the post-TDS payable", () => {
+  const document = invoiceDocument({
+    totalAmount: "492980.00",
+    taxAmount: "75200.40",
+    tdsAmount: "",
+    lines: [{
+      description: "MS SCRAP",
+      hsnSac: "72044900",
+      quantity: "12.66",
+      unit: "MT",
+      rate: "33000.00",
+      taxableAmount: "417780.00",
+      taxAmount: "75200.40",
+    }],
+  });
+  document.extracted_fields.documentDate = "2026-08-11";
+  document.extracted_fields.roundOffAmount = "-0.40";
+  delete document.extracted_fields.cgstTdsAmount;
+  delete document.extracted_fields.sgstTdsAmount;
+
+  const result = prepare(document, {
+    savedReview: {
+      sourceReferenceApproved: true,
+      applyTds194q: true,
+      tds194qRate: "0.1",
+      tds194qRounding: "nearest_rupee",
+    },
+  });
+
+  assert.equal(result.calculation.roundOffAmount, "-0.40");
+  assert.equal(result.calculation.calculatedInvoiceTotal, "492980.00");
+  assert.equal(result.calculation.totalWithholdingAmount, "8773.60");
+  assert.equal(result.calculation.calculatedPayable, "484206.40");
+  assert.equal(result.calculation.totalDifference, "0.00");
+});
+
 test("printed GST, 194Q, and GST TDS reconcile as separate deductions", () => {
   const document = invoiceDocument({
     totalAmount: "289750.00",

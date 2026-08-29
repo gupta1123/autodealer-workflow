@@ -236,6 +236,7 @@ export type TallyPostingResponse = {
     totalWithholdingAmount: string;
     tcsAmount: string;
     roundOffAmount: string;
+    calculatedInvoiceTotal: string;
     calculatedPayable: string;
     invoiceTotal: string;
     totalDifference: string;

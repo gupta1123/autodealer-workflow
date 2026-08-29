@@ -198,6 +198,7 @@ export type PurchasePostingCalculation = {
   totalWithholdingAmount: string;
   tcsAmount: string;
   roundOffAmount: string;
+  calculatedInvoiceTotal: string;
   calculatedPayable: string;
   invoiceTotal: string;
   totalDifference: string;
@@ -1482,6 +1483,7 @@ function calculate(
     totalWithholdingAmount: formatPaise(totalWithholding),
     tcsAmount: formatPaise(tcs),
     roundOffAmount: formatPaise(roundOff),
+    calculatedInvoiceTotal: formatPaise(grossInvoiceAmount),
     calculatedPayable: formatPaise(payable),
     invoiceTotal: formatPaise(invoiceTotal),
     totalDifference: formatPaise(reconciliationAmount - invoiceTotal),
