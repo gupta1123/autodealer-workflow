@@ -9,7 +9,7 @@ import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 
-const BRIDGE_VERSION = "0.1.57";
+const BRIDGE_VERSION = "0.1.58";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
@@ -1222,13 +1222,13 @@ function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
     "<ISOPTIONAL>No</ISOPTIONAL>",
     "<DIFFACTUALQTY>No</DIFFACTUALQTY>",
     `<NARRATION>${escapeXml(narration)}</NARRATION>`,
-    // Tally's invoice schema expects the party allocation before the other
-    // accounting and inventory allocations. If it arrives last, Tally can
-    // materialize PARTYLEDGERNAME first and treat the trailing party row as a
-    // second supplier allocation.
-    supplierLedgerEntry,
-    ...ledgerEntries,
+    // Solution Nyx rejects Item Invoice imports with a silent EXCEPTIONS=1
+    // when accounting allocations precede inventory allocations. Preserve the
+    // order accepted by Tally: inventory first, then the accounting rows. The
+    // role-collision guard above still guarantees a single supplier row.
     ...inventoryEntries,
+    ...ledgerEntries,
+    supplierLedgerEntry,
     buildPurchaseDocumentUdfXml(payload),
     "</VOUCHER>",
     "</TALLYMESSAGE>",

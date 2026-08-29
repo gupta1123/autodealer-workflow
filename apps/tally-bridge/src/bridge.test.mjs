@@ -711,9 +711,9 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
     "the supplier must be represented by exactly one party ledger entry"
   );
   assert.ok(
-    xml.indexOf("<LEDGERNAME>Vertex Industrial Supplies</LEDGERNAME>") <
-      xml.indexOf("<ALLINVENTORYENTRIES.LIST>"),
-    "the supplier party entry must precede invoice allocations"
+    xml.indexOf("<ALLINVENTORYENTRIES.LIST>") <
+      xml.indexOf("<LEDGERNAME>Vertex Industrial Supplies</LEDGERNAME>"),
+    "inventory allocations must precede the supplier party entry for Item Invoice imports"
   );
 });
 
