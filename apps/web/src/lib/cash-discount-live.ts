@@ -13,6 +13,7 @@ type LiveRequest = {
   customerScope?: Record<string, unknown>;
   onProgress?: (message: string) => void;
   onPreview?: (data: unknown) => void;
+  signal?: AbortSignal;
 };
 
 type LiveResult<T> = {
@@ -25,6 +26,8 @@ type LiveResult<T> = {
 };
 
 type PendingRequest = {
+  operation: LiveRequest["operation"];
+  cleanup: () => void;
   resolve: (data: unknown) => void;
   reject: (error: Error) => void;
   onProgress?: (message: string) => void;
@@ -43,6 +46,7 @@ type BrowserLiveSession = {
   readySettled: boolean;
   ended: boolean;
   pending: Map<string, PendingRequest>;
+  authTimeout?: number;
 };
 
 const SESSION_MAX_AGE_MS = 2 * 60_000;
@@ -89,12 +93,14 @@ function liveGatewayUrl() {
 function endSession(session: BrowserLiveSession, error: Error) {
   if (session.ended) return;
   session.ended = true;
+  window.clearTimeout(session.authTimeout);
   if (!session.readySettled) {
     session.readySettled = true;
     session.rejectReady(error);
   }
   for (const pending of session.pending.values()) {
     window.clearTimeout(pending.timeout);
+    pending.cleanup();
     pending.reject(error);
   }
   session.pending.clear();
@@ -102,6 +108,11 @@ function endSession(session: BrowserLiveSession, error: Error) {
 }
 
 function closeSession(session: BrowserLiveSession) {
+  for (const [requestId, pending] of session.pending) {
+    if (pending.operation === "scan" && session.socket.readyState === WebSocket.OPEN) {
+      session.socket.send(JSON.stringify({ type: "cancel", requestId }));
+    }
+  }
   endSession(session, new Error("The previous live Tally session was replaced."));
   if (session.socket.readyState === WebSocket.OPEN || session.socket.readyState === WebSocket.CONNECTING) {
     session.socket.close(1000, "Session refreshed");
@@ -148,6 +159,7 @@ function createSession(params: {
     try {
       const message = JSON.parse(String(event.data ?? "{}")) as LiveResult<unknown>;
       if (message.type === "authenticated") {
+        window.clearTimeout(session.authTimeout);
         if (!session.readySettled) {
           session.readySettled = true;
           session.resolveReady();
@@ -163,6 +175,7 @@ function createSession(params: {
         pending.onPreview?.(message.data);
       } else if (message.type === "result" && pending) {
         window.clearTimeout(pending.timeout);
+        pending.cleanup();
         session.pending.delete(requestId);
         if (message.success === true) pending.resolve(message.data);
         else pending.reject(new Error(message.error || "The live Tally request failed."));
@@ -179,6 +192,10 @@ function createSession(params: {
   socket.addEventListener("close", () => {
     endSession(session, new Error("The live Cash Discount channel closed before the request completed."));
   });
+  session.authTimeout = window.setTimeout(() => {
+    endSession(session, new Error("Live Tally connection timed out. Check the connector and retry."));
+    socket.close();
+  }, 15_000);
   return session;
 }
 
@@ -194,7 +211,7 @@ async function getLiveSession(request: LiveRequest) {
     !cachedSession.ended &&
     cachedSession.key === key &&
     cachedSession.token === token &&
-    Date.now() - cachedSession.createdAt < SESSION_MAX_AGE_MS &&
+    (Date.now() - cachedSession.createdAt < SESSION_MAX_AGE_MS || cachedSession.pending.size > 0) &&
     (cachedSession.socket.readyState === WebSocket.CONNECTING || cachedSession.socket.readyState === WebSocket.OPEN);
   if (reusable) return cachedSession as BrowserLiveSession;
   if (cachedSession) closeSession(cachedSession);
@@ -211,24 +228,44 @@ async function getLiveSession(request: LiveRequest) {
 }
 
 export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
+  request.signal?.throwIfAborted();
   const session = await getLiveSession(request);
   await session.ready;
+  request.signal?.throwIfAborted();
   return new Promise<T>((resolve, reject) => {
     const requestId = crypto.randomUUID();
+    const cancel = () => {
+      const pending = session.pending.get(requestId);
+      if (!pending) return;
+      window.clearTimeout(pending.timeout);
+      pending.cleanup();
+      session.pending.delete(requestId);
+      if (request.operation === "scan" && session.socket.readyState === WebSocket.OPEN) {
+        session.socket.send(JSON.stringify({ type: "cancel", requestId }));
+      }
+      reject(request.signal?.reason || new Error("Cash Discount scan cancelled."));
+    };
     const timeout = window.setTimeout(
       () => {
+        if (request.operation === "scan" && session.socket.readyState === WebSocket.OPEN) {
+          session.socket.send(JSON.stringify({ type: "cancel", requestId }));
+        }
+        request.signal?.removeEventListener("abort", cancel);
         session.pending.delete(requestId);
         reject(new Error("The live Tally request timed out. Check the connector and try again."));
       },
       4 * 60_000
     );
     session.pending.set(requestId, {
+      operation: request.operation,
+      cleanup: () => request.signal?.removeEventListener("abort", cancel),
       resolve: (data) => resolve(data as T),
       reject,
       onProgress: request.onProgress,
       onPreview: request.onPreview,
       timeout,
     });
+    request.signal?.addEventListener("abort", cancel, { once: true });
     session.socket.send(JSON.stringify({
       type: "request",
       requestId,

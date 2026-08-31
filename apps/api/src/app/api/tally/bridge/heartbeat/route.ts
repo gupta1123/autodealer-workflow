@@ -163,6 +163,7 @@ export async function POST(request: Request) {
         companyName: companyLoaded ? companyName : null,
         error: errorMessage,
         companies,
+        livenessOnly: body.livenessOnly === true,
       });
 
       if (!connection) {
@@ -170,6 +171,7 @@ export async function POST(request: Request) {
       }
 
       return jsonWithCors(request, {
+        livenessSupported: true,
         connection: serializeTallyConnectionStatus(connection),
       });
     }
@@ -225,6 +227,16 @@ export async function POST(request: Request) {
     }
 
     const now = new Date().toISOString();
+    // An alive connector is not a new Tally/company observation. While a read
+    // owns Tally's HTTP queue, update ONLY liveness and preserve last_tested_at.
+    if (body.livenessOnly === true) {
+      const { data: live, error: liveError } = await supabase.from("tally_connections")
+        .update({ last_heartbeat_at: now, bridge_version: bridgeVersion })
+        .eq("id", connection.id).eq("installation_id", bridgeMachineId).is("revoked_at", null)
+        .select(TALLY_CONNECTION_SELECT).single();
+      if (liveError) throw liveError;
+      return jsonWithCors(request, { livenessSupported: true, connection: serializeTallyConnectionStatus(live as unknown as TallyConnectionRow) });
+    }
     const resolvedCompanyName = companyLoaded ? companyName : null;
     const heartbeatStateChanged =
       connection.status !== status ||
@@ -281,6 +293,7 @@ export async function POST(request: Request) {
     }
 
     return jsonWithCors(request, {
+      livenessSupported: true,
       connection: serializeTallyConnectionStatus(updatedData as unknown as TallyConnectionRow),
     });
   } catch (error) {

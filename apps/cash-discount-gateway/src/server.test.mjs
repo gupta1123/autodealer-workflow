@@ -70,6 +70,7 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
     role: "connector",
     connectionId: "connection-1",
     token: "bridge-token",
+    bridgeVersion: "0.1.63",
   }));
   await nextMessage(connector, (message) => message.type === "authenticated");
 
@@ -161,11 +162,6 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
     data: { financialYear: "2026-27", ledgers: [], openBillsResult: {} },
   }));
 
-  const preview = await nextMessage(
-    browser,
-    (message) => message.type === "preview" && message.requestId === "request-1"
-  );
-  assert.equal(preview.data.preview, true);
   const result = await nextMessage(browser, (message) => message.type === "result");
   assert.equal(result.success, true);
   assert.deepEqual(result.data.tabs.cashDiscountTracker, []);
@@ -199,7 +195,18 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
   // scans; repeat refreshes do not re-run the live-session database checks.
   assert.equal(requests.filter((request) => request.url === "/api/collections/live/session").length, 2);
   assert.equal(requests.filter((request) => request.url === "/api/collections/live/analyse").length, 2);
-  assert.equal(requests.filter((request) => request.url === "/api/collections/live/analyse-preview").length, 2);
+  assert.equal(requests.filter((request) => request.url === "/api/collections/live/analyse-preview").length, 0);
+
+  browser.send(JSON.stringify({ type: "request", requestId: "cancel-1", operation: "scan", companyName: "Solution Nyx" }));
+  await nextMessage(connector, (message) => message.requestId === "cancel-1");
+  browser.send(JSON.stringify({ type: "request", requestId: "duplicate", operation: "scan", companyName: "Solution Nyx" }));
+  const duplicate = await nextMessage(browser, (message) => message.requestId === "duplicate");
+  assert.match(duplicate.error, /already running/);
+  const cancelledOnConnector = nextMessage(connector, (message) => message.type === "cancel" && message.requestId === "cancel-1");
+  const cancelledOnBrowser = nextMessage(browser, (message) => message.type === "result" && message.requestId === "cancel-1");
+  browser.send(JSON.stringify({ type: "cancel", requestId: "cancel-1" }));
+  await cancelledOnConnector;
+  assert.match((await cancelledOnBrowser).error, /cancelled/);
 
   browser.close();
   connector.close();

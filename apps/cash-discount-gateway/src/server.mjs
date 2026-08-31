@@ -23,7 +23,7 @@ function closeWithError(socket, message, code = 1008) {
   socket.close(code, message.slice(0, 120));
 }
 
-async function apiRequest(path, { accessToken, bridgeToken, body }) {
+async function apiRequest(path, { accessToken, bridgeToken, body, signal }) {
   const headers = { "Content-Type": "application/json" };
   if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
   if (bridgeToken) headers["X-Bridge-Token"] = bridgeToken;
@@ -31,6 +31,7 @@ async function apiRequest(path, { accessToken, bridgeToken, body }) {
     method: "POST",
     headers,
     body: JSON.stringify(body),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(25_000)]) : AbortSignal.timeout(25_000),
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -46,11 +47,16 @@ function clearPending(requestId) {
   if (!item) return null;
   clearTimeout(item.timeout);
   pending.delete(requestId);
+  item.controller.abort();
   if (item.debitNoteKey) activeDebitNotes.delete(item.debitNoteKey);
   return item;
 }
 
 function failPending(requestId, error) {
+  const active = pending.get(requestId);
+  if (active && ["scanning", "revalidating", "company_check"].includes(active.phase)) {
+    send(active.connector, { type: "cancel", requestId });
+  }
   const item = clearPending(requestId);
   if (!item) return;
   send(item.browser, {
@@ -64,6 +70,8 @@ function failPending(requestId, error) {
 function startPending({ requestId, browser, connector, connectionId, ownerUserId, accessToken, operation, proposal, payload }) {
   const timeout = setTimeout(() => failPending(requestId, new Error("The live Tally request timed out.")), REQUEST_TIMEOUT_MS);
   const item = {
+    controller: new AbortController(),
+    startedAt: Date.now(),
     requestId,
     browser,
     connector,
@@ -119,6 +127,7 @@ async function authenticate(socket, message) {
       ? session.customerScopes
       : null,
     defaultCustomerScope: session.defaultCustomerScope ?? null,
+    bridgeVersion: String(message.bridgeVersion || session.bridgeVersion || ""),
   };
   metadata.set(socket, meta);
 
@@ -154,6 +163,17 @@ async function handleBrowserRequest(socket, message, meta) {
   }
 
   const proposal = message.proposal && typeof message.proposal === "object" ? message.proposal : null;
+  if (["scan", "create_debit_note"].includes(operation)) {
+    const version = /^(\d+)\.(\d+)\.(\d+)$/.exec(connectorMeta.bridgeVersion);
+    if (!version || (Number(version[1]) === 0 && (Number(version[2]) < 1 || (Number(version[2]) === 1 && Number(version[3]) < 63)))) {
+      send(socket, { type: "result", requestId, success: false, error: "Install Kalika Tally Connector 0.1.63 or later on the Tally PC before scanning Cash Discounts." });
+      return;
+    }
+    if ([...pending.values()].some((item) => item.connectionId === meta.connectionId && ["scan", "create_debit_note"].includes(item.operation))) {
+      send(socket, { type: "result", requestId, success: false, error: "A Cash Discount scan or debit note is already running on this connector. Wait or cancel the current scan." });
+      return;
+    }
+  }
   const debitNoteKey = operation === "create_debit_note"
     ? `${meta.connectionId}|${String(proposal?.partyLedgerName ?? "").trim().toLowerCase()}|${String(proposal?.linkedInvoiceNumber ?? "").trim().toLowerCase()}`
     : null;
@@ -179,6 +199,7 @@ async function handleBrowserRequest(socket, message, meta) {
   send(connector, {
     type: "operation",
     requestId,
+    deadlineAt: Date.now() + 90_000,
       operation: operation === "company_check"
         ? "company_check"
         : operation === "bank_ledgers"
@@ -228,34 +249,18 @@ async function handleConnectorResult(socket, message, meta) {
 
   if (item.phase === "scanning") {
     try {
-      // Match Meenakshi's fast display path: calculate from the live in-memory
-      // snapshot without waiting for connection/proposal database reads. The
-      // authoritative response below still validates the connection and
-      // reconciles confirmed debit-note history before enabling actions.
-      try {
-        const preview = await apiRequest("/api/collections/live/analyse-preview", {
-          accessToken: item.accessToken,
-          body: {
-            connectionId: item.connectionId,
-            companyName: message.companyName,
-            scan: message.data,
-          },
-        });
-        send(item.browser, { type: "preview", requestId, data: preview });
-      } catch (previewError) {
-        console.warn(
-          `Cash Discount preview failed for ${requestId}; continuing with authoritative analysis:`,
-          previewError instanceof Error ? previewError.message : previewError
-        );
-      }
+      send(item.browser, { type: "progress", requestId, message: "Tally read finished. Checking debit-note history and calculating results..." });
       const dashboard = await apiRequest("/api/collections/live/analyse", {
         accessToken: item.accessToken,
+        signal: item.controller.signal,
         body: {
           connectionId: item.connectionId,
           companyName: message.companyName,
           scan: message.data,
         },
       });
+      if (!pending.has(requestId)) return;
+      console.log(`Cash Discount scan ${requestId} completed in ${Date.now() - item.startedAt} ms (gateway total).`);
       clearPending(requestId);
       send(item.browser, { type: "result", requestId, success: true, data: dashboard });
     } catch (error) {
@@ -268,6 +273,7 @@ async function handleConnectorResult(socket, message, meta) {
     try {
       const prepared = await apiRequest("/api/collections/live/prepare-debit-note", {
         accessToken: item.accessToken,
+        signal: item.controller.signal,
         body: {
           connectionId: item.connectionId,
           companyName: message.companyName,
@@ -347,6 +353,10 @@ export function startCashDiscountGateway(options = {}) {
       }
       if (message.type === "request" && meta.role === "browser") {
         await handleBrowserRequest(socket, message, meta);
+      } else if (message.type === "cancel" && meta.role === "browser") {
+        const item = pending.get(String(message.requestId || ""));
+        // Never automatically cancel a financial write with an unknown outcome.
+        if (item?.browser === socket && item.operation === "scan") failPending(item.requestId, new Error("Cash Discount scan cancelled."));
       } else if (message.type === "operation_result" && meta.role === "connector") {
         await handleConnectorResult(socket, message, meta);
       } else if (message.type === "progress" && meta.role === "connector") {
@@ -365,7 +375,8 @@ export function startCashDiscountGateway(options = {}) {
     const meta = metadata.get(socket);
     if (meta?.role === "connector" && connectors.get(meta.connectionId) === socket) connectors.delete(meta.connectionId);
     for (const [requestId, item] of pending) {
-      if (item.browser === socket) clearPending(requestId);
+      if (item.browser === socket && item.operation === "scan") failPending(requestId, new Error("Browser disconnected; scan cancelled."));
+      else if (item.browser === socket && item.operation !== "create_debit_note") clearPending(requestId);
       else if (item.connector === socket) failPending(requestId, new Error("The Tally connector disconnected during the live request."));
     }
   });

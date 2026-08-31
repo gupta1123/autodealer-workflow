@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildCollectionExportXml,
+  collectCashDiscountCustomerEvidence,
   buildBankVoucherXml,
   buildPurchaseVoucherXml,
   buildRequestedLedgerFormula,
@@ -308,7 +309,7 @@ test("complete targeted Bill data avoids the voucher fallback", async () => {
   assert.equal(result.result.queryDiagnostics.voucherFallbackUsed, false);
 });
 
-test("cash discount reuses its open-bills-first export and reads one compact voucher collection", async () => {
+test("cash discount reuses discovery and reads only the customer's native voucher collection", async () => {
   const calls = [];
   const billXml = '<ENVELOPE><STATUS>1</STATUS><BILL NAME="INV-1"><LEDGERNAME>Customer A</LEDGERNAME><BILLTYPE>New Ref</BILLTYPE><DATE>20260801</DATE><OPENINGBALANCE>500</OPENINGBALANCE><CLOSINGBALANCE>500</CLOSINGBALANCE></BILL></ENVELOPE>';
   const result = await fetchCustomerOpenBillsFromTally(
@@ -324,18 +325,19 @@ test("cash discount reuses its open-bills-first export and reads one compact vou
     }
   );
 
-  assert.deepEqual(calls.map((call) => call.tallyType), ["Voucher"]);
-  assert.equal(calls[0].collectionName, "Kalika Cash Discount Voucher Evidence");
+  assert.deepEqual(calls.map((call) => call.tallyType), ["Vouchers : Ledger"]);
+  assert.equal(calls[0].childOf, '"Customer A"');
+  assert.equal(calls[0].collectionName, "Kalika Cash Discount Ledger Evidence");
   assert.equal(calls[0].timeoutMs, 20_000);
   assert.deepEqual(calls[0].filterNames, undefined);
   assert.equal(result.result.queryDiagnostics.billQueryMode, "open_bills_first");
   assert.equal(result.result.queryDiagnostics.voucherEvidenceMode, "required");
-  assert.equal(result.result.queryDiagnostics.voucherQueryMode, "compact_full_period");
+  assert.equal(result.result.queryDiagnostics.voucherQueryMode, "ledger_scoped");
   assert.equal(result.result.queryDiagnostics.voucherBatchCount, 1);
   assert.equal(result.result.openBills[0].narration, "1% cash discount within 15 days");
 });
 
-test("cash discount scans a full financial year and many customers in one voucher request", async () => {
+test("cash discount reads many customers sequentially without a company-wide voucher scan", async () => {
   const calls = [];
   const ledgerNames = Array.from({ length: 45 }, (_, index) => `Customer ${index + 1}`);
   const billXml = ledgerNames.map((ledgerName, index) =>
@@ -363,11 +365,12 @@ test("cash discount scans a full financial year and many customers in one vouche
     }
   );
 
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 45);
+  assert.ok(calls.every((call) => call.tallyType === "Vouchers : Ledger" && call.childOf && !call.filterNames));
   assert.equal(calls[0].dateFrom, "2026-04-01");
   assert.equal(calls[0].dateTo, "2027-03-31");
   assert.equal(result.result.queryDiagnostics.requestedLedgerCount, 45);
-  assert.equal(result.result.queryDiagnostics.voucherBatchCount, 1);
+  assert.equal(result.result.queryDiagnostics.voucherBatchCount, 45);
   assert.equal(result.result.queryDiagnostics.voucherDateChunkCount, 1);
 });
 

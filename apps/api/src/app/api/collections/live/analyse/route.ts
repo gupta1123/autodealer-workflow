@@ -74,7 +74,7 @@ export async function POST(request: Request) {
         proposalWithLedgerSnapshot(proposal, ledgerByName.get(normalizeLedgerName(proposal.party_ledger_name)))
       )
     );
-    return jsonWithCors(request, analyseLiveCashDiscountSnapshot({
+    const dashboard = analyseLiveCashDiscountSnapshot({
       connectionId,
       companyName,
       financialYear,
@@ -83,7 +83,8 @@ export async function POST(request: Request) {
       createdProposals,
       connectionStatus: connection.status,
       lastHeartbeatAt: connection.last_heartbeat_at,
-    }));
+    });
+    return jsonWithCors(request, { ...dashboard, scanSummary: scan.scanSummary ?? null });
   } catch (error) {
     console.error("Error in POST /api/collections/live/analyse:", error);
     return jsonWithCors(request, {

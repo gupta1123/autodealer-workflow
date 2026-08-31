@@ -249,6 +249,7 @@ function isLiveTallyCompanyMatch(
 }
 
 type DashboardPayload = {
+  scanSummary?: { complete: boolean; completed: number; total: number; elapsedMs: number; resumable?: boolean; reused?: number; failures: Array<{ ledgerName: string; error: string }> };
   setupRequired?: boolean;
   preview?: boolean;
   error?: string;
@@ -681,6 +682,8 @@ export function CollectionsDashboardPage({
   const [whatsappDialogSending, setWhatsappDialogSending] = useState(false);
   const [message, setMessage] = useState<{ tone: "success" | "error" | "info"; text: string } | null>(null);
   const initialLoadStartedRef = useRef(false);
+  const activeScanRef = useRef<AbortController | null>(null);
+  useEffect(() => () => activeScanRef.current?.abort(new Error("Cash Discount page closed.")), []);
   const lastLoadedConnectionRef = useRef("");
 
   const selectedCompany = useMemo(
@@ -780,17 +783,22 @@ export function CollectionsDashboardPage({
   }, []);
 
   const refreshTallyOpenBills = useCallback(
-    async (connectionId: string, companyName?: string | null, financialYear?: string | null) => {
+    async (connectionId: string, companyName?: string | null, financialYear?: string | null, resume = false) => {
       const resolvedCompanyName = String(companyName ?? "").trim();
       if (!connectionId || !resolvedCompanyName) {
         throw new Error("Select the live Tally company before refreshing Cash Discounts.");
       }
-      setMessage({ tone: "info", text: "Checking eligible candidates…" });
-      return runCashDiscountLiveRequest<DashboardPayload>({
+      if (activeScanRef.current) throw new Error("A Cash Discount scan is already running. Wait or cancel it before refreshing.");
+      const controller = new AbortController();
+      activeScanRef.current = controller;
+      setMessage({ tone: "info", text: "Connected—reading eligible customers from Tally…" });
+      try { return await runCashDiscountLiveRequest<DashboardPayload>({
+        signal: controller.signal,
         connectionId,
         companyName: resolvedCompanyName,
         financialYear,
         operation: "scan",
+        payload: { resume },
         onProgress: (progressMessage) => {
           setMessage({ tone: "info", text: progressMessage });
         },
@@ -798,7 +806,9 @@ export function CollectionsDashboardPage({
           setDashboard(preview as DashboardPayload);
           setMessage({ tone: "info", text: "Live Cash Discount results are ready. Confirming debit-note history…" });
         },
-      });
+      }); } finally {
+        if (activeScanRef.current === controller) activeScanRef.current = null;
+      }
     },
     []
   );
@@ -844,6 +854,7 @@ export function CollectionsDashboardPage({
 
   const refreshAll = useCallback(
     async (options?: { quiet?: boolean; refreshTally?: boolean }) => {
+      if (activeScanRef.current) return;
       try {
         if (!options?.quiet) setLoading(true);
         setMessage(null);
@@ -928,6 +939,10 @@ export function CollectionsDashboardPage({
   }
 
   async function approveProposal(proposal: DebitNoteProposal) {
+    if (activeScanRef.current) {
+      setMessage({ tone: "error", text: "Wait for the current scan to finish before creating a debit note." });
+      return;
+    }
     if (!tallyCompanyVerified) {
       setMessage({ tone: "error", text: `Tally is open to ${activeTallyCompanyName || "another company"}. Switch it to ${selectedCompany?.companyName || "the selected company"}, refresh, then create the debit note.` });
       return;
@@ -1002,10 +1017,7 @@ export function CollectionsDashboardPage({
     } else if (!payload.ready) {
       throw new Error("The native Tally PDF export could not be started.");
     }
-    if (selectedConnectionId) {
-      const nextDashboard = await refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName, selectedCompany?.financialYear);
-      setDashboard(nextDashboard);
-    }
+    if (selectedConnectionId) await refreshCreatedDebitNotesFromStore(selectedConnectionId);
     return { ...(payload.proposal ?? proposal), nativeTallyPdfVerified: true };
   }
 
@@ -1423,6 +1435,9 @@ export function CollectionsDashboardPage({
             <select
               className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
               onChange={(event) => {
+                activeScanRef.current?.abort(new Error("Company selection changed. Refresh to scan the selected company."));
+                lastLoadedConnectionRef.current = "";
+                setDashboard(null);
                 const company = companies.find((item) => item.id === event.target.value) ?? null;
                 setSelectedCompanyId(event.target.value);
                 setSelectedConnectionId(company?.connectionId || "");
@@ -1468,6 +1483,7 @@ export function CollectionsDashboardPage({
 
           <button
             className="inline-flex h-9 w-fit items-center justify-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
+            disabled={loading || Boolean(activeScanRef.current)}
             onClick={() => void refreshAll()}
             type="button"
           >
@@ -1476,6 +1492,27 @@ export function CollectionsDashboardPage({
           </button>
         </div>
       </header>
+
+      {activeScanRef.current ? (
+        <button type="button" className="mb-3 rounded-lg border px-3 py-1 text-xs" onClick={() =>
+          activeScanRef.current?.abort(new Error("Scan cancelled. Tally may still be finishing its current read; wait before retrying."))}>
+          Cancel scan
+        </button>
+      ) : null}
+      {dashboard?.scanSummary?.complete === false ? (
+        <div role="alert" className="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">
+          <p>{dashboard.scanSummary.completed}/{dashboard.scanSummary.total} customers checked. Remaining customers need review; no missing evidence has been treated as zero.</p>
+          {dashboard.scanSummary.resumable ? <button type="button" className="mt-2 rounded-lg border px-3 py-1" disabled={Boolean(activeScanRef.current)} onClick={() => {
+            void refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName, selectedCompany?.financialYear, true)
+              .then((value) => { setDashboard(value); setMessage(null); })
+              .catch((error) => setMessage({ tone: "error", text: error.message }));
+          }}>Continue remaining customers</button> : null}
+          <details className="mt-2"><summary>Customers not checked</summary>
+            <ul>{dashboard.scanSummary.failures.map((failure) => <li key={failure.ledgerName}>{failure.ledgerName}: {failure.error}</li>)}</ul>
+          </details>
+        </div>
+      ) : null}
+      {Boolean(dashboard?.scanSummary?.reused) ? <p className="mb-3 text-xs text-slate-600">{dashboard?.scanSummary?.reused} completed customer results reused from this recent scan. Refresh checks everything again; posting always performs a fresh invoice check.</p> : null}
 
       {message?.tone === "info" ? (
         <div
@@ -1669,7 +1706,7 @@ export function CollectionsDashboardPage({
                   </thead>
                   <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
                     {pagedPendingProposals.map((proposal) => {
-                      const createEnabled = dashboard?.preview !== true && tallyCompanyVerified && canCreateInTally(proposal);
+                      const createEnabled = !activeScanRef.current && dashboard?.preview !== true && tallyCompanyVerified && canCreateInTally(proposal);
                       const displayAmount = proposal.recoverableAmount;
 
                       return (
@@ -1771,7 +1808,7 @@ export function CollectionsDashboardPage({
               </div>
               <div className="divide-y divide-[#e5ddd0] xl:hidden">
                 {pagedPendingProposals.map((proposal) => {
-                  const createEnabled = dashboard?.preview !== true && tallyCompanyVerified && canCreateInTally(proposal);
+                  const createEnabled = !activeScanRef.current && dashboard?.preview !== true && tallyCompanyVerified && canCreateInTally(proposal);
                   const displayAmount = proposal.recoverableAmount;
 
                   return (

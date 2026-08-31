@@ -134,6 +134,7 @@ export function serializeTallyConnectionStatus(row: TallyConnectionRow) {
     : 0;
   const revoked = Boolean(row.revoked_at);
   const bridgeStale = !lastHeartbeatAt || Date.now() - lastHeartbeatAt > 45_000;
+  const observationStale = !row.last_tested_at || Date.now() - Date.parse(row.last_tested_at) > 45_000;
   const companyDetectionReliable = connectorSupportsReliableActiveCompany(row.bridge_version);
   const connectorUpdateRequired =
     !revoked && !bridgeStale && Boolean(row.paired_at) && !companyDetectionReliable;
@@ -164,9 +165,10 @@ export function serializeTallyConnectionStatus(row: TallyConnectionRow) {
     bridgeConnected:
       !revoked && !bridgeStale && companyDetectionReliable && Boolean(row.paired_at),
     tallyReachable:
-      !revoked && !bridgeStale && companyDetectionReliable && row.last_tally_reachable === true,
+      !revoked && !bridgeStale && !observationStale && companyDetectionReliable && row.last_tally_reachable === true,
     companyLoaded:
-      !revoked && !bridgeStale && companyDetectionReliable && row.last_company_loaded === true,
+      !revoked && !bridgeStale && !observationStale && companyDetectionReliable && row.last_company_loaded === true,
+    tallyObservationStale: observationStale,
     heartbeatStale: !revoked && Boolean(row.paired_at) && bridgeStale,
     connectorUpdateRequired,
     revoked,

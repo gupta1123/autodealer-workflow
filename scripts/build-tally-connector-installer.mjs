@@ -13,7 +13,7 @@ const connector = {
   installDir: "C:\\Autodealer\\tally-bridge",
   runtimeEnvironmentVariable: "KALIKA_CONNECTOR_RUNTIME",
   runtimePackageName: "@autodealer/tally-bridge-runtime",
-  version: "0.1.62",
+  version: "0.1.63",
   tdlFileNames: [
     "kalika-native-debit-note-export.tdl",
     "kalika-purchase-document-attachment.tdl",
@@ -59,6 +59,7 @@ function ensureContains(filePath, expected, label) {
 
 function validateSources() {
   ensureFile(bridgeSource, "Tally bridge source");
+  ensureFile(path.join(bridgeRoot, "src", "cash-discount-runtime.mjs"), "Cash Discount runtime");
   ensureFile(path.join(electronAppSource, "main.mjs"), "Electron wrapper");
   ensureFile(path.join(electronAppSource, "package.json"), "Electron wrapper package");
   ensureFile(path.join(wsPackageSource, "package.json"), "ws runtime package");
@@ -87,6 +88,8 @@ function validateSources() {
 }
 
 function resetDir(dir) {
+  const resolved = path.resolve(dir);
+  if (resolved !== path.resolve(installerRoot, "payload-clean")) throw new Error("Refusing to reset a non-installer directory.");
   fs.rmSync(dir, { recursive: true, force: true });
   fs.mkdirSync(dir, { recursive: true });
 }
@@ -184,6 +187,7 @@ fs.mkdirSync(path.join(appDir, "src"), { recursive: true });
 fs.copyFileSync(path.join(electronAppSource, "main.mjs"), path.join(appDir, "main.mjs"));
 fs.copyFileSync(path.join(electronAppSource, "package.json"), path.join(appDir, "package.json"));
 fs.copyFileSync(bridgeSource, path.join(appDir, "src", "bridge.mjs"));
+fs.copyFileSync(path.join(bridgeRoot, "src", "cash-discount-runtime.mjs"), path.join(appDir, "src", "cash-discount-runtime.mjs"));
 copyDir(wsPackageSource, path.join(appDir, "node_modules", "ws"));
 fs.writeFileSync(
   path.join(payloadDir, "package.json"),

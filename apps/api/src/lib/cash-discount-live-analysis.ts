@@ -67,10 +67,11 @@ export function analyseLiveCashDiscountSnapshot(params: {
     ? params.openBillsResult.result as Record<string, unknown>
     : params.openBillsResult;
   const byLedger = result?.byLedger && typeof result.byLedger === "object"
-    ? result.byLedger as Record<string, { ledgerName?: string | null; openBills?: OpenBillRow[] }>
+    ? result.byLedger as Record<string, { ledgerName?: string | null; openBills?: OpenBillRow[]; complete?: boolean }>
     : {};
 
   for (const [bucketLedgerName, bucket] of Object.entries(byLedger)) {
+    if (bucket.complete === false) continue;
     for (const bill of Array.isArray(bucket?.openBills) ? bucket.openBills : []) {
       const ledgerName = toText(bill.ledgerName ?? bucket?.ledgerName ?? bucketLedgerName, 500);
       const billKey = `${normalizeLedgerName(ledgerName)}|${normalizeLedgerName(bill.referenceName)}|${normalizeLedgerName(bill.voucherNumber)}`;

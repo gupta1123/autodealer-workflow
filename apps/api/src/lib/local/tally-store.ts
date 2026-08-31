@@ -312,6 +312,7 @@ export async function getLocalConnectionForBridge(
 }
 
 export async function updateLocalTallyHeartbeat(input: {
+  livenessOnly?: boolean;
   connectionId: string;
   token: string;
   status: TallyConnectionStatus;
@@ -343,6 +344,13 @@ export async function updateLocalTallyHeartbeat(input: {
   }
 
   const now = nowIso();
+  if (input.livenessOnly) {
+    row.last_heartbeat_at = now;
+    row.bridge_version = input.bridgeVersion || row.bridge_version;
+    row.updated_at = now;
+    await writeState(state);
+    return publicConnection(row);
+  }
   row.status = input.status;
   row.tally_url = input.tallyUrl || row.tally_url;
   row.bridge_version = input.bridgeVersion || row.bridge_version;

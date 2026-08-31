@@ -51,6 +51,9 @@ export async function POST(request: Request) {
     if (!connectionId || !companyName || !partyLedgerName || !linkedInvoiceNumber || !openBillsResult) {
       return jsonWithCors(request, { error: "The live Debit Note recheck is incomplete." }, { status: 400 });
     }
+    if (scan.scanSummary && typeof scan.scanSummary === "object" && (scan.scanSummary as Record<string, unknown>).complete === false) {
+      return jsonWithCors(request, { error: "The invoice recheck is incomplete. Refresh before creating a debit note." }, { status: 409 });
+    }
 
     const supabase = createSupabaseAdminClient();
     const [{ data: connection, error: connectionError }, { data: createdRows, error: createdRowsError }] =

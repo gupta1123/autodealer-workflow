@@ -7,8 +7,10 @@ import path from "node:path";
 import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
+import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallyScheduler, createCashDiscountResultCache,
+  CASH_DISCOUNT_READ_MS, CASH_DISCOUNT_SCAN_MS, CASH_DISCOUNT_RESULT_BYTES } from "./cash-discount-runtime.mjs";
 
-const BRIDGE_VERSION = "0.1.62";
+const BRIDGE_VERSION = "0.1.63";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
@@ -16,10 +18,6 @@ const TALLY_IMPORT_TIMEOUT_MS = 30_000;
 // Exports can be larger than imports, but they must still release the bridge
 // cycle if Tally is busy or has stopped responding.
 const TALLY_EXPORT_TIMEOUT_MS = 60_000;
-// Finora reads the financial year's voucher evidence in one collection. Keep
-// that compact request bounded so a busy Tally instance cannot hold the
-// Electron command queue for minutes.
-const CASH_DISCOUNT_COMPACT_EXPORT_TIMEOUT_MS = 20_000;
 const OPEN_BILL_LEDGER_BATCH_SIZE = 50;
 const CASH_DISCOUNT_VOUCHER_DAYS_PER_CHUNK = 31;
 const CASH_DISCOUNT_EVIDENCE_LEDGER_BATCH_SIZE = 20;
@@ -41,6 +39,8 @@ const DEFAULT_TALLY_DATA_ROOT = path.join(process.env.PUBLIC || "C:\\Users\\Publ
 const CURRENT_FILE = fileURLToPath(import.meta.url);
 let cachedTrustedCaCertificates = null;
 const recentCompanyReadiness = new Map();
+const cashDiscountResultCache = createCashDiscountResultCache();
+const livenessCapableBackends = new Set();
 
 function trustedCaCertificates() {
   if (cachedTrustedCaCertificates) return cachedTrustedCaCertificates;
@@ -2179,10 +2179,13 @@ async function exportTallyCollection(tallyUrl, options) {
 }
 
 async function exportTallyXml(tallyUrl, xml, label = "Tally export", timeoutMs = TALLY_EXPORT_TIMEOUT_MS) {
+  const readContext = cashDiscountReadContext.getStore();
+  checkReadBudget(readContext);
   const controller = new AbortController();
-  const boundedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+  let boundedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
     ? timeoutMs
     : TALLY_EXPORT_TIMEOUT_MS;
+  if (readContext) boundedTimeoutMs = Math.max(1, Math.min(boundedTimeoutMs, CASH_DISCOUNT_READ_MS, readContext.deadlineAt - Date.now()));
   const timeout = setTimeout(() => controller.abort(), boundedTimeoutMs);
 
   try {
@@ -2192,10 +2195,13 @@ async function exportTallyXml(tallyUrl, xml, label = "Tally export", timeoutMs =
         "Content-Type": "text/xml",
       },
       body: xml,
-      signal: controller.signal,
+      signal: readContext?.signal ? AbortSignal.any([controller.signal, readContext.signal]) : controller.signal,
     });
 
-    const text = await response.text();
+    const text = readContext ? await readBoundedXml(response) : await response.text();
+    if (readContext && (!/<ENVELOPE[\s>]/i.test(text) || !/<\/ENVELOPE>\s*$/i.test(text))) {
+      throw new Error(`Tally returned incomplete XML for ${label}.`);
+    }
     const result = parseExportResult(text, response.status);
     if (!result.success) {
       throw new Error(
@@ -2217,29 +2223,36 @@ async function exportTallyXml(tallyUrl, xml, label = "Tally export", timeoutMs =
 
 async function exportCompactCashDiscountEvidenceXml(
   tallyUrl,
-  { companyName, dateFrom, dateTo },
+  { companyName, ledgerNames, dateFrom, dateTo },
   exportCollection = exportTallyCollection
 ) {
-  // This deliberately mirrors Finora's fast path: export the period once and
-  // match customer ledgers, invoice references and receipts in JavaScript.
-  // Filtering every month x every ledger batch makes Tally rebuild the same
-  // voucher collection many times and is the source of the multi-minute scan.
-  const xml = await exportCollection(tallyUrl, {
-    collectionName: "Kalika Cash Discount Voucher Evidence",
-    tallyType: "Voucher",
+  // ChildOf gathers only this ledger's vouchers. Do not rebuild the global
+  // Voucher collection for every month/batch, or read unrelated customers.
+  const responses = [];
+  let bytes = 0;
+  for (const ledgerName of ledgerNames) {
+    checkReadBudget();
+    const xml = await exportCollection(tallyUrl, {
+    collectionName: "Kalika Cash Discount Ledger Evidence",
+    tallyType: "Vouchers : Ledger",
+    childOf: tallyFormulaString(ledgerName),
     fetchFields:
       "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount",
     companyName,
     dateFrom,
     dateTo,
-    timeoutMs: CASH_DISCOUNT_COMPACT_EXPORT_TIMEOUT_MS,
-  });
+    timeoutMs: CASH_DISCOUNT_READ_MS,
+    });
+    bytes += Buffer.byteLength(xml);
+    if (bytes > CASH_DISCOUNT_RESULT_BYTES * 2) throw new Error("Cash Discount evidence exceeded its safe size limit.");
+    responses.push(xml);
+  }
   return {
-    xml,
-    batchCount: 1,
+    xml: responses.join("\n"),
+    batchCount: responses.length,
     dateChunkCount: 1,
     retrySplitCount: 0,
-    queryMode: "compact_full_period",
+    queryMode: "ledger_scoped",
   };
 }
 
@@ -3348,7 +3361,7 @@ function toOpenBill(block, ledgerName, evidence = {}) {
 
   const sourceVoucherType = getTagText(block, "VOUCHERTYPENAME") || getTagText(block, "VOUCHERTYPE") || null;
   const kind = classifyOpenBillReferenceKind({
-    billType: billReferenceType(block),
+    billType: /^yes$/i.test(getTagText(block, "ISADVANCE")) ? "Advance" : billReferenceType(block),
     sourceVoucherType,
     referenceName,
     knownInvoice: evidence.knownInvoice === true,
@@ -3794,17 +3807,19 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
   // allocation evidence. For other consumers, retain the narrower structural
   // fallback behaviour.
   const evidenceLedgerNames = dependencies.forceVoucherEvidence && billBlocks.length > 0
-    ? ledgerNames
+    ? Array.from(new Set(billBlocks.map(billLedgerName)))
     : fallbackLedgerNames;
-  const evidenceDateFrom =
-    requestedDateFrom ||
-    earliestBillDate(dependencies.forceVoucherEvidence ? billBlocks : fallbackBlocks);
+  const earliestDate = earliestBillDate(dependencies.forceVoucherEvidence ? billBlocks : fallbackBlocks);
+  const evidenceDateFrom = dependencies.forceVoucherEvidence
+    ? [requestedDateFrom, earliestDate].filter(Boolean).sort()[0] || null
+    : requestedDateFrom || earliestDate;
   const voucherExport = dependencies.voucherExport || (evidenceLedgerNames.length > 0
     ? dependencies.forceVoucherEvidence
       ? await exportCompactCashDiscountEvidenceXml(
           tallyUrl,
           {
             companyName,
+            ledgerNames: evidenceLedgerNames,
             dateFrom: evidenceDateFrom,
             dateTo: asOfDate,
           },
@@ -4147,7 +4162,8 @@ async function exportCashDiscountOpenBillsFirst(config, companyName, dateRange) 
     fetchFields:
       "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
     companyName,
-    dateFrom: dateRange?.dateFrom,
+    // Carry-forward bills can predate the selected FY; do not lose them.
+    dateFrom: null,
     dateTo: dateRange?.dateTo,
     formulae: [{ name: pendingFilterName, formula: openBillPendingFormula() }],
     filterNames: [pendingFilterName],
@@ -4159,7 +4175,13 @@ async function exportCashDiscountOpenBillsFirst(config, companyName, dateRange) 
   };
 }
 
-async function collectCashDiscountLiveSnapshot(config, operation, companyName, proposal, onProgress, financialYear, customerScope) {
+async function collectCashDiscountLiveSnapshot(config, operation, companyName, proposal, onProgress, financialYear, customerScope, readOptions = {}) {
+  if (!cashDiscountReadContext.getStore()) {
+    return cashDiscountReadContext.run({ deadlineAt: Date.now() + CASH_DISCOUNT_SCAN_MS }, () =>
+      collectCashDiscountLiveSnapshot(config, operation, companyName, proposal, onProgress, financialYear, customerScope, readOptions));
+  }
+  checkReadBudget();
+  const scanStarted = performance.now();
   const tallyKey = normalizeTallyUrl(config.tallyUrl);
   const recentReadiness = recentCompanyReadiness.get(tallyKey);
   const readiness = recentReadiness && Date.now() - recentReadiness.checkedAt <= CASH_DISCOUNT_READINESS_REUSE_MS
@@ -4175,6 +4197,13 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
   const resolvedCompany = requestedCompany || readiness.companyName || null;
   const asOfDate = new Date().toISOString().slice(0, 10);
   const dateRange = cashDiscountFinancialYearRange(financialYear || proposal?.financialYear, asOfDate);
+  if (!readOptions.resume || operation !== "cash_discount_scan") cashDiscountResultCache.clear();
+  // Never share financial scan caches across similarly named companies/PCs.
+  const companies = await fetchAvailableCompanies(config.tallyUrl, resolvedCompany);
+  const companyGuid = companies.find((company) => normalizeLooseName(company.companyName) === normalizeLooseName(resolvedCompany))?.guid;
+  const cacheScope = companyGuid && operation === "cash_discount_scan" ? JSON.stringify([
+    config.connectionId, config.bridgeMachineId, tallyKey, companyGuid, resolvedCompany, dateRange, customerScope,
+  ]) : null;
 
   const requestedLedgerName = String(proposal?.partyLedgerName || "").trim();
 
@@ -4182,6 +4211,19 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
   let candidateLedgerNames = [];
   if (operation === "cash_discount_revalidate") {
     candidateLedgerNames = requestedLedgerName ? [requestedLedgerName] : [];
+    if (!requestedLedgerName || !proposal?.linkedInvoiceNumber) throw new Error("A customer and invoice are required for revalidation.");
+    const xml = await exportTallyCollection(config.tallyUrl, {
+      collectionName: "Kalika Cash Discount Customer Bills",
+      tallyType: "Bills",
+      childOf: tallyFormulaString(requestedLedgerName),
+      fetchFields: "Name,Parent,LedgerName,IsAdvance,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance",
+      companyName: resolvedCompany,
+      dateTo: dateRange.dateTo,
+    });
+    const reference = normalizeLooseName(proposal.linkedInvoiceNumber);
+    billExport = { xml: extractBlocks(xml, "BILL").filter((block) =>
+      [getAttribute(block, "NAME"), getTagText(block, "NAME"), getTagText(block, "VOUCHERNUMBER")]
+        .some((value) => normalizeLooseName(value) === reference)).join("\n"), batchCount: 1, queryMode: "ledger_scoped" };
   } else {
     onProgress?.("Reading open customer bills from Tally...");
     billExport = await exportCashDiscountOpenBillsFirst(config, resolvedCompany, dateRange);
@@ -4231,17 +4273,14 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
     };
   }
 
-  onProgress?.(`Reading invoice narration and receipt evidence for ${ledgersToScan.length} customer ledger${ledgersToScan.length === 1 ? "" : "s"}...`);
-  let openBillsResult = await fetchCustomerOpenBillsFromTally(config, {
-    companyName: resolvedCompany,
-    ledgerName: ledgersToScan[0].name,
-    ledgerNames: ledgersToScan.map((ledger) => ledger.name),
-    dateFrom: dateRange.dateFrom,
-    asOfDate: dateRange.dateTo,
-  }, {
-    ...(billExport ? { billExport } : {}),
-    forceVoucherEvidence: true,
+  const ledgerResults = await collectCashDiscountCustomerEvidence(config, {
+    companyName: resolvedCompany, ledgers: ledgersToScan,
+    billExport, dateRange, onProgress, cacheScope, resume: readOptions.resume === true,
   });
+  if (operation === "cash_discount_revalidate" && !ledgerResults.complete) {
+    throw new Error(ledgerResults.failures[0]?.error || "The invoice recheck is incomplete. No debit note was created.");
+  }
+  let openBillsResult = { success: true, result: ledgerResults };
   const verifiedLedgerKeys = new Set(ledgersToScan.flatMap((ledger) => {
     if (ledger.cashDiscountCustomerScope?.source !== "sales_linked_exception") {
       return [normalizeLooseName(ledger.name)];
@@ -4274,6 +4313,16 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
   if (operation === "cash_discount_revalidate" && verifiedLedgers.length !== 1) {
     throw new Error("The selected non-standard customer no longer has verified Sales invoice evidence in Tally.");
   }
+  // Never return a previous company's evidence after the user switches Tally.
+  const finalState = await cashDiscountReadContext.run({ signal: cashDiscountReadContext.getStore()?.signal, deadlineAt: Date.now() + 5_000 }, async () => {
+    const active = await testTally(config.tallyUrl);
+    const currentCompanies = companyGuid ? await fetchAvailableCompanies(config.tallyUrl, resolvedCompany) : [];
+    return { active, guid: currentCompanies.find((company) => normalizeLooseName(company.companyName) === normalizeLooseName(resolvedCompany))?.guid };
+  });
+  if (!finalState.active.companyLoaded || normalizeLooseName(finalState.active.companyName) !== normalizeLooseName(resolvedCompany) || (companyGuid && finalState.guid !== companyGuid)) {
+    cashDiscountResultCache.clear();
+    throw new Error("Tally company changed or could not be verified during the scan. Refresh and select the company again.");
+  }
   return {
     companyName: resolvedCompany,
     financialYear: dateRange.financialYear,
@@ -4281,7 +4330,62 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
     dateTo: dateRange.dateTo,
     ledgers: verifiedLedgers.map(cashDiscountLiveLedger),
     openBillsResult,
+    scanSummary: { complete: ledgerResults.complete, completed: ledgerResults.completedCount,
+      total: ledgersToScan.length, failures: ledgerResults.failures, reused: ledgerResults.reusedCount,
+      resumable: Boolean(cacheScope && !ledgerResults.complete), elapsedMs: Math.round(performance.now() - scanStarted) },
   };
+}
+
+async function collectCashDiscountCustomerEvidence(config, { companyName, ledgers, billExport, dateRange, onProgress, cacheScope, resume }, dependencies = {}) {
+  const readCustomer = dependencies.readCustomer || fetchCustomerOpenBillsFromTally;
+  const blocksByLedger = new Map();
+  for (const block of extractBlocks(billExport.xml, "BILL")) {
+    const key = normalizeLooseName(billLedgerName(block));
+    if (!blocksByLedger.has(key)) blocksByLedger.set(key, []);
+    blocksByLedger.get(key).push(block);
+  }
+  const byLedger = {};
+  const failures = [];
+  let completedCount = 0;
+  let reusedCount = 0;
+  let resultBytes = 0;
+  let stopReason = null;
+  for (const [index, ledger] of ledgers.entries()) {
+    const started = performance.now();
+    try {
+      checkReadBudget();
+      if (stopReason) throw new Error(stopReason);
+      onProgress?.(`Reading customer ${index + 1}/${ledgers.length}: ${ledger.name}. ${completedCount} completed.`);
+      const billXml = (blocksByLedger.get(normalizeLooseName(ledger.name)) || []).join("\n");
+      const cacheKey = cacheScope ? createHash("sha256").update(JSON.stringify([cacheScope, ledger.guid, ledger.name, billXml])).digest("hex") : null;
+      const cached = cacheKey && resume ? cashDiscountResultCache.get(cacheKey) : null;
+      const result = cached ? { result: { byLedger: { [ledger.name]: cached } } } : await readCustomer(config, {
+        companyName, ledgerNames: [ledger.name], dateFrom: dateRange.dateFrom, asOfDate: dateRange.dateTo,
+      }, { forceVoucherEvidence: true, billExport: {
+        ...billExport, xml: billXml,
+      } });
+      const bucket = result.result?.byLedger?.[ledger.name];
+      if (!bucket) throw new Error("Tally returned no verifiable customer result.");
+      resultBytes += Buffer.byteLength(JSON.stringify(bucket));
+      if (resultBytes > CASH_DISCOUNT_RESULT_BYTES) throw new Error("Cash Discount results reached the safe size limit.");
+      byLedger[ledger.name] = { ...bucket, complete: true };
+      if (cached) reusedCount += 1;
+      else if (cacheKey) cashDiscountResultCache.set(cacheKey, byLedger[ledger.name]);
+      completedCount += 1;
+      onProgress?.(`Completed ${completedCount}/${ledgers.length} customers (${Math.round(performance.now() - started)} ms for last customer).`);
+    } catch (error) {
+      // Do not enqueue more Tally work after a failure: HTTP cancellation does
+      // not prove Tally stopped its internal calculation.
+      cashDiscountReadContext.getStore()?.signal?.throwIfAborted();
+      stopReason ||= error instanceof Error ? error.message : String(error);
+      failures.push({ ledgerName: ledger.name, error: stopReason });
+      byLedger[ledger.name] = { ...emptyOpenBillBucket(ledger.name), complete: false, error: stopReason };
+    }
+  }
+  return { byLedger, ledgerNames: ledgers.map((ledger) => ledger.name), completedCount, reusedCount,
+    complete: failures.length === 0, failures,
+    rawCount: Object.values(byLedger).reduce((total, bucket) => total + bucket.rawCount, 0),
+    queryDiagnostics: { voucherQueryMode: "ledger_scoped", resultBytes, requestedLedgerCount: ledgers.length } };
 }
 
 async function collectTallyCompanyCheck(config) {
@@ -4291,10 +4395,8 @@ async function collectTallyCompanyCheck(config) {
     const data = await work();
     return { data, durationMs: Number((performance.now() - probeStartedAt).toFixed(2)) };
   };
-  const [activeProbe, companiesProbe] = await Promise.all([
-    measure(() => testTally(config.tallyUrl)),
-    measure(() => fetchAvailableCompanies(config.tallyUrl)),
-  ]);
+  const activeProbe = await measure(() => testTally(config.tallyUrl));
+  const companiesProbe = await measure(() => fetchAvailableCompanies(config.tallyUrl));
   const readiness = activeProbe.data;
   if (!readiness.tallyReachable || !readiness.companyLoaded || !readiness.companyName) {
     throw new Error(readiness.error || "Tally Prime is not ready to identify the active company.");
@@ -4335,6 +4437,7 @@ async function collectTallyCompanyCheck(config) {
 }
 
 async function executeCashDiscountDebitNote(config, payload) {
+  cashDiscountResultCache.clear();
   const readiness = await testTally(config.tallyUrl);
   const requestedCompany = String(payload?.companyName || "").trim();
   if (!readiness.tallyReachable || !readiness.companyLoaded) {
@@ -4954,6 +5057,7 @@ async function materializePurchaseSourceDocument(payload) {
 }
 
 async function runCommand(config, command, options = {}) {
+  cashDiscountResultCache.clear();
   if (!command) return;
 
   if (command.commandType === "sync_masters") {
@@ -5477,7 +5581,11 @@ async function pairBridge(args) {
   console.log(`Config saved to ${CONFIG_PATH}`);
 }
 
-async function sendHeartbeat(config, testResult, availableCompanies = []) {
+async function sendHeartbeat(config, testResult, availableCompanies = [], livenessOnly = false) {
+  const backendKey = `${config.apiBase}|${config.connectionId}`;
+  // Old APIs interpret omitted Tally fields as "disconnected". Negotiate this
+  // mode on a normal heartbeat before ever sending a liveness-only payload.
+  if (livenessOnly && !livenessCapableBackends.has(backendKey)) return null;
   const response = await fetch(`${config.apiBase}/api/tally/bridge/heartbeat`, {
     method: "POST",
     headers: {
@@ -5490,10 +5598,12 @@ async function sendHeartbeat(config, testResult, availableCompanies = []) {
       bridgeVersion: BRIDGE_VERSION,
       bridgeMachineId: config.bridgeMachineId,
       bridgeMachineName: config.bridgeMachineName || os.hostname() || "This computer",
+      livenessOnly,
       ...testResult,
       companyName: testResult.companyName ?? null,
       companies: availableCompanies,
     }),
+    signal: AbortSignal.timeout(10_000),
   });
   const payload = await readJsonResponse(response);
 
@@ -5503,6 +5613,8 @@ async function sendHeartbeat(config, testResult, availableCompanies = []) {
     throw error;
   }
 
+  if (payload.livenessSupported === true) livenessCapableBackends.add(backendKey);
+  else livenessCapableBackends.delete(backendKey);
   return payload;
 }
 
@@ -5606,6 +5718,8 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
   let socket = null;
   let reconnectTimer = null;
   let stopped = false;
+  const activeReads = new Map();
+  let readInFlight = false;
 
   const log = (level, message) => emitLog(options, level, message);
   const send = (payload) => {
@@ -5624,6 +5738,16 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
     const requestId = String(message.requestId || "").trim();
     const operation = String(message.operation || "");
     if (!requestId) return;
+    const isRead = operation === "cash_discount_scan" || operation === "cash_discount_revalidate";
+    if (isRead && readInFlight) {
+      send({ type: "operation_result", requestId, success: false, error: "A Cash Discount read is already running. Wait for it to finish." });
+      return;
+    }
+    const controller = new AbortController();
+    const deadlineAt = Math.min(Number(message.deadlineAt) || Infinity, Date.now() + CASH_DISCOUNT_SCAN_MS);
+    if (isRead) { activeReads.set(requestId, controller); readInFlight = true; }
+    const startedAt = performance.now();
+    const deadlineTimer = isRead ? setTimeout(() => controller.abort(new Error("Cash Discount read deadline exceeded.")), Math.max(1, deadlineAt - Date.now())) : null;
     try {
       const data = await executeExclusive(async () => {
         if (operation === "company_check") {
@@ -5705,22 +5829,26 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
           return outcome.result || outcome;
         }
         if (operation === "cash_discount_scan" || operation === "cash_discount_revalidate") {
-          return collectCashDiscountLiveSnapshot(
+          // Reserve time for the final active-company check and result delivery.
+          return cashDiscountReadContext.run({ signal: controller.signal, deadlineAt: deadlineAt - 5_000 }, () => collectCashDiscountLiveSnapshot(
             config,
             operation,
             message.companyName,
             message.proposal,
             (progressMessage) => send({ type: "progress", requestId, message: progressMessage }),
             message.financialYear,
-            message.customerScope
-          );
+            message.customerScope,
+            message.payload
+          ));
         }
         if (operation === "cash_discount_execute_debit_note") {
           send({ type: "progress", requestId, message: "Creating and verifying the Debit Note in Tally..." });
           return executeCashDiscountDebitNote(config, message.commandPayload);
         }
         throw new Error("Unsupported live Cash Discount operation.");
-      });
+      }, isRead ? { signal: controller.signal, deadlineAt } : {});
+      if (isRead) controller.signal.throwIfAborted();
+      log("info", `Cash Discount ${operation} ${requestId} completed in ${Math.round(performance.now() - startedAt)} ms.`);
       send({ type: "operation_result", requestId, success: true, companyName: message.companyName, data });
     } catch (error) {
       send({
@@ -5730,6 +5858,10 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
         companyName: message.companyName,
         error: error instanceof Error ? error.message : String(error || "Live Cash Discount operation failed."),
       });
+    } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      activeReads.delete(requestId);
+      if (isRead) readInFlight = false;
     }
   };
 
@@ -5747,6 +5879,7 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
           role: "connector",
           connectionId: config.connectionId,
           token: config.bridgeToken,
+          bridgeVersion: BRIDGE_VERSION,
         });
       });
       socket.addEventListener("message", (event) => {
@@ -5756,6 +5889,8 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
             log("info", "Cash Discount live channel connected.");
           } else if (message.type === "operation") {
             void handleOperation(message);
+          } else if (message.type === "cancel") {
+            activeReads.get(String(message.requestId || ""))?.abort(new Error("Cash Discount read cancelled."));
           } else if (message.type === "error") {
             log("error", `Cash Discount live channel: ${message.error || "unknown error"}`);
           }
@@ -5766,7 +5901,10 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
       socket.addEventListener("error", () => {
         log("error", "Cash Discount live channel is unavailable; retrying.");
       });
-      socket.addEventListener("close", scheduleReconnect);
+      socket.addEventListener("close", () => {
+        for (const controller of activeReads.values()) controller.abort(new Error("Live channel disconnected."));
+        scheduleReconnect();
+      });
     } catch (error) {
       log("error", error instanceof Error ? error.message : "Could not start the Cash Discount live channel.");
       scheduleReconnect();
@@ -5960,30 +6098,19 @@ async function startBridge(args) {
   console.log(`Starting Tally bridge for ${config.tallyUrl}`);
   console.log(`Sending heartbeat every ${intervalMs} ms.`);
 
-  let running = false;
-  const executeExclusive = async (task) => {
-    while (running) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    running = true;
-    try {
-      return await task();
-    } finally {
-      running = false;
-    }
-  };
+  const scheduler = createTallyScheduler();
+  const executeExclusive = (task, scheduling) => scheduler.run(task, scheduling);
+  let heartbeatInFlight = false;
   const runSerially = async () => {
-    if (running) {
-      console.log("Previous bridge cycle is still running; skipping this heartbeat.");
+    if (scheduler.busy) {
+      if (!heartbeatInFlight) {
+        heartbeatInFlight = true;
+        try { await sendHeartbeat(config, {}, [], true); }
+        finally { heartbeatInFlight = false; }
+      }
       return;
     }
-
-    running = true;
-    try {
-      await runOnce(config, runtimeOptions);
-    } finally {
-      running = false;
-    }
+    await executeExclusive(() => runOnce(config, runtimeOptions));
   };
 
   await runOnce(config, runtimeOptions);
@@ -6030,7 +6157,8 @@ function createBridgeRunner(options = {}) {
 
   const intervalMs = Number(options.intervalMs || DEFAULT_HEARTBEAT_INTERVAL_MS);
   let timer = null;
-  let running = false;
+  const scheduler = createTallyScheduler();
+  let heartbeatInFlight = false;
   let stopped = false;
   let stopCommandWakeChannel = null;
   let stopCashDiscountLiveChannel = null;
@@ -6039,22 +6167,12 @@ function createBridgeRunner(options = {}) {
     companyListCache: { availableCompanies: [], nextRefreshAt: 0 },
   };
 
-  const executeExclusive = async (task) => {
-    while (running && !stopped) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    if (stopped) throw new Error("The connector has stopped.");
-    running = true;
-    try {
-      return await task();
-    } finally {
-      running = false;
-    }
-  };
+  const executeExclusive = (task, scheduling) => scheduler.run(task, scheduling);
 
   const stop = (reason = "stopped", error = null) => {
     if (stopped) return;
     stopped = true;
+    scheduler.stop();
     if (timer) {
       clearInterval(timer);
       timer = null;
@@ -6070,14 +6188,16 @@ function createBridgeRunner(options = {}) {
 
   const runSerially = async () => {
     if (stopped) return;
-    if (running) {
-      emitLog(options, "info", "Previous bridge cycle is still running; skipping this heartbeat.");
-      return;
-    }
-
-    running = true;
     try {
-      const cycle = await runOnce(config, runtimeOptions);
+      if (scheduler.busy) {
+        if (!heartbeatInFlight) {
+          heartbeatInFlight = true;
+          try { await sendHeartbeat(config, {}, [], true); }
+          finally { heartbeatInFlight = false; }
+        }
+        return;
+      }
+      const cycle = await executeExclusive(() => runOnce(config, runtimeOptions));
       if (typeof options.onStatus === "function") {
         options.onStatus(cycle);
       }
@@ -6095,8 +6215,6 @@ function createBridgeRunner(options = {}) {
         deleteConfig();
         stop(error?.status === 426 ? "update required" : "revoked", error);
       }
-    } finally {
-      running = false;
     }
   };
 
@@ -6629,6 +6747,7 @@ export {
   classifyTaxLedgers,
   cashDiscountVoucherDateChunks,
   collectCashDiscountLiveSnapshot,
+  collectCashDiscountCustomerEvidence,
   collectTallyCompanyCheck,
   buildCollectionExportXml,
   buildRequestedLedgerFormula,
