@@ -249,7 +249,10 @@ async function handleConnectorResult(socket, message, meta) {
 
   if (item.phase === "scanning") {
     try {
+      const connectorResultAt = Date.now();
+      const connectorDiagnostics = message.data?.benchmarkDiagnostics ?? null;
       send(item.browser, { type: "progress", requestId, message: "Tally read finished. Checking debit-note history and calculating results..." });
+      const analysisStartedAt = Date.now();
       const dashboard = await apiRequest("/api/collections/live/analyse", {
         accessToken: item.accessToken,
         signal: item.controller.signal,
@@ -260,6 +263,21 @@ async function handleConnectorResult(socket, message, meta) {
         },
       });
       if (!pending.has(requestId)) return;
+      if (connectorDiagnostics) {
+        const apiDiagnostics = dashboard.benchmarkDiagnostics?.api ?? null;
+        dashboard.benchmarkDiagnostics = {
+          connector: connectorDiagnostics,
+          api: apiDiagnostics,
+          gateway: {
+            requestToConnectorResultMs: connectorResultAt - item.startedAt,
+            analysisApiMs: Date.now() - analysisStartedAt,
+            totalMs: Date.now() - item.startedAt,
+            connectorResultBytes: Buffer.byteLength(JSON.stringify(message.data ?? {})),
+            browserResultBytes: 0,
+          },
+        };
+        dashboard.benchmarkDiagnostics.gateway.browserResultBytes = Buffer.byteLength(JSON.stringify(dashboard));
+      }
       console.log(`Cash Discount scan ${requestId} completed in ${Date.now() - item.startedAt} ms (gateway total).`);
       clearPending(requestId);
       send(item.browser, { type: "result", requestId, success: true, data: dashboard });

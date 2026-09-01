@@ -159,12 +159,21 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
     requestId: "request-1",
     success: true,
     companyName: "Solution Nyx",
-    data: { financialYear: "2026-27", ledgers: [], openBillsResult: {} },
+    data: {
+      financialYear: "2026-27",
+      ledgers: [],
+      openBillsResult: {},
+      benchmarkDiagnostics: { requestId: "request-1", totalMs: 125, tally: { callCount: 2 } },
+    },
   }));
 
   const result = await nextMessage(browser, (message) => message.type === "result");
   assert.equal(result.success, true);
   assert.deepEqual(result.data.tabs.cashDiscountTracker, []);
+  assert.equal(result.data.benchmarkDiagnostics.connector.requestId, "request-1");
+  assert.equal(result.data.benchmarkDiagnostics.connector.tally.callCount, 2);
+  assert.ok(result.data.benchmarkDiagnostics.gateway.totalMs >= 0);
+  assert.ok(result.data.benchmarkDiagnostics.gateway.browserResultBytes > 0);
 
   browser.send(JSON.stringify({
     type: "request",

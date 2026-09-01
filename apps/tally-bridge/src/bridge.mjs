@@ -8,7 +8,9 @@ import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallyScheduler, createCashDiscountResultCache,
-  CASH_DISCOUNT_READ_MS, CASH_DISCOUNT_SCAN_MS, CASH_DISCOUNT_RESULT_BYTES } from "./cash-discount-runtime.mjs";
+  createConnectorBenchmarkTrace, finishConnectorBenchmarkTrace, markConnectorBenchmarkStage,
+  recordConnectorTallyRead, CASH_DISCOUNT_READ_MS, CASH_DISCOUNT_SCAN_MS,
+  CASH_DISCOUNT_RESULT_BYTES } from "./cash-discount-runtime.mjs";
 
 const BRIDGE_VERSION = "0.1.63";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
@@ -2180,6 +2182,10 @@ async function exportTallyCollection(tallyUrl, options) {
 
 async function exportTallyXml(tallyUrl, xml, label = "Tally export", timeoutMs = TALLY_EXPORT_TIMEOUT_MS) {
   const readContext = cashDiscountReadContext.getStore();
+  const benchmarkStartedAt = performance.now();
+  let benchmarkResponseBytes = 0;
+  let benchmarkSuccess = false;
+  let benchmarkError = null;
   checkReadBudget(readContext);
   const controller = new AbortController();
   let boundedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
@@ -2199,6 +2205,7 @@ async function exportTallyXml(tallyUrl, xml, label = "Tally export", timeoutMs =
     });
 
     const text = readContext ? await readBoundedXml(response) : await response.text();
+    benchmarkResponseBytes = Buffer.byteLength(text);
     if (readContext && (!/<ENVELOPE[\s>]/i.test(text) || !/<\/ENVELOPE>\s*$/i.test(text))) {
       throw new Error(`Tally returned incomplete XML for ${label}.`);
     }
@@ -2210,14 +2217,24 @@ async function exportTallyXml(tallyUrl, xml, label = "Tally export", timeoutMs =
       );
     }
 
+    benchmarkSuccess = true;
     return text;
   } catch (error) {
+    benchmarkError = error instanceof Error ? error.message : String(error);
     if (error?.name === "AbortError") {
       throw new Error(`${label} timed out after ${Math.round(boundedTimeoutMs / 1000)} seconds.`);
     }
     throw error;
   } finally {
     clearTimeout(timeout);
+    recordConnectorTallyRead(readContext?.benchmark, {
+      label,
+      durationMs: performance.now() - benchmarkStartedAt,
+      requestBytes: Buffer.byteLength(xml),
+      responseBytes: benchmarkResponseBytes,
+      success: benchmarkSuccess,
+      error: benchmarkError,
+    });
   }
 }
 
@@ -5747,9 +5764,16 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
     const deadlineAt = Math.min(Number(message.deadlineAt) || Infinity, Date.now() + CASH_DISCOUNT_SCAN_MS);
     if (isRead) { activeReads.set(requestId, controller); readInFlight = true; }
     const startedAt = performance.now();
+    const benchmark = createConnectorBenchmarkTrace({
+      requestId,
+      operation,
+      companyName: message.companyName,
+    });
+    let benchmarkFinished = false;
     const deadlineTimer = isRead ? setTimeout(() => controller.abort(new Error("Cash Discount read deadline exceeded.")), Math.max(1, deadlineAt - Date.now())) : null;
     try {
       const data = await executeExclusive(async () => {
+        markConnectorBenchmarkStage(benchmark, "queueWaitMs", performance.now() - startedAt);
         if (operation === "company_check") {
           return collectTallyCompanyCheck(config);
         }
@@ -5830,7 +5854,7 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
         }
         if (operation === "cash_discount_scan" || operation === "cash_discount_revalidate") {
           // Reserve time for the final active-company check and result delivery.
-          return cashDiscountReadContext.run({ signal: controller.signal, deadlineAt: deadlineAt - 5_000 }, () => collectCashDiscountLiveSnapshot(
+          return cashDiscountReadContext.run({ signal: controller.signal, deadlineAt: deadlineAt - 5_000, benchmark }, () => collectCashDiscountLiveSnapshot(
             config,
             operation,
             message.companyName,
@@ -5848,9 +5872,19 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
         throw new Error("Unsupported live Cash Discount operation.");
       }, isRead ? { signal: controller.signal, deadlineAt } : {});
       if (isRead) controller.signal.throwIfAborted();
+      markConnectorBenchmarkStage(benchmark, "operationMs", performance.now() - startedAt);
+      const benchmarkDiagnostics = finishConnectorBenchmarkTrace(benchmark, { success: true });
+      benchmarkFinished = true;
+      if (benchmarkDiagnostics && data && typeof data === "object" && !Array.isArray(data)) {
+        data.benchmarkDiagnostics = benchmarkDiagnostics;
+      }
       log("info", `Cash Discount ${operation} ${requestId} completed in ${Math.round(performance.now() - startedAt)} ms.`);
       send({ type: "operation_result", requestId, success: true, companyName: message.companyName, data });
     } catch (error) {
+      if (!benchmarkFinished) {
+        finishConnectorBenchmarkTrace(benchmark, { success: false, error });
+        benchmarkFinished = true;
+      }
       send({
         type: "operation_result",
         requestId,
@@ -5859,6 +5893,7 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
         error: error instanceof Error ? error.message : String(error || "Live Cash Discount operation failed."),
       });
     } finally {
+      if (!benchmarkFinished) finishConnectorBenchmarkTrace(benchmark, { success: false, error: "Operation ended before a result was produced." });
       if (deadlineTimer) clearTimeout(deadlineTimer);
       activeReads.delete(requestId);
       if (isRead) readInFlight = false;

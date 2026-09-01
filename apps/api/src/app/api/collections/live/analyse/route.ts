@@ -18,6 +18,7 @@ export function OPTIONS(request: Request) {
 }
 
 export async function POST(request: Request) {
+  const diagnosticStartedAt = performance.now();
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
@@ -26,6 +27,9 @@ export async function POST(request: Request) {
     const connectionId = toText(body.connectionId, 80);
     const companyName = toText(body.companyName, 240);
     const scan = body.scan && typeof body.scan === "object" ? body.scan as Record<string, unknown> : {};
+    const benchmarkDiagnostics = scan.benchmarkDiagnostics && typeof scan.benchmarkDiagnostics === "object"
+      ? scan.benchmarkDiagnostics
+      : null;
     const financialYear = toText(scan.financialYear, 20) || null;
     const openBillsResult = scan.openBillsResult && typeof scan.openBillsResult === "object"
       ? scan.openBillsResult as Record<string, unknown>
@@ -38,6 +42,7 @@ export async function POST(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
+    const databaseStartedAt = performance.now();
     const [{ data: connection, error: connectionError }, { data: proposalRows, error: proposalError }] = await Promise.all([
       supabase
         .from("tally_connections")
@@ -55,6 +60,7 @@ export async function POST(request: Request) {
         .order("created_at", { ascending: false })
         .limit(500),
     ]);
+    const databaseMs = performance.now() - databaseStartedAt;
     if (connectionError) throw connectionError;
     if (proposalError) throw proposalError;
     if (!connection) return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
@@ -74,6 +80,7 @@ export async function POST(request: Request) {
         proposalWithLedgerSnapshot(proposal, ledgerByName.get(normalizeLedgerName(proposal.party_ledger_name)))
       )
     );
+    const analysisStartedAt = performance.now();
     const dashboard = analyseLiveCashDiscountSnapshot({
       connectionId,
       companyName,
@@ -84,7 +91,21 @@ export async function POST(request: Request) {
       connectionStatus: connection.status,
       lastHeartbeatAt: connection.last_heartbeat_at,
     });
-    return jsonWithCors(request, { ...dashboard, scanSummary: scan.scanSummary ?? null });
+    const analysisMs = performance.now() - analysisStartedAt;
+    return jsonWithCors(request, {
+      ...dashboard,
+      scanSummary: scan.scanSummary ?? null,
+      ...(benchmarkDiagnostics ? {
+        benchmarkDiagnostics: {
+          connector: benchmarkDiagnostics,
+          api: {
+            databaseMs: Number(databaseMs.toFixed(2)),
+            analysisMs: Number(analysisMs.toFixed(2)),
+            totalMs: Number((performance.now() - diagnosticStartedAt).toFixed(2)),
+          },
+        },
+      } : {}),
+    });
   } catch (error) {
     console.error("Error in POST /api/collections/live/analyse:", error);
     return jsonWithCors(request, {

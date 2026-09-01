@@ -1,7 +1,40 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallyScheduler, createCashDiscountResultCache } from "./cash-discount-runtime.mjs";
 import { collectCashDiscountCustomerEvidence, fetchCustomerOpenBillsFromTally } from "./bridge.mjs";
+
+test("benchmark diagnostics remain opt-in and write a bounded local trace", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "kalika-benchmark-"));
+  const previousEnabled = process.env.KALIKA_BENCHMARK_DIAGNOSTICS;
+  const previousDirectory = process.env.KALIKA_BENCHMARK_DIRECTORY;
+  process.env.KALIKA_BENCHMARK_DIAGNOSTICS = "1";
+  process.env.KALIKA_BENCHMARK_DIRECTORY = directory;
+  try {
+    const runtime = await import(`./cash-discount-runtime.mjs?benchmark-test=${Date.now()}`);
+    const trace = runtime.createConnectorBenchmarkTrace({ requestId: "test/request", operation: "cash_discount_scan" });
+    runtime.markConnectorBenchmarkStage(trace, "queueWaitMs", 12.345);
+    runtime.recordConnectorTallyRead(trace, {
+      label: "test export", durationMs: 20, requestBytes: 10, responseBytes: 100,
+      success: true,
+    });
+    const summary = runtime.finishConnectorBenchmarkTrace(trace, { success: true });
+    assert.equal(summary.success, true);
+    assert.equal(summary.stages.queueWaitMs, 12.35);
+    assert.equal(summary.tally.callCount, 1);
+    assert.equal(summary.tally.responseBytes, 100);
+    assert.equal(summary.localTraceWritten, true);
+    assert.equal(fs.readdirSync(directory).filter((name) => name.endsWith(".json")).length, 1);
+  } finally {
+    if (previousEnabled === undefined) delete process.env.KALIKA_BENCHMARK_DIAGNOSTICS;
+    else process.env.KALIKA_BENCHMARK_DIAGNOSTICS = previousEnabled;
+    if (previousDirectory === undefined) delete process.env.KALIKA_BENCHMARK_DIRECTORY;
+    else process.env.KALIKA_BENCHMARK_DIRECTORY = previousDirectory;
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("XML byte limit applies to chunked bodies without Content-Length", async () => {
   let cancelled = false;
