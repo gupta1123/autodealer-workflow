@@ -12,7 +12,7 @@ import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallySc
   recordConnectorTallyRead, CASH_DISCOUNT_READ_MS, CASH_DISCOUNT_SCAN_MS,
   CASH_DISCOUNT_RESULT_BYTES } from "./cash-discount-runtime.mjs";
 
-const BRIDGE_VERSION = "0.1.63";
+const BRIDGE_VERSION = "0.1.64";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
