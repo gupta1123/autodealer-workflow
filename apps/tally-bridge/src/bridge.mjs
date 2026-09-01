@@ -12,7 +12,7 @@ import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallySc
   recordConnectorTallyRead, CASH_DISCOUNT_READ_MS, CASH_DISCOUNT_SCAN_MS,
   CASH_DISCOUNT_RESULT_BYTES } from "./cash-discount-runtime.mjs";
 
-const BRIDGE_VERSION = "0.1.64";
+const BRIDGE_VERSION = "0.1.65";
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
@@ -23,8 +23,12 @@ const TALLY_EXPORT_TIMEOUT_MS = 60_000;
 const OPEN_BILL_LEDGER_BATCH_SIZE = 50;
 const CASH_DISCOUNT_VOUCHER_DAYS_PER_CHUNK = 31;
 const CASH_DISCOUNT_EVIDENCE_LEDGER_BATCH_SIZE = 20;
+const CASH_DISCOUNT_NATIVE_UNION_BATCH_SIZE = 50;
+const CASH_DISCOUNT_LOW_MEMORY_UNION_BATCH_SIZE = 25;
 const CASH_DISCOUNT_MAX_VOUCHER_CHUNKS = 60;
 const CASH_DISCOUNT_READINESS_REUSE_MS = 5_000;
+const CASH_DISCOUNT_VOUCHER_FIELDS =
+  "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount";
 const CONFIG_DIR = path.join(os.homedir(), ".autodealer-tally-bridge");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 const INSTALLATION_ID_PATH = path.join(CONFIG_DIR, "installation-id");
@@ -43,6 +47,16 @@ let cachedTrustedCaCertificates = null;
 const recentCompanyReadiness = new Map();
 const cashDiscountResultCache = createCashDiscountResultCache();
 const livenessCapableBackends = new Set();
+
+function cashDiscountNativeUnionBatchSize() {
+  const benchmarkOverride = Number(process.env.KALIKA_CASH_DISCOUNT_UNION_BATCH_SIZE);
+  if (Number.isInteger(benchmarkOverride) && benchmarkOverride > 0) {
+    return Math.min(200, benchmarkOverride);
+  }
+  return os.totalmem() <= 6 * 1024 * 1024 * 1024
+    ? CASH_DISCOUNT_LOW_MEMORY_UNION_BATCH_SIZE
+    : CASH_DISCOUNT_NATIVE_UNION_BATCH_SIZE;
+}
 
 function trustedCaCertificates() {
   if (cachedTrustedCaCertificates) return cachedTrustedCaCertificates;
@@ -2241,25 +2255,56 @@ async function exportTallyXml(tallyUrl, xml, label = "Tally export", timeoutMs =
 async function exportCompactCashDiscountEvidenceXml(
   tallyUrl,
   { companyName, ledgerNames, dateFrom, dateTo },
-  exportCollection = exportTallyCollection
+  exportCollection = exportTallyCollection,
+  exportXml = exportTallyXml
 ) {
-  // ChildOf gathers only this ledger's vouchers. Do not rebuild the global
-  // Voucher collection for every month/batch, or read unrelated customers.
+  // Native `Vouchers : Ledger` collections are materially faster than a
+  // company-wide Voucher filter in Tally. Combine a bounded number of those
+  // native collections into one union so Tally pays the HTTP/report setup cost
+  // once per batch instead of once per customer.
+  const names = uniquePayloadLedgerNames({ ledgerNames });
+  if (names.length === 0) return { xml: "", batchCount: 0, dateChunkCount: 0, retrySplitCount: 0, queryMode: "native_ledger_union" };
+  if (names.length === 1) {
+    const xml = await exportCollection(tallyUrl, {
+      collectionName: "Kalika Cash Discount Ledger Evidence",
+      tallyType: "Vouchers : Ledger",
+      childOf: tallyFormulaString(names[0]),
+      fetchFields: CASH_DISCOUNT_VOUCHER_FIELDS,
+      companyName,
+      dateFrom,
+      dateTo,
+      timeoutMs: CASH_DISCOUNT_READ_MS,
+    });
+    return { xml, batchCount: 1, dateChunkCount: 1, retrySplitCount: 0, queryMode: "ledger_scoped" };
+  }
+
+  const batchSize = cashDiscountNativeUnionBatchSize();
   const responses = [];
   let bytes = 0;
-  for (const ledgerName of ledgerNames) {
+  const batches = chunkValues(names, batchSize);
+  for (const [index, batch] of batches.entries()) {
     checkReadBudget();
-    const xml = await exportCollection(tallyUrl, {
-    collectionName: "Kalika Cash Discount Ledger Evidence",
-    tallyType: "Vouchers : Ledger",
-    childOf: tallyFormulaString(ledgerName),
-    fetchFields:
-      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount",
-    companyName,
-    dateFrom,
-    dateTo,
-    timeoutMs: CASH_DISCOUNT_READ_MS,
-    });
+    const collectionNames = batch.map((_, memberIndex) => `KalikaCashDiscountLedger${memberIndex + 1}`);
+    const memberCollections = batch.map((ledgerName, memberIndex) => [
+      `<COLLECTION NAME="${collectionNames[memberIndex]}" ISMODIFY="No">`,
+      "<TYPE>Vouchers : Ledger</TYPE>",
+      `<CHILDOF>${escapeXml(tallyFormulaString(ledgerName))}</CHILDOF>`,
+      `<FETCH>${escapeXml(CASH_DISCOUNT_VOUCHER_FIELDS)}</FETCH>`,
+      "</COLLECTION>",
+    ].join("")).join("");
+    const unionName = `Kalika Cash Discount Evidence Union ${index + 1}`;
+    const xml = await exportXml(tallyUrl, [
+      "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE>",
+      `<ID>${escapeXml(unionName)}</ID></HEADER><BODY><DESC><STATICVARIABLES>`,
+      companyName ? `<SVCURRENTCOMPANY>${escapeXml(companyName)}</SVCURRENTCOMPANY>` : "",
+      dateFrom ? `<SVFROMDATE TYPE="Date">${escapeXml(String(dateFrom).replaceAll("-", ""))}</SVFROMDATE>` : "",
+      dateTo ? `<SVTODATE TYPE="Date">${escapeXml(String(dateTo).replaceAll("-", ""))}</SVTODATE>` : "",
+      "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE>",
+      memberCollections,
+      `<COLLECTION NAME="${escapeXml(unionName)}" ISMODIFY="No"><COLLECTIONS>${collectionNames.join(",")}</COLLECTIONS>`,
+      `<FETCH>${escapeXml(CASH_DISCOUNT_VOUCHER_FIELDS)}</FETCH></COLLECTION>`,
+      "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>",
+    ].join(""), unionName, CASH_DISCOUNT_READ_MS);
     bytes += Buffer.byteLength(xml);
     if (bytes > CASH_DISCOUNT_RESULT_BYTES * 2) throw new Error("Cash Discount evidence exceeded its safe size limit.");
     responses.push(xml);
@@ -2269,7 +2314,7 @@ async function exportCompactCashDiscountEvidenceXml(
     batchCount: responses.length,
     dateChunkCount: 1,
     retrySplitCount: 0,
-    queryMode: "ledger_scoped",
+    queryMode: "native_ledger_union",
   };
 }
 
@@ -3840,7 +3885,8 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
             dateFrom: evidenceDateFrom,
             dateTo: asOfDate,
           },
-          exportCollection
+          exportCollection,
+          dependencies.exportXml || exportTallyXml
         )
       : await exportTargetedBillEvidenceXml(
           tallyUrl,
@@ -4136,8 +4182,7 @@ function cashDiscountLiveLedger(master) {
   };
 }
 
-const CASH_DISCOUNT_LEDGER_FIELDS =
-  "Name,Parent,GUID,PartyGSTIN,IsBillWiseOn,Email,EmailId,LedgerEmail,LedgerEmailId,LedgerMobile,Mobile,MobileNo,PhoneNumber,Phone,LedgerPhone,ContactPerson,Contact,AttentionTo,Address,Address1,Address2,Address3,Address4,Pincode";
+const CASH_DISCOUNT_LEDGER_DISCOVERY_FIELDS = "Name,Parent,GUID,PartyGSTIN,IsBillWiseOn";
 
 async function exportCashDiscountGroups(config, companyName) {
   const xml = await exportTallyCollection(config.tallyUrl, {
@@ -4152,23 +4197,19 @@ async function exportCashDiscountGroups(config, companyName) {
 async function exportCashDiscountLedgers(config, companyName, ledgerNames) {
   const names = uniquePayloadLedgerNames({ ledgerNames });
   if (names.length === 0) return [];
-  const batches = chunkValues(names, OPEN_BILL_LEDGER_BATCH_SIZE);
-  const responses = [];
-  for (const [index, batch] of batches.entries()) {
-    const filterName = "KalikaCashDiscountLedgerName";
-    responses.push(await exportTallyCollection(config.tallyUrl, {
-      collectionName: `Kalika Cash Discount Ledgers ${index + 1}`,
-      tallyType: "Ledger",
-      fetchFields: CASH_DISCOUNT_LEDGER_FIELDS,
-      companyName,
-      formulae: [{
-        name: filterName,
-        formula: buildRequestedLedgerFormula(batch, ["$Name"]),
-      }],
-      filterNames: [filterName],
-    }));
-  }
-  return parseMasterCollection(responses.join("\n"), "LEDGER");
+  // Filtering thousands of ledgers by a long OR formula makes Tally rescan its
+  // master collection once per batch. A single bounded minimal discovery is
+  // substantially faster and remains below the streamed XML safety limit;
+  // intersect with the open-bill names locally.
+  const xml = await exportTallyCollection(config.tallyUrl, {
+    collectionName: "Kalika Cash Discount Ledger Discovery",
+    tallyType: "Ledger",
+    fetchFields: CASH_DISCOUNT_LEDGER_DISCOVERY_FIELDS,
+    companyName,
+    timeoutMs: CASH_DISCOUNT_READ_MS,
+  });
+  const requestedKeys = new Set(names.map(normalizeLooseName));
+  return parseMasterCollection(xml, "LEDGER").filter((ledger) => requestedKeys.has(normalizeLooseName(ledger.name)));
 }
 
 async function exportCashDiscountOpenBillsFirst(config, companyName, dateRange) {
@@ -4253,6 +4294,10 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
         .map(billLedgerName)
         .filter(Boolean)
     ));
+    const benchmarkLedgerLimit = Number(process.env.KALIKA_CASH_DISCOUNT_BENCHMARK_LEDGER_LIMIT);
+    if (Number.isInteger(benchmarkLedgerLimit) && benchmarkLedgerLimit > 0) {
+      candidateLedgerNames = candidateLedgerNames.slice(0, benchmarkLedgerLimit);
+    }
   }
 
   if (candidateLedgerNames.length === 0) {
@@ -4355,6 +4400,7 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
 
 async function collectCashDiscountCustomerEvidence(config, { companyName, ledgers, billExport, dateRange, onProgress, cacheScope, resume }, dependencies = {}) {
   const readCustomer = dependencies.readCustomer || fetchCustomerOpenBillsFromTally;
+  const evidenceBatchSize = Math.max(1, Number(dependencies.evidenceBatchSize) || cashDiscountNativeUnionBatchSize());
   const blocksByLedger = new Map();
   for (const block of extractBlocks(billExport.xml, "BILL")) {
     const key = normalizeLooseName(billLedgerName(block));
@@ -4367,34 +4413,68 @@ async function collectCashDiscountCustomerEvidence(config, { companyName, ledger
   let reusedCount = 0;
   let resultBytes = 0;
   let stopReason = null;
-  for (const [index, ledger] of ledgers.entries()) {
+
+  const pendingEntries = [];
+  for (const ledger of ledgers) {
+    const billXml = (blocksByLedger.get(normalizeLooseName(ledger.name)) || []).join("\n");
+    const cacheKey = cacheScope ? createHash("sha256").update(JSON.stringify([cacheScope, ledger.guid, ledger.name, billXml])).digest("hex") : null;
+    const cached = cacheKey && resume ? cashDiscountResultCache.get(cacheKey) : null;
+    if (cached) {
+      const bucketBytes = Buffer.byteLength(JSON.stringify(cached));
+      if (resultBytes + bucketBytes > CASH_DISCOUNT_RESULT_BYTES) {
+        stopReason = "Cash Discount results reached the safe size limit.";
+        break;
+      }
+      resultBytes += bucketBytes;
+      byLedger[ledger.name] = { ...cached, complete: true };
+      completedCount += 1;
+      reusedCount += 1;
+      continue;
+    }
+    pendingEntries.push({ ledger, billXml, cacheKey });
+  }
+
+  const batches = chunkValues(pendingEntries, evidenceBatchSize);
+  for (const [batchIndex, batch] of batches.entries()) {
     const started = performance.now();
     try {
       checkReadBudget();
       if (stopReason) throw new Error(stopReason);
-      onProgress?.(`Reading customer ${index + 1}/${ledgers.length}: ${ledger.name}. ${completedCount} completed.`);
-      const billXml = (blocksByLedger.get(normalizeLooseName(ledger.name)) || []).join("\n");
-      const cacheKey = cacheScope ? createHash("sha256").update(JSON.stringify([cacheScope, ledger.guid, ledger.name, billXml])).digest("hex") : null;
-      const cached = cacheKey && resume ? cashDiscountResultCache.get(cacheKey) : null;
-      const result = cached ? { result: { byLedger: { [ledger.name]: cached } } } : await readCustomer(config, {
-        companyName, ledgerNames: [ledger.name], dateFrom: dateRange.dateFrom, asOfDate: dateRange.dateTo,
+      const ledgerNames = batch.map((entry) => entry.ledger.name);
+      onProgress?.(`Reading customers ${completedCount + 1}-${Math.min(ledgers.length, completedCount + batch.length)}/${ledgers.length} in one Tally batch. ${completedCount} completed.`);
+      const result = await readCustomer(config, {
+        companyName, ledgerNames, dateFrom: dateRange.dateFrom, asOfDate: dateRange.dateTo,
       }, { forceVoucherEvidence: true, billExport: {
-        ...billExport, xml: billXml,
+        ...billExport, xml: batch.map((entry) => entry.billXml).join("\n"),
       } });
-      const bucket = result.result?.byLedger?.[ledger.name];
-      if (!bucket) throw new Error("Tally returned no verifiable customer result.");
-      resultBytes += Buffer.byteLength(JSON.stringify(bucket));
-      if (resultBytes > CASH_DISCOUNT_RESULT_BYTES) throw new Error("Cash Discount results reached the safe size limit.");
-      byLedger[ledger.name] = { ...bucket, complete: true };
-      if (cached) reusedCount += 1;
-      else if (cacheKey) cashDiscountResultCache.set(cacheKey, byLedger[ledger.name]);
-      completedCount += 1;
-      onProgress?.(`Completed ${completedCount}/${ledgers.length} customers (${Math.round(performance.now() - started)} ms for last customer).`);
+      const batchBuckets = result.result?.byLedger || {};
+      const resolved = [];
+      for (const entry of batch) {
+        const bucket = batchBuckets[entry.ledger.name];
+        if (!bucket) throw new Error(`Tally returned no verifiable result for ${entry.ledger.name}.`);
+        const bucketBytes = Buffer.byteLength(JSON.stringify(bucket));
+        if (resultBytes + bucketBytes > CASH_DISCOUNT_RESULT_BYTES) throw new Error("Cash Discount results reached the safe size limit.");
+        resultBytes += bucketBytes;
+        const completedBucket = { ...bucket, complete: true };
+        resolved.push({ ...entry, bucket: completedBucket });
+      }
+      for (const entry of resolved) {
+        byLedger[entry.ledger.name] = entry.bucket;
+        if (entry.cacheKey) cashDiscountResultCache.set(entry.cacheKey, entry.bucket);
+        completedCount += 1;
+      }
+      onProgress?.(`Completed ${completedCount}/${ledgers.length} customers (${Math.round(performance.now() - started)} ms for batch ${batchIndex + 1}/${batches.length}).`);
     } catch (error) {
       // Do not enqueue more Tally work after a failure: HTTP cancellation does
       // not prove Tally stopped its internal calculation.
       cashDiscountReadContext.getStore()?.signal?.throwIfAborted();
       stopReason ||= error instanceof Error ? error.message : String(error);
+      break;
+    }
+  }
+  if (stopReason) {
+    for (const ledger of ledgers) {
+      if (byLedger[ledger.name]) continue;
       failures.push({ ledgerName: ledger.name, error: stopReason });
       byLedger[ledger.name] = { ...emptyOpenBillBucket(ledger.name), complete: false, error: stopReason };
     }
@@ -4402,7 +4482,8 @@ async function collectCashDiscountCustomerEvidence(config, { companyName, ledger
   return { byLedger, ledgerNames: ledgers.map((ledger) => ledger.name), completedCount, reusedCount,
     complete: failures.length === 0, failures,
     rawCount: Object.values(byLedger).reduce((total, bucket) => total + bucket.rawCount, 0),
-    queryDiagnostics: { voucherQueryMode: "ledger_scoped", resultBytes, requestedLedgerCount: ledgers.length } };
+    queryDiagnostics: { voucherQueryMode: "native_ledger_union", evidenceBatchSize, evidenceBatchCount: batches.length,
+      resultBytes, requestedLedgerCount: ledgers.length } };
 }
 
 async function collectTallyCompanyCheck(config) {

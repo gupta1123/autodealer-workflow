@@ -1,0 +1,21 @@
+const execute = process.argv.includes("--execute");
+if (!execute) throw new Error("Refusing to delete import probes without --execute.");
+const references = new Set(["TRF/26-27/00404-PROBE", "INV/26-27/00001-R9", "INV/26-27/00001-R12", "INV/26-27/00001-R17"]);
+const escapeXml = (value) => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+const text = (value, name) => value.match(new RegExp(`<${name}(?: [^>]*)?>([\\s\\S]*?)</${name}>`, "i"))?.[1]?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() ?? "";
+const post = async (xml) => {
+  const response = await fetch("http://127.0.0.1:9000", { method: "POST", headers: { "Content-Type": "text/xml" }, body: xml, signal: AbortSignal.timeout(60_000) });
+  return response.text();
+};
+const exportRequest = `<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Collection</TYPE><ID>Solution Nyx Probe Cleanup</ID></HEADER><BODY><DESC><STATICVARIABLES><SVCURRENTCOMPANY>Solution Nyx</SVCURRENTCOMPANY><SVFROMDATE>20260401</SVFROMDATE><SVTODATE>20260823</SVTODATE></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="Solution Nyx Probe Cleanup"><TYPE>Voucher</TYPE><FETCH>Date,VoucherNumber,VoucherTypeName,Reference</FETCH></COLLECTION></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+const exported = await post(exportRequest);
+const targets = [...exported.matchAll(/<VOUCHER\b[\s\S]*?<\/VOUCHER>/gi)].map((match) => match[0]).map((block) => ({ date: text(block, "DATE"), number: text(block, "VOUCHERNUMBER"), type: text(block, "VOUCHERTYPENAME"), reference: text(block, "REFERENCE") })).filter((voucher) => references.has(voucher.reference));
+if (targets.length !== references.size) throw new Error(`Expected ${references.size} active probes, found ${targets.length}: ${targets.map((item) => item.reference).join(", ")}`);
+const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const displayDate = (date) => `${Number(date.slice(6, 8))}-${months[Number(date.slice(4, 6)) - 1]}-${date.slice(0, 4)}`;
+const messages = targets.map((voucher) => `<TALLYMESSAGE xmlns:UDF="TallyUDF"><VOUCHER DATE="${displayDate(voucher.date)}" TAGNAME="Voucher Number" TAGVALUE="${escapeXml(voucher.number)}" VCHTYPE="${escapeXml(voucher.type)}" ACTION="Delete"></VOUCHER></TALLYMESSAGE>`);
+const response = await post(`<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA><REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES><SVCURRENTCOMPANY>Solution Nyx</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA>${messages.join("")}</REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>`);
+const deleted = Number(text(response, "DELETED") || 0);
+const errors = Number(text(response, "ERRORS") || 0);
+if (deleted !== targets.length || errors) throw new Error(`Probe cleanup mismatch: deleted=${deleted}, errors=${errors}`);
+console.log(JSON.stringify({ status: "complete", deleted, references: [...references] }, null, 2));

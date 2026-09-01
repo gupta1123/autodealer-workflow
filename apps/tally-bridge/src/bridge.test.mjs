@@ -337,7 +337,7 @@ test("cash discount reuses discovery and reads only the customer's native vouche
   assert.equal(result.result.openBills[0].narration, "1% cash discount within 15 days");
 });
 
-test("cash discount reads many customers sequentially without a company-wide voucher scan", async () => {
+test("cash discount combines many native customer voucher collections into one bounded union", async () => {
   const calls = [];
   const ledgerNames = Array.from({ length: 45 }, (_, index) => `Customer ${index + 1}`);
   const billXml = ledgerNames.map((ledgerName, index) =>
@@ -358,19 +358,20 @@ test("cash discount reads many customers sequentially without a company-wide vou
         queryMode: "open_bills_first",
       },
       forceVoucherEvidence: true,
-      exportCollection: async (_url, options) => {
-        calls.push(options);
+      exportXml: async (_url, xml, label) => {
+        calls.push({ xml, label });
         return "<ENVELOPE><STATUS>1</STATUS></ENVELOPE>";
       },
     }
   );
 
-  assert.equal(calls.length, 45);
-  assert.ok(calls.every((call) => call.tallyType === "Vouchers : Ledger" && call.childOf && !call.filterNames));
-  assert.equal(calls[0].dateFrom, "2026-04-01");
-  assert.equal(calls[0].dateTo, "2027-03-31");
+  assert.equal(calls.length, 1);
+  assert.equal((calls[0].xml.match(/<TYPE>Vouchers : Ledger<\/TYPE>/g) || []).length, 45);
+  assert.match(calls[0].xml, /<SVFROMDATE TYPE="Date">20260401<\/SVFROMDATE>/);
+  assert.match(calls[0].xml, /<SVTODATE TYPE="Date">20270331<\/SVTODATE>/);
   assert.equal(result.result.queryDiagnostics.requestedLedgerCount, 45);
-  assert.equal(result.result.queryDiagnostics.voucherBatchCount, 45);
+  assert.equal(result.result.queryDiagnostics.voucherBatchCount, 1);
+  assert.equal(result.result.queryDiagnostics.voucherQueryMode, "native_ledger_union");
   assert.equal(result.result.queryDiagnostics.voucherDateChunkCount, 1);
 });
 

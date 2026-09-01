@@ -78,7 +78,7 @@ test("failed customer stops further requests, preserving complete buckets", asyn
     companyName: "Company A", ledgers: ["A", "B", "C"].map((name) => ({ name })),
     billExport: { xml: "", queryMode: "open_bills_first", batchCount: 1 },
     dateRange: { dateFrom: "2026-04-01", dateTo: "2026-08-31" },
-  }, { readCustomer: async (_config, payload) => {
+  }, { evidenceBatchSize: 1, readCustomer: async (_config, payload) => {
     const name = payload.ledgerNames[0];
     calls.push(name);
     if (name === "B") throw new Error("Tally timed out");
@@ -90,6 +90,25 @@ test("failed customer stops further requests, preserving complete buckets", asyn
   assert.equal(result.byLedger.C.complete, false);
   assert.equal(result.completedCount, 1);
   assert.equal(result.failures.length, 2);
+});
+
+test("customer evidence is requested in bounded multi-ledger batches", async () => {
+  const calls = [];
+  const ledgers = Array.from({ length: 45 }, (_, index) => ({ name: `Customer ${index + 1}` }));
+  const result = await collectCashDiscountCustomerEvidence({}, {
+    companyName: "Company A", ledgers,
+    billExport: { xml: "", queryMode: "open_bills_first", batchCount: 1 },
+    dateRange: { dateFrom: "2026-04-01", dateTo: "2026-08-31" },
+  }, { evidenceBatchSize: 20, readCustomer: async (_config, payload) => {
+    calls.push([...payload.ledgerNames]);
+    return { result: { byLedger: Object.fromEntries(payload.ledgerNames.map((name) => [name, {
+      ledgerName: name, openBills: [], existingAdvances: [], rawCount: 0,
+    }])) } };
+  } });
+  assert.deepEqual(calls.map((batch) => batch.length), [20, 20, 5]);
+  assert.equal(result.completedCount, 45);
+  assert.equal(result.complete, true);
+  assert.equal(result.queryDiagnostics.evidenceBatchCount, 3);
 });
 
 test("carry-forward invoice evidence extends before the selected financial year", async () => {
