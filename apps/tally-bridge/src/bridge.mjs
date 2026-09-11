@@ -6301,7 +6301,35 @@ async function sendHeartbeat(config, testResult, availableCompanies = [], livene
 
   if (payload.livenessSupported === true) livenessCapableBackends.add(backendKey);
   else livenessCapableBackends.delete(backendKey);
+  adoptHeartbeatIdentity(config, payload);
   return payload;
+}
+
+function adoptHeartbeatIdentity(config, payload, persist = writeConfig) {
+  const identity = payload?.agentIdentity;
+  if (!identity || typeof identity !== "object") return false;
+  const expected = {
+    connectionId: String(config.connectionId || ""),
+    installationId: String(config.installationId || config.bridgeMachineId || ""),
+    sessionGeneration: Number(config.sessionGeneration || 0),
+  };
+  if (String(identity.connectionId || "") !== expected.connectionId ||
+      String(identity.installationId || "") !== expected.installationId ||
+      Number(identity.sessionGeneration || 0) !== expected.sessionGeneration) {
+    throw Object.assign(new Error("The heartbeat returned a different connector identity. Reconnect this computer."), { status: 409 });
+  }
+  const organizationId = String(identity.organizationId || "").trim();
+  const currentOrganizationId = String(config.organizationId || "").trim();
+  if (!organizationId) throw Object.assign(new Error("The heartbeat did not return an organization identity."), { status: 409 });
+  if (currentOrganizationId && currentOrganizationId !== "default" && currentOrganizationId !== organizationId) {
+    throw Object.assign(new Error("This connector is paired to a different organization. Reconnect this computer."), { status: 409 });
+  }
+  const ownerUserId = String(identity.ownerUserId || "").trim();
+  if (currentOrganizationId === organizationId && String(config.ownerUserId || "") === ownerUserId) return false;
+  config.organizationId = organizationId;
+  config.ownerUserId = ownerUserId || config.ownerUserId || null;
+  persist(config);
+  return true;
 }
 
 async function flushResultOutbox(config) {
@@ -7689,6 +7717,7 @@ export {
   collectCashDiscountCustomerEvidence,
   collectTallyCompanyCheck,
   buildCollectionExportXml,
+  adoptHeartbeatIdentity,
   buildRequestedLedgerFormula,
   buildPurchaseVoucherXml,
   cashDiscountFinancialYearRange,

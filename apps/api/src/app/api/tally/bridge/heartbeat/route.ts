@@ -237,6 +237,47 @@ export async function POST(request: Request) {
       );
     }
 
+    // Connections paired before organization-aware access was introduced can
+    // still have a valid installation-bound token but no organization. Repair
+    // only an unambiguous active membership; never move an already-scoped
+    // connection between organizations.
+    if (!connection.organization_id) {
+      const { data: memberships, error: membershipError } = await supabase
+        .from("access_members")
+        .select("organization_id")
+        .eq("user_id", connection.owner_user_id)
+        .eq("status", "active")
+        .limit(3);
+      if (membershipError) throw membershipError;
+      const organizations = [...new Set((memberships ?? []).map((row) => String(row.organization_id)).filter(Boolean))];
+      const legacyOwnerOrganization = organizations.find((id) => id === connection.owner_user_id);
+      const organizationId = legacyOwnerOrganization || (organizations.length === 1 ? organizations[0] : "");
+      if (!organizationId) {
+        return jsonWithCors(request, { error: "Reconnect this connector and select the intended organization." }, { status: 409 });
+      }
+      const { data: repaired, error: repairError } = await supabase
+        .from("tally_connections")
+        .update({ organization_id: organizationId })
+        .eq("id", connection.id)
+        .eq("owner_user_id", connection.owner_user_id)
+        .eq("installation_id", bridgeMachineId)
+        .is("organization_id", null)
+        .is("revoked_at", null)
+        .select("organization_id")
+        .single();
+      if (repairError) throw repairError;
+      connection.organization_id = String(repaired.organization_id);
+    }
+
+    const agentIdentity = {
+      protocolVersion,
+      organizationId: connection.organization_id,
+      ownerUserId: connection.owner_user_id,
+      connectionId: connection.id,
+      installationId: connection.installation_id,
+      sessionGeneration: connection.session_generation,
+    };
+
     const now = new Date().toISOString();
     // An alive connector is not a new Tally/company observation. While a read
     // owns Tally's HTTP queue, update ONLY liveness and preserve last_tested_at.
@@ -251,7 +292,7 @@ export async function POST(request: Request) {
         .eq("id", connection.id).eq("installation_id", bridgeMachineId).is("revoked_at", null)
         .select(TALLY_CONNECTION_SELECT).single();
       if (liveError) throw liveError;
-      return jsonWithCors(request, { livenessSupported: true, connection: serializeTallyConnectionStatus(live as unknown as TallyConnectionRow) });
+      return jsonWithCors(request, { livenessSupported: true, agentIdentity, connection: serializeTallyConnectionStatus(live as unknown as TallyConnectionRow) });
     }
     const resolvedCompanyName = companyLoaded ? companyName : null;
     const agentStatus = body.agentStatus && typeof body.agentStatus === "object" ? body.agentStatus : {};
@@ -352,6 +393,7 @@ export async function POST(request: Request) {
 
     return jsonWithCors(request, {
       livenessSupported: true,
+      agentIdentity,
       datasetStatus,
       connection: serializeTallyConnectionStatus(updatedData as unknown as TallyConnectionRow),
     });
