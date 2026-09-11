@@ -1,3 +1,8 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import { readCompleteHistory } from '@/lib/collections-history';
+import { followUpsDashboard } from '@/lib/access/followups-dashboard';
+import {requireDataset} from '@/lib/access/dataset';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { dedupeDebitNoteProposals, normalizeLedgerName, proposalWithLedgerSnapshot } from "@/lib/collections-dashboard";
@@ -17,7 +22,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   const diagnosticStartedAt = performance.now();
   try {
     const user = await requireRequestUser(request);
@@ -42,23 +47,21 @@ export async function POST(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
+    const followUps = new URL(request.url).pathname === '/api/collections/follow-ups/analyse';
+    const team=process.env.TEAM_ACCESS_ENFORCEMENT==='true'?await requireDataset(request,connectionId,{companyName,financialYear:body.financialYear||financialYear,companyGuid:body.companyGuid},followUps?'followups.prepare':'discounts.prepare'):null;
+    let proposals=supabase.from('debit_note_proposals').select('*').eq('company_name',companyName).eq('status','created_in_tally')
+      .order('created_at',{ascending:false}).order('id',{ascending:false});
+    proposals=team?proposals.eq('access_organization_id',team.access.organizationId).eq('access_company_id',team.link.company_id):proposals.eq('owner_user_id',user.id);
     const databaseStartedAt = performance.now();
     const [{ data: connection, error: connectionError }, { data: proposalRows, error: proposalError }] = await Promise.all([
-      supabase
+      team?Promise.resolve({data:team.connection,error:null}):supabase
         .from("tally_connections")
         .select("id, owner_user_id, status, last_company_name, last_heartbeat_at, last_tally_reachable, last_company_loaded")
         .eq("id", connectionId)
         .eq("owner_user_id", user.id)
         .is("revoked_at", null)
         .maybeSingle(),
-      supabase
-        .from("debit_note_proposals")
-        .select("*")
-        .eq("owner_user_id", user.id)
-        .eq("company_name", companyName)
-        .eq("status", "created_in_tally")
-        .order("created_at", { ascending: false })
-        .limit(500),
+      followUps ? Promise.resolve({data: [], error: null}) : readCompleteHistory((from,to) => proposals.range(from,to)).then(data => ({data,error:null})),
     ]);
     const databaseMs = performance.now() - databaseStartedAt;
     if (connectionError) throw connectionError;
@@ -76,7 +79,7 @@ export async function POST(request: Request) {
 
     const ledgerByName = new Map(ledgers.map((ledger) => [normalizeLedgerName(ledger.tally_name), ledger]));
     const createdProposals = dedupeDebitNoteProposals(
-      ((proposalRows ?? []) as unknown as DebitNoteProposalRow[]).map((proposal) =>
+      ((proposalRows ?? []) as unknown as DebitNoteProposalRow[]).filter(proposal => !financialYear || !proposal.financial_year || proposal.financial_year === financialYear).map((proposal) =>
         proposalWithLedgerSnapshot(proposal, ledgerByName.get(normalizeLedgerName(proposal.party_ledger_name)))
       )
     );
@@ -92,6 +95,7 @@ export async function POST(request: Request) {
       lastHeartbeatAt: connection.last_heartbeat_at,
     });
     const analysisMs = performance.now() - analysisStartedAt;
+    if (followUps) return jsonWithCors(request, followUpsDashboard(dashboard));
     return jsonWithCors(request, {
       ...dashboard,
       scanSummary: scan.scanSummary ?? null,
@@ -107,9 +111,12 @@ export async function POST(request: Request) {
       } : {}),
     });
   } catch (error) {
+    const failure=accessFailureResponse(request,error);if(failure)return failure;
     console.error("Error in POST /api/collections/live/analyse:", error);
     return jsonWithCors(request, {
       error: error instanceof Error ? error.message : "Could not analyse the live Tally data.",
     }, { status: 500 });
   }
 }
+
+export const POST = withTeamAccess(POSTHandler);

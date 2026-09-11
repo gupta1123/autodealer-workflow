@@ -1,3 +1,5 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import { settingsOrganization } from '@/lib/access/settings';
 import {
   getComparisonGroups,
   sanitizeComparisonGroups,
@@ -10,14 +12,14 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) {
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }
 
-    const groups = await getComparisonGroups();
+    const groups = await getComparisonGroups(await settingsOrganization(request));
     return jsonWithCors(request, { groups });
   } catch (error) {
     console.error("Error in GET /api/settings/comparison-groups:", error);
@@ -25,7 +27,7 @@ export async function GET(request: Request) {
   }
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) {
@@ -34,7 +36,7 @@ export async function POST(request: Request) {
 
     const body = (await request.json().catch(() => ({}))) as { groups?: unknown };
     const groups = sanitizeComparisonGroups(body.groups);
-    const success = await saveComparisonGroups(groups);
+    const success = await saveComparisonGroups(groups, await settingsOrganization(request));
 
     if (!success) {
       return jsonWithCors(request, { error: "Failed to save comparison groups" }, { status: 500 });
@@ -46,3 +48,6 @@ export async function POST(request: Request) {
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);
+export const POST = withTeamAccess(POSTHandler);

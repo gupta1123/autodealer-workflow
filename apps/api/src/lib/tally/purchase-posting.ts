@@ -6,6 +6,10 @@ import type {
   PurchaseValidationRuleKey,
 } from "@/lib/purchase-accounting-settings";
 import type { CommercialLineItem } from "@/types/pipeline";
+import {
+  calculatePurchaseVoucher,
+  PURCHASE_CALCULATION_VERSION,
+} from "@autodealer/shared/lib/purchase-voucher";
 
 export type PurchasePostingStatus =
   | "draft"
@@ -71,6 +75,7 @@ export type PurchasePostingReviewLine = {
   unit: string;
   rate: string;
   taxableAmount: string;
+  taxRate: string;
   stockItemName: string;
   purchaseLedgerName: string;
   godownName: string;
@@ -170,6 +175,7 @@ export type PurchasePostingSource = {
 };
 
 export type PurchasePostingCalculation = {
+  calculationVersion: number;
   taxMode: "cgst_sgst" | "igst" | "unknown";
   gstRate: string;
   supplierStateCode: string | null;
@@ -181,6 +187,7 @@ export type PurchasePostingCalculation = {
   sgstAmount: string;
   igstAmount: string;
   gstAmount: string;
+  taxBuckets: Array<{ kind: "cgst" | "sgst" | "igst"; rate: string; taxableBasis: string; amount: string }>;
   invoiceGstAmount: string;
   gstDifference: string;
   tdsAmount: string;
@@ -188,6 +195,8 @@ export type PurchasePostingCalculation = {
   tds194qBasisAmount: string;
   tds194qRounding: "paise" | "nearest_rupee";
   transportTdsAmount: string;
+  transportTdsCalculatedAmount: string;
+  transportTdsDifference: string;
   cgstTdsAmount: string;
   sgstTdsAmount: string;
   igstTdsAmount: string;
@@ -235,8 +244,8 @@ type PurchasePostingReviewPatch = Omit<Partial<PurchasePostingReview>, "lines"> 
   lines?: Array<Partial<PurchasePostingReviewLine> & Pick<PurchasePostingReviewLine, "lineId">>;
 };
 
-const TAX_TOLERANCE_PAISE = 100;
-const TOTAL_TOLERANCE_PAISE = 100;
+const TAX_TOLERANCE_PAISE = 0;
+const TOTAL_TOLERANCE_PAISE = 0;
 const MAX_ROUND_OFF_PAISE = 100;
 const SCRAP_GST_TDS_EFFECTIVE_DATE = "2024-10-10";
 const GST_TDS_CONTRACT_THRESHOLD_PAISE = 250_000 * 100;
@@ -587,6 +596,7 @@ function sourceLine(documentId: string, item: CommercialLineItem, index: number)
     unit: text(item.unit),
     rate,
     taxableAmount: "",
+    taxRate: text(item.taxRate),
     stockItemName: "",
     purchaseLedgerName: "",
     godownName: "",
@@ -600,6 +610,7 @@ function sourceLine(documentId: string, item: CommercialLineItem, index: number)
     unit: text(item.unit),
     rate,
     taxableAmount: taxable,
+    taxRate: text(item.taxRate),
     stockItemName: material.suggestedStockItem,
     purchaseLedgerName: "",
     godownName: "",
@@ -1036,6 +1047,7 @@ function buildDefaultReview(
       unit: reviewedUnit,
       rate: prior?.rate ?? line.rate,
       taxableAmount: prior?.taxableAmount ?? line.taxableAmount,
+      taxRate: prior?.taxRate ?? line.taxRate ?? source.invoiceTaxRate,
       stockItemName: stockItem,
       purchaseLedgerName:
         exactMasterName(masters, prior?.purchaseLedgerName || "", ["ledger"]) ||
@@ -1361,20 +1373,6 @@ function calculate(
   const gstRateBasisPoints = configuredGstRate !== null
     ? configuredGstRate
     : 0;
-  const freight = Math.max(0, moneyPaise(review.freightAmount) ?? 0);
-  const freightGstRate = rateBasisPoints(review.freightGstRate);
-  const taxableFreight = freightGstRate !== null && freightGstRate > 0 ? freight : 0;
-  const gstTaxable = basic + taxableFreight;
-  const cgst = taxMode === "cgst_sgst"
-    ? Math.round((gstTaxable * gstRateBasisPoints) / 20000)
-    : 0;
-  const sgst = taxMode === "cgst_sgst"
-    ? Math.round((gstTaxable * gstRateBasisPoints) / 20000)
-    : 0;
-  const igst = taxMode === "igst"
-    ? Math.round((gstTaxable * gstRateBasisPoints) / 10000)
-    : 0;
-  const gst = cgst + sgst + igst;
   const scrapGstTdsBasis = sum(review.lines.map((line) =>
     materialFromHsn(line.hsn).material === "ms_scrap"
       ? calculateLineTaxable(line)
@@ -1430,17 +1428,6 @@ function calculate(
   const effectiveGstTdsRate = hasGstTds
     ? taxMode === "cgst_sgst" ? "1" : "2"
     : review.gstTdsRate;
-  const totalWithholding = tds194q + transportTds + cgstTds + sgstTds + igstTds;
-  const tcs = review.tcsReceivable ? (moneyPaise(review.tcsAmount) ?? 0) : 0;
-  const invoiceTotal = moneyPaise(review.invoiceTotal) ?? 0;
-  const beforeRound = basic + freight + gst + tcs - totalWithholding;
-  const sourceRoundOff = moneyPaise(source.invoiceRoundOffAmount);
-  const reviewedRoundOff = moneyPaise(review.roundOffAmount);
-  const roundOff = sourceRoundOff
-    ? reviewedRoundOff ?? sourceRoundOff
-    : 0;
-  const grossInvoiceAmount = basic + freight + gst + tcs + roundOff;
-  const payable = beforeRound + roundOff;
   // Reconcile only deductions that are visibly included in the supplier's
   // printed payable. Reviewer-enabled deductions (for example 194Q) alter the
   // Tally payable without manufacturing a mismatch against an invoice that did
@@ -1452,41 +1439,71 @@ function calculate(
     moneyPaise(source.invoiceSgstTdsAmount) !== null ? sgstTds : 0,
     moneyPaise(source.invoiceIgstTdsAmount) !== null ? igstTds : 0,
   ]);
-  const reconciliationAmount = grossInvoiceAmount - printedWithholding;
+  const finalCalculation = calculatePurchaseVoucher({
+    taxMode,
+    defaultGstRate: review.gstRate,
+    lines: review.lines.map((line) => ({
+      lineId: line.lineId,
+      taxableAmount: line.taxableAmount || formatPaise(calculateLineTaxable(line)),
+      taxRate: line.taxRate || review.gstRate,
+    })),
+    freightAmount: review.freightAmount,
+    freightGstRate: review.freightGstRate,
+    invoiceGstAmount: formatPaise(invoiceGst),
+    invoiceTotal: review.invoiceTotal,
+    invoiceWithholdingAmount: formatPaise(printedWithholding),
+    sourceRoundOffAmount: source.invoiceRoundOffAmount,
+    confirmedRoundOffAmount: review.roundOffAmount,
+    tcsAmount: review.tcsReceivable ? review.tcsAmount : "0",
+    tds194qEnabled: review.applyTds194q,
+    tds194qBasisAmount: formatPaise(tds194qBasis),
+    tds194qRate: review.tds194qRate,
+    tds194qRounding: review.tds194qRounding,
+    transportTdsEnabled: accountingSettings.transporterTdsEnabled && review.applyTransportTds,
+    sourceTransportTdsAmount: source.invoiceTransportTdsAmount,
+    transportTdsRate: review.transportTdsRate,
+    cgstTdsAmount: formatPaise(cgstTds),
+    sgstTdsAmount: formatPaise(sgstTds),
+    igstTdsAmount: formatPaise(igstTds),
+  });
 
   return {
+    calculationVersion: PURCHASE_CALCULATION_VERSION,
     taxMode,
     gstRate: formatPaise(gstRateBasisPoints).replace(/\.00$/, ""),
     supplierStateCode,
     buyerStateCode,
-    basicAmount: formatPaise(basic),
-    freightAmount: formatPaise(freight),
-    gstTaxableAmount: formatPaise(gstTaxable),
-    cgstAmount: formatPaise(cgst),
-    sgstAmount: formatPaise(sgst),
-    igstAmount: formatPaise(igst),
-    gstAmount: formatPaise(gst),
-    invoiceGstAmount: formatPaise(invoiceGst),
-    gstDifference: formatPaise(gst - invoiceGst),
+    basicAmount: finalCalculation.basicAmount,
+    freightAmount: finalCalculation.freightAmount,
+    gstTaxableAmount: finalCalculation.gstTaxableAmount,
+    cgstAmount: finalCalculation.cgstAmount,
+    sgstAmount: finalCalculation.sgstAmount,
+    igstAmount: finalCalculation.igstAmount,
+    gstAmount: finalCalculation.gstAmount,
+    taxBuckets: finalCalculation.taxBuckets,
+    invoiceGstAmount: finalCalculation.invoiceGstAmount,
+    gstDifference: finalCalculation.gstDifference,
     tdsAmount: formatPaise(tds194q + transportTds),
-    tds194qAmount: formatPaise(tds194q),
-    tds194qBasisAmount: formatPaise(tds194qBasis),
+    tds194qAmount: finalCalculation.tds194qAmount,
+    tds194qBasisAmount: finalCalculation.tds194qBasisAmount,
     tds194qRounding: review.tds194qRounding,
-    transportTdsAmount: formatPaise(transportTds),
-    cgstTdsAmount: formatPaise(cgstTds),
-    sgstTdsAmount: formatPaise(sgstTds),
-    igstTdsAmount: formatPaise(igstTds),
+    transportTdsAmount: finalCalculation.transportTdsAmount,
+    transportTdsCalculatedAmount: finalCalculation.transportTdsCalculatedAmount,
+    transportTdsDifference: finalCalculation.transportTdsDifference,
+    cgstTdsAmount: finalCalculation.cgstTdsAmount,
+    sgstTdsAmount: finalCalculation.sgstTdsAmount,
+    igstTdsAmount: finalCalculation.igstTdsAmount,
     gstTdsBasisAmount: formatPaise(scrapGstTdsBasis),
     gstTdsRate: effectiveGstTdsRate,
     gstTdsAutomatic: automaticScrapGstTds,
     scrapGstTdsEligible,
-    totalWithholdingAmount: formatPaise(totalWithholding),
-    tcsAmount: formatPaise(tcs),
-    roundOffAmount: formatPaise(roundOff),
-    calculatedInvoiceTotal: formatPaise(grossInvoiceAmount),
-    calculatedPayable: formatPaise(payable),
-    invoiceTotal: formatPaise(invoiceTotal),
-    totalDifference: formatPaise(reconciliationAmount - invoiceTotal),
+    totalWithholdingAmount: finalCalculation.totalWithholdingAmount,
+    tcsAmount: finalCalculation.tcsAmount,
+    roundOffAmount: finalCalculation.roundOffAmount,
+    calculatedInvoiceTotal: finalCalculation.calculatedInvoiceTotal,
+    calculatedPayable: finalCalculation.calculatedPayable,
+    invoiceTotal: finalCalculation.invoiceTotal,
+    totalDifference: finalCalculation.totalDifference,
   };
 }
 
@@ -1702,13 +1719,41 @@ export function preparePurchasePosting(params: {
       quantity === null ||
       quantity <= 0 ||
       rate === null ||
-      rate < 0 ||
+      rate <= 0 ||
       taxable === null ||
       taxable <= 0
     ) {
       blockers.push(issue("LINE_ACCOUNTING_FIELDS_REQUIRED", "Complete item values", "Description, quantity, unit, rate and taxable amount are required.", "line", line.lineId));
     } else {
-      const calculatedTaxable = Math.round((quantity * rate) / 1000);
+      const quantityDecimals = line.quantity.replace(/,/g, "").split(".")[1]?.length ?? 0;
+      const rateDecimals = line.rate.replace(/,/g, "").split(".")[1]?.length ?? 0;
+      const unitMaster = selectedMaster(params.masters, line.unit, ["unit"]);
+      const liveUnitPrecision = Number(unitMaster?.raw_payload?.decimalPlaces);
+      const quantityPrecision = Number.isFinite(liveUnitPrecision)
+        ? Math.max(0, Math.min(6, Math.trunc(liveUnitPrecision)))
+        : 3;
+      if (quantityDecimals > quantityPrecision || rateDecimals > 4) {
+        blockers.push(issue(
+          "LINE_PRECISION_UNSUPPORTED",
+          "Item precision is unsupported",
+          `The selected Tally unit supports ${quantityPrecision} quantity decimal place${quantityPrecision === 1 ? "" : "s"}; Purchase rates support up to 4 decimals.`,
+          "line",
+          line.lineId
+        ));
+      }
+      const numericQuantity = Number(line.quantity.replace(/,/g, ""));
+      const numericRate = Number(line.rate.replace(/,/g, ""));
+      const calculatedTaxable = moneyPaise(String(numericQuantity * numericRate));
+      if (calculatedTaxable === null) {
+        blockers.push(issue(
+          "LINE_PRECISION_UNSUPPORTED",
+          "Item precision is unsupported",
+          "This quantity and rate cannot be represented safely at paise precision.",
+          "line",
+          line.lineId
+        ));
+        continue;
+      }
       if (Math.abs(calculatedTaxable - taxable) > TOTAL_TOLERANCE_PAISE) {
         blockers.push(issue(
           "LINE_TAXABLE_MISMATCH",
@@ -1998,6 +2043,14 @@ export function preparePurchasePosting(params: {
     if (!review.tcsLedgerName || !hasMaster(params.masters, review.tcsLedgerName, ["ledger", "tax_ledger"])) {
       blockers.push(issue("TCS_LEDGER_REQUIRED", "TCS ledger missing", "Select the configured TCS Receivable ledger.", "tax"));
     }
+    if (moneyPaise(calculation.transportTdsDifference) !== 0) {
+      blockers.push(issue(
+        "TRANSPORT_TDS_MISMATCH",
+        "Transport TDS amount and rate disagree",
+        `The extracted deduction differs from ${review.transportTdsRate}% of freight by ₹${calculation.transportTdsDifference}. Correct the extracted invoice before posting.`,
+        "tax"
+      ));
+    }
   }
   if (moneyPaise(calculation.gstDifference) !== null && Math.abs(moneyPaise(calculation.gstDifference) ?? 0) > TAX_TOLERANCE_PAISE) {
     blockers.push(issue("GST_MISMATCH", "GST does not reconcile", `Calculated GST differs from the invoice by ₹${calculation.gstDifference}.`, "tax"));
@@ -2083,6 +2136,7 @@ export function preparePurchasePosting(params: {
         unit: postingUnit,
         rate: line.rate,
         taxableAmount: line.taxableAmount || formatPaise(calculateLineTaxable(line)),
+        taxRate: line.taxRate || review.gstRate,
         godownName: line.godownName,
         batchName: line.batchName,
       };
@@ -2097,14 +2151,14 @@ export function preparePurchasePosting(params: {
           amount: calculation.freightAmount,
         }]
         : []),
-      ...(calculation.taxMode === "cgst_sgst"
-        ? [
-          { kind: "cgst", name: review.cgstLedgerName, rate: String(Number(calculation.gstRate) / 2), taxableBasis: calculation.gstTaxableAmount, amount: calculation.cgstAmount },
-          { kind: "sgst", name: review.sgstLedgerName, rate: String(Number(calculation.gstRate) / 2), taxableBasis: calculation.gstTaxableAmount, amount: calculation.sgstAmount },
-        ]
-        : calculation.taxMode === "igst"
-          ? [{ kind: "igst", name: review.igstLedgerName, rate: calculation.gstRate, taxableBasis: calculation.gstTaxableAmount, amount: calculation.igstAmount }]
-          : []),
+      ...calculation.taxBuckets.map((bucket) => ({
+        ...bucket,
+        name: bucket.kind === "cgst"
+          ? review.cgstLedgerName
+          : bucket.kind === "sgst"
+            ? review.sgstLedgerName
+            : review.igstLedgerName,
+      })),
       ...(tcsReceivableActive
         ? [{ kind: "tcs", name: review.tcsLedgerName, amount: calculation.tcsAmount }]
         : []),
@@ -2148,6 +2202,8 @@ export function preparePurchasePosting(params: {
     },
     basicAmount: calculation.basicAmount,
     finalPayableAmount: calculation.calculatedPayable,
+    canonicalVersion: 2,
+    calculationVersion: calculation.calculationVersion,
     narration: review.narration,
   };
 

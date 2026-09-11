@@ -1,3 +1,7 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {readTeamCommands} from '@/lib/access/command-results';
+import {queueTeamRead} from '@/lib/access/queue-read';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -84,7 +88,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(
+async function GETHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -95,6 +99,12 @@ export async function GET(
     }
 
     const { id } = await context.params;
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true') {
+      const url=new URL(request.url);
+      const ids=(url.searchParams.get('ids')||'').split(',').map(v=>v.trim()).filter(Boolean);
+      const commands=await readTeamCommands(request,id,ids,Number(url.searchParams.get('limit')||20));
+      return jsonWithCors(request,{commands:commands.map(serializeTallyBridgeCommand)});
+    }
     const connection = isLocalDbMode()
       ? await getLocalTallyConnection(id, user.id)
       : await requireConnection(user.id, id);
@@ -155,11 +165,12 @@ export async function GET(
     });
   } catch (error) {
     console.error("Error in GET /api/tally/connections/[id]/commands:", error);
+    const accessFailure=accessFailureResponse(request,error);if(accessFailure)return accessFailure;
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
 
-export async function POST(
+async function POSTHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -170,6 +181,9 @@ export async function POST(
     }
 
     const { id } = await context.params;
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true') {
+      return jsonWithCors(request,await queueTeamRead(request,id,await request.json()));
+    }
     const connection = isLocalDbMode()
       ? await getLocalTallyConnection(id, user.id)
       : await requireConnection(user.id, id);
@@ -790,6 +804,10 @@ export async function POST(
     return jsonWithCors(request, { error: "Unsupported Tally command type." }, { status: 400 });
   } catch (error) {
     console.error("Error in POST /api/tally/connections/[id]/commands:", error);
+    const accessFailure=accessFailureResponse(request,error);if(accessFailure)return accessFailure;
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);
+export const POST = withTeamAccess(POSTHandler);

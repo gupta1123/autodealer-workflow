@@ -1,4 +1,9 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { completeTeamPurchase } from '@/lib/access/purchase-completion';
+import {completeProposalOperation} from '@/lib/access/proposal-operations';
+import { completeTeamBank } from '@/lib/access/bank-completion';
+import {discountCompletion} from '@/lib/access/discount-writes';
+import { accessFailureResponse } from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { toNumber, type DebitNoteProposalRow } from "@/lib/collections";
 import { uploadNativeTallyDebitNotePdf } from "@/lib/debit-notes/pdf";
@@ -16,6 +21,7 @@ import {
 import { toNullableText } from "@/lib/tally/masters";
 import { normalizeMasterKey } from "@/lib/tally/masters";
 import { releaseTallyMasterSyncLock } from "@/lib/tally/master-sync-lock";
+import { publishBankJobEvent } from "@/lib/processing/bank-job-events.mjs";
 
 function getBridgeToken(request: Request) {
   const authorization = request.headers.get("authorization");
@@ -25,15 +31,6 @@ function getBridgeToken(request: Request) {
 
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
-}
-
-function compactPurchaseCommandPayload(payload: Record<string, unknown>) {
-  return {
-    postingId: payload.postingId ?? null,
-    caseId: payload.caseId ?? null,
-    revision: payload.revision ?? null,
-    idempotencyKey: payload.idempotencyKey ?? null,
-  };
 }
 
 function positiveTallyId(value: unknown) {
@@ -53,6 +50,7 @@ function compactPurchaseResult(result: Record<string, unknown>) {
     exceptions: result.exceptions ?? null,
     ignored: result.ignored ?? null,
     cancelled: result.cancelled ?? null,
+    lastVchId: positiveTallyId(result.lastVchId),
   };
   const rawTimings = result.timings && typeof result.timings === "object"
     ? result.timings as Record<string, unknown>
@@ -79,6 +77,10 @@ function compactPurchaseResult(result: Record<string, unknown>) {
       positiveTallyId(verification.voucherId) ??
       positiveTallyId(result.lastVchId),
     guid: verification.guid ?? result.guid ?? null,
+    uncertainWrite: result.uncertainWrite === true,
+    uncertaintyReason: toNullableText(result.uncertaintyReason, 100),
+    verificationOnly: result.verificationOnly === true,
+    verifiedAbsent: result.verifiedAbsent === true,
     voucherCreated: Boolean(
       result.voucherCreatedButVerificationFailed ||
       Number(result.created ?? 0) > 0 ||
@@ -129,6 +131,9 @@ export async function POST(
     const result = { ...rawResult };
     delete result.nativePdfBase64;
     const errorMessage = success ? null : toNullableText(body.error, 2000) ?? "Tally command failed.";
+    const reportedIdentity = body.identity && typeof body.identity === "object"
+      ? body.identity as Record<string, unknown>
+      : null;
 
     if (isLocalDbMode()) {
       const completed = await completeLocalTallyCommand({
@@ -193,7 +198,8 @@ export async function POST(
       .select("*")
       .eq("id", commandId)
       .eq("connection_id", connection.id)
-      .in("status", ["claimed", "queued"])
+      .in("status", process.env.TEAM_ACCESS_ENFORCEMENT === 'true'
+        ? ["claimed", "queued", "succeeded", "failed"] : ["claimed", "queued"])
       .maybeSingle();
 
     if (pendingCommandError) throw pendingCommandError;
@@ -207,15 +213,83 @@ export async function POST(
         ? (pendingCommand.payload as Record<string, unknown>)
         : {};
     const isPurchaseVoucher = pendingCommand.command_type === "create_purchase_voucher";
+    if (Number(pendingCommand.protocol_version || 0) >= 1) {
+      const mismatched = !reportedIdentity ||
+        String(reportedIdentity.connectionId || "") !== pendingCommand.connection_id ||
+        String(reportedIdentity.installationId || "") !== String(pendingCommand.installation_id || "") ||
+        Number(reportedIdentity.sessionGeneration || 0) !== Number(pendingCommand.session_generation || 0) ||
+        String(reportedIdentity.companyGuid || "") !== String(pendingCommand.company_guid || "") ||
+        String(reportedIdentity.financialYear || "") !== String(pendingCommand.financial_year || "");
+      if (mismatched) {
+        return jsonWithCors(request, { error: "Agent result identity does not match the claimed job." }, { status: 409 });
+      }
+    }
 
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true' && (commandPayload.operation==='export_native_pdf'||
+      (pendingCommand.command_type==='alter_ledger'&&commandPayload.reason==='cash_discount_whatsapp_phone_capture'))) {
+      if(reportedIdentity?.organizationId!==pendingCommand.organization_id||reportedIdentity?.ownerUserId!==pendingCommand.owner_user_id)
+        return jsonWithCors(request,{error:'Result identity differs from the issued operation.'},{status:409});
+      const completed=await completeProposalOperation({db:supabase,command:pendingCommand,connectionId:connection.id,tokenHash:hashSecret(token),success,result,base64:nativePdfBase64,error:errorMessage});
+      return jsonWithCors(request,{command:serializeTallyBridgeCommand(completed)});
+    }
+    if (process.env.TEAM_ACCESS_ENFORCEMENT === 'true' && pendingCommand.command_type==='create_debit_note') {
+      if(reportedIdentity?.organizationId!==pendingCommand.organization_id||reportedIdentity?.ownerUserId!==pendingCommand.owner_user_id)
+        return jsonWithCors(request,{error:'Result identity differs from the issued discount.'},{status:409});
+      const {data:completed,error}=await supabase.rpc('access_complete_discount',{
+        p_command:commandId,p_connection:connection.id,p_token_hash:hashSecret(token),
+        p_result:discountCompletion(success,result,commandPayload,errorMessage),
+      });
+      if(error)throw error;
+      return jsonWithCors(request,{command:serializeTallyBridgeCommand(completed)});
+    }
+    if (process.env.TEAM_ACCESS_ENFORCEMENT === 'true' && isPurchaseVoucher) {
+      if (reportedIdentity?.organizationId !== pendingCommand.organization_id ||
+          reportedIdentity?.ownerUserId !== pendingCommand.owner_user_id) {
+        return jsonWithCors(request, { error: 'Result organization or paired owner does not match the issued command.' }, { status: 409 });
+      }
+      const completed = await completeTeamPurchase({
+        db: supabase, commandId, connectionId: connection.id, bridgeTokenHash: hashSecret(token),
+        success, result, compactResult: compactPurchaseResult(result), error: errorMessage,
+      });
+      return jsonWithCors(request, { command: serializeTallyBridgeCommand(completed as TallyBridgeCommandRow) });
+    }
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true'&&['post_bank_voucher','verify_bank_transaction','create_ledger'].includes(pendingCommand.command_type)) {
+      if(reportedIdentity?.organizationId!==pendingCommand.organization_id||reportedIdentity?.ownerUserId!==pendingCommand.owner_user_id)
+        return jsonWithCors(request,{error:'Result organization or paired owner does not match the issued command.'},{status:409});
+      const completed=await completeTeamBank({db:supabase,commandId,connectionId:connection.id,bridgeTokenHash:hashSecret(token),
+        type:pendingCommand.command_type,success,result,error:errorMessage});
+      return jsonWithCors(request,{command:serializeTallyBridgeCommand(completed as TallyBridgeCommandRow)});
+    }
+    if (!['claimed', 'queued'].includes(pendingCommand.status)) {
+      return jsonWithCors(request, { error: 'This command is already terminal.' }, { status: 409 });
+    }
+
+    if (!success && commandPayload.pipelineVersion === 2 && pendingCommand.command_type === 'agent_parse_document') {
+      const identity = commandPayload.agentIdentity as Record<string, unknown>;
+      const { data: failed, error: failError } = await supabase.rpc('bank_local_v2_fail', {
+        p_job_id: commandPayload.bankStatementJobId, p_identity: identity, p_code: 'PREPARATION_FAILED',
+      });
+      if (failError) throw failError;
+      if (failed?.state === 'failed') void publishBankJobEvent(identity, 'bank_job_failed', {
+        jobId: commandPayload.bankStatementJobId, importId: commandPayload.bankStatementImportId,
+        revision: failed.revision, state: 'failed',
+      });
+    }
+
+    // Completion must follow durable debit-note history/PDF storage.
+    const deferDebitCompletion = success && pendingCommand.command_type === 'create_debit_note';
     const { data: commandData, error: updateError } = await supabase
       .from("tally_bridge_commands")
       .update({
-        status: success ? "succeeded" : "failed",
-        payload: isPurchaseVoucher ? compactPurchaseCommandPayload(commandPayload) : commandPayload,
+        status: deferDebitCompletion ? "claimed" : success ? "succeeded" : "failed",
+        // Keep the frozen canonical Purchase revision for a safe verification
+        // pass after a timeout or connector restart.
+        payload: commandPayload,
         result: isPurchaseVoucher ? compactPurchaseResult(result) : result,
         error: errorMessage,
-        completed_at: now,
+        completed_at: deferDebitCompletion ? null : now,
+        agent_receipt: toNullableText(body.agentReceipt, 500),
+        external_result_reference: toNullableText(body.externalResultReference, 1000),
       })
       .eq("id", commandId)
       .eq("connection_id", connection.id)
@@ -248,10 +322,12 @@ export async function POST(
     const command = {
       ...pendingCommand,
       status: success ? "succeeded" : "failed",
-      payload: isPurchaseVoucher ? compactPurchaseCommandPayload(commandPayload) : commandPayload,
+      payload: commandPayload,
       result: isPurchaseVoucher ? compactPurchaseResult(result) : result,
       error: errorMessage,
       completed_at: now,
+      agent_receipt: toNullableText(body.agentReceipt, 500),
+      external_result_reference: toNullableText(body.externalResultReference, 1000),
     } as TallyBridgeCommandRow;
 
     if (command.command_type === "sync_masters") {
@@ -382,17 +458,22 @@ export async function POST(
       const verification = result.verification && typeof result.verification === "object"
         ? result.verification as Record<string, unknown>
         : result;
-      const verificationStatus = toNullableText(verification.verificationStatus, 80);
+      const verificationStatus =
+        toNullableText(verification.verificationStatus, 80) ??
+        toNullableText(result.uncertaintyReason, 80);
       const alreadyInTally = success && Boolean(result.alreadyInTally);
       const verified = success && (verificationStatus === "verified" || alreadyInTally);
       const correctionRequired = Boolean(
         result.voucherCreatedButVerificationFailed ||
+        result.uncertainWrite ||
         result.possibleDuplicateInTally ||
         verificationStatus === "mismatch" ||
         verificationStatus === "ambiguous"
       );
       const postingStatus = verified
         ? "created"
+        : commandPayload.verificationOnly === true && success && verificationStatus === "missing"
+          ? "ready_for_approval"
         : correctionRequired
           ? "verification_required"
           : "failed";
@@ -418,10 +499,13 @@ export async function POST(
           .from("purchase_invoice_tally_postings")
           .update({
             status: postingStatus,
+            command_id: postingStatus === "ready_for_approval" ? null : commandId,
             tally_voucher_number: voucherNumber,
             tally_master_id: masterId,
             tally_guid: tallyGuid,
-            tally_created_at: voucherWasCreated && !alreadyInTally ? now : null,
+            tally_created_at: postingStatus === "ready_for_approval"
+              ? null
+              : voucherWasCreated && !alreadyInTally ? now : null,
             verified_at: verified ? now : null,
             verification_status: alreadyInTally ? "already_in_tally" : verificationStatus,
             last_error: verified ? null : purchaseVerificationError(errorMessage, verification),
@@ -607,7 +691,15 @@ export async function POST(
             last_error: null,
           });
 
-        if (insertProposalError) throw insertProposalError;
+        if (insertProposalError) {
+          if (insertProposalError.code !== '23505') throw insertProposalError;
+          const {data: saved,error: savedError} = await supabase.from('debit_note_proposals')
+            .select('tally_voucher_id,tally_voucher_guid,recoverable_amount').eq('tally_command_id',commandId)
+            .eq('owner_user_id',connection.owner_user_id).maybeSingle();
+          if (savedError) throw savedError;
+          if (!saved || Number(saved.recoverable_amount) !== Number(amount) ||
+            (voucherGuid ? saved.tally_voucher_guid !== voucherGuid : saved.tally_voucher_id !== voucherId)) throw insertProposalError;
+        }
 
       }
     }
@@ -745,10 +837,19 @@ export async function POST(
       },
     });
 
+    if (deferDebitCompletion) {
+      const {data: completed,error: completionError} = await supabase.from('tally_bridge_commands')
+        .update({status:'succeeded',completed_at:now}).eq('id',commandId).eq('connection_id',connection.id)
+        .eq('status','claimed').select('id').maybeSingle();
+      if (completionError) throw completionError;
+      if (!completed) return jsonWithCors(request,{error:'Debit note saved, but command state changed. Verify before retrying.'},{status:409});
+    }
     return jsonWithCors(request, {
       command: serializeTallyBridgeCommand(command),
     });
   } catch (error) {
+    const accessFailure = accessFailureResponse(request, error);
+    if (accessFailure) return accessFailure;
     console.error("Error in POST /api/tally/bridge/commands/[commandId]/result:", error);
     return jsonWithCors(
       request,

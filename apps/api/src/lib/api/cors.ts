@@ -40,7 +40,7 @@ export function applyCorsHeaders(response: NextResponse, request: Request) {
     // app are not rejected by the browser before the route can authenticate.
     response.headers.set(
       "Access-Control-Allow-Headers",
-      "Authorization, Content-Type, X-Tally-Control-Token"
+      "Authorization, Content-Type, X-Tally-Control-Token, X-Kalika-Organization"
     );
     response.headers.set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
     response.headers.set("Access-Control-Max-Age", "86400");

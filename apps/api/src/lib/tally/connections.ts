@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomInt } from "node:crypto";
+import { localAgentUpdateInfo } from "./agent-updates";
 
 export type TallyConnectionStatus =
   | "not_connected"
@@ -11,6 +12,7 @@ export type TallyConnectionStatus =
 export type TallyConnectionRow = {
   id: string;
   owner_user_id: string;
+  organization_id?: string | null;
   display_name: string;
   status: TallyConnectionStatus;
   tally_url: string;
@@ -27,6 +29,13 @@ export type TallyConnectionRow = {
   revoked_at: string | null;
   revoked_reason: string | null;
   session_generation: number;
+  agent_protocol_version?: number;
+  agent_version?: string | null;
+  agent_capabilities?: string[] | null;
+  agent_status?: Record<string, unknown> | null;
+  agent_last_seen_at?: string | null;
+  tdl_version?: number | null;
+  local_schema_version?: number | null;
   last_heartbeat_at: string | null;
   last_tested_at: string | null;
   last_tally_reachable: boolean | null;
@@ -43,6 +52,7 @@ const PAIRING_CODE_TTL_MINUTES = 10;
 export const TALLY_CONNECTION_SELECT = [
   "id",
   "owner_user_id",
+  "organization_id",
   "display_name",
   "status",
   "tally_url",
@@ -59,6 +69,13 @@ export const TALLY_CONNECTION_SELECT = [
   "revoked_at",
   "revoked_reason",
   "session_generation",
+  "agent_protocol_version",
+  "agent_version",
+  "agent_capabilities",
+  "agent_status",
+  "agent_last_seen_at",
+  "tdl_version",
+  "local_schema_version",
   "last_heartbeat_at",
   "last_tested_at",
   "last_tally_reachable",
@@ -117,6 +134,14 @@ export function serializeTallyConnection(row: TallyConnectionRow) {
     revokedAt: row.revoked_at,
     revokedReason: row.revoked_reason,
     sessionGeneration: row.session_generation,
+    organizationId: row.organization_id,
+    agentProtocolVersion: row.agent_protocol_version ?? 0,
+    agentVersion: row.agent_version,
+    agentCapabilities: row.agent_capabilities ?? [],
+    agentStatus: row.agent_status ?? {},
+    agentLastSeenAt: row.agent_last_seen_at,
+    tdlVersion: row.tdl_version,
+    localSchemaVersion: row.local_schema_version,
     lastHeartbeatAt: row.last_heartbeat_at,
     lastTestedAt: row.last_tested_at,
     lastTallyReachable: row.last_tally_reachable,
@@ -125,6 +150,7 @@ export function serializeTallyConnection(row: TallyConnectionRow) {
     lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    agentUpdate: localAgentUpdateInfo(row.agent_version || row.bridge_version),
   };
 }
 

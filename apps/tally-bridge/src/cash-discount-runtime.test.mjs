@@ -60,7 +60,7 @@ test("cancelled and expired queued work never touches Tally", async () => {
   const cancelled = queue.run(() => assert.fail("cancelled task ran"), { signal: controller.signal });
   const expired = queue.run(() => assert.fail("expired task ran"), { deadlineAt: Date.now() - 1 });
   const cancelledCheck = assert.rejects(cancelled);
-  const expiredCheck = assert.rejects(expired, /time budget/);
+  const expiredCheck = assert.rejects(expired, /expired|time budget/);
   controller.abort();
   release();
   await Promise.all([first, cancelledCheck, expiredCheck]);
@@ -78,7 +78,7 @@ test("failed customer stops further requests, preserving complete buckets", asyn
     companyName: "Company A", ledgers: ["A", "B", "C"].map((name) => ({ name })),
     billExport: { xml: "", queryMode: "open_bills_first", batchCount: 1 },
     dateRange: { dateFrom: "2026-04-01", dateTo: "2026-08-31" },
-  }, { evidenceBatchSize: 1, readCustomer: async (_config, payload) => {
+  }, { freeMemory: () => 2e9, batchLimit: () => 25, evidenceBatchSize: 1, readCustomer: async (_config, payload) => {
     const name = payload.ledgerNames[0];
     calls.push(name);
     if (name === "B") throw new Error("Tally timed out");
@@ -99,7 +99,7 @@ test("customer evidence is requested in bounded multi-ledger batches", async () 
     companyName: "Company A", ledgers,
     billExport: { xml: "", queryMode: "open_bills_first", batchCount: 1 },
     dateRange: { dateFrom: "2026-04-01", dateTo: "2026-08-31" },
-  }, { evidenceBatchSize: 20, readCustomer: async (_config, payload) => {
+  }, { freeMemory: () => 2e9, batchLimit: () => 25, evidenceBatchSize: 20, readCustomer: async (_config, payload) => {
     calls.push([...payload.ledgerNames]);
     return { result: { byLedger: Object.fromEntries(payload.ledgerNames.map((name) => [name, {
       ledgerName: name, openBills: [], existingAdvances: [], rawCount: 0,
@@ -135,4 +135,18 @@ test("continuation cache is bounded, expires, returns copies, and isolates keys"
   assert.equal(cache.get("other-company"), null);
   cache.set("key", { amount: 1 }); cache.clear();
   assert.equal(cache.get("key"), null);
+});
+
+test('low-memory scan does not issue an evidence request', async()=>{
+  const result=await collectCashDiscountCustomerEvidence({}, {companyName:'A',ledgers:[{name:'A'}],
+    billExport:{xml:''},dateRange:{}}, {freeMemory:()=>100,readCustomer:()=>assert.fail('must not query Tally')});
+  assert.equal(result.complete,false);assert.match(result.failures[0].error,/750 MB/);
+});
+
+test('posting can take the lane between scan chunks', async()=>{
+  const queue=createTallyScheduler();const order=[];let release;
+  const chunk=queue.run(()=>new Promise(resolve=>{order.push('scan-1');release=resolve;}),{priority:50});
+  const post=queue.run(()=>order.push('posting'),{priority:90});
+  const next=queue.run(()=>order.push('scan-2'),{priority:50});
+  release();await Promise.all([chunk,post,next]);assert.deepEqual(order,['scan-1','posting','scan-2']);
 });

@@ -1510,14 +1510,16 @@ export function serializeAccount(row: BankAccountRow) {
 export async function findBankAccountCandidates(
   supabase: SupabaseClient,
   ownerUserId: string,
-  account: BankAccountInput
+  account: BankAccountInput,
+  scope?:{organizationId:string;companyId:string}
 ) {
+  const predicate=scope?`and(access_organization_id.eq.${JSON.stringify(scope.organizationId)},access_company_id.eq.${JSON.stringify(scope.companyId)})`:`owner_user_id.eq.${JSON.stringify(ownerUserId)}`;
   const normalizedAccountNumber = normalizeAccountNumber(account.accountNumber);
   if (normalizedAccountNumber) {
     const { data, error } = await supabase
       .from("bank_accounts")
       .select("*")
-      .eq("owner_user_id", ownerUserId)
+      .or(predicate)
       .eq("account_number_normalized", normalizedAccountNumber)
       .limit(5);
     if (error) throw error;
@@ -1530,7 +1532,7 @@ export async function findBankAccountCandidates(
   const { data, error } = await supabase
     .from("bank_accounts")
     .select("*")
-    .eq("owner_user_id", ownerUserId)
+    .or(predicate)
     .ilike("account_holder_name", `%${normalizedHolder.split(" ").join("%")}%`)
     .limit(10);
 

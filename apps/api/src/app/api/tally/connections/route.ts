@@ -1,3 +1,7 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {permittedConnections} from '@/lib/access/connection-scope';
+import {AccessError,requireAccessContext} from '@/lib/access/server';
+import {canAccess} from '@autodealer/shared/lib/access';
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { isLocalDbMode } from "@/lib/local/mode";
@@ -109,8 +113,23 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   try {
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true') {
+      const access=await requireAccessContext(request);
+      let rows:TallyConnectionRow[];
+      if(canAccess(access,'connections.manage')&&access.member.all_companies) {
+        const result=await createSupabaseAdminClient().from('tally_connections').select(TALLY_CONNECTION_SELECT)
+          .eq('organization_id',access.organizationId).eq('owner_user_id',access.member.user_id)
+          .is('revoked_at',null).order('updated_at',{ascending:false}).limit(50);
+        if(result.error)throw result.error;
+        rows=(result.data||[]) as unknown as TallyConnectionRow[];
+      } else {
+        rows=(await permittedConnections(request)).rows;
+      }
+      return jsonWithCors(request,{connections:pickRelevantConnections(rows),observedAt:new Date().toISOString()},
+        {headers:{'Cache-Control':'private, no-store'}});
+    }
     const localMode = isLocalDbMode();
     const user = localMode ? { id: "local-dev-user" } : await requireRequestUser(request);
     if (!user) {
@@ -120,6 +139,7 @@ export async function GET(request: Request) {
     if (localMode) {
       return jsonWithCors(request, {
         connections: pickRelevantConnections(await listLocalTallyConnections(user.id)),
+        observedAt: new Date().toISOString(),
       });
     }
 
@@ -169,14 +189,16 @@ export async function GET(request: Request) {
 
     return jsonWithCors(request, {
       connections: pickRelevantConnections(rows),
+      observedAt: new Date().toISOString(),
     });
   } catch (error) {
+    if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
     console.error("Error in GET /api/tally/connections:", error);
     return jsonWithCors(request, tallyConnectionErrorPayload(error), { status: 500 });
   }
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const localMode = isLocalDbMode();
     const user = localMode ? { id: "local-dev-user" } : await requireRequestUser(request);
@@ -204,6 +226,7 @@ export async function POST(request: Request) {
     }
 
     const pairingCode = createPairingCode();
+    const teamContext=process.env.TEAM_ACCESS_ENFORCEMENT==='true'?await requireAccessContext(request):null;
     const controlToken = createBridgeToken();
     const supabase = createSupabaseAdminClient();
     const reuseConnectionId =
@@ -217,6 +240,7 @@ export async function POST(request: Request) {
         .select(TALLY_CONNECTION_SELECT)
         .eq("id", reuseConnectionId)
         .eq("owner_user_id", user.id)
+        .or(teamContext?`organization_id.eq.${JSON.stringify(teamContext.organizationId)}`:'id.not.is.null')
         .is("revoked_at", null)
         .is("bridge_token_hash", null)
         .maybeSingle();
@@ -263,6 +287,7 @@ export async function POST(request: Request) {
         updated_at: retiredAt,
       })
       .eq("owner_user_id", user.id)
+      .or(teamContext?`organization_id.eq.${JSON.stringify(teamContext.organizationId)}`:'id.not.is.null')
       .is("revoked_at", null)
       .is("bridge_token_hash", null);
 
@@ -274,6 +299,7 @@ export async function POST(request: Request) {
       .from("tally_connections")
       .insert({
         owner_user_id: user.id,
+        ...(teamContext?{organization_id:teamContext.organizationId}:{}),
         display_name: normalizeDisplayName(body.displayName),
         status: "waiting_for_bridge",
         tally_url: normalizeTallyUrl(body.tallyUrl),
@@ -308,7 +334,11 @@ export async function POST(request: Request) {
       { status: 201 }
     );
   } catch (error) {
+    if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
     console.error("Error in POST /api/tally/connections:", error);
     return jsonWithCors(request, tallyConnectionErrorPayload(error), { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);
+export const POST = withTeamAccess(POSTHandler);

@@ -7,6 +7,7 @@ import type {
   QueuedUpload,
 } from "@/types/pipeline";
 import { apiFetch } from "@/lib/api-client";
+import {loadProtectedCasePreview} from './protected-preview';
 import type { PacketIntelligence } from "@/lib/packet-intelligence";
 import { getQueuedUploadFiles, serializeQueuedUploadGroups } from "@/lib/upload-groups";
 
@@ -388,6 +389,7 @@ function toApiRequestError(
 }
 
 export async function persistProcessedCase(params: {
+  accessCompanyId?: string;
   uploads: QueuedUpload[];
   documents: CaseDoc[];
   mismatches: Mismatch[];
@@ -396,6 +398,7 @@ export async function persistProcessedCase(params: {
   allowDuplicate?: boolean;
 }): Promise<CreateCaseResponse> {
   const formData = new FormData();
+  if(params.accessCompanyId) formData.set('accessCompanyId',params.accessCompanyId);
   formData.set("documents", JSON.stringify(params.documents));
   formData.set("mismatches", JSON.stringify(params.mismatches));
   if (params.allowDuplicate) {
@@ -428,10 +431,12 @@ export async function persistProcessedCase(params: {
 }
 
 export async function createDraftCase(params: {
+  accessCompanyId?: string;
   uploads: QueuedUpload[];
   allowDuplicate?: boolean;
 }): Promise<CreateCaseResponse> {
   const formData = new FormData();
+  if(params.accessCompanyId) formData.set('accessCompanyId',params.accessCompanyId);
   formData.set("mode", "draft");
   if (params.allowDuplicate) {
     formData.set("allowDuplicate", "true");
@@ -792,7 +797,11 @@ export async function fetchCaseFileSignedUrl(
   const response = await performApiFetch(`/api/cases/${caseId}/files?${searchParams.toString()}`, {
     cache: "no-store",
   });
-  const { payload, rawText } = await readApiResponse<CaseFileSignedUrlResponse>(response);
+  const { payload, rawText } = await readApiResponse<CaseFileSignedUrlResponse & {contentPath?:string}>(response);
+
+  if (response.ok && payload.fileId === fileId && typeof payload.contentPath === 'string') {
+    return {fileId, signedUrl: await loadProtectedCasePreview(caseId,fileId,payload.contentPath)};
+  }
 
   if (!response.ok || typeof payload.fileId !== "string" || typeof payload.signedUrl !== "string") {
     throw toApiRequestError(payload, "Failed to load source preview.", {
@@ -806,3 +815,6 @@ export async function fetchCaseFileSignedUrl(
     signedUrl: payload.signedUrl,
   };
 }
+
+export const fetchCaseDetailPreferCache = fetchCaseDetail;
+export const fetchCaseFileSignedUrlPreferCache = fetchCaseFileSignedUrl;

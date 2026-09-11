@@ -1,3 +1,6 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {listAccessPredicate} from '@/lib/access/list-scope';
+import {requireResourceAccess} from '@/lib/access/resources';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -79,7 +82,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) {
@@ -101,11 +104,16 @@ export async function GET(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
+    const team=process.env.TEAM_ACCESS_ENFORCEMENT==='true'?await requireResourceAccess(request,'bank_account',accountId,'bank.view'):null;
+    if(team&&importId){
+      const imported=await requireResourceAccess(request,'bank_import',importId,'bank.view');
+      if(imported.scope.company_id!==team.scope.company_id)return jsonWithCors(request,{error:'Import is outside the selected account company.'},{status:404});
+    }
     const { data: account, error: accountError } = await supabase
       .from("bank_accounts")
       .select("id")
       .eq("id", accountId)
-      .eq("owner_user_id", user.id)
+      .or(await listAccessPredicate(request,user.id,'bank.view'))
       .maybeSingle();
 
     if (accountError) throw accountError;
@@ -119,7 +127,7 @@ export async function GET(request: Request) {
         "id, bank_account_id, statement_import_id, transaction_date, value_date, description, reference_number, debit_amount, credit_amount, balance_amount, transaction_type, category, counterparty_name, suggested_ledger_name, suggestion_confidence, suggestion_reason, confirmed_ledger_name, ledger_mapping_source, tally_status",
         { count: "exact" }
       )
-      .eq("owner_user_id", user.id)
+      .or(team?'id.not.is.null':`owner_user_id.eq.${JSON.stringify(user.id)}`)
       .eq("bank_account_id", accountId)
       .order("transaction_date", { ascending: true })
       .order("id", { ascending: true })
@@ -154,3 +162,5 @@ export async function GET(request: Request) {
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);

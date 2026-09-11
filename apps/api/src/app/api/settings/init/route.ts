@@ -1,3 +1,5 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import { settingsOrganization } from '@/lib/access/settings';
 import { getFieldSettings } from "@/lib/field-settings-service";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -6,14 +8,14 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) {
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }
 
-    const settings = await getFieldSettings();
+    const settings = await getFieldSettings(await settingsOrganization(request));
     
     if (!settings) {
       return jsonWithCors(request,
@@ -36,3 +38,5 @@ export async function GET(request: Request) {
     );
   }
 }
+
+export const GET = withTeamAccess(GETHandler);

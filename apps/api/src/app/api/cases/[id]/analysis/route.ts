@@ -1,3 +1,6 @@
+import { listAccessPredicate } from '@/lib/access/list-scope';
+import {requireAccessContext} from '@/lib/access/server';
+import { withTeamAccess } from '@/lib/access/route-boundary';
 import { NextResponse } from "next/server";
 
 import {
@@ -207,7 +210,7 @@ function mapCaseRow(row: {
   };
 }
 
-export async function POST(
+async function POSTHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -219,7 +222,9 @@ export async function POST(
     }
 
     const supabase = createSupabaseAdminClient();
-    const fieldConfiguration = await getPersistedPacketFieldConfiguration();
+    const fieldConfiguration = await getPersistedPacketFieldConfiguration(
+      process.env.TEAM_ACCESS_ENFORCEMENT==='true'?(await requireAccessContext(request)).organizationId:undefined
+    );
     const formData = await request.formData();
     const analysisMode = parseAnalysisMode(formData.get("analysisMode"));
     const comparisonOptions = parseComparisonOptions(formData.get("comparisonOptions"));
@@ -250,7 +255,7 @@ export async function POST(
         .from("packet_cases")
         .select("id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at")
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .single();
 
       if (result.error) {
@@ -270,7 +275,7 @@ export async function POST(
         .from("packet_cases")
         .select("id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta")
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .single();
 
       if (fallback.error) {
@@ -342,7 +347,7 @@ export async function POST(
           .from("packet_cases")
           .update(updatePayload)
           .eq("id", id)
-          .eq("owner_user_id", user.id)
+          .or(await listAccessPredicate(request, user.id, 'purchases.view'))
           .select(
             "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
           )
@@ -359,7 +364,7 @@ export async function POST(
           .from("packet_cases")
           .update(updatePayload)
           .eq("id", id)
-          .eq("owner_user_id", user.id)
+          .or(await listAccessPredicate(request, user.id, 'purchases.view'))
           .select(
             "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
           )
@@ -541,7 +546,7 @@ export async function POST(
         .from("packet_cases")
         .update(nextCasePayload)
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .select(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
         )
@@ -558,7 +563,7 @@ export async function POST(
         .from("packet_cases")
         .update(nextCasePayload)
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .select(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
         )
@@ -577,3 +582,5 @@ export async function POST(
 export async function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
+
+export const POST = withTeamAccess(POSTHandler);

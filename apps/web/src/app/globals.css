@@ -117,6 +117,7 @@
 @layer base {
   * {
     @apply border-border outline-ring/50;
+    box-sizing: border-box;
   }
   html, body {
     margin: 0;
@@ -126,11 +127,36 @@
   body {
     @apply bg-background text-foreground;
     font-family: var(--font-app-sans);
-    font-feature-settings: "kern" 1, "liga" 1;
+    font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
     letter-spacing: 0;
     text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* ── Thin scrollbar (WebKit) ── */
+  ::-webkit-scrollbar {
+    width: 5px;
+    height: 5px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(0, 0, 0, 0.12);
+    border-radius: 99px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 0, 0, 0.22);
+  }
+
+  /* ── Selection ── */
+  ::selection {
+    background: rgba(99, 102, 241, 0.15);
+    color: inherit;
   }
 }
+
 
 .bank-statements-workflow :where(
   button:not(:disabled):not([aria-disabled="true"]),
@@ -144,6 +170,54 @@
   label:has(input[type="radio"]:not(:disabled))
 ) {
   cursor: pointer;
+}
+
+/* Bank review follows the compact, keyboard-first Tally workspace used by the
+   reference implementation. Keep controls readable while fitting more rows. */
+.bank-statements-workflow .bank-statements-review-table th {
+  padding-block: 0.55rem;
+}
+
+.bank-statements-workflow .bank-statements-review-table td {
+  padding-block: 0.45rem;
+}
+
+.bank-statements-workflow .bank-statements-review-table tbody tr {
+  min-height: 2.75rem;
+}
+
+.bank-statements-workflow .bank-statements-review-table tbody td {
+  font-size: 0.625rem;
+  line-height: 0.8rem;
+}
+
+.bank-statements-workflow .bank-statements-review-table tbody td .text-sm {
+  font-size: 0.6875rem;
+  line-height: 0.9rem;
+}
+
+.bank-statements-workflow .bank-statements-review-table tbody td .text-xs {
+  font-size: 0.5625rem;
+  line-height: 0.75rem;
+}
+
+.bank-statements-workflow .bank-statements-review-table .posting-status-cell > button {
+  gap: 0.2rem;
+  padding-block: 0.125rem;
+}
+
+.bank-statements-workflow .bank-statements-review-table .posting-status-cell > button > span:first-child {
+  min-height: 1.125rem;
+  padding: 0.125rem 0.45rem;
+  font-size: 0.5625rem;
+  line-height: 0.65rem;
+  letter-spacing: 0.025em;
+}
+
+.bank-statements-workflow .bank-statements-review-table .posting-status-cell > button > span:not(:first-child) {
+  margin-top: 0;
+  font-size: 0.5625rem;
+  line-height: 0.7rem;
 }
 
 .bank-statements-workflow :where(

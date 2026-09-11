@@ -135,7 +135,14 @@ async function resolveUserFromCookies(): Promise<RequestUser | null> {
   return user ? { id: user.id } : null;
 }
 
-export async function requireRequestUser(request: Request): Promise<RequestUser | null> {
+const requestUsers = new WeakMap<Request, Promise<RequestUser | null>>();
+export function requireRequestUser(request: Request): Promise<RequestUser | null> {
+  let pending = requestUsers.get(request);
+  if (!pending) { pending = resolveRequestUser(request); requestUsers.set(request, pending); }
+  return pending;
+}
+
+async function resolveRequestUser(request: Request): Promise<RequestUser | null> {
   if (isLocalDbMode()) {
     return { id: LOCAL_USER_ID };
   }

@@ -17,6 +17,9 @@ import {
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import {canAccess} from '@autodealer/shared/lib/access';
+import { calculatePurchaseVoucher } from "@autodealer/shared/lib/purchase-voucher";
+import {PurchaseApprovalControls,usePurchaseApproval} from '@/components/access/PurchaseApprovalControls';
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -34,6 +37,12 @@ import {
 import { fetchCaseFileSignedUrl } from "@/lib/case-persistence";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import {
+  rankPurchaseLedgerRole as rankLedgerRole,
+  rankPurchaseStockItems as rankStockItems,
+  searchPurchaseMasterOptions,
+  selectedMasterOption,
+} from "@/lib/purchase-master-performance";
+import {
   approveAndQueueTallyPurchasePosting,
   fetchTallyPurchasePosting,
   matchTallyPurchaseLineMasters,
@@ -43,6 +52,7 @@ import {
   prepareTallyPurchasePostingFromLive,
   saveTallyPurchasePosting,
   selectTallyPurchaseInvoice,
+  verifyExistingTallyPurchaseVoucher,
   waitForTallyCommand,
   type TallyMasterOption,
   type TallyPostingIssue,
@@ -159,14 +169,6 @@ function stateLabel(code: string | null | undefined) {
   return states[code] ? `${states[code]} (${code})` : `State code ${code}`;
 }
 
-function normalizeUnitFamily(value: string | null | undefined) {
-  const normalized = String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
-  if (["mt", "mts", "metricton", "metrictons", "tonne", "tonnes"].includes(normalized)) {
-    return "metricton";
-  }
-  return normalized;
-}
-
 function numericDifference(
   invoice: string | null | undefined,
   calculated: string | null | undefined
@@ -197,111 +199,6 @@ function dedupeMasterOptions(options: TallyMasterOption[]) {
   }
 
   return [...byName.values()];
-}
-
-type LedgerRole =
-  | "purchase"
-  | "cgst"
-  | "sgst"
-  | "igst"
-  | "freight"
-  | "tds_194q"
-  | "transport_tds"
-  | "cgst_tds"
-  | "sgst_tds"
-  | "igst_tds"
-  | "tcs"
-  | "round_off";
-
-function optionIdentity(option: TallyMasterOption) {
-  return [
-    option.name,
-    option.parent,
-    option.groupPath,
-    option.taxType,
-    option.gstDutyHead,
-  ].filter(Boolean).join(" ");
-}
-
-function rankLedgerRole(
-  options: TallyMasterOption[],
-  role: LedgerRole,
-  expectedRate = 0,
-  aiCandidates: string[] = []
-) {
-  const aiNames = new Set(aiCandidates.map((name) => name.trim().toLowerCase()));
-  const score = (option: TallyMasterOption) => {
-    const identity = optionIdentity(option);
-    let value = aiNames.has(option.name.trim().toLowerCase()) ? 300 : 0;
-    if (role === "purchase") {
-      if (/purchase\s+accounts?/i.test(identity)) value += 120;
-      else if (/\bpurchase\b/i.test(identity)) value += 80;
-      if (/direct\s+expenses?/i.test(identity)) value += 25;
-      if (/\b(sales|output|bank|cash|sundry\s+(?:debtors?|creditors?))\b/i.test(identity)) value -= 120;
-    } else if (["cgst", "sgst", "igst"].includes(role)) {
-      const component = role === "cgst"
-        ? /\bcgst\b|central\s+tax/i
-        : role === "sgst"
-          ? /\bsgst\b|state\s+tax/i
-          : /\bigst\b|integrated\s+tax/i;
-      if (component.test(identity)) value += 120;
-      if (/\b(input|itc|purchase)\b/i.test(identity)) value += 50;
-      if (/\b(output|sales)\b/i.test(identity)) value -= 150;
-      if (option.taxRate !== null && expectedRate > 0 && Math.abs(option.taxRate - expectedRate) < 0.001) value += 30;
-    } else if (role === "freight") {
-      if (/freight|transportation\s+inward/i.test(identity)) value += 130;
-      if (/direct\s+expenses?|purchase/i.test(identity)) value += 25;
-    } else if (role === "tds_194q") {
-      if (/\btds\b|withholding|tax\s+deducted/i.test(identity)) value += 80;
-      if (/194q|0[.]?10/i.test(identity)) value += 100;
-    } else if (role === "transport_tds") {
-      if (/\btds\b|withholding|tax\s+deducted/i.test(identity)) value += 80;
-      if (/transport|freight|goods\s+carriage/i.test(identity)) value += 100;
-    } else if (["cgst_tds", "sgst_tds", "igst_tds"].includes(role)) {
-      if (/\btds\b|withholding|tax\s+deducted/i.test(identity)) value += 80;
-      const component = role === "cgst_tds"
-        ? /\bcgst\b|central\s+tax/i
-        : role === "sgst_tds"
-          ? /\bsgst\b|state\s+tax/i
-          : /\bigst\b|integrated\s+tax/i;
-      if (component.test(identity)) value += 100;
-    } else if (role === "tcs") {
-      if (/\btcs\b|tax\s+collected/i.test(identity)) value += 150;
-      if (/receivable/i.test(identity)) value += 25;
-    } else if (role === "round_off") {
-      if (/round[\s-]*off/i.test(identity)) value += 150;
-    }
-    return value;
-  };
-  const ranked = [...options]
-    .map((option) => ({ option, score: score(option) }))
-    .sort((left, right) => right.score - left.score || left.option.name.localeCompare(right.option.name));
-  return {
-    options: ranked.map((entry) => entry.option),
-    suggestedNames: ranked.filter((entry) => entry.score >= 100).slice(0, 8).map((entry) => entry.option.name),
-  };
-}
-
-function rankStockItems(
-  options: TallyMasterOption[],
-  line: TallyPostingReview["lines"][number],
-  aiCandidates: string[]
-) {
-  const aiNames = new Set(aiCandidates.map((name) => name.trim().toLowerCase()));
-  const normalizedHsn = line.hsn.replace(/\D/g, "");
-  const descriptionTokens = line.description.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length > 2);
-  const ranked = [...options].map((option) => {
-    let score = aiNames.has(option.name.trim().toLowerCase()) ? 300 : 0;
-    if (normalizedHsn && option.hsnCode?.replace(/\D/g, "") === normalizedHsn) score += 140;
-    const identity = optionIdentity(option).toLowerCase();
-    score += descriptionTokens.filter((token) => identity.includes(token)).length * 15;
-    if (line.unit && option.unitName && normalizeUnitFamily(line.unit) === normalizeUnitFamily(option.unitName)) score += 20;
-    return { option, score };
-  }).sort((left, right) => right.score - left.score || left.option.name.localeCompare(right.option.name));
-  return {
-    options: ranked.map((entry) => entry.option),
-    suggestedNames: ranked.filter((entry) => entry.score >= 100).slice(0, 8).map((entry) => entry.option.name),
-  };
 }
 
 function caseStatusLabel(status: string | undefined) {
@@ -341,6 +238,18 @@ function postingProgressMessage(status: string | undefined, verificationStatus?:
   if (status === "created") return "Purchase voucher created and verified in Tally.";
   if (status === "verification_required") return "Tally created the voucher, but verification needs attention.";
   return null;
+}
+
+function purchaseStageMessage(phase: string) {
+  return ({
+    preparing_source: "Preparing the source invoice and checking Tally…",
+    checking_duplicates: "Checking this supplier invoice across the financial year…",
+    validating_masters: "Validating the selected live Tally masters…",
+    importing_voucher: "Creating the Purchase voucher in Tally…",
+    verifying_voucher: "Reading the created voucher back from Tally…",
+    verification_required: "The write result needs verification before any retry.",
+    complete: "Purchase voucher created and verified in Tally.",
+  } as Record<string, string>)[phase] ?? `Tally: ${phase.replaceAll("_", " ")}…`;
 }
 
 function FieldIssues({ issues }: { issues?: TallyPostingIssue[] }) {
@@ -480,31 +389,12 @@ function MasterCombobox({
 }) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
-  const normalizedValue = value.trim().toLowerCase();
-  const selected =
-    options.find((option) => option.name.trim().toLowerCase() === normalizedValue) ??
-    null;
-  const filtered = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    if (!query) return options;
-    return options.filter((option) =>
-      [
-        option.name,
-        option.parent,
-        option.groupPath,
-        option.gstin,
-        option.hsnCode,
-        option.unitName,
-        option.taxRate,
-        option.closingBalance,
-        option.closingBalanceType,
-      ]
-        .filter((item) => item !== null && item !== undefined)
-        .join(" ")
-        .toLowerCase()
-        .includes(query)
-    );
-  }, [options, search]);
+  const selected = useMemo(() => selectedMasterOption(options, value), [options, value]);
+  const visibleState = useMemo(
+    () => searchPurchaseMasterOptions(options, suggestedNames, search),
+    [options, search, suggestedNames]
+  );
+  const visibleOptions = visibleState.visibleOptions;
   const detail = (option: TallyMasterOption) =>
     option.type === "ledger"
       ? [option.groupPath || option.parent, closingBalanceLabel(option)].filter(Boolean)
@@ -628,8 +518,9 @@ function MasterCombobox({
             style={{ maxHeight: "min(20rem, calc(var(--radix-popover-content-available-height) - 7rem))" }}
           >
             <div className="p-1.5">
-              {filtered.length > 0 ? (
-                filtered.map((option) => (
+              {visibleOptions.length > 0 ? (
+                <>
+                {visibleOptions.map((option) => (
                   <button
                     className={`w-full rounded-lg text-left transition hover:bg-emerald-50 ${compact ? "px-2.5 py-2" : "px-3 py-2.5"} ${
                       selected?.id === option.id ? "bg-emerald-50" : ""
@@ -675,7 +566,13 @@ function MasterCombobox({
                       ) : null}
                     </span>
                   </button>
-                ))
+                ))}
+                {visibleState.hasMore ? (
+                  <p className="px-3 py-2 text-center text-[10px] text-slate-400">
+                    Showing the first {visibleOptions.length.toLocaleString("en-IN")} matches. Type more to narrow the list.
+                  </p>
+                ) : null}
+                </>
               ) : (
                 <div className="px-3 py-8 text-center">
                   <PackageSearch className="mx-auto h-5 w-5 text-slate-300" />
@@ -762,6 +659,7 @@ export function TallyPurchasePostingPanel({
   onRefreshReady?: (refresh: () => Promise<void>) => void;
 }) {
   const [payload, setPayload] = useState<TallyPostingResponse | null>(null);
+  const approval = usePurchaseApproval(caseId);
   const [review, setReview] = useState<TallyPostingReview | null>(null);
   const [selectedConnectionId, setSelectedConnectionId] = useState("");
   const [selectedCompanyName, setSelectedCompanyName] = useState("");
@@ -786,6 +684,7 @@ export function TallyPurchasePostingPanel({
   const [matchingLineMasters, setMatchingLineMasters] = useState(false);
   const [lineMasterMatchError, setLineMasterMatchError] = useState<string | null>(null);
   const automaticSupplierMatchKeyRef = useRef("");
+  const localSupplierSuggestionKeyRef = useRef("");
   const automaticLineMasterMatchKeyRef = useRef("");
   const lastPostingStatusRef = useRef<string | null>(null);
   const automaticLiveRefreshRef = useRef<string | null>(null);
@@ -830,11 +729,13 @@ export function TallyPurchasePostingPanel({
   // command queue + one-second polling loop and also prevents two initial
   // tally-posting requests from racing each other.
   useEffect(() => {
+    if(approval.enabled&&approval.loading)return;
     if (automaticLiveRefreshRef.current === caseId) return;
     automaticLiveRefreshRef.current = caseId;
     setLiveMastersReady(false);
     void (async () => {
       const next = await load(false, null, true);
+      if(approval.enabled&&(!canAccess(approval.snapshot,'purchases.prepare')||approval.workflow?.state!=='draft'))return;
       const connection = next?.connection;
       if (
         !next ||
@@ -852,8 +753,13 @@ export function TallyPurchasePostingPanel({
           companyName: next.selectedCompanyName,
           operation: "ledger_masters",
           payload: {
+            moduleName: "purchase",
             persist: false,
+            requireFresh: true,
             requestedMasterTypes: ["ledger", "group", "stock_item", "unit", "gst_ledger", "tax_ledger"],
+            includeInventoryLocations: Boolean(
+              next.review?.lines.some((line) => line.godownName.trim() || line.batchName.trim())
+            ),
           },
           onProgress: (message) => setNotice(message),
         });
@@ -874,12 +780,51 @@ export function TallyPurchasePostingPanel({
         setLiveMastersReady(true);
         setNotice("Latest live Tally data loaded.");
       } catch (refreshError) {
-        setNotice(refreshError instanceof Error ? refreshError.message : "Live Tally refresh is unavailable.");
+        setError(refreshError instanceof Error ? refreshError.message : "Live Tally refresh is unavailable.");
+        setNotice(null);
       } finally {
         setRefreshingMasters(false);
       }
     })();
-  }, [caseId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [caseId,approval.enabled,approval.loading]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!liveMastersReady || !selectedConnectionId || !selectedCompanyName || !review?.supplierName) return;
+    const key = JSON.stringify([selectedConnectionId, selectedCompanyName, review.supplierName, review.supplierGstin]);
+    if (localSupplierSuggestionKeyRef.current === key) return;
+    localSupplierSuggestionKeyRef.current = key;
+    let cancelled = false;
+    void runCashDiscountLiveRequest<{
+      matches?: Record<string, { suggestions?: Array<{ ledger?: { name?: string } }> }>;
+    }>({
+      connectionId: selectedConnectionId,
+      companyName: selectedCompanyName,
+      operation: "ledger_suggestions",
+      payload: {
+        moduleName: "purchase",
+        id: "supplier",
+        name: review.supplierName,
+        gstin: review.supplierGstin,
+      },
+    }).then((result) => {
+      if (cancelled) return;
+      const names = (result.matches?.supplier?.suggestions || [])
+        .map((entry) => entry.ledger?.name?.trim()).filter((name): name is string => Boolean(name));
+      if (!names.length) return;
+      setSupplierLedgerMatch((current) => {
+        if (current?.matchType === "direct_match") return current;
+        const candidateLedgerNames = Array.from(new Set([...(current?.candidateLedgerNames || []), ...names])).slice(0, 8);
+        return {
+          matchType: "close_match",
+          ledgerName: current?.ledgerName || null,
+          candidateLedgerNames,
+          confidence: Math.max(current?.confidence || 0, 0.6),
+          reason: current?.reason || "Closest ledger names from the encrypted Local Agent index.",
+        };
+      });
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [liveMastersReady, review?.supplierGstin, review?.supplierName, selectedCompanyName, selectedConnectionId]);
 
   useEffect(() => {
     const postingStatus = payload?.posting?.status;
@@ -892,12 +837,18 @@ export function TallyPurchasePostingPanel({
     if (connectionId && commandId) {
       void (async () => {
         let pollAttempt = 0;
+        const pollingStartedAt = Date.now();
         try {
           while (!cancelled) {
+            if (Date.now() - pollingStartedAt > 180_000) {
+              setNotice("Tally is taking longer than expected. Refresh status to verify the existing command; do not submit it again.");
+              return;
+            }
             const intervalMs = Math.min(1500 + pollAttempt * 500, 4000);
             const terminal = await waitForTallyCommand(connectionId, commandId, {
               attempts: 1,
               intervalMs,
+              onProgress: (phase) => setNotice(purchaseStageMessage(phase)),
             });
             pollAttempt += 1;
             if (!terminal) continue;
@@ -912,6 +863,16 @@ export function TallyPurchasePostingPanel({
                 return;
               }
               const result = terminal.result ?? {};
+              if (result.verificationOnly === true) {
+                await load(true, connectionId, false, payload?.selectedCompanyName);
+                setError(null);
+                setNotice(
+                  result.verifiedAbsent === true
+                    ? "No matching voucher was found. The approved purchase can now be sent again safely."
+                    : "The existing Purchase voucher was found and verified in Tally."
+                );
+                return;
+              }
               const textResult = (key: string) =>
                 typeof result[key] === "string" && result[key].trim()
                   ? result[key].trim()
@@ -1021,12 +982,16 @@ export function TallyPurchasePostingPanel({
     });
   }, [onHeaderStateChange, payload]);
 
-  const locked = ["approved", "queued", "creating", "created", "verification_required"].includes(payload?.posting?.status ?? "");
+  const postingLocked = ["approved", "queued", "creating", "created", "verification_required"].includes(payload?.posting?.status ?? "");
+  const locked = postingLocked || (approval.enabled && (approval.loading || Boolean(approval.error) || !canAccess(approval.snapshot,'purchases.prepare') || Boolean(approval.workflow && approval.workflow.state !== 'draft')));
   const ledgerOptions = useMemo(
     () => dedupeMasterOptions(payload?.masterOptions.ledgers ?? []),
     [payload?.masterOptions.ledgers]
   );
-  const stockItemOptions = payload?.masterOptions.stockItems ?? [];
+  const stockItemOptions = useMemo(
+    () => payload?.masterOptions.stockItems ?? [],
+    [payload?.masterOptions.stockItems]
+  );
   const godownOptions = useMemo(() => {
     const liveOptions = payload?.masterOptions.godowns ?? [];
     const inferredNames = Array.from(new Set(
@@ -1052,6 +1017,7 @@ export function TallyPurchasePostingPanel({
         gstDutyHead: null,
         closingBalance: null,
         closingBalanceType: null,
+        decimalPlaces: null,
       }));
     return [...liveOptions, ...inferredOptions];
   }, [payload?.masterOptions.godowns, payload?.source?.godownName, payload?.source?.lines]);
@@ -1220,17 +1186,30 @@ export function TallyPurchasePostingPanel({
     selectedCompanyName,
     selectedConnectionId,
   ]);
-  const cgstRanked = rankLedgerRole(ledgerOptions, "cgst", Number(review?.gstRate || 0) / 2);
-  const sgstRanked = rankLedgerRole(ledgerOptions, "sgst", Number(review?.gstRate || 0) / 2);
-  const igstRanked = rankLedgerRole(ledgerOptions, "igst", Number(review?.gstRate || 0));
-  const freightRanked = rankLedgerRole(ledgerOptions, "freight", Number(review?.freightGstRate || 0));
-  const tds194qRanked = rankLedgerRole(ledgerOptions, "tds_194q");
-  const transportTdsRanked = rankLedgerRole(ledgerOptions, "transport_tds");
-  const cgstTdsRanked = rankLedgerRole(ledgerOptions, "cgst_tds");
-  const sgstTdsRanked = rankLedgerRole(ledgerOptions, "sgst_tds");
-  const igstTdsRanked = rankLedgerRole(ledgerOptions, "igst_tds");
-  const tcsRanked = rankLedgerRole(ledgerOptions, "tcs");
-  const roundOffRanked = rankLedgerRole(ledgerOptions, "round_off");
+  const rankedLedgerRoles = useMemo(() => ({
+    cgst: rankLedgerRole(ledgerOptions, "cgst", Number(review?.gstRate || 0) / 2),
+    sgst: rankLedgerRole(ledgerOptions, "sgst", Number(review?.gstRate || 0) / 2),
+    igst: rankLedgerRole(ledgerOptions, "igst", Number(review?.gstRate || 0)),
+    freight: rankLedgerRole(ledgerOptions, "freight", Number(review?.freightGstRate || 0)),
+    tds194q: rankLedgerRole(ledgerOptions, "tds_194q"),
+    transportTds: rankLedgerRole(ledgerOptions, "transport_tds"),
+    cgstTds: rankLedgerRole(ledgerOptions, "cgst_tds"),
+    sgstTds: rankLedgerRole(ledgerOptions, "sgst_tds"),
+    igstTds: rankLedgerRole(ledgerOptions, "igst_tds"),
+    tcs: rankLedgerRole(ledgerOptions, "tcs"),
+    roundOff: rankLedgerRole(ledgerOptions, "round_off"),
+  }), [ledgerOptions, review?.freightGstRate, review?.gstRate]);
+  const cgstRanked = rankedLedgerRoles.cgst;
+  const sgstRanked = rankedLedgerRoles.sgst;
+  const igstRanked = rankedLedgerRoles.igst;
+  const freightRanked = rankedLedgerRoles.freight;
+  const tds194qRanked = rankedLedgerRoles.tds194q;
+  const transportTdsRanked = rankedLedgerRoles.transportTds;
+  const cgstTdsRanked = rankedLedgerRoles.cgstTds;
+  const sgstTdsRanked = rankedLedgerRoles.sgstTds;
+  const igstTdsRanked = rankedLedgerRoles.igstTds;
+  const tcsRanked = rankedLedgerRoles.tcs;
+  const roundOffRanked = rankedLedgerRoles.roundOff;
   const cgstOptions = cgstRanked.options;
   const sgstOptions = sgstRanked.options;
   const igstOptions = igstRanked.options;
@@ -1242,11 +1221,33 @@ export function TallyPurchasePostingPanel({
   const igstTdsOptions = igstTdsRanked.options;
   const tcsOptions = tcsRanked.options;
   const roundOffOptions = roundOffRanked.options;
+  // Keep expensive 50k-master line rankings across ordinary amount and text
+  // edits. Each cache is discarded when its authoritative option array changes.
+  const stockRankingCache = useMemo(
+    () => {
+      void stockItemOptions;
+      return new Map<string, ReturnType<typeof rankStockItems>>();
+    },
+    [stockItemOptions]
+  );
+  const purchaseRankingCache = useMemo(
+    () => {
+      void ledgerOptions;
+      return new Map<string, ReturnType<typeof rankLedgerRole>>();
+    },
+    [ledgerOptions]
+  );
   const correctionBlockers = useMemo(
     () => ["created", "verification_required"].includes(payload?.posting?.status ?? "")
       ? []
       : (payload?.blockers ?? []).filter((issue) => {
       if (issue.scope === "case" || issue.scope === "company") return false;
+      if (!liveMastersReady && (
+        issue.code === "STOCK_ITEM_REQUIRED" ||
+        issue.code === "PURCHASE_LEDGER_REQUIRED" ||
+        issue.code === "SUPPLIER_LEDGER_REQUIRED" ||
+        issue.code.endsWith("_LEDGER_REQUIRED")
+      )) return false;
       // Server blockers describe the last saved review. Clear date errors as
       // soon as the current browser value is valid; Save still performs the
       // authoritative server validation before approval.
@@ -1254,7 +1255,7 @@ export function TallyPurchasePostingPanel({
       if (issue.code === "VOUCHER_DATE_REQUIRED" && isValidDateInput(review?.voucherDate)) return false;
       return true;
     }),
-    [payload?.blockers, payload?.posting?.status, review?.invoiceDate, review?.voucherDate]
+    [liveMastersReady, payload?.blockers, payload?.posting?.status, review?.invoiceDate, review?.voucherDate]
   );
   const acknowledgementWarnings = useMemo(
     () => (payload?.warnings ?? []).filter((warning) => warning.requiresAcknowledgement),
@@ -1334,6 +1335,7 @@ export function TallyPurchasePostingPanel({
       setNotice(hydrated.readyForApproval
         ? "Changes saved. This voucher is ready to send to Tally."
         : "Changes saved. Complete the highlighted items before approval.");
+      if (approval.enabled) await approval.refresh();
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "Could not save your changes.");
     } finally {
@@ -1426,7 +1428,8 @@ export function TallyPurchasePostingPanel({
       !payload?.readyForApproval ||
       dirty ||
       connectionDirty ||
-      locked ||
+      postingLocked ||
+      (approval.enabled && (approval.workflow?.state !== 'approved' || !canAccess(approval.snapshot,'purchases.post'))) ||
       refreshingMasters ||
       (acknowledgementWarnings.length > 0 && !warningsAcknowledged)
     ) {
@@ -1455,7 +1458,8 @@ export function TallyPurchasePostingPanel({
         acknowledgementWarnings.map((warning) => warning.code),
         selectedConnectionId,
         selectedCompanyName,
-        approvalContext
+        approvalContext,
+        approval.enabled ? approval.workflow?.revision : undefined
       );
       const hydrated = withLiveMasterOptions(next);
       setPayload(hydrated);
@@ -1472,6 +1476,28 @@ export function TallyPurchasePostingPanel({
       );
     } catch (queueError) {
       setError(queueError instanceof Error ? queueError.message : "Could not send the Purchase voucher to Tally.");
+    } finally {
+      setQueueing(false);
+    }
+  }
+
+  async function handleVerifyExisting() {
+    if (!payload?.posting || payload.posting.status !== "verification_required" || queueing) return;
+    try {
+      setQueueing(true);
+      setError(null);
+      setNotice("Checking Tally for the previously issued voucher…");
+      const next = await verifyExistingTallyPurchaseVoucher(
+        caseId,
+        payload.posting.connectionId,
+        payload.posting.companyName
+      );
+      const hydrated = withLiveMasterOptions(next);
+      setPayload(hydrated);
+      setReview(hydrated.review);
+      setNotice("Read-only verification queued. Kalika will not create another voucher.");
+    } catch (verificationError) {
+      setError(verificationError instanceof Error ? verificationError.message : "Could not verify the existing voucher.");
     } finally {
       setQueueing(false);
     }
@@ -1494,8 +1520,13 @@ export function TallyPurchasePostingPanel({
         companyName: connection.companyName,
         operation: "ledger_masters",
         payload: {
+          moduleName: "purchase",
           persist: false,
+          requireFresh: true,
           requestedMasterTypes: ["ledger", "group", "stock_item", "unit", "gst_ledger", "tax_ledger"],
+          includeInventoryLocations: Boolean(
+            review?.lines.some((line) => line.godownName.trim() || line.batchName.trim())
+          ),
         },
         onProgress: (message) => setNotice(message),
       });
@@ -1584,7 +1615,8 @@ export function TallyPurchasePostingPanel({
     payload?.readyForApproval &&
     payload?.posting &&
     !hasUnsavedChanges &&
-    !locked &&
+    !postingLocked &&
+    (!approval.enabled || (!approval.loading && !approval.error && approval.workflow?.state === 'approved' && canAccess(approval.snapshot,'purchases.post'))) &&
     !tallyReviewRefreshing &&
     connectionReadable &&
     selectedMatchesActive
@@ -1668,7 +1700,48 @@ export function TallyPurchasePostingPanel({
     );
   }
 
-  const calculation = payload.calculation;
+  const localTaxMode = (() => {
+    const supplier = review.supplierGstin.match(/^\d{2}/)?.[0];
+    const buyer = (review.buyerGstin || payload.connection?.companyGstin || "").match(/^\d{2}/)?.[0];
+    return supplier && buyer ? (supplier === buyer ? "cgst_sgst" as const : "igst" as const) : "unknown" as const;
+  })();
+  const sourceWithholdingAmount = [
+    payload.source?.invoiceTds194qAmount?.trim() ? Number(payload.calculation?.tds194qAmount || 0) : 0,
+    payload.source?.invoiceTransportTdsAmount?.trim() ? Number(payload.calculation?.transportTdsAmount || 0) : 0,
+    payload.source?.invoiceCgstTdsAmount?.trim() ? Number(payload.calculation?.cgstTdsAmount || 0) : 0,
+    payload.source?.invoiceSgstTdsAmount?.trim() ? Number(payload.calculation?.sgstTdsAmount || 0) : 0,
+    payload.source?.invoiceIgstTdsAmount?.trim() ? Number(payload.calculation?.igstTdsAmount || 0) : 0,
+  ].reduce((total, amount) => total + (Number.isFinite(amount) ? amount : 0), 0);
+  const liveCoreCalculation = calculatePurchaseVoucher({
+    taxMode: localTaxMode,
+    defaultGstRate: review.gstRate,
+    lines: review.lines.map((line) => ({ lineId: line.lineId, taxableAmount: line.taxableAmount, taxRate: line.taxRate || review.gstRate })),
+    freightAmount: review.freightAmount,
+    freightGstRate: review.freightGstRate,
+    invoiceGstAmount: payload.source?.invoiceTaxAmount ?? "",
+    invoiceTotal: review.invoiceTotal,
+    invoiceWithholdingAmount: String(sourceWithholdingAmount),
+    sourceRoundOffAmount: payload.source?.invoiceRoundOffAmount ?? "",
+    confirmedRoundOffAmount: review.roundOffAmount,
+    tcsAmount: review.tcsReceivable ? review.tcsAmount : "0",
+    tds194qEnabled: review.applyTds194q,
+    tds194qBasisAmount: review.tds194qBasisAmount,
+    tds194qRate: review.tds194qRate,
+    tds194qRounding: review.tds194qRounding,
+    transportTdsEnabled: review.applyTransportTds,
+    sourceTransportTdsAmount: payload.source?.invoiceTransportTdsAmount ?? "",
+    transportTdsRate: review.transportTdsRate,
+    cgstTdsAmount: review.applyGstTds ? payload.calculation?.cgstTdsAmount ?? "0" : "0",
+    sgstTdsAmount: review.applyGstTds ? payload.calculation?.sgstTdsAmount ?? "0" : "0",
+    igstTdsAmount: review.applyGstTds ? payload.calculation?.igstTdsAmount ?? "0" : "0",
+  });
+  const calculation = payload.calculation ? {
+    ...payload.calculation,
+    ...liveCoreCalculation,
+    taxMode: localTaxMode,
+    gstRate: review.gstRate,
+    tds194qRounding: review.tds194qRounding,
+  } : null;
   const invoiceTaxKnown = Boolean(payload.source?.invoiceTaxAmount?.trim());
   const invoiceTotalKnown = Boolean(payload.source?.invoiceTotal?.trim());
   const invoiceCgstTdsKnown = Boolean(payload.source?.invoiceCgstTdsAmount?.trim());
@@ -1723,13 +1796,13 @@ export function TallyPurchasePostingPanel({
   const liveCalculatedPayable = Number(calculation?.calculatedPayable || 0) + liveTcsDelta;
   const liveWithholdingTotal = Number(calculation?.totalWithholdingAmount || 0);
   const liveTotalDifference = Number(calculation?.totalDifference || 0) + liveTcsDelta;
-  const halfInvoiceGst = invoiceTaxKnown
-    ? String(Number(payload.source?.invoiceTaxAmount) / 2)
-    : null;
+  const extractedCgst = payload.source?.lines.reduce((sum, line) => sum + Number(line.invoiceCgstAmount || 0), 0) ?? 0;
+  const extractedSgst = payload.source?.lines.reduce((sum, line) => sum + Number(line.invoiceSgstAmount || 0), 0) ?? 0;
+  const halfInvoiceGst = invoiceTaxKnown ? String(Number(payload.source?.invoiceTaxAmount) / 2) : null;
   const cgstInvoiceAmount =
-    calculation?.taxMode === "cgst_sgst" ? halfInvoiceGst : null;
+    calculation?.taxMode === "cgst_sgst" ? (extractedCgst ? String(extractedCgst) : halfInvoiceGst) : null;
   const sgstInvoiceAmount =
-    calculation?.taxMode === "cgst_sgst" ? halfInvoiceGst : null;
+    calculation?.taxMode === "cgst_sgst" ? (extractedSgst ? String(extractedSgst) : halfInvoiceGst) : null;
   const igstInvoiceAmount =
     calculation?.taxMode === "igst" && invoiceTaxKnown
       ? payload.source?.invoiceTaxAmount ?? null
@@ -1889,12 +1962,16 @@ export function TallyPurchasePostingPanel({
         <section className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
           <div className="flex items-start gap-2">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-            <div>
+            <div className="min-w-0 flex-1">
               <strong className="block text-sm">Voucher created; verification needs attention</strong>
               <span className="mt-0.5 block text-xs leading-5 text-amber-800">
                 {payload.posting.lastError || "Refresh after checking the voucher in Tally. Kalika will not create a duplicate voucher."}
               </span>
             </div>
+            <Button className="shrink-0 border-amber-300 bg-white text-amber-900 hover:bg-amber-100" disabled={queueing} onClick={() => void handleVerifyExisting()} size="sm" variant="outline">
+              {queueing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              Verify in Tally
+            </Button>
           </div>
         </section>
       ) : null}
@@ -2048,14 +2125,28 @@ export function TallyPurchasePostingPanel({
             const masterMatch = lineMasterMatches.find((match) => match.lineId === line.lineId);
             const stockCandidates = masterMatch?.stockItem.candidateMasterNames ?? [];
             const purchaseCandidates = masterMatch?.purchaseLedger.candidateMasterNames ?? [];
-            const rankedStockItems = rankStockItems(stockItemOptions, line, stockCandidates);
-            const rankedPurchaseLedgers = rankLedgerRole(ledgerOptions, "purchase", 0, purchaseCandidates);
+            const stockRankingKey = JSON.stringify([
+              line.lineId, line.description, line.hsn, line.unit, stockCandidates,
+            ]);
+            let rankedStockItems = stockRankingCache.get(stockRankingKey);
+            if (!rankedStockItems) {
+              if (stockRankingCache.size >= 250) stockRankingCache.clear();
+              rankedStockItems = rankStockItems(stockItemOptions, line, stockCandidates);
+              stockRankingCache.set(stockRankingKey, rankedStockItems);
+            }
+            const purchaseRankingKey = JSON.stringify([line.lineId, purchaseCandidates]);
+            let rankedPurchaseLedgers = purchaseRankingCache.get(purchaseRankingKey);
+            if (!rankedPurchaseLedgers) {
+              if (purchaseRankingCache.size >= 250) purchaseRankingCache.clear();
+              rankedPurchaseLedgers = rankLedgerRole(ledgerOptions, "purchase", 0, purchaseCandidates);
+              purchaseRankingCache.set(purchaseRankingKey, rankedPurchaseLedgers);
+            }
             return (
             <article className="scroll-mt-24 overflow-hidden border-b border-slate-100 bg-white last:border-b-0" id={`tally-line-${line.lineId}`} key={line.lineId}>
               <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5 sm:px-4">
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-xs font-semibold text-slate-950">{line.description || `Item ${index + 1}`}</div>
-                  <div className="mt-1 grid grid-cols-2 gap-x-5 gap-y-1 sm:grid-cols-4">
+                  <div className="mt-1 grid grid-cols-2 gap-x-5 gap-y-1 sm:grid-cols-5">
                     <div>
                       <div className="text-[8px] font-semibold uppercase tracking-[0.1em] text-slate-400">HSN</div>
                       <div className="text-[10px] text-slate-600">{line.hsn || "Missing"}</div>
@@ -2072,6 +2163,10 @@ export function TallyPurchasePostingPanel({
                       <div className="text-[8px] font-semibold uppercase tracking-[0.1em] text-slate-400">Taxable amount</div>
                       <div className="text-[10px] font-semibold text-slate-700">{money(line.taxableAmount)}</div>
                     </div>
+                    <div>
+                      <div className="text-[8px] font-semibold uppercase tracking-[0.1em] text-slate-400">GST rate</div>
+                      <div className="text-[10px] text-slate-600">{line.taxRate || review.gstRate || "Missing"}%</div>
+                    </div>
                   </div>
                 </div>
                 {lineIssues(line.lineId).length > 0 ? (
@@ -2084,6 +2179,17 @@ export function TallyPurchasePostingPanel({
                 </div>
               ) : null}
               <div className="grid gap-3 border-t border-slate-100 bg-slate-50/50 p-3 sm:grid-cols-2 sm:p-4 lg:grid-cols-3">
+                <div>
+                  <Field
+                    compact
+                    disabled={locked}
+                    issues={lineIssues(line.lineId, ["LINE_GST_RATE_REQUIRED"])}
+                    label="Line GST rate %"
+                    onChange={(value) => updateLine(index, "taxRate", value)}
+                    sourceValue={sourceLine?.taxRate}
+                    value={line.taxRate || review.gstRate}
+                  />
+                </div>
                 <div>
                   <MasterCombobox
                     {...masterContext}
@@ -2737,6 +2843,7 @@ export function TallyPurchasePostingPanel({
         </div>
       </section>
 
+      <PurchaseApprovalControls approval={approval} hasUnsavedChanges={hasUnsavedChanges} ready={Boolean(payload.posting&&payload.readyForApproval)} />
       {(error || notice) ? (
         <div className={`sticky bottom-24 z-20 rounded-xl border px-4 py-3 text-sm shadow-lg ${
           error
@@ -2782,7 +2889,7 @@ export function TallyPurchasePostingPanel({
                 {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileCheck2 className="h-4 w-4" />}
                 Save and check
               </Button>
-              {onApprovePacket ? (
+              {onApprovePacket && !approval.enabled ? (
                 <Button
                   className="bg-emerald-700 text-white hover:bg-emerald-800"
                   disabled={approvingPacket || locked}
@@ -2811,7 +2918,7 @@ export function TallyPurchasePostingPanel({
                     ? "Checking Tally data"
                     : staleMastersBlocking
                       ? "Refresh Tally data first"
-                      : "Approve and send"}
+                      : approval.enabled ? "Post approved purchase" : "Approve and send"}
                 </Button>
               )}
             </div>
@@ -2858,6 +2965,14 @@ export function TallyPurchasePostingPanel({
                 </span>
               </span>
             </label>
+          ) : null}
+          {Number(calculation?.totalDifference || 0) !== 0 && !payload.source?.invoiceRoundOffAmount ? (
+            <div className="flex items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+              <span>The invoice does not reconcile and no source round-off was extracted.</span>
+              <a className="shrink-0 font-semibold underline underline-offset-2" href={`/cases/${caseId}`}>
+                Correct extracted invoice
+              </a>
+            </div>
           ) : null}
           <DialogFooter>
             <Button disabled={queueing} onClick={() => setConfirmOpen(false)} variant="outline">Cancel</Button>

@@ -1,13 +1,24 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import {TeamAccessPanel} from '@/components/settings/TeamAccessPanel';
+import {PaymentReminderSettings} from '@/components/settings/PaymentReminderSettings';
 import {
   Check,
+  CheckCircle2,
+  FileStack,
   Loader2,
+  RotateCcw,
+  Save,
   Search,
+  Settings2,
+  Shield,
+  Sliders,
+  SlidersHorizontal,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
+import { PageHeader } from "@/components/dashboard/PageHeader";
 import { CashDiscountCustomerScopeSettings } from "@/components/settings/CashDiscountCustomerScopeSettings";
 import { PurchasePostingDefaultsSettings } from "@/components/settings/PurchasePostingDefaultsSettings";
 import { apiFetch } from "@/lib/api-client";
@@ -30,7 +41,7 @@ import {
 } from "@/lib/document-schema";
 import type { DocType, FieldKey } from "@/types/pipeline";
 
-type ActiveTab = "documents" | "groups" | "accounting" | "cashDiscount";
+type ActiveTab = "documents" | "groups" | "accounting" | "cashDiscount" | "team" | "reminders";
 type BannerState = {
   tone: "success" | "error";
   text: string;
@@ -246,13 +257,13 @@ function SwitchControl({ checked }: { checked: boolean }) {
   return (
     <span
       aria-hidden="true"
-      className={`relative inline-flex h-[19px] w-8 shrink-0 rounded-full transition ${
-        checked ? "bg-[#3d6b4a]" : "bg-[#d8d4c9]"
+      className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
+        checked ? "bg-[#2b1a10]" : "bg-[#ded8d0]"
       }`}
     >
       <span
-        className={`absolute top-0.5 h-[15px] w-[15px] rounded-full bg-white transition ${
-          checked ? "left-[15px]" : "left-0.5"
+        className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${
+          checked ? "translate-x-4" : "translate-x-0"
         }`}
       />
     </span>
@@ -279,6 +290,7 @@ async function getResponseError(response: Response) {
 
 export default function SettingsPage() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("documents");
+  useEffect(()=>{const tab=new URLSearchParams(window.location.search).get('tab');if(tab==='team'||tab==='reminders')setActiveTab(tab);},[]);
   const [selectedDocType, setSelectedDocType] = useState<string>(AVAILABLE_DOC_TYPES[0] ?? "");
   const [docTypeEnabled, setDocTypeEnabled] = useState<DocTypeEnabledState>(() =>
     createDefaultDocTypeState()
@@ -677,78 +689,57 @@ export default function SettingsPage() {
 
   return (
     <AppShell>
-      <div className="min-h-screen bg-[#faf9f6] text-[#20201c]">
-        <div className="mx-auto max-w-[1180px] px-4 py-8 sm:px-8">
-          <header className="mb-7 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-            <div>
-              <p className="text-[11px] font-medium uppercase tracking-[0.22em] text-[#9b8f82]">
-                Settings
-              </p>
-              <h1 className="mt-1 text-[26px] font-medium tracking-tight">
-                {activeTab === "cashDiscount" ? "Cash Discount rules" : "Review rules"}
-              </h1>
-            </div>
-
-            {activeTab !== "cashDiscount" ? <div className="flex flex-wrap gap-2">
-              <Button
-                className="h-10 rounded-lg px-4 font-medium text-[#6f6256]"
-                disabled={loading || saving}
-                onClick={handleResetDefaults}
-                type="button"
-                variant="ghost"
-              >
-                Reset defaults
-              </Button>
-              <Button
-                className="h-10 rounded-lg bg-[#20201c] px-5 font-medium text-white shadow-sm hover:bg-[#111]"
-                disabled={loading || saving || !hasUnsavedChanges}
-                onClick={handleSave}
-                type="button"
-              >
-                {saving ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Saving
-                  </>
-                ) : (
-                  "Save changes"
-                )}
-              </Button>
-            </div> : null}
-          </header>
-
-          {activeTab !== "cashDiscount" ? <div className="mb-6 grid gap-3 md:grid-cols-3">
-            {[
-              {
-                label: "Documents",
-                value: `${enabledDocTypeCount}/${AVAILABLE_DOC_TYPES.length} enabled`,
-              },
-              {
-                label: "Fields",
-                value: `${enabledFieldCount}/${totalFieldCount} active`,
-              },
-              {
-                label: "Review groups",
-                value: `${enabledGroupCount}/${comparisonGroups.length} enabled`,
-              },
-            ].map((item) => (
-              <div
-                key={item.label}
-                className="rounded-[10px] border border-[#e8e5de] bg-white px-5 py-4"
-              >
-                <div className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#9b8f82]">
-                  {item.label}
-                </div>
-                <div className="mt-1 text-[22px] font-medium tracking-tight text-[#20201c]">
-                  {item.value}
-                </div>
+      <div className="min-h-full bg-[#f7f4ef] px-4 py-5 text-[#111827] sm:px-6 lg:px-8">
+        <div className="mx-auto flex w-full max-w-[1540px] flex-col gap-4">
+          <PageHeader
+            title="Settings"
+            subtitle="Extraction rules, review groups, and accounting policies"
+            badge={
+              <div className="flex items-center gap-1.5 rounded-lg border border-[#e6ded2] bg-[#fbfaf8] px-2.5 py-1 text-xs font-medium text-[#5b4b3d] shadow-sm">
+                <Shield className="h-3 w-3 text-[#8a7f72]" />
+                <span>Admin view</span>
               </div>
-            ))}
-          </div> : null}
+            }
+            actions={
+              !["cashDiscount","team","reminders"].includes(activeTab) ? (
+                <div className="flex items-center gap-2">
+                  <Button
+                    className="h-8 rounded-lg border border-[#ded8d0] bg-[#fbfaf8] px-3 text-xs font-medium text-[#3d3530] shadow-sm transition hover:bg-[#ede6d9]"
+                    disabled={loading || saving}
+                    onClick={handleResetDefaults}
+                    type="button"
+                    variant="ghost"
+                  >
+                    <RotateCcw className="mr-1.5 h-3.5 w-3.5 text-[#8a7f72]" />
+                    Reset defaults
+                  </Button>
+                  <Button
+                    className="h-8 rounded-lg bg-[#2b1a10] px-4 text-xs font-medium text-white shadow-sm transition hover:bg-[#3d2718]"
+                    disabled={loading || saving || !hasUnsavedChanges}
+                    onClick={handleSave}
+                    type="button"
+                  >
+                    {saving ? (
+                      <>
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        Saving...
+                      </>
+                    ) : (
+                      <>
+                        <Save className="mr-1.5 h-3.5 w-3.5" />
+                        Save changes
+                      </>
+                    )}
+                  </Button>
+                </div>
+              ) : null
+            }
+          />
+
 
           {banner ? (
             <div
-              className={`mb-4 rounded-xl border px-4 py-3 text-sm font-medium ${
+              className={`rounded-xl border px-4 py-3 text-sm font-medium ${
                 banner.tone === "success"
                   ? "border-[#10b981]/25 bg-[#ecfdf5] text-[#047857]"
                   : "border-[#ef4444]/25 bg-[#fff1f2] text-[#b91c1c]"
@@ -758,12 +749,13 @@ export default function SettingsPage() {
             </div>
           ) : null}
 
-          <div className="mb-5 inline-flex rounded-[9px] bg-[#f3f0e8] p-[3px]">
+          {/* ── Warm Earthen Tab Bar ── */}
+          <div className="inline-flex flex-wrap max-w-fit items-center gap-1 rounded-lg border border-[#e0d8cc] bg-[#ede6d9]/60 p-1">
             <button
-              className={`rounded-[7px] px-4 py-2 text-sm font-medium transition ${
+              className={`rounded-md px-3.5 py-1.5 text-xs font-semibold transition ${
                 activeTab === "documents"
-                  ? "bg-white text-[#20201c] shadow-sm"
-                  : "text-[#6b6a60] hover:text-[#20201c]"
+                  ? "bg-white text-[#111827] shadow-2xs"
+                  : "text-[#6b5d50] hover:text-[#111827]"
               }`}
               onClick={() => setActiveTab("documents")}
               type="button"
@@ -771,10 +763,10 @@ export default function SettingsPage() {
               Documents & fields
             </button>
             <button
-              className={`rounded-[7px] px-4 py-2 text-sm font-medium transition ${
+              className={`rounded-md px-3.5 py-1.5 text-xs font-semibold transition ${
                 activeTab === "groups"
-                  ? "bg-white text-[#20201c] shadow-sm"
-                  : "text-[#6b6a60] hover:text-[#20201c]"
+                  ? "bg-white text-[#111827] shadow-2xs"
+                  : "text-[#6b5d50] hover:text-[#111827]"
               }`}
               onClick={() => setActiveTab("groups")}
               type="button"
@@ -782,10 +774,10 @@ export default function SettingsPage() {
               Review groups
             </button>
             <button
-              className={`rounded-[7px] px-4 py-2 text-sm font-medium transition ${
+              className={`rounded-md px-3.5 py-1.5 text-xs font-semibold transition ${
                 activeTab === "accounting"
-                  ? "bg-white text-[#20201c] shadow-sm"
-                  : "text-[#6b6a60] hover:text-[#20201c]"
+                  ? "bg-white text-[#111827] shadow-2xs"
+                  : "text-[#6b5d50] hover:text-[#111827]"
               }`}
               onClick={() => setActiveTab("accounting")}
               type="button"
@@ -793,35 +785,36 @@ export default function SettingsPage() {
               Purchase accounting
             </button>
             <button
-              className={`rounded-[7px] px-4 py-2 text-sm font-medium transition ${
+              className={`rounded-md px-3.5 py-1.5 text-xs font-semibold transition ${
                 activeTab === "cashDiscount"
-                  ? "bg-white text-[#20201c] shadow-sm"
-                  : "text-[#6b6a60] hover:text-[#20201c]"
+                  ? "bg-white text-[#111827] shadow-2xs"
+                  : "text-[#6b5d50] hover:text-[#111827]"
               }`}
               onClick={() => setActiveTab("cashDiscount")}
               type="button"
             >
               Cash Discounts
             </button>
+            {([['reminders','Payment reminders'],['team','Team & Access']] as const).map(([key,label])=><button key={key} type="button" className={`rounded-md px-3.5 py-1.5 text-xs font-semibold transition ${activeTab===key?'bg-white text-[#111827] shadow-2xs':'text-[#6b5d50] hover:text-[#111827]'}`} onClick={()=>setActiveTab(key)}>{label}</button>)}
           </div>
 
           <div>
             <div className="flex flex-col gap-5 md:flex-row md:items-start">
-              {activeTab === "documents" ? (
+              {activeTab === "team" ? <TeamAccessPanel/> : activeTab === "reminders" ? <PaymentReminderSettings/> : activeTab === "documents" ? (
                 <>
-                  <aside className="w-full shrink-0 rounded-[10px] border border-[#e8e5de] bg-white p-2.5 md:w-[270px]">
-                    <label className="mb-2 flex items-center gap-2 rounded-lg bg-[#f3f0e8] px-3 py-2">
-                      <Search className="h-4 w-4 shrink-0 text-[#9c9a8e]" />
+                  <aside className="w-full shrink-0 rounded-xl border border-[#ded8d0] bg-white p-3 shadow-2xs md:w-[280px]">
+                    <div className="relative mb-2.5">
+                      <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#8a7f72]" />
                       <input
-                        className="w-full bg-transparent text-[13px] text-[#20201c] outline-none placeholder:text-[#9c9a8e]"
+                        className="w-full rounded-lg border border-[#ded8d0] bg-[#fbfaf8] py-1.5 pl-8 pr-3 text-xs text-[#111827] outline-none transition placeholder:text-[#a89e92] focus:border-[#2b1a10] focus:bg-white"
                         onChange={(event) => setDocSearch(event.target.value)}
-                        placeholder="Search documents"
+                        placeholder="Search documents..."
                         type="search"
                         value={docSearch}
                       />
-                    </label>
+                    </div>
 
-                    <div className="max-h-[560px] space-y-1 overflow-y-auto">
+                    <div className="max-h-[560px] space-y-1 overflow-y-auto pr-1">
                       {filteredDocTypes.map((docType) => {
                         const docFields = getConfigurableFields(docType);
                         const docEnabledFieldCount = docFields.filter(
@@ -833,17 +826,17 @@ export default function SettingsPage() {
                         return (
                           <button
                             key={docType}
-                            className={`w-full rounded-lg px-2 py-2.5 text-left transition ${
+                            className={`w-full rounded-lg px-2.5 py-2 text-left transition ${
                               isSelected
-                                ? "bg-[#e9f2ea] text-[#20201c]"
-                                : "text-[#20201c] hover:bg-[#f3f0e8]"
+                                ? "bg-[#ede6d9] text-[#2b1a10] font-medium shadow-2xs"
+                                : "text-[#3d3530] hover:bg-[#f7f4ef]"
                             }`}
                             onClick={() => setSelectedDocType(docType)}
                             type="button"
                           >
-                            <div className="flex items-center justify-between gap-3">
+                            <div className="flex items-center justify-between gap-2.5">
                               <div className="min-w-0">
-                                <div className="truncate text-sm font-medium">{docType}</div>
+                                <div className="truncate text-xs font-semibold">{docType}</div>
                                 <div className="mt-0.5 text-[11px] font-normal text-[#8a7f72]">
                                   {docEnabledFieldCount}/{docFields.length} fields active
                                 </div>
@@ -861,7 +854,7 @@ export default function SettingsPage() {
                         );
                       })}
                       {filteredDocTypes.length === 0 ? (
-                        <div className="rounded-lg border border-dashed border-[#d8d4c9] p-4 text-sm text-[#6b6a60]">
+                        <div className="rounded-lg border border-dashed border-[#ded8d0] p-4 text-center text-xs text-[#8a7f72]">
                           No document types found.
                         </div>
                       ) : null}
@@ -869,44 +862,83 @@ export default function SettingsPage() {
                   </aside>
 
                   <main className="min-w-0 flex-1">
+                    {/* ── Contextual KPIs for Documents & Fields ── */}
+                    <div className="mb-4 grid gap-3 sm:grid-cols-2">
+                      <div className="rounded-xl border border-[#ded8d0] bg-white p-3.5 shadow-2xs">
+                        <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">
+                          Document Types
+                        </div>
+                        <div className="mt-1 text-xl font-bold tracking-tight text-[#111827]">
+                          {enabledDocTypeCount} / {AVAILABLE_DOC_TYPES.length}
+                        </div>
+                        <div className="mt-0.5 text-xs text-[#8a7f72]">
+                          Enabled document types participating in checks
+                        </div>
+                      </div>
+                      <div className="rounded-xl border border-[#ded8d0] bg-white p-3.5 shadow-2xs">
+                        <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">
+                          Active Field Checks
+                        </div>
+                        <div className="mt-1 text-xl font-bold tracking-tight text-[#111827]">
+                          {enabledFieldCount} / {totalFieldCount}
+                        </div>
+                        <div className="mt-0.5 text-xs text-[#8a7f72]">
+                          Extraction & reconciliation checks turned on
+                        </div>
+                      </div>
+                    </div>
+
                     {loading ? (
                       <div className="space-y-3">
-                        <div className="h-16 animate-pulse rounded-xl bg-[#f3eee7]" />
+                        <div className="h-16 animate-pulse rounded-xl bg-[#ede6d9]/50" />
                         <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
                           {Array.from({ length: 12 }).map((_, index) => (
-                            <div key={index} className="h-12 animate-pulse rounded-lg bg-[#f3eee7]" />
+                            <div key={index} className="h-12 animate-pulse rounded-lg bg-[#ede6d9]/50" />
                           ))}
                         </div>
                       </div>
                     ) : (
                       <>
-                        <div className="mb-5 rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5">
-                          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                        <div className="mb-4 rounded-xl border border-[#ded8d0] bg-white px-5 py-4 shadow-2xs">
+                          <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                             <div>
-                              <h2 className="text-lg font-medium tracking-tight">{selectedDocType}</h2>
-                              <p className="mt-1 text-[13px] leading-5 text-[#6b6a60]">
-                                Include this document type in extraction and reconciliation.
+                              <div className="flex items-center gap-2">
+                                <h2 className="text-base font-bold tracking-tight text-[#111827]">{selectedDocType}</h2>
+                                <span className={`inline-flex items-center rounded-md px-2 py-0.5 text-[11px] font-medium ${
+                                  selectedDocTypeEnabled
+                                    ? "bg-[#ecfdf5] text-[#047857] border border-[#a7f3d0]"
+                                    : "bg-[#fef2f2] text-[#b91c1c] border border-[#fecaca]"
+                                }`}>
+                                  {selectedDocTypeEnabled ? "Included in checks" : "Excluded"}
+                                </span>
+                              </div>
+                              <p className="mt-1 text-xs text-[#5b4b3d]">
+                                Control whether this document type participates in extraction, comparison, and mismatch reconciliation.
                               </p>
                             </div>
 
                             <div className="flex flex-wrap items-center gap-2">
                               <button
                                 aria-pressed={selectedDocTypeEnabled}
-                                className="flex items-center gap-2 rounded-full border border-[#bdd8c2] bg-[#e9f2ea] px-3 py-1.5 text-[12px] font-medium text-[#3d6b4a] transition"
+                                className="flex items-center gap-2 rounded-lg border border-[#ded8d0] bg-[#fbfaf8] px-3 py-1.5 text-xs font-medium text-[#2b1a10] shadow-sm transition hover:bg-[#ede6d9]"
                                 onClick={() => handleToggleDocType(selectedDocType)}
                                 type="button"
                               >
                                 <SwitchControl checked={selectedDocTypeEnabled} />
-                                {selectedDocTypeEnabled ? "Included" : "Excluded"}
+                                <span>{selectedDocTypeEnabled ? "Included" : "Excluded"}</span>
                               </button>
                             </div>
                           </div>
                         </div>
 
-                        <div className="rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5">
-                          <div className="mb-4 flex flex-wrap justify-end gap-2">
+                        <div className="rounded-xl border border-[#ded8d0] bg-white px-5 py-4 shadow-2xs">
+                          <div className="mb-4 flex flex-wrap items-center justify-between gap-2 border-b border-[#f0ece4] pb-3">
+                            <span className="text-xs font-semibold uppercase tracking-wider text-[#8a7f72]">
+                              Field Extraction Checks
+                            </span>
+                            <div className="flex gap-2">
                               <Button
-                                className="h-8 rounded-lg border-[#d8d4c9] bg-white px-3 text-xs font-medium text-[#20201c] hover:bg-[#f3f0e8]"
+                                className="h-7 rounded-md border-[#ded8d0] bg-[#fbfaf8] px-2.5 text-xs font-medium text-[#3d3530] shadow-2xs hover:bg-[#ede6d9]"
                                 onClick={() => handleSetAllFields(selectedDocType, true)}
                                 type="button"
                                 variant="outline"
@@ -914,132 +946,133 @@ export default function SettingsPage() {
                                 Enable all
                               </Button>
                               <Button
-                                className="h-8 rounded-lg border-[#d8d4c9] bg-white px-3 text-xs font-medium text-[#20201c] hover:bg-[#f3f0e8]"
+                                className="h-7 rounded-md border-[#ded8d0] bg-[#fbfaf8] px-2.5 text-xs font-medium text-[#3d3530] shadow-2xs hover:bg-[#ede6d9]"
                                 onClick={() => handleSetAllFields(selectedDocType, false)}
                                 type="button"
                                 variant="outline"
                               >
                                 Disable all
                               </Button>
+                            </div>
                           </div>
 
-                        {selectedDocTypeEnabled ? null : (
-                          <div className="mb-4 rounded-lg border border-[#f59e0b]/25 bg-[#fff7e6] px-3 py-2 text-sm font-medium text-[#a16207]">
-                            Excluded documents are ignored by the workflow until included again.
+                          {selectedDocTypeEnabled ? null : (
+                            <div className="mb-4 rounded-lg border border-[#f59e0b]/25 bg-[#fff7e6] px-3.5 py-2.5 text-xs font-medium text-[#a16207]">
+                              Excluded documents are ignored by the workflow until included again.
+                            </div>
+                          )}
+
+                          <div className="space-y-5">
+                            <section>
+                              <div className="mb-2.5 flex items-end justify-between gap-3">
+                                <div>
+                                  <h3 className="text-[11px] font-bold uppercase tracking-[0.16em] text-[#8a7f72]">
+                                    Essential fields
+                                  </h3>
+                                  <p className="text-xs text-[#8a7f72]">
+                                    Key fields checked most often for reconciliation.
+                                  </p>
+                                </div>
+                                <span className="text-xs font-medium text-[#8a7f72]">
+                                  {
+                                    selectedPriorityFields.filter(
+                                      (fieldKey) => selectedFieldMap[fieldKey] ?? true
+                                    ).length
+                                  }
+                                  /{selectedPriorityFields.length} active
+                                </span>
+                              </div>
+
+                              <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+                                {selectedPriorityFields.map((fieldKey) => {
+                                  const isEnabled = selectedFieldMap[fieldKey] ?? true;
+
+                                  return (
+                                    <button
+                                      key={fieldKey}
+                                      aria-pressed={isEnabled}
+                                      className={`flex min-h-10 items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition ${
+                                        isEnabled
+                                          ? "border-[#ded8d0] bg-[#fdfcfa] hover:border-[#c8bfb0]"
+                                          : "border-[#e8e2d8] bg-[#f9f8f6] opacity-60"
+                                      } ${selectedDocTypeEnabled ? "hover:bg-[#f5f1eb]" : "opacity-40"}`}
+                                      disabled={!selectedDocTypeEnabled}
+                                      onClick={() => handleToggleField(selectedDocType, fieldKey)}
+                                      type="button"
+                                    >
+                                      <span
+                                        className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition ${
+                                          isEnabled
+                                            ? "border-[#2b1a10] bg-[#2b1a10] text-white"
+                                            : "border-[#ded8d0] bg-white text-transparent"
+                                        }`}
+                                      >
+                                        <Check className="h-3 w-3" />
+                                      </span>
+                                      <span className="min-w-0 truncate text-xs font-medium text-[#111827]">
+                                        {FIELD_LABELS[fieldKey]}
+                                      </span>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </section>
+
+                            <section>
+                              <div className="mb-2.5 flex items-end justify-between gap-3">
+                                <div>
+                                  <h3 className="text-[11px] font-bold uppercase tracking-[0.16em] text-[#8a7f72]">
+                                    Optional fields
+                                  </h3>
+                                  <p className="text-xs text-[#8a7f72]">
+                                    Additional fields available for this document type.
+                                  </p>
+                                </div>
+                                <span className="text-xs font-medium text-[#8a7f72]">
+                                  {
+                                    selectedStandardFields.filter(
+                                      (fieldKey) => selectedFieldMap[fieldKey] ?? true
+                                    ).length
+                                  }
+                                  /{selectedStandardFields.length} active
+                                </span>
+                              </div>
+
+                              <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+                                {selectedStandardFields.map((fieldKey) => {
+                                  const isEnabled = selectedFieldMap[fieldKey] ?? true;
+
+                                  return (
+                                    <button
+                                      key={fieldKey}
+                                      aria-pressed={isEnabled}
+                                      className={`flex min-h-10 items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition ${
+                                        isEnabled
+                                          ? "border-[#ded8d0] bg-[#fdfcfa] hover:border-[#c8bfb0]"
+                                          : "border-[#e8e2d8] bg-[#f9f8f6] opacity-60"
+                                      } ${selectedDocTypeEnabled ? "hover:bg-[#f5f1eb]" : "opacity-40"}`}
+                                      disabled={!selectedDocTypeEnabled}
+                                      onClick={() => handleToggleField(selectedDocType, fieldKey)}
+                                      type="button"
+                                    >
+                                      <span
+                                        className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition ${
+                                          isEnabled
+                                            ? "border-[#2b1a10] bg-[#2b1a10] text-white"
+                                            : "border-[#ded8d0] bg-white text-transparent"
+                                        }`}
+                                      >
+                                        <Check className="h-3 w-3" />
+                                      </span>
+                                      <span className="min-w-0 truncate text-xs font-medium text-[#111827]">
+                                        {FIELD_LABELS[fieldKey]}
+                                      </span>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </section>
                           </div>
-                        )}
-
-                        <div className="space-y-5">
-                          <section>
-                            <div className="mb-2 flex items-end justify-between gap-3">
-                              <div>
-                                <h3 className="text-[11px] font-medium uppercase tracking-[0.2em] text-[#8a7f72]">
-                                  Essential fields
-                                </h3>
-                                <p className="text-xs font-medium text-[#9b8f82]">
-                                  Used most often for reconciliation.
-                                </p>
-                              </div>
-                              <span className="text-xs font-medium text-[#8a7f72]">
-                                {
-                                  selectedPriorityFields.filter(
-                                    (fieldKey) => selectedFieldMap[fieldKey] ?? true
-                                  ).length
-                                }
-                                /{selectedPriorityFields.length} active
-                              </span>
-                            </div>
-
-                            <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
-                              {selectedPriorityFields.map((fieldKey) => {
-                                const isEnabled = selectedFieldMap[fieldKey] ?? true;
-
-                                return (
-                                  <button
-                                    key={fieldKey}
-                                    aria-pressed={isEnabled}
-                                    className={`flex min-h-10 items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition ${
-                                      isEnabled
-                                        ? "border-[#e8e5de] bg-white"
-                                        : "border-[#e5ddd0] bg-white"
-                                    } ${selectedDocTypeEnabled ? "hover:bg-[#fafafa]" : "opacity-60"}`}
-                                    disabled={!selectedDocTypeEnabled}
-                                    onClick={() => handleToggleField(selectedDocType, fieldKey)}
-                                    type="button"
-                                  >
-                                    <span
-                                      className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
-                                        isEnabled
-                                          ? "border-[#3d6b4a] bg-[#3d6b4a] text-white"
-                                          : "border-[#d8d4c9] bg-white text-transparent"
-                                      }`}
-                                    >
-                                      <Check className="h-3 w-3" />
-                                    </span>
-                                    <span className="min-w-0 truncate text-[13px] text-[#20201c]">
-                                      {FIELD_LABELS[fieldKey]}
-                                    </span>
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          </section>
-
-                          <section>
-                            <div className="mb-2 flex items-end justify-between gap-3">
-                              <div>
-                                <h3 className="text-[11px] font-medium uppercase tracking-[0.2em] text-[#8a7f72]">
-                                  Optional fields
-                                </h3>
-                                <p className="text-xs font-medium text-[#9b8f82]">
-                                  Extra signals available for this document type.
-                                </p>
-                              </div>
-                              <span className="text-xs font-medium text-[#8a7f72]">
-                                {
-                                  selectedStandardFields.filter(
-                                    (fieldKey) => selectedFieldMap[fieldKey] ?? true
-                                  ).length
-                                }
-                                /{selectedStandardFields.length} active
-                              </span>
-                            </div>
-
-                            <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
-                              {selectedStandardFields.map((fieldKey) => {
-                                const isEnabled = selectedFieldMap[fieldKey] ?? true;
-
-                                return (
-                                  <button
-                                    key={fieldKey}
-                                    aria-pressed={isEnabled}
-                                    className={`flex min-h-10 items-center gap-2.5 rounded-lg border px-3 py-2 text-left transition ${
-                                      isEnabled
-                                        ? "border-[#e8e5de] bg-white"
-                                        : "border-[#e5ddd0] bg-white"
-                                    } ${selectedDocTypeEnabled ? "hover:bg-[#fafafa]" : "opacity-60"}`}
-                                    disabled={!selectedDocTypeEnabled}
-                                    onClick={() => handleToggleField(selectedDocType, fieldKey)}
-                                    type="button"
-                                  >
-                                    <span
-                                      className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
-                                        isEnabled
-                                          ? "border-[#3d6b4a] bg-[#3d6b4a] text-white"
-                                          : "border-[#d8d4c9] bg-white text-transparent"
-                                      }`}
-                                    >
-                                      <Check className="h-3 w-3" />
-                                    </span>
-                                    <span className="min-w-0 truncate text-[13px] text-[#20201c]">
-                                      {FIELD_LABELS[fieldKey]}
-                                    </span>
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          </section>
-                        </div>
                         </div>
                       </>
                     )}
@@ -1047,10 +1080,19 @@ export default function SettingsPage() {
                 </>
               ) : activeTab === "groups" ? (
                 <>
-                  <aside className="w-full shrink-0 md:w-[270px]">
-                    <div className="max-h-[calc(100vh-260px)] space-y-2 overflow-y-auto pr-1">
+                  <aside className="w-full shrink-0 rounded-xl border border-[#ded8d0] bg-white p-3 shadow-2xs md:w-[280px]">
+                    <div className="mb-2.5 flex items-center justify-between px-1">
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-[#8a7f72]">
+                        Review Groups
+                      </span>
+                      <span className="text-xs font-semibold text-[#8a7f72]">
+                        {comparisonGroups.length}
+                      </span>
+                    </div>
+
+                    <div className="max-h-[calc(100vh-260px)] space-y-1.5 overflow-y-auto pr-1">
                       {comparisonGroups.length === 0 ? (
-                        <div className="rounded-[10px] border border-dashed border-[#d8d4c9] bg-white p-4 text-sm text-[#6b6a60]">
+                        <div className="rounded-lg border border-dashed border-[#ded8d0] p-4 text-center text-xs text-[#8a7f72]">
                           No groups configured.
                         </div>
                       ) : (
@@ -1060,18 +1102,18 @@ export default function SettingsPage() {
                           return (
                             <button
                               key={group.groupKey}
-                              className={`w-full rounded-[10px] border px-3.5 py-3 text-left transition ${
+                              className={`w-full rounded-lg border px-3 py-2.5 text-left transition ${
                                 isSelected
-                                  ? "border-[#bdd8c2] bg-[#e9f2ea] text-[#20201c]"
-                                  : "border-[#e8e5de] bg-white text-[#20201c] hover:bg-[#f3f0e8]"
+                                  ? "border-[#c8bfb0] bg-[#ede6d9] text-[#2b1a10] shadow-2xs font-medium"
+                                  : "border-[#ded8d0] bg-[#fbfaf8] text-[#3d3530] hover:bg-[#f3eee7]"
                               }`}
                               onClick={() => setSelectedGroupKey(group.groupKey)}
                               type="button"
                             >
-                              <div className="flex items-center justify-between gap-3">
+                              <div className="flex items-center justify-between gap-2.5">
                                 <div className="min-w-0">
-                                  <div className="truncate text-sm font-medium">{group.label}</div>
-                                  <div className="mt-0.5 text-[11.5px] font-normal text-[#9c9a8e]">
+                                  <div className="truncate text-xs font-semibold">{group.label}</div>
+                                  <div className="mt-0.5 text-[11px] font-normal text-[#8a7f72]">
                                     {group.fields.length} field{group.fields.length === 1 ? "" : "s"}
                                   </div>
                                 </div>
@@ -1091,7 +1133,7 @@ export default function SettingsPage() {
                         })
                       )}
                       <button
-                        className="w-full rounded-[10px] border border-dashed border-[#d8d4c9] bg-transparent px-4 py-3 text-center text-sm text-[#6b6a60] transition hover:border-[#9c9a8e] hover:text-[#20201c]"
+                        className="w-full rounded-lg border border-dashed border-[#ded8d0] bg-[#fbfaf8] px-3 py-2 text-center text-xs font-medium text-[#5b4b3d] transition hover:border-[#2b1a10] hover:text-[#2b1a10]"
                         onClick={handleAddGroup}
                         type="button"
                       >
@@ -1100,13 +1142,40 @@ export default function SettingsPage() {
                     </div>
                   </aside>
 
-                  <main className="min-w-0 flex-1 rounded-[10px] border border-[#e8e5de] bg-white p-6">
-                    {loading ? (
+                  <main className="min-w-0 flex-1 space-y-4">
+                    {/* ── Contextual KPIs for Review Groups ── */}
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="rounded-xl border border-[#ded8d0] bg-white p-3.5 shadow-2xs">
+                        <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">
+                          Active Groups
+                        </div>
+                        <div className="mt-1 text-xl font-bold tracking-tight text-[#111827]">
+                          {enabledGroupCount} / {comparisonGroups.length}
+                        </div>
+                        <div className="mt-0.5 text-xs text-[#8a7f72]">
+                          Comparison families enabled for mismatch grouping
+                        </div>
+                      </div>
+                      <div className="rounded-xl border border-[#ded8d0] bg-white p-3.5 shadow-2xs">
+                        <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">
+                          Grouped Fields
+                        </div>
+                        <div className="mt-1 text-xl font-bold tracking-tight text-[#111827]">
+                          {comparisonGroups.reduce((acc, g) => acc + g.fields.length, 0)} fields
+                        </div>
+                        <div className="mt-0.5 text-xs text-[#8a7f72]">
+                          Total fields mapped across all review families
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="rounded-xl border border-[#ded8d0] bg-white p-5 shadow-2xs">
+                      {loading ? (
                       <div className="space-y-3">
-                        <div className="h-16 animate-pulse rounded-xl bg-[#f3eee7]" />
+                        <div className="h-16 animate-pulse rounded-xl bg-[#ede6d9]/50" />
                         <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
                           {Array.from({ length: 12 }).map((_, index) => (
-                            <div key={index} className="h-12 animate-pulse rounded-lg bg-[#f3eee7]" />
+                            <div key={index} className="h-12 animate-pulse rounded-lg bg-[#ede6d9]/50" />
                           ))}
                         </div>
                       </div>
@@ -1114,27 +1183,27 @@ export default function SettingsPage() {
                       <div>
                         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                           <label className="min-w-0 flex-1">
-                            <div className="mb-1.5 text-[11px] font-medium tracking-[0.06em] text-[#8a7f72]">
+                            <div className="mb-1.5 text-xs font-bold uppercase tracking-wider text-[#8a7f72]">
                               Group name
                             </div>
                             <input
-                              className="h-10 w-full rounded-lg border border-[#d8d4c9] bg-white px-3.5 text-base font-medium text-[#20201c] outline-none transition focus:border-[#3d6b4a]"
+                              className="h-9 w-full rounded-lg border border-[#ded8d0] bg-[#fbfaf8] px-3 text-sm font-semibold text-[#111827] outline-none transition focus:border-[#2b1a10] focus:bg-white"
                               onChange={(event) =>
                                 handleRenameGroup(selectedGroup.groupKey, event.target.value)
                               }
                               value={selectedGroup.label}
                             />
-                            <p className="mt-2 text-[12.5px] leading-5 text-[#6b6a60]">
+                            <p className="mt-1.5 text-xs text-[#8a7f72]">
                               Reviewers will see these related fields together whenever any one of them shows a mismatch.
                             </p>
                           </label>
 
-                          <div className="flex shrink-0 items-center gap-4 pt-7">
+                          <div className="flex shrink-0 items-center gap-3 pt-6">
                             <button
-                              className={`rounded-full border px-4 py-2 text-xs font-medium transition ${
+                              className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition ${
                                 selectedGroup.enabled
-                                  ? "border-[#bdd8c2] bg-[#e9f2ea] text-[#3d6b4a]"
-                                  : "border-[#e7c3bb] bg-[#fbeeec] text-[#a3402f]"
+                                  ? "border-[#a7f3d0] bg-[#ecfdf5] text-[#047857]"
+                                  : "border-[#fecaca] bg-[#fef2f2] text-[#b91c1c]"
                               }`}
                               onClick={() =>
                                 handleUpdateGroup(selectedGroup.groupKey, {
@@ -1143,10 +1212,10 @@ export default function SettingsPage() {
                               }
                               type="button"
                             >
-                              {selectedGroup.enabled ? "Enabled" : "Disabled"}
+                              {selectedGroup.enabled ? "Group Enabled" : "Group Disabled"}
                             </button>
                             <button
-                              className="text-sm font-medium text-[#a3402f] transition hover:text-[#7f281d]"
+                              className="text-xs font-medium text-[#b91c1c] transition hover:text-[#991b1b]"
                               onClick={() => handleDeleteGroup(selectedGroup.groupKey)}
                               type="button"
                             >
@@ -1155,20 +1224,20 @@ export default function SettingsPage() {
                           </div>
                         </div>
 
-                        <div className="mt-4 rounded-lg bg-[#f3f0e8] p-3">
+                        <div className="mt-4 rounded-lg border border-[#e8e2d8] bg-[#fbfaf8] p-3">
                           {selectedGroup.fields.length > 0 ? (
-                            <div className="flex flex-wrap gap-2">
+                            <div className="flex flex-wrap gap-1.5">
                               {selectedGroup.fields.map((fieldKey) => (
                                 <span
                                   key={fieldKey}
-                                  className="max-w-full truncate rounded-full border border-[#e8e5de] bg-white px-3 py-1.5 text-xs text-[#20201c]"
+                                  className="inline-flex max-w-full items-center truncate rounded-md border border-[#ded8d0] bg-white px-2.5 py-1 text-xs font-medium text-[#2b1a10] shadow-2xs"
                                 >
                                   {FIELD_LABELS[fieldKey as FieldKey] ?? fieldKey}
                                 </span>
                               ))}
                             </div>
                           ) : (
-                            <span className="text-[12.5px] text-[#9c9a8e]">
+                            <span className="text-xs text-[#8a7f72]">
                               No fields selected yet. Pick from the list below.
                             </span>
                           )}
@@ -1176,29 +1245,29 @@ export default function SettingsPage() {
 
                         <section className="mt-5">
                           <div className="mb-3">
-                            <h3 className="text-[11px] font-medium tracking-[0.06em] text-[#8a7f72]">
+                            <h3 className="text-xs font-bold uppercase tracking-wider text-[#8a7f72]">
                               Fields in group
                             </h3>
-                            <p className="mt-1 text-[12.5px] leading-5 text-[#6b6a60]">
+                            <p className="mt-0.5 text-xs text-[#8a7f72]">
                               Pick every field that should be reviewed as one issue family, across all documents.
                             </p>
                           </div>
 
-                          <label className="mb-3 flex max-w-md items-center gap-2 rounded-lg bg-[#f3f0e8] px-3 py-2">
-                            <Search className="h-4 w-4 shrink-0 text-[#9c9a8e]" />
+                          <div className="relative mb-3 max-w-md">
+                            <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#8a7f72]" />
                             <input
-                              className="w-full bg-transparent text-[13px] text-[#20201c] outline-none placeholder:text-[#9c9a8e]"
+                              className="w-full rounded-lg border border-[#ded8d0] bg-[#fbfaf8] py-1.5 pl-8 pr-3 text-xs text-[#111827] outline-none transition placeholder:text-[#a89e92] focus:border-[#2b1a10] focus:bg-white"
                               onChange={(event) => setGroupFieldSearch(event.target.value)}
-                              placeholder="Search fields"
+                              placeholder="Search fields..."
                               type="search"
                               value={groupFieldSearch}
                             />
-                          </label>
+                          </div>
 
-                          <div className="max-h-[400px] overflow-y-auto rounded-lg border border-[#e8e5de]">
+                          <div className="max-h-[400px] overflow-y-auto rounded-lg border border-[#ded8d0]">
                             {filteredGroupFieldSections.map((section) => (
                               <div key={section.docType}>
-                                <div className="sticky top-0 z-10 bg-[#f3f0e8] px-4 py-2.5 text-[11px] font-medium tracking-[0.06em] text-[#9c9a8e]">
+                                <div className="sticky top-0 z-10 border-b border-[#e8e2d8] bg-[#ede6d9]/80 backdrop-blur-xs px-3.5 py-1.5 text-[11px] font-bold tracking-wider text-[#5b4b3d]">
                                   {section.docType}
                                 </div>
                                 {section.fields.map((fieldKey) => {
@@ -1213,31 +1282,31 @@ export default function SettingsPage() {
                                     <button
                                       key={`${section.docType}-${fieldKey}`}
                                       aria-pressed={isSelected}
-                                      className="flex w-full items-center gap-3 border-t border-[#e8e5de] px-4 py-2.5 text-left transition hover:bg-[#f3f0e8]"
+                                      className="flex w-full items-center gap-3 border-b border-[#f0ece4] px-3.5 py-2 text-left transition hover:bg-[#fbfaf8]"
                                       onClick={() =>
                                         handleToggleGroupField(selectedGroup.groupKey, fieldKey)
                                       }
                                       type="button"
                                     >
                                       <span
-                                        className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
+                                        className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition ${
                                           isSelected
-                                            ? "border-[#3d6b4a] bg-[#3d6b4a] text-white"
-                                            : "border-[#d8d4c9] bg-white text-transparent"
+                                            ? "border-[#2b1a10] bg-[#2b1a10] text-white"
+                                            : "border-[#ded8d0] bg-white text-transparent"
                                         }`}
                                       >
                                         <Check className="h-3 w-3" />
                                       </span>
-                                      <span className="min-w-0 flex-1 truncate text-[13px] text-[#20201c]">
+                                      <span className="min-w-0 flex-1 truncate text-xs font-medium text-[#111827]">
                                         {FIELD_LABELS[fieldKey]}
                                         {otherGroup ? (
-                                          <span className="text-[#9c9a8e]">
+                                          <span className="text-[#8a7f72]">
                                             {" "}
-                                            - in {otherGroup.label}
+                                            — in {otherGroup.label}
                                           </span>
                                         ) : null}
                                       </span>
-                                      <span className="shrink-0 font-mono text-[11px] text-[#9c9a8e]">
+                                      <span className="shrink-0 font-mono text-[11px] text-[#8a7f72]">
                                         {fieldKey}
                                       </span>
                                     </button>
@@ -1246,7 +1315,7 @@ export default function SettingsPage() {
                               </div>
                             ))}
                             {filteredGroupFieldSections.length === 0 ? (
-                              <div className="px-4 py-8 text-center text-sm text-[#6b6a60]">
+                              <div className="px-4 py-8 text-center text-xs text-[#8a7f72]">
                                 No fields found.
                               </div>
                             ) : null}
@@ -1254,28 +1323,59 @@ export default function SettingsPage() {
                         </section>
                       </div>
                     ) : (
-                      <div className="flex h-full items-center justify-center rounded-xl border border-dashed border-[#d8ccbc] bg-[#fbfaf8] text-sm font-medium text-[#8a7f72]">
+                      <div className="flex h-48 items-center justify-center rounded-xl border border-dashed border-[#ded8d0] bg-[#fbfaf8] text-xs font-medium text-[#8a7f72]">
                         Create a group to start.
                       </div>
                     )}
+                    </div>
                   </main>
                 </>
               ) : activeTab === "accounting" ? (
-                <main className="w-full">
-                  <section className="rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5">
+                <main className="w-full space-y-4">
+                  {/* ── Contextual KPIs for Purchase Accounting ── */}
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="rounded-xl border border-[#ded8d0] bg-white p-3.5 shadow-2xs">
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">
+                        Deductions Handled
+                      </div>
+                      <div className="mt-1 text-xl font-bold tracking-tight text-[#111827]">
+                        {[
+                          purchaseAccountingSettings.purchaseGoodsTdsEnabled,
+                          purchaseAccountingSettings.transporterTdsEnabled,
+                          purchaseAccountingSettings.gstTdsEnabled,
+                        ].filter(Boolean).length} / 3 Active
+                      </div>
+                      <div className="mt-0.5 text-xs text-[#8a7f72]">
+                        Goods TDS, Transporter TDS & GST TDS rules
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-[#ded8d0] bg-white p-3.5 shadow-2xs">
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">
+                        Validation Policies
+                      </div>
+                      <div className="mt-1 text-xl font-bold tracking-tight text-[#111827]">
+                        {Object.values(purchaseAccountingSettings.validationPolicy).filter((s) => s === "block").length} Blocking · {Object.values(purchaseAccountingSettings.validationPolicy).filter((s) => s === "warn").length} Warning
+                      </div>
+                      <div className="mt-0.5 text-xs text-[#8a7f72]">
+                        Purchase voucher validation criteria
+                      </div>
+                    </div>
+                  </div>
+
+                  <section className="rounded-xl border border-[#ded8d0] bg-white p-5 shadow-2xs">
                     <div className="max-w-3xl">
-                      <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#8a7f72]">
+                      <p className="text-[11px] font-bold uppercase tracking-wider text-[#8a7f72]">
                         Purchase voucher deductions
                       </p>
-                      <h2 className="mt-1 text-lg font-medium tracking-tight text-[#20201c]">
+                      <h2 className="mt-1 text-base font-bold tracking-tight text-[#111827]">
                         Choose which deductions Kalika should handle
                       </h2>
-                      <p className="mt-1 text-[13px] leading-5 text-[#6b6a60]">
+                      <p className="mt-1 text-xs text-[#5b4b3d]">
                         Leave a rule off when your business does not use it. GST and transporter deductions follow their evidence rules; Section 194Q is confirmed separately on each Purchase voucher because one invoice cannot prove annual eligibility.
                       </p>
                     </div>
 
-                    <div className="mt-4 divide-y divide-[#e8e5de] rounded-lg border border-[#e8e5de]">
+                    <div className="mt-4 divide-y divide-[#f0ece4] rounded-lg border border-[#ded8d0]">
                       {[
                         {
                           key: "purchaseGoodsTdsEnabled" as const,
@@ -1297,19 +1397,19 @@ export default function SettingsPage() {
                         return (
                           <button
                             aria-pressed={enabled}
-                            className={`flex w-full items-center justify-between gap-5 px-4 py-3.5 text-left transition ${
-                              enabled ? "bg-[#f7fbf7]" : "hover:bg-[#faf9f6]"
+                            className={`flex w-full items-center justify-between gap-4 px-4 py-3 text-left transition ${
+                              enabled ? "bg-[#fdfcfa]" : "hover:bg-[#fbfaf8]"
                             }`}
                             key={rule.key}
                             onClick={() => handleTogglePurchaseAccountingRule(rule.key)}
                             type="button"
                           >
                             <span className="min-w-0">
-                              <span className="block text-[13px] font-medium text-[#20201c]">{rule.label}</span>
-                              <span className="mt-0.5 block text-[12px] leading-5 text-[#6b6a60]">{rule.description}</span>
+                              <span className="block text-xs font-semibold text-[#111827]">{rule.label}</span>
+                              <span className="mt-0.5 block text-xs leading-5 text-[#6b5d50]">{rule.description}</span>
                             </span>
                             <span className="flex shrink-0 items-center gap-2">
-                              <span className={`text-[11px] font-medium ${enabled ? "text-[#3d6b4a]" : "text-[#9b8f82]"}`}>
+                              <span className={`text-xs font-medium ${enabled ? "text-[#047857]" : "text-[#8a7f72]"}`}>
                                 {enabled ? "On" : "Off"}
                               </span>
                               <SwitchControl checked={enabled} />
@@ -1319,43 +1419,43 @@ export default function SettingsPage() {
                       })}
                     </div>
                   </section>
-                  <section className="mt-5 overflow-hidden rounded-[10px] border border-[#e8e5de] bg-white">
-                    <div className="flex flex-col gap-2 border-b border-[#e8e5de] px-6 py-4 sm:flex-row sm:items-center sm:justify-between">
+                  <section className="overflow-hidden rounded-xl border border-[#ded8d0] bg-white shadow-2xs">
+                    <div className="flex flex-col gap-2 border-b border-[#f0ece4] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
                       <div>
-                        <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#8a7f72]">Validation policy</p>
-                        <h2 className="mt-1 text-base font-semibold tracking-tight text-[#20201c]">Choose what blocks a Purchase voucher</h2>
+                        <p className="text-[11px] font-bold uppercase tracking-wider text-[#8a7f72]">Validation policy</p>
+                        <h2 className="mt-1 text-base font-bold tracking-tight text-[#111827]">Choose what blocks a Purchase voucher</h2>
                       </div>
-                      <div className="flex items-center gap-4 text-[11px] font-medium text-[#746d63]" aria-label="Validation severity legend">
-                        <span><span className="mr-1 inline-block h-2 w-2 rounded-full bg-rose-500" />Block</span>
-                        <span><span className="mr-1 inline-block h-2 w-2 rounded-full bg-amber-400" />Warn</span>
-                        <span><span className="mr-1 inline-block h-2 w-2 rounded-full bg-slate-300" />Off</span>
+                      <div className="flex items-center gap-4 text-xs font-medium text-[#746d63]" aria-label="Validation severity legend">
+                        <span className="inline-flex items-center"><span className="mr-1.5 inline-block h-2 w-2 rounded-full bg-rose-500" />Block</span>
+                        <span className="inline-flex items-center"><span className="mr-1.5 inline-block h-2 w-2 rounded-full bg-amber-400" />Warn</span>
+                        <span className="inline-flex items-center"><span className="mr-1.5 inline-block h-2 w-2 rounded-full bg-slate-300" />Off</span>
                       </div>
                     </div>
-                    <div className="divide-y divide-[#e8e5de]">
+                    <div className="divide-y divide-[#f0ece4]">
                       {PURCHASE_VALIDATION_GROUPS.map((group) => (
-                        <div className="grid gap-1 px-6 py-3 lg:grid-cols-[150px_1fr]" key={group.title}>
-                          <h3 className="pt-2 text-xs font-semibold text-[#5e574d]">{group.title}</h3>
-                          <div className="divide-y divide-[#eeeae3]">
+                        <div className="grid gap-2 px-5 py-3.5 lg:grid-cols-[160px_1fr]" key={group.title}>
+                          <h3 className="pt-2 text-xs font-bold text-[#5b4b3d]">{group.title}</h3>
+                          <div className="divide-y divide-[#f5f1eb]">
                             {group.rules.map(([key, label, description]) => {
                               const selected = purchaseAccountingSettings.validationPolicy[key];
                               return (
                                 <div className="flex flex-col gap-2 py-2.5 sm:flex-row sm:items-center sm:justify-between" key={key}>
                                   <div className="min-w-0 pr-3">
-                                    <p className="text-[13px] font-medium text-[#20201c]">{label}</p>
-                                    <p className="mt-0.5 text-[11px] leading-4 text-[#837b70]">{description}</p>
+                                    <p className="text-xs font-semibold text-[#111827]">{label}</p>
+                                    <p className="mt-0.5 text-xs text-[#8a7f72]">{description}</p>
                                   </div>
-                                  <div className="grid shrink-0 grid-cols-3 rounded-lg bg-[#f2efe9] p-0.5" role="group" aria-label={`${label} severity`}>
+                                  <div className="grid shrink-0 grid-cols-3 rounded-lg border border-[#e0d8cc] bg-[#ede6d9]/60 p-0.5" role="group" aria-label={`${label} severity`}>
                                     {(["block", "warn", "off"] as const).map((severity) => (
                                       <button
                                         aria-pressed={selected === severity}
-                                        className={`min-w-[58px] rounded-md px-2.5 py-1.5 text-[11px] font-semibold capitalize transition ${
+                                        className={`min-w-[56px] rounded-md px-2 py-1 text-xs font-semibold capitalize transition ${
                                           selected === severity
                                             ? severity === "block"
-                                              ? "bg-white text-rose-700 shadow-sm"
+                                              ? "bg-white text-rose-700 shadow-2xs"
                                               : severity === "warn"
-                                                ? "bg-white text-amber-700 shadow-sm"
-                                                : "bg-white text-slate-600 shadow-sm"
-                                            : "text-[#92887c] hover:text-[#4e4942]"
+                                                ? "bg-white text-amber-700 shadow-2xs"
+                                                : "bg-white text-slate-700 shadow-2xs"
+                                            : "text-[#8a7f72] hover:text-[#111827]"
                                         }`}
                                         key={severity}
                                         onClick={() => handleSetPurchaseValidationSeverity(key, severity)}
@@ -1372,7 +1472,7 @@ export default function SettingsPage() {
                         </div>
                       ))}
                     </div>
-                    <p className="border-t border-[#e8e5de] bg-[#faf9f6] px-6 py-2.5 text-[11px] text-[#746d63]">
+                    <p className="border-t border-[#f0ece4] bg-[#fbfaf8] px-5 py-2.5 text-xs text-[#8a7f72]">
                       Accounting integrity checks—balanced totals, valid dates, and required posting ledgers—always block and cannot be disabled.
                     </p>
                   </section>

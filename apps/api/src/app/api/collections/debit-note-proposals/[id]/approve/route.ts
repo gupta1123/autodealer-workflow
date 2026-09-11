@@ -1,3 +1,8 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {requireResourceAccess} from '@/lib/access/resources';
+import {requireDataset} from '@/lib/access/dataset';
+import {enqueueTeamDiscount} from '@/lib/access/discount-writes';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
@@ -27,7 +32,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function POST(
+async function POSTHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -39,6 +44,16 @@ export async function POST(
 
     const { id } = await context.params;
     const supabase = createSupabaseAdminClient();
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true') {
+      const resource=await requireResourceAccess(request,'proposal',id,'discounts.post');
+      const {data:proposal,error}=await supabase.from('debit_note_proposals').select('*').eq('id',id)
+        .eq('access_organization_id',resource.scope.organization_id).eq('access_company_id',resource.scope.company_id).maybeSingle();
+      if(error)throw error;
+      if(!proposal?.connection_id)return jsonWithCors(request,{error:'A verified proposal connection is required.'},{status:409});
+      const scope=await requireDataset(request,proposal.connection_id,{companyId:resource.scope.company_id,financialYear:proposal.financial_year,companyName:proposal.company_name},'discounts.post');
+      const queued=await enqueueTeamDiscount(scope,{},id);
+      return jsonWithCors(request,{proposal:serializeDebitNoteProposal({...proposal,status:'queued_in_tally',tally_command_id:queued.command.id}),command:serializeTallyBridgeCommand(queued.command)});
+    }
     const { data: proposalData, error: proposalError } = await supabase
       .from("debit_note_proposals")
       .select("*")
@@ -177,6 +192,7 @@ export async function POST(
       command: serializeTallyBridgeCommand(command),
     });
   } catch (error) {
+    const failure=accessFailureResponse(request,error);if(failure)return failure;
     if (isMissingTableError(error)) {
       return jsonWithCors(
         request,
@@ -193,3 +209,5 @@ export async function POST(
     );
   }
 }
+
+export const POST = withTeamAccess(POSTHandler);

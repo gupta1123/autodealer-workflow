@@ -2,6 +2,7 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { isLocalDbMode } from "@/lib/local/mode";
 import { pairLocalTallyConnection } from "@/lib/local/tally-store";
+import { restoreConnectionCompanyLinks } from "@/lib/access/connection-company-links";
 import {
   connectorSupportsReliableActiveCompany,
   createBridgeToken,
@@ -190,6 +191,10 @@ export async function POST(
     }
 
     const bridgeToken = createBridgeToken();
+    const protocolVersion = Math.max(0, Math.trunc(Number(body.protocolVersion || 0)));
+    const agentCapabilities = Array.isArray(body.agentCapabilities)
+      ? body.agentCapabilities.filter((value: unknown): value is string => typeof value === "string").slice(0, 100)
+      : [];
     const companyName = toNullableText(body.companyName);
     const tallyReachable = toNullableBoolean(body.tallyReachable);
     const reportedCompanyLoaded = toNullableBoolean(body.companyLoaded);
@@ -201,6 +206,7 @@ export async function POST(
       .from("tally_connections")
       .select("id")
       .eq("owner_user_id", connection.owner_user_id)
+      .eq("organization_id", connection.organization_id || connection.owner_user_id)
       .eq("installation_id", bridgeMachineId)
       .is("revoked_at", null)
       .not("bridge_token_hash", "is", null)
@@ -258,6 +264,11 @@ export async function POST(
         bridge_machine_id: bridgeMachineId,
         bridge_machine_name: bridgeMachineName,
         installation_id: bridgeMachineId,
+        organization_id: connection.organization_id || connection.owner_user_id,
+        agent_protocol_version: protocolVersion,
+        agent_version: toNullableText(body.agentVersion) || bridgeVersion,
+        agent_capabilities: agentCapabilities,
+        agent_last_seen_at: pairedAt,
         revoked_at: null,
         revoked_reason: null,
         session_generation: Number(connection.session_generation ?? 0) + 1,
@@ -278,6 +289,14 @@ export async function POST(
 
     const updatedConnection = updatedData as unknown as TallyConnectionRow;
 
+    const restoredMappings = await restoreConnectionCompanyLinks({
+      db: supabase,
+      organizationId: updatedConnection.organization_id || updatedConnection.owner_user_id,
+      installationId: updatedConnection.installation_id!,
+      connectionId: updatedConnection.id,
+      now: pairedAt,
+    });
+
     await logConnectionEvent(
       updatedConnection.id,
       updatedConnection.owner_user_id,
@@ -292,12 +311,22 @@ export async function POST(
         companyName,
         tallyReachable,
         companyLoaded,
+        restoredCompanyMappings: restoredMappings.restored,
+        mappingConflicts: restoredMappings.conflicts,
       }
     );
 
     return jsonWithCors(request, {
       connection: serializeTallyConnection(updatedConnection),
       bridgeToken,
+      agentIdentity: {
+        protocolVersion,
+        organizationId: updatedConnection.organization_id || updatedConnection.owner_user_id,
+        ownerUserId: updatedConnection.owner_user_id,
+        connectionId: updatedConnection.id,
+        installationId: updatedConnection.installation_id,
+        sessionGeneration: updatedConnection.session_generation,
+      },
     });
   } catch (error) {
     console.error("Error in POST /api/tally/connections/[id]/pair:", error);

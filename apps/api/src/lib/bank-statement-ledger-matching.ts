@@ -578,17 +578,18 @@ async function fetchAllActiveTallyLedgers(input: {
   supabase: SupabaseClient;
   ownerUserId: string;
   connectionId?: string | null;
+  datasetId?: string | null;
+  companyName?: string | null;
 }) {
   if (!input.connectionId) return [] as TallyMasterRow[];
 
   const ledgers: TallyMasterRow[] = [];
   const pageSize = 1000;
   for (let from = 0; from < 20000; from += pageSize) {
-    const { data, error } = await input.supabase
-      .from("tally_masters")
-      .select("*")
-      .eq("owner_user_id", input.ownerUserId)
-      .eq("connection_id", input.connectionId)
+    let query = input.supabase.from(input.datasetId ? 'access_dataset_masters' : 'tally_masters').select('*');
+    query = input.datasetId ? query.eq('dataset_id',input.datasetId) : query.eq('owner_user_id',input.ownerUserId).eq('connection_id',input.connectionId);
+    if (!input.datasetId && input.companyName) query = query.eq('company_name',input.companyName);
+    const { data, error } = await query
       .eq("master_type", "ledger")
       .eq("is_active", true)
       .order("tally_name", { ascending: true })
@@ -607,6 +608,7 @@ export async function suggestBankLedgersForTransactions(input: {
   ownerUserId: string;
   connectionId?: string | null;
   companyName?: string | null;
+  datasetId?: string | null;
   transactions: BankLedgerSuggestionTransaction[];
 }): Promise<BankLedgerSuggestion[]> {
   if (input.transactions.length === 0) return [];
@@ -637,11 +639,10 @@ export async function suggestBankLedgersForTransactions(input: {
     );
     const mappingChunks = await Promise.all(
       chunkValues(sourceKeys, 40).map(async (sourceKeyChunk) => {
-        const { data, error } = await input.supabase
-          .from("tally_mapping_settings")
-          .select("*")
-          .eq("owner_user_id", input.ownerUserId)
-          .eq("connection_id", input.connectionId)
+        let query = input.supabase.from(input.datasetId ? 'access_dataset_mappings' : 'tally_mapping_settings').select('*');
+        query = input.datasetId ? query.eq('dataset_id',input.datasetId) : query.eq('owner_user_id',input.ownerUserId).eq('connection_id',input.connectionId);
+        if (!input.datasetId && input.companyName) query = query.eq('company_name',input.companyName);
+        const { data, error } = await query
           .eq("mapping_type", "bank_narration_ledger")
           .in("source_key", sourceKeyChunk)
           .eq("status", "active")

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createInlinePriorityScheduler } from "./agent/scheduler.mjs";
 
 export const cashDiscountReadContext = new AsyncLocalStorage();
 export const CASH_DISCOUNT_READ_MS = 20_000;
@@ -26,7 +27,7 @@ function memorySample() {
 }
 
 export function createConnectorBenchmarkTrace({ requestId, operation, companyName } = {}) {
-  if (!BENCHMARK_DIAGNOSTICS_ENABLED) return null;
+  if (!BENCHMARK_DIAGNOSTICS_ENABLED && !['cash_discount_scan','cash_discount_revalidate','verify_bank_transaction','fetch_customer_open_bills'].includes(operation)) return null;
   const startedAt = performance.now();
   const startedCpu = process.cpuUsage();
   const samples = [memorySample()];
@@ -43,7 +44,7 @@ export function createConnectorBenchmarkTrace({ requestId, operation, companyNam
     sampleTimer: null,
     startedCpu,
   };
-  trace.sampleTimer = setInterval(() => samples.push(memorySample()), 500);
+  trace.sampleTimer = setInterval(() => { if (samples.length < 1000) samples.push(memorySample()); }, 500);
   trace.sampleTimer.unref?.();
   return trace;
 }
@@ -100,6 +101,10 @@ export function finishConnectorBenchmarkTrace(trace, { success, error } = {}) {
       sampleCount: trace.samples.length,
     },
   };
+  if (!BENCHMARK_DIAGNOSTICS_ENABLED) {
+    delete summary.tally.reads;
+    return summary;
+  }
   try {
     fs.mkdirSync(BENCHMARK_DIRECTORY, { recursive: true });
     const safeId = trace.requestId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 100);
@@ -171,25 +176,5 @@ export async function readBoundedXml(response, limit = CASH_DISCOUNT_XML_BYTES) 
 // One FIFO for Tally HTTP work. Waiting jobs are cancellable and expire before
 // executing, so retrying in the browser cannot leave orphaned scans behind.
 export function createTallyScheduler() {
-  let tail = Promise.resolve();
-  let active = false;
-  let stopped = false;
-  let queued = 0;
-  return {
-    get busy() { return active || queued > 0; },
-    stop() { stopped = true; },
-    run(task, { signal, deadlineAt = Infinity } = {}) {
-      queued += 1;
-      const result = tail.then(async () => {
-        queued -= 1;
-        if (stopped) throw new Error("The connector has stopped.");
-        checkReadBudget({ signal, deadlineAt });
-        active = true;
-        try { return await task(); }
-        finally { active = false; }
-      });
-      tail = result.catch(() => {});
-      return result;
-    },
-  };
+  return createInlinePriorityScheduler();
 }

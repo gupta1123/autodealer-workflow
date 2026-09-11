@@ -2,7 +2,8 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   ArrowLeft,
   CheckCircle2,
@@ -24,14 +25,32 @@ import {
   ZoomIn,
   ZoomOut,
   RotateCw,
+  GripVertical,
   type LucideIcon,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
+import {
+  CaseDetailRedesign,
+  type RedesignedDocumentCard,
+} from "@/components/cases/CaseDetailRedesign";
+import { PdfEvidencePreview } from "@/components/cases/PdfEvidencePreview";
+import {releaseProtectedPreview} from '@/lib/protected-preview';
+import { TallyInReviewPanel } from "@/components/cases/TallyInReviewPanel";
+import { ExtractedFieldsPanel, type ExtractedFieldItem } from "@/components/cases/ExtractedFieldsPanel";
+import styles from "@/components/cases/CaseDetailPage.module.css";
 import { AnalysisOptionsDialog } from "@/components/workspace/AnalysisOptionsDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   getComparisonModeLabel,
   isPrimaryComparisonField,
@@ -49,7 +68,8 @@ import {
   enqueueCaseAnalysis,
   fetchCaseAnalysisStatus,
   fetchCaseDetail,
-  fetchCaseFileSignedUrl,
+  fetchCaseDetailPreferCache,
+  fetchCaseFileSignedUrlPreferCache,
   updateCaseDecision,
   type CaseDecision,
   type SavedCaseDetail,
@@ -65,7 +85,19 @@ import type {
 
 type LoadState = "loading" | "ready" | "error";
 type ActiveTab = "preview" | "data";
-type DataViewMode = "fields" | "lineItems";
+type DataViewMode = "fields" | "lineItems" | "terms";
+type PreviewFocus = {
+  id: string;
+  label: string;
+  query: string;
+  pageNumber?: number;
+  occurrence?: number;
+};
+const DEFAULT_DATA_PANE_WIDTH = 576;
+const DEFAULT_PREVIEW_ZOOM = 1;
+const MIN_DATA_PANE_WIDTH = 280;
+const MIN_PREVIEW_PANE_WIDTH = 440;
+const PANE_RESIZE_STEP = 24;
 const PURCHASE_ORDER_DOCUMENT_TYPES = new Set(["Purchase Order", "Amended Purchase Order"]);
 const TERMS_CHECKLIST_DEFINITIONS = [
   { key: "paymentTerms", label: "Payment", keywords: ["payment", "advance", "proforma"] },
@@ -655,6 +687,15 @@ function displayValue(value: unknown) {
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
 }
+
+function formatMoney(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  return new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    maximumFractionDigits: 2,
+  }).format(value);
+}
 function getDocumentIndexDetails(document: SavedCaseDetail["documents"][number]) {
   const type = document.documentType || "Document";
   const sourcePage = getDocumentSourcePage(document);
@@ -742,9 +783,34 @@ function getDocumentSourcePage(document?: SavedCaseDetail["documents"][number] |
   return Number.isFinite(page) && page > 0 ? Math.round(page) : 1;
 }
 
+function getLineItemPreviewPage(
+  document: SavedCaseDetail["documents"][number] | null,
+  item: CommercialLineItem
+) {
+  const documentStartPage = getDocumentSourcePage(document);
+  const itemSourcePage = Number(item.sourcePage);
+  if (!Number.isFinite(itemSourcePage) || itemSourcePage < 1) return documentStartPage;
+
+  const documentPageCount = Math.max(1, document?.pageCount || 1);
+  if (itemSourcePage <= documentPageCount) {
+    return documentStartPage + itemSourcePage - 1;
+  }
+
+  return Math.round(itemSourcePage);
+}
+
+function normalizeEvidenceValue(value: unknown) {
+  return String(value ?? "")
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function getCaseStatusLabel(status: string) {
   if (status === "draft") return "Draft";
-  if (status === "accepted") return "Accepted";
+  if (status === "accepted") return "Approved";
   if (status === "rejected") return "Rejected";
   if (status === "failed") return "Failed";
   if (status === "processing") return "Processing";
@@ -798,102 +864,278 @@ function getFriendlyAnalysisStage(stage: string | null, status: "idle" | "proces
 }
 
 function CaseDetailSkeleton() {
-  return (
-    <div className="flex min-h-[calc(100vh-4rem)] flex-1 flex-col overflow-hidden bg-[#fafafa] tracking-normal">
-      <header className="flex h-14 sm:h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-3 sm:px-6">
-        <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-4">
-          <Skeleton className="h-8 w-8 shrink-0 rounded-lg bg-slate-100" />
-          <div className="h-6 w-px shrink-0 bg-slate-200" />
-          <Skeleton className="h-4 w-44 max-w-[45vw] bg-slate-100" />
-        </div>
-        <Skeleton className="hidden h-7 w-24 rounded-full bg-slate-100 md:block" />
-        <Skeleton className="h-5 w-16 rounded-full bg-slate-100 md:hidden" />
-      </header>
-
-      <div className="flex flex-1 min-h-0">
-        <aside className="hidden w-80 shrink-0 flex-col border-r border-slate-200 bg-[#fafafa] lg:w-[24rem] md:flex">
-          <div className="p-6 space-y-6">
-            <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
-              <div className="space-y-3 bg-slate-50 p-5">
-                <div className="flex items-center gap-2">
-                  <Skeleton className="h-7 w-7 rounded-full bg-slate-200/70" />
-                  <Skeleton className="h-4 w-36 bg-slate-200/70" />
-                </div>
-                <Skeleton className="h-3.5 w-full bg-slate-200/70" />
-                <Skeleton className="h-3.5 w-4/5 bg-slate-200/70" />
+  const useRedesignedSkeleton = true;
+  if (useRedesignedSkeleton) {
+    return (
+      <div className={styles.redesignPage} aria-label="Loading case details" aria-busy="true">
+        {/* compactHeader — mirrors CaseDetailRedesign compactHeader */}
+        <header className={styles.compactHeader}>
+          <div className={styles.compactHeaderLeft}>
+            <Skeleton className="h-8 w-8 rounded-lg bg-[#eee7dd] shrink-0" />
+            <div className={styles.compactInfo}>
+              <div className={styles.compactTitleRow}>
+                <Skeleton className="h-5 w-48 bg-[#eee7dd] rounded" />
+                <Skeleton className="h-5 w-20 rounded-full bg-[#eee7dd]" />
               </div>
-              <div className="grid grid-cols-2 gap-4 border-t border-slate-100 p-5">
-                {Array.from({ length: 4 }).map((_, index) => (
-                  <div key={index} className="space-y-2">
-                    <Skeleton className="h-3 w-16 bg-slate-100" />
-                    <Skeleton className="h-4 w-24 bg-slate-100" />
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div>
-              <div className="mb-3 flex items-center justify-between px-1">
-                <Skeleton className="h-3 w-36 bg-slate-200/70" />
-                <Skeleton className="h-5 w-8 rounded-full bg-slate-200/70" />
-              </div>
-              <div className="space-y-1.5">
-                {Array.from({ length: 5 }).map((_, index) => (
-                  <div key={index} className="flex items-center gap-3 rounded-xl border border-transparent px-3 py-3">
-                    <Skeleton className="h-8 w-8 shrink-0 rounded-lg bg-slate-100" />
-                    <div className="min-w-0 flex-1 space-y-2">
-                      <Skeleton className="h-3.5 w-4/5 bg-slate-100" />
-                      <Skeleton className="h-3 w-1/2 bg-slate-100" />
-                    </div>
-                  </div>
-                ))}
+              <div className={styles.compactMetaRow}>
+                <Skeleton className="h-3 w-28 bg-[#eee7dd]" />
+                <span className="hidden sm:block h-3 w-px bg-[#e8e2db]" />
+                <Skeleton className="h-3 w-32 bg-[#eee7dd]" />
+                <Skeleton className="hidden sm:block h-3 w-24 bg-[#eee7dd]" />
               </div>
             </div>
           </div>
-        </aside>
+          <div className={styles.compactHeaderRight}>
+            <nav className={styles.compactTabs} aria-hidden="true">
+              <Skeleton className="h-4 w-16 bg-[#eee7dd] rounded" />
+              <Skeleton className="h-4 w-20 bg-[#eee7dd] rounded" />
+              <Skeleton className="h-4 w-14 bg-[#eee7dd] rounded" />
+            </nav>
+            <div className="flex items-center gap-2">
+              <Skeleton className="h-8 w-24 rounded-lg bg-[#eee7dd]" />
+              <Skeleton className="h-8 w-20 rounded-lg bg-[#eee7dd]" />
+              <Skeleton className="h-8 w-20 rounded-lg bg-[#eee7dd]" />
+            </div>
+          </div>
+        </header>
 
-        <main className="flex flex-1 min-w-0 flex-col bg-[#fafafa] px-2.5 pb-0 pt-2.5 sm:p-4 md:p-6 lg:p-8">
-          <div className="mb-3 rounded-xl border border-[#e5ddd0] bg-white p-1.5 shadow-sm md:hidden">
-            <div className="flex gap-2 overflow-hidden">
-              {Array.from({ length: 3 }).map((_, index) => (
-                <Skeleton key={index} className="h-12 min-w-[130px] rounded-lg bg-[#f0ece6]" />
+        {/* topDocumentStrip — 10-up grid, responsive scroll under 1280 */}
+        <section className={styles.topDocumentStrip} aria-hidden="true">
+          {Array.from({ length: 10 }).map((_, index) => (
+            <div key={index} className={`${styles.topDocCard} ${index === 0 ? styles.topDocCardActive : ""} opacity-60`}>
+              <div className={styles.topDocCardHeader}>
+                <Skeleton className="h-[18px] w-[18px] rounded-[4px] bg-[#eee7dd]" />
+                <Skeleton className="h-1.5 w-1.5 rounded-full bg-[#eee7dd]" />
+              </div>
+              <Skeleton className="h-3 w-20 bg-[#eee7dd] rounded" />
+              <Skeleton className="mt-1.5 h-2.5 w-16 bg-[#eee7dd] rounded" />
+            </div>
+          ))}
+        </section>
+
+        {/* splitWorkspace — left preview + right data, exact grid as real */}
+        <section className={styles.splitWorkspace} aria-hidden="true">
+          <div className={styles.splitPreviewPane}>
+            <div className={styles.splitPreviewHeader}>
+              <div className={styles.splitDocTitleBlock}>
+                <Skeleton className="h-4 w-20 bg-[#eee7dd] rounded" />
+                <Skeleton className="h-3 w-28 bg-[#eee7dd] rounded" />
+                <Skeleton className="h-3 w-12 bg-[#eee7dd] rounded" />
+              </div>
+              <div className={styles.splitPreviewControls}>
+                <Skeleton className="h-6 w-28 rounded-full bg-[#eee7dd]" />
+                <Skeleton className="h-7 w-20 rounded-md bg-[#eee7dd]" />
+                <Skeleton className="h-7 w-20 rounded-md bg-[#eee7dd]" />
+              </div>
+            </div>
+            <div className={styles.splitPreviewStage}>
+              <div className="w-[min(760px,68vw)] max-w-[68vw] rounded-[6px] border border-[#ded8d0] bg-white p-6 shadow-[0_10px_25px_-10px_rgba(43,26,16,0.2)]">
+                <Skeleton className="h-5 w-2/3 bg-[#eee7dd]" />
+                <Skeleton className="mt-2 h-3 w-1/2 bg-[#eee7dd]" />
+                <Skeleton className="mt-6 h-px w-full bg-[#e8e2db]" />
+                <div className="mt-6 space-y-3">
+                  {Array.from({ length: 6 }).map((_, i) => (
+                    <Skeleton key={i} className="h-3 w-full bg-[#eee7dd]" />
+                  ))}
+                </div>
+                <div className="mt-6 grid grid-cols-2 gap-4">
+                  <Skeleton className="h-16 rounded-md bg-[#f3eee7]" />
+                  <Skeleton className="h-16 rounded-md bg-[#f3eee7]" />
+                </div>
+              </div>
+            </div>
+            <div className={styles.splitStampStrip}>
+              <Skeleton className="h-7 w-20 rounded-lg bg-[#eee7dd]" />
+              <Skeleton className="h-7 w-24 rounded-lg bg-[#eee7dd]" />
+              <Skeleton className="h-7 w-20 rounded-lg bg-[#eee7dd]" />
+            </div>
+          </div>
+          <div className={styles.splitDataPane}>
+            <div className={styles.splitDataHeader}>
+              <Skeleton className="h-4 w-32 bg-[#eee7dd] rounded" />
+              <Skeleton className="mt-1 h-3 w-20 bg-[#eee7dd] rounded" />
+              <div className="mt-3 flex gap-4">
+                <Skeleton className="h-3 w-16 bg-[#eee7dd] rounded" />
+                <Skeleton className="h-3 w-20 bg-[#eee7dd] rounded" />
+                <Skeleton className="h-3 w-16 bg-[#eee7dd] rounded" />
+              </div>
+            </div>
+            <div className={styles.splitDataScroll}>
+              {Array.from({ length: 3 }).map((_, sec) => (
+                <div key={sec} className={styles.splitSection}>
+                  <Skeleton className="mb-2 h-2.5 w-20 bg-[#eee7dd] rounded" />
+                  <div className={styles.splitFieldList}>
+                    {Array.from({ length: 3 }).map((_, i) => (
+                      <div key={i} className={styles.splitFieldItem}>
+                        <Skeleton className="h-2.5 w-16 bg-[#eee7dd]" />
+                        <Skeleton className="mt-1.5 h-3.5 w-24 bg-[#eee7dd]" />
+                      </div>
+                    ))}
+                  </div>
+                </div>
               ))}
             </div>
           </div>
+        </section>
+      </div>
+    );
+  }
+  return (
+    <div className={styles.page} aria-label="Loading case details" aria-busy="true">
+      <header className={styles.header}>
+        <Skeleton className="h-7 w-7 shrink-0 rounded-md bg-slate-100" />
+        <div className={styles.breadcrumb}>
+          <Skeleton className="h-3.5 w-44 bg-slate-100" />
+          <span className={styles.breadcrumbSeparator}>/</span>
+          <Skeleton className="h-3.5 w-36 bg-slate-100" />
+        </div>
+        <div className={styles.headerSpacer} />
+        <Skeleton className="hidden h-3.5 w-48 bg-slate-100 lg:block" />
+        <Skeleton className="h-6 w-20 rounded-full bg-rose-50" />
+      </header>
 
-          <div className="flex flex-1 flex-col overflow-hidden bg-white shadow-sm sm:rounded-2xl sm:border sm:border-slate-200">
-            <div className="flex flex-col justify-between gap-3 border-b border-slate-100 bg-white p-2 sm:flex-row sm:items-center sm:p-4">
-              <div className="hidden items-center gap-3 sm:flex">
-                <Skeleton className="h-5 w-5 rounded bg-slate-100" />
-                <Skeleton className="h-4 w-28 bg-slate-100" />
-                <Skeleton className="h-5 w-14 rounded-full bg-slate-100" />
-              </div>
-              <div className="flex w-full items-center justify-between gap-3 sm:w-auto sm:justify-end">
-                <div className="flex w-full items-center rounded-xl border border-[#e5ddd0] bg-[#f0ece6] p-1.5 sm:w-auto">
-                  {Array.from({ length: 3 }).map((_, index) => (
-                    <Skeleton key={index} className="mx-1 h-8 flex-1 rounded-lg bg-white/70 sm:w-20" />
+      <div className={`${styles.reviewBar} ${styles.reviewBarRed}`}>
+        <span className={styles.severityDot} />
+        <div className={styles.reviewCopy}>
+          <Skeleton className="h-3.5 w-48 bg-slate-100" />
+          <Skeleton className="mt-1.5 h-2.5 w-80 max-w-[52vw] bg-slate-100" />
+        </div>
+        <Skeleton className="h-3 w-12 bg-slate-100" />
+        <Skeleton className="h-7 w-36 rounded-md bg-slate-200" />
+      </div>
+
+      <section className={styles.packetStrip} aria-label="Loading documents in packet">
+        <div className={styles.packetStripLabel}>
+          Documents in packet <span>· 5</span>
+        </div>
+        <div className={styles.packetCards}>
+          {Array.from({ length: 5 }).map((_, index) => (
+            <div
+              key={index}
+              className={`${styles.packetCard} ${styles.skeletonPacketCard} ${index === 0 ? styles.packetCardActive : ""}`}
+            >
+              <span className={styles.packetCardTopline}>
+                <Skeleton className="h-4 w-12 rounded bg-slate-100" />
+                <Skeleton className="ml-auto h-1.5 w-1.5 rounded-full bg-slate-200" />
+              </span>
+              <Skeleton className="mt-2 h-3.5 w-28 bg-slate-100" />
+              <Skeleton className="mt-2 h-2.5 w-20 bg-slate-100" />
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <div className={styles.mobileControls} aria-hidden="true">
+        <Skeleton className="h-8 flex-1 rounded-md bg-slate-100" />
+        <Skeleton className="h-8 flex-1 rounded-md bg-slate-100" />
+      </div>
+      <div className={styles.mobileDocuments} aria-hidden="true">
+        {Array.from({ length: 3 }).map((_, index) => (
+          <Skeleton key={index} className="h-12 min-w-32 rounded-md bg-slate-100" />
+        ))}
+      </div>
+
+      <div
+        className={`${styles.workspace} ${styles.desktopWorkspace}`}
+        style={{ "--data-pane-width": `${DEFAULT_DATA_PANE_WIDTH}px` } as CSSProperties}
+      >
+        <main className={styles.viewerPane}>
+          <div className={styles.viewerToolbar}>
+            <Skeleton className="h-3.5 w-24 bg-slate-100" />
+            <Skeleton className="h-3 w-20 bg-slate-100" />
+            <span className={styles.toolbarDivider} />
+            <Skeleton className="h-5 w-20 bg-slate-100" />
+            <div className={styles.zoomControls}>
+              <Skeleton className="h-5 w-28 bg-slate-100" />
+            </div>
+          </div>
+          <div className={styles.viewerCanvas}>
+            <div className={styles.skeletonPreviewStage}>
+              <div className={styles.skeletonPdfPage}>
+                <div className={styles.skeletonPdfHeader}>
+                  <div className="space-y-2">
+                    <Skeleton className="h-6 w-56 bg-slate-100" />
+                    <Skeleton className="h-2.5 w-48 bg-slate-100" />
+                    <Skeleton className="h-2.5 w-36 bg-slate-100" />
+                  </div>
+                  <div className="flex flex-col items-end space-y-2">
+                    <Skeleton className="h-5 w-40 bg-slate-100" />
+                    <Skeleton className="h-2.5 w-32 bg-slate-100" />
+                    <Skeleton className="h-2.5 w-24 bg-slate-100" />
+                  </div>
+                </div>
+                <div className={styles.skeletonPdfRule} />
+                <div className={styles.skeletonPdfPanel}>
+                  <div className="space-y-2">
+                    <Skeleton className="h-2.5 w-14 bg-slate-200" />
+                    <Skeleton className="h-3.5 w-40 bg-slate-200" />
+                    <Skeleton className="h-2.5 w-48 bg-slate-200" />
+                  </div>
+                  <div className="space-y-2">
+                    <Skeleton className="h-2.5 w-14 bg-slate-200" />
+                    <Skeleton className="h-3.5 w-40 bg-slate-200" />
+                    <Skeleton className="h-2.5 w-44 bg-slate-200" />
+                  </div>
+                </div>
+                <div className={styles.skeletonPdfTable}>
+                  <div className={styles.skeletonPdfTableHead} />
+                  {Array.from({ length: 6 }).map((_, index) => (
+                    <div key={index} className={styles.skeletonPdfTableRow}>
+                      <Skeleton className="h-2.5 w-36 bg-slate-100" />
+                      <Skeleton className="h-2.5 w-16 bg-slate-100" />
+                      <Skeleton className="h-2.5 w-10 bg-slate-100" />
+                      <Skeleton className="h-2.5 w-20 bg-slate-100" />
+                    </div>
                   ))}
                 </div>
               </div>
             </div>
+          </div>
+        </main>
 
-            <div className="relative flex-1 bg-[#525659] p-4">
-              <div className="mx-auto h-full max-w-3xl rounded-lg bg-white p-6 shadow-2xl">
-                <div className="space-y-4">
-                  <Skeleton className="h-7 w-3/4 bg-slate-100" />
-                  <Skeleton className="h-4 w-1/2 bg-slate-100" />
-                  <div className="space-y-3 pt-6">
-                    {Array.from({ length: 9 }).map((_, index) => (
-                      <Skeleton key={index} className="h-3.5 w-full bg-slate-100" />
-                    ))}
-                  </div>
-                </div>
+        <div className={styles.paneResizeHandle} aria-hidden="true">
+          <GripVertical />
+        </div>
+
+        <aside className={styles.dataPane} aria-label="Loading extracted document data">
+          <div className={styles.dataTabs}>
+            {Array.from({ length: 3 }).map((_, index) => (
+              <div key={index} className={`${styles.dataTab} ${index === 0 ? styles.dataTabActive : ""}`}>
+                <Skeleton className={`h-3 bg-slate-100 ${index === 1 ? "w-16" : "w-12"}`} />
+                <Skeleton className="h-2.5 w-3 bg-slate-100" />
               </div>
-              <div className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2 shadow-2xl">
-                <Skeleton className="h-3 w-10 bg-white/20" />
-                <Skeleton className="h-6 w-6 rounded-lg bg-white/20" />
-                <Skeleton className="h-6 w-6 rounded-lg bg-white/20" />
+            ))}
+          </div>
+          <div className={styles.dataBody}>
+            <div className={styles.dataHint}>
+              <Skeleton className="h-3.5 w-3.5 rounded-full bg-slate-100" />
+              <Skeleton className="h-2.5 w-56 max-w-[80%] bg-slate-100" />
+            </div>
+            <div className={styles.dataGroupLabel}>
+              <Skeleton className="h-2.5 w-28 bg-slate-100" />
+            </div>
+            {Array.from({ length: 9 }).map((_, index) => (
+              <div key={index} className={styles.fieldRow}>
+                <Skeleton className={`h-2.5 bg-slate-100 ${index % 3 === 0 ? "w-24" : "w-32"}`} />
+                <Skeleton className={`mt-2 h-3 bg-slate-100 ${index % 2 === 0 ? "w-44" : "w-52"}`} />
               </div>
+            ))}
+          </div>
+        </aside>
+      </div>
+
+      <div className={`${styles.workspace} ${styles.legacyMobileWorkspace}`} aria-hidden="true">
+        <main className={styles.viewerPane}>
+          <div className={styles.viewerToolbar}>
+            <Skeleton className="h-3.5 w-24 bg-slate-100" />
+            <Skeleton className="h-3 w-20 bg-slate-100" />
+            <div className={styles.zoomControls}>
+              <Skeleton className="h-5 w-20 bg-slate-100" />
+            </div>
+          </div>
+          <div className={styles.viewerCanvas}>
+            <div className={styles.skeletonPreviewStage}>
+              <div className={styles.skeletonPdfPage} />
             </div>
           </div>
         </main>
@@ -903,6 +1145,7 @@ function CaseDetailSkeleton() {
 }
 
 export function CaseDetailPage({ caseId }: { caseId: string }) {
+  const router = useRouter();
   const [detail, setDetail] = useState<SavedCaseDetail | null>(null);
   const [status, setStatus] = useState<LoadState>("loading");
   const [error, setError] = useState<string | null>(null);
@@ -916,21 +1159,45 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   const [draftFileError, setDraftFileError] = useState<string | null>(null);
   const [decisionStatus, setDecisionStatus] = useState<"idle" | "updating" | "error">("idle");
   const [decisionError, setDecisionError] = useState<string | null>(null);
+  const [isMismatchNavigationPending, setIsMismatchNavigationPending] = useState(false);
+  const [isTallyReviewOpen, setIsTallyReviewOpen] = useState(false);
 
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<ActiveTab>("preview");
   const [activeDataView, setActiveDataView] = useState<DataViewMode>("fields");
   const [previewPageIndex, setPreviewPageIndex] = useState(0);
-  const [previewZoom, setPreviewZoom] = useState(1);
+  const [previewZoom, setPreviewZoom] = useState(DEFAULT_PREVIEW_ZOOM);
+  const [previewFocus, setPreviewFocus] = useState<PreviewFocus | null>(null);
+  const [previewPdfPage, setPreviewPdfPage] = useState<number | null>(null);
+  const [previewPdfPageCount, setPreviewPdfPageCount] = useState(1);
+  const [dataPaneWidth, setDataPaneWidth] = useState(DEFAULT_DATA_PANE_WIDTH);
+  const [isPaneResizing, setIsPaneResizing] = useState(false);
   const [signedFileUrls, setSignedFileUrls] = useState<Record<string, string | null>>({});
+  const protectedPreviews = useRef(new Set<string>());
+  useEffect(() => {
+    const reset = () => {
+      for (const url of protectedPreviews.current) releaseProtectedPreview(url);
+      protectedPreviews.current.clear();
+      setSignedFileUrls({});
+    };
+    window.addEventListener('kalika-access-invalidated', reset);
+    reset();
+    return () => {
+      window.removeEventListener('kalika-access-invalidated', reset);
+      for (const url of protectedPreviews.current) releaseProtectedPreview(url);
+      protectedPreviews.current.clear();
+    };
+  }, [caseId]);
   const [loadingPreviewFileId, setLoadingPreviewFileId] = useState<string | null>(null);
   const [previewUrlError, setPreviewUrlError] = useState<string | null>(null);
   const draftFileInputRef = useRef<HTMLInputElement | null>(null);
+  const desktopWorkspaceRef = useRef<HTMLDivElement | null>(null);
+  const paneResizeStartRef = useRef<{ pointerX: number; paneWidth: number } | null>(null);
 
   useEffect(() => {
     let active = true;
 
-    fetchCaseDetail(caseId)
+    fetchCaseDetailPreferCache(caseId)
       .then((payload) => {
         if (!active) return;
         setDetail(payload);
@@ -951,7 +1218,24 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     setSignedFileUrls({});
     setLoadingPreviewFileId(null);
     setPreviewUrlError(null);
+    setDataPaneWidth(DEFAULT_DATA_PANE_WIDTH);
   }, [caseId]);
+
+  useEffect(() => {
+    const workspace = desktopWorkspaceRef.current;
+    if (!workspace) return;
+
+    const observer = new ResizeObserver(([entry]) => {
+      const workspaceWidth = entry?.contentRect.width || workspace.clientWidth;
+      const maximumWidth = Math.max(
+        MIN_DATA_PANE_WIDTH,
+        workspaceWidth - MIN_PREVIEW_PANE_WIDTH - 8
+      );
+      setDataPaneWidth((current) => Math.min(current, maximumWidth));
+    });
+    observer.observe(workspace);
+    return () => observer.disconnect();
+  }, [status]);
 
   const displayDocuments = useMemo(
     () => (detail ? getDisplayDocuments(detail.documents) : []),
@@ -1061,13 +1345,28 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       ) ?? [],
     [detail]
   );
-  const canonicalInvoiceCount = displayDocuments.filter(isInvoiceDocument).length;
   const pendingMismatchCount = visibleMismatches.filter(
     (mismatch) => mismatch.resolutionStatus === "pending"
   ).length;
   const rejectedMismatchCount = visibleMismatches.filter(
     (mismatch) => mismatch.resolutionStatus === "rejected"
   ).length;
+  const mismatchReviewHref = `/cases/${caseId}/mismatches`;
+
+  useEffect(() => {
+    if (status !== "ready" || visibleMismatches.length === 0) return;
+    router.prefetch(mismatchReviewHref);
+  }, [mismatchReviewHref, router, status, visibleMismatches.length]);
+
+  function prepareMismatchNavigation() {
+    router.prefetch(mismatchReviewHref);
+  }
+
+  function beginMismatchNavigation() {
+    setIsMismatchNavigationPending(true);
+    prepareMismatchNavigation();
+  }
+
   const reviewSummary = useMemo(() => {
     if (!detail) {
       return null;
@@ -1127,15 +1426,8 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
         buttonLabel:
           visibleMismatches.length > 0
             ? `View ${visibleMismatches.length} Reviewed Issue${visibleMismatches.length === 1 ? "" : "s"}`
-            : canonicalInvoiceCount === 1
-              ? "Prepare Tally Purchase Voucher"
-              : null,
-        action:
-          visibleMismatches.length > 0
-            ? "review" as const
-            : canonicalInvoiceCount === 1
-              ? "tally" as const
-              : null,
+            : null,
+        action: visibleMismatches.length > 0 ? "review" as const : null,
         badgeLabel: "Accepted",
         showConfidence: false,
         showBadge: false,
@@ -1221,7 +1513,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       showBadge: false,
       facts,
     };
-  }, [canonicalInvoiceCount, detail, pendingMismatchCount, rejectedMismatchCount, visibleMismatches.length]);
+  }, [detail, pendingMismatchCount, rejectedMismatchCount, visibleMismatches.length]);
 
   const activeDocumentEntries = useMemo(() => {
     if (!activeDocument) return [];
@@ -1373,27 +1665,38 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     activePreviewFile?.originalName || activeDocument?.sourceFileName || activeDocument?.sourceHint
   );
   const activeDocumentSourcePage = getDocumentSourcePage(activeDocument);
-  const canGoToPreviousPreviewPage = previewPageIndex > 0;
+  const activePdfPage = Math.min(
+    Math.max(1, previewPdfPage ?? activeDocumentSourcePage),
+    Math.max(1, previewPdfPageCount)
+  );
+  const canGoToPreviousPreviewPage = activeSourceIsImage
+    ? previewPageIndex > 0
+    : activePdfPage > 1;
   const canGoToNextPreviewPage =
-    activeDocumentFiles.length > 0 && previewPageIndex < activeDocumentFiles.length - 1;
-  const canZoomOut = activeSourceIsImage && previewZoom > 0.75;
-  const canZoomIn = activeSourceIsImage && previewZoom < 3;
+    activeSourceIsImage
+      ? activeDocumentFiles.length > 0 && previewPageIndex < activeDocumentFiles.length - 1
+      : activePdfPage < previewPdfPageCount;
+  const canZoomOut = Boolean(activeFileUrl) && previewZoom > 0.75;
+  const canZoomIn = Boolean(activeFileUrl) && previewZoom < 3;
 
   useEffect(() => {
     setPreviewPageIndex(0);
-    setPreviewZoom(1);
-  }, [activeDocumentId]);
+    setPreviewZoom(DEFAULT_PREVIEW_ZOOM);
+    setPreviewFocus(null);
+    setPreviewPdfPage(null);
+    setPreviewPdfPageCount(Math.max(1, activeDocument?.pageCount || 1));
+  }, [activeDocument?.pageCount, activeDocumentId]);
 
   useEffect(() => {
     setPreviewPageIndex((current) => Math.min(current, Math.max(activeDocumentFiles.length - 1, 0)));
   }, [activeDocumentFiles.length]);
 
   useEffect(() => {
-    setPreviewZoom(1);
+    setPreviewZoom(DEFAULT_PREVIEW_ZOOM);
   }, [previewPageIndex]);
 
   useEffect(() => {
-    if (!detail || activeTab !== "preview" || !activePreviewFile) {
+    if (!detail || !activePreviewFile) {
       return;
     }
 
@@ -1408,9 +1711,10 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     setLoadingPreviewFileId(activePreviewFile.id);
     setPreviewUrlError(null);
 
-    fetchCaseFileSignedUrl(detail.case.id, activePreviewFile.id)
+    fetchCaseFileSignedUrlPreferCache(detail.case.id, activePreviewFile.id)
       .then((payload) => {
-        if (!active) return;
+        if (!active) { releaseProtectedPreview(payload.signedUrl); return; }
+        if (payload.signedUrl.startsWith('blob:')) protectedPreviews.current.add(payload.signedUrl);
         setSignedFileUrls((current) => ({
           ...current,
           [payload.fileId]: payload.signedUrl,
@@ -1436,7 +1740,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     return () => {
       active = false;
     };
-  }, [activePreviewFile, activeTab, detail, signedFileUrls]);
+  }, [activePreviewFile, detail, signedFileUrls]);
 
   const comparisonOptions = useMemo(
     () =>
@@ -1534,11 +1838,81 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     }
   }
 
+  function handleDocumentSelection(documentId: string) {
+    setActiveDocumentId(documentId);
+    setActiveTab("preview");
+  }
+
+  function handlePreviewFocus(nextFocus: PreviewFocus) {
+    setPreviewFocus(nextFocus);
+    if (nextFocus.pageNumber && nextFocus.pageNumber > 0) {
+      setPreviewPdfPage(nextFocus.pageNumber);
+    }
+    setActiveTab("preview");
+  }
+
+  function getDataPaneWidthBounds() {
+    const workspaceWidth = desktopWorkspaceRef.current?.clientWidth || 0;
+    return {
+      min: MIN_DATA_PANE_WIDTH,
+      max: Math.max(
+        MIN_DATA_PANE_WIDTH,
+        workspaceWidth > 0
+          ? workspaceWidth - MIN_PREVIEW_PANE_WIDTH - 8
+          : DEFAULT_DATA_PANE_WIDTH
+      ),
+    };
+  }
+
+  function resizeDataPane(nextWidth: number) {
+    const bounds = getDataPaneWidthBounds();
+    setDataPaneWidth(Math.min(bounds.max, Math.max(bounds.min, Math.round(nextWidth))));
+  }
+
+  function handlePaneResizeStart(event: React.PointerEvent<HTMLButtonElement>) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    paneResizeStartRef.current = { pointerX: event.clientX, paneWidth: dataPaneWidth };
+    setIsPaneResizing(true);
+  }
+
+  function handlePaneResizeMove(event: React.PointerEvent<HTMLButtonElement>) {
+    const resizeStart = paneResizeStartRef.current;
+    if (!resizeStart) return;
+    resizeDataPane(resizeStart.paneWidth + resizeStart.pointerX - event.clientX);
+  }
+
+  function handlePaneResizeEnd(event: React.PointerEvent<HTMLButtonElement>) {
+    if (!paneResizeStartRef.current) return;
+    paneResizeStartRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setIsPaneResizing(false);
+  }
+
+  function handlePaneResizeKeyDown(event: React.KeyboardEvent<HTMLButtonElement>) {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      resizeDataPane(dataPaneWidth + PANE_RESIZE_STEP);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      resizeDataPane(dataPaneWidth - PANE_RESIZE_STEP);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      resizeDataPane(MIN_DATA_PANE_WIDTH);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      resizeDataPane(DEFAULT_DATA_PANE_WIDTH);
+    }
+  }
+
   const isFinalDecision = detail?.case.status === "accepted" || detail?.case.status === "rejected";
 
   if (status === "loading") {
     return (
-      <AppShell>
+      <AppShell defaultSidebarCollapsed>
         <CaseDetailSkeleton />
       </AppShell>
     );
@@ -1546,7 +1920,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
   if (status === "error") {
     return (
-      <AppShell>
+      <AppShell defaultSidebarCollapsed>
         <div className="flex flex-1 items-center justify-center bg-slate-50/50 p-6 min-h-[calc(100vh-4rem)] tracking-normal">
           <div className="w-full max-w-md flex flex-col items-center text-center bg-white p-8 rounded-3xl shadow-sm border border-slate-200">
             <div className="flex h-16 w-16 items-center justify-center rounded-full bg-red-50 mb-4">
@@ -1579,7 +1953,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     const readyCount = detail.files.length;
 
     return (
-      <AppShell>
+      <AppShell defaultSidebarCollapsed>
         <div className="flex flex-1 flex-col bg-[#f7f7f5] animate-in fade-in duration-500 min-h-[calc(100vh-4rem)] tracking-normal">
           <header className="flex h-14 sm:h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 sm:px-6">
             <div className="flex items-center gap-3 sm:gap-4 w-full">
@@ -1749,207 +2123,1179 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   // ANALYZED STATE (Split Screen View)
   // =========================================
   const showActions = detail && detail.case.status !== "draft" && !isFinalDecision;
+  const reviewCountLabel =
+    visibleMismatches.length > 0
+      ? isFinalDecision
+        ? `${visibleMismatches.length} reviewed`
+        : `${pendingMismatchCount || visibleMismatches.length} open`
+      : `${displayDocuments.length} checked`;
   const splitAnalysisMeta = readSplitAnalysisMeta(detail?.case.processingMeta);
   const sellerChainRoleMeta = readSellerChainRoleSelectionMeta(detail?.case.processingMeta);
+  const packetPageCount = displayDocuments.reduce(
+    (total, document) => total + Math.max(1, document.pageCount || 1),
+    0
+  );
+  const headerInvoiceAmount = formatMoney(
+    displayDocuments
+      .map((document) => getInvoiceAmount(document))
+      .find((value): value is number => value !== null)
+  );
+  const currentDocumentIndex = activeDocument ? getDocumentIndexDetails(activeDocument) : null;
+  const caseStatusTone =
+    detail?.case.status === "accepted"
+      ? styles.statusAccepted
+      : detail?.case.status === "rejected"
+        ? styles.statusRejected
+        : visibleMismatches.length > 0
+          ? styles.statusReview
+          : styles.statusNeutral;
+  const reviewBarTone =
+    reviewSummary?.tone === "emerald"
+      ? styles.reviewBarGreen
+      : reviewSummary?.tone === "rose"
+        ? styles.reviewBarRed
+        : styles.reviewBarAmber;
+
+  const redesignedDetail = detail;
+  if (Boolean(redesignedDetail)) {
+    const detail = redesignedDetail as SavedCaseDetail;
+    const redesignedDocuments: RedesignedDocumentCard[] = displayDocuments.map((document) => {
+      const index = getDocumentIndexDetails(document);
+      const identifiers = [document.id, document.clientDocumentId, document.sourceHint, document.title]
+        .filter((value): value is string => Boolean(value));
+      const extractedFieldCount = Object.values(document.extractedFields || {}).filter(
+        (val) => val !== null && val !== undefined && String(val).trim() !== ""
+      ).length;
+      return {
+        id: document.id,
+        type: index.type,
+        fileName: index.fileName,
+        pageLabel: index.pageLabel,
+        pageCount: Math.max(1, document.pageCount || 1),
+        fieldCount: extractedFieldCount,
+        hasIssue: visibleMismatches.some((mismatch) =>
+          mismatch.values.some((entry) => Boolean(entry.docId && identifiers.includes(entry.docId)))
+        ),
+      };
+    });
+    const extractedDate = displayDocuments
+      .map((document) =>
+        ["invoiceDate", "poDate", "documentDate", "date"]
+          .map((key) => document.extractedFields[key])
+          .find((value) => typeof value === "string" && value.trim())
+      )
+      .find((value): value is string => typeof value === "string" && Boolean(value.trim()));
+    const createdDate = new Intl.DateTimeFormat("en-IN", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    }).format(new Date(detail.case.createdAt));
+    const uploadedLabel = `Uploaded ${new Intl.DateTimeFormat("en-IN", {
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date(detail.case.createdAt))}`;
+
+    const previewNode = activeFileUrl ? (
+      activeSourceIsImage ? (
+        <div className={styles.redesignPreviewScroller}>
+          <div
+            className={styles.redesignPreviewImageScale}
+            style={{ transform: `scale(${previewZoom})` }}
+          >
+            <Image
+              src={activeFileUrl}
+              alt={`Document preview page ${previewPageIndex + 1}`}
+              width={1200}
+              height={1600}
+              unoptimized
+              sizes="(min-width: 1100px) 64vw, 94vw"
+              className={styles.redesignPreviewImage}
+              draggable={false}
+            />
+          </div>
+        </div>
+      ) : (
+        <div className={styles.redesignPdfPreview}>
+          <PdfEvidencePreview
+            url={activeFileUrl}
+            pageNumber={activePdfPage}
+            zoom={previewZoom}
+            highlightText={previewFocus?.query}
+            highlightLabel={previewFocus?.label}
+            highlightOccurrence={previewFocus?.occurrence}
+            searchPageStart={activeDocumentSourcePage}
+            searchPageEnd={
+              activeDocumentSourcePage + Math.max(1, activeDocument?.pageCount || 1) - 1
+            }
+            onHighlightPageChange={setPreviewPdfPage}
+            onPageCountChange={setPreviewPdfPageCount}
+          />
+        </div>
+      )
+    ) : (
+      <div className={styles.redesignPreviewEmpty}>
+        {isPreviewUrlLoading ? <Loader2 className={styles.redesignSpinner} /> : <FileSearch />}
+        <strong>{isPreviewUrlLoading ? "Loading source preview…" : "Preview unavailable"}</strong>
+        <span>{previewUrlError || "The source file could not be opened for this document."}</span>
+      </div>
+    );
+
+    const stampCheckKeys = [
+      "hasAuthorizedSignature",
+      "hasVendorStamp",
+      "hasStoreStamp",
+      "hasStoreSignature",
+      "hasGateStamp",
+    ];
+
+    const extractedFieldItems: ExtractedFieldItem[] = (activeDocumentFieldEntries || []).map(
+      ([key, value]) => {
+        const currentValue = typeof value === "string" ? value : displayValue(value);
+        const fieldLabel = getDocumentFieldLabel(activeDocument?.documentType, key);
+        const hasMismatch = visibleMismatches.some((m) => m.fieldName === key);
+        return {
+          key,
+          label: fieldLabel,
+          value: currentValue || "Not detected",
+          hasMismatch,
+        };
+      }
+    );
+
+    if (activeDocument?.extractedFields) {
+      const existingKeySet = new Set(extractedFieldItems.map((f) => f.key));
+      for (const stampKey of stampCheckKeys) {
+        if (!existingKeySet.has(stampKey)) {
+          const rawVal = activeDocument.extractedFields[stampKey];
+          if (rawVal !== undefined && rawVal !== null && String(rawVal).trim() !== "") {
+            const isYes = rawVal === true || String(rawVal).toLowerCase() === "yes";
+            extractedFieldItems.push({
+              key: stampKey,
+              label: getDocumentFieldLabel(activeDocument.documentType, stampKey),
+              value: isYes ? "Yes" : "No",
+              hasMismatch: visibleMismatches.some((m) => m.fieldName === stampKey),
+            });
+          }
+        }
+      }
+    }
+
+    const stampBadgesNode = activeDocument?.extractedFields ? (
+      <>
+        <div
+          className={
+            activeDocument.extractedFields.hasStoreStamp === true ||
+            String(activeDocument.extractedFields.hasStoreStamp).toLowerCase() === "yes"
+              ? styles.stampBoxActive
+              : styles.stampBoxDashed
+          }
+        >
+          {activeDocument.extractedFields.hasStoreStamp === true ||
+          String(activeDocument.extractedFields.hasStoreStamp).toLowerCase() === "yes"
+            ? "STORE STAMP"
+            : "NO STORE STAMP"}
+        </div>
+        <div
+          className={
+            activeDocument.extractedFields.hasVendorStamp === true ||
+            String(activeDocument.extractedFields.hasVendorStamp).toLowerCase() === "yes"
+              ? styles.stampBoxActive
+              : styles.stampBoxDashed
+          }
+        >
+          {activeDocument.extractedFields.hasVendorStamp === true ||
+          String(activeDocument.extractedFields.hasVendorStamp).toLowerCase() === "yes"
+            ? "VENDOR STAMP"
+            : "NO VENDOR STAMP"}
+        </div>
+        <div
+          className={
+            activeDocument.extractedFields.hasGateStamp === true ||
+            String(activeDocument.extractedFields.hasGateStamp).toLowerCase() === "yes"
+              ? styles.stampBoxActive
+              : styles.stampBoxDashed
+          }
+        >
+          {activeDocument.extractedFields.hasGateStamp === true ||
+          String(activeDocument.extractedFields.hasGateStamp).toLowerCase() === "yes"
+            ? "GATE STAMP"
+            : "NO GATE STAMP"}
+        </div>
+      </>
+    ) : null;
+
+    const lineItemsDocumentTotal = formatMoney(activeDocument ? getInvoiceAmount(activeDocument) : null);
+    const lineItemsContent = (
+      <div className={styles.redesignDataContent}>
+        {lineItemsDocumentTotal ? (
+          <div className={styles.redesignLineSummary}>
+            <span>Document total</span>
+            <strong>{lineItemsDocumentTotal}</strong>
+          </div>
+        ) : null}
+        {activeDocumentLineItems.length > 0 ? (
+          <div className={styles.redesignLineTableWrap}>
+            <table className={styles.redesignLineTable}>
+              <thead><tr>{activeDocumentLineItemColumns.map((column) => <th key={column.key}>{column.label}</th>)}</tr></thead>
+              <tbody>
+                {activeDocumentLineItems.map((item, itemIndex) => {
+                  const lineLabel = `Line item ${item.lineNumber || itemIndex + 1}`;
+                  const lineQuery = item.rawText || item.description || item.itemCode || item.lineNumber || "";
+                  const linePageNumber = getLineItemPreviewPage(activeDocument, item);
+                  const focusId = `line-item-${activeDocument?.id || "document"}-${itemIndex}`;
+                  return (
+                    <tr
+                      key={`${item.lineNumber ?? itemIndex}-${item.description ?? item.rawText ?? ""}`}
+                      className={previewFocus?.id === focusId ? styles.redesignDataRowActive : undefined}
+                      tabIndex={0}
+                      onClick={() => handlePreviewFocus({ id: focusId, label: lineLabel, query: lineQuery, pageNumber: linePageNumber })}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          handlePreviewFocus({ id: focusId, label: lineLabel, query: lineQuery, pageNumber: linePageNumber });
+                        }
+                      }}
+                    >
+                      {activeDocumentLineItemColumns.map((column) => {
+                        const cellValue = column.key === "lineNumber"
+                          ? getLineItemValue(item, column.key) || String(itemIndex + 1)
+                          : getLineItemValue(item, column.key);
+                        return <td key={column.key}>{cellValue ? String(cellValue) : "—"}</td>;
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : <div className={styles.redesignDataEmpty}>No line-item table was extracted for this document.</div>}
+      </div>
+    );
+
+    const termsContent = (
+      <div className={styles.redesignDataContent}>
+        <div className={styles.redesignDataGroupLabel}>Purchase-order terms</div>
+        <div className={styles.redesignTermsList}>
+          {activeTermsChecklistRows.map((row) => (
+            <button
+              type="button"
+              key={row.key}
+              onClick={() => handlePreviewFocus({
+                id: `term-${activeDocument?.id || "document"}-${row.key}`,
+                label: row.label,
+                query: row.value,
+                pageNumber: activeDocumentSourcePage,
+              })}
+            >
+              <span><strong>{row.label}</strong><small>{row.value}</small></span>
+              <em className={row.issue ? styles.redesignTermIssue : styles.redesignTermClear}>
+                {row.issue ? "Needs review" : "Fulfilled"}
+              </em>
+            </button>
+          ))}
+          {unmatchedTermsIssues.map((issue) => (
+            <button
+              type="button"
+              key={issue.id}
+              onClick={() => handlePreviewFocus({
+                id: `term-issue-${issue.id}`,
+                label: "Terms review item",
+                query: issue.analysis || issue.fixPlan || getTermsIssueText(issue),
+                pageNumber: activeDocumentSourcePage,
+              })}
+            >
+              <span><strong>Review item</strong><small>{issue.analysis || issue.fixPlan || getTermsIssueText(issue)}</small></span>
+              <em className={styles.redesignTermIssue}>Needs review</em>
+            </button>
+          ))}
+          {activeTermsChecklistRows.length === 0 && unmatchedTermsIssues.length === 0 ? (
+            <div className={styles.redesignDataEmpty}>No purchase-order terms were extracted for this document.</div>
+          ) : null}
+        </div>
+      </div>
+    );
+
+    const dataNode = (
+      <ExtractedFieldsPanel
+        caseId={caseId}
+        fields={extractedFieldItems}
+        lineItemCount={activeDocumentLineItems.length}
+        activeFocusId={previewFocus?.id || null}
+        onFocusField={({ id, label, query }) =>
+          handlePreviewFocus({
+            id,
+            label,
+            query,
+            pageNumber: activeDocumentSourcePage,
+          })
+        }
+        activeDataView={activeDataView}
+        onDataViewChange={setActiveDataView}
+        termsCount={activeTermsChecklistRows.length + unmatchedTermsIssues.length}
+        hasFailureState={visibleMismatches.some((m) =>
+          m.values.some(
+            (entry) =>
+              entry.docId &&
+              [activeDocument?.id, activeDocument?.clientDocumentId].includes(entry.docId)
+          )
+        )}
+        lineItemsContent={lineItemsContent}
+        termsContent={termsContent}
+      />
+    );
+
+    const complianceContent = (
+      <div className={styles.redesignComplianceList}>
+        {activeTermsChecklistRows.length > 0 ? activeTermsChecklistRows.map((row) => (
+          <article key={row.key}>
+            <div><strong>{row.label}</strong><span className={row.issue ? styles.redesignComplianceIssue : styles.redesignComplianceClear}>
+              {row.issue ? <TriangleAlert /> : <CheckCircle2 />} {row.issue ? "Needs review" : "Fulfilled"}
+            </span></div>
+            <p>{row.value}</p>
+            {row.evidence ? <small>{row.evidence}</small> : null}
+          </article>
+        )) : <div className={styles.redesignDataEmpty}>Select a purchase order to review its compliance clauses.</div>}
+      </div>
+    );
+
+    const activityContent = (
+      <div className={styles.redesignActivityList}>
+        <article><i /><time>{uploadedLabel}</time><p><strong>Case created</strong> with {detail.files.length} uploaded file{detail.files.length === 1 ? "" : "s"}.</p></article>
+        <article><i /><time>{createdDate}</time><p><strong>Packet analyzed</strong> into {displayDocuments.length} classified document{displayDocuments.length === 1 ? "" : "s"}.</p></article>
+        <article><i /><time>Current</time><p><strong>Status: {getCaseStatusLabel(detail.case.status)}</strong>{visibleMismatches.length ? ` · ${visibleMismatches.length} mismatch${visibleMismatches.length === 1 ? "" : "es"} on record.` : " · no mismatches found."}</p></article>
+      </div>
+    );
+
+    return (
+      <AppShell defaultSidebarCollapsed>
+        <CaseDetailRedesign
+          caseId={caseId}
+          caseSlug={detail.case.slug}
+          caseName={detail.case.displayName}
+          parentName={detail.case.receiverName || detail.case.buyerName || "Procurement packet"}
+          poNumber={detail.case.poNumber}
+          invoiceNumber={detail.case.invoiceNumber}
+          dateLabel={extractedDate || createdDate}
+          amountLabel={headerInvoiceAmount}
+          uploadedLabel={uploadedLabel}
+          statusLabel={getCaseStatusLabel(detail.case.status)}
+          status={detail.case.status}
+          showActions={Boolean(showActions)}
+          decisionUpdating={decisionStatus === "updating"}
+          decisionError={decisionStatus === "error" ? decisionError : null}
+          onDecision={(decision) => void handleCaseDecision(decision)}
+          documents={redesignedDocuments}
+          activeDocumentId={activeDocumentId}
+          onSelectDocument={handleDocumentSelection}
+          mismatchCount={visibleMismatches.length}
+          canReviewTally={displayDocuments.some(isInvoiceDocument)}
+          pendingMismatchCount={pendingMismatchCount}
+          reviewTitle={reviewSummary?.title || "Packet review"}
+          reviewDescription={reviewSummary?.description || "Review the packet before deciding."}
+          complianceCount={activeTermsChecklistRows.length + unmatchedTermsIssues.length}
+          complianceContent={complianceContent}
+          activityContent={activityContent}
+          viewerMode={activeTab}
+          onViewerModeChange={setActiveTab}
+          sourceReference={currentDocumentIndex?.fileName || activeSourceLabel}
+          previewNode={previewNode}
+          dataNode={dataNode}
+          previewFocusLabel={previewFocus?.label}
+          onClearPreviewFocus={() => setPreviewFocus(null)}
+          canPreviousPage={canGoToPreviousPreviewPage}
+          canNextPage={canGoToNextPreviewPage}
+          showPageControls={activeSourceIsImage ? previewPageCount > 1 : previewPdfPageCount > 1}
+          pageLabel={activeSourceIsImage ? `${Math.min(previewPageIndex + 1, previewPageCount)} / ${previewPageCount}` : `${activePdfPage} / ${previewPdfPageCount}`}
+          onPreviousPage={() => {
+            setPreviewFocus(null);
+            if (activeSourceIsImage) setPreviewPageIndex((current) => Math.max(0, current - 1));
+            else setPreviewPdfPage(Math.max(1, activePdfPage - 1));
+          }}
+          onNextPage={() => {
+            setPreviewFocus(null);
+            if (activeSourceIsImage) setPreviewPageIndex((current) => Math.min(Math.max(activeDocumentFiles.length - 1, 0), current + 1));
+            else setPreviewPdfPage(Math.min(previewPdfPageCount, activePdfPage + 1));
+          }}
+          zoom={previewZoom}
+          canZoomOut={canZoomOut}
+          canZoomIn={canZoomIn}
+          onZoomOut={() => setPreviewZoom((current) => Math.max(0.75, Number((current - 0.25).toFixed(2))))}
+          onZoomIn={() => setPreviewZoom((current) => Math.min(3, Number((current + 0.25).toFixed(2))))}
+          onResetZoom={() => setPreviewZoom(DEFAULT_PREVIEW_ZOOM)}
+          stampBadgesNode={stampBadgesNode}
+        />
+
+        <AnalysisOptionsDialog
+          open={analysisOptionsOpen}
+          onOpenChange={setAnalysisOptionsOpen}
+          onSelect={(nextOptions) => {
+            setAnalysisOptionsOpen(false);
+            void handleAnalyzeDraftCase(nextOptions, pendingAnalysisMode);
+          }}
+        />
+
+        <Dialog open={isTallyReviewOpen} onOpenChange={setIsTallyReviewOpen}>
+          <DialogContent className={styles.tallyReviewDialog}>
+            <DialogHeader className={styles.tallyReviewDialogHeader}>
+              <DialogTitle className={styles.tallyReviewDialogTitle}>Approved case · Tally review</DialogTitle>
+              <DialogDescription className={styles.tallyReviewDialogDescription}>
+                Review the prepared Purchase voucher and posting status without leaving the case workspace.
+              </DialogDescription>
+            </DialogHeader>
+            <div className={styles.tallyReviewDialogBody}>
+              {isTallyReviewOpen ? (
+                <TallyInReviewPanel
+                  caseId={caseId}
+                  onViewOriginal={(documentId) => {
+                    setActiveDocumentId(documentId);
+                    setActiveTab("preview");
+                    setIsTallyReviewOpen(false);
+                  }}
+                />
+              ) : null}
+            </div>
+          </DialogContent>
+        </Dialog>
+      </AppShell>
+    );
+  }
 
   return (
-    <AppShell>
+    <AppShell defaultSidebarCollapsed>
       <div
-        className={`relative flex min-h-[calc(100vh-4rem)] flex-1 flex-col overflow-hidden bg-[#fafafa] tracking-normal animate-in fade-in duration-300 ${
-          showActions ? "pb-28 md:pb-0" : ""
-        }`}
+        className={`${styles.page} animate-in fade-in duration-300`}
       >
 
         {/* Top Navigation Bar */}
-        <header className="flex h-14 sm:h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-3 sm:px-6 z-20 relative">
-          <div className="flex items-center gap-2 sm:gap-4 min-w-0 flex-1">
-            <Link href="/cases" className="flex items-center justify-center h-8 w-8 rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-100 transition-colors shrink-0">
-              <ArrowLeft className="h-4 w-4 sm:h-5 w-5" />
-            </Link>
-            <div className="w-px h-6 bg-slate-200 shrink-0"></div>
-            <div className="min-w-0 flex flex-col justify-center">
-              <h1 className="text-xs sm:text-base font-medium text-slate-900 truncate">
+        <header className={styles.header}>
+          <Link href="/cases" className={styles.backButton} aria-label="Back to cases">
+            <ArrowLeft className="h-4 w-4" />
+          </Link>
+          <div className={styles.breadcrumb}>
+            <span className={styles.breadcrumbParent}>
+              {detail?.case.receiverName || detail?.case.buyerName || "Cases"}
+            </span>
+            <span className={styles.breadcrumbSeparator}>/</span>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <h1 className={styles.breadcrumbCurrent} tabIndex={0}>
+                  {detail?.case.displayName}
+                </h1>
+              </TooltipTrigger>
+              <TooltipContent
+                side="bottom"
+                align="start"
+                sideOffset={8}
+                className={styles.breadcrumbTooltip}
+              >
                 {detail?.case.displayName}
-              </h1>
-            </div>
+              </TooltipContent>
+            </Tooltip>
           </div>
+          <div className={styles.headerSpacer} />
+          <div className={styles.headerMeta}>
+            {[headerInvoiceAmount, `${displayDocuments.length} documents`, `${packetPageCount} pages`]
+              .filter(Boolean)
+              .join(" · ")}
+          </div>
+          <div className={`${styles.statusPill} ${caseStatusTone}`}>
+            <span className={styles.statusDot} />
+            {getCaseStatusLabel(detail?.case.status || "")}
+          </div>
+          {showActions ? (
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                className={`${styles.headerAction} ${styles.rejectAction}`}
+                disabled={decisionStatus === "updating"}
+                onClick={() => handleCaseDecision("rejected")}
+              >
+                Reject
+              </Button>
+              <Button
+                size="sm"
+                className={`${styles.headerAction} ${styles.acceptAction}`}
+                disabled={decisionStatus === "updating"}
+                onClick={() => handleCaseDecision("accepted")}
+              >
+                {decisionStatus === "updating" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                Accept case
+              </Button>
+            </>
+          ) : null}
+        </header>
 
-          {/* Action Area (Desktop) */}
-          <div className="hidden md:flex items-center gap-3 shrink-0">
-            <Badge variant="outline" className={`rounded-full px-3 py-1 text-xs font-medium uppercase tracking-wider ${getCaseStatusClassName(detail?.case.status || "")}`}>
-              {getCaseStatusLabel(detail?.case.status || "")}
-            </Badge>
-            {showActions ? (
-              <>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="text-rose-600 hover:bg-rose-50 hover:text-rose-700 border-slate-200 shadow-sm transition-colors"
-                  disabled={decisionStatus === "updating"}
-                  onClick={() => handleCaseDecision("rejected")}
+        {decisionStatus === "error" && decisionError ? (
+          <div className={styles.decisionError}>{decisionError}</div>
+        ) : null}
+
+        {(splitAnalysisMeta || sellerChainRoleMeta) && (
+          <div className={styles.noticeStack}>
+            {splitAnalysisMeta ? (
+              <div className={styles.contextNotice}>
+                <Sparkles className={styles.contextNoticeIcon} />
+                <div className={styles.contextNoticeBody}>
+                  <div className={styles.contextNoticeTitle}>{splitAnalysisMeta.note}</div>
+                  <div className={styles.contextNoticeMeta}>
+                    Case {splitAnalysisMeta.groupIndex} of {splitAnalysisMeta.groupCount}
+                    {splitAnalysisMeta.sourceFileNames.length
+                      ? ` · ${splitAnalysisMeta.sourceFileNames.join(", ")}`
+                      : ""}
+                  </div>
+                </div>
+                {splitAnalysisMeta.siblingCases.length > 0 ? (
+                  <div className={styles.siblingLinks}>
+                    {splitAnalysisMeta.siblingCases.map((sibling) => (
+                      <Link key={sibling.id} href={`/cases/${sibling.id}`} className={styles.siblingLink}>
+                        Case {sibling.groupIndex}
+                      </Link>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            {sellerChainRoleMeta ? (
+              <div className={`${styles.contextNotice} ${styles.contextNoticeAmber}`}>
+                <ShieldAlert className={styles.contextNoticeIcon} />
+                <div className={styles.contextNoticeBody}>
+                  <div className={styles.contextNoticeTitle}>{sellerChainRoleMeta.note}</div>
+                  <div className={styles.contextNoticeMeta}>
+                    {sellerChainRoleMeta.primaryDocumentIds.length} reconciliation ·{" "}
+                    {sellerChainRoleMeta.contextDocumentIds.length} context
+                  </div>
+                </div>
+              </div>
+            ) : null}
+          </div>
+        )}
+
+        {reviewSummary ? (
+          <div className={`${styles.reviewBar} ${reviewBarTone}`}>
+            <span className={styles.severityDot} />
+            <div className={styles.reviewCopy}>
+              <div className={styles.reviewTitle}>{reviewSummary.title}</div>
+              <div className={styles.reviewDescription}>
+                {reviewSummary.description} {reviewSummary.actionHint}
+              </div>
+            </div>
+            <span className={styles.reviewCount}>{reviewCountLabel}</span>
+            <div className={styles.reviewActions}>
+              {reviewSummary.action === "review" ? (
+                <Link
+                  href={mismatchReviewHref}
+                  prefetch
+                  className={styles.reviewButton}
+                  aria-label={isMismatchNavigationPending ? "Opening mismatch review" : "Review mismatches"}
+                  onPointerEnter={prepareMismatchNavigation}
+                  onFocus={prepareMismatchNavigation}
+                  onClick={beginMismatchNavigation}
                 >
-                  <X className="h-4 w-4 mr-1.5" />
-                  Reject
-                </Button>
-                <Button
-                  size="sm"
-                  className="bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm transition-colors"
+                  {isMismatchNavigationPending ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Opening review…
+                    </>
+                  ) : (
+                    <>
+                      Review mismatches
+                      <span className={styles.mono}>{visibleMismatches.length}</span>
+                    </>
+                  )}
+                </Link>
+              ) : reviewSummary.action === "approve" && showActions ? (
+                <button
+                  type="button"
+                  className={styles.reviewButton}
                   disabled={decisionStatus === "updating"}
                   onClick={() => handleCaseDecision("accepted")}
                 >
-                  {decisionStatus === "updating" ? (
-                    <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
-                  ) : (
-                    <Check className="h-4 w-4 mr-1.5" />
-                  )}
-                  Accept Case
-                </Button>
-              </>
-            ) : null}
+                  Approve case
+                </button>
+              ) : reviewSummary.action === "retry" ? (
+                <button
+                  type="button"
+                  className={styles.reviewButton}
+                  onClick={() => {
+                    setPendingAnalysisMode("standard");
+                    setAnalysisOptionsOpen(true);
+                  }}
+                >
+                  Retry analysis
+                </button>
+              ) : null}
+              {detail?.case.status === "accepted" ? (
+                <button
+                  type="button"
+                  className={`${styles.reviewButton} ${styles.tallyReviewButton}`}
+                  onClick={() => setIsTallyReviewOpen(true)}
+                >
+                  <Database aria-hidden="true" />
+                  Tally review
+                </button>
+              ) : null}
+            </div>
           </div>
+        ) : null}
 
-          {/* Mobile Status Badge fallback */}
-          <div className="md:hidden shrink-0 ml-2">
-            <Badge variant="outline" className={`rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${getCaseStatusClassName(detail?.case.status || "")}`}>
-              {getCaseStatusLabel(detail?.case.status || "")}
-            </Badge>
+        <section className={styles.packetStrip} aria-label="Documents in packet">
+          <div className={styles.packetStripLabel}>
+            Documents in packet <span>· {displayDocuments.length}</span>
           </div>
-        </header>
+          <div className={styles.packetCards}>
+            {displayDocuments.map((doc) => {
+              const isActive = activeDocumentId === doc.id;
+              const documentIndex = getDocumentIndexDetails(doc);
+              const documentIdentifiers = [doc.id, doc.clientDocumentId, doc.sourceHint, doc.title]
+                .filter((value): value is string => Boolean(value));
+              const hasIssue = visibleMismatches.some((mismatch) =>
+                mismatch.values.some(
+                  (entry) => entry.docId && documentIdentifiers.includes(entry.docId)
+                )
+              );
 
-        {decisionStatus === "error" && decisionError && (
-          <div className="bg-red-50 text-red-600 text-xs sm:text-sm p-3 text-center border-b border-red-100 font-medium z-10 relative shrink-0">
-            {decisionError}
+              return (
+                <button
+                  key={doc.id}
+                  type="button"
+                  className={`${styles.packetCard} ${isActive ? styles.packetCardActive : ""}`}
+                  onClick={() => handleDocumentSelection(doc.id)}
+                  aria-pressed={isActive}
+                >
+                  <span className={styles.packetCardTopline}>
+                    <span className={styles.pageBadge}>{documentIndex.pageLabel}</span>
+                    <span
+                      className={`${styles.documentStateDot} ${hasIssue ? styles.documentStateDotIssue : ""}`}
+                      aria-label={hasIssue ? "Has mismatch" : "Checked"}
+                    />
+                  </span>
+                  <span className={styles.packetCardName}>{documentIndex.type}</span>
+                  <span className={styles.packetCardMeta} title={documentIndex.fileName}>
+                    {documentIndex.fileName}
+                  </span>
+                </button>
+              );
+            })}
           </div>
-        )}
+        </section>
 
-        {splitAnalysisMeta && (
-          <div className="relative z-10 shrink-0 border-b border-indigo-100 bg-indigo-50 px-4 py-3 text-indigo-950 sm:px-6">
-            <div className="mx-auto flex max-w-7xl flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex min-w-0 items-start gap-3">
-                <div className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-indigo-100 bg-white text-indigo-600 shadow-sm">
-                  <Sparkles className="h-4 w-4" />
-                </div>
-                <div className="min-w-0">
-                  <p className="text-sm font-medium leading-5">
-                    {splitAnalysisMeta.note}
-                  </p>
-                  <p className="mt-0.5 text-xs font-medium text-indigo-700">
-                    Case {splitAnalysisMeta.groupIndex} of {splitAnalysisMeta.groupCount}
-                    {splitAnalysisMeta.sourceFileNames.length
-                      ? ` from ${splitAnalysisMeta.sourceFileNames.join(", ")}`
-                      : ""}
-                  </p>
-                </div>
+        {/* Desktop review workspace: source document and extracted data stay visible together. */}
+        <div
+          ref={desktopWorkspaceRef}
+          className={`${styles.workspace} ${styles.desktopWorkspace} ${isPaneResizing ? styles.workspaceResizing : ""}`}
+          style={{ "--data-pane-width": `${dataPaneWidth}px` } as CSSProperties}
+        >
+          <main className={styles.viewerPane}>
+            <div className={styles.viewerToolbar}>
+              <span className={styles.viewerTitle}>{currentDocumentIndex?.type || "Document preview"}</span>
+              <span className={styles.viewerSource} title={currentDocumentIndex?.fileName}>
+                {currentDocumentIndex?.fileName || activeSourceLabel}
+              </span>
+              {previewFocus ? (
+                <button
+                  type="button"
+                  className={styles.focusChip}
+                  onClick={() => setPreviewFocus(null)}
+                  title="Clear preview highlight"
+                >
+                  <span className={styles.focusChipDot} />
+                  {previewFocus.label}
+                  <X className="h-3 w-3" />
+                </button>
+              ) : null}
+              <span className={styles.toolbarDivider} />
+              <div className={styles.pageControls} aria-label="Page controls">
+                <button
+                  type="button"
+                  className={styles.toolButton}
+                  disabled={!canGoToPreviousPreviewPage}
+                  onClick={() => {
+                    setPreviewFocus(null);
+                    if (activeSourceIsImage) {
+                      setPreviewPageIndex((current) => Math.max(0, current - 1));
+                    } else {
+                      setPreviewPdfPage(Math.max(1, activePdfPage - 1));
+                    }
+                  }}
+                  aria-label="Previous page"
+                >
+                  <ChevronLeft className="h-3.5 w-3.5" />
+                </button>
+                <span className={styles.pageCounter}>
+                  {activeSourceIsImage
+                    ? `${Math.min(previewPageIndex + 1, previewPageCount)} / ${previewPageCount}`
+                    : `${activePdfPage} / ${previewPdfPageCount}`}
+                </span>
+                <button
+                  type="button"
+                  className={styles.toolButton}
+                  disabled={!canGoToNextPreviewPage}
+                  onClick={() => {
+                    setPreviewFocus(null);
+                    if (activeSourceIsImage) {
+                      setPreviewPageIndex((current) =>
+                        Math.min(Math.max(activeDocumentFiles.length - 1, 0), current + 1)
+                      );
+                    } else {
+                      setPreviewPdfPage(Math.min(previewPdfPageCount, activePdfPage + 1));
+                    }
+                  }}
+                  aria-label="Next page"
+                >
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </button>
               </div>
-              {splitAnalysisMeta.siblingCases.length > 0 && (
-                <div className="flex flex-wrap gap-2 pl-11 sm:justify-end sm:pl-0">
-                  {splitAnalysisMeta.siblingCases.map((sibling) => (
-                    <Button
-                      key={sibling.id}
-                      asChild
-                      size="sm"
-                      variant="outline"
-                      className="h-8 rounded-lg border-indigo-200 bg-white px-3 text-xs font-medium text-indigo-700 hover:bg-indigo-100 hover:text-indigo-800"
-                    >
-                      <Link href={`/cases/${sibling.id}`}>
-                        Case {sibling.groupIndex}
-                      </Link>
-                    </Button>
-                  ))}
+              <div className={styles.zoomControls} aria-label="Zoom controls">
+                <button
+                  type="button"
+                  className={styles.toolButton}
+                  disabled={!canZoomOut}
+                  onClick={() =>
+                    setPreviewZoom((current) => Math.max(0.75, Number((current - 0.25).toFixed(2))))
+                  }
+                  aria-label="Zoom out"
+                >
+                  <ZoomOut className="h-3.5 w-3.5" />
+                </button>
+                <span className={styles.zoomLabel}>{Math.round(previewZoom * 100)}%</span>
+                <button
+                  type="button"
+                  className={styles.toolButton}
+                  disabled={!canZoomIn}
+                  onClick={() =>
+                    setPreviewZoom((current) => Math.min(3, Number((current + 0.25).toFixed(2))))
+                  }
+                  aria-label="Zoom in"
+                >
+                  <ZoomIn className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  className={styles.toolButton}
+                  disabled={!activeFileUrl || previewZoom === DEFAULT_PREVIEW_ZOOM}
+                  onClick={() => setPreviewZoom(DEFAULT_PREVIEW_ZOOM)}
+                  aria-label="Reset zoom"
+                >
+                  <RotateCw className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+
+            <div className={styles.viewerCanvas}>
+              {activeFileUrl ? (
+                activeSourceIsImage ? (
+                  <div className={styles.previewScroller}>
+                    <div className={styles.previewImageWrap}>
+                      <div
+                        className={styles.previewImageScale}
+                        style={{ transform: `scale(${previewZoom})` }}
+                      >
+                        <Image
+                          src={activeFileUrl}
+                          alt={`Document preview page ${previewPageIndex + 1}`}
+                          width={1200}
+                          height={1600}
+                          unoptimized
+                          sizes="(min-width: 1240px) 50vw, 44vw"
+                          className={styles.previewImage}
+                          draggable={false}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <PdfEvidencePreview
+                    url={activeFileUrl}
+                    pageNumber={activePdfPage}
+                    zoom={previewZoom}
+                    highlightText={previewFocus?.query}
+                    highlightLabel={previewFocus?.label}
+                    highlightOccurrence={previewFocus?.occurrence}
+                    searchPageStart={activeDocumentSourcePage}
+                    searchPageEnd={
+                      activeDocumentSourcePage + Math.max(1, activeDocument?.pageCount || 1) - 1
+                    }
+                    onHighlightPageChange={setPreviewPdfPage}
+                    onPageCountChange={setPreviewPdfPageCount}
+                  />
+                )
+              ) : (
+                <div className={styles.previewEmpty}>
+                  <div className={styles.previewEmptyInner}>
+                    {isPreviewUrlLoading ? (
+                      <Loader2 className="h-8 w-8 animate-spin opacity-60" />
+                    ) : (
+                      <FileSearch className="h-8 w-8 opacity-50" />
+                    )}
+                    <span>
+                      {isPreviewUrlLoading
+                        ? "Loading source preview…"
+                        : previewUrlError || "Source preview is not available for this document."}
+                    </span>
+                  </div>
                 </div>
               )}
             </div>
-          </div>
-        )}
+          </main>
 
-        {sellerChainRoleMeta && (
-          <div className="relative z-10 shrink-0 border-b border-amber-100 bg-amber-50 px-4 py-3 text-amber-950 sm:px-6">
-            <div className="mx-auto flex max-w-7xl items-start gap-3">
-              <div className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-amber-100 bg-white text-amber-600 shadow-sm">
-                <ShieldAlert className="h-4 w-4" />
-              </div>
-              <div className="min-w-0">
-                <p className="text-sm font-medium leading-5">
-                  {sellerChainRoleMeta.note}
-                </p>
-                <p className="mt-0.5 text-xs font-medium text-amber-700">
-                  {sellerChainRoleMeta.primaryDocumentIds.length} reconciliation document
-                  {sellerChainRoleMeta.primaryDocumentIds.length === 1 ? "" : "s"};{" "}
-                  {sellerChainRoleMeta.contextDocumentIds.length} context document
-                  {sellerChainRoleMeta.contextDocumentIds.length === 1 ? "" : "s"}
-                </p>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Mobile AI Alert Banner (Extremely Compact) */}
-        {reviewSummary && (visibleMismatches.length > 0 || detail?.case.status === "accepted" || detail?.case.status === "rejected") && (
-          <div
-            className={`md:hidden border-b py-2.5 px-4 flex items-center justify-between shrink-0 z-10 relative ${
-              reviewSummary.tone === "emerald"
-                ? "bg-emerald-50 border-emerald-100"
-                : reviewSummary.tone === "amber"
-                  ? "bg-amber-50 border-amber-100"
-                  : "bg-rose-50 border-rose-100"
-            }`}
+          <button
+            type="button"
+            role="separator"
+            className={styles.paneResizeHandle}
+            aria-label="Resize PDF preview and extracted data panels"
+            aria-orientation="vertical"
+            aria-valuemin={MIN_DATA_PANE_WIDTH}
+            aria-valuemax={getDataPaneWidthBounds().max}
+            aria-valuenow={dataPaneWidth}
+            title="Drag to resize · Double-click to reset"
+            onPointerDown={handlePaneResizeStart}
+            onPointerMove={handlePaneResizeMove}
+            onPointerUp={handlePaneResizeEnd}
+            onPointerCancel={handlePaneResizeEnd}
+            onDoubleClick={() => resizeDataPane(DEFAULT_DATA_PANE_WIDTH)}
+            onKeyDown={handlePaneResizeKeyDown}
           >
-            <div className="flex items-center gap-2.5 min-w-0">
-              <div
-                className={`p-1 rounded-full shrink-0 ${
-                  reviewSummary.tone === "emerald"
-                    ? "bg-emerald-100"
-                    : reviewSummary.tone === "amber"
-                      ? "bg-amber-100"
-                      : "bg-rose-100"
-                }`}
+            <GripVertical aria-hidden="true" />
+          </button>
+
+          <aside className={styles.dataPane} aria-label="Extracted document data">
+            <div className={styles.dataTabs} role="tablist" aria-label="Extracted data views">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeDataView === "fields"}
+                className={`${styles.dataTab} ${activeDataView === "fields" ? styles.dataTabActive : ""}`}
+                onClick={() => setActiveDataView("fields")}
               >
-                {reviewSummary.tone === "emerald" ? (
-                  <CheckCircle2 className="h-4 w-4 text-emerald-600" />
-                ) : (
-                  <TriangleAlert
-                    className={`h-4 w-4 ${
-                      reviewSummary.tone === "amber" ? "text-amber-600" : "text-rose-600"
-                    }`}
-                  />
-                )}
-              </div>
-              <h3
-                className={`text-[11px] font-medium uppercase tracking-tight ${
-                  reviewSummary.tone === "emerald"
-                    ? "text-emerald-900"
-                    : reviewSummary.tone === "amber"
-                      ? "text-amber-900"
-                      : "text-rose-900"
-                }`}
+                Fields <span className={styles.dataTabCount}>{activeDocumentFieldEntries.length}</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeDataView === "lineItems"}
+                className={`${styles.dataTab} ${activeDataView === "lineItems" ? styles.dataTabActive : ""}`}
+                onClick={() => setActiveDataView("lineItems")}
               >
-                {reviewSummary.title}
-              </h3>
+                Line items <span className={styles.dataTabCount}>{activeDocumentLineItems.length}</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeDataView === "terms"}
+                className={`${styles.dataTab} ${activeDataView === "terms" ? styles.dataTabActive : ""}`}
+                onClick={() => setActiveDataView("terms")}
+              >
+                PO terms{" "}
+                <span className={styles.dataTabCount}>
+                  {activeTermsChecklistRows.length + unmatchedTermsIssues.length}
+                </span>
+              </button>
             </div>
-            {reviewSummary.buttonLabel ? (
-              <Button
-                asChild
-                size="sm"
-                variant="ghost"
-                className={`h-8 text-[10px] text-white rounded-lg px-4 shrink-0 font-medium uppercase tracking-wider shadow-sm ${
-                  reviewSummary.tone === "emerald"
-                    ? "bg-emerald-600 hover:bg-emerald-700"
-                    : reviewSummary.tone === "amber"
-                      ? "bg-amber-600 hover:bg-amber-700"
-                      : "bg-rose-600 hover:bg-rose-700"
-                }`}
-              >
-                <Link href={`/cases/${caseId}/mismatches`}>Review</Link>
-              </Button>
-            ) : null}
-          </div>
-        )}
+
+            <div className={styles.dataBody}>
+              {activeDataView === "fields" ? (
+                <>
+                  <div className={styles.dataHint}>
+                    <Eye className="h-3.5 w-3.5" /> Values extracted from the selected document
+                  </div>
+                  <div className={styles.dataGroupLabel}>{currentDocumentIndex?.type || "Document"}</div>
+                  {activeDocumentFieldEntries.length > 0 ? (
+                    activeDocumentFieldEntries.map(([key, value]) => {
+                      const currentValue = typeof value === "string" ? value : displayValue(value);
+                      const fieldLabel = getDocumentFieldLabel(activeDocument?.documentType, key);
+                      const focusId = `field-${activeDocument?.id || "document"}-${key}`;
+                      return (
+                        <button
+                          key={key}
+                          type="button"
+                          className={`${styles.fieldRow} ${previewFocus?.id === focusId ? styles.dataRowActive : ""}`}
+                          onClick={() =>
+                            handlePreviewFocus({
+                              id: focusId,
+                              label: fieldLabel,
+                              query: currentValue,
+                              pageNumber: activeDocumentSourcePage,
+                            })
+                          }
+                        >
+                          <div className={styles.fieldKey}>
+                            {fieldLabel}
+                          </div>
+                          <div className={styles.fieldValue}>
+                            {currentValue || <span className={styles.emptyValue}>Not detected</span>}
+                          </div>
+                        </button>
+                      );
+                    })
+                  ) : (
+                    <div className={styles.emptyState}>No scalar fields were extracted for this document.</div>
+                  )}
+                </>
+              ) : null}
+
+              {activeDataView === "lineItems" ? (
+                <>
+                  <div className={styles.lineSummary}>
+                    <div className={styles.lineSummaryItem}>
+                      <div className={styles.lineSummaryLabel}>Rows</div>
+                      <div className={styles.lineSummaryValue}>{activeDocumentLineItems.length}</div>
+                    </div>
+                    <div className={styles.lineSummaryItem}>
+                      <div className={styles.lineSummaryLabel}>Document total</div>
+                      <div className={styles.lineSummaryValue}>
+                        {formatMoney(activeDocument ? getInvoiceAmount(activeDocument) : null) || "—"}
+                      </div>
+                    </div>
+                  </div>
+                  {activeDocumentLineItems.length > 0 ? (
+                    <div className={styles.lineTableWrap}>
+                      <table className={styles.lineTable}>
+                        <thead>
+                          <tr>
+                            {activeDocumentLineItemColumns.map((column) => (
+                              <th key={column.key}>{column.label}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {activeDocumentLineItems.map((item, itemIndex) => {
+                            const focusPrefix = `line-item-${activeDocument?.id || "document"}-${itemIndex}`;
+                            const focusId = `${focusPrefix}-row`;
+                            const lineLabel = `Line item ${item.lineNumber || itemIndex + 1}`;
+                            const lineQuery =
+                              item.rawText || item.description || item.itemCode || item.lineNumber || "";
+                            const linePageNumber = getLineItemPreviewPage(activeDocument, item);
+                            const normalizedLineQuery = normalizeEvidenceValue(lineQuery);
+                            const lineOccurrence = activeDocumentLineItems
+                              .slice(0, itemIndex)
+                              .filter(
+                                (previousItem) =>
+                                  getLineItemPreviewPage(activeDocument, previousItem) === linePageNumber &&
+                                  normalizeEvidenceValue(
+                                    previousItem.rawText ||
+                                      previousItem.description ||
+                                      previousItem.itemCode ||
+                                      previousItem.lineNumber ||
+                                      ""
+                                  ) === normalizedLineQuery
+                              ).length;
+                            const selectLineItem = () =>
+                              handlePreviewFocus({
+                                id: focusId,
+                                label: lineLabel,
+                                query: lineQuery,
+                                pageNumber: linePageNumber,
+                                occurrence: lineOccurrence,
+                              });
+
+                            return (
+                              <tr
+                                key={`${item.lineNumber ?? itemIndex}-${item.description ?? item.rawText ?? ""}`}
+                                className={previewFocus?.id.startsWith(focusPrefix) ? styles.dataRowActive : undefined}
+                                role="button"
+                                tabIndex={0}
+                                onClick={selectLineItem}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter" || event.key === " ") {
+                                    event.preventDefault();
+                                    selectLineItem();
+                                  }
+                                }}
+                              >
+                                {activeDocumentLineItemColumns.map((column) => {
+                                  const value =
+                                    column.key === "lineNumber"
+                                      ? getLineItemValue(item, column.key) || String(itemIndex + 1)
+                                      : getLineItemValue(item, column.key);
+                                  const displayText = value ? String(value) : "—";
+                                  const cellQuery =
+                                    column.key === "lineNumber"
+                                      ? item.itemCode || item.description || displayText
+                                      : value
+                                        ? String(value)
+                                        : "";
+                                  const cellFocusId = `${focusPrefix}-${column.key}`;
+                                  const normalizedCellQuery = normalizeEvidenceValue(cellQuery);
+                                  const cellOccurrence = activeDocumentLineItems
+                                    .slice(0, itemIndex)
+                                    .filter((previousItem) => {
+                                      if (
+                                        getLineItemPreviewPage(activeDocument, previousItem) !== linePageNumber
+                                      ) {
+                                        return false;
+                                      }
+                                      const previousValue =
+                                        column.key === "lineNumber"
+                                          ? previousItem.itemCode || previousItem.description || ""
+                                          : getLineItemValue(previousItem, column.key);
+                                      return normalizeEvidenceValue(previousValue) === normalizedCellQuery;
+                                    }).length;
+                                  const selectCell = () =>
+                                    handlePreviewFocus({
+                                      id: cellFocusId,
+                                      label: `${column.label} · ${lineLabel}`,
+                                      query: cellQuery,
+                                      pageNumber: linePageNumber,
+                                      occurrence: cellOccurrence,
+                                    });
+
+                                  return (
+                                    <td
+                                      key={column.key}
+                                      className={previewFocus?.id === cellFocusId ? styles.lineCellActive : undefined}
+                                      role="button"
+                                      tabIndex={0}
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        selectCell();
+                                      }}
+                                      onKeyDown={(event) => {
+                                        if (event.key === "Enter" || event.key === " ") {
+                                          event.preventDefault();
+                                          event.stopPropagation();
+                                          selectCell();
+                                        }
+                                      }}
+                                    >
+                                      {displayText}
+                                    </td>
+                                  );
+                                })}
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className={styles.emptyState}>No line-item table was extracted for this document.</div>
+                  )}
+                </>
+              ) : null}
+
+              {activeDataView === "terms" ? (
+                <>
+                  <div className={styles.termsSummary}>
+                    <div>
+                      <div className={styles.termsSummaryTitle}>Terms compliance</div>
+                      <div className={styles.termsSummaryCopy}>
+                        {activeTermsChecklistRows.length} extracted clause
+                        {activeTermsChecklistRows.length === 1 ? "" : "s"}
+                      </div>
+                    </div>
+                    <span
+                      className={`${styles.termsStatus} ${activeTermsIssues.length > 0 ? styles.termsStatusIssue : ""}`}
+                    >
+                      {activeTermsIssues.length > 0 ? (
+                        <TriangleAlert className="h-3 w-3" />
+                      ) : (
+                        <CheckCircle2 className="h-3 w-3" />
+                      )}
+                      {activeTermsIssues.length > 0 ? `${activeTermsIssues.length} flagged` : "Clear"}
+                    </span>
+                  </div>
+
+                  {activeTermsChecklistRows.map((row) => {
+                    const StatusIcon = row.status.icon;
+                    const focusId = `term-${activeDocument?.id || "document"}-${row.key}`;
+                    return (
+                      <div
+                        key={row.key}
+                        className={`${styles.termRow} ${previewFocus?.id === focusId ? styles.dataRowActive : ""}`}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() =>
+                          handlePreviewFocus({
+                            id: focusId,
+                            label: row.label,
+                            query: row.value,
+                            pageNumber: activeDocumentSourcePage,
+                          })
+                        }
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            handlePreviewFocus({
+                              id: focusId,
+                              label: row.label,
+                              query: row.value,
+                              pageNumber: activeDocumentSourcePage,
+                            });
+                          }
+                        }}
+                      >
+                        <div className={styles.termHeader}>
+                          <div className={styles.termCategory}>{row.label}</div>
+                          <span className={`${styles.termBadge} ${row.status.className}`}>
+                            <StatusIcon className="h-3 w-3" /> {row.status.label}
+                          </span>
+                        </div>
+                        <div className={styles.termText}>{row.value}</div>
+                        {row.detail ? <div className={styles.termDetail}>{row.detail}</div> : null}
+                        {row.evidence ? <div className={styles.termEvidence}>{row.evidence}</div> : null}
+                        {row.issue?.analysis ? <div className={styles.termIssue}>{row.issue.analysis}</div> : null}
+                      </div>
+                    );
+                  })}
+
+                  {unmatchedTermsIssues.map((issue) => {
+                    const status = getTermsIssueStatus(issue);
+                    const StatusIcon = status.icon;
+                    const focusId = `term-issue-${activeDocument?.id || "document"}-${issue.id}`;
+                    const issueText =
+                      issue.analysis || issue.fixPlan || getTermsIssueText(issue) || "Terms issue requires review.";
+                    const issueQuery =
+                      issue.values
+                        .map((entry) => String(entry.value ?? "").trim())
+                        .find(Boolean) || issueText;
+                    const selectIssue = () =>
+                      handlePreviewFocus({
+                        id: focusId,
+                        label: "Terms review item",
+                        query: issueQuery,
+                        pageNumber: activeDocumentSourcePage,
+                      });
+                    return (
+                      <div
+                        key={issue.id}
+                        className={`${styles.termRow} ${previewFocus?.id === focusId ? styles.dataRowActive : ""}`}
+                        role="button"
+                        tabIndex={0}
+                        onClick={selectIssue}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            selectIssue();
+                          }
+                        }}
+                      >
+                        <div className={styles.termHeader}>
+                          <div className={styles.termCategory}>Review item</div>
+                          <span className={`${styles.termBadge} ${status.className}`}>
+                            <StatusIcon className="h-3 w-3" /> {status.label}
+                          </span>
+                        </div>
+                        <div className={styles.termText}>{issueText}</div>
+                      </div>
+                    );
+                  })}
+
+                  {activeTermsChecklistRows.length === 0 && unmatchedTermsIssues.length === 0 ? (
+                    <div className={styles.emptyState}>No purchase-order terms were extracted for this document.</div>
+                  ) : null}
+                </>
+              ) : null}
+            </div>
+          </aside>
+        </div>
 
         {/* Main Content Split */}
-        <div className="flex flex-1 min-h-0 relative">
+        <div className={`${styles.legacyMobileWorkspace} flex-1 min-h-0 relative`}>
 
           {/* Left Sidebar (Desktop only) */}
-          <aside className="hidden h-full max-h-[calc(100vh-4rem)] min-h-0 w-[20rem] shrink-0 overflow-hidden border-r border-slate-200 bg-[#fafafa] md:flex md:flex-col xl:w-[22rem]">
+          <aside className="hidden">
             <div className="min-w-0 shrink-0 p-5 pb-4">
 
                 {/* Decision Summary Card */}
@@ -2047,21 +3393,19 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                                 : "bg-rose-600 hover:bg-rose-700"
                           }`}
                         >
-                          <Link href={`/cases/${caseId}/mismatches`}>
-                            <TriangleAlert className="mr-2 h-4 w-4" />
-                            {reviewSummary.buttonLabel}
-                          </Link>
-                        </Button>
-                      )}
-
-                      {reviewSummary.buttonLabel && reviewSummary.action === "tally" && (
-                        <Button
-                          asChild
-                          className="mt-4 h-10 w-full bg-slate-900 font-medium text-white shadow-sm hover:bg-slate-800"
-                        >
-                          <Link href={`/cases/${caseId}/mismatches`}>
-                            <Database className="mr-2 h-4 w-4" />
-                            {reviewSummary.buttonLabel}
+                          <Link
+                            href={mismatchReviewHref}
+                            prefetch
+                            onPointerEnter={prepareMismatchNavigation}
+                            onFocus={prepareMismatchNavigation}
+                            onClick={beginMismatchNavigation}
+                          >
+                            {isMismatchNavigationPending ? (
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            ) : (
+                              <TriangleAlert className="mr-2 h-4 w-4" />
+                            )}
+                            {isMismatchNavigationPending ? "Opening review…" : reviewSummary.buttonLabel}
                           </Link>
                         </Button>
                       )}
@@ -2080,21 +3424,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                           {reviewSummary.buttonLabel}
                         </Button>
                       )}
-
-                      {canonicalInvoiceCount === 1 &&
-                        reviewSummary.action === "approve" &&
-                        showActions && (
-                          <Button
-                            asChild
-                            variant="outline"
-                            className="mt-2 h-10 w-full border-emerald-200 bg-white font-medium text-slate-800 shadow-sm hover:bg-emerald-50 hover:text-emerald-950"
-                          >
-                            <Link href={`/cases/${caseId}/mismatches`}>
-                              <Database className="mr-2 h-4 w-4 text-emerald-700" />
-                              Prepare Tally voucher
-                            </Link>
-                          </Button>
-                        )}
 
                       {reviewSummary.buttonLabel && reviewSummary.action === "retry" && (
                         <Button
@@ -2180,7 +3509,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           <main className="flex-1 flex flex-col min-w-0 bg-[#fafafa] pt-2.5 px-2.5 pb-0 sm:p-4 md:p-6 lg:p-8 relative">
 
             {/* Mobile Document Selector (Horizontal scroll) */}
-            <div className="md:hidden bg-white border border-[#e5ddd0] rounded-xl mb-3 p-1.5 shrink-0 z-10 relative overflow-hidden shadow-sm">
+            <div className="bg-white border border-[#e5ddd0] rounded-xl mb-3 p-1.5 shrink-0 z-10 relative overflow-hidden shadow-sm">
               <div className="flex overflow-x-auto gap-2 snap-x scrollbar-hide py-0.5 px-0.5">
                 {displayDocuments.map((doc) => {
                   const isActive = activeDocumentId === doc.id;
@@ -2359,9 +3688,9 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                           <div className="h-3 w-px bg-white/20 mx-1 hidden sm:block"></div>
                           <button
                             type="button"
-                            disabled={!activeSourceIsImage || previewZoom === 1}
+                            disabled={!activeSourceIsImage || previewZoom === DEFAULT_PREVIEW_ZOOM}
                             className="hidden sm:block p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
-                            onClick={() => setPreviewZoom(1)}
+                            onClick={() => setPreviewZoom(DEFAULT_PREVIEW_ZOOM)}
                             aria-label="Reset zoom"
                           >
                             <RotateCw className="h-4 w-4" />
@@ -2617,31 +3946,19 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
         {/* Mobile Sticky Action Bar */}
         {showActions && (
           <div
-            className="fixed left-0 right-0 z-[90] flex items-center gap-3 border-t border-slate-200 bg-white p-3 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] md:hidden"
+            className={styles.mobileActionBar}
             style={{ bottom: "calc(5.25rem + env(safe-area-inset-bottom))" }}
           >
-            {canonicalInvoiceCount === 1 && (
-              <Button
-                asChild
-                variant="outline"
-                className="flex-1 rounded-xl border-emerald-200 bg-emerald-50 text-emerald-800 shadow-sm h-12 font-medium hover:bg-emerald-100 hover:text-emerald-900"
-              >
-                <Link href={`/cases/${caseId}/mismatches`}>
-                  <Database className="mr-2 h-5 w-5" />
-                  Tally
-                </Link>
-              </Button>
-            )}
             <Button
               variant="outline"
-              className="flex-1 rounded-xl text-rose-600 hover:bg-rose-50 hover:text-rose-700 border-slate-200 shadow-sm h-12 font-medium"
+              className={`${styles.mobileActionButton} text-rose-600 hover:bg-rose-50 hover:text-rose-700 border-slate-200 shadow-sm font-medium`}
               disabled={decisionStatus === "updating"}
               onClick={() => handleCaseDecision("rejected")}
             >
               <X className="h-5 w-5 mr-2" /> Reject
             </Button>
             <Button
-              className="flex-1 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm h-12 font-medium"
+              className={`${styles.mobileActionButton} bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm font-medium`}
               disabled={decisionStatus === "updating"}
               onClick={() => handleCaseDecision("accepted")}
             >
@@ -2654,6 +3971,40 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
             </Button>
           </div>
         )}
+
+        <AnalysisOptionsDialog
+          open={analysisOptionsOpen}
+          onOpenChange={setAnalysisOptionsOpen}
+          onSelect={(nextOptions) => {
+            setAnalysisOptionsOpen(false);
+            void handleAnalyzeDraftCase(nextOptions, pendingAnalysisMode);
+          }}
+        />
+
+        <Dialog open={isTallyReviewOpen} onOpenChange={setIsTallyReviewOpen}>
+          <DialogContent className={styles.tallyReviewDialog}>
+            <DialogHeader className={styles.tallyReviewDialogHeader}>
+              <DialogTitle className={styles.tallyReviewDialogTitle}>
+                Approved case · Tally review
+              </DialogTitle>
+              <DialogDescription className={styles.tallyReviewDialogDescription}>
+                Review the prepared Purchase voucher and posting status without leaving the case workspace.
+              </DialogDescription>
+            </DialogHeader>
+            <div className={styles.tallyReviewDialogBody}>
+              {isTallyReviewOpen ? (
+                <TallyInReviewPanel
+                  caseId={caseId}
+                  onViewOriginal={(documentId) => {
+                    setActiveDocumentId(documentId);
+                    setActiveTab("preview");
+                    setIsTallyReviewOpen(false);
+                  }}
+                />
+              ) : null}
+            </div>
+          </DialogContent>
+        </Dialog>
       </div>
     </AppShell>
   );

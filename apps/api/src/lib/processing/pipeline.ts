@@ -5246,12 +5246,16 @@ export function verifyProcessedDocuments(
 
 export async function processStoredCaseFiles(params: {
   caseId: string;
+  fieldConfiguration?: Awaited<ReturnType<typeof getPersistedPacketFieldConfiguration>>;
   analysisMode?: CaseAnalysisMode;
   comparisonOptions?: unknown;
   onProgress?: (details: { progress: number; stage: string }) => Promise<void> | void;
 }) {
   const supabase = createSupabaseAdminClient();
-  const fieldConfiguration = await getPersistedPacketFieldConfiguration();
+  if(process.env.TEAM_ACCESS_ENFORCEMENT==='true'&&!params.fieldConfiguration) {
+    throw new Error('Authorized organization field configuration is required.');
+  }
+  const fieldConfiguration = params.fieldConfiguration ?? await getPersistedPacketFieldConfiguration();
   const comparisonOptions = readComparisonOptions(params.comparisonOptions ?? DEFAULT_COMPARISON_OPTIONS);
   const analysisMode = params.analysisMode ?? "standard";
 

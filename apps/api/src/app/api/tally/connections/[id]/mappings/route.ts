@@ -1,3 +1,6 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {datasetSelection,requireMasterDataset,saveDatasetMapping} from '@/lib/access/master-store';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -35,7 +38,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(
+async function GETHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -46,6 +49,17 @@ export async function GET(
     }
 
     const { id } = await context.params;
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true') {
+      const scope=await requireMasterDataset(request,id,datasetSelection(new URL(request.url)));
+      if(!scope.dataset)return jsonWithCors(request,{mappings:[],datasetId:null});
+      const {data,error}=await createSupabaseAdminClient().from('access_dataset_mappings').select('*')
+        .eq('dataset_id',scope.dataset.id).order('updated_at',{ascending:false}).limit(5001);
+      if(error)throw error;
+      if((data?.length||0)>5000)return jsonWithCors(request,{error:'Mapping list exceeds the supported limit.'},{status:413});
+      return jsonWithCors(request,{mappings:(data||[]).map(row=>({...serializeTallyMapping({
+        ...row,connection_id:id,owner_user_id:scope.connection.owner_user_id,company_name:scope.link.company_name,
+      } as TallyMappingRow),revision:row.revision})),datasetId:scope.dataset.id});
+    }
     const connection = await requireConnection(user.id, id);
     if (!connection) {
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
@@ -68,12 +82,13 @@ export async function GET(
       mappings: ((data ?? []) as unknown as TallyMappingRow[]).map(serializeTallyMapping),
     });
   } catch (error) {
+    const denied=accessFailureResponse(request,error);if(denied)return denied;
     console.error("Error in GET /api/tally/connections/[id]/mappings:", error);
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
 
-export async function POST(
+async function POSTHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -84,8 +99,9 @@ export async function POST(
     }
 
     const { id } = await context.params;
-    const connection = await requireConnection(user.id, id);
-    if (!connection) {
+    const team=process.env.TEAM_ACCESS_ENFORCEMENT==='true';
+    const connection = team?null:await requireConnection(user.id, id);
+    if (!team && !connection) {
       return jsonWithCors(request, { error: "Tally connection not found" }, { status: 404 });
     }
 
@@ -101,6 +117,16 @@ export async function POST(
       return jsonWithCors(request, { error: "Mapping type, source, and target master are required." }, { status: 400 });
     }
 
+    if(team) {
+      const {scope,mapping}=await saveDatasetMapping(request,id,body,{
+        mapping_type:mappingType,source_key:sourceKey,source_label:sourceLabel,target_master_type:targetMasterType,
+        target_master_key:targetMasterKey,target_master_name:targetMasterName,status:body.status==='inactive'?'inactive':'active',
+        notes:toNullableText(body.notes,1000),
+      });
+      return jsonWithCors(request,{mapping:{...serializeTallyMapping({...mapping,connection_id:id,
+        owner_user_id:scope.connection.owner_user_id,company_name:scope.link.company_name} as TallyMappingRow),revision:mapping.revision}});
+    }
+
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("tally_mapping_settings")
@@ -108,7 +134,7 @@ export async function POST(
         {
           connection_id: id,
           owner_user_id: user.id,
-          company_name: connection.last_company_name ?? "Unknown company",
+          company_name: connection!.last_company_name ?? "Unknown company",
           mapping_type: mappingType,
           source_key: sourceKey,
           source_label: sourceLabel,
@@ -146,7 +172,11 @@ export async function POST(
       mapping: serializeTallyMapping(data as unknown as TallyMappingRow),
     });
   } catch (error) {
+    const denied=accessFailureResponse(request,error);if(denied)return denied;
     console.error("Error in POST /api/tally/connections/[id]/mappings:", error);
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);
+export const POST = withTeamAccess(POSTHandler);

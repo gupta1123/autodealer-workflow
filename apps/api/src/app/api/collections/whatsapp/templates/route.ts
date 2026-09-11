@@ -1,3 +1,4 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { fetchMsg91WhatsappTemplates, getMsg91WhatsappConfig } from "@/lib/msg91/whatsapp";
@@ -6,7 +7,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) {
@@ -50,3 +51,5 @@ export async function GET(request: Request) {
     );
   }
 }
+
+export const GET = withTeamAccess(GETHandler);

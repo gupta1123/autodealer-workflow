@@ -1,6 +1,7 @@
 "use client";
 
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
+import {accessCacheEpoch} from '@/lib/access-cache';
 
 const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL || "").replace(/\/+$/, "");
 const USE_CROSS_ORIGIN_API =
@@ -14,6 +15,7 @@ function isLocalDbMode() {
 let browserClient: ReturnType<typeof createSupabaseBrowserClient> | null = null;
 let cachedAccessToken: { token: string; expiresAt: number } | null = null;
 let pendingAccessToken: Promise<string | null> | null = null;
+let observedAuthUserId: string | null = null;
 
 function clearCachedAccessToken() {
   cachedAccessToken = null;
@@ -23,7 +25,14 @@ function clearCachedAccessToken() {
 function getBrowserClient() {
   if (!browserClient) {
     browserClient = createSupabaseBrowserClient();
-    browserClient.auth.onAuthStateChange(clearCachedAccessToken);
+    browserClient.auth.onAuthStateChange((event,session) => {
+      clearCachedAccessToken();
+      const userChanged=observedAuthUserId!==(session?.user.id??null);
+      observedAuthUserId=session?.user.id??null;
+      if (event === 'SIGNED_OUT' || (event === 'SIGNED_IN'&&userChanged) || event === 'USER_UPDATED') {
+        queueMicrotask(() => window.dispatchEvent(new Event('kalika-auth-changed')));
+      }
+    });
   }
 
   return browserClient;
@@ -102,12 +111,18 @@ export async function getApiAccessToken() {
   return readAccessToken();
 }
 
-export async function apiFetch(path: string, init?: RequestInit) {
+async function authenticatedFetch(path: string, init?: RequestInit) {
+  // Pin organization before asynchronous token refresh. A retry must not move
+  // an old screen's mutation into a newly selected organization.
+  const organization=typeof window!=='undefined'?sessionStorage.getItem('kalika-access-organization'):null;
   const accessToken = await readAccessToken();
   const apiUrl = buildApiUrl(path);
 
   async function sendRequest(token: string | null) {
     const headers = new Headers(init?.headers);
+    if (path.startsWith('/api/') && typeof window !== 'undefined' && !headers.has('X-Kalika-Organization')) {
+      if (organization) headers.set('X-Kalika-Organization', organization);
+    }
     if (token) {
       headers.set("Authorization", `Bearer ${token}`);
     }
@@ -130,4 +145,27 @@ export async function apiFetch(path: string, init?: RequestInit) {
   }
 
   return sendRequest(refreshedAccessToken);
+}
+
+export async function apiFetch(path: string, init?: RequestInit) {
+  const started = performance.now();
+  const epoch=accessCacheEpoch();
+  const response = await authenticatedFetch(path, init);
+  if(epoch!==accessCacheEpoch()){
+    void response.body?.cancel().catch(()=>{});
+    throw new DOMException('Access context changed; discard the previous response.','AbortError');
+  }
+  if (typeof window !== 'undefined') {
+    if (path === '/api/tally/connections' && (!init?.method || init.method === 'GET') && response.ok) {
+      // Reuse status reads already performed by pages; the sidebar need not
+      // issue a second request to learn about their refreshed observations.
+      void response.clone().json().then(payload => window.dispatchEvent(new CustomEvent('kalika:tally-status-observed', {
+        detail: { connections: payload.connections, serverDate: payload.observedAt || response.headers.get('date'), started },
+      }))).catch(() => {});
+    } else if (response.ok && init?.method && !['GET','HEAD','OPTIONS'].includes(init.method.toUpperCase()) &&
+      /^\/api\/tally\/connections\/(?:disconnect-others|[^/]+\/(?:disconnect|pair))$/.test(path)) {
+      window.dispatchEvent(new Event('kalika:tally-status-invalidated'));
+    }
+  }
+  return response;
 }

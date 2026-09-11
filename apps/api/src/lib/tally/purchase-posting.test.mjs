@@ -17,6 +17,11 @@ function dataUrl(source) {
 }
 
 async function loadPurchasePostingModule() {
+  const sharedCalculatorSource = readFileSync(
+    new URL("../../../../../packages/shared/src/lib/purchase-voucher.ts", import.meta.url),
+    "utf8"
+  );
+  const sharedCalculatorUrl = dataUrl(transpile(sharedCalculatorSource));
   const lineItemsSource = readFileSync(new URL("../line-items.ts", import.meta.url), "utf8");
   const lineItemsUrl = dataUrl(transpile(lineItemsSource));
   const commercialFieldsSource = readFileSync(
@@ -29,6 +34,10 @@ async function loadPurchasePostingModule() {
     .replace(
       'from "@/lib/invoice-commercial-fields"',
       `from "${commercialFieldsUrl}"`
+    )
+    .replace(
+      'from "@autodealer/shared/lib/purchase-voucher"',
+      `from "${sharedCalculatorUrl}"`
     );
   return import(dataUrl(transpile(postingSource)));
 }
@@ -200,7 +209,7 @@ test("72044900 maps to the combined client stock and Maharashtra purchase rules"
   assert.ok(result.tallyPayload.withholdings
     .filter((entry) => entry.kind === "cgst_tds" || entry.kind === "sgst_tds")
     .every((entry) => entry.rate === "1"));
-  assert.equal(result.blockers.length, 0);
+  assert.deepEqual(result.blockers, []);
 });
 
 test("supplier ledger cannot also be selected as an item purchase ledger", () => {
@@ -290,7 +299,9 @@ test("reviewer can disable all applicable GST TDS deductions for a voucher", () 
 });
 
 test("invoice evidence automatically selects every applicable purchase adjustment", () => {
-  const document = invoiceDocument({ totalAmount: "1157.00" });
+  const document = invoiceDocument({ totalAmount: "1857.00" });
+  document.extracted_fields.freightAmount = "700.00";
+  document.extracted_fields.freightGstRate = "0";
   document.extracted_fields.transportTdsAmount = "7.00";
   document.extracted_fields.transportTdsRate = "1";
   document.extracted_fields.tcsAmount = "5.00";
@@ -314,7 +325,7 @@ test("invoice evidence automatically selects every applicable purchase adjustmen
     name: "TCS Receivable",
     amount: "5.00",
   });
-  assert.equal(result.calculation.calculatedPayable, "1157.00");
+  assert.equal(result.calculation.calculatedPayable, "1857.00");
   assert.equal(result.blockers.length, 0);
 });
 
@@ -732,8 +743,8 @@ test("TCS is opt-in and changes the visible payable only when selected", () => {
 
 test("mixed-item invoices calculate reviewer-enabled 194Q on the confirmed voucher basis", () => {
   const document = invoiceDocument({
-    totalAmount: "1169.50",
-    tdsAmount: "0.50",
+    totalAmount: "1169.00",
+    tdsAmount: "1.00",
     lines: [
       { description: "MS Scrap", hsnSac: "72044900", quantity: "1", unit: "MT", rate: "500", taxableAmount: "500", taxAmount: "90" },
       { description: "Sponge Iron", hsnSac: "72031000", quantity: "1", unit: "MT", rate: "500", taxableAmount: "500", taxAmount: "90" },
@@ -753,7 +764,7 @@ test("mixed-item invoices calculate reviewer-enabled 194Q on the confirmed vouch
   assert.equal(result.calculation.tds194qAmount, "1.00");
   assert.equal(result.calculation.cgstTdsAmount, "5.00");
   assert.equal(result.calculation.sgstTdsAmount, "5.00");
-  assert.equal(result.blockers.length, 0);
+  assert.deepEqual(result.blockers, []);
 });
 
 test("optional deductions and their prompts are omitted when organization rules are off", () => {

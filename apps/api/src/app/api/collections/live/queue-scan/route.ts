@@ -1,3 +1,4 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -27,7 +28,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
@@ -154,3 +155,5 @@ export async function POST(request: Request) {
     );
   }
 }
+
+export const POST = withTeamAccess(POSTHandler);

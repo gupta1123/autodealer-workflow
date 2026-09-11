@@ -11,6 +11,8 @@ test("live validation metadata excludes legacy catalogue arrays", () => {
     source: "live_tally",
     companyName: "Solution Nyx",
     fetchedAt: "2026-08-29T00:00:00.000Z",
+    validatedAt: "2026-09-09T08:00:00.000Z",
+    validation: { catalogueDigest: "a".repeat(64), completeTypes: ["ledger", "group", "stock_item", "unit"] },
     ledgers: [{ raw: "x".repeat(300_000) }],
     stockItems: [{ raw: "x".repeat(300_000) }],
     units: [{ raw: "x".repeat(300_000) }],
@@ -18,6 +20,8 @@ test("live validation metadata excludes legacy catalogue arrays", () => {
 
   assert.equal(metadata.source, "live_tally");
   assert.equal(metadata.companyName, "Solution Nyx");
+  assert.equal(metadata.validatedAt, "2026-09-09T08:00:00.000Z");
+  assert.equal(metadata.catalogueIdentity.catalogueDigest, "a".repeat(64));
   assert.equal("ledgers" in metadata, false);
   assert.equal("stockItems" in metadata, false);
   assert.ok(JSON.stringify(metadata).length < 1024);

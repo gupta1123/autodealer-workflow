@@ -1,3 +1,7 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {requireResourceAccess} from '@/lib/access/resources';
+import {AccessError} from '@/lib/access/server';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { createHash } from "node:crypto";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -372,7 +376,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function POST(
+async function POSTHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -383,6 +387,11 @@ export async function POST(
     }
 
     const { id } = await context.params;
+    const authorized=process.env.TEAM_ACCESS_ENFORCEMENT==='true'
+      ? await requireResourceAccess(request,'bank_import',id,'bank.prepare'):null;
+    const companyPredicate=authorized
+      ? `and(access_organization_id.eq.${JSON.stringify(authorized.scope.organization_id)},access_company_id.eq.${JSON.stringify(authorized.scope.company_id)})`
+      : `owner_user_id.eq.${JSON.stringify(user.id)}`;
     const body = (await request.json().catch(() => ({}))) as ConfirmPayload;
     const reconcileAgainstLiveTally = body.reconcileAgainstLiveTally === true;
     const submittedTransactions = (body.transactions ?? []).flatMap((value) => {
@@ -409,7 +418,7 @@ export async function POST(
       .from("bank_statement_imports")
       .select("*")
       .eq("id", id)
-      .eq("owner_user_id", user.id)
+      .or(companyPredicate)
       .single();
 
     if (importError || !importRow) {
@@ -448,11 +457,15 @@ export async function POST(
     const submittedAccount = body.account ?? {};
 
     if (accountId) {
+      if(authorized) {
+        const accountAccess=await requireResourceAccess(request,'bank_account',accountId,'bank.prepare');
+        if(accountAccess.scope.company_id!==authorized.scope.company_id)throw new AccessError('Select a bank account belonging to the statement company.',403);
+      }
       const { data, error } = await supabase
         .from("bank_accounts")
         .select("*")
         .eq("id", accountId)
-        .eq("owner_user_id", user.id)
+        .or(companyPredicate)
         .single();
       if (error || !data) {
         return jsonWithCors(request, { error: "Selected bank account was not found." }, { status: 404 });
@@ -467,9 +480,10 @@ export async function POST(
       // A statement without a readable account number can still be posted when
       // the user deliberately selects a bank ledger. Use a stable internal key
       // for the bank-account record; it is never presented as a real account.
+      const manualScopeKey=authorized?`${authorized.scope.organization_id}|${authorized.scope.company_id}`:user.id;
       const accountKey = normalizedAccountNumber || (
         manualLedgerName
-          ? `MANUAL-${createHash("sha256").update(`${user.id}|${manualLedgerName.toLowerCase()}`).digest("hex").slice(0, 24).toUpperCase()}`
+          ? `MANUAL-${createHash("sha256").update(`${manualScopeKey}|${manualLedgerName.toLowerCase()}`).digest("hex").slice(0, 24).toUpperCase()}`
           : ""
       );
       if (!accountKey) {
@@ -478,6 +492,7 @@ export async function POST(
 
       const insertPayload = {
         owner_user_id: user.id,
+        ...(authorized?{access_organization_id:authorized.scope.organization_id,access_company_id:authorized.scope.company_id}:{}),
         bank_name: account.bankName || importRow.extracted_bank_name || null,
         account_number_normalized: accountKey,
         account_number_masked: normalizedAccountNumber ? maskAccountNumber(accountNumber) : "UNVERIFIED",
@@ -496,7 +511,7 @@ export async function POST(
         const { data: existing, error: existingError } = await supabase
           .from("bank_accounts")
           .select("*")
-          .eq("owner_user_id", user.id)
+          .or(companyPredicate)
           .eq("account_number_normalized", accountKey)
           .single();
         if (existingError || !existing) throw error;
@@ -511,13 +526,16 @@ export async function POST(
       return jsonWithCors(request, { error: "Bank account could not be resolved." }, { status: 400 });
     }
 
+    // Keep the existing account's deduplication namespace, independently of the
+    // teammate whose current authorization permits this confirmation.
+    const bankOwnerId=authorized?String(accountRow.owner_user_id):user.id;
     const rowsByFingerprint = new Map(
       transactions.map((transaction) => {
         const fingerprint = buildTransactionFingerprint(accountId, transaction);
         return [
           fingerprint,
           {
-            owner_user_id: user.id,
+            owner_user_id: bankOwnerId,
             bank_account_id: accountId,
             statement_import_id: id,
             transaction_date: transaction.transactionDate,
@@ -561,7 +579,7 @@ export async function POST(
       .select(
         "id, owner_user_id, bank_account_id, transaction_date, description, reference_number, debit_amount, credit_amount, fingerprint, tally_voucher_id, tally_posted_at"
       )
-      .eq("owner_user_id", user.id)
+      .eq("owner_user_id", bankOwnerId)
       .eq("bank_account_id", accountId)
       .eq("tally_status", "posted");
 
@@ -570,7 +588,7 @@ export async function POST(
     const postedRows = (existingPostedRows ?? []) as unknown as PostedTransactionRow[];
     if (!reconcileAgainstLiveTally && postedRows.length > 0) {
       const postedLogRows = postedRows.map((row) => ({
-        owner_user_id: user.id,
+        owner_user_id: bankOwnerId,
         bank_account_id: accountId,
         source_transaction_id: row.id,
         fingerprint: row.fingerprint,
@@ -604,7 +622,7 @@ export async function POST(
       const { error: stalePostingLogError } = await supabase
         .from("bank_transaction_posting_log")
         .delete()
-        .eq("owner_user_id", user.id)
+        .eq("owner_user_id", bankOwnerId)
         .eq("bank_account_id", accountId)
         .in("fingerprint", submittedFingerprints);
       if (stalePostingLogError) throw stalePostingLogError;
@@ -613,7 +631,7 @@ export async function POST(
       ? await supabase
           .from("bank_transaction_posting_log")
           .select("fingerprint, tally_voucher_id, tally_posted_at")
-          .eq("owner_user_id", user.id)
+          .eq("owner_user_id", bankOwnerId)
           .eq("bank_account_id", accountId)
           .eq("status", "posted")
           .in("fingerprint", submittedFingerprints)
@@ -625,7 +643,7 @@ export async function POST(
       ? await supabase
           .from("bank_transactions")
           .select("id, fingerprint, statement_import_id, tally_status")
-          .eq("owner_user_id", user.id)
+          .eq("owner_user_id", bankOwnerId)
           .eq("bank_account_id", accountId)
           .in("fingerprint", submittedFingerprints)
       : { data: [], error: null };
@@ -663,7 +681,7 @@ export async function POST(
     });
 
     const rowsToInsert = snapshotRows.map((row) => ({
-      owner_user_id: user.id,
+      owner_user_id: bankOwnerId,
       bank_account_id: accountId,
       statement_import_id: id,
       transaction_date: row.transaction_date,
@@ -736,14 +754,14 @@ export async function POST(
           .from("bank_accounts")
           .update(accountUpdate)
           .eq("id", accountId)
-          .eq("owner_user_id", user.id)
+          .eq("owner_user_id", bankOwnerId)
           .select("*")
           .single()
       : supabase
           .from("bank_accounts")
           .select("*")
           .eq("id", accountId)
-          .eq("owner_user_id", user.id)
+          .eq("owner_user_id", bankOwnerId)
           .single();
 
     const [{ data: updatedAccount, error: accountUpdateError }, { data: updatedImport, error: importUpdateError }] =
@@ -761,6 +779,7 @@ export async function POST(
                 ? importRow.processing_meta
                 : {}),
               confirmedAt: new Date().toISOString(),
+              ...(authorized?{confirmedByUserId:user.id}:{}),
               confirmedTransactionCount: transactions.length,
               ignoredNonPostingRowCount: submittedTransactions.length - transactions.length,
               importedAfterTransactionDate: lastImportedTransactionDate,
@@ -782,7 +801,7 @@ export async function POST(
             },
           })
           .eq("id", id)
-          .eq("owner_user_id", user.id)
+          .or(companyPredicate)
           .select("*")
           .single(),
       ]);
@@ -790,7 +809,9 @@ export async function POST(
     if (accountUpdateError) throw accountUpdateError;
     if (importUpdateError) throw importUpdateError;
 
-    const { data: olderImports, error: olderImportsError } = await supabase
+    // Shared history must not be removed as a side effect of confirming a new
+    // statement. Explicit retention/deletion policy handles it separately.
+    const { data: olderImports, error: olderImportsError } = authorized ? {data:[],error:null} : await supabase
       .from("bank_statement_imports")
       .select("id, storage_path")
       .eq("owner_user_id", user.id)
@@ -841,6 +862,7 @@ export async function POST(
       alreadyPostedTransactionCount: postedByFingerprint.size,
     });
   } catch (error) {
+    const accessError=accessFailureResponse(request,error);if(accessError)return accessError;
     console.error("Error in POST /api/bank-statements/imports/[id]/confirm:", error);
     if (isSupabaseConnectivityError(error)) {
       return jsonWithCors(
@@ -859,3 +881,5 @@ export async function POST(
     );
   }
 }
+
+export const POST = withTeamAccess(POSTHandler);

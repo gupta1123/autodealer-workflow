@@ -2,6 +2,7 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { isLocalDbMode } from "@/lib/local/mode";
 import { updateLocalTallyHeartbeat } from "@/lib/local/tally-store";
+import { canonicalAgentDatasetRows } from "@/lib/tally/agent-datasets";
 import {
   hashSecret,
   connectorSupportsReliableActiveCompany,
@@ -114,6 +115,8 @@ export async function POST(request: Request) {
     const bridgeVersion = toNullableText(body.bridgeVersion);
     const bridgeMachineId = toNullableText(body.bridgeMachineId);
     const bridgeMachineName = toNullableText(body.bridgeMachineName);
+    const protocolVersion = Math.max(0, Math.trunc(Number(body.protocolVersion || 0)));
+    const sessionGeneration = Math.max(0, Math.trunc(Number(body.sessionGeneration || 0)));
 
     if (!connectionId || !token) {
       return jsonWithCors(request, { error: "Connection id and bridge token are required." }, { status: 400 });
@@ -226,18 +229,35 @@ export async function POST(request: Request) {
       );
     }
 
+    if (protocolVersion >= 1 && sessionGeneration !== Number(connection.session_generation || 0)) {
+      return jsonWithCors(
+        request,
+        { error: "This Local Agent session was superseded. Reconnect this computer." },
+        { status: 409 }
+      );
+    }
+
     const now = new Date().toISOString();
     // An alive connector is not a new Tally/company observation. While a read
     // owns Tally's HTTP queue, update ONLY liveness and preserve last_tested_at.
     if (body.livenessOnly === true) {
+      const livenessUpdate: Record<string, unknown> = {
+        last_heartbeat_at: now,
+        bridge_version: bridgeVersion,
+      };
+      if (protocolVersion >= 1) livenessUpdate.agent_last_seen_at = now;
       const { data: live, error: liveError } = await supabase.from("tally_connections")
-        .update({ last_heartbeat_at: now, bridge_version: bridgeVersion })
+        .update(livenessUpdate)
         .eq("id", connection.id).eq("installation_id", bridgeMachineId).is("revoked_at", null)
         .select(TALLY_CONNECTION_SELECT).single();
       if (liveError) throw liveError;
       return jsonWithCors(request, { livenessSupported: true, connection: serializeTallyConnectionStatus(live as unknown as TallyConnectionRow) });
     }
     const resolvedCompanyName = companyLoaded ? companyName : null;
+    const agentStatus = body.agentStatus && typeof body.agentStatus === "object" ? body.agentStatus : {};
+    const capabilities = Array.isArray(body.agentCapabilities)
+      ? body.agentCapabilities.filter((value: unknown): value is string => typeof value === "string").slice(0, 100)
+      : [];
     const heartbeatStateChanged =
       connection.status !== status ||
       connection.last_tally_reachable !== tallyReachable ||
@@ -260,6 +280,17 @@ export async function POST(request: Request) {
         last_company_name: resolvedCompanyName,
         last_error: errorMessage,
         last_companies_snapshot: companies,
+        agent_protocol_version: protocolVersion,
+        agent_version: toNullableText(body.agentVersion),
+        agent_capabilities: capabilities,
+        agent_status: agentStatus,
+        agent_last_seen_at: protocolVersion >= 1 ? now : connection.agent_last_seen_at,
+        tdl_version: Number.isFinite(Number((agentStatus as Record<string, unknown>).tdlVersion))
+          ? Number((agentStatus as Record<string, unknown>).tdlVersion)
+          : null,
+        local_schema_version: Number.isFinite(Number((agentStatus as Record<string, unknown>).localSchemaVersion))
+          ? Number((agentStatus as Record<string, unknown>).localSchemaVersion)
+          : null,
       })
       .eq("id", connection.id)
       .eq("installation_id", bridgeMachineId)
@@ -269,6 +300,33 @@ export async function POST(request: Request) {
 
     if (updateError) {
       throw updateError;
+    }
+
+    let datasetStatus: { accepted: number; rejected: number; errorCode: string | null } | undefined;
+    if (protocolVersion >= 1 && Array.isArray((agentStatus as Record<string, unknown>).datasets)) {
+      const statusRecord = agentStatus as Record<string, unknown>;
+      const canonical = canonicalAgentDatasetRows({
+        datasets: statusRecord.datasets as Array<Record<string, unknown>>,
+        agentStatus: statusRecord,
+        connection,
+        agentVersion: toNullableText(body.agentVersion) || bridgeVersion || "unknown",
+        protocolVersion,
+        now,
+      });
+      datasetStatus = { accepted: canonical.rows.length, rejected: canonical.rejected, errorCode: null };
+      if (canonical.rows.length) {
+        const { error: datasetError } = await supabase.from("tally_agent_datasets").upsert(canonical.rows, {
+          onConflict: "organization_id,connection_id,installation_id,company_guid,financial_year",
+        });
+        if (datasetError) {
+          datasetStatus.errorCode = "AGENT_DATASET_STATUS_WRITE_FAILED";
+          console.error("Agent dataset status write failed after heartbeat was accepted:", {
+            connectionId: connection.id,
+            code: datasetError.code,
+            message: datasetError.message,
+          });
+        }
+      }
     }
 
     if (heartbeatStateChanged) {
@@ -294,6 +352,7 @@ export async function POST(request: Request) {
 
     return jsonWithCors(request, {
       livenessSupported: true,
+      datasetStatus,
       connection: serializeTallyConnectionStatus(updatedData as unknown as TallyConnectionRow),
     });
   } catch (error) {

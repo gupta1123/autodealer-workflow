@@ -1,3 +1,4 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 
@@ -36,7 +37,7 @@ function isRetryableStatus(status: number) {
   return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
-export async function POST(req: Request) {
+async function POSTHandler(req: Request) {
   const user = await requireRequestUser(req);
   if (!user) {
     return jsonWithCors(req, { error: "Unauthorized" }, { status: 401 });
@@ -121,3 +122,5 @@ export async function POST(req: Request) {
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
+
+export const POST = withTeamAccess(POSTHandler);

@@ -176,7 +176,8 @@ export async function uploadDebitNotePdf(supabase: SupabaseAdminClient, proposal
 export async function uploadNativeTallyDebitNotePdf(
   supabase: SupabaseAdminClient,
   proposal: DebitNoteProposalRow,
-  pdf: Buffer
+  pdf: Buffer,
+  immutable = false
 ) {
   if (!Buffer.isBuffer(pdf) || pdf.length < 5 || !pdf.subarray(0, 5).equals(Buffer.from("%PDF-"))) {
     throw new Error("The connector did not return a valid PDF document from Tally.");
@@ -187,12 +188,13 @@ export async function uploadNativeTallyDebitNotePdf(
 
   await ensureDebitNotePdfBucket(supabase);
   const fileName = nativeTallyDebitNotePdfFileName(proposal);
-  const path = `${proposal.owner_user_id}/${proposal.id}/native/${fileName}`;
+  const digest = createHash("sha256").update(pdf).digest("hex");
+  const path = `${proposal.owner_user_id}/${proposal.id}/native/${immutable ? `${digest}.pdf` : fileName}`;
   const { error } = await supabase.storage.from(DEBIT_NOTE_PDF_BUCKET).upload(path, pdf, {
     contentType: "application/pdf",
-    upsert: true,
+    upsert: !immutable,
   });
-  if (error) throw error;
+  if (error && !(immutable && /already exists|Duplicate/i.test(String((error as {message?:unknown}).message)))) throw error;
 
   return {
     reference: encodeDebitNotePdfReference(path),

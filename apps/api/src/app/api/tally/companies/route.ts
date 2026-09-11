@@ -1,3 +1,5 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {permittedConnections} from '@/lib/access/connection-scope';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { isLocalDbMode, LOCAL_USER_ID } from "@/lib/local/mode";
 import { listLocalTallyConnections } from "@/lib/local/tally-store";
@@ -327,7 +329,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   try {
     const localMode = isLocalDbMode();
     const user = localMode ? { id: LOCAL_USER_ID } : await requireRequestUser(request);
@@ -343,6 +345,18 @@ export async function GET(request: Request) {
         { error: "Select a Tally connector before loading companies." },
         { status: 400 }
       );
+    }
+
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true') {
+      const {links,rows}=await permittedConnections(request,connectionId);
+      const companies=links.flatMap(link=>{
+        const row=rows.find(row=>row.id===link.connection_id);
+        if(!row)return [];
+        return [{...serializeCompany(row,link.company_name,{companyName:link.company_name,guid:link.company_guid,
+          financialYear:link.financial_year,financialYearStart:null,booksFrom:null,currentPeriod:null,isActive:row.last_company_name===link.company_name}),
+          id:`${link.connection_id}::${link.company_guid}::${link.financial_year}`,accessCompanyId:link.company_id}];
+      });
+      return jsonWithCors(request,{companies},{headers:{'Cache-Control':'private, no-store'}});
     }
 
     if (localMode) {
@@ -506,3 +520,5 @@ export async function GET(request: Request) {
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);

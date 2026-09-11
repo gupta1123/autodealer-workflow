@@ -1,3 +1,7 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {requireMasterDataset} from '@/lib/access/master-store';
+import {enqueueTeamDiscount} from '@/lib/access/discount-writes';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { analyseCashDiscountNarration } from "@/lib/cash-discount-narration";
@@ -90,7 +94,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) {
@@ -116,13 +120,14 @@ export async function POST(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
-    const { data: connection, error: connectionError } = await supabase
+    const team=process.env.TEAM_ACCESS_ENFORCEMENT==='true'?await requireMasterDataset(request,connectionId,{companyName:body.companyName||proposal.companyName,financialYear:body.financialYear||proposal.financialYear},'discounts.post'):null;
+    let connectionQuery = supabase
       .from("tally_connections")
       .select("id, owner_user_id, last_company_name, status, last_tally_reachable, last_company_loaded, last_heartbeat_at, updated_at")
       .eq("id", connectionId)
-      .eq("owner_user_id", user.id)
-      .is("revoked_at", null)
-      .maybeSingle();
+      .is("revoked_at", null);
+    if(!team)connectionQuery=connectionQuery.eq('owner_user_id',user.id);
+    const {data:connection,error:connectionError}=await connectionQuery.maybeSingle();
 
     if (connectionError) throw connectionError;
     if (!connection) {
@@ -141,31 +146,29 @@ export async function POST(request: Request) {
       );
     }
 
+    const commands=()=>{
+      const query=supabase.from(team?'access_visible_commands':'tally_bridge_commands').select('id, status, payload, result, completed_at, created_at');
+      return team?query.eq('organization_id',team.access.organizationId).eq('access_company_id',team.link.company_id)
+        .eq('installation_id',team.link.installation_id).eq('company_guid',team.link.company_guid).eq('financial_year',team.link.financial_year).eq('visibility_permission','discounts.view')
+        :query.eq('owner_user_id',user.id);
+    };
+    const proposals=supabase.from('debit_note_proposals').select('party_ledger_name, linked_invoice_number, recoverable_amount, reason_code');
     const [
       { data: openBillCommandRows, error: openBillCommandError },
       { data: createdRows, error: createdRowsError },
       { data: inFlightRows, error: inFlightError },
     ] = await Promise.all([
-      supabase
-        .from("tally_bridge_commands")
-        .select("id, status, payload, result, completed_at, created_at")
-        .eq("owner_user_id", user.id)
+      commands()
         .eq("connection_id", connection.id)
         .eq("command_type", "fetch_customer_open_bills")
         .eq("status", "succeeded")
         .order("completed_at", { ascending: false })
         .limit(100),
-      supabase
-        .from("debit_note_proposals")
-        .select("party_ledger_name, linked_invoice_number, recoverable_amount, reason_code")
-        .eq("owner_user_id", user.id)
+      (team?proposals.eq('access_organization_id',team.access.organizationId).eq('access_company_id',team.link.company_id).eq('financial_year',team.link.financial_year):proposals.eq('owner_user_id',user.id))
         .eq("company_name", companyName)
         .eq("status", "created_in_tally")
         .limit(500),
-      supabase
-        .from("tally_bridge_commands")
-        .select("id, status, payload, result, completed_at, created_at")
-        .eq("owner_user_id", user.id)
+      commands()
         .eq("connection_id", connection.id)
         .eq("command_type", "create_debit_note")
         .in("status", ["queued", "claimed"])
@@ -266,11 +269,9 @@ export async function POST(request: Request) {
       );
     }
 
-    const { data: ledgerData, error: ledgerError } = await supabase
-      .from("tally_masters")
-      .select("tally_name, gstin, parent_name, raw_payload")
-      .eq("owner_user_id", user.id)
-      .eq("connection_id", connection.id)
+    const masters=supabase.from(team?'access_dataset_masters':'tally_masters').select('tally_name, gstin, parent_name, raw_payload');
+    const { data: ledgerData, error: ledgerError } = await (team?masters.eq('dataset_id',team.dataset?.id||'00000000-0000-0000-0000-000000000000'):
+      masters.eq('owner_user_id',user.id).eq('connection_id',connection.id).eq('company_name',companyName))
       .eq("master_type", "ledger")
       .eq("tally_name", matchingBill.ledgerName)
       .eq("is_active", true)
@@ -334,6 +335,10 @@ export async function POST(request: Request) {
       gstMode: "finance_review",
       sourceProposal: authoritativeProposal,
     };
+    if(team) {
+      const queued=await enqueueTeamDiscount(team,commandPayload);
+      return jsonWithCors(request,{command:serializeTallyBridgeCommand(queued.command),proposalId:queued.proposalId});
+    }
     const idempotencyKey = [companyName, matchingBill.ledgerName, linkedInvoiceNumber]
       .map((value) => normalizeCompanyName(value))
       .join("|");
@@ -379,6 +384,7 @@ export async function POST(request: Request) {
       command: serializeTallyBridgeCommand(commandData as unknown as TallyBridgeCommandRow),
     });
   } catch (error) {
+    const failure=accessFailureResponse(request,error);if(failure)return failure;
     console.error("Error in POST /api/collections/tally-debit-notes/approve:", error);
     return jsonWithCors(
       request,
@@ -387,3 +393,5 @@ export async function POST(request: Request) {
     );
   }
 }
+
+export const POST = withTeamAccess(POSTHandler);

@@ -1,3 +1,7 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import { followUpsDashboard } from '@/lib/access/followups-dashboard';
+import {requireMasterDataset,datasetSelection} from '@/lib/access/master-store';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
@@ -505,7 +509,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) {
@@ -513,6 +517,7 @@ export async function GET(request: Request) {
     }
 
     const url = new URL(request.url);
+    const followUps = url.pathname === '/api/collections/follow-ups';
     const connectionId = url.searchParams.get("connectionId")?.trim();
     const requestedCompanyName = nullableText(url.searchParams.get("companyName"), 240);
 
@@ -521,7 +526,8 @@ export async function GET(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
-    const { data: connection, error: connectionError } = await supabase
+    const team=process.env.TEAM_ACCESS_ENFORCEMENT==='true'?await requireMasterDataset(request,connectionId,datasetSelection(url),followUps?'followups.view':'discounts.view'):null;
+    const { data: connection, error: connectionError } = team?{data:team.connection,error:null}:await supabase
       .from("tally_connections")
       .select("id, owner_user_id, display_name, last_company_name, status, last_heartbeat_at, last_tally_reachable, last_company_loaded")
       .eq("id", connectionId)
@@ -568,13 +574,13 @@ export async function GET(request: Request) {
       { data: companyConnectionRows, error: companyConnectionError },
       { data: companySyncRows, error: companySyncError },
     ] = await Promise.all([
-      supabase
+      team?Promise.resolve({data:[],error:null}):supabase
         .from("tally_connections")
         .select("id")
         .eq("owner_user_id", user.id)
         .eq("last_company_name", companyName)
         .limit(200),
-      supabase
+      team?Promise.resolve({data:[],error:null}):supabase
         .from("tally_master_sync_runs")
         .select("connection_id")
         .eq("owner_user_id", user.id)
@@ -592,41 +598,36 @@ export async function GET(request: Request) {
     }
 
     const connectionIds = Array.from(compatibleConnectionIds);
+    const proposalQuery=supabase.from('debit_note_proposals').select('*');
+    const masterQuery=supabase.from(team?'access_dataset_masters':'tally_masters').select('tally_name, parent_name, gstin, raw_payload');
+    const commands=()=>{
+      const query=supabase.from(team?'access_visible_commands':'tally_bridge_commands').select('id, connection_id, owner_user_id, payload, result, completed_at, created_at');
+      return team?query.eq('organization_id',team.access.organizationId).eq('access_company_id',team.link.company_id)
+       .eq('company_guid',team.link.company_guid).eq('financial_year',team.link.financial_year).eq('installation_id',team.link.installation_id)
+       .eq('visibility_permission',followUps?'followups.view':'discounts.view'):query.eq('owner_user_id',user.id);
+    };
     const [
       { data: proposalRows, error: proposalError },
       { data: ledgerRows, error: ledgerError },
       { data: openBillCommandRows, error: openBillCommandError },
       { data: debitNoteCommandRows, error: debitNoteCommandError },
     ] = await Promise.all([
-      supabase
-        .from("debit_note_proposals")
-        .select("*")
-        .eq("owner_user_id", user.id)
+      followUps ? Promise.resolve({data: [], error: null}) : (team?proposalQuery.eq('access_organization_id',team.access.organizationId).eq('access_company_id',team.link.company_id).eq('financial_year',team.link.financial_year):proposalQuery.eq('owner_user_id',user.id))
         .eq("company_name", companyName)
         .eq("status", "created_in_tally")
         .order("created_at", { ascending: false })
         .limit(100),
-      supabase
-        .from("tally_masters")
-        .select("tally_name, parent_name, gstin, raw_payload")
-        .eq("owner_user_id", user.id)
-        .eq("connection_id", connectionId)
+      (team?masterQuery.eq('dataset_id',team.dataset?.id||'00000000-0000-0000-0000-000000000000'):masterQuery.eq('owner_user_id',user.id).eq('connection_id',connectionId).eq('company_name',companyName))
         .eq("master_type", "ledger")
         .eq("is_active", true)
         .limit(5000),
-      supabase
-        .from("tally_bridge_commands")
-        .select("id, connection_id, owner_user_id, payload, result, completed_at, created_at")
-        .eq("owner_user_id", user.id)
+      commands()
         .eq("connection_id", connectionId)
         .eq("command_type", "fetch_customer_open_bills")
         .eq("status", "succeeded")
         .order("completed_at", { ascending: false })
         .limit(100),
-      supabase
-        .from("tally_bridge_commands")
-        .select("id, connection_id, owner_user_id, payload, result, completed_at, created_at")
-        .eq("owner_user_id", user.id)
+      followUps ? Promise.resolve({data: [], error: null}) : commands()
         .in("connection_id", connectionIds)
         .eq("command_type", "create_debit_note")
         .eq("status", "succeeded")
@@ -650,7 +651,7 @@ export async function GET(request: Request) {
       .map((command) => debitNoteRowFromSucceededCommand(command, { last_company_name: connection.last_company_name }))
       .filter((row): row is NonNullable<typeof row> => Boolean(row));
 
-    if (missingCreatedRows.length > 0) {
+    if (!team && missingCreatedRows.length > 0) {
       const { data: insertedRows, error: insertMissingError } = await supabase
         .from("debit_note_proposals")
         .insert(missingCreatedRows)
@@ -806,6 +807,14 @@ export async function GET(request: Request) {
     const createdAmount = createdProposals.reduce((sum, row) => sum + toNumber(row.recoverable_amount), 0);
     const paymentFollowUpAmount = paymentFollowUps.reduce((sum, row) => sum + row.totalPayableAmount, 0);
 
+    if (followUps) return jsonWithCors(request, followUpsDashboard({
+      company: {connectionId, companyName, status: connection.status, lastHeartbeatAt: connection.last_heartbeat_at},
+      kpis: {paymentFollowUps: paymentFollowUps.length, paymentFollowUpAmount,
+        unpaidInvoices: paymentFollowUps.filter(row => Math.abs(row.outstandingAmount-row.originalInvoiceAmount)<=1).length,
+        partialUnpaidInvoices: paymentFollowUps.filter(row => row.outstandingAmount<row.originalInvoiceAmount-1).length},
+      tabs: {paymentFollowUps},
+    }));
+
     return jsonWithCors(request, {
       setupRequired: false,
       company: {
@@ -852,6 +861,7 @@ export async function GET(request: Request) {
       ],
     });
   } catch (error) {
+    const failure=accessFailureResponse(request,error);if(failure)return failure;
     if (isMissingCollectionsTable(error)) {
       return jsonWithCors(request, {
         setupRequired: true,
@@ -870,3 +880,5 @@ export async function GET(request: Request) {
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);

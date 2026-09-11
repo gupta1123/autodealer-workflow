@@ -1,9 +1,11 @@
+import { listAccessPredicate } from '@/lib/access/list-scope';
+import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { getLatestProcessingJob, mapProcessingJob } from "@/lib/processing/jobs";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
-export async function GET(
+async function GETHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -20,7 +22,7 @@ export async function GET(
       .from("packet_cases")
       .select("id, status")
       .eq("id", id)
-      .eq("owner_user_id", user.id)
+      .or(await listAccessPredicate(request, user.id, 'purchases.view'))
       .maybeSingle();
 
     if (caseError) {
@@ -48,3 +50,5 @@ export async function GET(
 export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
+
+export const GET = withTeamAccess(GETHandler);

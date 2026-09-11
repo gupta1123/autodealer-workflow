@@ -69,6 +69,12 @@ const LINE_ITEM_FIELD_LABELS: Record<string, string> = {
   "lineItems.hsnSacMismatch": "Line item HSN/SAC",
   "lineItems.amountMismatch": "Line item amount",
 };
+const REVIEW_FIELD_LABELS: Record<string, string> = {
+  documentDate: "Document date",
+  eWayBillNumber: "E-way bill number",
+  registrationNumber: "Registration number",
+  vehicleNumber: "Registration number",
+};
 const TERMS_COMPLIANCE_FIELD = "termsAndConditions";
 
 function normalizeCompanyName(value?: string | null) {
@@ -87,6 +93,9 @@ function getFieldLabel(fieldName: string) {
   if (LINE_ITEM_FIELD_LABELS[fieldName]) {
     return LINE_ITEM_FIELD_LABELS[fieldName];
   }
+  if (REVIEW_FIELD_LABELS[fieldName]) {
+    return REVIEW_FIELD_LABELS[fieldName];
+  }
   return getComparisonDisplayLabel(fieldName, FIELD_LABEL_LOOKUP[fieldName]);
 }
 
@@ -104,17 +113,17 @@ function getMismatchResolutionLabel(status: MismatchRecord["resolutionStatus"]) 
 
 function getMismatchResolutionClassName(status: MismatchRecord["resolutionStatus"]) {
   if (status === "accepted") {
-    return "border-emerald-200 bg-emerald-50 text-emerald-700";
+    return "border-[#c3dfcb] bg-[#ebf5ee] text-[#1b4332]";
   }
   if (status === "rejected") {
-    return "border-rose-200 bg-rose-50 text-rose-700";
+    return "border-[#f2c7c4] bg-[#fbf0ef] text-[#8c1d18]";
   }
-  return "border-amber-200 bg-amber-50 text-amber-700";
+  return "border-[#f9d8a7] bg-[#fef6e9] text-[#78350f]";
 }
 
 function displayValue(value: unknown) {
   if (value === null || value === undefined || value === "") {
-    return <span className="text-slate-400 italic font-normal">Missing</span>;
+    return <span className="italic font-normal text-[#b5aaa0]">Missing</span>;
   }
   if (Array.isArray(value)) return value.join(", ");
   if (typeof value === "object") return JSON.stringify(value);
@@ -483,7 +492,7 @@ function getReviewerHint(mismatch: MismatchRecord, evidence?: MismatchEvidence[]
       .split("")
       .filter((char, index) => char !== uniqueValues[1][index]).length;
     if (diffCount > 0 && diffCount <= 2) {
-      return `Only ${diffCount === 1 ? "one character differs" : `${diffCount} characters differ`} - likely OCR, typing, or formatting. Check the source before treating it as a business mismatch.`;
+      return `${diffCount}-character difference. Likely OCR or formatting—verify the source.`;
     }
   }
 
@@ -543,6 +552,18 @@ function getCompactSourceLabel(document?: SavedCaseDetail["documents"][number]) 
   }
 
   return fileName || document.title || sourceLabel;
+}
+
+function getDocumentPageLabel(document?: SavedCaseDetail["documents"][number]) {
+  if (!document) return "Page —";
+
+  const sourceLabel = getDocumentSourceLabel(document);
+  const pageMatch = sourceLabel.match(/\bpages?\s+(\d+)(?:\s*[-–]\s*(\d+))?/i);
+  if (!pageMatch) return "Page —";
+
+  return pageMatch[2]
+    ? `Pages ${pageMatch[1]}–${pageMatch[2]}`
+    : `Page ${pageMatch[1]}`;
 }
 
 function getEvidenceDocumentRole(document?: SavedCaseDetail["documents"][number]) {
@@ -633,11 +654,10 @@ function getIssueListDetail(mismatch: MismatchRecord, evidence: MismatchEvidence
   }
 
   const count = getValueCount(mismatch);
-  return `${count} value${count === 1 ? "" : "s"} disagree`;
-}
-
-function getDocumentRoleSummary(evidence: MismatchEvidence[]) {
-  return uniqueStrings(evidence.map((entry) => getEvidenceDocumentRole(entry.document))).join(" vs ");
+  const status = mismatch.resolutionStatus === "pending"
+    ? ""
+    : ` · ${getMismatchResolutionLabel(mismatch.resolutionStatus)}`;
+  return `${count} value${count === 1 ? "" : "s"} compared${status}`;
 }
 
 function getSingleIssueRows(evidence: MismatchEvidence[], fieldName: string) {
@@ -649,74 +669,74 @@ function getSingleIssueRows(evidence: MismatchEvidence[], fieldName: string) {
 function MismatchReviewSkeleton() {
   return (
     <div className="flex flex-1 flex-col min-h-0 overflow-hidden lg:flex-row">
-      <aside className="flex shrink-0 flex-col border-b border-slate-200 bg-white lg:w-72 lg:border-b-0 lg:border-r">
-        <div className="hidden border-b border-slate-100 p-5 lg:block">
+      <aside className="flex shrink-0 flex-col border-b border-[#e0d8cc] bg-white lg:w-60 lg:border-b-0 lg:border-r">
+        <div className="hidden border-b border-[#ece6dc] p-5 lg:block">
           <div className="mb-4 flex items-center gap-2">
-            <Skeleton className="h-4 w-4 rounded bg-slate-100" />
-            <Skeleton className="h-4 w-28 bg-slate-100" />
+            <Skeleton className="h-4 w-4 rounded bg-[#eee7dd]" />
+            <Skeleton className="h-4 w-28 bg-[#eee7dd]" />
           </div>
           <div className="space-y-3">
             <div className="space-y-2">
-              <Skeleton className="h-3 w-16 bg-slate-100" />
-              <Skeleton className="h-4 w-40 bg-slate-100" />
+              <Skeleton className="h-3 w-16 bg-[#eee7dd]" />
+              <Skeleton className="h-4 w-40 bg-[#eee7dd]" />
             </div>
             <div className="flex items-center justify-between">
               <div className="space-y-2">
-                <Skeleton className="h-3 w-20 bg-slate-100" />
-                <Skeleton className="h-4 w-8 bg-slate-100" />
+                <Skeleton className="h-3 w-20 bg-[#eee7dd]" />
+                <Skeleton className="h-4 w-8 bg-[#eee7dd]" />
               </div>
               <div className="space-y-2">
-                <Skeleton className="h-3 w-16 bg-amber-100" />
-                <Skeleton className="h-4 w-8 bg-amber-100" />
+                <Skeleton className="h-3 w-16 bg-[#eee7dd]" />
+                <Skeleton className="h-4 w-8 bg-[#eee7dd]" />
               </div>
             </div>
           </div>
         </div>
 
-        <div className="flex flex-1 flex-col overflow-hidden bg-slate-50/50 lg:bg-white">
-          <div className="flex items-center justify-between border-b border-slate-100 bg-white px-4 py-3 lg:px-5 lg:py-4">
-            <Skeleton className="h-4 w-32 bg-slate-100" />
+        <div className="flex flex-1 flex-col overflow-hidden bg-[#fbfaf8] lg:bg-white">
+          <div className="flex items-center justify-between border-b border-[#ece6dc] bg-white px-4 py-3 lg:px-5 lg:py-4">
+            <Skeleton className="h-4 w-32 bg-[#eee7dd]" />
           </div>
           <div className="flex gap-2 overflow-x-auto p-3 lg:block lg:space-y-0 lg:overflow-y-hidden lg:p-0">
             {Array.from({ length: 5 }).map((_, index) => (
               <div
                 key={index}
-                className="shrink-0 rounded-full border border-slate-200 bg-white px-4 py-2 lg:w-full lg:rounded-none lg:border-0 lg:border-l-[3px] lg:border-transparent lg:px-5 lg:py-3"
+                className="shrink-0 rounded-full border border-[#e0d8cc] bg-white px-4 py-2 lg:w-full lg:rounded-none lg:border-0 lg:border-l-[3px] lg:border-transparent lg:px-5 lg:py-3"
               >
-                <Skeleton className="h-4 w-28 bg-slate-100" />
-                <Skeleton className="mt-2 hidden h-3 w-20 bg-slate-100 lg:block" />
+                <Skeleton className="h-4 w-28 bg-[#eee7dd]" />
+                <Skeleton className="mt-2 hidden h-3 w-20 bg-[#eee7dd] lg:block" />
               </div>
             ))}
           </div>
         </div>
       </aside>
 
-      <main className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
+      <main className="flex-1 overflow-y-auto bg-[#f7f4ef] p-4 sm:p-6 lg:p-8">
         <div className="mx-auto max-w-3xl space-y-6">
           <div className="space-y-2">
-            <Skeleton className="h-7 w-52 bg-slate-200/70" />
-            <Skeleton className="h-4 w-80 max-w-full bg-slate-200/70" />
+            <Skeleton className="h-7 w-52 bg-[#eee7dd]" />
+            <Skeleton className="h-4 w-80 max-w-full bg-[#eee7dd]" />
           </div>
           <div>
             <div className="mb-3 flex items-center gap-2">
-              <Skeleton className="h-4 w-4 rounded bg-slate-100" />
-              <Skeleton className="h-4 w-32 bg-slate-100" />
+              <Skeleton className="h-4 w-4 rounded bg-[#eee7dd]" />
+              <Skeleton className="h-4 w-32 bg-[#eee7dd]" />
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
               {Array.from({ length: 4 }).map((_, index) => (
-                <div key={index} className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-                  <Skeleton className="mb-3 h-3 w-32 bg-slate-100" />
-                  <Skeleton className="h-4 w-44 bg-slate-100" />
+                <div key={index} className="rounded-lg border border-[#e0d8cc] bg-white p-4 shadow-sm">
+                  <Skeleton className="mb-3 h-3 w-32 bg-[#eee7dd]" />
+                  <Skeleton className="h-4 w-44 bg-[#eee7dd]" />
                 </div>
               ))}
             </div>
           </div>
-          <div className="rounded-lg border border-slate-200 bg-slate-50/80 p-4 sm:p-5">
-            <Skeleton className="mb-4 h-4 w-36 bg-slate-200/70" />
+          <div className="rounded-lg border border-[#e0d8cc] bg-[#fbfaf8] p-4 sm:p-5">
+            <Skeleton className="mb-4 h-4 w-36 bg-[#eee7dd]" />
             <div className="space-y-3">
-              <Skeleton className="h-3.5 w-full bg-slate-200/70" />
-              <Skeleton className="h-3.5 w-5/6 bg-slate-200/70" />
-              <Skeleton className="h-3.5 w-4/6 bg-slate-200/70" />
+              <Skeleton className="h-3.5 w-full bg-[#eee7dd]" />
+              <Skeleton className="h-3.5 w-5/6 bg-[#eee7dd]" />
+              <Skeleton className="h-3.5 w-4/6 bg-[#eee7dd]" />
             </div>
           </div>
         </div>
@@ -731,6 +751,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [activeMismatchId, setActiveMismatchId] = useState<string | null>(null);
   const [reviewMode, setReviewMode] = useState<"mismatches" | "tally">("mismatches");
+  const [tallyOpened, setTallyOpened] = useState(false);
   const [decisionStatus, setDecisionStatus] = useState<"idle" | "updating" | "error">("idle");
   const [decisionError, setDecisionError] = useState<string | null>(null);
   const [tallyHeaderState, setTallyHeaderState] = useState<TallyPurchaseHeaderState | null>(null);
@@ -801,9 +822,14 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
 
   useEffect(() => {
     if (hasInvoice && visibleMismatches.length === 0) {
+      setTallyOpened(true);
       setReviewMode("tally");
     }
   }, [hasInvoice, visibleMismatches.length]);
+
+  useEffect(() => {
+    if (reviewMode === "tally") setTallyOpened(true);
+  }, [reviewMode]);
 
   useEffect(() => {
     setActiveMismatchId((current) => {
@@ -841,7 +867,6 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
     ? mismatchGroups.find((group) => group.key === activeGroupKey) ?? null
     : null;
 
-  const activeFieldLabel = activeMismatch ? getFieldLabel(activeMismatch.fieldName) : "";
   const activeEvidence = useMemo(
     () => (activeMismatch ? buildMismatchEvidence(activeMismatch, documentLookup) : []),
     [activeMismatch, documentLookup]
@@ -854,9 +879,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
     activeMismatch?.fieldName === "taxAmount" && activeIsSingleDocumentIssue
       ? parseTaxValidationIssue(activeEvidence[0]?.value)
       : null;
-  const activeIssueModeLabel = activeMismatch ? getIssueModeLabel(activeMismatch, activeEvidence) : "";
   const activeIssueHint = activeMismatch ? getReviewerHint(activeMismatch, activeEvidence) : "";
-  const activeDocumentSummary = activeEvidence.length > 0 ? getDocumentRoleSummary(activeEvidence) : "";
   const activeSingleIssueRows = activeMismatch
     ? getSingleIssueRows(activeEvidence, activeMismatch.fieldName)
     : [];
@@ -1082,56 +1105,51 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
           ? "Switch company in Tally"
           : "Tally unavailable";
   const tallyHeaderToneClass = tallyVoucherVerified || tallyCompanyContextVerified
-    ? "border-emerald-200 bg-emerald-50/80"
+    ? "border-[#c3dfcb] bg-[#ebf5ee]/80"
     : tallyHeaderState?.selectedConnectionId
-      ? "border-amber-300 bg-amber-50"
+      ? "border-[#f9d8a7] bg-[#fef6e9]"
       : "border-[#e5ddd0] bg-white";
 
   return (
     <AppShell defaultSidebarCollapsed>
-      <div className="flex h-full flex-col bg-slate-50 animate-in fade-in duration-500">
+      <div className="flex h-full flex-col bg-[#f7f4ef] animate-in fade-in duration-500 text-[#111827]">
 
-        {/* Header */}
-        <header className="sticky top-0 z-10 flex h-16 shrink-0 items-center justify-between gap-4 border-b border-slate-200 bg-white px-4 shadow-sm sm:px-6">
+        {/* Header - warm palette aligned to PageHeader (Cases/RecycleBin) */}
+        <header className="sticky top-0 z-10 flex h-14 shrink-0 items-center justify-between gap-4 border-b border-[#e0d8cc] bg-[#f7f4ef]/95 px-4 shadow-[0_1px_3px_rgba(45,36,28,0.03)] backdrop-blur-md sm:px-6">
           <div className="flex min-w-0 flex-1 items-center gap-3">
             <Link
               href={`/cases/${caseId}`}
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-900"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[#ded8d0] bg-[#fbfaf8] text-[#5a5046] transition-colors hover:bg-[#ede6d9] hover:text-[#111827]"
             >
               <ArrowLeft className="h-5 w-5" />
             </Link>
 
-            <div className="flex min-w-0 flex-1 items-center gap-3">
+            <div className="flex min-w-0 flex-1 items-center gap-2.5">
               {status === "loading" ? (
-                <Skeleton className="h-5 w-52 max-w-[55vw] bg-slate-100" />
+                <Skeleton className="h-5 w-52 max-w-[55vw] bg-[#eee7dd]" />
               ) : (
-                <h1 className="truncate text-sm font-semibold tracking-tight text-slate-900 sm:text-[15px]">
+                <h1 className="truncate text-lg font-bold tracking-tight text-[#111827] sm:text-xl">
                   {detail?.case.displayName}
                 </h1>
               )}
               {detail && reviewMode !== "tally" && (
                 <div className="hidden items-center gap-2 sm:flex shrink-0">
-                  <Badge
-                    variant="secondary"
-                    className="bg-amber-100 text-amber-800 hover:bg-amber-100 border-transparent rounded-md px-2 py-0.5"
-                  >
-                    {visibleMismatches.length} Issue{visibleMismatches.length === 1 ? "" : "s"}
-                  </Badge>
-                  <Badge
-                    variant="outline"
-                    className={`rounded-md px-2 py-0.5 ${detail.case.status === "accepted"
-                        ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                  <span className="hidden text-[#c4b9ad] sm:inline-block">·</span>
+                  <span
+                    className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium shadow-sm ${detail.case.status === "accepted"
+                        ? "border-[#c3dfcb] bg-[#ebf5ee] text-[#1b4332]"
                         : detail.case.status === "rejected"
-                          ? "border-rose-200 bg-rose-50 text-rose-700"
-                          : "border-slate-200 bg-slate-50 text-slate-600"
+                          ? "border-[#f2c7c4] bg-[#fbf0ef] text-[#8c1d18]"
+                          : "border-[#ded8d0] bg-[#fbfaf8] text-[#5b4b3d]"
                       }`}
                   >
+                    <span className={`h-1.5 w-1.5 rounded-full ${detail.case.status === "accepted" ? "bg-[#2d6a4f]" : detail.case.status === "rejected" ? "bg-[#b91c1c]" : "bg-[#8a7f72]"}`} />
                     {detail.case.status === "accepted"
-                      ? "Case accepted"
+                      ? "Review complete"
                       : detail.case.status === "rejected"
                         ? "Case rejected"
-                        : "Pending decision"}
-                  </Badge>
+                        : "Review pending"}
+                  </span>
                 </div>
               )}
             </div>
@@ -1140,27 +1158,27 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
             <div className={`hidden min-w-0 shrink-0 items-center gap-3 rounded-xl border px-3 py-2 shadow-sm transition-colors md:inline-flex ${tallyHeaderToneClass}`}>
               <div className="flex min-w-0 items-center gap-2">
                 {refreshingTallyHeader ? (
-                  <Loader2 className="h-4 w-4 shrink-0 animate-spin text-slate-500" />
+                  <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[#8a7f72]" />
                 ) : tallyVoucherVerified || tallyCompanyContextVerified ? (
-                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-[#2d6a4f]" />
                 ) : (
-                  <ShieldAlert className="h-4 w-4 shrink-0 text-amber-700" />
+                  <ShieldAlert className="h-4 w-4 shrink-0 text-[#b45309]" />
                 )}
                 <div className="min-w-0">
                   <div className={`text-xs font-bold ${
                     tallyVoucherVerified || tallyCompanyContextVerified
-                      ? "text-emerald-950"
+                      ? "text-[#1b4332]"
                       : tallyHeaderState?.selectedConnectionId
-                        ? "text-amber-950"
-                        : "text-slate-950"
+                        ? "text-[#78350f]"
+                        : "text-[#111827]"
                   }`}>{tallyHeaderTitle}</div>
                   <div
                     className={`mt-0.5 max-w-[285px] truncate text-[11px] font-semibold ${
                       tallyVoucherVerified || tallyCompanyContextVerified
-                        ? "text-emerald-700"
+                        ? "text-[#2d6a4f]"
                         : tallyHeaderState?.selectedConnectionId
-                          ? "text-amber-700"
-                          : "text-slate-400"
+                          ? "text-[#b45309]"
+                          : "text-[#b5aaa0]"
                     }`}
                     title={tallyVoucherVerified
                       ? `Supplier invoice ${tallyHeaderState?.invoiceNumber || "—"} was verified in Tally.`
@@ -1203,12 +1221,12 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
 
         {/* Error State */}
         {status === "error" && (
-          <div className="p-4 sm:p-8 flex-1">
-            <div className="mx-auto flex max-w-2xl items-start gap-4 rounded-xl border border-red-200 bg-white p-6 shadow-sm">
-              <ShieldAlert className="h-6 w-6 shrink-0 text-red-500" />
+          <div className="flex-1 bg-[#f7f4ef] p-4 sm:p-8">
+            <div className="mx-auto flex max-w-2xl items-start gap-4 rounded-xl border border-rose-200 bg-white p-6 shadow-sm">
+              <ShieldAlert className="h-6 w-6 shrink-0 text-rose-500" />
               <div>
-                <h3 className="text-lg font-medium text-slate-900">Unable to load review</h3>
-                <p className="mt-1 text-sm text-slate-500">{error}</p>
+                <h3 className="text-lg font-bold tracking-tight text-[#111827]">Unable to load review</h3>
+                <p className="mt-1 text-xs font-normal text-[#8a7f72]">{error}</p>
               </div>
             </div>
           </div>
@@ -1216,128 +1234,98 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
 
         {/* Main Content Layout */}
         {status === "ready" && detail && (
-          <div className="flex flex-1 flex-col lg:flex-row min-h-0 overflow-hidden">
+          <div className="flex flex-1 flex-col lg:flex-row min-h-0 overflow-hidden bg-[#f7f4ef]">
 
-            {/* Grouped issue navigation */}
-            <aside className="flex min-h-0 shrink-0 flex-col border-b border-slate-200 bg-white lg:w-72 lg:border-b-0 lg:border-r">
+            {/* Grouped issue navigation - warm palette */}
+            <aside className="flex min-h-0 shrink-0 flex-col border-b border-[#e0d8cc] bg-white lg:w-60 lg:border-b-0 lg:border-r">
 
               {/* Desktop Only: Case Meta Summary */}
               <div className="hidden">
                 <div className="flex items-center gap-2 mb-4">
-                  <h2 className="text-sm font-medium text-slate-800">Case Summary</h2>
+                  <h2 className="text-xs font-semibold tracking-wide text-[#3d3530]">Case Summary</h2>
                 </div>
                 <div className="space-y-3">
                   <div>
-                    <p className="text-xs font-medium text-slate-500">Receiver</p>
-                    <p className="text-sm font-medium text-slate-900 truncate" title={detail.case.receiverName || "—"}>
+                    <p className="text-xs font-semibold text-[#8a7f72]">Receiver</p>
+                    <p className="text-[13px] font-medium text-[#111827] truncate" title={detail.case.receiverName || "—"}>
                       {detail.case.receiverName || "—"}
                     </p>
                   </div>
                   <div className="flex items-center justify-between">
                     <div>
-                      <p className="text-xs font-medium text-slate-500">Documents</p>
-                      <p className="text-sm font-medium text-slate-900">{detail.documents.length}</p>
+                      <p className="text-xs font-semibold text-[#8a7f72]">Documents</p>
+                      <p className="text-[13px] font-medium text-[#111827]">{detail.documents.length}</p>
                     </div>
                     <div>
-                      <p className="text-xs font-medium text-amber-600">Pending</p>
-                      <p className="text-sm font-medium text-amber-700">{pendingMismatchCount}</p>
+                      <p className="text-xs font-semibold text-[#8a7f72]">Pending</p>
+                      <p className="text-[13px] font-semibold text-[#78350f]">{pendingMismatchCount}</p>
                     </div>
                   </div>
                 </div>
               </div>
 
               <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-white">
-                <div className="border-b border-slate-100 px-4 py-3 lg:px-5">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <h3 className="text-sm font-medium text-slate-900">Review groups</h3>
-                      <p className="mt-0.5 text-xs text-slate-500">
-                        {detail.documents.length} documents - {visibleMismatches.length} issues
-                      </p>
-                    </div>
-                    <div className="text-right text-xs text-slate-500">
-                      <div>Pending {pendingMismatchCount}</div>
-                      <div>
-                        Accepted {acceptedMismatchCount} - Rejected {rejectedMismatchCount}
-                      </div>
-                    </div>
-                  </div>
+                <div className="border-b border-[#ece6dc] bg-[#fbfaf8] px-4 py-3">
+                  <h3 className="text-xs font-semibold tracking-wide text-[#3d3530]">Review</h3>
+                  <p className="mt-0.5 text-xs font-normal text-[#8a7f72]">
+                    {visibleMismatches.length === 0 ? "No issues" : `${acceptedMismatchCount + rejectedMismatchCount} of ${visibleMismatches.length} done · ${pendingMismatchCount} left`}
+                  </p>
                 </div>
 
-                {hasInvoice ? (
-                  <div className="border-b border-slate-100 p-3 lg:px-4">
-                    <button
-                      className={`flex w-full items-center gap-3 rounded-lg border px-3 py-3 text-left transition ${
-                        reviewMode === "tally"
-                          ? "border-emerald-200 bg-emerald-50 text-emerald-950"
-                          : "border-slate-200 bg-white text-slate-900 hover:bg-slate-50"
-                      }`}
-                      onClick={() => setReviewMode("tally")}
-                      type="button"
-                    >
-                      <span className={`grid h-8 w-8 place-items-center rounded-md ${
-                        reviewMode === "tally" ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-600"
-                      }`}>
-                        <Database className="h-4 w-4" />
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span className="block text-sm font-medium">Tally Purchase voucher</span>
-                        <span className="mt-0.5 block text-xs text-slate-500">Separate review and posting approval</span>
-                      </span>
-                      <ChevronDown className={`h-4 w-4 -rotate-90 ${reviewMode === "tally" ? "text-emerald-600" : "text-slate-400"}`} />
-                    </button>
+                {hasInvoice && (
+                  <div className="border-b border-[#ece6dc] bg-white p-2">
+                    <div className="grid grid-cols-2 gap-1 rounded-lg border border-[#e0d8cc] bg-[#ede6d9]/60 p-1">
+                      <button
+                        type="button"
+                        onClick={() => setReviewMode("mismatches")}
+                        className={`rounded-md px-2.5 py-1.5 text-xs font-semibold transition ${reviewMode === "mismatches" ? "bg-white text-[#111827] shadow-sm" : "text-[#6b5d50] hover:text-[#111827]"}`}
+                      >
+                        Issues{visibleMismatches.length ? ` · ${pendingMismatchCount}` : ""}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setReviewMode("tally")}
+                        className={`rounded-md px-2.5 py-1.5 text-xs font-semibold transition flex items-center justify-center gap-1 ${reviewMode === "tally" ? "bg-white text-[#111827] shadow-sm" : "text-[#6b5d50] hover:text-[#111827]"}`}
+                      >
+                        <Database className="h-3.5 w-3.5" /> Tally
+                      </button>
+                    </div>
                   </div>
-                ) : null}
+                )}
 
                 {visibleMismatches.length === 0 ? (
-                  <div className="p-5 text-sm text-slate-500">No conflicting values found.</div>
+                  <div className="p-5 text-xs font-normal text-[#8a7f72]">All clear — no issues to review.</div>
                 ) : (
-                  <div className="flex min-h-0 flex-1 gap-2 overflow-x-auto p-3 lg:block lg:space-y-1 lg:overflow-x-hidden lg:overflow-y-auto lg:p-4 lg:pb-20">
+                  <div className="flex min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
                     {mismatchGroups.map((group) => {
                       const isExpanded = expandedGroupKeys.has(group.key);
-                      const isActiveGroup = activeGroupKey === group.key;
 
                       return (
-                        <section key={group.key} className="min-w-[260px] shrink-0 lg:min-w-0">
+                        <section key={group.key} className="border-b border-[#f0ece4] last:border-0">
+                          {/* Group header: compact bar, distinct from child rows */}
                           <button
-                            className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition ${
-                              isActiveGroup ? "bg-slate-100" : "hover:bg-slate-50"
-                            }`}
+                            className="flex w-full items-center gap-2 px-3 py-1.5 text-left bg-[#fbfaf8] hover:bg-[#f0ece6] transition border-b border-[#f0ece4]/60"
                             onClick={() => handleToggleGroup(group.key)}
                             type="button"
+                            aria-expanded={isExpanded}
+                            aria-label={`${group.label} — ${group.pending} pending, ${group.mismatches.length} total. Click to ${isExpanded ? "collapse" : "expand"}`}
                           >
-                            <span
-                              className={`h-2 w-2 shrink-0 rounded-full ${
-                                group.pending > 0 ? "bg-amber-500" : "bg-emerald-500"
-                              }`}
-                            />
-                            <span className="min-w-0 flex-1">
-                              <span className="block break-words text-sm font-medium leading-5 text-slate-950">
-                                {group.label}
-                              </span>
-                              <span className="mt-0.5 block text-xs text-slate-500">
-                                {group.pending > 0 ? `${group.pending} to review` : "All matched"}
-                              </span>
+                            <span className={`h-1 w-1 shrink-0 rounded-full ${group.pending > 0 ? "bg-[#b45309]" : "bg-[#2d6a4f]"}`} />
+                            <span className="min-w-0 flex-1 flex items-center gap-1.5">
+                              <span className="text-[11px] font-bold uppercase tracking-wide text-[#3d3530] leading-none">{group.label}</span>
+                              <span className="text-[11px] font-normal text-[#8a7f72] leading-none">· {group.pending > 0 ? `${group.pending} to do` : "Done"} · {group.mismatches.length}</span>
                             </span>
-                            <span className="shrink-0 text-xs text-slate-500">
-                              {group.mismatches.length}
-                            </span>
-                            <ChevronDown
-                              className={`h-4 w-4 shrink-0 text-slate-400 transition ${
-                                isExpanded ? "rotate-180" : ""
-                              }`}
-                            />
+                            <span className="text-[11px] font-medium text-[#8a7f72] tabular-nums leading-none">{group.pending > 0 ? `${group.pending}` : "✓"}</span>
+                            <ChevronDown className={`h-3 w-3 shrink-0 text-[#b5aaa0] transition ${isExpanded ? "rotate-180" : ""}`} />
                           </button>
 
-                          {isExpanded ? (
-                            <div className="mt-1 space-y-1 pl-5">
+                          {isExpanded && (
+                            <div className="bg-white border-t border-[#ece6dc]">
                               {group.mismatches.map((mismatch) => {
                                 const isActive = activeMismatchId === mismatch.id;
                                 const isPending = mismatch.resolutionStatus === "pending";
                                 const isSelected = selectedMismatchIds.has(mismatch.id);
-                                const itemLabel = isLineItemMismatchField(mismatch.fieldName)
-                                  ? getLineItemLabel(mismatch)
-                                  : null;
+                                const itemLabel = isLineItemMismatchField(mismatch.fieldName) ? getLineItemLabel(mismatch) : null;
                                 const mismatchEvidence = buildMismatchEvidence(mismatch, documentLookup);
                                 const issueLabel = getIssueDisplayTitle(mismatch, mismatchEvidence);
                                 const issueDetail = getIssueListDetail(mismatch, mismatchEvidence);
@@ -1345,30 +1333,19 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                                 return (
                                   <div
                                     key={mismatch.id}
-                                    className={`flex items-center gap-2 rounded-lg px-2.5 py-2 transition ${
-                                      isActive ? "bg-[#eef2ff]" : "hover:bg-slate-50"
-                                    }`}
+                                    className={`flex items-start gap-2.5 py-2.5 pr-3 transition border-l-2 ${isActive ? "border-[#2b1a10] bg-[#ede6d9]/35" : "border-transparent hover:bg-[#f7f4ef]"} ${isSelected && !isActive ? "bg-[#fbfaf8]" : ""}`}
+                                    style={{ paddingLeft: "28px" }}
                                   >
                                     {isPending && !isCaseFinal ? (
                                       <input
                                         aria-label={`Select ${issueLabel}`}
                                         checked={isSelected}
-                                        className="h-4 w-4 shrink-0 rounded border-slate-300 accent-emerald-600"
-                                        onChange={(event) => {
-                                          event.stopPropagation();
-                                          handleToggleSelectedMismatch(mismatch.id);
-                                        }}
-                                        onClick={(event) => event.stopPropagation()}
+                                        className="mt-0.5 h-3.5 w-3.5 shrink-0 rounded border-[#c4b9ad] accent-[#2b1a10]"
+                                        onChange={() => handleToggleSelectedMismatch(mismatch.id)}
                                         type="checkbox"
                                       />
                                     ) : (
-                                      <span
-                                        className={`h-2 w-2 shrink-0 rounded-full ${
-                                          mismatch.resolutionStatus === "accepted"
-                                            ? "bg-emerald-500"
-                                            : "bg-rose-500"
-                                        }`}
-                                      />
+                                      <span className={`mt-1.5 h-1 w-1 shrink-0 rounded-full ${mismatch.resolutionStatus === "accepted" ? "bg-[#2d6a4f]" : mismatch.resolutionStatus === "rejected" ? "bg-[#b91c1c]" : "bg-[#b45309]"}`} />
                                     )}
                                     <button
                                       className="min-w-0 flex-1 text-left"
@@ -1378,23 +1355,15 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                                       }}
                                       type="button"
                                     >
-                                      {itemLabel ? (
-                                        <span className="block break-words text-xs leading-4 text-slate-500">
-                                          {itemLabel}
-                                        </span>
-                                      ) : null}
-                                      <span className="block break-words text-sm font-medium leading-5 text-slate-900">
-                                        {issueLabel}
-                                      </span>
-                                      <span className="block break-words text-xs leading-4 text-slate-500">
-                                        {issueDetail}
-                                      </span>
+                                      {itemLabel ? <span className="block text-[10px] font-normal text-[#8a7f72] leading-3">{itemLabel}</span> : null}
+                                      <span className={`block text-[12px] leading-4 ${isActive ? "font-semibold text-[#111827]" : "font-normal text-[#3d3530]"}`}>{issueLabel}</span>
+                                      <span className="block text-[11px] font-normal text-[#8a7f72] leading-3 mt-0.5 truncate">{issueDetail}</span>
                                     </button>
                                   </div>
                                 );
                               })}
                             </div>
-                          ) : null}
+                          )}
                         </section>
                       );
                     })}
@@ -1403,84 +1372,73 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
               </div>
             </aside>
 
-            {/* Main Detail Content */}
-            <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
+            {/* Main Detail Content - warm palette */}
+            <main className="flex min-h-0 flex-1 flex-col overflow-hidden bg-[#f7f4ef]">
               <div className="flex-1 overflow-y-auto">
-                {reviewMode === "tally" ? (
-                  <TallyPurchasePostingPanel
-                    caseId={caseId}
-                    onApprovePacket={
-                      detail.case.status === "completed" &&
-                      pendingMismatchCount === 0 &&
-                      rejectedMismatchCount === 0
-                        ? handleApprovePacketFromTally
-                        : undefined
-                    }
-                    onHeaderStateChange={setTallyHeaderState}
-                    onRefreshReady={(refresh) => {
-                      tallyPurchaseRefreshRef.current = refresh;
-                    }}
-                  />
-                ) : (
-                <div className="mx-auto max-w-4xl p-3 sm:p-4 lg:p-5">
+                {tallyOpened ? (
+                  <div className={reviewMode === "tally" ? "contents" : "hidden"} aria-hidden={reviewMode !== "tally"}>
+                    <TallyPurchasePostingPanel
+                      caseId={caseId}
+                      onApprovePacket={
+                        detail.case.status === "completed" &&
+                        pendingMismatchCount === 0 &&
+                        rejectedMismatchCount === 0
+                          ? handleApprovePacketFromTally
+                          : undefined
+                      }
+                      onHeaderStateChange={setTallyHeaderState}
+                      onRefreshReady={(refresh) => {
+                        tallyPurchaseRefreshRef.current = refresh;
+                      }}
+                    />
+                  </div>
+                ) : null}
+                {reviewMode === "mismatches" ? (
+                <div className="mx-auto w-full max-w-6xl px-4 py-3 sm:px-6 sm:py-4 lg:px-8">
                   {visibleMismatches.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center rounded-2xl bg-white border border-slate-200 p-12 text-center shadow-sm mt-8">
-                      <div className="h-16 w-16 rounded-full bg-emerald-100 flex items-center justify-center mb-4">
-                        <CheckCircle2 className="h-8 w-8 text-emerald-600" />
+                    <div className="flex flex-col items-center justify-center rounded-2xl border border-[#e0d8cc] bg-white p-12 text-center shadow-sm mt-8">
+                      <div className="mb-4 flex h-11 w-11 items-center justify-center rounded-xl border border-[#ded8d0] bg-[#fbfaf8] text-[#2d6a4f]">
+                        <CheckCircle2 className="h-6 w-6" />
                       </div>
-                      <h2 className="text-2xl font-medium text-slate-900">All clear</h2>
-                      <p className="mt-2 text-slate-500">
+                      <h2 className="text-lg font-bold tracking-tight text-[#111827]">All clear</h2>
+                      <p className="mt-1 text-xs font-normal text-[#8a7f72]">
                         No value conflicts were found across the documents in this case.
                       </p>
                     </div>
                   ) : activeMismatch ? (
-                    <article className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-                      <div className="border-b border-slate-100 px-4 py-3 sm:px-5">
+                    <article className="min-w-0">
+                      <div className="border-b border-[#ded8d0] py-3">
                         <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                           <div className="min-w-0">
-                            <div className="mb-1 flex flex-wrap items-center gap-1.5 text-xs text-slate-600">
-                              <span>{activeGroup?.label ?? "Review group"}</span>
-                              <span className="text-slate-300">/</span>
-                              <span>{activeIssueModeLabel}</span>
-                              {activeDocumentSummary ? (
-                                <>
-                                  <span className="text-slate-300">/</span>
-                                  <span>{activeDocumentSummary}</span>
-                                </>
-                              ) : null}
-                              <span className="hidden">
-                                {activeEvidence
-                                  .map((evidence) => getEvidenceDocumentRole(evidence.document))
-                                  .filter((value, index, values) => values.indexOf(value) === index)
-                                  .join(" ↔ ") || "Documents involved"}
-                              </span>
+                            <div className="mb-1 flex flex-wrap items-center gap-1.5 text-xs font-normal text-[#8a7f72]">
+                              <span>{(activeGroup?.label ?? "Review group").replace(" / ", " & ")}</span>
                             </div>
-                            <h2 className="text-lg font-medium tracking-tight text-slate-950 sm:text-xl">
+                            <h2 className="text-lg font-bold tracking-tight text-[#111827] sm:text-xl">
                               {activeIssueDisplayTitle}
                             </h2>
                           </div>
-                          <Badge
-                            variant="outline"
-                            className={`w-fit rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${getMismatchResolutionClassName(activeMismatch.resolutionStatus)}`}
+                          <span
+                            className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium shadow-sm ${getMismatchResolutionClassName(activeMismatch.resolutionStatus)}`}
                           >
+                            <span className={`h-1.5 w-1.5 rounded-full ${activeMismatch.resolutionStatus === "accepted" ? "bg-[#2d6a4f]" : activeMismatch.resolutionStatus === "rejected" ? "bg-[#b91c1c]" : "bg-[#b45309]"}`} />
                             {getMismatchResolutionLabel(activeMismatch.resolutionStatus)}
-                          </Badge>
+                          </span>
                         </div>
 
-                        {activeIssueHint ? (
-                          <div className="mt-3 rounded-lg bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-700">
+                        {activeIssueHint && isActiveMismatchPending ? (
+                          <div className="mt-3 border-l-2 border-[#cdbfae] py-0.5 pl-3 text-xs font-normal leading-5 text-[#5b4b3d]">
                             {activeIssueHint}
                           </div>
                         ) : null}
                       </div>
 
                       {activeIsSingleDocumentIssue ? (
-                        <div className="space-y-3 p-4 sm:p-5">
-                          <div className="rounded-lg border border-red-100 bg-red-50/70 p-3">
-                            <div className="text-xs font-medium text-red-700">
+                        <div className="space-y-4 py-4">
+                          <div className="border-y border-[#f2c7c4] bg-[#fbf0ef] px-3 py-3">
+                            <div className="text-xs font-semibold text-[#8c1d18]">
                               {activeTaxValidationIssue ? "Tax check failed" : "Issue found"}
                             </div>
-                            <div className="mt-1.5 text-sm leading-5 text-red-950">
+                            <div className="mt-1.5 text-[13px] font-medium leading-5 text-[#8c1d18]">
                               {activeTaxValidationIssue
                                 ? activeTaxValidationIssue.summary
                                 : formatMismatchValue(
@@ -1492,27 +1450,27 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                             {activeTaxValidationIssue ? (
                               <>
                                 <div className="mt-3 grid gap-2 sm:grid-cols-4">
-                                  <div className="rounded-md bg-white/80 px-2.5 py-2">
-                                    <div className="text-[10px] font-medium text-red-700/70">Taxable</div>
-                                    <div className="mt-0.5 text-sm text-red-950">
+                                  <div className="rounded-md bg-white px-2.5 py-2">
+                                    <div className="text-[10px] font-semibold tracking-wide text-[#8a7f72]">Taxable</div>
+                                    <div className="mt-0.5 text-[13px] font-medium text-[#111827]">
                                       {formatTaxAmount(activeTaxValidationIssue.taxableAmount)}
                                     </div>
                                   </div>
-                                  <div className="rounded-md bg-white/80 px-2.5 py-2">
-                                    <div className="text-[10px] font-medium text-red-700/70">Expected tax</div>
-                                    <div className="mt-0.5 text-sm text-red-950">
+                                  <div className="rounded-md bg-white px-2.5 py-2">
+                                    <div className="text-[10px] font-semibold tracking-wide text-[#8a7f72]">Expected tax</div>
+                                    <div className="mt-0.5 text-[13px] font-medium text-[#111827]">
                                       {formatTaxAmount(activeTaxValidationIssue.expectedTax)}
                                     </div>
                                   </div>
-                                  <div className="rounded-md bg-white/80 px-2.5 py-2">
-                                    <div className="text-[10px] font-medium text-red-700/70">Extracted tax</div>
-                                    <div className="mt-0.5 text-sm text-red-950">
+                                  <div className="rounded-md bg-white px-2.5 py-2">
+                                    <div className="text-[10px] font-semibold tracking-wide text-[#8a7f72]">Extracted tax</div>
+                                    <div className="mt-0.5 text-[13px] font-medium text-[#111827]">
                                       {formatTaxAmount(activeTaxValidationIssue.actualTax)}
                                     </div>
                                   </div>
-                                  <div className="rounded-md bg-white/80 px-2.5 py-2">
-                                    <div className="text-[10px] font-medium text-red-700/70">Difference</div>
-                                    <div className="mt-0.5 text-sm text-red-950">
+                                  <div className="rounded-md bg-white px-2.5 py-2">
+                                    <div className="text-[10px] font-semibold tracking-wide text-[#8a7f72]">Difference</div>
+                                    <div className="mt-0.5 text-[13px] font-medium text-[#111827]">
                                       {activeTaxValidationIssue.difference === null
                                         ? "-"
                                         : `${formatTaxAmount(Math.abs(activeTaxValidationIssue.difference))} ${
@@ -1522,7 +1480,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                                   </div>
                                 </div>
                                 {(activeTaxValidationIssue.rule || activeTaxValidationIssue.condition) && (
-                                  <div className="mt-2 rounded-md bg-white/70 px-2.5 py-1.5 text-[11px] leading-4 text-red-900/80">
+                                  <div className="mt-2 rounded-md bg-white px-2.5 py-1.5 text-[11px] font-normal leading-4 text-[#5b4b3d]">
                                     {activeTaxValidationIssue.condition ? (
                                       <span>{activeTaxValidationIssue.condition}. </span>
                                     ) : null}
@@ -1535,17 +1493,17 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                             ) : null}
                           </div>
 
-                          <div className="grid gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm sm:grid-cols-2">
+                          <div className="grid gap-2 border-y border-[#e0d8cc] px-3 py-2 text-[13px] sm:grid-cols-2">
                             <div className="min-w-0">
-                              <span className="mr-2 text-xs font-medium text-slate-500">Document</span>
-                              <span className="text-slate-900">
+                              <span className="mr-2 text-xs font-semibold text-[#8a7f72]">Document</span>
+                              <span className="font-medium text-[#111827]">
                                 {getEvidenceDocumentRole(activeEvidence[0]?.document)}
                               </span>
                             </div>
                             <div className="min-w-0">
-                              <span className="mr-2 text-xs font-medium text-slate-500">Source</span>
+                              <span className="mr-2 text-xs font-semibold text-[#8a7f72]">Source</span>
                               <span
-                                className="inline-block max-w-full truncate align-bottom text-slate-900"
+                                className="inline-block max-w-full truncate align-bottom font-medium text-[#111827]"
                                 title={getDocumentSourceLabel(activeEvidence[0]?.document)}
                               >
                                 {getCompactSourceLabel(activeEvidence[0]?.document)}
@@ -1554,15 +1512,15 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                           </div>
 
                           {activeSingleIssueRows.length > 0 ? (
-                            <div className="rounded-lg border border-slate-200 bg-white">
-                              <div className="border-b border-slate-100 px-3 py-2 text-xs font-medium text-slate-500">
+                            <div className="border-y border-[#e0d8cc]">
+                              <div className="border-b border-[#ece6dc] bg-[#fbfaf8] px-3 py-2 text-xs font-semibold text-[#3d3530]">
                                 Useful context
                               </div>
-                              <div className="divide-y divide-slate-100">
+                              <div className="divide-y divide-[#ece6dc]">
                                 {activeSingleIssueRows.map((row) => (
                                   <div key={row.key} className="grid gap-2 px-3 py-2 text-xs sm:grid-cols-[180px_1fr]">
-                                    <div className="text-slate-500">{row.label}</div>
-                                    <div className="text-slate-900">{displayValue(row.value)}</div>
+                                    <div className="font-normal text-[#8a7f72]">{row.label}</div>
+                                    <div className="font-medium text-[#111827]">{displayValue(row.value)}</div>
                                   </div>
                                 ))}
                               </div>
@@ -1570,14 +1528,17 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                           ) : null}
                         </div>
                       ) : (
-                        <div className="overflow-x-auto p-5 sm:p-6">
-                          <table className="w-full min-w-[640px] border-collapse text-left text-sm">
+                        <div className="overflow-x-auto border-b border-[#ded8d0]">
+                          <table className="w-full min-w-[640px] border-collapse text-left text-[13px]">
                             <thead>
-                              <tr className="border-b border-slate-200 text-xs font-medium tracking-wide text-slate-500">
+                              <tr className="border-b border-[#e0d8cc] bg-transparent text-xs font-semibold tracking-wide text-[#3d3530]">
                                 <th className="w-44 px-3 py-3">Field</th>
                                 {activeEvidence.map((evidence) => (
-                                  <th key={evidence.key} className="px-3 py-3">
-                                    <div className="max-w-[220px] truncate">
+                                  <th
+                                    key={evidence.key}
+                                    className="w-36 min-w-[9rem] max-w-[10rem] px-3 py-3 align-bottom"
+                                  >
+                                    <div className="whitespace-normal break-words leading-4">
                                       {getEvidenceDocumentRole(evidence.document)}
                                     </div>
                                   </th>
@@ -1585,19 +1546,21 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                               </tr>
                             </thead>
                             <tbody>
-                              <tr className="border-b border-red-100 bg-red-50/70">
-                                <td className="border-l-4 border-red-500 px-3 py-3 font-medium text-slate-700">
-                                  {activeFieldLabel}
+                              <tr className="border-b border-[#f2c7c4] bg-[#fbf0ef]">
+                                <td className="border-l-4 border-[#b91c1c] px-3 py-3 font-semibold text-[#3d3530]">
+                                  Compared value
                                 </td>
                                 {activeEvidence.map((evidence) => (
-                                  <td key={evidence.key} className="px-3 py-3 font-medium text-red-900">
-                                    {formatMismatchValue(
-                                      activeMismatch.fieldName,
-                                      evidence.value,
-                                      getEvidenceDocumentRole(evidence.document)
-                                    )}
-                                    <div className="mt-1 max-w-[220px] truncate text-xs font-normal text-red-700/70">
-                                      {getDocumentSourceLabel(evidence.document)}
+                                  <td key={evidence.key} className="max-w-[10rem] break-words px-3 py-3 align-top font-semibold text-[#8c1d18]">
+                                    <span className="break-all">
+                                      {formatMismatchValue(
+                                        activeMismatch.fieldName,
+                                        evidence.value,
+                                        getEvidenceDocumentRole(evidence.document)
+                                      )}
+                                    </span>
+                                    <div className="mt-1 whitespace-nowrap text-[11px] font-normal text-[#8a7f72]">
+                                      {getDocumentPageLabel(evidence.document)}
                                     </div>
                                   </td>
                                 ))}
@@ -1617,13 +1580,13 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                                       .find((row) => row.key === contextKey)?.label ?? getFieldLabel(contextKey);
 
                                   return (
-                                    <tr key={contextKey} className="border-b border-slate-100">
-                                      <td className="px-3 py-3 font-medium text-slate-600">{label}</td>
+                                    <tr key={contextKey} className="border-b border-[#ece6dc]">
+                                      <td className="px-3 py-3 font-semibold text-[#3d3530]">{label}</td>
                                       {activeEvidence.map((evidence) => {
                                         const row = evidence.contextRows.find((entry) => entry.key === contextKey);
                                         return (
-                                          <td key={`${evidence.key}-${contextKey}`} className="px-3 py-3 text-slate-800">
-                                            {row ? displayValue(row.value) : <span className="text-slate-300">-</span>}
+                                          <td key={`${evidence.key}-${contextKey}`} className="max-w-[10rem] break-all px-3 py-3 font-normal text-[#111827]">
+                                            {row ? displayValue(row.value) : <span className="text-[#b5aaa0]">—</span>}
                                           </td>
                                         );
                                       })}
@@ -1635,53 +1598,60 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                         </div>
                       )}
 
-                      <div className="border-t border-slate-100 px-4 py-2.5 text-xs text-slate-500 sm:px-5">
-                        Deciding: <span className="font-medium text-slate-800">{activeIssueDisplayTitle}</span>
-                      </div>
                     </article>
                   ) : (
-                    <div className="flex h-[400px] items-center justify-center text-center text-sm text-slate-500">
+                    <div className="flex h-[400px] items-center justify-center text-center text-xs font-normal text-[#8a7f72]">
                       Select an issue from the list to review conflicting values.
                     </div>
                   )}
                 </div>
-                )}
+                ) : null}
               </div>
 
-              {reviewMode === "mismatches" && visibleMismatches.length > 0 && activeMismatch && (
-                <footer className="z-20 shrink-0 border-t border-slate-200 bg-white/95 px-4 py-3 shadow-[0_-8px_24px_rgba(15,23,42,0.08)] backdrop-blur sm:px-6 lg:px-8">
+              {reviewMode === "mismatches" && visibleMismatches.length > 0 && activeMismatch && !isCaseFinal && (
+                <footer className="z-20 shrink-0 border-t border-[#e0d8cc] bg-[#fbfaf8]/95 px-4 py-3 shadow-[0_-8px_24px_rgba(45,36,28,0.06)] backdrop-blur sm:px-6 lg:px-8">
                   <div className="mx-auto flex max-w-5xl flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <div className="min-w-0">
-	                      <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500">
-	                        <span>
-	                          Pending <span className="font-medium text-slate-800">{pendingMismatchCount}</span>
-                        </span>
-                        <span>
-                          Accepted <span className="font-medium text-emerald-700">{acceptedMismatchCount}</span>
-                        </span>
-	                        <span>
-	                          Rejected <span className="font-medium text-rose-700">{rejectedMismatchCount}</span>
-	                        </span>
-	                        <span>
-	                          Selected <span className="font-medium text-slate-800">{selectedPendingMismatchIds.length}</span>
-	                        </span>
-	                      </div>
-                      {decisionStatus === "error" && decisionError && (
-                        <div className="mt-1 text-xs font-medium text-rose-700">{decisionError}</div>
-                      )}
-                      {detail.case.status === "accepted" && (
-                        <div className="mt-1 text-xs font-medium text-emerald-700">
-                          All issues are accepted. This case has been accepted automatically.
-                        </div>
-                      )}
-                      {!isActiveMismatchPending && (
-                        <div
-                          className={`mt-1 text-xs font-medium ${activeMismatch.resolutionStatus === "accepted" ? "text-emerald-700" : "text-rose-700"}`}
+                      <div className="flex items-center gap-2.5">
+                        <span
+                          className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full ${
+                            detail.case.status === "accepted"
+                              ? "bg-[#eaf7f0] text-[#1b4332]"
+                              : detail.case.status === "rejected"
+                                ? "bg-[#fbefee] text-[#8c1d18]"
+                                : "bg-[#f1ece4] text-[#5f554b]"
+                          }`}
+                          aria-hidden="true"
                         >
-                          {activeMismatch.resolutionStatus === "accepted"
-                            ? "This issue is accepted."
-                            : "This issue is rejected."}
+                          {detail.case.status === "accepted" ? (
+                            <Check className="h-3.5 w-3.5" />
+                          ) : detail.case.status === "rejected" ? (
+                            <X className="h-3.5 w-3.5" />
+                          ) : (
+                            <span className="text-[11px] font-semibold">{pendingMismatchCount}</span>
+                          )}
+                        </span>
+                        <div className="min-w-0">
+                          <div className="text-xs font-semibold text-[#2d2722]">
+                            {detail.case.status === "accepted"
+                              ? "Review complete"
+                              : detail.case.status === "rejected"
+                                ? "Case rejected"
+                                : selectedPendingMismatchIds.length > 0
+                                  ? `${selectedPendingMismatchIds.length} selected`
+                                  : `${pendingMismatchCount} ${pendingMismatchCount === 1 ? "issue" : "issues"} to review`}
+                          </div>
+                          <div className="mt-0.5 text-[11px] text-[#8a7f72]">
+                            {detail.case.status === "accepted"
+                              ? `${acceptedMismatchCount} ${acceptedMismatchCount === 1 ? "issue" : "issues"} accepted`
+                              : detail.case.status === "rejected"
+                                ? `${rejectedMismatchCount} rejected · ${acceptedMismatchCount} accepted`
+                                : `${acceptedMismatchCount} accepted · ${rejectedMismatchCount} rejected`}
+                          </div>
                         </div>
+                      </div>
+                      {decisionStatus === "error" && decisionError && (
+                        <div className="mt-1 text-xs font-medium text-[#8c1d18]">{decisionError}</div>
                       )}
                     </div>
 
@@ -1689,7 +1659,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                       {selectedPendingMismatchIds.length > 0 && !isCaseFinal ? (
                         <>
                           <Button
-                            className="border-slate-200 text-slate-600 hover:bg-slate-50"
+                            className="rounded-lg border-[#ded8d0] bg-[#fbfaf8] text-xs font-medium text-[#3d3530] hover:bg-[#ede6d9] shadow-sm"
                             disabled={decisionStatus === "updating"}
                             onClick={handleClearSelected}
                             variant="outline"
@@ -1698,7 +1668,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                           </Button>
                           <Button
                             variant="outline"
-                            className="border-rose-200 text-rose-700 hover:bg-rose-50 hover:text-rose-800"
+                            className="rounded-lg border-[#f2c7c4] bg-[#fbf0ef] text-xs font-medium text-[#8c1d18] hover:bg-[#f2c7c4]/50 shadow-sm"
                             disabled={decisionStatus === "updating"}
                             onClick={() => {
                               void handleBulkMismatchDecision("rejected");
@@ -1712,7 +1682,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                             Reject Selected
                           </Button>
                           <Button
-                            className="bg-emerald-600 text-white hover:bg-emerald-700"
+                            className="rounded-lg bg-[#2b1a10] text-xs font-medium text-white hover:bg-[#3b271a] shadow-sm"
                             disabled={decisionStatus === "updating"}
                             onClick={() => {
                               void handleBulkMismatchDecision("accepted");
@@ -1729,16 +1699,16 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                       ) : isActiveMismatchPending && !isCaseFinal ? (
 	                        <>
                           <Button
-                            className="border-slate-200 text-slate-600 hover:bg-slate-50"
+                            className="rounded-lg border-[#ded8d0] bg-[#fbfaf8] text-xs font-medium text-[#3d3530] hover:bg-[#ede6d9] shadow-sm"
                             disabled={decisionStatus === "updating" || pendingVisibleMismatchIds.length === 0}
                             onClick={handleSelectAllPending}
                             variant="outline"
                           >
                             Select all
                           </Button>
-	                          <Button
+ 	                          <Button
                             variant="outline"
-                            className="border-rose-200 text-rose-700 hover:bg-rose-50 hover:text-rose-800"
+                            className="rounded-lg border-[#f2c7c4] bg-[#fbf0ef] text-xs font-medium text-[#8c1d18] hover:bg-[#f2c7c4]/50 shadow-sm"
                             disabled={decisionStatus === "updating"}
                             onClick={() => handleMismatchDecision("rejected")}
                           >
@@ -1750,7 +1720,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                             Reject Issue
                           </Button>
                           <Button
-                            className="bg-emerald-600 text-white hover:bg-emerald-700"
+                            className="rounded-lg bg-[#2b1a10] text-xs font-medium text-white hover:bg-[#3b271a] shadow-sm"
                             disabled={decisionStatus === "updating"}
                             onClick={() => handleMismatchDecision("accepted")}
                           >
@@ -1762,14 +1732,14 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                             Accept Issue
                           </Button>
                         </>
-                      ) : (
-                        <Badge
-                          variant="outline"
-                          className={`rounded-full border px-2.5 py-1 text-[11px] font-medium uppercase tracking-wide ${getMismatchResolutionClassName(activeMismatch.resolutionStatus)}`}
+                      ) : !isCaseFinal ? (
+                        <span
+                          className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium uppercase tracking-wide ${getMismatchResolutionClassName(activeMismatch.resolutionStatus)}`}
                         >
+                          <span className={`h-1.5 w-1.5 rounded-full ${activeMismatch.resolutionStatus === "accepted" ? "bg-[#2d6a4f]" : "bg-[#b91c1c]"}`} />
                           {getMismatchResolutionLabel(activeMismatch.resolutionStatus)}
-                        </Badge>
-                      )}
+                        </span>
+                      ) : null}
                     </div>
                   </div>
                 </footer>

@@ -1,2 +1,3 @@
 @echo off
-"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" "%~dp0kalika-tally-bridge.iss"
+cd /d "%~dp0\..\.."
+node scripts\build-tally-connector-installer.mjs

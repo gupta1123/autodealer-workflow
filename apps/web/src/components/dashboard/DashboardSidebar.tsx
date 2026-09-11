@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   LayoutDashboard,
   FolderOpen,
@@ -19,23 +19,10 @@ import {
 } from "lucide-react";
 
 import styles from "./DashboardSidebar.module.css";
-import { apiFetch } from "@/lib/api-client";
-import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
-
-type TallyConnectionSummary = {
-  id: string;
-  bridgeConnected?: boolean;
-  tallyReachable?: boolean;
-  companyLoaded?: boolean;
-  lastCompanyName?: string | null;
-};
-
-type TallyStatus =
-  | "checking"
-  | "connected"
-  | "attention"
-  | "disconnected"
-  | "unavailable";
+import { useTallyIndicator } from '@/components/tally/TallyStatusProvider';
+import { useAccess } from '@/components/access/AccessProvider';
+import { canAccess } from '@autodealer/shared/lib/access';
+import { pagePermissions } from '@autodealer/shared/lib/access-routes';
 
 /* ── Sectioned nav ───────────────────────────── */
 const SIDEBAR_SECTIONS = [
@@ -91,76 +78,19 @@ export interface DashboardSidebarProps {
 
 export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSidebarProps) {
   const pathname = usePathname();
+  const {snapshot}=useAccess();
+  const visible=(href:string)=>!snapshot?.sharingEnabled||pagePermissions(href).length===0||pagePermissions(href).some(p=>canAccess(snapshot,p));
+  const sections=SIDEBAR_SECTIONS.map(section=>({...section,items:section.items.filter(item=>visible(item.href))})).filter(section=>section.items.length>0);
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
-  const [tallyStatus, setTallyStatus] = useState<TallyStatus>("checking");
-  const [tallyCompanyName, setTallyCompanyName] = useState<string | null>(null);
+  useEffect(() => setCollapsed(defaultCollapsed), [defaultCollapsed]);
+  const { status: tallyStatus, companyName: tallyCompanyName } = useTallyIndicator();
   const userRowRef = useRef<HTMLDivElement>(null);
 
-  const refreshTallyStatus = useCallback(async () => {
-    try {
-      const response = await apiFetch("/api/tally/connections", {
-        method: "GET",
-        cache: "no-store",
-      });
-      if (!response.ok) throw new Error("Could not read Tally status");
-
-      const payload = (await response.json()) as {
-        connections?: TallyConnectionSummary[];
-      };
-      const connections = payload.connections ?? [];
-      const preferredConnectionId = readPreferredTallyConnectionId();
-      const connection =
-        connections.find((item) => item.id === preferredConnectionId) ??
-        connections.find(
-          (item) =>
-            item.bridgeConnected === true &&
-            item.tallyReachable === true &&
-            item.companyLoaded === true,
-        ) ??
-        connections[0];
-
-      if (
-        connection?.bridgeConnected === true &&
-        connection.tallyReachable === true &&
-        connection.companyLoaded === true
-      ) {
-        setTallyStatus("connected");
-        setTallyCompanyName(connection.lastCompanyName ?? null);
-        return;
-      }
-
-      setTallyCompanyName(null);
-      setTallyStatus(
-        connection?.bridgeConnected === true
-          ? "attention"
-          : "disconnected",
-      );
-    } catch {
-      setTallyCompanyName(null);
-      setTallyStatus("unavailable");
-    }
-  }, []);
-
-  useEffect(() => {
-    void refreshTallyStatus();
-
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") void refreshTallyStatus();
-    }, 30_000);
-    const handleFocus = () => void refreshTallyStatus();
-    window.addEventListener("focus", handleFocus);
-
-    return () => {
-      window.clearInterval(timer);
-      window.removeEventListener("focus", handleFocus);
-    };
-  }, [refreshTallyStatus]);
-
-  const displayUser: UserInfo = user ?? {
+  const displayUser: UserInfo = user ?? (snapshot ? {name:snapshot.member.display_name,email:snapshot.member.email} : {
     name: "Admin",
     email: "admin@kalika.local",
-  };
+  });
 
   const initials = displayUser.name
     .split(" ")
@@ -191,7 +121,7 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
 
       {/* ── DESKTOP SECTIONED NAVIGATION ── */}
       <nav className={`${styles.navSection} ${styles.desktopNav}`}>
-        {SIDEBAR_SECTIONS.map((section) => (
+        {sections.map((section) => (
           <div key={section.id} className={styles.sectionGroup}>
             {!collapsed && <h3 className={styles.sectionHeader}>{section.title}</h3>}
             <ul className={styles.navList} role="list">
@@ -223,7 +153,7 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
       {/* ── MOBILE FLAT NAVIGATION ── */}
       <nav className={`${styles.navSection} ${styles.mobileNav}`}>
         <ul className={styles.navList} role="list">
-          {SIDEBAR_SECTIONS.flatMap((s) => s.items).map((item) => {
+          {sections.flatMap((s) => s.items).map((item) => {
             const active = isActivePath(pathname, item.href, item.exact);
             const Icon = item.icon;
             return (

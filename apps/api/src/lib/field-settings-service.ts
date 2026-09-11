@@ -117,6 +117,7 @@ export async function getPersistedPacketFieldConfiguration(
   const settings = await getFieldSettings(orgId);
 
   if (!settings) {
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true')throw new Error('Organization field configuration is unavailable.');
     return buildPacketFieldConfiguration();
   }
 

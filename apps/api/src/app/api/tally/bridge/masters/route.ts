@@ -1,4 +1,5 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import {accessFailureResponse} from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import {
   hashSecret,
@@ -122,6 +123,18 @@ export async function POST(request: Request) {
       }
     }
 
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true') {
+      if(!body.commandId||!body.identity)return jsonWithCors(request,{error:'A scoped master-sync command is required. Update the connector and start a sync from Kalika.'},{status:409});
+      if(rows.length>20000||Buffer.byteLength(JSON.stringify(rows))>32*1024*1024)
+        return jsonWithCors(request,{error:'Master snapshot exceeds the supported limit.'},{status:413});
+      const {data:saved,error:saveError}=await supabase.rpc('access_save_master_snapshot',{
+        p_command:body.commandId,p_connection:connection.id,p_token_hash:hashSecret(token),p_identity:body.identity,
+        p_types:[...syncedTypes],p_rows:rows,
+      });
+      if(saveError)throw saveError;
+      return jsonWithCors(request,{...saved,totals,masters:[],supportedTypes:MASTER_TYPES});
+    }
+
     const { data: syncRun, error: runError } = await supabase
       .from("tally_master_sync_runs")
       .insert({
@@ -185,13 +198,7 @@ export async function POST(request: Request) {
     // Only retire the prior snapshot after the new rows have been written.
     // This prevents a failed upsert from leaving the company with no active
     // masters, and sync_run_id keeps the just-upserted rows active.
-    const { error: otherCompanyDeactivateError } = await supabase
-      .from("tally_masters")
-      .update({ is_active: false, last_synced_at: now })
-      .eq("connection_id", connection.id)
-      .neq("company_name", companyName)
-      .eq("is_active", true);
-    if (otherCompanyDeactivateError) throw otherCompanyDeactivateError;
+    // A refresh of this company must not invalidate another company's cache.
 
     if (syncedTypes.size > 0) {
       const { error: priorSnapshotDeactivateError } = await supabase
@@ -240,6 +247,7 @@ export async function POST(request: Request) {
       supportedTypes: MASTER_TYPES,
     });
   } catch (error) {
+    const denied=accessFailureResponse(request,error);if(denied)return denied;
     if (syncFailureContext) {
       await syncFailureContext.supabase
         .from("tally_master_sync_runs")

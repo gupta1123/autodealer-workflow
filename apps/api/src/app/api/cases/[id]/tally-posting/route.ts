@@ -1,3 +1,9 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import { requireResourceAccess } from '@/lib/access/resources';
+import { AccessError } from '@/lib/access/server';
+import {accessFailureResponse} from '@/lib/access/failures';
+import { listAccessPredicate } from '@/lib/access/list-scope';
+import { purchaseFinancialDigest } from '@/lib/access/purchase-digest';
 import { createHash } from "node:crypto";
 
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
@@ -75,10 +81,13 @@ type LoadedContext = {
   masters: PurchasePostingMasterInput[];
   liveMasterCommandId: string | null;
   liveMasterFetchedAt: string | null;
+  liveMasterValidatedAt: string | null;
+  liveMasterValidation: Record<string, unknown> | null;
   liveMasterTotals: Record<string, unknown>;
   masterSource: "live_purchase" | "synced_fallback" | null;
   liveCompanyProfile: {
     name: string | null;
+    guid: string | null;
     gstin: string | null;
     stateCode: string | null;
   } | null;
@@ -101,15 +110,31 @@ function isFreshTimestamp(value: string | null | undefined, maxAgeMs: number) {
   return Number.isFinite(timestamp) && Date.now() - timestamp <= maxAgeMs;
 }
 
-function hasCompleteMasterSnapshot(context: Pick<LoadedContext, "liveMasterFetchedAt" | "liveMasterTotals" | "masters">) {
-  if (!context.liveMasterFetchedAt) return false;
+function hasCompleteMasterSnapshot(context: Pick<LoadedContext, "liveMasterFetchedAt" | "liveMasterValidatedAt" | "liveMasterValidation" | "liveMasterTotals" | "liveCompanyProfile" | "masters">) {
+  if (!context.liveMasterFetchedAt || !context.liveMasterValidatedAt) return false;
   const totals = context.liveMasterTotals ?? {};
+  const validation = context.liveMasterValidation ?? {};
+  const completeTypes = Array.isArray(validation.completeTypes)
+    ? validation.completeTypes.map((value) => String(value))
+    : [];
+  const digest = typeof validation.catalogueDigest === "string" ? validation.catalogueDigest : "";
+  const proofGuid = typeof validation.companyGuid === "string" ? validation.companyGuid.trim() : "";
+  const profileGuid = context.liveCompanyProfile?.guid?.trim() ?? "";
+  const proofFinancialYear = typeof validation.financialYear === "string" ? validation.financialYear.trim() : "";
   return (
+    Number(validation.version || 0) >= 1 &&
+    ["incremental_alter_id", "full_live_read"].includes(String(validation.mode || "")) &&
+    Boolean(proofGuid && profileGuid && proofGuid === profileGuid && proofFinancialYear) &&
     ["ledger", "group", "stock_item", "unit"].every((type) =>
-      Object.prototype.hasOwnProperty.call(totals, type)
+      Object.prototype.hasOwnProperty.call(totals, type) && completeTypes.includes(type)
     ) &&
+    /^[a-f0-9]{64}$/i.test(digest) &&
     context.masters.some((master) => master.master_type === "ledger")
   );
+}
+
+function isMasterSnapshotFresh(context: Pick<LoadedContext, "liveMasterValidatedAt">) {
+  return isFreshTimestamp(context.liveMasterValidatedAt, MASTER_SNAPSHOT_MAX_AGE_MS);
 }
 
 function serializeError(error: unknown) {
@@ -367,6 +392,8 @@ function numberValue(value: unknown) {
 function livePurchaseMasters(resultValue: unknown): {
   companyName: string | null;
   fetchedAt: string | null;
+  validatedAt: string | null;
+  validation: Record<string, unknown> | null;
   totals: Record<string, unknown>;
   companyProfile: LoadedContext["liveCompanyProfile"];
   masters: PurchasePostingMasterInput[];
@@ -424,12 +451,16 @@ function livePurchaseMasters(resultValue: unknown): {
     });
 
   const profile = recordValue(result.companyProfile);
+  const validation = recordValue(result.validation);
   return {
     companyName: textValue(result.companyName),
     fetchedAt: textValue(result.fetchedAt),
+    validatedAt: textValue(result.validatedAt) ?? textValue(validation?.validatedAt),
+    validation,
     totals: recordValue(result.totals) ?? {},
     companyProfile: profile ? {
       name: textValue(profile.name),
+      guid: textValue(profile.guid),
       gstin: textValue(profile.gstin),
       stateCode: textValue(profile.stateCode),
     } : null,
@@ -552,6 +583,7 @@ function purchaseMappingProposals(
 }
 
 async function loadContext(
+  request: Request,
   caseId: string,
   ownerUserId: string,
   requestedConnectionId?: string | null,
@@ -560,6 +592,18 @@ async function loadContext(
   options: { loadMappings?: boolean } = {}
 ): Promise<LoadedContext> {
   const supabase = createSupabaseAdminClient();
+  const team = process.env.TEAM_ACCESS_ENFORCEMENT === 'true'
+    ? await requireResourceAccess(request, 'case', caseId, 'purchases.view') : null;
+  const casePredicate = await listAccessPredicate(request, ownerUserId, 'purchases.view');
+  let connectionPredicate = `owner_user_id.eq.${JSON.stringify(ownerUserId)}`;
+  if (team) {
+    const links = await supabase.from('access_company_links').select('connection_id')
+      .eq('organization_id', team.access.organizationId).eq('company_id', team.scope.company_id!);
+    if (links.error) throw new AccessError('Verified company routing is unavailable.', 503);
+    const ids = [...new Set((links.data || []).map(row => row.connection_id as string))];
+    if (requestedConnectionId && !ids.includes(requestedConnectionId)) throw new AccessError('Connection is outside the purchase company.', 403);
+    connectionPredicate = ids.length ? `id.in.(${ids.map(id => JSON.stringify(id)).join(',')})` : 'id.is.null';
+  }
   const loadMappings = options.loadMappings !== false;
   const earlyMappingsResultPromise = loadMappings && requestedConnectionId && requestedCompanyName
     ? supabase
@@ -574,9 +618,9 @@ async function loadContext(
       .from("packet_cases")
       .select("id, status, owner_user_id")
       .eq("id", caseId)
-      .eq("owner_user_id", ownerUserId)
+      .or(casePredicate)
       .maybeSingle(),
-    getPurchaseAccountingSettingsOrDefaults(),
+    getPurchaseAccountingSettingsOrDefaults(team?.access.organizationId ?? 'default'),
     supabase
       .from("packet_documents")
       .select("id, document_type, source_file_name, source_hint, title, extracted_fields, markdown")
@@ -590,7 +634,7 @@ async function loadContext(
     supabase
       .from("tally_connections")
       .select(TALLY_CONNECTION_SELECT)
-      .eq("owner_user_id", ownerUserId)
+      .or(connectionPredicate)
       .is("revoked_at", null)
       .not("bridge_token_hash", "is", null)
       .not("installation_id", "is", null)
@@ -601,7 +645,7 @@ async function loadContext(
       .from("purchase_invoice_tally_postings")
       .select("*")
       .eq("case_id", caseId)
-      .eq("owner_user_id", ownerUserId)
+      .or(team ? 'id.not.is.null' : `owner_user_id.eq.${JSON.stringify(ownerUserId)}`)
       .maybeSingle(),
     earlyMappingsResultPromise,
   ]);
@@ -692,6 +736,8 @@ async function loadContext(
   let mappings: PurchasePostingMappingInput[] = [];
   let liveMasterCommandId: string | null = null;
   let liveMasterFetchedAt: string | null = null;
+  let liveMasterValidatedAt: string | null = null;
+  let liveMasterValidation: Record<string, unknown> | null = null;
   let liveMasterTotals: Record<string, unknown> = {};
   let liveCompanyProfile: LoadedContext["liveCompanyProfile"] = null;
   let masterSource: LoadedContext["masterSource"] = null;
@@ -702,8 +748,10 @@ async function loadContext(
       normalizeCompanyName(live.companyName) === normalizeCompanyName(companyName)
     ) {
       masters = live.masters;
-      liveMasterCommandId = `live:${live.fetchedAt ?? new Date().toISOString()}`;
-      liveMasterFetchedAt = live.fetchedAt ?? new Date().toISOString();
+      liveMasterCommandId = `live:${live.validatedAt ?? live.fetchedAt ?? new Date().toISOString()}`;
+      liveMasterFetchedAt = live.fetchedAt;
+      liveMasterValidatedAt = live.validatedAt;
+      liveMasterValidation = live.validation;
       liveMasterTotals = live.totals;
       liveCompanyProfile = live.companyProfile;
       masterSource = "live_purchase";
@@ -755,6 +803,8 @@ async function loadContext(
     masters,
     liveMasterCommandId,
     liveMasterFetchedAt,
+    liveMasterValidatedAt,
+    liveMasterValidation,
     liveMasterTotals,
     masterSource,
     liveCompanyProfile,
@@ -822,7 +872,7 @@ function prepareLoadedContext(
     ),
     masterDataReady: Boolean(
       context.liveMasterCommandId &&
-      isFreshTimestamp(context.liveMasterFetchedAt, MASTER_SNAPSHOT_MAX_AGE_MS) &&
+      isMasterSnapshotFresh(context) &&
       masterSnapshotComplete
     ),
     companyName,
@@ -929,10 +979,8 @@ function responseBody(
       lastHeartbeatAt: context.connectionStatus.lastHeartbeatAt,
       masterSyncRunId: context.liveMasterCommandId,
       masterSyncedAt: context.liveMasterFetchedAt,
-      masterSnapshotFresh: isFreshTimestamp(
-        context.liveMasterFetchedAt,
-        MASTER_SNAPSHOT_MAX_AGE_MS
-      ),
+      masterValidatedAt: context.liveMasterValidatedAt,
+      masterSnapshotFresh: isMasterSnapshotFresh(context),
       masterSnapshotComplete: hasCompleteMasterSnapshot(context),
       masterTotals: context.liveMasterTotals,
       masterSource: context.masterSource,
@@ -971,7 +1019,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(request: Request, contextParam: { params: Promise<{ id: string }> }) {
+async function GETHandler(request: Request, contextParam: { params: Promise<{ id: string }> }) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
@@ -979,7 +1027,7 @@ export async function GET(request: Request, contextParam: { params: Promise<{ id
     const searchParams = new URL(request.url).searchParams;
     const requestedConnectionId = searchParams.get("connectionId");
     const requestedCompanyName = searchParams.get("companyName");
-    const context = await loadContext(
+    const context = await loadContext(request,
       id,
       user.id,
       requestedConnectionId,
@@ -995,6 +1043,7 @@ export async function GET(request: Request, contextParam: { params: Promise<{ id
     );
     return jsonWithCors(request, responseBody(context, prepared));
   } catch (error) {
+    const denied=accessFailureResponse(request,error);if(denied)return denied;
     if (serializeError(error) === "CASE_NOT_FOUND") {
       return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
     }
@@ -1012,7 +1061,7 @@ export async function GET(request: Request, contextParam: { params: Promise<{ id
   }
 }
 
-export async function PATCH(request: Request, contextParam: { params: Promise<{ id: string }> }) {
+async function PATCHHandler(request: Request, contextParam: { params: Promise<{ id: string }> }) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
@@ -1030,7 +1079,7 @@ export async function PATCH(request: Request, contextParam: { params: Promise<{ 
     if (!requestedReview) {
       return jsonWithCors(request, { error: "A Tally posting review is required." }, { status: 400 });
     }
-    const context = await loadContext(
+    const context = await loadContext(request,
       id,
       user.id,
       requestedConnectionId,
@@ -1130,7 +1179,7 @@ export async function PATCH(request: Request, contextParam: { params: Promise<{ 
       if (mappingError) throw mappingError;
     }
     const posting = result.data as PostingRow;
-    const refreshed = await loadContext(
+    const refreshed = await loadContext(request,
       id,
       user.id,
       posting.connection_id,
@@ -1149,6 +1198,7 @@ export async function PATCH(request: Request, contextParam: { params: Promise<{ 
       liveMatchingComplete: Boolean(body.liveMasters),
     });
   } catch (error) {
+    const denied=accessFailureResponse(request,error);if(denied)return denied;
     if (serializeError(error) === "TALLY_CONNECTION_NOT_FOUND") {
       return jsonWithCors(request, { error: "The selected Tally connection is unavailable." }, { status: 409 });
     }
@@ -1163,16 +1213,76 @@ export async function PATCH(request: Request, contextParam: { params: Promise<{ 
   }
 }
 
-export async function POST(request: Request, contextParam: { params: Promise<{ id: string }> }) {
+async function POSTHandler(request: Request, contextParam: { params: Promise<{ id: string }> }) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     const { id } = await contextParam.params;
     const body = await request.json().catch(() => ({}));
+    if (body.action === "verify_existing") {
+      const requestedConnectionId = typeof body.connectionId === "string" ? body.connectionId : null;
+      const requestedCompanyName = typeof body.companyName === "string" ? body.companyName : null;
+      const initial = await loadContext(request, id, user.id, requestedConnectionId, requestedCompanyName);
+      const context = initial.posting?.connection_id
+        ? await loadContext(request, id, user.id, initial.posting.connection_id, requestedCompanyName)
+        : initial;
+      if (!context.posting || context.posting.status !== "verification_required" || !context.posting.command_id) {
+        return jsonWithCors(request, { error: "This Purchase voucher is not awaiting verification." }, { status: 409 });
+      }
+      if (!context.connection || context.connection.id !== context.posting.connection_id) {
+        return jsonWithCors(request, { error: "Reconnect the same Tally company before verifying this voucher." }, { status: 409 });
+      }
+      if (!context.connectionStatus?.agentCapabilities?.includes("purchase-strict-readback-v1")) {
+        return jsonWithCors(request, { error: "Update and reconnect the Kalika Local Agent before verification." }, { status: 409 });
+      }
+      const requestedAt = new Date().toISOString();
+      const team = process.env.TEAM_ACCESS_ENFORCEMENT === "true"
+        ? await requireResourceAccess(request, "case", id, "purchases.post")
+        : null;
+      const queued = team
+        ? await context.supabase.rpc("access_enqueue_purchase_verification", {
+            p_actor: user.id,
+            p_org: team.access.organizationId,
+            p_case: id,
+            p_connection: context.connection.id,
+            p_requested_at: requestedAt,
+          })
+        : await context.supabase.rpc("queue_purchase_invoice_tally_verification", {
+            p_posting_id: context.posting.id,
+            p_owner_user_id: user.id,
+            p_connection_id: context.connection.id,
+            p_previous_command_id: context.posting.command_id,
+            p_requested_at: requestedAt,
+          });
+      if (queued.error) throw queued.error;
+      const commandId = String(queued.data);
+      await Promise.all([
+        context.supabase.from("tally_connection_events").insert({
+          connection_id: context.connection.id,
+          owner_user_id: context.connection.owner_user_id,
+          event_type: "command_queued",
+          message: "Read-only Purchase voucher verification queued.",
+          payload: { commandType: "create_purchase_voucher", verificationOnly: true, commandId, caseId: id },
+        }),
+        wakeTallyConnector(context.connection.id),
+      ]);
+      const { prepared } = await prepareContext(context, user.id, asSavedReview(context.posting.review_patch), { checkDuplicate: false });
+      return jsonWithCors(request, responseBody({
+        ...context,
+        posting: {
+          ...context.posting,
+          command_id: commandId,
+          status: "queued",
+          queued_at: requestedAt,
+          last_error: null,
+          updated_at: requestedAt,
+        },
+      }, prepared, { includeMasterOptions: false }));
+    }
     if (body.action === "prepare_live_context") {
       const requestedConnectionId = typeof body.connectionId === "string" ? body.connectionId : null;
       const requestedCompanyName = typeof body.companyName === "string" ? body.companyName : null;
-      const context = await loadContext(
+      const context = await loadContext(request,
         id,
         user.id,
         requestedConnectionId,
@@ -1182,7 +1292,7 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
       if (
         !context.connection ||
         !hasCompleteMasterSnapshot(context) ||
-        !isFreshTimestamp(context.liveMasterFetchedAt, MASTER_SNAPSHOT_MAX_AGE_MS)
+        !isMasterSnapshotFresh(context)
       ) {
         return jsonWithCors(request, { error: "The live Tally master read is incomplete or stale." }, { status: 409 });
       }
@@ -1246,11 +1356,11 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
     if (body.action === "match_purchase_masters") {
       const requestedConnectionId = typeof body.connectionId === "string" ? body.connectionId : null;
       const requestedCompanyName = typeof body.companyName === "string" ? body.companyName : null;
-      const context = await loadContext(id, user.id, requestedConnectionId, requestedCompanyName, body.liveMasters);
+      const context = await loadContext(request, id, user.id, requestedConnectionId, requestedCompanyName, body.liveMasters);
       if (
         !context.connection ||
         !hasCompleteMasterSnapshot(context) ||
-        !isFreshTimestamp(context.liveMasterFetchedAt, MASTER_SNAPSHOT_MAX_AGE_MS)
+        !isMasterSnapshotFresh(context)
       ) {
         return jsonWithCors(request, { error: "Refresh the live Tally company data before matching invoice items." }, { status: 409 });
       }
@@ -1283,11 +1393,11 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
     if (body.action === "match_supplier_ledger") {
       const requestedConnectionId = typeof body.connectionId === "string" ? body.connectionId : null;
       const requestedCompanyName = typeof body.companyName === "string" ? body.companyName : null;
-      const context = await loadContext(id, user.id, requestedConnectionId, requestedCompanyName, body.liveMasters);
+      const context = await loadContext(request, id, user.id, requestedConnectionId, requestedCompanyName, body.liveMasters);
       if (
         !context.connection ||
         !hasCompleteMasterSnapshot(context) ||
-        !isFreshTimestamp(context.liveMasterFetchedAt, MASTER_SNAPSHOT_MAX_AGE_MS)
+        !isMasterSnapshotFresh(context)
       ) {
         return jsonWithCors(request, { error: "Refresh the selected Tally company's masters before matching the supplier." }, { status: 409 });
       }
@@ -1317,7 +1427,7 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
       typeof body.companyName === "string" && body.companyName.trim()
         ? body.companyName.trim()
         : null;
-    const initial = await loadContext(
+    const initial = await loadContext(request,
       id,
       user.id,
       requestedConnectionId,
@@ -1325,7 +1435,7 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
       body.liveMasters
     );
     const context = initial.posting?.connection_id && isPostingLocked(initial.posting.status)
-      ? await loadContext(id, user.id, initial.posting.connection_id, requestedCompanyName, body.liveMasters)
+      ? await loadContext(request, id, user.id, initial.posting.connection_id, requestedCompanyName, body.liveMasters)
       : initial;
     if (!context.posting) {
       return jsonWithCors(request, { error: "Save the Tally review before approving it." }, { status: 409 });
@@ -1376,6 +1486,14 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
     if (!context.connection || !duplicate) {
       return jsonWithCors(request, { error: "An active Tally company and invoice identity are required." }, { status: 409 });
     }
+    if (
+      Number(prepared.tallyPayload?.canonicalVersion || 0) >= 2 &&
+      !context.connectionStatus?.agentCapabilities?.includes("purchase-canonical-v2")
+    ) {
+      return jsonWithCors(request, {
+        error: "Update and reconnect the Kalika Local Agent before posting this Purchase voucher.",
+      }, { status: 409 });
+    }
 
     const now = new Date().toISOString();
     const idem = idempotencyKey(id, context.posting.revision, duplicate);
@@ -1400,8 +1518,20 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
         downloadUrl: signedUrlResult.data.signedUrl,
       };
     }
+    const calculationDigest = createHash("sha256")
+      .update(JSON.stringify({
+        version: prepared.calculation?.calculationVersion ?? 1,
+        calculation: prepared.calculation,
+        items: prepared.tallyPayload?.items,
+        charges: prepared.tallyPayload?.charges,
+        withholdings: prepared.tallyPayload?.withholdings,
+        finalPayableAmount: prepared.tallyPayload?.finalPayableAmount,
+      }))
+      .digest("hex");
     const frozenPayload = {
       ...prepared.tallyPayload,
+      calculationDigest,
+      catalogueIdentity: recordValue(recordValue(body.liveMasters)?.catalogueIdentity),
       postingId: context.posting.id,
       caseId: id,
       sourceFileId: sourceFile?.id ?? null,
@@ -1425,7 +1555,7 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
     const approvedPayloadHash = createHash("sha256")
       .update(JSON.stringify(frozenPayload))
       .digest("hex");
-    const commandResult = await context.supabase.rpc("queue_purchase_invoice_tally_posting", {
+    const queueArgs = {
       p_posting_id: context.posting.id,
       p_owner_user_id: user.id,
       p_connection_id: context.connection.id,
@@ -1436,7 +1566,20 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
       p_approved_at: now,
       p_tally_payload: frozenPayload,
       p_revision: context.posting.revision,
-    });
+    };
+    const team = process.env.TEAM_ACCESS_ENFORCEMENT === 'true'
+      ? await requireResourceAccess(request, 'case', id, 'purchases.post') : null;
+    if (team && !Number.isSafeInteger(body.workflowRevision)) {
+      return jsonWithCors(request, { error: 'Reload the approved purchase revision before posting.' }, { status: 409 });
+    }
+    const commandResult = team
+      ? await context.supabase.rpc('access_enqueue_purchase', {
+          p_actor: user.id, p_org: team.access.organizationId, p_case: id,
+          p_workflow_revision: body.workflowRevision, p_source_revision: team.scope.source_revision,
+          p_financial_digest: purchaseFinancialDigest(context.documents.map(({id,document_type,extracted_fields}) => ({id,document_type,extracted_fields})), context.posting.review_patch, { companyId: team.scope.company_id, connectionId: context.posting.connection_id }),
+          p_args: queueArgs,
+        })
+      : await context.supabase.rpc('queue_purchase_invoice_tally_posting', queueArgs);
     if (commandResult.error) {
       if (/duplicate|unique/i.test(serializeError(commandResult.error))) {
         return jsonWithCors(request, { error: "This supplier invoice is already claimed by another Tally posting." }, { status: 409 });
@@ -1491,6 +1634,7 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
       liveMatchingComplete: Boolean(body.liveMasters),
     });
   } catch (error) {
+    const denied=accessFailureResponse(request,error);if(denied)return denied;
     if (serializeError(error) === "TALLY_CONNECTION_NOT_FOUND") {
       return jsonWithCors(request, { error: "The selected Tally connection is unavailable." }, { status: 409 });
     }
@@ -1504,3 +1648,7 @@ export async function POST(request: Request, contextParam: { params: Promise<{ i
     return jsonWithCors(request, { error: serializeError(error) }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);
+export const PATCH = withTeamAccess(PATCHHandler);
+export const POST = withTeamAccess(POSTHandler);

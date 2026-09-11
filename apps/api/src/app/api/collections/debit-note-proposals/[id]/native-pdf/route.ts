@@ -1,3 +1,7 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {requireResourceAccess} from '@/lib/access/resources';
+import {accessFailureResponse} from '@/lib/access/failures';
+import {queueProposalOperation} from '@/lib/access/proposal-operations';
 import { applyCorsHeaders, jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { NextResponse } from "next/server";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -33,18 +37,21 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
+async function GETHandler(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     const { id } = await context.params;
     const supabase = createSupabaseAdminClient();
-    const { data, error } = await supabase
+    const team=process.env.TEAM_ACCESS_ENFORCEMENT==='true'
+      ?await requireResourceAccess(request,'proposal',id,'discounts.export'):null;
+    let query = supabase
       .from("debit_note_proposals")
       .select("*")
-      .eq("id", id)
-      .eq("owner_user_id", user.id)
-      .maybeSingle();
+      .eq("id", id);
+    query=team?query.eq('access_organization_id',team.scope.organization_id).eq('access_company_id',team.scope.company_id)
+      :query.eq('owner_user_id',user.id);
+    const {data,error}=await query.maybeSingle();
     if (error) throw error;
     if (!data) return jsonWithCors(request, { error: "Debit note proposal not found." }, { status: 404 });
 
@@ -59,7 +66,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     );
     if (!url) return jsonWithCors(request, { error: "The verified native Tally PDF could not be opened." }, { status: 404 });
 
-    if (new URL(request.url).searchParams.get("download") === "1") {
+    if (team || new URL(request.url).searchParams.get("download") === "1") {
       const sourceResponse = await fetch(url);
       if (!sourceResponse.ok) {
         return jsonWithCors(request, { error: "The verified Tally PDF could not be downloaded." }, { status: 502 });
@@ -76,18 +83,23 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
 
     return jsonWithCors(request, { url });
   } catch (error) {
+    const failure=accessFailureResponse(request,error);if(failure)return failure;
     console.error("Error in GET /api/collections/debit-note-proposals/[id]/native-pdf:", error);
     return jsonWithCors(request, { error: error instanceof Error ? error.message : "Internal server error" }, { status: 500 });
   }
 }
 
-export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
+async function POSTHandler(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     const { id } = await context.params;
     const body = await request.json().catch(() => ({}));
     const requestedConnectionId = toNullableText(body.connectionId, 80);
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true') {
+      const queued=await queueProposalOperation(request,id,requestedConnectionId||undefined,'native_pdf');
+      return jsonWithCors(request,{command:serializeTallyBridgeCommand(queued.command),pending:true,proposal:serializeDebitNoteProposal(queued.proposal)});
+    }
     const supabase = createSupabaseAdminClient();
     const { data, error } = await supabase
       .from("debit_note_proposals")
@@ -203,7 +215,11 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       proposal: serializeDebitNoteProposal(proposal),
     });
   } catch (error) {
+    const failure=accessFailureResponse(request,error);if(failure)return failure;
     console.error("Error in POST /api/collections/debit-note-proposals/[id]/native-pdf:", error);
     return jsonWithCors(request, { error: error instanceof Error ? error.message : "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);
+export const POST = withTeamAccess(POSTHandler);

@@ -22,3 +22,11 @@ For Purchase vouchers, the connector first downloads the approved source PDF
 to its managed documents folder. Tally stores the local path, filename,
 document ID, and SHA-256 checksum as voucher UDFs. The PDF itself remains a
 managed file; include the connector documents folder in workstation backups.
+## Kalika Local Agent sync reports
+
+`kalika-agent-sync-reports.tdl` exposes the versioned Local Agent capability
+handshake. The agent supplies compact, parameter-bound collection definitions
+for incremental masters, open bills, workflow vouchers, and voucher identity
+checks. This avoids permanently loading broad collections in Tally and lets the
+agent bind every request to the selected company, financial year, AlterID, date
+range, and ledger scope.

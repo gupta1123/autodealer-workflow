@@ -1,3 +1,4 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
@@ -43,7 +44,7 @@ function requestContext(request: Request, body?: Record<string, unknown>) {
   };
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
@@ -63,7 +64,7 @@ export async function GET(request: Request) {
   }
 }
 
-export async function PUT(request: Request) {
+async function PUTHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
@@ -87,3 +88,6 @@ export async function PUT(request: Request) {
     return jsonWithCors(request, { error: "Could not save Cash Discount customer scope." }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);
+export const PUT = withTeamAccess(PUTHandler);

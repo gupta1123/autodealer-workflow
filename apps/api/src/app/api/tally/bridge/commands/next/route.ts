@@ -70,9 +70,51 @@ export async function GET(request: Request) {
       return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
     }
 
+    if (process.env.TEAM_ACCESS_ENFORCEMENT === 'true') {
+      const claimed = await supabase.rpc('access_claim_next_command', {
+        p_connection: connection.id, p_installation: connection.installation_id,
+        p_generation: connection.session_generation, p_bridge_version: bridgeVersion,
+      });
+      if (claimed.error) {
+        return jsonWithCors(request, { error: 'Command authorization or pairing is unavailable.' }, { status: claimed.error.code === '42501' ? 403 : 503 });
+      }
+      return jsonWithCors(request, { command: claimed.data ? serializeTallyBridgeCommand(claimed.data as TallyBridgeCommandRow) : null });
+    }
+
     const now = new Date().toISOString();
+    const sessionFilter = `protocol_version.eq.0,and(installation_id.eq.${connection.installation_id},session_generation.eq.${connection.session_generation})`;
     const staleClaimedBefore = new Date(Date.now() - 2 * 60 * 1000).toISOString();
-    const { data: exhaustedCommands, error: exhaustedClaimError } = await supabase
+    // A Purchase write may have reached Tally even when the connector result was
+    // lost. Never requeue it automatically: preserve the frozen payload and
+    // require a read-only verification pass before any later create command.
+    const { data: uncertainPurchaseCommands, error: uncertainPurchaseError } = await supabase
+      .from("tally_bridge_commands")
+      .update({
+        status: "failed",
+        completed_at: now,
+        error: "Purchase write result missing; verify the existing voucher before retrying.",
+      })
+      .eq("connection_id", connection.id)
+      .or(sessionFilter)
+      .eq("command_type", "create_purchase_voucher")
+      .eq("status", "claimed")
+      .lt("claimed_at", staleClaimedBefore)
+      .select("id");
+    if (uncertainPurchaseError) throw uncertainPurchaseError;
+    const uncertainPurchaseIds = (uncertainPurchaseCommands ?? []).map((command) => command.id);
+    if (uncertainPurchaseIds.length > 0) {
+      const { error: postingUncertainError } = await supabase
+        .from("purchase_invoice_tally_postings")
+        .update({
+          status: "verification_required",
+          verification_status: "result_delivery_interrupted",
+          last_error: "Tally may already contain this voucher. Run verification before retrying.",
+        })
+        .in("command_id", uncertainPurchaseIds)
+        .in("status", ["approved", "queued", "creating"]);
+      if (postingUncertainError) throw postingUncertainError;
+    }
+    const { error: exhaustedClaimError } = await supabase
       .from("tally_bridge_commands")
       .update({
         status: "failed",
@@ -80,35 +122,15 @@ export async function GET(request: Request) {
         error: "Bridge claimed this command but did not report a result before the retry limit.",
       })
       .eq("connection_id", connection.id)
+      .or(sessionFilter)
       .eq("status", "claimed")
+      .neq("command_type", "create_purchase_voucher")
       .lt("claimed_at", staleClaimedBefore)
       .gte("attempts", 3)
       .select("id, command_type");
 
     if (exhaustedClaimError) throw exhaustedClaimError;
-    const exhaustedIds = (exhaustedCommands ?? [])
-      .filter((command) => command.command_type === "create_purchase_voucher")
-      .map((command) => command.id);
-    if (exhaustedIds.length > 0) {
-      const [postingCleanup, commandCleanup] = await Promise.all([
-        supabase
-          .from("purchase_invoice_tally_postings")
-          .update({
-            status: "failed",
-            last_error: "Tally bridge did not report a result before the retry limit.",
-          })
-          .in("command_id", exhaustedIds)
-          .in("status", ["queued", "creating"]),
-        supabase
-          .from("tally_bridge_commands")
-          .update({ payload: {}, result: {} })
-          .in("id", exhaustedIds),
-      ]);
-      if (postingCleanup.error) throw postingCleanup.error;
-      if (commandCleanup.error) throw commandCleanup.error;
-    }
-
-    const { data: requeuedCommands, error: staleClaimError } = await supabase
+    const { error: staleClaimError } = await supabase
       .from("tally_bridge_commands")
       .update({
         status: "queued",
@@ -116,27 +138,19 @@ export async function GET(request: Request) {
         error: "Requeued after the bridge claimed this command but did not report a result.",
       })
       .eq("connection_id", connection.id)
+      .or(sessionFilter)
       .eq("status", "claimed")
+      .neq("command_type", "create_purchase_voucher")
       .lt("claimed_at", staleClaimedBefore)
       .lt("attempts", 3)
       .select("id, command_type");
 
     if (staleClaimError) throw staleClaimError;
-    const requeuedIds = (requeuedCommands ?? [])
-      .filter((command) => command.command_type === "create_purchase_voucher")
-      .map((command) => command.id);
-    if (requeuedIds.length > 0) {
-      await supabase
-        .from("purchase_invoice_tally_postings")
-        .update({ status: "queued", last_error: null })
-        .in("command_id", requeuedIds)
-        .eq("status", "creating");
-    }
-
     const { data: commandData, error: commandError } = await supabase
       .from("tally_bridge_commands")
       .select("*")
       .eq("connection_id", connection.id)
+      .or(sessionFilter)
       .eq("status", "queued")
       .lte("available_at", now)
       .lt("attempts", 3)

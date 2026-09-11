@@ -1,3 +1,6 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {requireMasterDataset,datasetSelection} from '@/lib/access/master-store';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -188,8 +191,10 @@ function analyzeLedgerHealth(masters: TallyMasterRow[]) {
   }
 
   let possibleDuplicateCount = 0;
+  let comparedPairs = 0;
+  let duplicateScanLimited = false;
   for (let i = 0; i < partyLedgers.length; i += 1) {
-    if (possibleDuplicateCount >= 25) break;
+    if (possibleDuplicateCount >= 25 || duplicateScanLimited) break;
 
     const left = partyLedgers[i];
     const leftName = normalizeName(left.tally_name);
@@ -202,6 +207,8 @@ function analyzeLedgerHealth(masters: TallyMasterRow[]) {
       const rightName = normalizeName(right.tally_name);
       if (!right || !rightName || leftName === rightName) continue;
       if (left.gstin && right.gstin && left.gstin !== right.gstin) continue;
+      // Bound quadratic fuzzy work independently of how many matches are found.
+      if (++comparedPairs > 25000) { duplicateScanLimited = true; break; }
 
       const score = similarity(leftName, rightName);
       if (score < 0.86) continue;
@@ -270,6 +277,7 @@ function analyzeLedgerHealth(masters: TallyMasterRow[]) {
       criticalCount,
       warningCount,
       score,
+      duplicateScanLimited,
     },
     issues,
   };
@@ -279,7 +287,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(
+async function GETHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -291,6 +299,21 @@ export async function GET(
 
     const { id } = await context.params;
     const supabase = createSupabaseAdminClient();
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true') {
+      const scope=await requireMasterDataset(request,id,datasetSelection(new URL(request.url)),'connections.manage');
+      if(!scope.dataset)return jsonWithCors(request,{...analyzeLedgerHealth([]),syncRequired:true});
+      // Explicit pages avoid PostgREST's default row limit truncating health results.
+      const masters:TallyMasterRow[]=[];
+      for(let offset=0;offset<20000;offset+=1000) {
+        const {data,error}=await supabase.from('access_dataset_masters').select('*')
+          .eq('dataset_id',scope.dataset.id).eq('is_active',true).in('master_type',['ledger','gst_ledger'])
+          .order('id',{ascending:true}).range(offset,offset+999);
+        if(error)throw error;
+        masters.push(...(data||[]) as unknown as TallyMasterRow[]);
+        if((data?.length||0)<1000)break;
+      }
+      return jsonWithCors(request,analyzeLedgerHealth(masters));
+    }
 
     const { data: connection, error: connectionError } = await supabase
       .from("tally_connections")
@@ -323,7 +346,10 @@ export async function GET(
 
     return jsonWithCors(request, analyzeLedgerHealth((data ?? []) as unknown as TallyMasterRow[]));
   } catch (error) {
+    const failure=accessFailureResponse(request,error);if(failure)return failure;
     console.error("Error in GET /api/tally/connections/[id]/master-health:", error);
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);

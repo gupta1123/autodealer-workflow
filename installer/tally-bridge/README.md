@@ -1,6 +1,9 @@
-# Kalika Tally Connector Installer
+# Kalika Local Agent installer
 
-This folder contains the Windows installer assets for the desktop Tally connector.
+This directory contains the `electron-builder` NSIS release for **Kalika Local
+Agent 1.0.0**. It replaces the legacy hand-copied Electron/Inno connector in
+place while preserving the installation identity, pairing, encrypted cache and
+managed attachments.
 
 The installer is intentionally defensive:
 
@@ -21,22 +24,14 @@ From the repo root:
 npm run installer:tally-bridge
 ```
 
-The setup executable is written to:
+The x64 NSIS installer and update metadata are written below:
 
 ```text
-installer\tally-bridge\output\KalikaTallyConnectorSetup.exe
+installer\tally-bridge\output
 ```
 
-The build uses the existing local Electron runtime at:
-
-```text
-C:\Autodealer\tally-bridge
-```
-
-It then replaces the packaged app contents with:
-
-- `installer/tally-bridge/electron-app/main.mjs`
-- `apps/tally-bridge/src/bridge.mjs`
+The root build uses Electron Builder and NSIS. The former `.iss` package is
+retained only as historical source and is not part of this build.
 
 ## Runtime Layout
 

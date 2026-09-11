@@ -1,5 +1,9 @@
-import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import { applyCorsHeaders, jsonWithCors, optionsWithCors } from "@/lib/api/cors";
+import { NextResponse } from 'next/server';
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { listAccessPredicate } from "@/lib/access/list-scope";
+import { AccessError, requireAccessContext } from "@/lib/access/server";
 
 import {
   getCaseCategoryFromProcessingMeta,
@@ -131,7 +135,7 @@ function mapCaseRow(row: {
   };
 }
 
-export async function GET(
+async function GETHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -148,6 +152,7 @@ export async function GET(
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }
 
+    const accessPredicate=await listAccessPredicate(request,user.id,"purchases.view");
     const supabase = createSupabaseAdminClient();
     let existing: { processing_meta?: unknown; deleted_at?: string | null } | null = null;
 
@@ -156,7 +161,7 @@ export async function GET(
         .from("packet_cases")
         .select("id, owner_user_id, processing_meta, deleted_at")
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(accessPredicate)
         .single();
 
       if (result.error) {
@@ -168,6 +173,7 @@ export async function GET(
 
       existing = result.data;
     } catch (error) {
+    if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
       if (!isRecycleBinSchemaMissing(error)) {
         throw error;
       }
@@ -176,7 +182,7 @@ export async function GET(
         .from("packet_cases")
         .select("id, owner_user_id, processing_meta")
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(accessPredicate)
         .single();
 
       if (fallback.error) {
@@ -198,7 +204,7 @@ export async function GET(
 
     const { data: file, error: fileError } = await supabase
       .from("packet_case_files")
-      .select("id, storage_bucket, storage_path")
+      .select("id, storage_bucket, storage_path, mime_type, size_bytes")
       .eq("id", fileId)
       .eq("case_id", id)
       .single();
@@ -211,6 +217,32 @@ export async function GET(
     }
 
     const bucketName = file.storage_bucket || STORAGE_BUCKET;
+    if (process.env.TEAM_ACCESS_ENFORCEMENT === 'true') {
+      // A reusable Storage URL bypasses membership revocation. Team previews
+      // remain authenticated API reads; no signed capability leaves the server.
+      if (new URL(request.url).searchParams.get('content') !== '1') {
+        return jsonWithCors(request, {
+          fileId: file.id,
+          contentPath: `/api/cases/${id}/files?${new URLSearchParams({fileId: file.id, content: '1'})}`,
+        }, {headers: {'Cache-Control': 'private, no-store'}});
+      }
+      const mime = String(file.mime_type || '').toLowerCase();
+      if (!['application/pdf','image/png','image/jpeg','image/webp','image/gif'].includes(mime)) {
+        throw new AccessError('This file type cannot be previewed safely.',415);
+      }
+      const size = Number(file.size_bytes);
+      if (!Number.isSafeInteger(size) || size <= 0 || size > 25 * 1024 * 1024) {
+        throw new AccessError('Source preview exceeds the supported size limit.',413);
+      }
+      const {data, error} = await supabase.storage.from(bucketName).download(file.storage_path);
+      if (error || !data) throw new AccessError('Source preview is unavailable.',503);
+      if (data.size > 25 * 1024 * 1024) throw new AccessError('Source preview exceeds the supported size limit.',413);
+      return applyCorsHeaders(new NextResponse(data, {headers: {
+        'Content-Type': mime, 'Content-Length': String(data.size),
+        'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "sandbox; default-src 'none'", 'Content-Disposition': 'inline',
+      }}), request);
+    }
     const { data: signedData, error: signedError } = await supabase.storage
       .from(bucketName)
       .createSignedUrl(file.storage_path, 60 * 60);
@@ -224,11 +256,12 @@ export async function GET(
       signedUrl: signedData.signedUrl,
     });
   } catch (error) {
+    if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
     return jsonWithCors(request, { error: serializeError(error) }, { status: 500 });
   }
 }
 
-export async function POST(
+async function POSTHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -277,7 +310,7 @@ export async function POST(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
         )
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .single();
 
       if (result.error) {
@@ -299,7 +332,7 @@ export async function POST(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
         )
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .single();
 
       if (fallback.error) {
@@ -434,7 +467,7 @@ export async function POST(
         .from("packet_cases")
         .update(nextPayload)
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .select(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
         )
@@ -467,7 +500,7 @@ export async function POST(
         .from("packet_cases")
         .update(nextPayload)
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .select(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
         )
@@ -490,3 +523,6 @@ export async function POST(
 export async function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
+
+export const GET = withTeamAccess(GETHandler);
+export const POST = withTeamAccess(POSTHandler);

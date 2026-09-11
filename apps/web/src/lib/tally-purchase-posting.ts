@@ -20,6 +20,7 @@ export type TallyPostingLine = {
   unit: string;
   rate: string;
   taxableAmount: string;
+  taxRate: string;
   stockItemName: string;
   purchaseLedgerName: string;
   godownName: string;
@@ -156,6 +157,7 @@ export type TallyPostingResponse = {
     lastHeartbeatAt: string | null;
     masterSyncRunId: string | null;
     masterSyncedAt: string | null;
+    masterValidatedAt: string | null;
     masterSnapshotFresh: boolean;
     masterSnapshotComplete: boolean;
     masterTotals: Record<string, unknown>;
@@ -203,11 +205,16 @@ export type TallyPostingResponse = {
     lines: Array<TallyPostingLine & {
       material: "ms_scrap" | "sponge_iron" | "unknown";
       materialLabel: string;
+      invoiceCgstAmount: string;
+      invoiceSgstAmount: string;
+      invoiceIgstAmount: string;
+      invoiceTaxAmount: string;
       sourcePage: number | null;
     }>;
   };
   review: TallyPostingReview | null;
   calculation: null | {
+    calculationVersion: number;
     taxMode: "cgst_sgst" | "igst" | "unknown";
     gstRate: string;
     supplierStateCode: string | null;
@@ -219,6 +226,7 @@ export type TallyPostingResponse = {
     sgstAmount: string;
     igstAmount: string;
     gstAmount: string;
+    taxBuckets: Array<{ kind: "cgst" | "sgst" | "igst"; rate: string; taxableBasis: string; amount: string }>;
     invoiceGstAmount: string;
     gstDifference: string;
     tdsAmount: string;
@@ -226,6 +234,8 @@ export type TallyPostingResponse = {
     tds194qBasisAmount: string;
     tds194qRounding: "paise" | "nearest_rupee";
     transportTdsAmount: string;
+    transportTdsCalculatedAmount: string;
+    transportTdsDifference: string;
     cgstTdsAmount: string;
     sgstTdsAmount: string;
     igstTdsAmount: string;
@@ -269,6 +279,7 @@ export type TallyMasterOption = {
   gstDutyHead: string | null;
   closingBalance: number | null;
   closingBalanceType: "Dr" | "Cr" | null;
+  decimalPlaces: number | null;
 };
 
 export type SupplierLedgerMatch = {
@@ -389,6 +400,7 @@ export function prepareLiveTallyCatalogue(
         gstDutyHead: liveText(row.gstDutyHead ?? raw.gstDutyHead),
         closingBalance: balance,
         closingBalanceType: balanceType === "Dr" || balanceType === "Cr" ? balanceType : null,
+        decimalPlaces: liveNumber(row.decimalPlaces ?? raw.decimalPlaces),
       } satisfies TallyMasterOption];
     });
   const ledgerRows = Array.isArray(masters.ledgers) ? masters.ledgers : [];
@@ -535,7 +547,34 @@ export function prepareLiveTallyCatalogue(
     const option = ledgerOptionByName.get(key);
     return option ? [liveValidationMasterRow(option)] : [];
   });
-  const compactStockItems = stockItemOptions.map(liveValidationMasterRow);
+  const selectedStockNames = new Set((review?.lines ?? [])
+    .map((line) => liveKey(line.stockItemName))
+    .filter(Boolean));
+  const compactStockByName = new Map<string, TallyMasterOption>();
+  for (const option of stockItemOptions) {
+    if (selectedStockNames.has(liveKey(option.name))) compactStockByName.set(liveKey(option.name), option);
+  }
+  for (const line of review?.lines ?? []) {
+    const identity = `${line.description} ${line.hsn} ${line.unit}`;
+    stockItemOptions
+      .map((option) => ({
+        option,
+        score:
+          liveTokenAffinity(identity, `${option.name} ${option.parent || ""}`) * 10 +
+          Number(Boolean(line.hsn) && String(option.hsnCode || "").replace(/\D/g, "") === String(line.hsn).replace(/\D/g, "")) * 8 +
+          Number(Boolean(line.unit) && liveKey(option.unitName) === liveKey(line.unit)) * 3,
+      }))
+      .filter((entry) => entry.score > 0)
+      .sort((left, right) => right.score - left.score || left.option.name.localeCompare(right.option.name))
+      .slice(0, 12)
+      .forEach(({ option }) => compactStockByName.set(liveKey(option.name), option));
+  }
+  const compactStockItems = Array.from(compactStockByName.values()).map(liveValidationMasterRow);
+  const relevantUnits = new Set([
+    ...(review?.lines ?? []).map((line) => liveKey(line.unit)),
+    ...Array.from(compactStockByName.values()).map((option) => liveKey(option.unitName)),
+  ].filter(Boolean));
+  const selectedGodowns = new Set((review?.lines ?? []).map((line) => liveKey(line.godownName)).filter(Boolean));
 
   return {
     compactResult: {
@@ -545,8 +584,8 @@ export function prepareLiveTallyCatalogue(
         ledgers: compactLedgers,
         groups: [],
         stockItems: compactStockItems,
-        units: unitOptions.map(liveValidationMasterRow),
-        godowns: godownOptions.map(liveValidationMasterRow),
+        units: unitOptions.filter((option) => relevantUnits.has(liveKey(option.name))).map(liveValidationMasterRow),
+        godowns: godownOptions.filter((option) => selectedGodowns.has(liveKey(option.name))).map(liveValidationMasterRow),
       },
     },
     masterOptions: {
@@ -703,13 +742,15 @@ export async function approveAndQueueTallyPurchasePosting(
   acknowledgedWarningCodes: string[] = [],
   connectionId?: string | null,
   companyName?: string | null,
-  liveMasters?: unknown
+  liveMasters?: unknown,
+  workflowRevision?: number
 ) {
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       action: "approve_and_queue",
+      workflowRevision,
       acknowledgedWarningCodes,
       connectionId,
       companyName,
@@ -718,6 +759,24 @@ export async function approveAndQueueTallyPurchasePosting(
     }),
   });
   return readResponse(response, "Failed to queue the Purchase voucher.");
+}
+
+export async function verifyExistingTallyPurchaseVoucher(
+  caseId: string,
+  connectionId?: string | null,
+  companyName?: string | null
+) {
+  const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "verify_existing",
+      connectionId,
+      companyName,
+      compactResponse: true,
+    }),
+  });
+  return readResponse(response, "Failed to verify the existing Purchase voucher.");
 }
 
 export async function prepareTallyPurchasePostingFromLive(
@@ -812,7 +871,7 @@ export async function queueTallyMasterRefresh(connectionId: string, companyName:
 export async function waitForTallyCommand(
   connectionId: string,
   commandId: string,
-  options?: { attempts?: number; intervalMs?: number }
+  options?: { attempts?: number; intervalMs?: number; onProgress?: (phase: string) => void }
 ) {
   const attempts = options?.attempts ?? 45;
   const intervalMs = options?.intervalMs ?? 2000;
@@ -831,6 +890,7 @@ export async function waitForTallyCommand(
         error?: string | null;
         completedAt?: string | null;
         updatedAt?: string | null;
+        compactProgress?: { phase?: string | null } | null;
       } | null;
     } = {};
     try {
@@ -843,6 +903,7 @@ export async function waitForTallyCommand(
     }
     const command = payload.command;
     if (!command) continue;
+    if (command.compactProgress?.phase) options?.onProgress?.(command.compactProgress.phase);
     if (["succeeded", "failed", "canceled"].includes(command.status)) return command;
   }
   return null;

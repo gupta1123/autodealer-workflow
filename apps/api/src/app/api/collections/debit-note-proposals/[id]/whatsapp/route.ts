@@ -1,8 +1,14 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import { createHash } from 'node:crypto';
+import {requireResourceAccess} from '@/lib/access/resources';
+import {requireDataset} from '@/lib/access/dataset';
+import {queueProposalOperation} from '@/lib/access/proposal-operations';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { getNativeTallyPdfEvidence, serializeDebitNoteProposal, toNullableText, type DebitNoteProposalRow } from "@/lib/collections";
 import { createDebitNotePdfSignedUrl } from "@/lib/debit-notes/pdf";
-import { sendDebitNoteWhatsapp, getMsg91WhatsappConfig, normalizeWhatsappPhone } from "@/lib/msg91/whatsapp";
+import { sendDebitNoteWhatsapp, getMsg91WhatsappConfig, normalizeWhatsappPhone, WhatsappRejectedError } from "@/lib/msg91/whatsapp";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 function isMissingTableError(error: unknown) {
@@ -26,13 +32,18 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function POST(
+async function POSTHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
   const { id } = await context.params;
   const supabase = createSupabaseAdminClient();
   let ownerUserId = "";
+  let authorizedProposal = false;
+  let sendClaimed = false;
+  let providerAccepted = false;
+  let claimedSnapshot: Record<string, unknown> | null = null;
+  let claimVersion = '';
 
   try {
     const user = await requireRequestUser(request);
@@ -47,12 +58,13 @@ export async function POST(
       return jsonWithCors(request, { error: "MSG91 WhatsApp is not configured." }, { status: 409 });
     }
 
-    const { data: proposalData, error: proposalError } = await supabase
+    const team=process.env.TEAM_ACCESS_ENFORCEMENT==='true'?await requireResourceAccess(request,'proposal',id,'discounts.export'):null;
+    let proposalQuery = supabase
       .from("debit_note_proposals")
       .select("*")
-      .eq("id", id)
-      .eq("owner_user_id", user.id)
-      .maybeSingle();
+      .eq("id", id);
+    proposalQuery=team?proposalQuery.eq('access_organization_id',team.scope.organization_id).eq('access_company_id',team.scope.company_id):proposalQuery.eq('owner_user_id',user.id);
+    const {data:proposalData,error:proposalError}=await proposalQuery.maybeSingle();
 
     if (proposalError) throw proposalError;
     if (!proposalData) {
@@ -60,6 +72,13 @@ export async function POST(
     }
 
     const proposal = proposalData as unknown as DebitNoteProposalRow;
+    ownerUserId=proposal.owner_user_id;
+    authorizedProposal=true;
+    // The dedicated column is the durable lock. Other workflows may refresh
+    // customer_snapshot (e.g. PDF export), but must not reopen an uncertain send.
+    if (proposal.communication_status === 'drafted') {
+      return jsonWithCors(request,{error:'A WhatsApp submission is in progress or needs provider verification. Do not resend yet.'},{status:409});
+    }
     if (proposal.status !== "created_in_tally") {
       return jsonWithCors(request, { error: "Create the debit note in Tally before sending WhatsApp." }, { status: 409 });
     }
@@ -90,11 +109,16 @@ export async function POST(
     }
     const shouldSavePhoneToTally = body.savePhoneToTally === true && Boolean(body.recipientPhone);
     let tallySaveConnectionId = proposal.connection_id;
+    if(team&&shouldSavePhoneToTally) {
+      const scope=await requireDataset(request,toNullableText(body.connectionId,80)||proposal.connection_id||'',
+        {companyId:team.scope.company_id,financialYear:proposal.financial_year},'connections.manage');
+      tallySaveConnectionId=scope.connection.id;
+    }
 
     // A proposal can belong to a retired connector after the same company has
     // been paired again. Always use the live connector supplied by the page for
     // a new Tally ledger update, rather than queueing work for an old bridge.
-    if (shouldSavePhoneToTally && body.connectionId) {
+    if (!team && shouldSavePhoneToTally && body.connectionId) {
       const requestedConnectionId = toNullableText(body.connectionId, 80);
       if (!requestedConnectionId) {
         return jsonWithCors(request, { error: "The active Tally connection is invalid." }, { status: 400 });
@@ -118,7 +142,8 @@ export async function POST(
       proposal.tally_pdf_reference,
       60 * 60
     );
-    const documentUrl = toNullableText(body.documentUrl, 2000) ?? storedPdfUrl ?? config.fallbackDocumentUrl;
+    // Only the verified voucher document may be sent, never a browser-supplied URL.
+    const documentUrl = storedPdfUrl;
     if (!documentUrl) {
       return jsonWithCors(
         request,
@@ -130,17 +155,56 @@ export async function POST(
     const documentName =
       toNullableText(body.documentName, 180) ??
       (proposal.tally_voucher_number ? `${proposal.tally_voucher_number}.pdf` : undefined);
+    if(team) {
+      const {error:permissionError}=await supabase.rpc('access_assert_permission',{p_actor:user.id,p_org:team.scope.organization_id,p_permission:'discounts.export',p_company:team.scope.company_id});
+      if(permissionError)throw permissionError;
+    }
+    // Persist intent BEFORE contacting the provider. A lost response must not
+    // permit another paid/customer-visible send, even across API processes.
+    const attemptKey = createHash('sha256').update(JSON.stringify([
+      proposal.id, recipientPhone, proposal.tally_pdf_reference,
+      getNativeTallyPdfEvidence(proposal.customer_snapshot)?.sha256,
+    ])).digest('hex');
+    const previousAttempt = proposal.customer_snapshot?.whatsappAttempt as { key?: string; state?: string } | undefined;
+    const pdfExportedAt = getNativeTallyPdfEvidence(proposal.customer_snapshot)?.exportedAt;
+    if (!previousAttempt && proposal.communication_status === 'sent' &&
+      (!pdfExportedAt || !proposal.communication_sent_at || Date.parse(pdfExportedAt) <= Date.parse(proposal.communication_sent_at))) {
+      return jsonWithCors(request,{proposal:serializeDebitNoteProposal(proposal),sent:true,accepted:true,duplicate:true});
+    }
+    if (previousAttempt && ['submitting', 'unknown'].includes(previousAttempt.state || '')) {
+      return jsonWithCors(request, { error: 'The previous WhatsApp submission needs verification. Do not resend until its provider status is checked.' }, {status:409});
+    }
+    if (previousAttempt?.key === attemptKey && previousAttempt.state === 'accepted') {
+      return jsonWithCors(request, { proposal: serializeDebitNoteProposal(proposal), sent: true, accepted: true, duplicate: true });
+    }
+    const attemptSnapshot = {
+      ...(proposal.customer_snapshot ?? {}),
+      whatsappAttempt: { key: attemptKey, state: 'submitting', startedAt: new Date().toISOString() },
+    };
+    claimVersion = new Date().toISOString();
+    const {data: claim, error: claimError} = await supabase.from('debit_note_proposals')
+      .update({customer_snapshot: attemptSnapshot, communication_status:'drafted', updated_at:claimVersion})
+      .eq('id',proposal.id).eq('owner_user_id',ownerUserId).eq('updated_at',proposal.updated_at)
+      .neq('communication_status','drafted').select('id').maybeSingle();
+    if (claimError) throw claimError;
+    if (!claim) return jsonWithCors(request,{error:'This debit note changed or another submission is running. Refresh its status.'},{status:409});
+    sendClaimed = true;
+    claimedSnapshot = attemptSnapshot;
     const result = await sendDebitNoteWhatsapp({
       proposal,
       recipientPhone,
       documentUrl,
       documentName,
     });
+    providerAccepted = true;
 
     const now = new Date().toISOString();
     let phoneSaveCommandId: string | null = null;
     let phoneSaveQueueError: string | null = null;
-    if (shouldSavePhoneToTally && tallySaveConnectionId) {
+    if (team && shouldSavePhoneToTally && tallySaveConnectionId) {
+      try {const queued=await queueProposalOperation(request,proposal.id,tallySaveConnectionId,'phone',recipientPhone.replace(/\D/g,''));phoneSaveCommandId=queued.command.id;}
+      catch {phoneSaveQueueError='WhatsApp was sent, but the phone update could not be queued. Check your Tally connection and permission.';}
+    } else if (shouldSavePhoneToTally && tallySaveConnectionId) {
       const { data: commandData, error: commandError } = await supabase
         .from("tally_bridge_commands")
         .insert({
@@ -176,7 +240,8 @@ export async function POST(
         communication_recipient: recipientPhone,
         communication_sent_at: now,
         customer_snapshot: {
-          ...(proposal.customer_snapshot ?? {}),
+          ...attemptSnapshot,
+          whatsappAttempt: { ...attemptSnapshot.whatsappAttempt, state: 'accepted', acceptedAt: now },
           phone: recipientPhone,
           whatsapp: {
             provider: "msg91",
@@ -192,7 +257,8 @@ export async function POST(
         updated_at: now,
       })
       .eq("id", proposal.id)
-      .eq("owner_user_id", user.id)
+      .eq("owner_user_id", ownerUserId)
+      .eq('communication_status','drafted').eq('updated_at',claimVersion)
       .select("*")
       .single();
 
@@ -201,11 +267,28 @@ export async function POST(
     return jsonWithCors(request, {
       proposal: serializeDebitNoteProposal(updatedData as unknown as DebitNoteProposalRow),
       sent: true,
+      accepted: true,
       phoneSaveCommandId: phoneSaveCommandId || null,
       phoneSaveConnectionId: phoneSaveCommandId ? tallySaveConnectionId : null,
       phoneSaveQueueError,
     });
   } catch (error) {
+    if (sendClaimed && !providerAccepted && error instanceof WhatsappRejectedError) {
+      const {error:saveError} = await supabase.from('debit_note_proposals').update({
+        communication_status:'failed',last_error:error.message,updated_at:new Date().toISOString(),
+        customer_snapshot:{...claimedSnapshot,whatsappAttempt:{...(claimedSnapshot?.whatsappAttempt as Record<string,unknown>),state:'rejected'}},
+      }).eq('id',id).eq('owner_user_id',ownerUserId).eq('communication_status','drafted').eq('updated_at',claimVersion);
+      if (!saveError) return jsonWithCors(request,{error:error.message},{status:422});
+    }
+    if (sendClaimed) {
+      // Leave the durable intent unresolved on uncertainty. Never turn an
+      // accepted send into a retryable failure because a later DB write failed.
+      const message = providerAccepted
+        ? 'WhatsApp was accepted by the provider, but its saved status could not be updated. Do not resend; verify provider status.'
+        : 'WhatsApp submission outcome is uncertain. Verify provider status before trying again.';
+      return jsonWithCors(request, {error:message, accepted:providerAccepted, verificationRequired:true}, {status:providerAccepted?202:409});
+    }
+    const failure=accessFailureResponse(request,error);if(failure)return failure;
     if (isMissingTableError(error)) {
       return jsonWithCors(
         request,
@@ -217,7 +300,7 @@ export async function POST(
     const message = error instanceof Error ? error.message : "Internal server error";
     console.error("Error in POST /api/collections/debit-note-proposals/[id]/whatsapp:", error);
 
-    if (id) {
+    if (id && authorizedProposal && ownerUserId && sendClaimed) {
       let query = supabase
         .from("debit_note_proposals")
         .update({
@@ -237,3 +320,5 @@ export async function POST(
     return jsonWithCors(request, { error: message }, { status: 500 });
   }
 }
+
+export const POST = withTeamAccess(POSTHandler);

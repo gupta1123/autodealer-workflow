@@ -1,3 +1,7 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {permittedConnections} from '@/lib/access/connection-scope';
+import { AccessError, requireAccessContext } from '@/lib/access/server';
+import { canAccess } from '@autodealer/shared/lib/access';
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -13,7 +17,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(
+async function GETHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -25,6 +29,19 @@ export async function GET(
     }
 
     const { id } = await context.params;
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true') {
+      const access=await requireAccessContext(request);
+      let rows:TallyConnectionRow[];
+      if(canAccess(access,'connections.manage')&&access.member.all_companies) {
+        const result=await createSupabaseAdminClient().from('tally_connections').select(TALLY_CONNECTION_SELECT)
+          .eq('id',id).eq('organization_id',access.organizationId).eq('owner_user_id',access.member.user_id)
+          .is('revoked_at',null).limit(1);
+        if(result.error)throw result.error;
+        rows=(result.data||[]) as unknown as TallyConnectionRow[];
+      } else rows=(await permittedConnections(request,id)).rows;
+      if(!rows.length)return jsonWithCors(request,{error:'Tally connection not found'},{status:404});
+      return jsonWithCors(request,{connection:serializeTallyConnectionStatus(rows[0])},{headers:{'Cache-Control':'private, no-store'}});
+    }
 
     if (localMode) {
       const connection = await getLocalTallyConnection(id, user.id);
@@ -58,7 +75,10 @@ export async function GET(
       connection: serializeTallyConnectionStatus(data as unknown as TallyConnectionRow),
     });
   } catch (error) {
+    if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
     console.error("Error in GET /api/tally/connections/[id]/status:", error);
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);

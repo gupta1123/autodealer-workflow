@@ -1,3 +1,5 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import { settingsOrganization } from '@/lib/access/settings';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
@@ -49,12 +51,12 @@ function parseSettings(input: unknown): PurchaseAccountingSettings | null {
   };
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
 
-    const settings = await getPurchaseAccountingSettings();
+    const settings = await getPurchaseAccountingSettings(await settingsOrganization(request));
     return jsonWithCors(request, { settings });
   } catch (error) {
     if (isPurchaseAccountingSettingsSchemaMissing(error)) {
@@ -65,7 +67,7 @@ export async function GET(request: Request) {
   }
 }
 
-export async function PUT(request: Request) {
+async function PUTHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
@@ -84,7 +86,7 @@ export async function PUT(request: Request) {
       );
     }
 
-    const saved = await savePurchaseAccountingSettings(settings);
+    const saved = await savePurchaseAccountingSettings(settings, await settingsOrganization(request));
     return jsonWithCors(request, { success: true, settings: saved });
   } catch (error) {
     if (isPurchaseAccountingSettingsSchemaMissing(error)) {
@@ -94,3 +96,6 @@ export async function PUT(request: Request) {
     return jsonWithCors(request, { error: errorMessage(error) }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);
+export const PUT = withTeamAccess(PUTHandler);

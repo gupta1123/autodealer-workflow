@@ -1,3 +1,6 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import { authorizeLiveConnection } from '@/lib/access/live-authority';
+import { AccessError } from '@/lib/access/server';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -18,7 +21,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const body = await request.json().catch(() => ({}));
     const role = String(body.role ?? "");
@@ -32,6 +35,14 @@ export async function POST(request: Request) {
     if (role === "browser") {
       const user = await requireRequestUser(request);
       if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
+      // Company discovery feeds APIs that always require an exact, reviewed
+      // dataset identity. Resolve it even during the legacy owner rollout so
+      // the browser never has to turn a company name into an authorization.
+      if(process.env.TEAM_ACCESS_ENFORCEMENT==='true' || Boolean(body.operation)) {
+        const authority=await authorizeLiveConnection(request,body);
+        return jsonWithCors(request,{authenticated:true,teamAccess:true,connectionId,...authority},
+          {headers:{'Cache-Control':'private, no-store'}});
+      }
       const [connectionResult, customerScopeResult] = await Promise.all([
         supabase
           .from("tally_connections")
@@ -84,9 +95,14 @@ export async function POST(request: Request) {
       authenticated: true,
       ownerUserId: connection.owner_user_id,
       connectionId: connection.id,
+      installationId:connection.installation_id,
+      sessionGeneration:connection.session_generation,
     });
   } catch (error) {
+    if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
     console.error("Error in POST /api/collections/live/session:", error);
     return jsonWithCors(request, { error: "Could not authenticate the live Cash Discount session." }, { status: 500 });
   }
 }
+
+export const POST = withTeamAccess(POSTHandler,{bridgeSession:true});

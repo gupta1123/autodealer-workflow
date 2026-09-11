@@ -13,12 +13,13 @@ await app.prepare();
 const httpServer = createServer((request, response) => handle(request, response));
 const cashDiscountGateway = startCashDiscountGateway({
   server: httpServer,
-  path: "/cash-discount-live",
+  path: "/agent-live",
+  legacyPaths: ["/cash-discount-live"],
   apiBaseUrl: process.env.CASH_DISCOUNT_API_BASE_URL || `http://127.0.0.1:${port}`,
 });
 
 httpServer.listen(port, hostname, () => {
-  console.log(`API and Cash Discount live gateway listening on http://${hostname}:${port}`);
+  console.log(`API and Kalika Local Agent gateway listening on http://${hostname}:${port}`);
 });
 
 function shutdown(signal) {

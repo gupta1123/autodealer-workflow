@@ -1,3 +1,4 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
@@ -18,10 +19,12 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true')return jsonWithCors(request,
+      {error:'Team debit notes are recorded by the authenticated issued-command callback. Refresh the command status.'},{status:409});
 
     const body = await request.json().catch(() => ({}));
     const connectionId = toNullableText(body.connectionId, 80);
@@ -172,3 +175,5 @@ export async function POST(request: Request) {
     );
   }
 }
+
+export const POST = withTeamAccess(POSTHandler);

@@ -8,7 +8,7 @@
     "npm": "11.x"
   },
   "scripts": {
-    "dev": "node --use-system-ca src/server.mjs",
+    "dev": "node --env-file-if-exists=../api/.env --env-file-if-exists=../api/.env.local --use-system-ca src/server.mjs",
     "start": "node --use-system-ca src/server.mjs"
   },
   "dependencies": {

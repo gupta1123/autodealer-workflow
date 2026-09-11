@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import {useActionAccess} from '@/components/access/useActionAccess';
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import {
@@ -25,6 +26,11 @@ import { AppShell } from "@/components/dashboard/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { apiFetch } from "@/lib/api-client";
+import {companyOptionIdentity} from '@/lib/company-option-identity';
+import {useAccess} from '@/components/access/AccessProvider';
+import { localPdfMetadata, sendPdfToLocalAgent, sendLedgerContextToLocalAgent, cancelLocalDocument, assertLocalBankContextIdentity } from "@/lib/local-bank-document";
+import { createBankPreviewCompletion } from '@/lib/bank-preview-completion';
+import { watchBankJob } from '@/lib/cash-discount-live';
 import { allocateReceiptByFifo } from "@/lib/bank-statement-bill-allocation";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
@@ -54,6 +60,7 @@ type BankStatementImport = {
 };
 
 type CompanyOption = {
+  accessCompanyId?: string;
   id: string;
   connectionId: string;
   companyName: string;
@@ -91,7 +98,7 @@ const BANK_STATEMENT_COMPANY_SELECTION_KEY = "kalika.bankStatements.selectedComp
 function uniqueCompanyOptions(options: CompanyOption[]) {
   const seen = new Set<string>();
   return options.filter((option) => {
-    const key = `${option.companyName.trim().toLowerCase()}::${option.financialYear.trim().toLowerCase()}`;
+    const key = companyOptionIdentity(option);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -326,6 +333,7 @@ type PreviewResponse = {
   requiresManualExtraction?: boolean;
   extractionError?: string | null;
   extractionDiagnostics?: {
+    localParsing?: { source: string; machineName?: string; aiMs?: number; auditHash?: string; sourceRetention?: string };
     rawAiTransactionCount?: number;
     normalizedAiTransactionCount?: number;
     coverageComplete?: boolean;
@@ -1289,6 +1297,7 @@ function LedgerSearchSelect({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [activeOptionIndex, setActiveOptionIndex] = useState(0);
+  const deferredQuery = useDeferredValue(query);
   const uniqueGroups = useMemo(() => {
     const seen = new Set<string>();
     return groups
@@ -1304,7 +1313,7 @@ function LedgerSearchSelect({
       .filter((group) => group.options.length > 0);
   }, [groups]);
   const filteredGroups = useMemo(() => {
-    const normalizedQuery = normalizeName(query);
+    const normalizedQuery = normalizeName(deferredQuery);
     if (!normalizedQuery) return uniqueGroups;
     return uniqueGroups
       .map((group) => ({
@@ -1314,10 +1323,19 @@ function LedgerSearchSelect({
         ),
       }))
       .filter((group) => group.options.length > 0);
-  }, [query, uniqueGroups]);
+  }, [deferredQuery, uniqueGroups]);
+  const renderedGroups = useMemo(() => {
+    let remaining = 80;
+    return filteredGroups.flatMap((group) => {
+      if (remaining <= 0) return [];
+      const options = group.options.slice(0, remaining);
+      remaining -= options.length;
+      return options.length > 0 ? [{ ...group, options }] : [];
+    });
+  }, [filteredGroups]);
   const visibleOptions = useMemo(
-    () => filteredGroups.flatMap((group) => group.options),
-    [filteredGroups]
+    () => renderedGroups.flatMap((group) => group.options),
+    [renderedGroups]
   );
 
   function chooseLedger(name: string) {
@@ -1330,10 +1348,10 @@ function LedgerSearchSelect({
   return (
     <div className="relative">
       <div className="relative">
-        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9a8d7f]" />
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#9a8d7f]" />
         <input
           autoFocus
-          className="h-10 w-full rounded-md border border-[#d8cbbb] bg-white px-3 pl-9 text-sm font-medium text-[#2b241d] outline-none transition placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
+          className="h-8 w-full rounded-md border border-[#d8cbbb] bg-white px-2.5 pl-8 text-[11px] font-medium text-[#2b241d] outline-none transition placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
           onBlur={() => window.setTimeout(() => setOpen(false), 120)}
           onChange={(event) => {
             setQuery(event.target.value);
@@ -1374,10 +1392,10 @@ function LedgerSearchSelect({
 
       {open ? (
         <div className="absolute z-30 mt-2 max-h-72 w-full overflow-auto rounded-xl border border-[#d8cbbb] bg-white p-1 shadow-xl">
-          {filteredGroups.length > 0 ? (
-            filteredGroups.map((group) => (
+          {renderedGroups.length > 0 ? (
+            renderedGroups.map((group) => (
               <div className="mb-1 last:mb-0" key={group.label}>
-                <div className="px-3 pb-1 pt-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
+                <div className="px-2.5 pb-0.5 pt-1.5 text-[8px] font-bold uppercase tracking-[0.14em] text-[#9a8d7f]">
                   {group.label}
                 </div>
                 {group.options.map((option) => {
@@ -1385,7 +1403,7 @@ function LedgerSearchSelect({
                   const keyboardActive = optionIndex === activeOptionIndex;
                   return (
                     <button
-                      className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold transition hover:bg-[#fbf4ea] ${
+                      className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left text-[11px] font-semibold leading-4 transition hover:bg-[#fbf4ea] ${
                         option.name === value || keyboardActive
                           ? "bg-[#f6efe6] text-[#4b3828]"
                           : "text-[#2b241d]"
@@ -1399,7 +1417,7 @@ function LedgerSearchSelect({
                     >
                       <span className="min-w-0">
                         <span className="block truncate">{option.name}</span>
-                        <span className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] font-medium text-[#8a7f72]">
+                        <span className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[9px] font-medium leading-3 text-[#8a7f72]">
                           {option.helper ? <span className="truncate">{option.helper}</span> : null}
                           {formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType) ? (
                             <span className="whitespace-nowrap font-bold text-[#6f4e2f]">
@@ -1410,14 +1428,14 @@ function LedgerSearchSelect({
                           )}
                         </span>
                       </span>
-                      {option.name === value ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" /> : null}
+                      {option.name === value ? <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-700" /> : null}
                     </button>
                   );
                 })}
               </div>
             ))
           ) : (
-            <div className="px-3 py-4 text-sm font-semibold text-[#8a7f72]">
+            <div className="px-2.5 py-3 text-[11px] font-semibold text-[#8a7f72]">
               No matching ledger found.
             </div>
           )}
@@ -1470,7 +1488,8 @@ function LedgerReviewSelect({
     () => buildLedgerPickerGroups(transaction, ledgerMasters),
     [ledgerMasters, transaction]
   );
-  const normalizedQuery = normalizeName(query);
+  const deferredQuery = useDeferredValue(query);
+  const normalizedQuery = normalizeName(deferredQuery);
   const filteredGroups = useMemo(() => {
     if (!normalizedQuery) return groups;
 
@@ -1481,16 +1500,25 @@ function LedgerReviewSelect({
           const searchable = `${group.label} ${option.label} ${option.name} ${option.helper ?? ""} ${option.badge ?? ""} ${formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType) ?? ""}`;
           return (
             normalizeName(searchable).includes(normalizedQuery) ||
-            ledgerNameSimilarity(query, option.name) >= 0.78
+            ledgerNameSimilarity(deferredQuery, option.name) >= 0.78
           );
         }),
       }))
       .filter((group) => group.options.length > 0);
-  }, [groups, normalizedQuery, query]);
+  }, [deferredQuery, groups, normalizedQuery]);
+  const renderedGroups = useMemo(() => {
+    let remaining = 80;
+    return filteredGroups.flatMap((group) => {
+      if (remaining <= 0) return [];
+      const options = group.options.slice(0, remaining);
+      remaining -= options.length;
+      return options.length > 0 ? [{ ...group, options }] : [];
+    });
+  }, [filteredGroups]);
   const displayValue = open ? query : getLedgerPickerDisplayValue(transaction);
   const visibleOptions = useMemo(
-    () => filteredGroups.flatMap((group) => group.options),
-    [filteredGroups]
+    () => renderedGroups.flatMap((group) => group.options),
+    [renderedGroups]
   );
 
   function selectOption(option: LedgerSelection) {
@@ -1563,10 +1591,10 @@ function LedgerReviewSelect({
         width: popoverPosition.width,
       }}
     >
-      {filteredGroups.length > 0 ? (
-        filteredGroups.map((group) => (
+      {renderedGroups.length > 0 ? (
+        renderedGroups.map((group) => (
           <div className="mb-1 last:mb-0" key={group.label}>
-            <div className="px-3 pb-1 pt-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
+            <div className="px-2.5 pb-0.5 pt-1.5 text-[8px] font-bold uppercase tracking-[0.14em] text-[#9a8d7f]">
               {group.label}
             </div>
             {group.options.map((option) => {
@@ -1577,7 +1605,7 @@ function LedgerReviewSelect({
               const keyboardActive = optionIndex === activeOptionIndex;
               return (
                 <button
-                  className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm font-semibold transition hover:bg-[#fbf4ea] ${
+                  className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left text-[11px] font-semibold leading-4 transition hover:bg-[#fbf4ea] ${
                     selected || keyboardActive ? "bg-[#f6efe6] text-[#4b3828]" : "text-[#2b241d]"
                   }`}
                   key={option.key}
@@ -1589,7 +1617,7 @@ function LedgerReviewSelect({
                 >
                   <span className="min-w-0">
                     <span className="block whitespace-normal break-words">{option.label}</span>
-                    <span className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] font-medium leading-4 text-[#8a7f72]">
+                    <span className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[9px] font-medium leading-3 text-[#8a7f72]">
                       {option.helper ? <span className="whitespace-normal break-words">{option.helper}</span> : null}
                       {formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType) ? (
                         <span className="whitespace-nowrap font-bold text-[#6f4e2f]">
@@ -1602,11 +1630,11 @@ function LedgerReviewSelect({
                   </span>
                   <span className="flex shrink-0 items-center gap-2">
                     {option.badge ? (
-                      <Badge className="border-[#d8cbbb] bg-white text-[#6f4e2f]" variant="outline">
+                        <Badge className="h-4 border-[#d8cbbb] bg-white px-1.5 py-0 text-[8px] leading-none text-[#6f4e2f]" variant="outline">
                         {option.badge}
                       </Badge>
                     ) : null}
-                    {selected ? <CheckCircle2 className="h-4 w-4 text-emerald-700" /> : null}
+                    {selected ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-700" /> : null}
                   </span>
                 </button>
               );
@@ -1614,11 +1642,11 @@ function LedgerReviewSelect({
           </div>
         ))
       ) : ledgerMasters.length === 0 ? (
-        <div className="px-3 py-4 text-sm font-semibold text-[#8a7f72]">
+        <div className="px-2.5 py-3 text-[11px] font-semibold text-[#8a7f72]">
           Tally ledgers are not loaded. Use Sync above, then search again.
         </div>
       ) : (
-        <div className="px-3 py-4 text-sm font-semibold text-[#8a7f72]">
+        <div className="px-2.5 py-3 text-[11px] font-semibold text-[#8a7f72]">
           No matching ledger found.
         </div>
       )}
@@ -1631,7 +1659,7 @@ function LedgerReviewSelect({
         <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9a8d7f]" />
         <input
           autoFocus
-          className="h-10 w-full rounded-md border border-[#d8cbbb] bg-white px-3 pl-9 text-sm font-medium text-[#2b241d] outline-none transition placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
+          className="h-8 w-full rounded-md border border-[#d8cbbb] bg-white px-2.5 pl-8 text-[11px] font-medium text-[#2b241d] outline-none transition placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
           onBlur={() => {
             window.setTimeout(() => {
               const focusedElement = document.activeElement;
@@ -1710,9 +1738,9 @@ function CurrencyAmountInput({
 
   return (
     <div className="inline-flex h-8.5 w-36 items-center rounded-xl border border-[#e5ddd0] bg-white px-3 focus-within:border-amber-500">
-      <span className="mr-1.5 text-xs font-bold text-slate-400">Rs.</span>
+      <span className="mr-1.5 text-xs font-medium text-slate-400">Rs.</span>
       <input
-        className="min-w-0 flex-1 bg-transparent text-right text-xs font-bold text-[#1a1a1a] outline-none"
+        className="min-w-0 flex-1 bg-transparent text-right text-xs font-medium text-[#1a1a1a] outline-none"
         inputMode="decimal"
         max={max}
         min={min}
@@ -2049,6 +2077,49 @@ function getBillAllocationBadgeText(
   if (context.partyKind && context.reason.includes("bill-wise")) return "Needs Bill-Wise";
   if (!context.partyKind && context.reason.includes("party ledger")) return "Needs Party Ledger";
   return "Not Applicable";
+}
+
+function getBillAllocationSubtext(
+  draft?: BillAllocationDraft | null,
+  transaction?: ReviewTransaction,
+  ledgerMasters: TallyMaster[] = []
+) {
+  if (!draft) {
+    if (
+      transaction &&
+      isIncomingReceiptRow(transaction) &&
+      transaction.selectedLedgerName.trim() &&
+      !isBillMatchEligibleTransaction(transaction, ledgerMasters)
+    ) {
+      return isSuspenseLedgerName(transaction.selectedLedgerName)
+        ? "Will post to Suspense · Bill matching not applicable"
+        : "Bill matching not applicable";
+    }
+    return "";
+  }
+  if (draft.status === "ready_to_post") {
+    const billLines = draft.allocations.filter((line) => line.referenceType === "Agst Ref");
+    const billAmount = billLines.reduce((sum, line) => sum + line.allocatedAmount, 0);
+    if (billLines.length === 0) {
+      return `${formatCurrencyAmount(draft.newAdvanceAmount || draft.receiptAmount)} · No open bill`;
+    }
+    if (draft.newAdvanceAmount > 0) {
+      return `${formatCurrencyAmount(billAmount)} allocated · ${formatCurrencyAmount(draft.newAdvanceAmount)} advance`;
+    }
+    if (billLines.length === 1) {
+      const settlement = Math.abs(Number(billLines[0]?.pendingAmountAfterAllocation ?? 0)) < 0.005
+        ? "Full settlement"
+        : "Partial settlement";
+      return `${formatCurrencyAmount(billAmount)} · ${settlement}`;
+    }
+    return `${formatCurrencyAmount(billAmount)} allocated`;
+  }
+  if (draft.status === "needs_review" || draft.status === "cannot_match_yet") {
+    return `${formatCurrencyAmount(Math.max(0, draft.unallocatedAmount))} unallocated`;
+  }
+  if (draft.status === "stale_data") return "Tally bill data changed";
+  if (draft.status === "post_failed") return "Open and retry posting";
+  return "";
 }
 
 function getBillAllocationBadgeClass(
@@ -2720,8 +2791,8 @@ function ScrollablePdfPreview({ objectUrl, fileName }: { objectUrl: string; file
           <div className="flex min-h-full items-center justify-center px-6 text-center">
             <div className="max-w-sm">
               <AlertTriangle className="mx-auto h-6 w-6 text-rose-700" />
-              <p className="mt-3 text-sm font-bold text-[#2d2d2d]">Preview could not be displayed</p>
-              <p className="mt-1 text-xs font-semibold leading-5 text-[#71695f]">{error}</p>
+              <p className="mt-3 text-sm font-semibold text-[#2d2d2d]">Preview could not be displayed</p>
+              <p className="mt-1 text-xs font-normal leading-5 text-[#71695f]">{error}</p>
             </div>
           </div>
         ) : (
@@ -2754,6 +2825,7 @@ function formatFileSize(size: number | null | undefined) {
 }
 
 export function BankStatementsPage() {
+  const {enforcementRequired:accessEnforced}=useAccess();
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [file, setFile] = useState<File | null>(null);
@@ -2780,6 +2852,7 @@ export function BankStatementsPage() {
   const [bankLedgerChangeMode, setBankLedgerChangeMode] = useState(false);
   const [pendingBankLedgerName, setPendingBankLedgerName] = useState("");
   const [ledgerMasters, setLedgerMasters] = useState<TallyMaster[]>([]);
+  const localLedgerSuggestionKeyRef = useRef("");
   const [tallyBankLedgersByCompany, setTallyBankLedgersByCompany] = useState<Record<string, LocalBankLedger[]>>({});
   const [transactions, setTransactions] = useState<ReviewTransaction[]>([]);
   const [editingLedgerIds, setEditingLedgerIds] = useState<Set<string>>(new Set());
@@ -2802,7 +2875,8 @@ export function BankStatementsPage() {
   const [statementDoneSummary, setStatementDoneSummary] = useState<StatementDoneSummary | null>(null);
   const [reviewFiltersOpen, setReviewFiltersOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
-  const [activeReviewTransactionId, setActiveReviewTransactionId] = useState<string | null>(null);
+  const activeReviewTransactionIdRef = useRef<string | null>(null);
+  const [expandedNarrationTransactionId, setExpandedNarrationTransactionId] = useState<string | null>(null);
   const [reviewSearch, setReviewSearch] = useState("");
   const [reviewWorkStatusFilter, setReviewWorkStatusFilter] = useState<ReviewWorkStatusFilter>("all");
   const [reviewTallyResultFilter, setReviewTallyResultFilter] = useState<ReviewTallyResultFilter>("all");
@@ -2830,6 +2904,34 @@ export function BankStatementsPage() {
   const tallyStatusStartedAtRef = useRef(Date.now());
   const lastNonEmptyCompaniesRef = useRef<CompanyOption[]>([]);
   const [checkingLiveTallyCompany, setCheckingLiveTallyCompany] = useState(true);
+
+  const selectReviewTransaction = useCallback((transactionId: string | null) => {
+    const previousId = activeReviewTransactionIdRef.current;
+    if (previousId && previousId !== transactionId) {
+      const previousRow = reviewRowRefs.current.get(previousId);
+      previousRow?.setAttribute("data-active", "false");
+      previousRow?.setAttribute("aria-selected", "false");
+    }
+    activeReviewTransactionIdRef.current = transactionId;
+    if (transactionId) {
+      const nextRow = reviewRowRefs.current.get(transactionId);
+      nextRow?.setAttribute("data-active", "true");
+      nextRow?.setAttribute("aria-selected", "true");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!expandedNarrationTransactionId) return;
+
+    function collapseNarrationOnOutsideClick(event: PointerEvent) {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest("[data-narration-cell]")) return;
+      setExpandedNarrationTransactionId(null);
+    }
+
+    document.addEventListener("pointerdown", collapseNarrationOnOutsideClick);
+    return () => document.removeEventListener("pointerdown", collapseNarrationOnOutsideClick);
+  }, [expandedNarrationTransactionId]);
 
   const validTransactions = useMemo(
     () => transactions.filter(transactionIsValid),
@@ -2888,6 +2990,7 @@ export function BankStatementsPage() {
       : null,
     [companyOptions, selectedCompanyId]
   );
+  const allowed=useActionAccess(selectedCompany?.accessCompanyId);
   useEffect(() => {
     if (selectedCompany) {
       writeStoredCompanySelection(selectedCompany);
@@ -2971,9 +3074,12 @@ export function BankStatementsPage() {
       return true;
     });
   }, [ledgerMasters, selectedCompany, selectedCompanyName, tallyBankLedgersByCompany]);
+  const originalSuggestedBankLedgerName = preview?.account.tallyLedgerName?.trim() || "";
   const bankLedgerPickerGroups = useMemo<LedgerSearchGroup[]>(() => {
+    const originalSuggestionKey = normalizeName(originalSuggestedBankLedgerName);
     const identifiedNames = new Set(bankLedgerOptions.map((ledger) => normalizeName(ledger.name)));
     const identifiedBankLedgers = [...bankLedgerOptions]
+      .filter((ledger) => normalizeName(ledger.name) !== originalSuggestionKey)
       .sort((left, right) => left.name.localeCompare(right.name))
       .map((ledger) => ({
         name: ledger.name,
@@ -2984,7 +3090,12 @@ export function BankStatementsPage() {
         ...ledgerBalanceFields(ledger),
       }));
     const allOtherLedgers = ledgerMasters
-      .filter((ledger) => ledger.name.trim() && !identifiedNames.has(normalizeName(ledger.name)))
+      .filter(
+        (ledger) =>
+          ledger.name.trim() &&
+          normalizeName(ledger.name) !== originalSuggestionKey &&
+          !identifiedNames.has(normalizeName(ledger.name))
+      )
       .sort((left, right) => left.name.localeCompare(right.name))
       .map((ledger) => ({
         name: ledger.name,
@@ -2993,10 +3104,19 @@ export function BankStatementsPage() {
       }));
 
     return [
+      ...(originalSuggestedBankLedgerName
+        ? [{
+            label: "Original suggestion",
+            options: [{
+              name: originalSuggestedBankLedgerName,
+              helper: "Suggested match from statement analysis",
+            }],
+          }]
+        : []),
       { label: "Identified bank account ledgers", options: identifiedBankLedgers },
       { label: "All other Tally ledgers", options: allOtherLedgers },
     ];
-  }, [bankLedgerOptions, ledgerMasters]);
+  }, [bankLedgerOptions, ledgerMasters, originalSuggestedBankLedgerName]);
   const exactBankLedgerMatch = useMemo(() => {
     const statementAccountNumber = normalizeBankAccountNumber(account.accountNumber);
     if (!statementAccountNumber) return null;
@@ -3360,7 +3480,7 @@ export function BankStatementsPage() {
           : tallyPostingScope === "payments"
             ? `Post ${missingOutgoingCount} Payment${missingOutgoingCount === 1 ? "" : "s"}`
             : `Post ${selectedPostingTransactions.length} Ready Entr${selectedPostingTransactions.length === 1 ? "y" : "ies"}`;
-  const statementReviewLocked = Boolean(statementDoneSummary) || tallyPostingInProgress;
+  const statementReviewLocked = !allowed('bank.prepare') || Boolean(statementDoneSummary) || tallyPostingInProgress;
   const statementReviewDrawerLocked = tallyPostingInProgress;
   const activeReviewFilterCount = [
     reviewSearch.trim(),
@@ -3392,15 +3512,16 @@ export function BankStatementsPage() {
 
   useEffect(() => {
     if (visibleReviewTransactions.length === 0) {
-      setActiveReviewTransactionId(null);
+      selectReviewTransaction(null);
       return;
     }
-    setActiveReviewTransactionId((current) =>
+    const current = activeReviewTransactionIdRef.current;
+    selectReviewTransaction(
       current && visibleReviewTransactions.some((transaction) => transaction.id === current)
         ? current
         : visibleReviewTransactions[0].id
     );
-  }, [visibleReviewTransactions]);
+  }, [selectReviewTransaction, visibleReviewTransactions]);
 
   useEffect(() => {
     function isTypingTarget(target: EventTarget | null) {
@@ -3495,7 +3616,7 @@ export function BankStatementsPage() {
         if (filteredTransactions.length === 0) return;
         event.preventDefault();
         const currentIndex = filteredTransactions.findIndex(
-          (transaction) => transaction.id === activeReviewTransactionId
+          (transaction) => transaction.id === activeReviewTransactionIdRef.current
         );
         let nextIndex = currentIndex < 0 ? 0 : currentIndex;
         if (event.key === "Home") nextIndex = 0;
@@ -3506,7 +3627,7 @@ export function BankStatementsPage() {
         else if (event.key === "PageUp") nextIndex -= rowsPerPage;
         nextIndex = Math.min(Math.max(nextIndex, 0), filteredTransactions.length - 1);
         const nextTransaction = filteredTransactions[nextIndex];
-        setActiveReviewTransactionId(nextTransaction.id);
+        selectReviewTransaction(nextTransaction.id);
         setReviewPage(Math.floor(nextIndex / rowsPerPage) + 1);
         window.requestAnimationFrame(() => {
           window.requestAnimationFrame(() => {
@@ -3516,6 +3637,7 @@ export function BankStatementsPage() {
         return;
       }
 
+      const activeReviewTransactionId = activeReviewTransactionIdRef.current;
       if ((event.key === "Enter" || event.key === "F2") && activeReviewTransactionId && !statementReviewLocked) {
         event.preventDefault();
         setEditingLedgerIds(new Set([activeReviewTransactionId]));
@@ -3525,7 +3647,6 @@ export function BankStatementsPage() {
     window.addEventListener("keydown", handleReviewShortcut);
     return () => window.removeEventListener("keydown", handleReviewShortcut);
   }, [
-    activeReviewTransactionId,
     bankLedgerChangeMode,
     billAllocationsByTransactionId,
     billAllocationReviewTransactionId,
@@ -3534,6 +3655,7 @@ export function BankStatementsPage() {
     outgoingReviewTransactionId,
     preview,
     reviewFiltersOpen,
+    selectReviewTransaction,
     rowsPerPage,
     shortcutsOpen,
     statementReviewLocked,
@@ -3693,7 +3815,7 @@ export function BankStatementsPage() {
     return nextCompanies;
   }, [selectedCompanyId, tallyConnectionId]);
 
-  const loadLedgerMasters = useCallback(async (connectionId: string) => {
+  const loadLedgerMasters = useCallback(async (connectionId: string, exactScope?: { companyName: string; financialYear: string; identity: Record<string, unknown> }) => {
     const loadSeq = ledgerLoadSeqRef.current + 1;
     ledgerLoadSeqRef.current = loadSeq;
 
@@ -3704,21 +3826,37 @@ export function BankStatementsPage() {
       return [];
     }
 
-    const connectionCompany = companyOptions.find((option) => option.connectionId === connectionId);
+    const candidates=companyOptions.filter(option=>option.connectionId===connectionId);
+    const connectionCompany=candidates.find(option=>option.id===selectedCompanyId)||(candidates.length===1?candidates[0]:undefined);
+    if(!exactScope&&!connectionCompany)throw new Error('Select the company and financial year before loading ledgers.');
+    if(accessEnforced&&!allowed('bank.prepare')) {
+      const query=new URLSearchParams({type:'ledger',all:'true',companyName:exactScope?.companyName||connectionCompany!.companyName,
+        financialYear:exactScope?.financialYear||connectionCompany!.financialYear});
+      const response=await apiFetch(`/api/tally/connections/${connectionId}/masters?${query}`,{cache:'no-store'});
+      if(!response.ok)throw new Error(await readError(response));
+      const result=await response.json() as {masters?:TallyMaster[]};
+      const masters=result.masters||[];
+      if(loadSeq===ledgerLoadSeqRef.current)setLedgerMasters(masters);
+      return masters;
+    }
     const payload = await runCashDiscountLiveRequest<{
       ledgers?: TallyMaster[];
       groups?: TallyMaster[];
+      bankDocumentIdentity?: Record<string, unknown>;
     }>({
       connectionId,
-      companyName: connectionCompany?.companyName || selectedCompanyName,
+      companyName: exactScope?.companyName || connectionCompany?.companyName || selectedCompanyName,
+      financialYear: exactScope?.financialYear || connectionCompany?.financialYear,
       operation: "ledger_masters",
+      payload: { persist: false, ...(exactScope ? { bankDocumentIdentity: exactScope.identity } : {}) },
     });
+    if (exactScope) assertLocalBankContextIdentity(exactScope.identity, payload.bankDocumentIdentity);
     const masters = payload.ledgers ?? [];
     if (loadSeq === ledgerLoadSeqRef.current) {
       setLedgerMasters(masters);
     }
     return masters;
-  }, [companyOptions, selectedCompanyName]);
+  }, [companyOptions, selectedCompanyName, selectedCompanyId,accessEnforced,allowed]);
 
   useEffect(() => {
     if (!tallyConnectionId) {
@@ -4132,6 +4270,61 @@ export function BankStatementsPage() {
     );
   }, [ledgerMasters]);
 
+  useEffect(() => {
+    if (!tallyConnectionId || !selectedCompany || ledgerMasters.length === 0) return;
+    const eligible = transactions.filter((transaction) =>
+      !transaction.ledgerSelectionTouched &&
+      Boolean(transaction.counterpartyName || transaction.description) &&
+      (transaction.ledgerAction === "needs_review" || transaction.ledgerAction === "use_suspense")
+    ).slice(0, 100);
+    if (!eligible.length) return;
+    const key = JSON.stringify([
+      tallyConnectionId,
+      selectedCompany.id,
+      ledgerMasters.length,
+      eligible.map((transaction) => [transaction.id, transaction.counterpartyName, transaction.description]),
+    ]);
+    if (localLedgerSuggestionKeyRef.current === key) return;
+    localLedgerSuggestionKeyRef.current = key;
+    let cancelled = false;
+    void runCashDiscountLiveRequest<{
+      matches?: Record<string, { suggestions?: Array<{ ledger?: TallyMaster; score?: number; source?: string }>; vectorEnabled?: boolean }>;
+    }>({
+      connectionId: tallyConnectionId,
+      companyName: selectedCompany.companyName,
+      financialYear: selectedCompany.financialYear,
+      operation: "ledger_suggestions",
+      payload: {
+        moduleName: "bank",
+        queries: eligible.map((transaction) => ({
+          id: transaction.id,
+          name: transaction.counterpartyName || transaction.description,
+        })),
+      },
+    }).then((result) => {
+      if (cancelled || !result.matches) return;
+      setTransactions((current) => current.map((transaction) => {
+        if (transaction.ledgerSelectionTouched) return transaction;
+        const match = result.matches?.[transaction.id];
+        const names = (match?.suggestions || [])
+          .map((entry) => entry.ledger?.name?.trim())
+          .filter((name): name is string => typeof name === "string" && Boolean(name) && !isSuspenseLedgerName(name));
+        const candidateLedgerNames = Array.from(new Set([...transaction.candidateLedgerNames, ...names])).slice(0, 8);
+        if (!candidateLedgerNames.length || candidateLedgerNames.join("|") === transaction.candidateLedgerNames.join("|")) return transaction;
+        return {
+          ...transaction,
+          candidateLedgerNames,
+          requiresUserConfirmation: true,
+          suggestionReason: `Closest local Tally ledger matches: ${candidateLedgerNames.join(", ")}.`,
+        };
+      }));
+    }).catch(() => {
+      // The existing deterministic and AI suggestions remain available if the
+      // local index is disabled, rebuilding, or the connector disconnects.
+    });
+    return () => { cancelled = true; };
+  }, [ledgerMasters.length, selectedCompany, tallyConnectionId, transactions]);
+
   function updateLedgerSelection(id: string, selection: LedgerSelection) {
     setTransactions((current) =>
       current.map((transaction) =>
@@ -4450,7 +4643,12 @@ export function BankStatementsPage() {
     // Tally choice must never overwrite it with the ledger's account details.
     setAccount((current) => ({ ...current, tallyLedgerName: ledgerName }));
     setBankLedgerName(ledgerName);
-    setBankLedgerVerified(false);
+    setBankLedgerVerified(
+      Boolean(
+        originalSuggestedBankLedgerName &&
+        normalizeName(ledgerName) === normalizeName(originalSuggestedBankLedgerName)
+      )
+    );
     setBankLedgerManuallyConfirmed(true);
     setBankLedgerChangeMode(false);
     setPendingBankLedgerName("");
@@ -4539,11 +4737,30 @@ export function BankStatementsPage() {
     setReviewAllocationFilter("all");
     setReviewDateFrom("");
     setReviewDateTo("");
-    setActiveReviewTransactionId(null);
+    selectReviewTransaction(null);
     setBillAllocationReviewTransactionId(null);
     setOutgoingReviewTransactionId(null);
   }
-  async function pollImportUntilReady(importId: string, ledgerMastersForReview = ledgerMasters) {
+  async function pollImportUntilReady(importId: string, ledgerMastersForReview = ledgerMasters, documentProcessingComplete = false) {
+    const initialStatus = await loadImportStatus(importId);
+    if (initialStatus.pipelineVersion === 2) {
+      const completion = createBankPreviewCompletion({
+        snapshot: () => loadImportStatus(importId),
+        preview: () => loadImportPreviewWithPagedTransactions(importId),
+      });
+      // Resume the saved job's connection, never the currently selected PC.
+      const stopWatching = initialStatus.connectionId && initialStatus.job?.id
+        ? watchBankJob({ connectionId: initialStatus.connectionId, companyName: initialStatus.companyName || '', jobId: initialStatus.job.id,
+            onEvent: () => { void completion.check(); }, onOnline: online => completion.setOnline(online) })
+        : () => {};
+      try {
+        void completion.check();
+        const preview = await completion.promise;
+        applyPreviewPayload(preview, EMPTY_ACCOUNT, ledgerMastersForReview);
+        setBanner(getAnalysisCompleteMessage(preview));
+        return preview;
+      } finally { stopWatching(); completion.stop(); }
+    }
     const startedAt = Date.now();
     const maximumWaitMs = 15 * 60 * 1000;
     for (let attempt = 0; Date.now() - startedAt < maximumWaitMs; attempt += 1) {
@@ -4552,9 +4769,7 @@ export function BankStatementsPage() {
       if (payload.processing) {
         setBanner({
           tone: "info",
-          text: payload.job?.stage
-            ? `Analyzing statement: ${payload.job.stage}`
-            : "Analyzing statement...",
+          text: documentProcessingComplete ? "Finalizing results" : payload.job?.stage || "Processing document",
         });
         continue;
       }
@@ -4572,7 +4787,119 @@ export function BankStatementsPage() {
     throw new Error("Bank statement analysis is still running after 15 minutes. The job remains saved; refresh to check its latest status.");
   }
 
+  async function resolvePdfParsingPolicy() {
+    const response = await apiFetch("/api/bank-statements/parsing-policy", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connectionId: tallyConnectionId, companyName: selectedCompanyName, financialYear: selectedFinancialYear }),
+    });
+    const policy = await response.json();
+    if (!response.ok) throw new Error(policy.error || "Cannot verify the PDF parsing settings.");
+    return policy as { mode: 'local_agent' | 'backend'; pipelineVersion: 1 | 2; identity?: Record<string, unknown> };
+  }
+
+  async function resolvePdfParsingMode() { return (await resolvePdfParsingPolicy()).mode; }
+
+  async function analyzeLocalV2(nextFile: File, identity?: Record<string, unknown>) {
+    if (!identity) throw new Error('The selected agent did not return its document scope. Refresh and retry.');
+    const started = performance.now();
+    let traceJobId: string | undefined = undefined;
+    let ledgerReadyMs = 0;
+    const trace = (phase: string, measurements: Record<string, number> = {}) => console.info('[bank-v2-browser]', {
+      jobId: traceJobId, phase, elapsedMs: Math.round(performance.now() - started), ...measurements,
+    });
+    const abort = new AbortController();
+    // Start the existing fresh read immediately, with its original scope and
+    // ordering. Import creation and PDF parsing do not wait on this promise.
+    const mastersPromise = loadLedgerMasters(tallyConnectionId, { companyName: selectedCompanyName, financialYear: String(identity.financialYear), identity }).then(masters => {
+      if (!masters?.length) throw new Error('Could not fetch the latest ledgers from Tally. Keep Tally and the connector open, then retry.');
+      ledgerReadyMs = performance.now() - started;
+      return masters;
+    });
+    mastersPromise.catch(() => {});
+    const form = new FormData();
+    form.set('pipelineVersion', '2');
+    form.set('localDocument', JSON.stringify(await localPdfMetadata(nextFile)));
+    form.set('account', JSON.stringify(EMPTY_ACCOUNT));
+    form.set('connectionId', tallyConnectionId);
+    form.set('companyName', selectedCompanyName);
+    form.set('financialYear', selectedFinancialYear);
+    form.set('bankLedgerName', '');
+    form.set('syncBeforeAnalysis', 'false');
+    const response = await apiFetch('/api/bank-statements/imports', { method: 'POST', body: form });
+    if (!response.ok) throw new Error(await readError(response));
+    const payload = await response.json() as PreviewResponse & {
+      pipelineVersion: number; localUpload?: { token: string; identity: Record<string, unknown>; jobId: string };
+    };
+    if (payload.pipelineVersion !== 2 || !payload.localUpload) throw new Error('The v2 upload ticket is missing. Check import status before retrying.');
+    const ticket = payload.localUpload;
+    traceJobId = ticket.jobId;
+    trace('job_created', { fileBytes: nextFile.size });
+    let preparationFailed = false;
+    const completion = createBankPreviewCompletion({
+      snapshot: () => loadImportStatus(payload.import.id),
+      preview: () => { trace('preview_fetch_started'); return loadImportPreviewWithPagedTransactions(payload.import.id); },
+    });
+    const stopWatching = watchBankJob({ connectionId: tallyConnectionId, companyName: selectedCompanyName, jobId: ticket.jobId,
+      onEvent: () => { trace('job_event'); void completion.check(); }, onOnline: online => completion.setOnline(online),
+    });
+    setBanner({ tone: 'info', text: 'Preparing document' });
+    const context = mastersPromise.then(async masters => {
+      trace('ledger_preparation_complete', { ledgerPreparationMs: Math.round(ledgerReadyMs), ledgerCount: masters.length });
+      assertLocalBankContextIdentity(identity, ticket.identity);
+      // Same normalization/limits as the existing import route, without a
+      // Supabase round trip or persisting the full ledger catalogue.
+      const ledgerNames = Array.from(new Set(masters.map(ledger => ledger.name.trim()).filter(Boolean)));
+      const normalizedNames = Array.from(new Set(ledgerNames.map(name => name.trim().slice(0, 500)).filter(Boolean))).slice(0, 20000);
+      const bankAccountCandidates = masters.flatMap(ledger => {
+        const accountNumber = normalizeBankAccountNumber(ledger.bankAccountNumber).replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 40);
+        const ledgerName = ledger.name.trim().slice(0, 500);
+        return accountNumber && ledgerName ? [{ ledgerName, accountNumber }] : [];
+      }).slice(0, 1000);
+      await sendLedgerContextToLocalAgent(ticket.token, { pipelineVersion: 2, identity: ticket.identity,
+        ledgerNames: normalizedNames, bankAccountCandidates }, abort.signal);
+      trace('context_transferred');
+      return masters;
+    }).catch(async error => {
+      preparationFailed = true; abort.abort();
+      completion.fail(error instanceof Error ? error : new Error('Ledger preparation failed.'));
+      await cancelLocalDocument(ticket.token);
+      await apiFetch(`/api/bank-statements/imports/${payload.import.id}/local-upload-failed`, { method: 'POST' }).catch(() => {});
+      throw error;
+    });
+    const transfer = sendPdfToLocalAgent(nextFile, ticket.token, text => {
+      trace(`document_stage:${text}`); setBanner({ tone: 'info', text });
+    }, abort.signal);
+    // Both a committed stream completion and a socket notification trigger the
+    // same deduplicated fetch. A lost stream reads status, never cancels paid AI.
+    void transfer.then(() => completion.check(), () => completion.check());
+    try {
+      const [masters, preview] = await Promise.all([context, completion.promise]);
+      applyPreviewPayload(preview, EMPTY_ACCOUNT, masters);
+      setBanner(getAnalysisCompleteMessage(preview));
+      trace('preview_applied', { rowCount: preview.transactions.length });
+      requestAnimationFrame(() => requestAnimationFrame(() => trace('preview_paint_opportunity')));
+    } catch (error) {
+      // A lost processing response is not a cancellation or a reason to call AI
+      // again. Inspect durable status; preparation failures were cancelled above.
+      if (!preparationFailed) {
+        const status = await loadImportStatus(payload.import.id);
+        if (!status.processing && !['failed', 'cancelled', 'canceled'].includes(status.job?.status || '')) {
+          const preview = await loadImportPreviewWithPagedTransactions(payload.import.id);
+          applyPreviewPayload(preview, EMPTY_ACCOUNT, await mastersPromise);
+          setBanner(getAnalysisCompleteMessage(preview));
+          return;
+        }
+      }
+      throw error;
+    } finally {
+      stopWatching(); completion.stop(); abort.abort();
+    }
+  }
+
   async function handleSelectedStatementFile(nextFile: File) {
+    if(!allowed('bank.prepare')) {
+      setBanner({tone:'error',text:'Your role can view bank statements but cannot prepare new entries.'});return;
+    }
     if (!selectedCompanyId || !selectedCompanyName) {
       setBanner({ tone: "error", text: "Select the Tally company before uploading a bank statement." });
       return;
@@ -4592,11 +4919,21 @@ export function BankStatementsPage() {
     setStatementPasswordVerified(false);
     setFile(nextFile);
     try {
+      const mode = isPdfFile(nextFile) ? await resolvePdfParsingMode() : "backend";
       const nextPreview = await buildDocumentPreview(nextFile);
+      if (nextPreview.kind === "pdf" && mode === "local_agent") {
+        nextPreview.objectUrl = URL.createObjectURL(nextFile);
+        setDocumentPreview(nextPreview);
+        return;
+      }
       setDocumentPreview(nextPreview);
       if (nextPreview.kind === "pdf" && !nextPreview.error) {
         await unlockStatementPdfPreview(nextFile, "");
       }
+    } catch (error) {
+      setFile(null);
+      setDocumentPreview(null);
+      setBanner({ tone: "error", text: error instanceof Error ? error.message : "Cannot prepare document." });
     } finally {
       setDocumentPreviewLoading(false);
     }
@@ -4610,6 +4947,10 @@ export function BankStatementsPage() {
     setStatementPasswordVerified(false);
 
     try {
+      if (await resolvePdfParsingMode() === "local_agent") {
+        setDocumentPreview(current => current ? { ...current, objectUrl: URL.createObjectURL(nextFile), error: null } : current);
+        return true;
+      }
       const formData = new FormData();
       formData.set("file", nextFile);
       if (password) {
@@ -4704,6 +5045,15 @@ export function BankStatementsPage() {
     return (await response.json()) as PreviewResponse;
   }
 
+  async function loadImportStatus(importId: string) {
+    const response = await apiFetch(`/api/bank-statements/imports/${importId}?includeTransactions=false&statusOnly=true`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(await readError(response));
+    return await response.json() as {
+      pipelineVersion?: number; processing?: boolean; connectionId?: string; companyName?: string;
+      job?: { id?: string; status?: string; error?: string | null } | null;
+    };
+  }
+
   async function loadImportPreviewWithPagedTransactions(importId: string) {
     const pageSize = 500;
     const firstResponse = await apiFetch(
@@ -4787,6 +5137,7 @@ export function BankStatementsPage() {
   }
 
   async function analyzeFile(nextFile = file) {
+    if(!allowed('bank.prepare')){setBanner({tone:'error',text:'Your role cannot analyse bank statements.'});return;}
     if (!nextFile) {
       setBanner({ tone: "error", text: "Select a bank statement file." });
       return;
@@ -4825,6 +5176,12 @@ export function BankStatementsPage() {
       setPostUploadSyncImportId(null);
       setPostUploadSyncError(null);
       setFile(nextFile);
+      const parsingPolicy = isPdfFile(nextFile) ? await resolvePdfParsingPolicy() : { mode: 'backend' as const, pipelineVersion: 1 as const };
+      if (parsingPolicy.mode === 'local_agent' && parsingPolicy.pipelineVersion === 2) {
+        await analyzeLocalV2(nextFile, parsingPolicy.identity);
+        return;
+      }
+      const parsingMode = parsingPolicy.mode;
       const syncedMasters = await loadLedgerMasters(tallyConnectionId);
       if (!syncedMasters || syncedMasters.length === 0) {
         throw new Error(
@@ -4834,7 +5191,11 @@ export function BankStatementsPage() {
       const ledgerMastersForReview = syncedMasters;
 
       const formData = new FormData();
-      formData.set("file", nextFile);
+      if (parsingMode === "local_agent") {
+        formData.set("localDocument", JSON.stringify(await localPdfMetadata(nextFile)));
+      } else {
+        formData.set("file", nextFile);
+      }
       formData.set("account", JSON.stringify(EMPTY_ACCOUNT));
       formData.set("connectionId", tallyConnectionId);
       formData.set("companyName", selectedCompanyName);
@@ -4852,7 +5213,7 @@ export function BankStatementsPage() {
           return accountNumber ? [{ ledgerName: ledger.name.trim(), accountNumber }] : [];
         }))
       );
-      if (isPdfFile(nextFile) && statementPassword.trim()) {
+      if (parsingMode !== "local_agent" && isPdfFile(nextFile) && statementPassword.trim()) {
         formData.set("statementPassword", statementPassword);
       }
 
@@ -4882,7 +5243,19 @@ export function BankStatementsPage() {
         throw new Error(payload.error || `Request failed with status ${response.status}`);
       }
 
-      const payload = (await response.json()) as PreviewResponse;
+      const payload = (await response.json()) as PreviewResponse & { localUpload?: { token: string } };
+      let documentProcessingComplete = false;
+      if (parsingMode === "local_agent") {
+        if (!payload.localUpload) throw new Error("Local upload ticket missing. PDF was not uploaded.");
+        setBanner({ tone: "info", text: "Preparing document" });
+        try {
+          documentProcessingComplete = await sendPdfToLocalAgent(nextFile, payload.localUpload.token,
+            text => setBanner({ tone: "info", text }));
+        } catch (error) {
+          await apiFetch(`/api/bank-statements/imports/${payload.import.id}/local-upload-failed`, { method: "POST" }).catch(() => {});
+          throw error;
+        }
+      }
       setStatementPassword("");
       setStatementPasswordRequired(false);
       setStatementPasswordError(null);
@@ -4890,15 +5263,13 @@ export function BankStatementsPage() {
       if (payload.processing) {
         setBanner({
           tone: "info",
-          text: payload.job?.stage
-            ? `Analyzing statement: ${payload.job.stage}`
-            : "Analyzing statement...",
+          text: documentProcessingComplete ? "Finalizing results" : payload.job?.stage || "Processing document",
         });
-        await pollImportUntilReady(payload.import.id, ledgerMastersForReview);
+        await pollImportUntilReady(payload.import.id, ledgerMastersForReview, documentProcessingComplete);
       } else {
         const latestPayload = await loadImportPreviewMetadata(payload.import.id);
         if (latestPayload.processing) {
-          await pollImportUntilReady(payload.import.id, ledgerMastersForReview);
+          await pollImportUntilReady(payload.import.id, ledgerMastersForReview, documentProcessingComplete);
         } else {
           const analyzedPayload = await loadImportPreviewWithPagedTransactions(payload.import.id);
           applyPreviewPayload(analyzedPayload, EMPTY_ACCOUNT, ledgerMastersForReview);
@@ -4952,6 +5323,7 @@ export function BankStatementsPage() {
   }
 
   async function syncCompanyData(options?: { quiet?: boolean; statusText?: string }) {
+    if(!allowed('bank.prepare'))return false;
     const connection = commandConnection;
     if (!connection) {
       setBanner({ tone: "error", text: "Select a Tally connection before syncing ledgers." });
@@ -4969,9 +5341,10 @@ export function BankStatementsPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          commandType: "sync_masters",
+          commandType: accessEnforced ? "sync_bank_masters" : "sync_masters",
           payload: {
             companyName: selectedCompanyName || connection.lastCompanyName,
+            financialYear: selectedCompany?.financialYear,
             // A bank-statement refresh needs counterparties and the user's
             // configured group scope. Purchase stock, units and tax masters
             // are unrelated and can make a large Tally company sync fragile.
@@ -5064,7 +5437,9 @@ export function BankStatementsPage() {
       connectionId: connection.id,
       companyName: selectedCompanyName || connection.lastCompanyName || "",
       operation: "fetch_customer_open_bills",
+      onProgress: (text) => setBanner({ tone: "info", text }),
       payload: {
+        moduleName: "bank",
         ledgerName: requestedLedgerNames[0],
         ledgerNames: requestedLedgerNames,
         companyName: selectedCompanyName || connection.lastCompanyName,
@@ -5163,6 +5538,7 @@ export function BankStatementsPage() {
       connectionId: connection.id,
       companyName: selectedCompanyName || connection.lastCompanyName || "",
       operation: "verify_bank_transaction",
+      onProgress: (text) => setBanner({ tone: "info", text }),
       payload: {
         companyName: selectedCompanyName || connection.lastCompanyName,
         bankLedgerName,
@@ -5305,6 +5681,7 @@ export function BankStatementsPage() {
   }
 
   async function matchPendingBills() {
+    if(!allowed('bank.prepare')){setBanner({tone:'error',text:'Your role cannot run Tally matching.'});return;}
     if (preview?.requiresManualExtraction || preview?.extractionDiagnostics?.coverageComplete === false) {
       const unresolvedPages = preview.extractionDiagnostics?.unresolvedPages ?? [];
       showToast(
@@ -5444,6 +5821,7 @@ export function BankStatementsPage() {
     mode: TallySendMode,
     options: { skipBillMatching?: boolean } = {}
   ) {
+    if(!allowed('bank.post')){setBanner({tone:'error',text:'Your role cannot post bank entries.'});return;}
     if (!preview) return;
     const skipBillMatching = options.skipBillMatching === true;
     if (preview.requiresManualExtraction || preview.extractionDiagnostics?.coverageComplete === false) {
@@ -5818,7 +6196,7 @@ export function BankStatementsPage() {
                 <AlertTriangle className="h-5 w-5" />
               </div>
               <div className="min-w-0 flex-1">
-                <h2 className="text-base font-black text-[#1a1a1a]" id="direct-post-title">
+                <h2 className="text-base font-semibold text-[#1a1a1a]" id="direct-post-title">
                   Post without matching bills?
                 </h2>
                 <p className="mt-1 text-sm font-semibold leading-5 text-[#71695f]">
@@ -5852,7 +6230,7 @@ export function BankStatementsPage() {
             </div>
             <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
               <Button
-                className="h-10 rounded-xl border-[#ddd3c5] bg-white px-4 text-xs font-bold text-[#5a5046]"
+                className="h-10 rounded-xl border-[#ddd3c5] bg-white px-4 text-xs font-medium text-[#5a5046]"
                 onClick={() => setPendingDirectPostMode(null)}
                 type="button"
                 variant="outline"
@@ -5860,7 +6238,7 @@ export function BankStatementsPage() {
                 Cancel
               </Button>
               <Button
-                className="h-10 rounded-xl bg-[#2d2d2d] px-4 text-xs font-bold text-white hover:bg-[#1a1a1a]"
+                className="h-10 rounded-xl bg-[#2d2d2d] px-4 text-xs font-medium text-white hover:bg-[#1a1a1a]"
                 onClick={() => {
                   const mode = pendingDirectPostMode;
                   setPendingDirectPostMode(null);
@@ -5887,10 +6265,10 @@ export function BankStatementsPage() {
           <div className="w-full max-w-lg rounded-2xl border border-[#ddd3c5] bg-white p-5 shadow-2xl">
             <div className="flex items-start justify-between gap-4">
               <div>
-                <h2 className="text-lg font-black text-[#1a1a1a]" id="bank-statement-shortcuts-title">
+                <h2 className="text-lg font-semibold text-[#1a1a1a]" id="bank-statement-shortcuts-title">
                   Bank statement shortcuts
                 </h2>
-                <p className="mt-1 text-xs font-semibold leading-5 text-slate-500">
+                <p className="mt-1 text-xs font-normal leading-5 text-slate-500">
                   {preview
                     ? "Familiar Tally-style keys for reviewing the analysed statement without leaving the table."
                     : "These Tally-style review shortcuts become active after a statement has been analysed."}
@@ -5918,7 +6296,7 @@ export function BankStatementsPage() {
                 ["Esc", "Close the current popover, editor, drawer, filters, or this window"],
               ].map(([shortcut, description]) => (
                 <div className="flex items-center gap-4 py-3" key={shortcut}>
-                  <kbd className="inline-flex min-w-20 justify-center rounded-md border border-[#d8cbbb] bg-[#faf8f4] px-2 py-1 text-[11px] font-black text-[#4b3828] shadow-sm">
+                  <kbd className="inline-flex min-w-20 justify-center rounded-md border border-[#d8cbbb] bg-[#faf8f4] px-2 py-1 text-[11px] font-semibold text-[#4b3828] shadow-sm">
                     {shortcut}
                   </kbd>
                   <span className="text-sm font-semibold text-slate-600">{description}</span>
@@ -5933,21 +6311,15 @@ export function BankStatementsPage() {
           </div>
         </div>
       ) : null}
-      <div className={`bank-statements-workflow min-h-screen bg-[#f7f7f5] px-4 text-[#1a1a1a] sm:px-8 ${preview ? "py-3 pb-40 sm:py-4 sm:pb-40" : "py-6 sm:py-8"}`}>
-        <div className={`mx-auto flex max-w-7xl flex-col ${preview ? "gap-2.5" : "gap-4"}`}>
-          <header className={`flex flex-col md:flex-row md:items-start md:justify-between border-b border-[#e5ddd0] ${preview ? "gap-2 pb-2" : "gap-3 pb-4"}`}>
-            <div>
-              {!preview && (
-                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200/50 text-[10px] font-bold uppercase tracking-wider text-amber-800 mb-2">
-                  <Sparkles className="h-3 w-3 text-amber-600 animate-spin duration-3000" />
-                  ERP Reconciliation
-                </div>
-              )}
-              <h1 className={`${preview ? "text-xl sm:text-2xl" : "text-2xl sm:text-[28px]"} font-black tracking-tight text-[#1a1a1a] flex items-center gap-2`}>
+      <div className={`bank-statements-workflow flex min-h-full flex-col bg-[#f7f7f5] text-[#1a1a1a] ${preview ? "pb-20" : ""}`}>
+        <div className="min-w-0 flex-1 px-0 py-3 sm:py-4">
+          <div className="flex w-full max-w-none flex-col gap-2.5">
+          <header className={`flex flex-col gap-2 px-2 md:flex-row md:items-center md:justify-between ${preview ? "border-b border-[#e5ddd0] pb-2" : ""}`}>
+            <h1 className="flex shrink-0 flex-wrap items-center gap-2 text-xl font-black tracking-tight text-[#1a1a1a] sm:text-2xl">
                 Bank Statements
                 {preview && (
                   <span
-                    className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider ${
+                    className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-bold uppercase tracking-wider ${
                       statementDoneSummary
                         ? "border-emerald-250 bg-emerald-50 text-emerald-800"
                         : "border-emerald-250 bg-emerald-50 text-emerald-800"
@@ -5965,14 +6337,8 @@ export function BankStatementsPage() {
                 >
                   <Info className="h-4 w-4" />
                 </button>
-              </h1>
-              {!preview && (
-                <p className="text-xs font-semibold text-slate-500 mt-1">
-                  Reconcile bank statement transactions and match bill allocations with Tally.
-                </p>
-              )}
-            </div>
-            <div className="inline-flex items-center gap-3 rounded-xl border border-[#e5ddd0] bg-white px-3.5 py-2 shadow-sm">
+            </h1>
+            <div className="inline-flex max-w-full flex-wrap items-center gap-3 rounded-xl border border-[#e5ddd0] bg-white px-3.5 py-2 shadow-sm">
               <div className="flex min-w-0 items-center gap-2">
                 {tallyConnected ? (
                   <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
@@ -5980,7 +6346,7 @@ export function BankStatementsPage() {
                   <AlertTriangle className="h-4 w-4 shrink-0 text-amber-700" />
                 )}
                 <div className="min-w-0">
-                  <div className="text-xs font-bold text-[#1a1a1a]">
+                  <div className="text-xs font-medium text-[#1a1a1a]">
                     {!selectedCompanyName
                       ? "Select Tally company"
                       : !tallyConnected
@@ -6001,7 +6367,7 @@ export function BankStatementsPage() {
                   type="button"
                   onClick={refreshTallyConnectionStatus}
                   disabled={refreshingConnections}
-                  className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all disabled:cursor-not-allowed disabled:opacity-60"
+                  className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   {refreshingConnections ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -6021,7 +6387,7 @@ export function BankStatementsPage() {
                           : "Open Tally Prime, load the company for this workflow, then return here and refresh.",
                       });
                     }}
-                    className="inline-flex h-8 items-center rounded-xl bg-[#2d2d2d] px-3.5 text-xs font-bold text-white hover:bg-[#1a1a1a] shadow-sm transition-all"
+                    className="inline-flex h-8 items-center rounded-xl bg-[#2d2d2d] px-3.5 text-xs font-medium text-white hover:bg-[#1a1a1a] shadow-sm transition-all"
                   >
                     {tallyConnected ? "Show switch steps" : "Connection steps"}
                   </button>
@@ -6031,14 +6397,21 @@ export function BankStatementsPage() {
           </header>
 
           {!preview ? (
-            <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-[#e5ddd0] bg-white px-3 py-2 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
-              {["Upload statement", "Review file", "Analyze", "Match transactions"].map((step, index) => {
+            <div className="flex w-full min-w-0 flex-wrap items-center gap-1 rounded-xl border border-[#e5ddd0] bg-white px-2 py-1 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+              {[
+                ["Upload", "Upload statement"],
+                ["Review", "Review file"],
+                ["Analyze", "Analyze"],
+                ["Match", "Match transactions"],
+              ].map(([label, fullLabel], index) => {
                 const complete = workflowStep > index;
                 const current = workflowStep === index;
                 return (
                   <div
-                    key={step}
-                    className={`flex items-center gap-2 rounded-xl px-2.5 py-1.5 text-[11px] font-extrabold ${
+                    aria-label={fullLabel}
+                    key={fullLabel}
+                    title={fullLabel}
+                    className={`flex items-center gap-1.5 rounded-lg px-2 py-1 text-[10px] font-extrabold ${
                       complete
                         ? "bg-emerald-50 text-emerald-800"
                         : current
@@ -6047,7 +6420,7 @@ export function BankStatementsPage() {
                     }`}
                   >
                     <span
-                      className={`grid h-5 w-5 place-items-center rounded-full text-[10px] ${
+                      className={`grid h-4 w-4 place-items-center rounded-full text-[9px] ${
                         complete
                           ? "bg-emerald-600 text-white"
                           : current
@@ -6055,9 +6428,9 @@ export function BankStatementsPage() {
                             : "bg-slate-100 text-slate-400"
                       }`}
                     >
-                      {complete ? <CheckCircle2 className="h-3.5 w-3.5" /> : index + 1}
+                      {complete ? <CheckCircle2 className="h-3 w-3" /> : index + 1}
                     </span>
-                    {step}
+                    {label}
                   </div>
                 );
               })}
@@ -6092,10 +6465,10 @@ export function BankStatementsPage() {
                   <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
                 )}
                 <div className="min-w-0">
-                  <div className="font-extrabold">
+                  <div className="font-semibold">
                     {syncingMasters ? "Tally sync is running" : "Tally sync needed for ledger matching"}
                   </div>
-                  <div className="mt-0.5 text-xs font-semibold leading-5 text-amber-900">
+                  <div className="mt-0.5 text-xs font-normal leading-5 text-amber-900">
                     {postUploadSyncError ||
                       "Statement analysis can continue. Ledger matching will update after Tally sync completes."}
                   </div>
@@ -6105,7 +6478,7 @@ export function BankStatementsPage() {
                 type="button"
                 onClick={retryPostUploadSync}
                 disabled={!tallyCompanyContextVerified || loading || syncingMasters}
-                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-4 text-xs font-bold text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-4 text-xs font-medium text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {loading || syncingMasters ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -6131,12 +6504,12 @@ export function BankStatementsPage() {
                 <div className="flex min-w-0 items-start gap-3">
                   <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0" />
                   <div className="min-w-0">
-                    <div className="text-sm font-bold">{statementDoneSummary.title}</div>
+                    <div className="text-sm font-semibold">{statementDoneSummary.title}</div>
                     <div className="mt-1 text-xs font-semibold opacity-80">{statementDoneSummary.text}</div>
                   </div>
                 </div>
                 <button
-                  className="inline-flex h-9 items-center justify-center rounded-xl bg-white px-4 text-xs font-bold text-[#2d2d2d] shadow-sm ring-1 ring-black/5 transition hover:bg-[#faf8f4]"
+                  className="inline-flex h-9 items-center justify-center rounded-xl bg-white px-4 text-xs font-medium text-[#2d2d2d] shadow-sm ring-1 ring-black/5 transition hover:bg-[#faf8f4]"
                   onClick={() => clearStatementReview()}
                   type="button"
                 >
@@ -6159,9 +6532,9 @@ export function BankStatementsPage() {
               >
                 <div className="space-y-4">
                   <label className="block">
-                    <span className="text-xs font-bold text-[#5a5046]">Company</span>
+                    <span className="text-xs font-medium text-[#5a5046]">Company</span>
                     <select
-                      className="mt-1.5 h-11 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
+                      className="mt-1.5 h-11 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
                       onChange={(event) => updateStatementContext(event.target.value)}
                       value={selectedCompanyId}
                     >
@@ -6183,16 +6556,16 @@ export function BankStatementsPage() {
                     <span className="flex items-start justify-between gap-4">
                       <span className="min-w-0">
                         <span className="flex flex-wrap items-center gap-2">
-                          <span className="text-xs font-extrabold text-[#1a1a1a]">
+                          <span className="text-xs font-semibold text-[#1a1a1a]">
                             Fetch latest Tally ledgers before analysis
                           </span>
-                          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide text-amber-800">
+                          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800">
                             Auto
                           </span>
                         </span>
                         <span
                           id="bank-statement-sync-mode-status"
-                          className="mt-1.5 block text-xs font-semibold leading-5 text-[#6f6256]"
+                          className="mt-1.5 block text-xs font-normal leading-5 text-[#6f6256]"
                         >
                           {syncModeStatus.tone === "warning"
                             ? "Fresh ledger fetch will run before analysis once the selected Tally company is verified."
@@ -6207,12 +6580,12 @@ export function BankStatementsPage() {
                     <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs font-semibold text-amber-900">
                       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
                       <span>
-                        <span className="block font-extrabold">{syncModeStatus.title}</span>
+                        <span className="block font-semibold">{syncModeStatus.title}</span>
                         <span className="mt-0.5 block leading-5">{syncModeStatus.text}</span>
                       </span>
                     </div>
                   ) : !documentPreview && !documentPreviewLoading ? (
-                    <div className="flex items-center gap-2 px-1 text-xs font-bold text-emerald-800">
+                    <div className="flex items-center gap-2 px-1 text-xs font-medium text-emerald-800">
                       <CheckCircle2 className="h-4 w-4 shrink-0" />
                       Ready to upload.
                     </div>
@@ -6233,6 +6606,7 @@ export function BankStatementsPage() {
                   ref={fileInputRef}
                   type="file"
                   accept=".csv,.txt,.pdf,image/*"
+                  disabled={!allowed('bank.prepare')}
                   className="hidden"
                   onClick={(event) => {
                     event.currentTarget.value = "";
@@ -6245,7 +6619,8 @@ export function BankStatementsPage() {
                 {!documentPreview && !documentPreviewLoading ? (
                   <button
                     type="button"
-                    aria-disabled={!uploadContextReady || loading}
+                    disabled={!allowed('bank.prepare')}
+                    aria-disabled={!allowed('bank.prepare') || !uploadContextReady || loading}
                     onClick={() => {
                       if (!uploadContextReady) {
                         setBanner({ tone: "error", text: setupErrorMessage || "Complete setup before upload." });
@@ -6289,7 +6664,7 @@ export function BankStatementsPage() {
                     } shadow-sm`}>
                       {loading ? <Loader2 className="h-6 w-6 animate-spin" /> : <UploadCloud className="h-6 w-6" />}
                     </div>
-                    <div className="text-lg font-extrabold text-[#1a1a1a]">
+                    <div className="text-lg font-semibold text-[#1a1a1a]">
                       {loading ? "Analyzing..." : uploadContextReady ? "Upload statement" : "Connect Tally company"}
                     </div>
                     <div className="mt-1 text-xs font-semibold text-slate-400">
@@ -6302,7 +6677,7 @@ export function BankStatementsPage() {
                     <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-xl bg-[#2d2d2d] text-white shadow-sm">
                       <Loader2 className="h-6 w-6 animate-spin" />
                     </div>
-                    <div className="text-lg font-extrabold text-[#1a1a1a]">Reading file...</div>
+                    <div className="text-lg font-semibold text-[#1a1a1a]">Reading file...</div>
                     <div className="mt-1 text-xs font-semibold text-slate-400">Preparing preview before analysis</div>
                   </div>
                 ) : null}
@@ -6313,7 +6688,7 @@ export function BankStatementsPage() {
                       <label className="block min-w-0">
                         <span className="text-[10px] font-bold uppercase tracking-wider text-[#8b7a68]">Company</span>
                         <select
-                          className="mt-1 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
+                          className="mt-1 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
                           onChange={(event) => updateStatementContext(event.target.value)}
                           value={selectedCompanyId}
                         >
@@ -6334,8 +6709,8 @@ export function BankStatementsPage() {
                       >
                         <span className="min-w-0">
                           <span className="flex flex-wrap items-center gap-2">
-                            <span className="text-xs font-extrabold text-[#1a1a1a]">Fresh Tally fetch first</span>
-                            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-extrabold uppercase tracking-wide text-amber-800">
+                            <span className="text-xs font-semibold text-[#1a1a1a]">Fresh Tally fetch first</span>
+                            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800">
                               Auto
                             </span>
                           </span>
@@ -6356,14 +6731,14 @@ export function BankStatementsPage() {
                             clearSelectedStatementFile();
                             fileInputRef.current?.click();
                           }}
-                          className="inline-flex h-9 w-full items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                          className="inline-flex h-9 w-full items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#5a5046] transition hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
                         >
                           Upload another
                         </button>
                         <button
                           type="button"
                           disabled={
-                            Boolean(documentPreview.error) ||
+                            !allowed('bank.prepare') || Boolean(documentPreview.error) ||
                             loading ||
                             documentPreviewLoading ||
                             statementPasswordChecking ||
@@ -6380,7 +6755,7 @@ export function BankStatementsPage() {
                           onClick={() => {
                             if (file) void analyzeFile(file);
                           }}
-                          className="inline-flex h-9 w-full items-center justify-center rounded-xl bg-[#2d2d2d] px-3 text-xs font-bold text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+                          className="inline-flex h-9 w-full items-center justify-center rounded-xl bg-[#2d2d2d] px-3 text-xs font-medium text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           Analyze file
                         </button>
@@ -6393,7 +6768,7 @@ export function BankStatementsPage() {
                           <UploadCloud className="h-4.5 w-4.5" />
                         </div>
                         <div className="min-w-0">
-                          <div className="truncate text-sm font-extrabold text-[#1a1a1a]" title={documentPreview.fileName}>
+                          <div className="truncate text-sm font-semibold text-[#1a1a1a]" title={documentPreview.fileName}>
                             {documentPreview.fileName}
                           </div>
                           <div className="mt-0.5 text-xs font-semibold text-[#7a6c5f]">
@@ -6451,7 +6826,7 @@ export function BankStatementsPage() {
                                 value={statementPassword}
                               />
                               <button
-                                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-3 text-xs font-bold text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+                                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-3 text-xs font-medium text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
                                 disabled={!statementPassword.trim() || statementPasswordChecking}
                                 onClick={() => void unlockStatementPdfPreview(file, statementPassword)}
                                 type="button"
@@ -6513,7 +6888,7 @@ export function BankStatementsPage() {
                                   {documentPreview.headers.map((header, index) => (
                                     <th
                                       key={`${header}-${index}`}
-                                      className="max-w-[220px] border-b border-[#e5ddd0] px-3 py-2 font-extrabold"
+                                      className="max-w-[220px] border-b border-[#e5ddd0] px-3 py-2 font-semibold"
                                       title={header}
                                     >
                                       <span className="block truncate">{header}</span>
@@ -6539,7 +6914,7 @@ export function BankStatementsPage() {
                             </table>
                           </div>
                         ) : documentPreview.kind === "text" ? (
-                          <pre className="max-h-[560px] overflow-auto whitespace-pre-wrap bg-white px-5 py-4 text-xs font-semibold leading-5 text-[#2b241d]">
+                          <pre className="max-h-[560px] overflow-auto whitespace-pre-wrap bg-white px-5 py-4 text-xs font-normal leading-5 text-[#2b241d]">
                             {documentPreview.textLines.join("\n")}
                           </pre>
                         ) : documentPreview.kind === "pdf" && documentPreview.objectUrl ? (
@@ -6563,10 +6938,10 @@ export function BankStatementsPage() {
                                   <Landmark className="h-5 w-5" />
                                 )}
                               </div>
-                              <div className="mt-3 text-sm font-extrabold text-[#1a1a1a]">
+                              <div className="mt-3 text-sm font-semibold text-[#1a1a1a]">
                                 {statementPasswordChecking ? "Checking PDF security" : "Password required"}
                               </div>
-                              <p className="mt-1 text-xs font-semibold leading-5 text-[#7a6c5f]">
+                              <p className="mt-1 text-xs font-normal leading-5 text-[#7a6c5f]">
                                 {statementPasswordChecking
                                   ? "Preparing a safe preview without storing the document password."
                                   : "Enter the PDF password on the left, then choose Unlock preview."}
@@ -6594,44 +6969,43 @@ export function BankStatementsPage() {
               </section>
             </section>
           ) : (
-            <section className="space-y-2.5">
-              <div className="rounded-xl border border-[#e5ddd0] bg-white px-3 py-2 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
-                <div className="grid gap-2 xl:grid-cols-[56%_44%] xl:items-center xl:gap-0">
-                  <div className="grid min-w-0 sm:grid-cols-[minmax(0,0.82fr)_minmax(0,1.05fr)_minmax(0,1.2fr)] sm:divide-x sm:divide-[#eee7dc]">
-                    <div className="min-w-0 py-1 sm:pr-3">
+            <section className="space-y-0">
+              <div className="border-b border-[#e5ddd0] bg-transparent px-1 py-2 sm:px-2">
+                <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+                  <div className="flex min-w-0 flex-1 items-center gap-3">
+                    <div className="hidden min-w-0 py-1 sm:pr-3">
                       <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Company</div>
-                      <div className="mt-0.5 break-words text-xs font-extrabold leading-4 text-[#1a1a1a]" title={selectedCompanyName}>
+                      <div className="mt-0.5 break-words text-xs font-normal leading-4 text-[#1a1a1a]" title={selectedCompanyName}>
                         {selectedCompanyName || "Not selected"} - {selectedFinancialYear}
                       </div>
                     </div>
-                    <div className="min-w-0 py-1 sm:px-3">
+                    <div className="hidden min-w-0 py-1 sm:px-3">
                       <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Period</div>
-                      <div className="mt-0.5 break-words text-xs font-extrabold leading-4 text-[#1a1a1a]">
+                      <div className="mt-0.5 break-words text-xs font-normal leading-4 text-[#1a1a1a]">
                         {preview.import.statementPeriodStart && preview.import.statementPeriodEnd
                           ? `${formatShortDate(preview.import.statementPeriodStart)} - ${formatShortDate(preview.import.statementPeriodEnd)}`
                           : "After analysis"}
                       </div>
                     </div>
-                    <div className="min-w-0 py-1 sm:px-3">
-                      <div className="text-[10px] font-bold uppercase tracking-wider text-sky-700">Statement account</div>
-                      <div className="mt-0.5 break-words text-xs font-extrabold leading-4 text-[#1a1a1a]" title={`${account.bankName || ""} ${account.accountNumber || ""}`}>
+                    <div className="min-w-0 py-0.5">
+                      <div className="text-[9px] font-extrabold uppercase tracking-[0.12em] text-slate-400">Statement account</div>
+                      <div className="mt-0.5 truncate text-[11px] font-extrabold leading-[13px] text-[#1a1a1a]" title={`${account.bankName || ""} ${account.accountNumber || ""}`}>
                         {account.bankName || "Account not detected"}
                         {account.accountNumber ? ` - ${account.accountNumber}` : ""}
                       </div>
-                      <div className="mt-0.5 break-words text-[10px] font-semibold leading-3.5 text-slate-400">
-                        {account.accountHolderName || "Holder not found"}
-                        {account.ifscCode ? ` - ${account.ifscCode}` : ""}
+                      <div className="mt-0.5 truncate text-[9px] font-semibold leading-3 text-slate-400">
+                        {account.accountHolderName || selectedCompanyName || "Holder not found"}
                       </div>
                     </div>
                   </div>
 
-                  <div className="min-w-0 border-t border-[#eee7dc] pt-2 xl:border-l xl:border-t-0 xl:pl-3 xl:pt-0">
+                  <div className="min-w-0 flex-1 border-t border-[#eee7dc] pt-2 lg:border-l lg:border-t-0 lg:pl-4 lg:pt-0">
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-1.5">
                           <ArrowRight aria-label="Statement to Tally ledger" className={`hidden h-3 w-3 shrink-0 xl:block ${bankLedgerVerified ? "text-emerald-600" : "text-amber-600"}`} />
-                          <div className="text-[9px] font-bold uppercase tracking-wider text-emerald-700">
-                            {bankLedgerChangeMode ? "Replace ledger" : "Posting ledger"}
+                          <div className="text-[9px] font-extrabold uppercase tracking-[0.12em] text-slate-400">
+                            {bankLedgerChangeMode ? "Replace ledger" : "Tally ledger"}
                           </div>
                         </div>
                         {bankLedgerChangeMode || !bankLedgerName ? (
@@ -6674,11 +7048,11 @@ export function BankStatementsPage() {
                               <AlertTriangle className="h-3 w-3 shrink-0 text-amber-600" />
                             )}
                             <div className="min-w-0">
-                              <div className="break-words text-xs font-extrabold leading-4 text-[#1a1a1a]" title={bankLedgerName}>
+                              <div className="truncate text-[11px] font-extrabold leading-[13px] text-[#1a1a1a]" title={bankLedgerName}>
                                 {bankLedgerName}
                               </div>
-                              <div className={`text-[9px] font-bold leading-3.5 ${bankLedgerVerified ? "text-emerald-700" : "text-amber-700"}`} title={bankLedgerVerified ? "Exact statement account match" : "Manual selection - review account numbers"}>
-                                {bankLedgerVerified ? "Exact statement account match" : "Manual selection - review account numbers"}
+                              <div className={`text-[9px] font-bold leading-3 ${bankLedgerVerified ? "text-emerald-700" : "text-amber-700"}`} title={bankLedgerVerified ? "Exact statement account match" : "Manual selection - review account numbers"}>
+                                {bankLedgerVerified ? "Matched" : "Review account match"}
                               </div>
                             </div>
                           </div>
@@ -6718,34 +7092,36 @@ export function BankStatementsPage() {
                             ))}
                           </select>
                         ) : null}
-                        {!bankLedgerChangeMode && bankLedgerName ? (
+                        <div className="flex items-center gap-1.5">
+                          {!bankLedgerChangeMode && bankLedgerName ? (
+                            <button
+                              type="button"
+                              onClick={beginBankLedgerChange}
+                              className="inline-flex h-6.5 items-center justify-center rounded-lg border border-[#e5ddd0] bg-white px-2 text-[11px] font-bold text-[#5a5046] transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                            >
+                              Change ledger
+                            </button>
+                          ) : null}
                           <button
                             type="button"
-                            onClick={beginBankLedgerChange}
-                            className="inline-flex h-6.5 items-center justify-center rounded-lg border border-[#e5ddd0] bg-white px-2 text-[9px] font-bold text-[#5a5046] transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                            onClick={handleSyncLedgerMasters}
+                            disabled={!tallyCompanyContextVerified || syncingMasters || loadingBankLedgers}
+                            className="inline-flex h-6.5 items-center justify-center gap-1 rounded-lg border border-[#e5ddd0] bg-white px-2 text-[11px] font-bold text-[#5a5046] transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
                           >
-                            Change ledger
+                            {syncingMasters || loadingBankLedgers ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <RefreshCw className="h-3.5 w-3.5" />
+                            )}
+                            Sync
                           </button>
-                        ) : null}
-                        <button
-                          type="button"
-                          onClick={handleSyncLedgerMasters}
-                          disabled={!tallyCompanyContextVerified || syncingMasters || loadingBankLedgers}
-                          className="inline-flex h-6.5 items-center justify-center gap-1 rounded-lg border border-[#e5ddd0] bg-white px-2 text-[9px] font-bold text-[#5a5046] transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          {syncingMasters || loadingBankLedgers ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            <RefreshCw className="h-3.5 w-3.5" />
-                          )}
-                          Sync
-                        </button>
+                        </div>
                       </div>
                     </div>
                   </div>
                 </div>
               </div>
-              {bankLedgerName && !bankLedgerVerified ? (
+              {bankLedgerName && !bankLedgerVerified && !bankLedgerManuallyConfirmed ? (
                 <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-900">
                   <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
                   <span>
@@ -6753,10 +7129,10 @@ export function BankStatementsPage() {
                   </span>
                 </div>
               ) : null}
-              <section className="rounded-2xl border border-[#e5ddd0] bg-white p-3 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+              <section className="hidden">
                 <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
                   <div>
-                    <h2 className="text-sm font-black text-[#1a1a1a]">
+                    <h2 className="text-sm font-semibold text-[#1a1a1a]">
                       {tallyPostingInProgress
                         ? "Posting bank transactions to Tally"
                         : matchingBills
@@ -6840,10 +7216,10 @@ export function BankStatementsPage() {
                   ].map((item) => (
                     <div key={item.label} className={`min-w-[160px] rounded-xl border px-3 py-2 xl:min-w-0 ${item.className}`}>
                       <div className="flex items-center justify-between gap-2">
-                        <div className="truncate text-[9px] font-black uppercase tracking-[0.12em] opacity-75">
+                        <div className="truncate text-[11px] font-semibold uppercase tracking-[0.12em] opacity-75">
                           {item.label}
                         </div>
-                        <div className="shrink-0 text-lg font-black leading-none">{item.value}</div>
+                        <div className="shrink-0 text-lg font-semibold leading-none">{item.value}</div>
                       </div>
                       <div className="mt-1 truncate text-[10px] font-bold leading-4 opacity-80" title={item.detail}>{item.detail}</div>
                     </div>
@@ -6881,13 +7257,13 @@ export function BankStatementsPage() {
               <div className="hidden rounded-2xl border border-[#e3d6c6] bg-white px-4 py-3 shadow-sm">
                 <div className="grid gap-3 lg:grid-cols-2 lg:items-start">
                   <div className="min-w-0 rounded-xl border border-[#eee5da] bg-[#fdfaf6] px-4 py-3">
-                    <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#9a8d7f]">
                       Statement account
                     </div>
                     <div className="mt-2 flex min-w-0 items-center gap-2">
                       <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
                       <div className="min-w-0">
-                        <div className="truncate text-sm font-black text-[#2b241d]">
+                        <div className="truncate text-sm font-semibold text-[#2b241d]">
                           {account.bankName || "Account not detected"}
                           {account.accountNumber ? ` - ${account.accountNumber}` : ""}
                         </div>
@@ -6933,7 +7309,7 @@ export function BankStatementsPage() {
 
                   <div className="min-w-0 rounded-xl border border-[#eee5da] bg-[#fdfaf6] px-4 py-3">
                     <div className="flex min-h-7 items-center justify-between gap-3">
-                      <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#9a8d7f]">
+                      <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#9a8d7f]">
                         Post entries to Tally bank account
                       </div>
                       <button
@@ -6954,12 +7330,12 @@ export function BankStatementsPage() {
                       <div className="mt-2 flex flex-wrap items-center gap-2">
                         <div className="flex min-w-0 items-center gap-2">
                           <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
-                          <div className="truncate text-sm font-black text-[#2b241d]">{bankLedgerName}</div>
+                          <div className="truncate text-sm font-semibold text-[#2b241d]">{bankLedgerName}</div>
                         </div>
                         <button
                           type="button"
                           onClick={() => setBankLedgerName("")}
-                          className="text-xs font-bold text-[#6f4e2f] underline-offset-2 hover:underline"
+                          className="text-xs font-medium text-[#6f4e2f] underline-offset-2 hover:underline"
                         >
                           Change
                         </button>
@@ -6978,7 +7354,7 @@ export function BankStatementsPage() {
                 </div>
               </div>
 
-              <div className="overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+              <div className="overflow-hidden border-y border-[#e5ddd0] bg-white">
                 <div className="border-b border-[#e5ddd0] px-4 py-2.5">
                   <div className="flex flex-col gap-2 xl:flex-row xl:items-center xl:justify-between">
                     <div className="flex flex-wrap items-center gap-2.5">
@@ -6994,7 +7370,7 @@ export function BankStatementsPage() {
                         <Filter className="h-3.5 w-3.5" />
                         Filters
                         {activeReviewFilterCount > 0 ? (
-                          <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[#2d2d2d] px-1 text-[9px] text-white">
+                          <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[#2d2d2d] px-1 text-[11px] text-white">
                             {activeReviewFilterCount}
                           </span>
                         ) : null}
@@ -7007,7 +7383,7 @@ export function BankStatementsPage() {
                       {!tallyCheckAttempted && validTransactions.length > 0 ? (
                         <button
                           aria-pressed={statementDirectionsSwapped}
-                          className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-3 text-[10px] font-bold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 ${
+                          className={`hidden h-8 items-center gap-1.5 rounded-lg border px-3 text-[10px] font-bold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 ${
                             statementDirectionsSwapped
                               ? "border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100"
                               : "border-[#e5ddd0] bg-white text-[#5a5046] hover:border-amber-300 hover:bg-amber-50 hover:text-amber-900"
@@ -7023,6 +7399,10 @@ export function BankStatementsPage() {
                       ) : null}
                     </div>
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-[#e5ddd0] bg-[#faf8f4]/70 px-3 py-1.5 text-[10px] font-bold">
+                      <span className="inline-flex items-center gap-1.5 text-[#2d2d2d]">
+                        <span className="h-1.5 w-1.5 rounded-full bg-[#2d2d2d]" />
+                        {validTransactions.length} checked
+                      </span>
                       {bankPostingCompleted ? (
                         <>
                           <span className="inline-flex items-center gap-1.5 text-emerald-800">
@@ -7078,7 +7458,7 @@ export function BankStatementsPage() {
                             Work status
                           </span>
                           <select
-                            className="mt-1.5 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                            className="mt-1.5 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#1a1a1a] outline-none focus:border-amber-500"
                             onChange={(event) => setReviewWorkStatusFilter(event.target.value as ReviewWorkStatusFilter)}
                             title="Needs action contains only unresolved close ledger matches."
                             value={reviewWorkStatusFilter}
@@ -7160,7 +7540,7 @@ export function BankStatementsPage() {
                               <CalendarDays className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
                               <input
                                 aria-label="Statement period from"
-                                className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 pl-9 text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                                className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 pl-9 text-xs font-medium text-[#1a1a1a] outline-none focus:border-amber-500"
                                 onChange={(event) => setReviewDateFrom(event.target.value)}
                                 ref={reviewPeriodInputRef}
                                 type="date"
@@ -7185,7 +7565,7 @@ export function BankStatementsPage() {
                               Receipt allocation
                             </span>
                             <select
-                              className="mt-1.5 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#1a1a1a] outline-none focus:border-amber-500"
+                              className="mt-1.5 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#1a1a1a] outline-none focus:border-amber-500"
                               onChange={(event) => setReviewAllocationFilter(event.target.value as ReviewAllocationFilter)}
                               value={reviewAllocationFilter}
                             >
@@ -7198,7 +7578,7 @@ export function BankStatementsPage() {
                           </label>
                         ) : null}
                         <button
-                          className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
+                          className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-medium text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
                           onClick={() => {
                             setReviewSearch("");
                             setReviewWorkStatusFilter("all");
@@ -7218,30 +7598,31 @@ export function BankStatementsPage() {
                   ) : null}
                 </div>
 
-                <div className="max-h-[calc(100vh-390px)] overflow-auto [scrollbar-gutter:stable]">
-                  <table className="w-full min-w-[940px] table-fixed border-collapse text-left">
+                <div className="max-h-[calc(100vh-285px)] overflow-auto [scrollbar-gutter:stable]">
+                  <table className="bank-statements-review-table w-full min-w-[1120px] table-fixed border-collapse text-left">
                     <thead className="sticky top-0 z-20">
                       <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                        <th className="w-20 px-3 py-3.5">Date</th>
-                        <th className="w-[29%] px-3 py-3.5">Transaction</th>
-                        <th className="w-24 px-3 py-3.5 text-right">Payment</th>
-                        <th className="w-24 px-3 py-3.5 text-right">Receipt</th>
-                        <th className="w-[22%] px-3 py-3.5">Tally ledger</th>
-                        <th className="w-32 px-3 py-3.5">Ledger status</th>
-                        <th className="w-44 px-3 py-3.5">Tally result</th>
+                        <th className="w-[6%] px-3 py-3.5">Date</th>
+                        <th className="w-[22%] px-3 py-3.5">Particulars</th>
+                        <th className="w-[7%] px-3 py-3.5">Vch type</th>
+                        <th className="w-[12%] px-3 py-3.5">Reference</th>
+                        <th className="w-[8%] px-3 py-3.5 text-right">Payment</th>
+                        <th className="w-[8%] px-3 py-3.5 text-right">Receipt</th>
+                        <th className="w-[20%] px-3 py-3.5">Tally ledger</th>
+                        <th className="w-[14%] px-3 py-3.5">Posting status</th>
                         <th className="w-12 px-2 py-3.5" aria-label="Row actions"></th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
                       {validTransactions.length === 0 ? (
                         <tr>
-                          <td colSpan={8} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
+                          <td colSpan={9} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
                             No posting rows were extracted. Upload another file or add rows after extraction support improves.
                           </td>
                         </tr>
                       ) : visibleReviewTransactions.length === 0 ? (
                         <tr>
-                          <td colSpan={8} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
+                          <td colSpan={9} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
                             No rows match the current filters.
                           </td>
                         </tr>
@@ -7268,46 +7649,64 @@ export function BankStatementsPage() {
                             isBillMatchEligibleTransaction(transaction, ledgerMasters)
                           );
                           const ledgerMatchStatus = getReviewStatusLabel(transaction);
-                          const ledgerMatchStatusClass = getReviewStatusClass(transaction);
+                          const narrationExpanded = expandedNarrationTransactionId === transaction.id;
 
                           return (
                             <tr
-                              aria-selected={activeReviewTransactionId === transaction.id}
-                              className={`align-middle transition-colors ${
-                                activeReviewTransactionId === transaction.id
-                                  ? "bg-amber-50/70 shadow-[inset_3px_0_0_#f59e0b]"
-                                  : "hover:bg-[#fcfbfa]/60"
-                              }`}
+                              aria-selected="false"
+                              className="group cursor-pointer align-middle transition-colors hover:bg-[#fcfbfa]/60 data-[active=true]:bg-amber-50/70 data-[active=true]:shadow-[inset_3px_0_0_#f59e0b]"
+                              data-active="false"
                               key={transaction.id}
-                              onMouseDown={() => setActiveReviewTransactionId(transaction.id)}
+                              onMouseDown={() => selectReviewTransaction(transaction.id)}
                               ref={(node) => {
                                 if (node) reviewRowRefs.current.set(transaction.id, node);
                                 else reviewRowRefs.current.delete(transaction.id);
                               }}
                             >
-                              <td className="px-3 py-4 text-xs font-bold text-slate-500">
+                              <td className="px-3 py-4 text-xs font-medium text-slate-500">
                                 {formatShortDate(transaction.transactionDate)}
                               </td>
-                              <td className="px-3 py-4 align-top">
-                                <div className="whitespace-normal break-words text-sm font-bold leading-5 text-[#1a1a1a]" title={partyTitle}>
+                              <td
+                                aria-expanded={narrationExpanded}
+                                className={`px-3 py-4 align-top ${narrationExpanded ? "cursor-zoom-out" : "cursor-zoom-in"}`}
+                                data-narration-cell
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  setExpandedNarrationTransactionId((current) =>
+                                    current === transaction.id ? null : transaction.id
+                                  );
+                                }}
+                                title={narrationExpanded ? "Click to collapse narration" : "Click to view full narration"}
+                              >
+                                <div className="truncate text-sm font-semibold leading-5 text-[#1a1a1a]" title={partyTitle}>
                                   {partyTitle}
                                 </div>
-                                <div className="mt-0.5 line-clamp-2 whitespace-normal break-words text-xs font-semibold leading-4 text-slate-500" title={transaction.description}>
+                                <div
+                                  className={`mt-0.5 text-xs font-normal leading-4 text-slate-500 ${
+                                    narrationExpanded ? "whitespace-normal break-words" : "truncate"
+                                  }`}
+                                  title={narrationExpanded ? undefined : transaction.description}
+                                >
                                   {transaction.description || "Narration not found"}
                                 </div>
-                                <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[10px] font-bold">
-                                  <span className="shrink-0 text-[#1a1a1a]">{mode || "-"}</span>
-                                  <span className="min-w-0 truncate text-slate-500" title={reference}>{reference || "-"}</span>
-                                </div>
                               </td>
-                              <td className="px-3 py-4 text-right text-sm font-extrabold text-red-600">
+                              <td className={`px-3 py-4 align-top text-[10px] font-extrabold ${debit ? "text-red-700" : "text-emerald-700"}`}>
+                                {debit ? "Payment" : credit ? "Receipt" : mode || "-"}
+                                <span className="mt-0.5 block text-[9px] font-semibold text-slate-400">{mode || "-"}</span>
+                              </td>
+                              <td className="px-3 py-4 align-top text-[10px] font-bold text-slate-600" title={reference}>
+                                <span className="block truncate">{reference || "-"}</span>
+                              </td>
+                              <td className="px-3 py-4 text-right text-sm font-semibold text-red-600">
                                 {debit || "-"}
                               </td>
-                              <td className="px-3 py-4 text-right text-sm font-extrabold text-emerald-700">
+                              <td className="px-3 py-4 text-right text-sm font-semibold text-emerald-700">
                                 {credit || "-"}
                               </td>
                               <td
                                 className={`px-3 py-4 align-top ${
+                                  "group-data-[active=true]:ring-2 group-data-[active=true]:ring-inset group-data-[active=true]:ring-amber-500"
+                                } ${
                                   !showLedgerSelect && !statementReviewLocked
                                     ? "cursor-pointer outline-none transition hover:bg-[#fbf7f1] focus-visible:bg-[#fbf7f1] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-amber-300"
                                     : ""
@@ -7349,36 +7748,32 @@ export function BankStatementsPage() {
                                   />
                                 ) : (
                                   <div className="block max-w-full text-left">
-                                    <span className="block line-clamp-2 whitespace-normal break-words text-sm font-bold leading-5 text-[#1a1a1a]" title={ledgerDisplayName}>
+                                    <span className="block line-clamp-2 whitespace-normal break-words text-sm font-semibold leading-5 text-[#1a1a1a]" title={ledgerDisplayName}>
                                       {ledgerDisplayName}
                                     </span>
-                                    <span className="mt-0.5 block truncate text-xs font-semibold leading-4 text-slate-500">
-                                      {getLedgerGroupLabel(transaction, ledgerMasters)}
+                                    <span className="mt-0.5 flex items-center gap-1 truncate text-[9px] font-semibold leading-3 text-slate-500">
+                                      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${getReviewStatusClass(transaction).includes("emerald") ? "bg-emerald-500" : "bg-amber-500"}`} />
+                                      {getLedgerGroupLabel(transaction, ledgerMasters)} · {ledgerMatchStatus}
                                     </span>
                                   </div>
                                 )}
                               </td>
-                              <td className="px-3 py-4 align-middle">
-                                <span className={`inline-flex min-h-5 items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase leading-none tracking-wide ${ledgerMatchStatusClass}`}>
-                                  {ledgerMatchStatus}
-                                </span>
-                              </td>
-                              <td className="px-3 py-4">
+                              <td className="posting-status-cell px-2 py-2 align-top sm:px-3">
                                 {tallyPresence?.status === "found" ? (
                                   <button
-                                    className="inline-flex min-w-0 max-w-full flex-col items-start gap-1 rounded-xl border border-transparent px-2 py-1.5 text-left transition hover:border-[#e5ddd0] hover:bg-[#faf8f4] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-200"
+                                    className="flex w-full min-w-0 flex-col items-start gap-1 rounded-lg border border-transparent px-1.5 py-0 text-left transition hover:border-[#e5ddd0] hover:bg-[#faf8f4] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-200"
                                     onClick={() => setOutgoingReviewTransactionId(transaction.id)}
                                     title="View matching Tally voucher details"
                                     type="button"
                                   >
-                                    <span className={`inline-flex min-h-5 self-start items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase leading-none tracking-wide ${
+                                    <span className={`inline-flex min-h-5 max-w-full self-start items-center gap-1 overflow-hidden text-ellipsis whitespace-nowrap rounded-full border px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide ${
                                       tallyPresence.duplicateInTally
                                         ? "border-amber-250 bg-amber-50 text-amber-800"
                                         : "border-emerald-250 bg-emerald-50 text-emerald-800"
                                     }`}>
                                       {tallyPresence.duplicateInTally ? "Already posted - duplicates" : "Already in Tally"}
                                     </span>
-                                    <span className="block max-w-full truncate text-[10px] font-semibold leading-4 text-slate-500" title={tallyPresence.reason}>
+                                    <span className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500" title={tallyPresence.reason}>
                                       {tallyPresence.duplicateInTally
                                         ? `Tally vouchers ${tallyPresence.matches?.map((match) => match.voucherNumber).filter(Boolean).join(", ") || "need review"}`
                                         : tallyPresence.voucherNumber
@@ -7388,7 +7783,7 @@ export function BankStatementsPage() {
                                   </button>
                                 ) : outgoingPayment && !outgoingNeedsBillAllocation ? (
                                   <button
-                                    className={`inline-flex min-w-0 max-w-full flex-col items-start gap-1 rounded-xl border border-transparent px-2 py-1.5 text-left transition ${
+                                    className={`flex w-full min-w-0 flex-col items-start gap-1 rounded-lg border border-transparent px-1.5 py-0 text-left transition ${
                                       statementReviewDrawerLocked ? "cursor-default" : "hover:border-[#e5ddd0] hover:bg-[#faf8f4]"
                                     }`}
                                     onClick={() => {
@@ -7398,12 +7793,12 @@ export function BankStatementsPage() {
                                     type="button"
                                   >
                                     <span
-                                      className={`inline-flex min-h-5 self-start items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase leading-none tracking-wide ${getOutgoingVerificationClass(outgoingVerification)}`}
+                                      className={`inline-flex min-h-5 max-w-full self-start items-center gap-1 overflow-hidden text-ellipsis whitespace-nowrap rounded-full border px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide ${getOutgoingVerificationClass(outgoingVerification)}`}
                                     >
                                       {getOutgoingVerificationLabel(outgoingVerification)}
                                     </span>
                                     <span
-                                      className="block max-w-full truncate text-[10px] font-semibold leading-4 text-slate-500"
+                                      className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500"
                                       title={outgoingVerification?.reason}
                                     >
                                       {getOutgoingVerificationSubtext(outgoingVerification)}
@@ -7411,7 +7806,7 @@ export function BankStatementsPage() {
                                   </button>
                                 ) : (
                                   <button
-                                    className={`inline-flex min-w-0 max-w-full flex-col items-start gap-1 rounded-xl border border-transparent px-2 py-1.5 text-left transition ${
+                                    className={`flex w-full min-w-0 flex-col items-start gap-1 rounded-lg border border-transparent px-1.5 py-0 text-left transition ${
                                       statementReviewDrawerLocked ? "cursor-default" : "hover:border-[#e5ddd0] hover:bg-[#faf8f4]"
                                     }`}
                                     onClick={() => {
@@ -7421,13 +7816,17 @@ export function BankStatementsPage() {
                                     type="button"
                                   >
                                     <span
-                                      className={`inline-flex min-h-5 self-start items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase leading-none tracking-wide ${getBillAllocationBadgeClass(transaction, ledgerMasters, billAllocation)}`}
+                                      className={`inline-flex min-h-5 max-w-full self-start items-center gap-1 overflow-hidden text-ellipsis whitespace-nowrap rounded-full border px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide ${getBillAllocationBadgeClass(transaction, ledgerMasters, billAllocation)}`}
                                     >
-                                      {getBillAllocationBadgeText(transaction, ledgerMasters, billAllocation)}
+                                      {!tallyCheckAttempted &&
+                                      isIncomingReceiptRow(transaction) &&
+                                      !isSuspenseLedgerName(transaction.selectedLedgerName)
+                                        ? "Not matched"
+                                        : getBillAllocationBadgeText(transaction, ledgerMasters, billAllocation)}
                                     </span>
-                                    {billAllocation?.caseLabel && billAllocation.status === "ready_to_post" ? (
-                                      <span className="block max-w-full truncate text-[10px] font-semibold leading-4 text-slate-500" title={billAllocation.reason}>
-                                        {billAllocation.caseLabel}
+                                    {getBillAllocationSubtext(billAllocation, transaction, ledgerMasters) ? (
+                                      <span className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500" title={billAllocation?.reason || "Bill matching is not required for this ledger."}>
+                                        {getBillAllocationSubtext(billAllocation, transaction, ledgerMasters)}
                                       </span>
                                     ) : null}
                                   </button>
@@ -7468,7 +7867,7 @@ export function BankStatementsPage() {
                   <div className="flex items-center gap-2">
                     <span>Rows per page</span>
                     <select
-                      className="h-8.5 rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-bold text-[#5a5046] outline-none focus:border-amber-500"
+                      className="h-8.5 rounded-xl border border-[#e5ddd0] bg-white px-3.5 text-xs font-medium text-[#5a5046] outline-none focus:border-amber-500"
                       onChange={(event) => {
                         setRowsPerPage(Number(event.target.value));
                         setReviewPage(1);
@@ -7491,14 +7890,14 @@ export function BankStatementsPage() {
                     </span>
                     <div className="flex items-center gap-2">
                       <button
-                        className="rounded-xl border border-[#e5ddd0] bg-white px-3 py-2 text-xs font-bold text-[#5a5046] transition hover:bg-[#faf8f4] disabled:cursor-not-allowed disabled:opacity-50"
+                        className="rounded-xl border border-[#e5ddd0] bg-white px-3 py-2 text-xs font-medium text-[#5a5046] transition hover:bg-[#faf8f4] disabled:cursor-not-allowed disabled:opacity-50"
                         disabled={reviewPage <= 1}
                         onClick={() => setReviewPage((current) => Math.max(1, current - 1))}
                         type="button"
                       >
                         Previous
                       </button>
-                      <span className="text-xs font-bold text-slate-500">
+                      <span className="text-xs font-medium text-slate-500">
                         Page {reviewPage} of {reviewPageCount}
                       </span>
                       <button
@@ -7522,16 +7921,44 @@ export function BankStatementsPage() {
                     onClick={() => closeBillAllocationReview(false, true)}
                     type="button"
                   />
-                  <aside className="relative flex h-full w-full max-w-[720px] flex-col border-l border-[#e5ddd0] bg-[#fcfbfa] shadow-2xl">
-                    <div className="flex items-start justify-between border-b border-[#e5ddd0] bg-white px-5 py-4">
-                      <div>
-                        <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                          Bill Allocation
+                  <aside className="relative z-10 flex h-full w-full max-w-[720px] flex-col border-l border-[#aebfca] bg-white shadow-2xl">
+                    <header className="border-b border-[#b8cad5]">
+                      <div className="flex min-h-8 items-center justify-between gap-2 bg-[#d8eaf4] px-4 py-1 text-[#27485d]">
+                        <span className="text-[9px] font-extrabold uppercase tracking-[0.12em]">Bill Allocation</span>
+                        <div className="flex items-center gap-1">
+                          <Button
+                            className="h-6 px-2 text-[8px] font-extrabold uppercase tracking-wide transition hover:bg-white/60 disabled:opacity-35"
+                            disabled={billAllocationReviewIndex <= 0}
+                            onClick={() => openAdjacentBillAllocation(-1)}
+                            type="button"
+                            variant="ghost"
+                          >
+                            Previous
+                          </Button>
+                          <Button
+                            className="h-6 px-2 text-[8px] font-extrabold uppercase tracking-wide transition hover:bg-white/60 disabled:opacity-35"
+                            disabled={billAllocationReviewIndex < 0 || billAllocationReviewIndex >= partyBillAllocationReviewTransactions.length - 1}
+                            onClick={() => openAdjacentBillAllocation(1)}
+                            type="button"
+                            variant="ghost"
+                          >
+                            Next
+                          </Button>
+                          <button
+                            className="inline-flex h-6 w-6 items-center justify-center transition hover:bg-white/60"
+                            onClick={() => closeBillAllocationReview()}
+                            title="Close"
+                            type="button"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
                         </div>
-                        <h2 className="mt-1 text-xl font-extrabold text-[#1a1a1a]">
+                      </div>
+                      <div className="bg-white px-4 py-2.5">
+                        <h2 className="text-[15px] font-extrabold leading-5 text-[#171717]">
                           {getTransactionPartyTitle(billAllocationReviewTransaction)}
                         </h2>
-                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs font-semibold text-slate-500">
+                        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[9px] font-bold leading-4 text-[#61788a]">
                           <span>
                             {formatShortDate(billAllocationReviewTransaction.transactionDate)}
                           </span>
@@ -7547,45 +7974,14 @@ export function BankStatementsPage() {
                           {getTransactionReference(billAllocationReviewTransaction) ? (
                             <>
                               <span>-</span>
-                              <span>{getTransactionReference(billAllocationReviewTransaction)}</span>
+                              <span className="font-mono">{getTransactionReference(billAllocationReviewTransaction)}</span>
                             </>
                           ) : null}
                         </div>
                       </div>
-                      <div className="flex items-center gap-1">
-                        <Button
-                          className="h-9 rounded-xl px-3 text-[11px] font-bold"
-                          disabled={billAllocationReviewIndex <= 0}
-                          onClick={() => openAdjacentBillAllocation(-1)}
-                          type="button"
-                          variant="outline"
-                        >
-                          Previous
-                        </Button>
-                        <Button
-                          className="h-9 rounded-xl px-3 text-[11px] font-bold"
-                          disabled={
-                            billAllocationReviewIndex < 0 ||
-                            billAllocationReviewIndex >= partyBillAllocationReviewTransactions.length - 1
-                          }
-                          onClick={() => openAdjacentBillAllocation(1)}
-                          type="button"
-                          variant="outline"
-                        >
-                          Next
-                        </Button>
-                        <button
-                          className="inline-flex h-9 w-9 items-center justify-center rounded-xl text-slate-400 hover:bg-slate-100 hover:text-slate-900 transition-colors"
-                          onClick={() => closeBillAllocationReview()}
-                          title="Close"
-                          type="button"
-                        >
-                          <X className="h-4 w-4" />
-                        </button>
-                      </div>
-                    </div>
+                    </header>
 
-                    <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
+                    <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
                       <div className="hidden grid gap-3 sm:grid-cols-2">
                         {[
                           ["Bank Date", formatShortDate(billAllocationReviewTransaction.transactionDate)],
@@ -7607,42 +8003,42 @@ export function BankStatementsPage() {
                             <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
                               {label}
                             </div>
-                            <div className="mt-1 text-sm font-extrabold text-[#1a1a1a]">{value}</div>
+                            <div className="mt-1 text-sm font-semibold text-[#1a1a1a]">{value}</div>
                           </div>
                         ))}
                       </div>
 
                       {!billAllocationReviewDraft ? (
-                        <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-900">
-                          Match bills first. This row has no allocation draft yet.
+                        <div className="border-y border-[#cfdbe2] bg-[#f4f8fb] px-3 py-2.5 text-[10px] font-bold leading-4 text-[#3f5d70]">
+                          Run Check Tally Matches to load this ledger’s open bills before allocating the entry.
                         </div>
                       ) : (
                         <>
-                          <div className="mt-1 rounded-2xl bg-[#242722] px-4 py-3 text-white shadow-[0_8px_22px_rgba(36,39,34,0.12)]">
+                          <div className="border-y border-[#b8cad5] bg-[#f4f8fb] px-3 py-2.5 text-[#172f3e]">
                             <div className="flex flex-wrap items-end justify-between gap-3">
                               <div>
-                                <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-white/55">
+                                <div className="text-[8px] font-extrabold uppercase tracking-[0.14em] text-[#7890a1]">
                                   {billAllocationReviewIsPayment ? "Payment" : "Receipt"}
                                 </div>
-                                <div className="mt-0.5 text-xl font-extrabold tracking-tight">
+                                <div className="mt-0.5 text-[16px] font-extrabold tracking-tight">
                                   {formatCurrencyAmount(billAllocationReviewDraft.receiptAmount)}
                                 </div>
                               </div>
                               <div className="flex items-center gap-5 text-right">
                                 <div>
-                                  <div className="text-[9px] font-bold uppercase tracking-wider text-white/45">Bills</div>
-                                  <div className="mt-0.5 text-sm font-bold">
+                                  <div className="text-[8px] font-extrabold uppercase tracking-wider text-[#7890a1]">Bills</div>
+                                  <div className="mt-0.5 text-[10px] font-extrabold">
                                     {formatCurrencyAmount(billAllocationReviewDraft.totalAllocatedAmount - billAllocationReviewDraft.newAdvanceAmount)}
                                   </div>
                                 </div>
                                 <div>
-                                  <div className="text-[9px] font-bold uppercase tracking-wider text-white/45">Advance</div>
-                                  <div className="mt-0.5 text-sm font-bold">{formatCurrencyAmount(billAllocationReviewDraft.newAdvanceAmount)}</div>
+                                  <div className="text-[8px] font-extrabold uppercase tracking-wider text-[#7890a1]">Advance</div>
+                                  <div className="mt-0.5 text-[10px] font-extrabold">{formatCurrencyAmount(billAllocationReviewDraft.newAdvanceAmount)}</div>
                                 </div>
-                                <span className={`rounded-full px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-wider ${
+                                <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider ${
                                   Math.abs(billAllocationReviewDraft.unallocatedAmount) < 0.01
-                                    ? "bg-emerald-400/15 text-emerald-200"
-                                    : "bg-amber-300/15 text-amber-200"
+                                    ? "bg-emerald-100 text-emerald-800"
+                                    : "bg-amber-100 text-amber-800"
                                 }`}>
                                   {Math.abs(billAllocationReviewDraft.unallocatedAmount) < 0.01
                                     ? "Balanced"
@@ -7652,7 +8048,7 @@ export function BankStatementsPage() {
                                 </span>
                               </div>
                             </div>
-                            <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/10">
+                            <div className="mt-2.5 h-1 overflow-hidden bg-[#d6e2e9]">
                               <div
                                 className={`h-full rounded-full transition-[width] duration-300 ${
                                   billAllocationReviewDraft.unallocatedAmount < -0.005 ? "bg-amber-300" : "bg-emerald-400"
@@ -7666,7 +8062,7 @@ export function BankStatementsPage() {
                             </div>
                           </div>
 
-                          <div className={`mt-2 flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[11px] font-semibold ${
+                          <div className={`mt-2 flex items-center gap-2 border-y px-3 py-2 text-[10px] font-bold ${
                             billAllocationReviewDraft.requiresUserReview
                               ? "bg-amber-50 text-amber-900"
                               : "bg-emerald-50 text-emerald-900"
@@ -7676,12 +8072,12 @@ export function BankStatementsPage() {
                               ) : (
                                 <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
                               )}
-                              <span className="font-extrabold">{billAllocationReviewDraft.caseType === "manual_review" ? "Manual allocation" : "Suggested allocation"}</span>
+                              <span className="font-semibold">{billAllocationReviewDraft.caseType === "manual_review" ? "Manual allocation" : "Suggested allocation"}</span>
                               <span className="min-w-0 truncate opacity-75">{billAllocationReviewDraft.reason}</span>
                           </div>
 
                           {billAllocationReviewDraft.existingAdvances.length > 0 ? (
-                            <div className="mt-3 rounded-xl border border-amber-200 bg-white px-4 py-3 text-xs font-semibold leading-5 text-amber-900">
+                            <div className="mt-3 border-y border-amber-200 bg-amber-50 px-3 py-2.5 text-[10px] font-semibold leading-4 text-amber-900">
                               This {billAllocationReviewIsPayment ? "supplier" : "customer"} already has {formatCurrencyAmount(
                                 billAllocationReviewDraft.existingAdvances.reduce(
                                   (sum, advance) => sum + advance.pendingAdvanceAmount,
@@ -7692,7 +8088,7 @@ export function BankStatementsPage() {
                           ) : null}
 
                           <section className="hidden mt-6">
-                            <h3 className="text-sm font-bold text-[#1a1a1a]">Proposed Allocation</h3>
+                            <h3 className="text-sm font-semibold text-[#1a1a1a]">Proposed Allocation</h3>
                             <div className="mt-2 overflow-x-auto rounded-md border border-[#e5ddd0] bg-white">
                               <table className="w-full min-w-[640px] text-left text-xs">
                                 <thead className="bg-[#fcfbfa] text-[10px] font-bold uppercase tracking-wider text-slate-400">
@@ -7740,8 +8136,7 @@ export function BankStatementsPage() {
                           <section className="mt-3">
                             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#e8e1d7] pb-2">
                               <div>
-                                <h3 className="text-sm font-extrabold text-[#1a1a1a]">Open bills</h3>
-                                <p className="text-[10px] font-semibold text-slate-400">Choose bills and adjust the allocated amount</p>
+                              <h3 className="text-xs font-extrabold text-[#1a1a1a]">Open bills</h3>
                               </div>
                               <div className="flex flex-wrap gap-1 rounded-lg bg-[#f3efe9] p-1">
                               <Button
@@ -7812,7 +8207,7 @@ export function BankStatementsPage() {
                                 <label className="relative min-w-[260px] flex-1">
                                 <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
                                 <input
-                                  className="h-9 w-full rounded-xl border border-[#ddd3c5] bg-white pl-10 pr-3 text-xs font-semibold outline-none transition focus:border-[#8d714f] focus:ring-2 focus:ring-[#8d714f]/10"
+                              className="h-8 w-full rounded-md border border-[#cfdbe2] bg-white pl-9 pr-3 text-[10px] font-semibold outline-none transition focus:border-[#587286] focus:ring-2 focus:ring-[#d8eaf4]"
                                   onChange={(event) => setBillAllocationSearch(event.target.value)}
                                   placeholder="Search bill reference, voucher, date, or amount"
                                   type="search"
@@ -7820,19 +8215,19 @@ export function BankStatementsPage() {
                                 />
                                   <span className="sr-only">Search open Tally bills</span>
                                 </label>
-                                <span className="whitespace-nowrap rounded-full bg-[#f3efe9] px-2.5 py-1 text-[10px] font-extrabold text-[#756858]">
+                                <span className="whitespace-nowrap rounded-full bg-[#f3efe9] px-2.5 py-1 text-[10px] font-semibold text-[#756858]">
                                   {selectedBillAllocationCount} selected · {filteredBillAllocationCandidates.length} shown
                                 </span>
                               </div>
                             </div>
-                            <div className="mt-2 overflow-x-auto rounded-2xl border border-[#ddd3c5] bg-white shadow-[0_8px_22px_rgba(66,53,37,0.05)]">
+                          <div className="mt-2 overflow-x-auto border-y border-[#cfdbe2] bg-white">
                               <table className="w-full min-w-[560px] text-left text-xs">
-                                <thead className="bg-[#f7f3ed] text-[9px] font-extrabold uppercase tracking-[0.12em] text-[#9a8d7f]">
+                              <thead className="bg-[#fcfbfa] text-[9px] font-extrabold uppercase tracking-[0.12em] text-slate-400">
                                   <tr>
                                     <th className="px-3 py-2">Bill Reference</th>
                                     <th className="px-3 py-2 text-right">Pending</th>
                                     <th className="px-3 py-2 text-right">Allocate</th>
-                                    <th className="w-[100px] px-3 py-2 text-right"></th>
+                                  <th className="w-[150px] px-3 py-2 text-right"></th>
                                   </tr>
                                 </thead>
                                 <tbody className="divide-y divide-[#eee7dc] text-slate-600 font-semibold">
@@ -7858,13 +8253,13 @@ export function BankStatementsPage() {
                                       return (
                                         <tr className={currentAmount > 0 ? "bg-emerald-50/45" : "transition-colors hover:bg-[#fcfaf7]"} key={bill.referenceName}>
                                           <td className="px-3 py-2.5">
-                                            <div className="font-extrabold text-[#1a1a1a]">{bill.referenceName}</div>
+                                    <div className="font-extrabold text-[#1a1a1a]">{bill.referenceName}</div>
                                             <div className="mt-0.5 flex flex-wrap gap-x-2 text-[10px] font-semibold text-slate-400">
                                               <span>Invoice {bill.invoiceDate ? formatShortDate(bill.invoiceDate) : "date unavailable"}</span>
                                               {bill.dueDate ? <span>Due {formatShortDate(bill.dueDate)}</span> : null}
                                             </div>
                                           </td>
-                                          <td className="px-3 py-2.5 text-right font-extrabold text-[#4e5d71]">{formatCurrencyAmount(bill.pendingAmount)}</td>
+                                          <td className="px-3 py-2.5 text-right font-semibold text-[#4e5d71]">{formatCurrencyAmount(bill.pendingAmount)}</td>
                                           <td className="px-3 py-2.5 text-right">
                                             <CurrencyAmountInput
                                               max={bill.pendingAmount}
@@ -7924,9 +8319,9 @@ export function BankStatementsPage() {
                           </section>
 
                           {billAllocationReviewDraft.existingAdvances.length > 0 ? (
-                            <section className="mt-6">
-                              <h3 className="text-sm font-bold text-[#1a1a1a]">Existing Advances</h3>
-                              <div className="mt-2 overflow-x-auto rounded-xl border border-[#e5ddd0] bg-white">
+                            <section className="mt-4">
+                              <h3 className="text-xs font-bold text-[#1a1a1a]">Existing advances</h3>
+                              <div className="mt-2 overflow-x-auto border-y border-[#cfdbe2] bg-white">
                                 <table className="w-full min-w-[420px] text-left text-xs">
                                   <thead className="bg-[#fcfbfa] text-[10px] font-bold uppercase tracking-wider text-slate-400">
                                     <tr>
@@ -7958,14 +8353,14 @@ export function BankStatementsPage() {
                         </>
                       )}
                     </div>
-                    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#e5ddd0] bg-white px-5 py-4">
-                      <span className="text-xs font-semibold text-slate-500">
+                    <div className="flex items-center justify-between gap-2 border-t border-[#b8cad5] bg-[#eaf3f8] px-4 py-2">
+                      <span className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-[#61788a]">
                         Allocation is applied to this statement only. Nothing is posted until you confirm posting.
                       </span>
                       <div className="flex items-center gap-2">
                         {billAllocationReviewDraft?.requiresUserReview ? (
                           <Button
-                            className="h-10 rounded-xl text-xs font-bold"
+                          className="h-8 rounded-md border-[#b8cad5] bg-white px-3 text-[10px] font-bold"
                             onClick={() => closeBillAllocationReview(true)}
                             type="button"
                             variant="outline"
@@ -7974,7 +8369,7 @@ export function BankStatementsPage() {
                           </Button>
                         ) : null}
                         <Button
-                          className="bg-[#2d2d2d] text-white text-xs font-bold hover:bg-[#1a1a1a] shadow-sm transition-all rounded-xl h-10"
+                          className="h-8 rounded-md bg-[#263b47] px-3 text-[10px] font-bold text-white shadow-none transition hover:bg-[#172a35]"
                           disabled={!billAllocationReviewDraft || billAllocationReviewDraft.requiresUserReview}
                           onClick={() => closeAndOpenNextBillIssue()}
                           type="button"
@@ -7999,43 +8394,45 @@ export function BankStatementsPage() {
                     onClick={() => setOutgoingReviewTransactionId(null)}
                     type="button"
                   />
-                  <aside className="relative flex h-full w-full max-w-[680px] flex-col border-l border-[#e5ddd0] bg-[#fcfbfa] shadow-2xl">
-                    <div className="flex items-start justify-between border-b border-[#e5ddd0] bg-white px-5 py-4">
-                      <div>
-                        <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  <aside className="relative z-10 flex h-full w-full max-w-[680px] flex-col border-l border-[#aebfca] bg-white shadow-2xl">
+                    <header className="border-b border-[#b8cad5]">
+                      <div className="flex min-h-8 items-center justify-between gap-2 bg-[#d8eaf4] px-4 py-1">
+                        <span className="text-[9px] font-extrabold uppercase tracking-[0.12em] text-[#27485d]">
                           {tallyResultReviewDraft?.status === "found" || tallyResultReviewDraft?.status === "ambiguous"
                             ? "Tally Match Details"
                             : tallyResultReviewIsIncoming
                               ? "Receipt Check"
                               : "Payment Check"}
-                        </div>
-                        <h2 className="mt-1 text-xl font-extrabold text-[#1a1a1a]">
+                        </span>
+                        <button
+                          className="inline-flex h-6 w-6 items-center justify-center text-[#587286] transition hover:bg-white/60 hover:text-[#172f3e]"
+                          onClick={() => setOutgoingReviewTransactionId(null)}
+                          title="Close"
+                          type="button"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                      <div className="bg-white px-4 py-2.5">
+                        <h2 className="text-[15px] font-extrabold leading-5 text-[#171717]">
                           {getTransactionPartyTitle(outgoingReviewTransaction)}
                         </h2>
-                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs font-semibold text-slate-500">
+                        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[9px] font-bold leading-4 text-[#61788a]">
                           <span>{formatShortDate(outgoingReviewTransaction.transactionDate)}</span>
                           <span>-</span>
                           <span>{formatCurrencyAmount(tallyResultReviewAmount)}</span>
                           {getTransactionReference(outgoingReviewTransaction) ? (
                             <>
                               <span>-</span>
-                              <span>{getTransactionReference(outgoingReviewTransaction)}</span>
+                              <span className="font-mono">{getTransactionReference(outgoingReviewTransaction)}</span>
                             </>
                           ) : null}
                         </div>
                       </div>
-                      <button
-                        className="inline-flex h-9 w-9 items-center justify-center rounded-xl text-slate-400 hover:bg-slate-100 hover:text-slate-900 transition-colors"
-                        onClick={() => setOutgoingReviewTransactionId(null)}
-                        title="Close"
-                        type="button"
-                      >
-                        <X className="h-4 w-4" />
-                      </button>
-                    </div>
+                    </header>
 
-                    <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-                      <div className="mb-4 grid gap-3 rounded-xl border border-[#e5ddd0] bg-white p-4 sm:grid-cols-2">
+                    <div className="min-h-0 flex-1 overflow-y-auto">
+                      <div className="grid border-b border-[#cfdbe2] bg-[#fffefb] sm:grid-cols-2">
                         {[
                           ["Bank Date", formatShortDate(outgoingReviewTransaction.transactionDate)],
                           ["Amount", formatCurrencyAmount(tallyResultReviewAmount)],
@@ -8045,48 +8442,48 @@ export function BankStatementsPage() {
                           ["Bank Ledger", bankLedgerName || "-"],
                           ["Will Post As", tallyResultReviewPostingVoucherType],
                         ].map(([label, value]) => (
-                          <div key={label} className="border-b border-[#e5ddd0] pb-2">
-                            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                          <div key={label} className="min-w-0 border-b border-[#e0e7eb] px-4 py-2 sm:border-r sm:even:border-r-0">
+                            <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-[#7890a1]">
                               {label}
                             </div>
-                            <div className="mt-1 text-sm font-extrabold text-[#1a1a1a]">{value}</div>
+                            <div className="mt-0.5 break-words text-[11px] font-extrabold leading-[14px] text-[#1a1a1a]">{value}</div>
                           </div>
                         ))}
                       </div>
 
-                      <div className="rounded-xl border border-[#e5ddd0] bg-white p-4 shadow-[0_2px_8px_rgba(0,0,0,0.01)]">
-                        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${getOutgoingVerificationClass(tallyResultReviewDraft)}`}>
+                      <div className="border-b border-[#cfdbe2] bg-[#f4f8fb] px-4 py-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#dbe5eb] pb-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[8px] font-extrabold uppercase tracking-wider ${getOutgoingVerificationClass(tallyResultReviewDraft)}`}>
                               {getOutgoingVerificationLabel(tallyResultReviewDraft)}
                             </span>
                             {tallyResultReviewDraft?.status === "found" && !tallyResultReviewDraft.duplicateInTally ? (
-                              <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-800">
+                              <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[8px] font-extrabold uppercase tracking-wider text-emerald-800">
                                 No action required
                               </span>
                             ) : null}
                             {tallyResultReviewDraft?.status === "missing" ? (
-                              <span className="inline-flex items-center rounded-full border border-blue-200 bg-blue-50 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-blue-800">
+                              <span className="inline-flex items-center rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[8px] font-extrabold uppercase tracking-wider text-blue-800">
                                 Ready to post as {tallyResultReviewPostingVoucherType}
                               </span>
                             ) : null}
                           </div>
-                          <span className="text-xs font-semibold text-slate-400">
+                          <span className="text-[9px] font-bold text-slate-400">
                             Ledger: {outgoingReviewTransaction.selectedLedgerName || "-"}
                           </span>
                         </div>
-                        <p className="mt-3 text-sm leading-6 text-slate-600">
+                        <p className="mt-2 text-[10px] font-semibold leading-4 text-[#3f5d70]">
                           {tallyResultReviewReason}
                         </p>
                       </div>
 
-                      <section className={tallyResultReviewEvidence.length ? "mt-5" : "hidden"}>
+                      <section className={tallyResultReviewEvidence.length ? "px-4 py-3" : "hidden"}>
                         <div className="flex flex-wrap items-end justify-between gap-2">
                           <div>
-                            <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                            <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">
                               Tally evidence
                             </div>
-                            <h3 className="mt-1 text-sm font-bold text-[#1a1a1a]">
+                            <h3 className="mt-0.5 text-[11px] font-extrabold text-[#1a1a1a]">
                               {tallyResultReviewDraft?.status === "found"
                                 ? tallyResultReviewDraft.duplicateInTally
                                   ? "Matching Tally vouchers"
@@ -8095,7 +8492,7 @@ export function BankStatementsPage() {
                             </h3>
                           </div>
                           {tallyResultReviewDraft?.status === "found" ? (
-                            <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider ${
+                            <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[8px] font-extrabold uppercase tracking-wider ${
                               tallyResultReviewDraft.duplicateInTally
                                 ? "border-amber-200 bg-amber-50 text-amber-800"
                                 : "border-emerald-200 bg-emerald-50 text-emerald-800"
@@ -8104,45 +8501,45 @@ export function BankStatementsPage() {
                             </span>
                           ) : null}
                         </div>
-                        <div className="mt-2 space-y-3">
+                        <div className="mt-2 border-t border-[#cfdbe2]">
                           {tallyResultReviewEvidence.length ? (
                             tallyResultReviewEvidence.map((match, index) => (
                               <div
                                 key={`${match.masterId || match.voucherNumber || index}`}
-                                className="rounded-xl border border-[#e5ddd0] bg-white p-4 shadow-[0_2px_8px_rgba(0,0,0,0.01)]"
+                                className="border-b border-[#cfdbe2] bg-white py-3"
                               >
                                 <div className="flex flex-wrap items-start justify-between gap-3">
                                   <div>
-                                    <div className="text-sm font-bold text-[#1a1a1a]">
+                                    <div className="text-[11px] font-extrabold text-[#1a1a1a]">
                                       {match.voucherNumber
                                         ? `Voucher ${match.voucherNumber}`
                                         : match.masterId
                                           ? `Voucher ${match.masterId}`
                                           : `Candidate ${index + 1}`}
                                     </div>
-                                    <div className="mt-1 text-xs font-semibold text-slate-400">
+                                    <div className="mt-0.5 text-[9px] font-semibold text-slate-400">
                                       {[match.voucherType, match.date ? formatShortDate(match.date) : null, match.reference]
                                         .filter(Boolean)
                                         .join(" - ") || "Voucher details from Tally"}
                                     </div>
                                   </div>
                                   {typeof match.score === "number" ? (
-                                    <span className="inline-flex items-center gap-1.5 rounded-full border border-[#e5ddd0] bg-[#faf8f4] px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-600">
+                                    <span className="inline-flex items-center gap-1 rounded-full border border-[#e5ddd0] bg-[#faf8f4] px-2 py-0.5 text-[8px] font-extrabold uppercase tracking-wider text-slate-600">
                                       Score: {match.score}
                                     </span>
                                   ) : null}
                                 </div>
-                                <div className="mt-4 grid gap-2 sm:grid-cols-2 border-t border-slate-100 pt-3">
+                                <div className="mt-3 grid gap-2 border-t border-slate-100 pt-2 sm:grid-cols-2">
                                   <div>
-                                    <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                                    <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">
                                       Party / Ledger
                                     </div>
-                                    <div className="mt-1 text-xs font-extrabold text-[#1a1a1a]">
+                                    <div className="mt-0.5 text-[10px] font-extrabold text-[#1a1a1a]">
                                       {match.partyLedgerName || match.ledgerNames[0] || "-"}
                                     </div>
                                   </div>
                                   <div>
-                                    <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                                    <div className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-slate-400">
                                       Why it matched
                                     </div>
                                     <div className="mt-1 flex flex-wrap gap-1">
@@ -8150,13 +8547,13 @@ export function BankStatementsPage() {
                                         match.reasons.map((reason) => (
                                           <span
                                             key={reason}
-                                            className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-800"
+                                              className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[8px] font-bold text-amber-800"
                                           >
                                             {reason}
                                           </span>
                                         ))
                                       ) : (
-                                        <span className="text-xs font-semibold text-slate-400">
+                                        <span className="text-[9px] font-semibold text-slate-400">
                                           Unique voucher returned by the live Tally check
                                         </span>
                                       )}
@@ -8166,19 +8563,39 @@ export function BankStatementsPage() {
                               </div>
                             ))
                           ) : (
-                            <div className="rounded-xl border border-[#e5ddd0] bg-white px-4 py-5 text-sm font-semibold text-slate-400 text-center">
+                            <div className="border-b border-[#cfdbe2] bg-white px-3 py-4 text-center text-[10px] font-semibold text-slate-400">
                               No candidate vouchers returned by Tally.
                             </div>
                           )}
                         </div>
                       </section>
                     </div>
+                    <div className="flex items-center justify-between border-t border-[#b8cad5] bg-[#eaf3f8] px-4 py-2">
+                      <span className="text-[8px] font-extrabold uppercase tracking-[0.12em] text-[#61788a]">
+                        Review transaction
+                      </span>
+                      <Button
+                        autoFocus
+                        className="h-8 rounded-md bg-[#263b47] px-3 text-[10px] font-bold text-white shadow-none transition hover:bg-[#172a35]"
+                        onClick={() => {
+                          const currentIndex = filteredTransactions.findIndex((row) => row.id === outgoingReviewTransaction.id);
+                          const nextTransaction = currentIndex >= 0 ? filteredTransactions[currentIndex + 1] : null;
+                          setOutgoingReviewTransactionId(nextTransaction?.id ?? null);
+                          selectReviewTransaction(nextTransaction?.id ?? null);
+                        }}
+                        type="button"
+                      >
+                        {filteredTransactions.findIndex((row) => row.id === outgoingReviewTransaction.id) < filteredTransactions.length - 1
+                          ? "Done & next"
+                          : "Done"}
+                      </Button>
+                    </div>
                   </aside>
                 </div>
               ) : null}
 
-              <div className="fixed bottom-2 left-2 right-2 z-40 rounded-xl border border-[#ddd3c5] bg-white/95 px-3 py-2 shadow-[0_8px_24px_rgba(49,39,26,0.12)] backdrop-blur-xl sm:left-[232px]">
-                <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-2">
+              <div className="fixed bottom-[calc(4.75rem+env(safe-area-inset-bottom))] left-0 right-0 z-40 border-t border-[#ddd3c5] bg-white/95 px-2 py-2.5 shadow-[0_-4px_20px_rgba(49,39,26,0.08)] backdrop-blur-xl md:bottom-0 md:left-16">
+                <div className="flex w-full max-w-none flex-wrap items-center justify-between gap-2">
                 <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2.5 gap-y-1">
                   <div className="contents text-[11px] font-bold">
                     <span className={`inline-flex h-6 items-center rounded-full border px-2.5 text-[11px] font-bold ${newReceiptCount > 0 && !statementCompletedCleanly ? "border-blue-200 bg-blue-50 text-blue-800" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}>
@@ -8200,9 +8617,19 @@ export function BankStatementsPage() {
                       </span>
                     ) : null}
                   </div>
+                  {!statementCompletedCleanly ? (
+                    <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] font-semibold text-slate-500">
+                      {transactionOutcomeCounts.needsAttention > 0 ? (
+                        <span className="font-bold text-amber-800">
+                          {transactionOutcomeCounts.needsAttention} held for review — not included in posting
+                        </span>
+                      ) : null}
+                      <span>Direct vouchers · Bill allocation when available · Duplicates checked before posting</span>
+                    </div>
+                  ) : null}
                   {!statementCompletedCleanly && tallyPostingStatus ? (
                     <div
-                      className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs font-bold"
+                      className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs font-medium"
                       role={tallyPostingStatus.finished ? "status" : "progressbar"}
                       aria-valuemin={0}
                       aria-valuemax={tallyPostingStatus.total}
@@ -8257,6 +8684,7 @@ export function BankStatementsPage() {
                     <>
                       <Button
                         className="h-8 flex-1 rounded-lg border-[#ddd3c5] bg-white px-3 text-[10px] font-bold text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] sm:flex-none"
+                        style={{display:allowed('bank.prepare')?undefined:'none'}}
                         onClick={matchPendingBills}
                         disabled={
                           sending ||
@@ -8297,6 +8725,7 @@ export function BankStatementsPage() {
                                 ? "border border-amber-250 bg-amber-50 text-amber-900 hover:bg-amber-100"
                                 : "bg-[#2d2d2d] text-white hover:bg-[#1a1a1a]"
                             }`}
+                            style={{display:allowed('bank.post')?undefined:'none'}}
                             onClick={() => {
                               if (billAllocationReviewIsNextAction && firstSelectedBlockingBillAllocationTransaction) {
                                 setBillAllocationReviewTransactionId(firstSelectedBlockingBillAllocationTransaction.id);
@@ -8335,7 +8764,9 @@ export function BankStatementsPage() {
                             ) : (
                               <ArrowRight className="h-3.5 w-3.5" />
                             )}
-                            {postTallyButtonLabel}
+                            {billAllocationReviewIsNextAction
+                              ? postTallyButtonLabel
+                              : `Post to Tally (${selectedPostingTransactions.length})`}
                           </Button>
                         </div>
                       ) : null}
@@ -8347,6 +8778,7 @@ export function BankStatementsPage() {
             </section>
           )}
         </div>
+      </div>
       </div>
     </AppShell>
   );

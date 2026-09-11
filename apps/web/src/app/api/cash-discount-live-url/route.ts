@@ -18,7 +18,7 @@ export function GET() {
 
   const url = new URL(target);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.pathname = "/cash-discount-live";
+  url.pathname = "/agent-live";
   url.search = "";
   url.hash = "";
 

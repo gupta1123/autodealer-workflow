@@ -1,5 +1,8 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { listAccessPredicate } from "@/lib/access/list-scope";
+import { AccessError, requireAccessContext } from "@/lib/access/server";
 import {
   getMismatchResolutionStatusForCaseDecision,
   isMismatchResolutionSchemaMissing,
@@ -417,7 +420,7 @@ function mapCaseRow(
   };
 }
 
-export async function GET(
+async function GETHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -428,8 +431,9 @@ export async function GET(
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }
 
+    const accessPredicate=await listAccessPredicate(request,user.id,"purchases.view");
     const supabase = createSupabaseAdminClient();
-    const fieldConfiguration = await getPersistedPacketFieldConfiguration();
+    const fieldConfiguration = await getPersistedPacketFieldConfiguration(process.env.TEAM_ACCESS_ENFORCEMENT==='true'?(await requireAccessContext(request)).organizationId:undefined);
 
     let caseRow:
       | {
@@ -457,7 +461,7 @@ export async function GET(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, owner_user_id, deleted_at"
         )
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(accessPredicate)
         .single();
 
       if (result.error) {
@@ -469,6 +473,7 @@ export async function GET(
 
       caseRow = result.data;
     } catch (error) {
+    if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
       if (!isRecycleBinSchemaMissing(error)) {
         throw error;
       }
@@ -479,7 +484,7 @@ export async function GET(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, owner_user_id"
         )
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(accessPredicate)
         .single();
 
       if (fallback.error) {
@@ -608,6 +613,7 @@ export async function GET(
       mismatches: filteredMismatches,
     });
   } catch (error) {
+    if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
     return jsonWithCors(request, 
       {
         error: serializeError(error),
@@ -617,7 +623,7 @@ export async function GET(
   }
 }
 
-export async function DELETE(
+async function DELETEHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -643,7 +649,7 @@ export async function DELETE(
             "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
           )
           .eq("id", id)
-          .eq("owner_user_id", user.id)
+          .or(await listAccessPredicate(request, user.id, 'purchases.view'))
           .not("deleted_at", "is", null)
           .single();
         if (result.error) throw result.error;
@@ -663,7 +669,7 @@ export async function DELETE(
             "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
           )
           .eq("id", id)
-          .eq("owner_user_id", user.id)
+          .or(await listAccessPredicate(request, user.id, 'purchases.view'))
           .single();
         if (fallback.error) {
           if (fallback.error.code === "PGRST116") {
@@ -705,7 +711,7 @@ export async function DELETE(
         .from("packet_cases")
         .delete()
         .eq("id", id)
-        .eq("owner_user_id", user.id);
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'));
       if (canHardDeleteWithColumn) {
         deletion = deletion.not("deleted_at", "is", null);
       }
@@ -759,7 +765,7 @@ export async function DELETE(
           deleted_by_user_id: user.id,
         })
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .is("deleted_at", null)
         .select(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
@@ -785,7 +791,7 @@ export async function DELETE(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
         )
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .single();
 
       if (existing.error) {
@@ -806,7 +812,7 @@ export async function DELETE(
           processing_meta: withRecycleBinMetadata(existing.data.processing_meta, deletedAt, user.id),
         })
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .select(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
         )
@@ -833,7 +839,7 @@ export async function DELETE(
   }
 }
 
-export async function PATCH(
+async function PATCHHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -862,7 +868,7 @@ export async function PATCH(
           .from("packet_cases")
           .update({ status: nextStatus })
           .eq("id", id)
-          .eq("owner_user_id", user.id)
+          .or(await listAccessPredicate(request, user.id, 'purchases.view'))
           .is("deleted_at", null)
           .select(
             "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
@@ -906,7 +912,7 @@ export async function PATCH(
             "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
           )
           .eq("id", id)
-          .eq("owner_user_id", user.id)
+          .or(await listAccessPredicate(request, user.id, 'purchases.view'))
           .single();
 
         if (existing.error) {
@@ -942,7 +948,7 @@ export async function PATCH(
           .from("packet_cases")
           .update({ status: nextStatus })
           .eq("id", id)
-          .eq("owner_user_id", user.id)
+          .or(await listAccessPredicate(request, user.id, 'purchases.view'))
           .select(
             "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
           )
@@ -983,7 +989,7 @@ export async function PATCH(
           deleted_by_user_id: null,
         })
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .not("deleted_at", "is", null)
         .select(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
@@ -1009,7 +1015,7 @@ export async function PATCH(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
         )
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .single();
 
       if (existing.error) {
@@ -1029,7 +1035,7 @@ export async function PATCH(
           processing_meta: withoutRecycleBinMetadata(existing.data.processing_meta),
         })
         .eq("id", id)
-        .eq("owner_user_id", user.id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
         .select(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
         )
@@ -1059,3 +1065,7 @@ export async function PATCH(
 export async function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
+
+export const GET = withTeamAccess(GETHandler);
+export const DELETE = withTeamAccess(DELETEHandler);
+export const PATCH = withTeamAccess(PATCHHandler);

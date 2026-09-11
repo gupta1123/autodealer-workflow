@@ -22,12 +22,10 @@ import {
   parseTallyImportResult,
   openBillBlockRequiresVoucherFallback,
   parseLedgerClosingBalance,
-  purchaseImportNeedsDefaultBatchRetry,
   purchasePayloadMasterNames,
   purchaseVoucherFinancialYearRange,
   purchaseVoucherReadbackComparison,
   strictBankTransactionCandidates,
-  withDefaultPurchaseBatchAllocations,
 } from "./bridge.mjs";
 
 test("Supabase binary broadcast wake frames decode without financial payloads", () => {
@@ -78,6 +76,7 @@ test("purchase master preflight covers every selected ledger and stock item once
       "Input SGST",
     ],
     stockItemNames: ["Item One", "Item Two"],
+    godownNames: [],
   });
 });
 
@@ -365,14 +364,16 @@ test("cash discount combines many native customer voucher collections into one b
     }
   );
 
-  assert.equal(calls.length, 1);
-  assert.equal((calls[0].xml.match(/<TYPE>Vouchers : Ledger<\/TYPE>/g) || []).length, 45);
+  assert.ok(calls.length >= 5);
+  assert.ok(calls.every(call => (call.xml.match(/<TYPE>Vouchers : Ledger<\/TYPE>/g) || []).length <= 50));
+  assert.equal(calls.reduce((sum,call) => sum + (call.xml.match(/<TYPE>Vouchers : Ledger<\/TYPE>/g) || []).length,0), 45 * 5);
   assert.match(calls[0].xml, /<SVFROMDATE TYPE="Date">20260401<\/SVFROMDATE>/);
-  assert.match(calls[0].xml, /<SVTODATE TYPE="Date">20270331<\/SVTODATE>/);
+  assert.match(calls[0].xml, /<SVTODATE TYPE="Date">20260629<\/SVTODATE>/);
+  assert.match(calls.at(-1).xml, /<SVTODATE TYPE="Date">20270331<\/SVTODATE>/);
   assert.equal(result.result.queryDiagnostics.requestedLedgerCount, 45);
-  assert.equal(result.result.queryDiagnostics.voucherBatchCount, 1);
-  assert.equal(result.result.queryDiagnostics.voucherQueryMode, "native_ledger_union");
-  assert.equal(result.result.queryDiagnostics.voucherDateChunkCount, 1);
+  assert.equal(result.result.queryDiagnostics.voucherBatchCount, calls.length);
+  assert.equal(result.result.queryDiagnostics.voucherQueryMode, "native_ledger_union_windowed");
+  assert.equal(result.result.queryDiagnostics.voucherDateChunkCount, 5);
 });
 
 test("incomplete Bill data performs one targeted sequential voucher fallback", async () => {
@@ -397,7 +398,7 @@ test("incomplete Bill data performs one targeted sequential voucher fallback", a
   assert.equal(result.result.queryDiagnostics.voucherFallbackLedgerCount, 1);
 });
 
-test("large ledger sets use one full Bill collection instead of repeatedly rescanning Tally", async () => {
+test("bank checks keep 51 parties scoped in sequential batches", async () => {
   const calls = [];
   const ledgerNames = Array.from({ length: 51 }, (_, index) => `Customer ${index + 1}`);
   const result = await fetchCustomerOpenBillsFromTally(
@@ -411,9 +412,9 @@ test("large ledger sets use one full Bill collection instead of repeatedly resca
     }
   );
 
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].filterNames, ["AutodealerPendingBill"]);
-  assert.equal(result.result.queryDiagnostics.billQueryMode, "full");
+  assert.equal(calls.length, 3);
+  for (const call of calls) assert.deepEqual(call.filterNames, ["AutodealerPendingBill", "AutodealerRequestedBillLedger"]);
+  assert.equal(result.result.queryDiagnostics.billQueryMode, "targeted");
 });
 
 test("a failed Bill query is not misreported as an empty successful result", async () => {
@@ -781,35 +782,6 @@ test("Purchase vouchers only include an explicitly selected Tally godown", () =>
   );
 });
 
-test("silent Purchase import exceptions retry only missing inventory allocations", () => {
-  const payload = {
-    items: [
-      { stockItemName: "MS Scrap", godownName: "", batchName: "" },
-      { stockItemName: "Sponge Iron", godownName: "Scrap Yard", batchName: "Lot 7" },
-    ],
-  };
-  assert.equal(purchaseImportNeedsDefaultBatchRetry({
-    success: false,
-    result: { created: 0, altered: 0, errors: 0, exceptions: 1 },
-  }, payload), true);
-  assert.equal(purchaseImportNeedsDefaultBatchRetry({
-    success: false,
-    result: { created: 0, altered: 0, errors: 1, exceptions: 0 },
-  }, payload), false);
-  assert.deepEqual(withDefaultPurchaseBatchAllocations(payload).items, [
-    {
-      stockItemName: "MS Scrap",
-      godownName: "Main Location",
-      batchName: "Primary Batch",
-    },
-    {
-      stockItemName: "Sponge Iron",
-      godownName: "Scrap Yard",
-      batchName: "Lot 7",
-    },
-  ]);
-});
-
 test("Purchase duplicate checks cover the complete Indian financial year", () => {
   assert.deepEqual(purchaseVoucherFinancialYearRange("2026-08-21"), {
     dateFrom: "2026-04-01",
@@ -877,6 +849,7 @@ test("Purchase voucher verification includes the attached source PDF identity", 
   };
   const voucher = {
     date: "20260729",
+    reference: "VIS/26-27/0142",
     referenceDate: "20260728",
     inventoryEntries: [],
     ledgerEntries: [{
@@ -964,4 +937,100 @@ test("Purchase voucher verification includes the attached source PDF identity", 
     ),
     []
   );
+});
+
+test("canonical Purchase vouchers reject an unbalanced approved representation", () => {
+  assert.throws(() => buildPurchaseVoucherXml({
+    canonicalVersion: 2,
+    companyName: "Solution Nyx",
+    voucherDate: "2026-09-05",
+    supplierInvoiceDate: "2026-09-05",
+    supplierInvoiceNumber: "INV-UNBALANCED",
+    supplierLedgerName: "Supplier",
+    finalPayableAmount: 119,
+    items: [{
+      stockItemName: "MS Scrap",
+      purchaseLedgerName: "Scrap Purchase",
+      hsn: "72044900",
+      quantity: 1,
+      unit: "MTS",
+      rate: 100,
+      taxableAmount: 100,
+    }],
+    charges: [{ kind: "igst", name: "Input IGST", amount: 18 }],
+    withholdings: [],
+  }), /not balanced/i);
+});
+
+test("Purchase read-back rejects every substantive canonical mutation regardless of ordering", () => {
+  const payload = {
+    canonicalVersion: 2,
+    voucherDate: "2026-09-05",
+    supplierInvoiceDate: "2026-09-05",
+    supplierInvoiceNumber: "INV-STRICT-1",
+    supplierLedgerName: "Supplier",
+    finalPayableAmount: 117.5,
+    items: [{
+      stockItemName: "MS Scrap",
+      purchaseLedgerName: "Scrap Purchase",
+      hsn: "72044900",
+      quantity: 1,
+      unit: "MTS",
+      rate: 100,
+      taxableAmount: 100,
+      godownName: "Warehouse A",
+      batchName: "Lot 1",
+    }],
+    charges: [
+      { kind: "cgst", name: "Input CGST", amount: 9 },
+      { kind: "sgst", name: "Input SGST", amount: 9 },
+    ],
+    withholdings: [{ kind: "tds_194q", name: "TDS 194Q", amount: 1 }],
+    ledgers: { roundOff: { name: "Round Off", amount: 0.5 } },
+  };
+  const voucher = {
+    date: "20260905",
+    reference: "INV-STRICT-1",
+    referenceDate: "20260905",
+    inventoryEntries: [{
+      stockItemName: "MS Scrap",
+      purchaseLedgerName: "Scrap Purchase",
+      hsn: "72044900",
+      quantity: "1 MTS",
+      rate: "100 / MTS",
+      signedAmount: -100,
+      amount: 100,
+      godownName: "Warehouse A",
+      batchName: "Lot 1",
+    }],
+    ledgerEntries: [
+      { ledgerName: "Input SGST", amount: -9 },
+      { ledgerName: "Supplier", amount: 117.5 },
+      { ledgerName: "TDS 194Q", amount: 1 },
+      { ledgerName: "Round Off", amount: -0.5 },
+      { ledgerName: "Input CGST", amount: -9 },
+    ],
+    billAllocations: [{ referenceName: "INV-STRICT-1", billType: "New Ref", billDate: "20260905", amount: 117.5 }],
+  };
+  assert.deepEqual(purchaseVoucherReadbackComparison(voucher, payload), []);
+
+  const mutations = [
+    ["quantity", { inventoryEntries: [{ ...voucher.inventoryEntries[0], quantity: "2 MTS" }] }],
+    ["rate", { inventoryEntries: [{ ...voucher.inventoryEntries[0], rate: "101 / MTS" }] }],
+    ["unit", { inventoryEntries: [{ ...voucher.inventoryEntries[0], quantity: "1 KG" }] }],
+    ["tax ledger", { ledgerEntries: voucher.ledgerEntries.map((row) => row.ledgerName === "Input CGST" ? { ...row, ledgerName: "Wrong CGST" } : row) }],
+    ["accounting direction", { inventoryEntries: [{ ...voucher.inventoryEntries[0], signedAmount: 100 }] }],
+    ["round-off", { ledgerEntries: voucher.ledgerEntries.map((row) => row.ledgerName === "Round Off" ? { ...row, amount: 0.5 } : row) }],
+    ["godown", { inventoryEntries: [{ ...voucher.inventoryEntries[0], godownName: "Warehouse B" }] }],
+    ["batch", { inventoryEntries: [{ ...voucher.inventoryEntries[0], batchName: "Lot 2" }] }],
+    ["bill type", { billAllocations: [{ ...voucher.billAllocations[0], billType: "Agst Ref" }] }],
+    ["extra entry", { ledgerEntries: [...voucher.ledgerEntries, { ledgerName: "Unexpected", amount: -1 }] }],
+  ];
+  for (const [name, mutation] of mutations) {
+    assert.notDeepEqual(
+      purchaseVoucherReadbackComparison({ ...voucher, ...mutation }, payload),
+      [],
+      `${name} mutation must fail verification`
+    );
+  }
 });

@@ -11,6 +11,7 @@ import {
   LogOut,
   ChevronsUpDown,
   Settings,
+  Plug,
 } from "lucide-react";
 
 import styles from "./DashboardSidebar.module.css";
@@ -21,6 +22,7 @@ const PRIMARY_NAV = [
   { href: "/workspace", label: "Add Case", icon: FileStack },
   { href: "/cases", label: "All Cases", icon: FolderOpen },
   { href: "/recycle-bin", label: "Recycle Bin", icon: Trash2 },
+  { href: "/tally-connect", label: "Tally Connect", icon: Plug },
 ];
 
 function isActivePath(pathname: string, href: string) {
@@ -66,6 +68,7 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
 
       {/* ── PRIMARY NAVIGATION ── */}
       <nav className={styles.navSection}>
+        <p className={styles.navSectionLabel}>Workspace</p>
         <ul className={styles.navList} role="list">
           {PRIMARY_NAV.map((item) => {
             const active = isActivePath(pathname, item.href);
@@ -77,7 +80,6 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
                   className={`${styles.navItem} ${active ? styles.navItemActive : ""}`}
                 >
                   <div className={styles.navItemLeft}>
-                    {active && <div className={styles.activeBar} />}
                     <Icon className={styles.navIcon} />
                     <span className={styles.navTitle}>{item.label}</span>
                   </div>
@@ -118,7 +120,7 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
                   <div className={styles.popoverUserEmail}>{displayUser.email}</div>
                 </div>
               </div>
-              
+
               <div className={styles.popoverMenu}>
                 <Link href="/settings" className={styles.popoverMenuItem} onClick={() => setPopoverOpen(false)}>
                   <Settings size={14} className={styles.popoverMenuIcon} />
@@ -154,7 +156,7 @@ export function DashboardSidebar({ user }: DashboardSidebarProps) {
               <span className={styles.userEmail}>{displayUser.email}</span>
             </div>
           </div>
-          <ChevronsUpDown size={14} className={styles.userChevron} />
+          <ChevronsUpDown size={13} className={styles.userChevron} />
         </div>
       </div>
     </aside>

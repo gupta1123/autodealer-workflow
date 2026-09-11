@@ -1,3 +1,6 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {datasetSelection,requireMasterDataset} from '@/lib/access/master-store';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -18,7 +21,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(
+async function GETHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -33,10 +36,37 @@ export async function GET(
     const type = parseMasterType(url.searchParams.get("type"));
     const query = url.searchParams.get("q")?.trim() ?? "";
     const requestedCompanyName = url.searchParams.get("companyName")?.trim() ?? "";
-    const limit = Math.min(Number(url.searchParams.get("limit") || 100), 5000);
+    const rawLimit=Number(url.searchParams.get("limit") || 100);
+    const limit = Number.isSafeInteger(rawLimit)?Math.max(1,Math.min(rawLimit,5000)):100;
     const fetchAll = url.searchParams.get("all") === "true";
 
     const supabase = createSupabaseAdminClient();
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true') {
+      const scope=await requireMasterDataset(request,id,datasetSelection(url));
+      if(!scope.dataset)return jsonWithCors(request,{masters:[],masterCount:0,latestSync:null});
+      const rows:TallyMasterRow[]=[];
+      for(let from=0;from<20001;from+=1000) {
+        let q=supabase.from('access_dataset_masters').select('*').eq('dataset_id',scope.dataset.id)
+          .eq('is_active',true).order('master_type').order('tally_name').order('id');
+        if(type)q=q.eq('master_type',type);
+        if(query)q=q.ilike('tally_name',`%${query.replace(/[\\%_]/g,'\\$&')}%`);
+        const size=fetchAll?1000:Math.min(1000,limit-from);
+        if(size<=0)break;
+        const {data,error}=await q.range(from,from+size-1);if(error)throw error;
+        rows.push(...(data||[]).map(row=>({...row,connection_id:id,owner_user_id:scope.connection.owner_user_id,
+          company_name:scope.link.company_name,sync_run_id:null} as TallyMasterRow)));
+        if((data?.length||0)<size)break;
+      }
+      if(rows.length>20000)return jsonWithCors(request,{error:'Master list exceeds the supported limit.'},{status:413});
+      const {data:groups,error:groupError}=type==='ledger'?await supabase.from('access_dataset_masters')
+        .select('tally_name,parent_name').eq('dataset_id',scope.dataset.id).eq('master_type','group').limit(5001):{data:[],error:null};
+      if(groupError)throw groupError;
+      if((groups?.length||0)>5000)return jsonWithCors(request,{error:'Group list exceeds the supported limit.'},{status:413});
+      const identities=(groups||[]).map(g=>({name:g.tally_name,parent:g.parent_name}));
+      return jsonWithCors(request,{masters:rows.map(row=>({...serializeTallyMaster(row),
+        ...(row.master_type==='ledger'&&identities.length?{ledgerType:classifyPartyLedgerFromGroups({name:row.tally_name,parent:row.parent_name},identities)}:{})})),
+        masterCount:rows.length,latestSync:{id:scope.dataset.id,status:'completed',company_name:scope.link.company_name,completed_at:scope.dataset.updated_at},datasetId:scope.dataset.id});
+    }
     const { data: connection, error: connectionError } = await supabase
       .from("tally_connections")
       .select("id, owner_user_id, last_company_name")
@@ -146,7 +176,10 @@ export async function GET(
       latestSync: runData ?? null,
     });
   } catch (error) {
+    const denied=accessFailureResponse(request,error);if(denied)return denied;
     console.error("Error in GET /api/tally/connections/[id]/masters:", error);
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);

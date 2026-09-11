@@ -1,3 +1,8 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {requireMasterDataset} from '@/lib/access/master-store';
+import {AccessError} from '@/lib/access/server';
+import {accessFailureResponse} from '@/lib/access/failures';
+import {wakeTallyConnector} from '@/lib/tally/command-wake';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { normalizeName } from "@/lib/bank-statements";
@@ -20,6 +25,9 @@ type QueuePayload = {
   async?: boolean;
   connectionId?: string;
   companyName?: string;
+  companyId?: string;
+  companyGuid?: string;
+  financialYear?: string;
   transactionIds?: string[];
   accountId?: string;
   bankLedgerName?: string;
@@ -261,7 +269,7 @@ async function resolveQueueUser(request: Request) {
   return requireRequestUser(request);
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const user = await resolveQueueUser(request);
     if (!user) {
@@ -321,7 +329,13 @@ export async function POST(request: Request) {
       return jsonWithCors(request, { error: "Select the Tally company before sending entries." }, { status: 400 });
     }
 
-    const { data: submittedConnection, error: submittedConnectionError } = await supabase
+    const team=process.env.TEAM_ACCESS_ENFORCEMENT==='true';
+    const teamScope=team?await requireMasterDataset(request,submittedConnectionId,{companyName:expectedCompanyName,
+      companyId:body.companyId,companyGuid:body.companyGuid,financialYear:body.financialYear},'bank.post'):null;
+    if(teamScope&&!teamScope.dataset)throw new AccessError('Sync masters for this company before posting.',409);
+    const sourcePredicate=teamScope?`and(queue_organization_id.eq.${JSON.stringify(teamScope.access.organizationId)},queue_company_id.eq.${JSON.stringify(teamScope.link.company_id)})`:`owner_user_id.eq.${user.id}`;
+    const parentPredicate=teamScope?teamScope.predicate:`owner_user_id.eq.${user.id}`;
+    const { data: submittedConnection, error: submittedConnectionError } = teamScope?{data:teamScope.connection,error:null}:await supabase
       .from("tally_connections")
       .select("id, owner_user_id, status, last_company_name, last_heartbeat_at, last_tally_reachable")
       .eq("id", submittedConnectionId)
@@ -363,7 +377,9 @@ export async function POST(request: Request) {
     const connection = submittedConnection;
     const connectionId = connection.id;
 
-    if (body.async === true) {
+    // Team admission commits the bounded batch directly; no owner-impersonating
+    // queue worker is needed for preparation. The actual Tally work stays queued.
+    if (body.async === true && !teamScope) {
       const totalCount = requestedTransactionIds.length || (Array.isArray(body.transactions) ? body.transactions.length : 0) || 1;
       const { data: job, error: jobError } = await supabase
         .from("bank_statement_tally_queue_jobs")
@@ -403,9 +419,9 @@ export async function POST(request: Request) {
     }
 
     let query = supabase
-      .from("bank_transactions")
+      .from(teamScope?"access_bank_queue_transactions":"bank_transactions")
       .select("*")
-      .eq("owner_user_id", user.id)
+      .or(sourcePredicate)
       .in("tally_status", ["pending", "failed", "missing_in_tally", "verification_failed"])
       .order("transaction_date", { ascending: true })
       .limit(100);
@@ -420,11 +436,18 @@ export async function POST(request: Request) {
     if (transactionError) throw transactionError;
 
     const transactions = (transactionRows ?? []) as unknown as BankTransactionRow[];
+    if (teamScope && requestedTransactionIds.length && (
+      requestedTransactionIds.length > 100 ||
+      new Set(requestedTransactionIds).size !== requestedTransactionIds.length ||
+      transactions.length !== requestedTransactionIds.length
+    )) {
+      return jsonWithCors(request, { error: "The selected entries changed, are unavailable, or exceed the 100-entry batch limit. Refresh and select the entries again." }, { status: 409 });
+    }
     if (transactions.length === 0) {
       let summaryQuery = supabase
-        .from("bank_transactions")
+        .from(teamScope?"access_bank_queue_transactions":"bank_transactions")
         .select("tally_status")
-        .eq("owner_user_id", user.id);
+        .or(sourcePredicate);
 
       if (requestedTransactionIds.length) {
         summaryQuery = summaryQuery.in("id", requestedTransactionIds);
@@ -468,7 +491,7 @@ export async function POST(request: Request) {
     const { data: accountRows, error: accountError } = await supabase
       .from("bank_accounts")
       .select("id, bank_name, account_number_masked, account_holder_name, tally_ledger_name")
-      .eq("owner_user_id", user.id)
+      .or(parentPredicate)
       .in("id", accountIds);
 
     if (accountError) throw accountError;
@@ -486,7 +509,7 @@ export async function POST(request: Request) {
       ? await supabase
           .from("bank_statement_imports")
           .select("id, extracted_bank_name")
-          .eq("owner_user_id", user.id)
+          .or(parentPredicate)
           .in("id", importIds)
       : { data: [], error: null };
 
@@ -503,7 +526,7 @@ export async function POST(request: Request) {
     const { data: postingLogRows, error: postingLogError } = await supabase
       .from("bank_transaction_posting_log")
       .select("fingerprint, status, command_id")
-      .eq("owner_user_id", user.id)
+      .or(teamScope?`bank_account_id.in.(${accountIds.join(',')})`:`owner_user_id.eq.${user.id}`)
       .in("bank_account_id", accountIds)
       .in("fingerprint", fingerprints)
       .in("status", ["queued", "posted", "verified"]);
@@ -564,13 +587,15 @@ export async function POST(request: Request) {
     }
 
     const activeLedgers: TallyLedgerRow[] = [];
+    const masterTable=teamScope?'access_dataset_masters':'tally_masters';
+    const masterPredicate=teamScope?`dataset_id.eq.${teamScope.dataset!.id}`:
+      `and(owner_user_id.eq.${user.id},connection_id.eq.${connectionId},company_name.eq.${JSON.stringify(expectedCompanyName)})`;
     const ledgerPageSize = 1000;
     for (let from = 0; from < 20000; from += ledgerPageSize) {
       const { data: ledgerRows, error: ledgerError } = await supabase
-        .from("tally_masters")
+        .from(masterTable)
         .select("tally_name, parent_name")
-        .eq("owner_user_id", user.id)
-        .eq("connection_id", connectionId)
+        .or(masterPredicate)
         .eq("master_type", "ledger")
         .eq("is_active", true)
         .order("tally_name", { ascending: true })
@@ -589,10 +614,9 @@ export async function POST(request: Request) {
     const activeGroups: TallyLedgerRow[] = [];
     for (let from = 0; from < 20000; from += ledgerPageSize) {
       const { data: groupRows, error: groupError } = await supabase
-        .from("tally_masters")
+        .from(masterTable)
         .select("tally_name, parent_name")
-        .eq("owner_user_id", user.id)
-        .eq("connection_id", connectionId)
+        .or(masterPredicate)
         .eq("master_type", "group")
         .eq("is_active", true)
         .order("tally_name", { ascending: true })
@@ -942,6 +966,19 @@ export async function POST(request: Request) {
       ).values()
     );
 
+    if(teamScope) {
+      const {data:createdCommands,error}=await supabase.rpc('access_enqueue_bank_batch',{
+        p_actor:user.id,p_org:teamScope.access.organizationId,p_company:teamScope.link.company_id,
+        p_dataset:teamScope.dataset!.id,p_generation:teamScope.connection.session_generation,
+        p_commands:commands,p_mappings:uniqueMappingRows,
+      });
+      if(error)throw error;
+      await wakeTallyConnector(connectionId).catch(()=>undefined);
+      return jsonWithCors(request,{queuedCount:voucherCommands.length,verificationCount:verificationCommands.length,
+        commandCount:commands.length,commands:createdCommands||[],diagnostics:{eligibleTransactionCount:transactions.length,
+          expectedReceiptCount,expectedPaymentPostCount,expectedPaymentCheckCount,companySuspenseLedgerName:companySuspenseLedgerName||null,skipped,skippedRows}});
+    }
+
     if (uniqueMappingRows.length > 0) {
       const { error: mappingError } = await supabase
         .from("tally_mapping_settings")
@@ -1107,6 +1144,7 @@ export async function POST(request: Request) {
       },
     });
   } catch (error) {
+    const denied=accessFailureResponse(request,error);if(denied)return denied;
     console.error("Error in POST /api/bank-statements/tally/queue:", error);
     return jsonWithCors(
       request,
@@ -1115,3 +1153,5 @@ export async function POST(request: Request) {
     );
   }
 }
+
+export const POST = withTeamAccess(POSTHandler);

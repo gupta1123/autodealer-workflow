@@ -5,6 +5,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { createSupabaseFetch } from "./fetch";
 
 function isLocalDbMode() {
+  if(process.env.NODE_ENV==='production'&&(process.env.LOCAL_DB_MODE==='true'||process.env.NEXT_PUBLIC_LOCAL_DB_MODE==='true'))throw new Error('Local authentication bypass is forbidden in production.');
   return process.env.LOCAL_DB_MODE === "true" || process.env.NEXT_PUBLIC_LOCAL_DB_MODE === "true";
 }
 
@@ -123,7 +124,10 @@ export async function updateSession(request: NextRequest) {
   let user;
 
   try {
-    const result = await supabase.auth.getUser();
+    // Route navigation only needs a cryptographically verified identity.
+    // getClaims() can verify asymmetric JWTs from the cached JWKS instead of
+    // making a Supabase Auth network request for every page/RSC prefetch.
+    const result = await supabase.auth.getClaims();
     if (result.error) {
       if (isAuthSessionMissingError(result.error)) {
         user = null;
@@ -140,7 +144,7 @@ export async function updateSession(request: NextRequest) {
         throw result.error;
       }
     } else {
-      user = result.data.user;
+      user = result.data?.claims ?? null;
     }
   } catch (error) {
     console.error("Supabase auth service could not be reached:", error);

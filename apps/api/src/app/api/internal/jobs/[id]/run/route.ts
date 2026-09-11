@@ -1,4 +1,5 @@
 import { jsonWithCors } from "@/lib/api/cors";
+import {assertQueuedResource,QueuedAccessDenied} from '@/lib/access/queued-authority.mjs';
 import { resolveCaseDisplayNameWithAI } from "@/lib/case-naming";
 import { summarizeCase } from "@/lib/case-summary";
 import { getPersistedPacketFieldConfiguration } from "@/lib/field-settings-service";
@@ -281,6 +282,17 @@ export async function POST(
   }
 
   const runId = randomUUID();
+  let jobScope: {organization_id:string;company_id:string}|null = null;
+  try {
+    jobScope=await assertQueuedResource(supabase,{actorId:job.owner_user_id,resourceType:'case',resourceId:job.case_id,permission:'purchases.prepare'});
+  } catch(error) {
+    if(error instanceof QueuedAccessDenied){
+      const stopped=await supabase.from('packet_processing_jobs').update({status:'failed',error:error.message,finished_at:now,locked_at:null,locked_by:null}).eq('id',id).eq('status','running');
+      if(stopped.error)return jsonWithCors(request,{error:'Could not close revoked work.'},{status:503});
+      return jsonWithCors(request,{error:error.message},{status:409});
+    }
+    return jsonWithCors(request,{error:'Queued authorization is unavailable.'},{status:503});
+  }
   const jobResult = readRecord(job.result);
   const lockedBy = typeof job.locked_by === "string" && job.locked_by.trim() ? job.locked_by : null;
   const attemptCount = asNumber(job.attempt_count);
@@ -425,11 +437,12 @@ export async function POST(
 
     const analysisMode = readAnalysisMode(jobResult.analysisMode);
     const comparisonOptions = jobResult.comparisonOptions;
-    const fieldConfiguration = await getPersistedPacketFieldConfiguration();
+    const fieldConfiguration = await getPersistedPacketFieldConfiguration(jobScope?.organization_id ?? 'default');
 
     const extractionStartedAt = Date.now();
     const processed = await processStoredCaseFiles({
       caseId: job.case_id,
+      fieldConfiguration,
       analysisMode,
       comparisonOptions,
       onProgress: async ({ progress, stage }) => {
@@ -604,7 +617,8 @@ export async function POST(
         createdSiblingCaseIds.push(group.caseId);
         const { error: caseInsertError } = await supabase.from("packet_cases").insert({
           id: group.caseId,
-          owner_user_id: caseRow.owner_user_id,
+          owner_user_id: jobScope ? job.owner_user_id : caseRow.owner_user_id,
+          ...(jobScope ? {access_organization_id:jobScope.organization_id,access_company_id:jobScope.company_id} : {}),
           slug: group.summary.slug,
           display_name: group.displayName,
           buyer_name: group.summary.buyerName || null,

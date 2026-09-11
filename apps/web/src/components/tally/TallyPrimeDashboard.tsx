@@ -2,11 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { PageHeader } from '@/components/dashboard/PageHeader';
 import {
   ArrowRight,
   CheckCircle2,
+  Download,
   FileText,
   Loader2,
+  MoreHorizontal,
   PlugZap,
   RefreshCw,
   Server,
@@ -18,6 +21,9 @@ import { apiFetch } from "@/lib/api-client";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { LocalAgentPanel } from "@/components/tally/LocalAgentPanel";
+import { TallyCompanyLinkingPanel } from "@/components/tally/TallyCompanyLinkingPanel";
 
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_LAN_TALLY_URL = "http://192.168.1.10:9000";
@@ -47,6 +53,15 @@ type TallyConnection = {
   tallyReachable?: boolean;
   companyLoaded?: boolean;
   heartbeatStale?: boolean;
+  agentUpdate?: {
+    installedVersion: string | null;
+    latestVersion: string;
+    minimumVersion: string;
+    updateAvailable: boolean;
+    updateRequired: boolean;
+    downloadUrl: string;
+    releaseUrl: string;
+  };
 };
 
 type CompanyOption = {
@@ -215,13 +230,13 @@ function StatusCard({
     <div className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-all duration-300 hover:shadow-[0_4px_12px_rgba(0,0,0,0.03)]">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">
+          <div className="text-xs font-medium text-[#8a7f72]">
             {title}
           </div>
-          <div className="mt-2 text-base font-extrabold text-[#1a1a1a]">
+          <div className="mt-2 text-sm font-semibold text-[#1a1a1a]">
             {value}
           </div>
-          <div className="mt-1 text-xs font-semibold text-slate-400 leading-snug">
+          <div className="mt-1 text-xs font-normal text-[#8a7f72] leading-snug">
             {detail}
           </div>
         </div>
@@ -267,14 +282,14 @@ function HubCard({
           <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-amber-50 border border-amber-100/50 text-amber-700 transition-colors group-hover:bg-amber-100/60">
             {icon}
           </div>
-          <ArrowRight className="h-5 w-5 text-slate-400 transition-all duration-300 group-hover:translate-x-1 group-hover:text-[#1a1a1a]" />
+          <ArrowRight className="h-5 w-5 text-[#8a7f72] transition-all duration-300 group-hover:translate-x-1 group-hover:text-[#1a1a1a]" />
         </div>
-        <h3 className="text-lg font-extrabold text-[#1a1a1a]">{title}</h3>
-        <p className="mt-2 text-xs font-semibold leading-relaxed text-slate-500">
+        <h3 className="text-sm font-semibold text-[#1a1a1a]">{title}</h3>
+        <p className="mt-2 text-xs font-normal leading-relaxed text-[#8a7f72]">
           {description}
         </p>
       </div>
-      <div className="mt-6 w-fit rounded-full border border-amber-250 bg-amber-50 px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-amber-800">
+      <div className="mt-6 w-fit rounded-full border border-amber-250 bg-amber-50 px-3 py-1 text-[11px] font-medium text-amber-800">
         {status}
       </div>
     </button>
@@ -434,6 +449,31 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           cache: "no-store",
         },
       );
+      if (response.status === 404) {
+        setConnections((current) =>
+          current.filter((connection) => connection.id !== connectionId),
+        );
+        setCompanies((current) =>
+          current.filter((company) => company.connectionId !== connectionId),
+        );
+        setSelectedId((current) => (current === connectionId ? "" : current));
+        if (typeof window !== "undefined") {
+          if (
+            window.localStorage.getItem(SELECTED_CONNECTION_STORAGE_KEY) ===
+            connectionId
+          ) {
+            window.localStorage.removeItem(SELECTED_CONNECTION_STORAGE_KEY);
+          }
+          window.localStorage.removeItem(
+            `${CONNECTION_CONTROL_STORAGE_PREFIX}${connectionId}`,
+          );
+          window.localStorage.removeItem(
+            `${EXPECTED_MACHINE_STORAGE_PREFIX}${connectionId}`,
+          );
+        }
+        setMessage(null);
+        return;
+      }
       if (!response.ok) {
         throw new Error(await readError(response));
       }
@@ -787,23 +827,12 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   if (view === "home") {
     return (
       <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
-        <div className="mb-8 border-b border-[#e5ddd0] pb-6">
-          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200/50 text-[10px] font-bold uppercase tracking-wider text-amber-800">
-            <Sparkles className="h-3 w-3 text-amber-600 animate-spin duration-3000" />
-            ERP Sync Bridge
-          </div>
-          <h1 className="text-3xl font-black tracking-tight text-[#1a1a1a] mt-2 flex items-center gap-2">
-            Tally Prime Integration
-          </h1>
-          <p className="text-xs font-semibold text-slate-500 mt-1">
-            Sync your dealer verification workflows directly with Tally Prime
-            company ledgers.
-          </p>
-        </div>
+        <PageHeader sticky={false} className="mb-4" title="Tally Prime Integration"
+          subtitle="Sync workflows with Tally Prime company ledgers" />
 
         {message ? (
           <div
-            className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${
+            className={`mb-6 rounded-xl border px-4 py-3 text-xs font-medium ${
               message.tone === "success"
                 ? "border-emerald-200 bg-emerald-50 text-emerald-800"
                 : "border-red-200 bg-red-50 text-red-800"
@@ -837,21 +866,12 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
 
   return (
     <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
-      <div className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <h2 className="text-2xl font-black tracking-tight text-[#1a1a1a]">
-            Tally Connection
-          </h2>
-          <p className="mt-1 text-xs font-semibold text-slate-500">
-            Connect Tally Prime to sync workflows and post bank statement ledger
-            entries.
-          </p>
-        </div>
-      </div>
+      <PageHeader sticky={false} className="mb-4" title="Tally Connection"
+        subtitle="Connect Tally Prime to sync workflows and post entries" />
 
       {message ? (
         <div
-          className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${
+          className={`mb-6 rounded-xl border px-4 py-3 text-xs font-medium ${
             message.tone === "success"
               ? "border-emerald-255 bg-emerald-50 text-emerald-800"
               : "border-red-255 bg-red-50 text-red-800"
@@ -864,10 +884,10 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       {!connectorActive ? (
         <section className="mb-5 rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
           <div className="mb-4">
-            <div className="text-[9px] font-bold uppercase tracking-wider text-slate-400">
+            <div className="text-xs font-medium text-[#8a7f72]">
               Tally target
             </div>
-            <h3 className="mt-2 text-base font-extrabold text-[#1a1a1a]">
+            <h3 className="mt-2 text-sm font-semibold text-[#1a1a1a]">
               Connection location
             </h3>
           </div>
@@ -885,10 +905,10 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               }}
               type="button"
             >
-              <div className="text-sm font-extrabold text-[#1a1a1a]">
+              <div className="text-sm font-semibold text-[#1a1a1a]">
                 Same machine
               </div>
-              <div className="mt-1 text-xs font-semibold leading-5 text-slate-500">
+              <div className="mt-1 text-xs font-normal leading-5 text-[#8a7f72]">
                 Tally and connector run on this computer.
               </div>
             </button>
@@ -907,10 +927,10 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               }}
               type="button"
             >
-              <div className="text-sm font-extrabold text-[#1a1a1a]">
+              <div className="text-sm font-semibold text-[#1a1a1a]">
                 LAN/server
               </div>
-              <div className="mt-1 text-xs font-semibold leading-5 text-slate-500">
+              <div className="mt-1 text-xs font-normal leading-5 text-[#8a7f72]">
                 Connector reaches Tally on a Gold LAN machine.
               </div>
             </button>
@@ -919,7 +939,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           {setupMode === "lan_server" ? (
             <div className="mt-4">
               <label
-                className="text-[9px] font-bold uppercase tracking-wider text-slate-400"
+                className="text-xs font-normal text-[#8a7f72]"
                 htmlFor="tally-url"
               >
                 Tally server URL
@@ -931,7 +951,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                 placeholder={DEFAULT_LAN_TALLY_URL}
                 value={tallyUrlInput}
               />
-              <div className="mt-2 text-xs font-semibold leading-5 text-slate-500">
+              <div className="mt-2 text-xs font-normal leading-5 text-[#8a7f72]">
                 Use the Tally server IP or hostname reachable from the connector
                 machine.
               </div>
@@ -959,7 +979,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                 </div>
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="text-base font-extrabold text-[#1a1a1a]">
+                    <h3 className="text-sm font-semibold text-[#1a1a1a]">
                       {selectedConnection.displayName}
                     </h3>
                     <Badge
@@ -970,7 +990,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                             ? "border-red-255 bg-red-55 text-red-855"
                             : statusTone === "warning"
                               ? "border-amber-250 bg-amber-50 text-amber-800"
-                              : "border-[#e5ddd0] bg-white text-slate-500"
+                              : "border-[#e5ddd0] bg-white text-[#8a7f72]"
                       }
                       variant="outline"
                     >
@@ -979,7 +999,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                         : "Reconnect required"}
                     </Badge>
                   </div>
-                  <div className="mt-1 max-w-3xl text-sm font-semibold text-slate-500">
+                  <div className="mt-1 max-w-3xl text-xs font-medium text-[#8a7f72]">
                     {selectedCompany?.financialYear
                       ? formatCompanyOptionLabel(selectedCompany)
                       : companyDetail}
@@ -990,7 +1010,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               <div className="flex w-full flex-wrap gap-2.5 lg:w-auto lg:shrink-0 lg:flex-nowrap lg:items-center lg:justify-end">
                   {!connectorActive ? (
                     <Button
-                      className="w-fit whitespace-nowrap rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] text-xs font-bold text-white shadow-md transition-all"
+                      className="w-fit whitespace-nowrap rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] text-xs font-medium text-white shadow-md transition-all"
                       disabled={creating}
                       onClick={() => void connectConnector()}
                       type="button"
@@ -1003,47 +1023,28 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                       Reconnect
                     </Button>
                   ) : (
-                    <Button
-                      className="w-fit whitespace-nowrap rounded-xl border-amber-250 bg-amber-50 text-xs font-bold text-amber-800 hover:bg-amber-100 hover:text-amber-900 shadow-sm transition-all"
-                      disabled={disconnecting}
-                      onClick={() => void disconnectConnector()}
-                      type="button"
-                      variant="outline"
-                    >
-                      {disconnecting ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                      ) : (
-                        <PlugZap className="h-3.5 w-3.5 mr-1.5" />
-                      )}
-                      Pause connection
-                    </Button>
+                    <Popover>
+                      <PopoverTrigger asChild>
+                        <Button aria-label="Open connection menu" className="rounded-xl" size="icon" type="button" variant="outline"><MoreHorizontal className="h-4 w-4" /></Button>
+                      </PopoverTrigger>
+                      <PopoverContent align="end" className="w-64 rounded-xl border-[#e5ddd0] p-2 shadow-xl">
+                        <p className="px-2 pb-1 pt-1 text-[11px] font-semibold text-[#8a7f72]">Connection</p>
+                        <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-amber-800 hover:bg-amber-50 disabled:opacity-50" disabled={disconnecting} onClick={() => { if (window.confirm("Pause this Tally connection? Active Kalika workflows will stop until you reconnect.")) void disconnectConnector(); }} type="button"><PlugZap className="h-3.5 w-3.5" />Pause connection…</button>
+                        {otherActiveConnectionCount > 0 ? <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50" disabled={disconnectingOthers} onClick={() => { if (window.confirm(`Disconnect ${otherActiveConnectionCount} other active connector session${otherActiveConnectionCount === 1 ? "" : "s"}?`)) void disconnectOtherConnectors(); }} type="button"><PlugZap className="h-3.5 w-3.5" />Disconnect other sessions…</button> : null}
+                        <div className="mt-1 border-t border-slate-100 px-2 pt-2 text-[11px] leading-4 text-[#8a7f72]">Last heartbeat {formatTime(selectedConnection.lastHeartbeatAt)}</div>
+                      </PopoverContent>
+                    </Popover>
                   )}
-                {otherActiveConnectionCount > 0 ? (
-                  <Button
-                    className="w-fit whitespace-nowrap rounded-xl border-red-250 bg-red-50 text-xs font-bold text-red-800 hover:bg-red-100 hover:text-red-900 shadow-sm transition-all"
-                    disabled={disconnectingOthers}
-                    onClick={() => void disconnectOtherConnectors()}
-                    type="button"
-                    variant="outline"
-                  >
-                    {disconnectingOthers ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
-                    ) : (
-                      <PlugZap className="h-3.5 w-3.5 mr-1.5" />
-                    )}
-                    Disconnect other sessions
-                  </Button>
-                ) : null}
               </div>
             </div>
           </div>
 
           <div className="grid gap-4 md:grid-cols-3">
             <StatusCard
-              detail={`Version ${selectedConnection.bridgeVersion || "unknown"} · Last seen: ${formatTime(selectedConnection.lastHeartbeatAt)}`}
+              detail={`Cloud heartbeat · Version ${selectedConnection.bridgeVersion || "unknown"} · ${formatTime(selectedConnection.lastHeartbeatAt)}`}
               ok={connectorActive}
-              title="Connector"
-              value={connectorActive ? "Connected" : "Waiting"}
+              title="Agent link"
+              value={connectorActive ? "Online" : "Waiting"}
             />
             <StatusCard
               detail={`Last checked: ${formatTime(selectedConnection.lastTestedAt)}`}
@@ -1064,6 +1065,27 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               value={companyLoaded ? "Loaded" : "Not detected"}
             />
           </div>
+          {selectedConnection.agentUpdate?.updateAvailable ? (
+            <div className="flex flex-col gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <div className="text-sm font-semibold text-amber-950">Local Agent update available</div>
+                <div className="mt-1 text-xs text-amber-800">
+                  Version {selectedConnection.agentUpdate.latestVersion} keeps the local cache across reconnects and updates automatically after download.
+                </div>
+              </div>
+              <Button asChild className="shrink-0 rounded-xl bg-amber-950 text-xs text-white hover:bg-amber-900">
+                <a href={selectedConnection.agentUpdate.downloadUrl} rel="noreferrer">
+                  <Download className="mr-1.5 h-3.5 w-3.5" /> Download update
+                </a>
+              </Button>
+            </div>
+          ) : null}
+          {connectorActive ? (
+            <>
+              <TallyCompanyLinkingPanel connectionId={selectedConnection.id} onLinked={() => loadConnections({ quiet: true })} />
+              <LocalAgentPanel connectionId={selectedConnection.id} companyName={selectedConnection.lastCompanyName} />
+            </>
+          ) : null}
         </div>
       ) : (
         <div className="flex min-h-[320px] items-center justify-center rounded-2xl border-2 border-dashed border-[#e5ddd0] bg-white p-8 text-center shadow-sm">
@@ -1071,15 +1093,15 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
             <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-amber-50 border border-amber-200/50 text-amber-700">
               <PlugZap className="h-6 w-6 animate-pulse" />
             </div>
-            <h3 className="mt-4 text-base font-extrabold text-[#1a1a1a]">
+            <h3 className="mt-4 text-sm font-semibold text-[#1a1a1a]">
               No Tally connection found
             </h3>
-            <p className="mt-1.5 text-xs font-semibold text-slate-400 max-w-sm">
+            <p className="mt-1.5 text-xs font-normal text-[#8a7f72] max-w-sm">
               Bridge this workstation to start the Tally Prime desktop agent and
               sync ledgers.
             </p>
             <Button
-              className="mt-6 rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] px-6 py-5 text-xs font-bold text-white shadow-md transition-all"
+              className="mt-6 rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] px-6 py-5 text-xs font-medium text-white shadow-md transition-all"
               disabled={creating}
               onClick={() => void connectConnector()}
               type="button"

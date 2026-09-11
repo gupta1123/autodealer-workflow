@@ -1,12 +1,14 @@
 "use client";
 
 import { getApiAccessToken } from "@/lib/api-client";
+import {accessCacheEpoch,registerAccessCache} from '@/lib/access-cache';
 
 type LiveRequest = {
   connectionId: string;
   companyName: string;
+  companyGuid?: string | null;
   financialYear?: string | null;
-  operation: "company_check" | "bank_ledgers" | "ledger_masters" | "verify_bank_transaction" | "fetch_customer_open_bills" | "scan" | "create_debit_note";
+  operation: "company_check" | "bank_ledgers" | "ledger_masters" | "ledger_suggestions" | "verify_bank_transaction" | "fetch_customer_open_bills" | "scan" | "followups_scan" | "create_debit_note";
   payload?: Record<string, unknown>;
   companyNames?: string[];
   proposal?: Record<string, unknown>;
@@ -47,11 +49,17 @@ type BrowserLiveSession = {
   ended: boolean;
   pending: Map<string, PendingRequest>;
   authTimeout?: number;
+  bankOnline: boolean;
+  scopedBankJobs?: boolean;
+  bankWatchers: Set<{ jobId: string; event: (event: BankJobEvent) => void; online: (online: boolean) => void }>;
 };
+
+export type BankJobEvent = { type: string; jobId: string; importId?: string; revision: number; state: string };
 
 const SESSION_MAX_AGE_MS = 2 * 60_000;
 let cachedGatewayUrl: Promise<string> | null = null;
 let cachedSession: BrowserLiveSession | null = null;
+registerAccessCache('tally-live-session',()=>{if(cachedSession)closeSession(cachedSession);});
 
 async function gatewayUrl() {
   const configured = String(process.env.NEXT_PUBLIC_CASH_DISCOUNT_GATEWAY_URL || "").trim();
@@ -75,7 +83,7 @@ async function gatewayUrl() {
     url.port = "3002";
     url.pathname = "/";
   } else {
-    url.pathname = "/cash-discount-live";
+    url.pathname = "/agent-live";
   }
   url.search = "";
   url.hash = "";
@@ -104,12 +112,15 @@ function endSession(session: BrowserLiveSession, error: Error) {
     pending.reject(error);
   }
   session.pending.clear();
+  session.bankOnline = false;
+  for (const watcher of session.bankWatchers) watcher.online(false);
+  session.bankWatchers.clear();
   if (cachedSession === session) cachedSession = null;
 }
 
 function closeSession(session: BrowserLiveSession) {
   for (const [requestId, pending] of session.pending) {
-    if (pending.operation === "scan" && session.socket.readyState === WebSocket.OPEN) {
+    if (["scan", "followups_scan", "verify_bank_transaction", "fetch_customer_open_bills"].includes(pending.operation) && session.socket.readyState === WebSocket.OPEN) {
       session.socket.send(JSON.stringify({ type: "cancel", requestId }));
     }
   }
@@ -125,6 +136,7 @@ function createSession(params: {
   gateway: string;
   connectionId: string;
   companyName: string;
+  organizationId: string;
 }) {
   let resolveReady!: () => void;
   let rejectReady!: (error: Error) => void;
@@ -144,6 +156,8 @@ function createSession(params: {
     readySettled: false,
     ended: false,
     pending: new Map(),
+    bankOnline: false,
+    bankWatchers: new Set(),
   };
 
   socket.addEventListener("open", () => {
@@ -152,13 +166,24 @@ function createSession(params: {
       role: "browser",
       connectionId: params.connectionId,
       companyName: params.companyName,
+      organizationId:params.organizationId,
       token: params.token,
     }));
   });
   socket.addEventListener("message", (event) => {
     try {
-      const message = JSON.parse(String(event.data ?? "{}")) as LiveResult<unknown>;
+      const message = JSON.parse(String(event.data ?? "{}")) as LiveResult<unknown> & BankJobEvent & { online?: boolean; scopedBankJobs?: boolean };
+      if (message.type === 'bank_job_channel') {
+        if (!message.jobId) session.bankOnline = message.online === true;
+        for (const watcher of session.bankWatchers) if(!message.jobId || watcher.jobId===message.jobId) watcher.online(message.online===true);
+        return;
+      }
+      if (['bank_job_progress','bank_job_completed','bank_job_failed','bank_job_cancelled'].includes(message.type || '')) {
+        for (const watcher of session.bankWatchers) if (watcher.jobId === message.jobId) watcher.event(message);
+        return;
+      }
       if (message.type === "authenticated") {
+        session.scopedBankJobs=message.scopedBankJobs===true;
         window.clearTimeout(session.authTimeout);
         if (!session.readySettled) {
           session.readySettled = true;
@@ -200,18 +225,21 @@ function createSession(params: {
 }
 
 async function getLiveSession(request: LiveRequest) {
+  const epoch=accessCacheEpoch();
+  const organizationId=sessionStorage.getItem('kalika-access-organization')||'';
   const accessToken = await getApiAccessToken();
   const localMode = process.env.NEXT_PUBLIC_LOCAL_DB_MODE === "true";
   if (!accessToken && !localMode) throw new Error("Your session has expired. Sign in and try again.");
   const token = accessToken || "local-development";
   const gateway = await liveGatewayUrl();
-  const key = `${gateway}|${request.connectionId}`;
+  if(epoch!==accessCacheEpoch())throw new DOMException('Access changed before the live request started.','AbortError');
+  const key = `${gateway}|${organizationId}|${request.connectionId}`;
   const reusable =
     cachedSession &&
     !cachedSession.ended &&
     cachedSession.key === key &&
     cachedSession.token === token &&
-    (Date.now() - cachedSession.createdAt < SESSION_MAX_AGE_MS || cachedSession.pending.size > 0) &&
+    (Date.now() - cachedSession.createdAt < SESSION_MAX_AGE_MS || cachedSession.pending.size > 0 || cachedSession.bankWatchers.size > 0) &&
     (cachedSession.socket.readyState === WebSocket.CONNECTING || cachedSession.socket.readyState === WebSocket.OPEN);
   if (reusable) return cachedSession as BrowserLiveSession;
   if (cachedSession) closeSession(cachedSession);
@@ -220,6 +248,7 @@ async function getLiveSession(request: LiveRequest) {
     token,
     gateway,
     connectionId: request.connectionId,
+    organizationId,
     // Authenticate the connection once and let the API return the small scope
     // map for every company on it. Company switches then reuse this socket.
     companyName: "",
@@ -227,10 +256,54 @@ async function getLiveSession(request: LiveRequest) {
   return cachedSession;
 }
 
+// Shares the existing authenticated gateway connection. No rows or document
+// content are accepted over this channel; events only trigger durable reads.
+export function watchBankJob(params: { connectionId: string; companyName: string; jobId: string;
+  onEvent: (event: BankJobEvent) => void; onOnline: (online: boolean) => void }) {
+  let stopped = false, retry: ReturnType<typeof setTimeout> | undefined;
+  let detach = () => {};
+  let revision = 0;
+  const connect = async () => {
+    if (stopped) return;
+    try {
+      const session = await getLiveSession({ ...params, operation: 'company_check' });
+      await session.ready;
+      if (stopped) return;
+      const watcher = { jobId: params.jobId,
+        event: (event: BankJobEvent) => {
+          if (stopped || !Number.isSafeInteger(event.revision) || event.revision <= revision) return;
+          revision = event.revision; params.onEvent(event);
+        },
+        online: (online: boolean) => {
+          if (stopped) return;
+          params.onOnline(online);
+          if (!online && session.ended && !retry) retry = setTimeout(() => { retry = undefined; detach(); void connect(); }, 2000);
+        },
+      };
+      session.bankWatchers.add(watcher);
+      if(session.scopedBankJobs)session.socket.send(JSON.stringify({type:'bank_job_watch',jobId:params.jobId}));
+      detach = () => {
+        session.bankWatchers.delete(watcher);
+        if(session.scopedBankJobs&&session.socket.readyState===WebSocket.OPEN&&
+          ![...session.bankWatchers].some(w=>w.jobId===params.jobId)) {
+          session.socket.send(JSON.stringify({type:'bank_job_unwatch',jobId:params.jobId}));
+        }
+      };
+      watcher.online(session.scopedBankJobs?false:session.bankOnline);
+    } catch {
+      if (!stopped) { params.onOnline(false); retry = setTimeout(() => { retry = undefined; void connect(); }, 2000); }
+    }
+  };
+  void connect();
+  return () => { stopped = true; clearTimeout(retry); detach(); };
+}
+
 export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
+  const epoch=accessCacheEpoch();
   request.signal?.throwIfAborted();
   const session = await getLiveSession(request);
   await session.ready;
+  if(epoch!==accessCacheEpoch())throw new DOMException('Access changed before the live request started.','AbortError');
   request.signal?.throwIfAborted();
   return new Promise<T>((resolve, reject) => {
     const requestId = crypto.randomUUID();
@@ -240,14 +313,14 @@ export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
       window.clearTimeout(pending.timeout);
       pending.cleanup();
       session.pending.delete(requestId);
-      if (request.operation === "scan" && session.socket.readyState === WebSocket.OPEN) {
+      if (["scan", "followups_scan", "verify_bank_transaction", "fetch_customer_open_bills"].includes(request.operation) && session.socket.readyState === WebSocket.OPEN) {
         session.socket.send(JSON.stringify({ type: "cancel", requestId }));
       }
       reject(request.signal?.reason || new Error("Cash Discount scan cancelled."));
     };
     const timeout = window.setTimeout(
       () => {
-        if (request.operation === "scan" && session.socket.readyState === WebSocket.OPEN) {
+        if (["scan", "followups_scan", "verify_bank_transaction", "fetch_customer_open_bills"].includes(request.operation) && session.socket.readyState === WebSocket.OPEN) {
           session.socket.send(JSON.stringify({ type: "cancel", requestId }));
         }
         request.signal?.removeEventListener("abort", cancel);
@@ -271,6 +344,7 @@ export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
       requestId,
       operation: request.operation,
       companyName: request.companyName,
+      companyGuid: request.companyGuid,
       companyNames: request.companyNames,
       financialYear: request.financialYear,
       proposal: request.proposal,

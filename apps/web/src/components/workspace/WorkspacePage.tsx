@@ -1,10 +1,14 @@
 "use client";
 
 import Image from "next/image";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import ReactMarkdown from "react-markdown";
+import { PageHeader } from "@/components/dashboard/PageHeader";
+import {useAccess} from '@/components/access/AccessProvider';
+import {canAccess} from '@autodealer/shared/lib/access';
 import {
   Card,
   CardContent,
@@ -80,6 +84,7 @@ import {
   CheckCircle2,
   Eye,
   FileText,
+  Files,
   Folder,
   FolderPlus,
   GitCompare,
@@ -91,8 +96,10 @@ import {
   Trash2,
   Plus,
   ArrowLeft,
+  ArrowRight,
   UploadCloud,
-  Database
+  Database,
+  Shield,
 } from "lucide-react";
 import type {
   CaseAnalysisMode,
@@ -470,6 +477,11 @@ function formatDuplicateCaseDate(value: string) {
 }
 
 export function WorkspacePage() {
+  const teamAccess=useAccess();
+  const [accessCompanyId,setAccessCompanyId]=useState('');
+  const availableCompanies=teamAccess.snapshot?.companies.filter(c=>canAccess(teamAccess.snapshot,'purchases.prepare',c.id))??[];
+  const selectedAccessCompany=availableCompanies.some(c=>c.id===accessCompanyId)?accessCompanyId:availableCompanies.length===1?availableCompanies[0].id:'';
+  useEffect(()=>setAccessCompanyId(''),[teamAccess.snapshot?.organizationId]);
   const router = useRouter();
   const {
     status: pipelineStatus,
@@ -1058,7 +1070,8 @@ export function WorkspacePage() {
     try {
       setDraftCaseStatus("saving");
       setDraftCaseError(null);
-      const created = await createDraftCase({ uploads: queuedUploads });
+      if(teamAccess.enforcementRequired&&!selectedAccessCompany)throw new Error('Select the company for this case.');
+      const created = await createDraftCase({ uploads: queuedUploads,accessCompanyId:selectedAccessCompany });
       updateSavedCase(created.case);
       setCaseDraftCreated(true);
       setDraftCaseStatus("saved");
@@ -1116,7 +1129,8 @@ export function WorkspacePage() {
 
       let caseRecord = persistence.savedCase;
       if (!caseRecord) {
-        const created = await createDraftCase({ uploads: queuedUploads });
+        if(teamAccess.enforcementRequired&&!selectedAccessCompany)throw new Error('Select the company for this case.');
+        const created = await createDraftCase({ uploads: queuedUploads,accessCompanyId:selectedAccessCompany });
         updateSavedCase(created.case);
         caseRecord = created.case;
       }
@@ -1184,104 +1198,115 @@ export function WorkspacePage() {
   ) : null;
 
   const queuedUploadRail = hasUploads ? (
-    <div className="w-full max-w-3xl space-y-3 text-left">
-      <div className="flex items-center justify-between">
-        <div className="text-sm font-bold text-[#1a1a1a]">Documents in this case</div>
-        <div className="text-xs font-bold uppercase tracking-[0.2em] text-[#8a7f72]">
-          {queuedUploadLabel}
+    <div className="w-full space-y-3.5 text-left">
+      {/* Header bar */}
+      <div className="flex items-center justify-between pb-1">
+        <div className="flex items-center gap-2">
+          <div className="flex h-5 w-5 items-center justify-center rounded-md bg-[#2b1a10] text-white shadow-xs">
+            <Files className="h-3 w-3" />
+          </div>
+          <span className="text-xs font-semibold uppercase tracking-wider text-[#2b1a10]">
+            Queued Documents
+          </span>
+          <span className="flex h-5 items-center rounded-full bg-[#ede6d9] px-2 text-[11px] font-semibold text-[#5b4b3d]">
+            {queuedUploads.length}
+          </span>
         </div>
+        <span className="text-[11px] font-medium text-[#8a7f72]">
+          Ready for case creation
+        </span>
       </div>
-      <div className="overflow-x-auto">
-        <div className="flex items-center gap-3 pb-1">
-          {queuedUploads.map((upload, index) => {
-            const fallbackTemplate = matchSampleByIndex(index);
-            const inferredType = upload.resultDoc?.type ?? upload.classifiedType ?? fallbackTemplate.type;
-            const imageUrls = imagePreviewUrls.get(upload.id);
-            const pageCount = getQueuedUploadPageCount(upload);
 
-            if (imageUrls?.length) {
-              return (
-                <div key={upload.id} className="group relative h-14 w-14 shrink-0">
+      {/* Grid of uploaded document cards */}
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+        {queuedUploads.map((upload, index) => {
+          const fallbackTemplate = matchSampleByIndex(index);
+          const inferredType = upload.resultDoc?.type ?? upload.classifiedType ?? fallbackTemplate.type;
+          const imageUrls = imagePreviewUrls.get(upload.id);
+          const pageCount = getQueuedUploadPageCount(upload);
+          const isImage = Boolean(imageUrls?.length);
+
+          return (
+            <div
+              key={upload.id}
+              className="group relative flex items-center justify-between gap-3 rounded-xl border border-[#ded8d0] bg-[#fbfaf8] p-2.5 shadow-2xs transition-all hover:border-[#b9aa99] hover:bg-white hover:shadow-xs"
+            >
+              {/* Left thumbnail / icon */}
+              <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                {isImage && imageUrls ? (
                   <button
                     type="button"
-                    className="relative h-full w-full overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white shadow-sm transition hover:border-[#8a7f72]"
                     onClick={() => setImagePreviewUploadId(upload.id)}
-                    aria-label={`Preview ${upload.name}`}
+                    className="relative h-11 w-11 shrink-0 overflow-hidden rounded-lg border border-[#ded8d0] bg-white transition group-hover:border-[#b9aa99]"
+                    title="Click to preview"
                   >
                     <Image
                       src={imageUrls[0]}
                       alt={upload.name}
                       fill
                       unoptimized
-                      sizes="56px"
+                      sizes="44px"
                       className="object-cover"
                     />
-                    <span className="absolute -right-1 -top-1 z-10 grid h-5 w-5 place-items-center rounded-full bg-[#1a1a1a] text-[11px] font-bold text-white shadow-sm">
-                      {index + 1}
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 transition group-hover:opacity-100">
+                      <Eye className="h-3.5 w-3.5 text-white" />
+                    </div>
+                  </button>
+                ) : (
+                  <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-[#ded8d0] bg-[#f2ece2] text-[#5b4b3d]">
+                    <FileText className="h-5 w-5" />
+                  </div>
+                )}
+
+                {/* File info */}
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5">
+                    <span className="truncate text-xs font-semibold text-[#111827]" title={upload.name}>
+                      {upload.name}
+                    </span>
+                  </div>
+                  <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+                    <span className="inline-flex items-center rounded-sm bg-[#ede6d9] px-1.5 py-0.5 text-[10px] font-medium text-[#5b4b3d]">
+                      {inferredType}
+                    </span>
+                    <span className="text-[10px] text-[#8a7f72]">
+                      Slot {index + 1}
                     </span>
                     {pageCount > 1 && (
-                      <span className="absolute bottom-1 left-1 z-10 rounded-full bg-white/95 px-1.5 py-0.5 text-[10px] font-bold text-[#1a1a1a] shadow-sm">
-                        {pageCount}p
+                      <span className="text-[10px] font-medium text-[#8a7f72]">
+                        · {pageCount} pgs
                       </span>
                     )}
-                  </button>
-                  {!persistence.savedCase && (
-                    <button
-                      type="button"
-                      className="absolute -bottom-1 -right-1 z-10 grid h-6 w-6 place-items-center rounded-full border border-red-100 bg-white text-red-500 shadow-sm transition hover:bg-red-50"
-                      onClick={() => removeUpload(upload.id)}
-                      aria-label="Remove image"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  )}
+                  </div>
                 </div>
-              );
-            }
+              </div>
 
-            return (
-              <Popover key={upload.id}>
-                <PopoverTrigger asChild>
+              {/* Actions right */}
+              <div className="flex items-center gap-1 shrink-0">
+                {isImage && (
                   <button
                     type="button"
-                    className="group relative flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-[#e5ddd0] bg-white text-[#5a5046] shadow-sm transition hover:border-[#8a7f72] hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                    onClick={() => setImagePreviewUploadId(upload.id)}
+                    className="rounded-md p-1.5 text-[#8a7f72] opacity-0 transition-opacity hover:bg-[#ede6d9] hover:text-[#111827] group-hover:opacity-100"
+                    title="Preview document"
                   >
-                    <FileText className="h-6 w-6" />
-                    <span className="absolute -right-1 -top-1 grid h-5 w-5 place-items-center rounded-full bg-[#1a1a1a] text-[11px] font-bold text-white shadow-sm">
-                      {index + 1}
-                    </span>
+                    <Eye className="h-3.5 w-3.5" />
                   </button>
-                </PopoverTrigger>
-                <PopoverContent align="center" side="top" className="w-64 text-left border-[#e5ddd0] shadow-xl rounded-2xl p-3">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-bold text-[#1a1a1a]">
-                        {upload.name}
-                      </div>
-                      <div className="text-xs font-medium text-slate-500 mt-0.5">
-                        Slot {index + 1} · {inferredType}
-                        {pageCount > 1 ? ` · ${pageCount} pages` : ""}
-                      </div>
-                    </div>
-                    {!persistence.savedCase && (
-                      <button
-                        type="button"
-                        className="shrink-0 rounded-full border border-slate-200 bg-slate-50 p-1.5 text-slate-400 transition hover:border-red-200 hover:bg-red-50 hover:text-red-600"
-                        onClick={() => removeUpload(upload.id)}
-                        aria-label="Remove file"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                    )}
-                  </div>
-                  <div className="mt-3 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5 text-xs font-medium text-slate-600 leading-relaxed">
-                    These documents are saved in this case. Analysis starts when you choose Analyze case.
-                  </div>
-                </PopoverContent>
-              </Popover>
-            );
-          })}
-        </div>
+                )}
+                {!persistence.savedCase && (
+                  <button
+                    type="button"
+                    onClick={() => removeUpload(upload.id)}
+                    className="rounded-md p-1.5 text-[#8a7f72] transition-colors hover:bg-rose-50 hover:text-rose-600"
+                    title="Remove file"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   ) : null;
@@ -1365,63 +1390,74 @@ export function WorkspacePage() {
   // =========================================================================
   if (pipelineStatus === "idle" && !caseDraftCreated) {
     return renderWithSidebar(
-      <div className="flex min-h-screen flex-col bg-[#f7f7f5] px-4 pb-20 text-[#1a1a1a] sm:px-6 md:pb-8">
-        {/* Header Section */}
-        <div className="mx-auto w-full max-w-2xl pt-5 mb-5 border-b border-[#e5ddd0] pb-4">
-          <div className="flex items-center gap-3 sm:gap-4">
-            <div className="hidden sm:flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-[#f0ece6] text-[#1a1a1a] border border-[#e5ddd0] shadow-sm">
-              <UploadCloud className="h-6 w-6" />
-            </div>
-            <div className="flex flex-col min-w-0">
-              <h1 className="text-lg sm:text-xl font-bold text-[#1a1a1a]">Add case documents</h1>
-              <p className="text-xs sm:text-sm font-medium text-[#8a7f72] mt-0.5 leading-snug">Upload or scan the documents for one case.</p>
-            </div>
-          </div>
-        </div>
+      <div className="min-h-full bg-[#f7f4ef] px-4 py-5 text-[#111827] sm:px-6 lg:px-8">
+        <div className="mx-auto flex w-full max-w-[1540px] flex-col gap-6">
+          <PageHeader
+            title="Add Case"
+            subtitle="Upload or scan documents for one case"
+            badge={
+              <div className="flex items-center gap-1.5 rounded-lg border border-[#e6ded2] bg-[#fbfaf8] px-2.5 py-1 text-xs font-medium text-[#5b4b3d] shadow-sm">
+                <Shield className="h-3 w-3 text-[#8a7f72]" />
+                <span>Admin view</span>
+              </div>
+            }
+            actions={
+              <Link
+                href="/cases"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-[#ded8d0] bg-[#fbfaf8] px-3 py-1.5 text-xs font-medium text-[#3d3530] shadow-sm transition hover:bg-[#ede6d9]"
+              >
+                <Folder className="h-3.5 w-3.5 text-[#8a7f72]" />
+                <span>All Cases</span>
+              </Link>
+            }
+          />
 
-        {/* Centered Upload Card */}
-        <div className="flex flex-1 items-center justify-center">
-        <div className="w-full max-w-2xl">
+          {/* Centered Upload Card */}
+          {teamAccess.enforcementRequired&&<label className="mx-auto flex w-full max-w-2xl flex-col gap-2 text-sm font-medium">Company for this case<select value={selectedAccessCompany} onChange={e=>setAccessCompanyId(e.target.value)} className="rounded-lg border border-[#ded8d0] bg-white p-3"><option value="">Select a company</option>{availableCompanies.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></label>}
+          <div className="flex flex-1 items-center justify-center pb-12">
+            <div className="w-full max-w-2xl">
           <div
-            className={`w-full rounded-[2rem] border-2 border-dashed px-5 py-7 text-center shadow-sm transition-all sm:px-8 sm:py-8 ${
+            className={`w-full rounded-2xl border-2 border-dashed px-6 py-8 text-center transition-all sm:px-10 sm:py-10 ${
               isUploadDragActive
-                ? "border-[#22c55e] bg-[#f0fdf4] shadow-lg shadow-emerald-100 ring-4 ring-emerald-100"
-                : "border-[#e5ddd0] bg-white hover:border-[#d4c9b8] hover:shadow-md"
+                ? "border-[#2b1a10] bg-[#fbfaf8] shadow-md ring-4 ring-[#ede6d9]"
+                : "border-[#ded8d0] bg-white hover:border-[#b9aa99] hover:shadow-xs"
             }`}
             onDragEnter={handleUploadDragEnter}
             onDragOver={handleUploadDragOver}
             onDragLeave={handleUploadDragLeave}
             onDrop={handleUploadDrop}
           >
+            {/* Top Icon */}
             <div
-              className={`mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-[1.25rem] border shadow-sm ${
+              className={`mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl border shadow-2xs ${
                 isUploadDragActive
-                  ? "border-[#bbf7d0] bg-white text-[#15803d]"
-                  : "border-[#e5ddd0] bg-[#f0ece6] text-[#1a1a1a]"
+                  ? "border-[#2b1a10] bg-[#2b1a10] text-white"
+                  : "border-[#ded8d0] bg-[#fbfaf8] text-[#2b1a10]"
               }`}
             >
-              <UploadCloud className="h-7 w-7" />
+              <UploadCloud className="h-5 w-5" />
             </div>
 
-            <h2 className="text-2xl font-extrabold text-[#1a1a1a] sm:text-3xl">
+            {/* Title & Subtitle */}
+            <h2 className="text-xl font-bold tracking-tight text-[#111827] sm:text-2xl">
               {isUploadDragActive ? "Drop files to add them" : "Upload case packet"}
             </h2>
             {isUploadDragActive ? (
-              <p className="mt-2 text-base font-semibold text-[#15803d]">
-                Release to upload PDFs and images for this case.
+              <p className="mt-1.5 text-xs font-semibold text-[#2b1a10]">
+                Release to add PDFs and images to this case.
               </p>
             ) : (
-              <p className="mt-2 text-base font-medium text-[#5a5046]">
-                Drag and drop PDFs/images here, or{" "}
-                <label className="cursor-pointer font-bold text-[#15803d] hover:text-[#166534] hover:underline">
+              <p className="mt-1.5 text-xs font-normal text-[#5b4b3d]">
+                Drag and drop PDFs or images here, or{" "}
+                <label className="cursor-pointer font-semibold text-[#2b1a10] underline underline-offset-2 hover:text-[#3b271a]">
                   click to browse
                   <input type="file" multiple accept={DOCUMENT_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
                 </label>
               </p>
             )}
 
-            {/* Pills */}
-            <div className="mx-auto mt-5 flex max-w-2xl flex-wrap justify-center gap-2">
+            {/* File format pills */}
+            <div className="mx-auto mt-4 flex max-w-xl flex-wrap justify-center gap-1.5">
               {[
                 { label: "PDF", accent: true },
                 { label: "JPG" },
@@ -1436,10 +1472,10 @@ export function WorkspacePage() {
               ].map((pill) => (
                 <span
                   key={pill.label}
-                  className={`rounded-full border px-3 py-1 text-xs font-bold uppercase tracking-wider ${
+                  className={`rounded-md border px-2 py-0.5 text-[11px] font-medium tracking-normal ${
                     pill.accent
-                      ? "border-[#c9ead2] bg-[#eaf7ee] text-[#15803d]"
-                      : "border-[#e5ddd0] bg-[#faf8f4] text-[#5a5046]"
+                      ? "border-[#ded8d0] bg-[#ede6d9] text-[#2b1a10] font-semibold"
+                      : "border-[#e6ded2] bg-[#fbfaf8] text-[#6b5d52]"
                   }`}
                 >
                   {pill.label}
@@ -1447,24 +1483,31 @@ export function WorkspacePage() {
               ))}
             </div>
 
-
-
             {/* Action Buttons */}
-            <div className="mx-auto mt-6 flex flex-wrap justify-center gap-3">
-              <Button className="rounded-xl bg-[#1a1a1a] px-5 py-5 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] transition-transform hover:scale-[1.02]" onClick={() => fileInputRef.current?.click()}>
-                <UploadCloud className="mr-2 h-5 w-5" /> Upload PDF/Image
+            <div className="mx-auto mt-6 flex flex-wrap items-center justify-center gap-2.5">
+              <Button
+                className="h-9 rounded-lg bg-[#2b1a10] px-4 text-xs font-semibold text-white shadow-2xs hover:bg-[#3b271a] transition-colors"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <UploadCloud className="mr-1.5 h-3.5 w-3.5" /> Upload PDF/Image
                 <input ref={fileInputRef} type="file" multiple accept={DOCUMENT_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
               </Button>
-              <Button variant="outline" className="rounded-xl border-[#e5ddd0] bg-white px-5 py-5 text-base font-bold text-[#5a5046] shadow-sm hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-transform hover:scale-[1.02]" onClick={() => galleryInputRef.current?.click()}>
-                <ImagePlus className="mr-2 h-5 w-5 text-[#8a7f72]" /> Choose from gallery
+              <Button
+                variant="outline"
+                className="h-9 rounded-lg border-[#ded8d0] bg-[#fbfaf8] px-3.5 text-xs font-semibold text-[#5b4b3d] shadow-2xs hover:bg-white hover:text-[#111827] transition-colors"
+                onClick={() => galleryInputRef.current?.click()}
+              >
+                <ImagePlus className="mr-1.5 h-3.5 w-3.5 text-[#8a7f72]" /> Choose from gallery
                 <input ref={galleryInputRef} type="file" multiple accept={IMAGE_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
               </Button>
-              <Button variant="outline" className="rounded-xl border-[#e5ddd0] bg-white px-5 py-5 text-base font-bold text-[#5a5046] shadow-sm hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-transform hover:scale-[1.02]" onClick={handleCameraCaptureRequest}>
-                <Camera className="mr-2 h-5 w-5 text-[#8a7f72]" /> Scan document
+              <Button
+                variant="outline"
+                className="h-9 rounded-lg border-[#ded8d0] bg-[#fbfaf8] px-3.5 text-xs font-semibold text-[#5b4b3d] shadow-2xs hover:bg-white hover:text-[#111827] transition-colors"
+                onClick={handleCameraCaptureRequest}
+              >
+                <Camera className="mr-1.5 h-3.5 w-3.5 text-[#8a7f72]" /> Scan document
               </Button>
             </div>
-
-
           </div>
 
           {/* Draft Error & Queue Overlays */}
@@ -1477,31 +1520,39 @@ export function WorkspacePage() {
 
           {hasUploads && (
             <motion.div
-              initial={{ opacity: 0, y: 10 }}
+              initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              className="mt-5 flex flex-col items-center"
+              className="mt-6 flex flex-col items-center w-full"
             >
-              <div className="w-full rounded-[1.5rem] border border-[#e5ddd0] bg-white p-4 shadow-sm">
+              <div className="w-full rounded-2xl border border-[#ded8d0] bg-white p-4 sm:p-5 shadow-xs">
                 {queuedUploadRail}
               </div>
-              <div className="mt-4 w-full max-w-md">
+              <div className="mt-4 flex w-full justify-end">
                 <Button
-                  size="lg"
+                  size="default"
                   disabled={draftCaseStatus === "saving"}
-                  className="w-full rounded-2xl bg-[#1a1a1a] px-8 py-6 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] disabled:opacity-60 transition-transform hover:scale-[1.02]"
+                  className="h-10 rounded-lg bg-[#2b1a10] px-5 text-xs font-semibold text-white shadow-xs hover:bg-[#3b271a] disabled:opacity-50 transition-colors"
                   onClick={handleCreateCaseDraft}
                 >
                   {draftCaseStatus === "saving" ? (
-                    <span className="flex items-center justify-center gap-3"><Loader2 className="h-5 w-5 animate-spin" /> Creating case...</span>
+                    <span className="flex items-center gap-2">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Creating case...
+                    </span>
                   ) : (
-                    <span className="flex items-center justify-center gap-3"><FolderPlus className="h-5 w-5" /> Create case</span>
+                    <span className="flex items-center gap-2">
+                      <FolderPlus className="h-3.5 w-3.5" />
+                      Create case
+                      <ArrowRight className="h-3.5 w-3.5 text-white/70 ml-0.5" />
+                    </span>
                   )}
                 </Button>
               </div>
             </motion.div>
           )}
 
-        </div>
+            </div>
+          </div>
         </div>
         {cameraFallbackInput}
         {duplicateUploadDialog}
@@ -1517,60 +1568,76 @@ export function WorkspacePage() {
   // =========================================================================
   if (pipelineStatus === "idle" && caseDraftCreated) {
     return renderWithSidebar(
-      <>
-        <section className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#f7f7f5]">
-          <div className="absolute inset-0 -z-10">
-            <div className="absolute left-[12%] top-[14%] h-72 w-72 rounded-full bg-[#e5ddd0]/40 blur-3xl" />
-            <div className="absolute right-[12%] bottom-[14%] h-80 w-80 rounded-full bg-[#d4c9b8]/30 blur-3xl" />
-          </div>
+      <div className="min-h-full bg-[#f7f4ef] px-4 py-5 text-[#111827] sm:px-6 lg:px-8">
+        <div className="mx-auto flex w-full max-w-[1540px] flex-col gap-6">
+          <PageHeader
+            title="Add Case"
+            subtitle="Review uploaded documents and analyze"
+            badge={
+              <div className="flex items-center gap-1.5 rounded-lg border border-[#e6ded2] bg-[#fbfaf8] px-2.5 py-1 text-xs font-medium text-[#5b4b3d] shadow-sm">
+                <Shield className="h-3 w-3 text-[#8a7f72]" />
+                <span>Admin view</span>
+              </div>
+            }
+            actions={
+              <Link
+                href="/cases"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-[#ded8d0] bg-[#fbfaf8] px-3 py-1.5 text-xs font-medium text-[#3d3530] shadow-sm transition hover:bg-[#ede6d9]"
+              >
+                <Folder className="h-3.5 w-3.5 text-[#8a7f72]" />
+                <span>All Cases</span>
+              </Link>
+            }
+          />
+        <section className="flex min-h-[60vh] flex-col items-center bg-[#f7f4ef] px-4 py-6">
           <motion.div
-            initial={{ opacity: 0, y: 24 }}
+            initial={{ opacity: 0, y: 12 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5, ease: "easeOut" }}
-            className="relative z-10 mx-auto flex w-full max-w-4xl flex-col items-center gap-8 px-6 py-16 text-center"
+            transition={{ duration: 0.35, ease: "easeOut" }}
+            className="mx-auto flex w-full max-w-3xl flex-col items-center gap-5 text-center"
           >
-            <div className="grid h-16 w-16 place-items-center rounded-[1.25rem] bg-[#eaf7ee] text-[#15803d] shadow-sm border border-[#c9ead2]">
-              <CheckCircle2 className="h-8 w-8" />
+            <div className="grid h-11 w-11 place-items-center rounded-xl border border-[#ded8d0] bg-[#fbfaf8] text-[#2b1a10] shadow-sm">
+              <CheckCircle2 className="h-5 w-5" />
             </div>
 
-            <div className="space-y-4 max-w-2xl">
-              <div className="text-xs font-bold uppercase tracking-[0.3em] text-[#8a7f72]">Case created</div>
-              <h1 className="text-4xl font-extrabold tracking-tight text-[#1a1a1a] sm:text-5xl">
+            <div className="space-y-2 max-w-2xl">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">Case created</div>
+              <h1 className="text-xl font-bold tracking-tight text-[#111827]">
                 Ready to analyze
               </h1>
-              <p className="mx-auto text-base font-medium leading-relaxed text-[#5a5046]">
-                This case has {queuedUploadLabel} ready. Add any missing documents, then analyze to extract fields and check mismatches.
+              <p className="mx-auto text-xs font-normal leading-5 text-[#8a7f72] max-w-xl">
+                {queuedUploadLabel} ready — add missing docs, then analyze.
               </p>
 
               {persistence.savedCase && (
-                <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-[#e5ddd0] bg-white px-4 py-2 text-sm font-bold text-[#5a5046] shadow-sm">
-                  <Folder className="h-4 w-4 text-[#8a7f72]" /> {persistence.savedCase.displayName}
+                <div className="mx-auto mt-3 inline-flex items-center gap-1.5 rounded-lg border border-[#e6ded2] bg-[#fbfaf8] px-2.5 py-1 text-xs font-medium text-[#5b4b3d] shadow-sm">
+                  <Folder className="h-3 w-3 text-[#8a7f72]" /> {persistence.savedCase.displayName}
                 </div>
               )}
               {draftCaseStatus === "saving" && (
-                <div className="mx-auto mt-4 inline-flex items-center gap-2 rounded-full border border-[#c9ead2] bg-[#eaf7ee] px-4 py-2 text-sm font-bold text-[#15803d] shadow-sm">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Adding documents to case...
+                <div className="mx-auto mt-3 inline-flex items-center gap-1.5 rounded-lg border border-[#c3dfcb] bg-[#ebf5ee] px-2.5 py-1 text-xs font-medium text-[#1b4332] shadow-sm">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  Adding documents…
                 </div>
               )}
               {draftCaseStatus === "error" && draftCaseError && (
-                <div className="mx-auto mt-4 max-w-2xl rounded-2xl border border-red-200 bg-red-50 px-5 py-4 text-sm font-bold text-red-700 shadow-sm">
+                <div className="mx-auto mt-3 max-w-2xl rounded-lg border border-[#f2c7c4] bg-[#fbf0ef] px-4 py-3 text-xs font-medium text-[#8c1d18] shadow-sm">
                   {draftCaseError}
                 </div>
               )}
               {duplicateCaseNoticePanel}
             </div>
 
-            <div className="w-full max-w-3xl rounded-[2rem] border border-[#e5ddd0] bg-white p-6 shadow-sm">
+            <div className="w-full max-w-3xl rounded-xl border border-[#ded8d0] bg-white p-4 shadow-2xs">
               {queuedUploadRail}
             </div>
 
-            <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#8a7f72]">
-              Mode: {getComparisonModeLabel(comparisonOptions)}
+            <div className="text-xs font-normal text-[#8a7f72]">
+              Mode: <span className="font-medium text-[#3d3530]">{getComparisonModeLabel(comparisonOptions)}</span>
             </div>
 
             {/* ACTION ROW */}
-            <div className="mt-2 flex w-full max-w-3xl flex-col gap-4 sm:flex-row sm:items-center sm:justify-center">
+            <div className="flex w-full max-w-3xl flex-col gap-2 sm:flex-row sm:items-center sm:justify-center">
 
               {/* HIDDEN INPUTS FOR POPOVER */}
               <input ref={fileInputRef} type="file" multiple accept={DOCUMENT_UPLOAD_ACCEPT} className="hidden" onChange={handleUploadInputChange} />
@@ -1578,18 +1645,18 @@ export function WorkspacePage() {
 
               <Popover>
                 <PopoverTrigger asChild>
-                  <Button variant="outline" disabled={draftCaseStatus === "saving"} className="rounded-2xl px-6 py-6 text-base font-bold border-[#e5ddd0] text-[#5a5046] bg-white hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-transform hover:scale-[1.02]">
-                    <Plus className="mr-2 h-5 w-5 text-[#8a7f72]" /> Add documents
+                  <Button variant="outline" disabled={draftCaseStatus === "saving"} className="h-9 rounded-lg border-[#ded8d0] bg-white px-4 text-xs font-medium text-[#3d3530] shadow-sm transition hover:bg-[#faf8f4] hover:text-[#111827]">
+                    <Plus className="mr-1.5 h-3.5 w-3.5 text-[#8a7f72]" /> Add documents
                   </Button>
                 </PopoverTrigger>
-                <PopoverContent align="center" side="bottom" className="w-56 p-2 rounded-2xl border-[#e5ddd0] shadow-xl bg-white">
-                  <button onClick={() => fileInputRef.current?.click()} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-colors">
+                <PopoverContent align="center" side="bottom" className="w-56 p-1.5 rounded-xl border-[#ded8d0] shadow-md bg-white">
+                  <button onClick={() => fileInputRef.current?.click()} className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-xs font-medium text-[#3d3530] hover:bg-[#faf8f4] hover:text-[#111827] transition-colors">
                     <FolderPlus className="h-4 w-4 text-[#8a7f72]" /> Upload PDF/Image
                   </button>
-                  <button onClick={() => galleryInputRef.current?.click()} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-colors">
+                  <button onClick={() => galleryInputRef.current?.click()} className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-xs font-medium text-[#3d3530] hover:bg-[#faf8f4] hover:text-[#111827] transition-colors">
                     <ImagePlus className="h-4 w-4 text-[#8a7f72]" /> Choose from gallery
                   </button>
-                  <button onClick={handleCameraCaptureRequest} disabled={cameraStatus === "opening"} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] transition-colors disabled:opacity-50">
+                  <button onClick={handleCameraCaptureRequest} disabled={cameraStatus === "opening"} className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-xs font-medium text-[#3d3530] hover:bg-[#faf8f4] hover:text-[#111827] transition-colors disabled:opacity-50">
                     {cameraStatus === "opening" ? <Loader2 className="h-4 w-4 animate-spin text-[#8a7f72]" /> : <Camera className="h-4 w-4 text-[#8a7f72]" />} Scan document
                   </button>
                 </PopoverContent>
@@ -1598,10 +1665,10 @@ export function WorkspacePage() {
               <Button
                 type="button"
                 disabled={!hasUploads || draftCaseStatus === "saving"}
-                className="flex-1 rounded-2xl bg-[#1a1a1a] px-8 py-6 text-base font-bold text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] transition-transform hover:scale-[1.02]"
+                className="h-9 flex-1 rounded-lg bg-[#2b1a10] px-5 text-xs font-medium text-white shadow-sm hover:bg-[#3b271a] transition-colors"
                 onClick={handleAnalyzeRequest}
               >
-                <Play className="mr-2 h-5 w-5 fill-white" />
+                <Play className="mr-1.5 h-3.5 w-3.5 fill-white" />
                 Analyze case
               </Button>
 
@@ -1609,11 +1676,11 @@ export function WorkspacePage() {
                 type="button"
                 disabled={!hasUploads || draftCaseStatus === "saving"}
                 variant="outline"
-                className="rounded-2xl border-emerald-200 bg-emerald-50 px-6 py-6 text-base font-bold text-emerald-800 shadow-sm transition-transform hover:scale-[1.02] hover:bg-emerald-100 hover:text-emerald-900"
+                className="h-9 rounded-lg border-[#c3dfcb] bg-[#ebf5ee] px-4 text-xs font-medium text-[#1b4332] shadow-sm transition hover:bg-[#c3dfcb]/40 hover:text-[#1b4332]"
                 onClick={handleSmartSplitAnalyzeRequest}
               >
-                <Sparkles className="mr-2 h-5 w-5" />
-                Analyze multi-doc PDFs
+                <Sparkles className="mr-1.5 h-3.5 w-3.5 text-[#2d6a4f]" />
+                Analyze multi-doc
               </Button>
             </div>
           </motion.div>
@@ -1623,7 +1690,8 @@ export function WorkspacePage() {
         {cameraCaptureDialog}
         {imagePreviewDialog}
         {analysisOptionsDialog}
-      </>
+        </div>
+      </div>
     );
   }
 
@@ -1691,45 +1759,43 @@ export function WorkspacePage() {
           transition={{ duration: 0.5, ease: "easeOut" }}
           className="relative z-10 mx-auto flex w-full max-w-5xl flex-col gap-5 sm:gap-8 px-4 sm:px-6 py-8 sm:py-12"
         >
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
             <div>
-              <span className="text-xs font-bold uppercase tracking-[0.3em] text-[#8a7f72]">
-                Document intake pipeline
+              <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">
+                Document intake
               </span>
-              <h1 className="mt-2 text-2xl font-extrabold tracking-tight text-slate-900 sm:text-4xl">
-                Classifying, digitizing, and validating uploads…
+              <h1 className="mt-1 text-xl font-bold tracking-tight text-[#111827]">
+                Classifying and validating…
               </h1>
             </div>
-            <div className="rounded-xl border border-[#e5ddd0] bg-white px-4 py-2.5 sm:px-5 sm:py-4 text-left sm:text-right shadow-sm shrink-0 self-start sm:self-auto min-w-[100px]">
-              <div className="text-[9px] sm:text-[10px] font-bold uppercase tracking-widest text-[#8a7f72]">Elapsed</div>
-              <div className="text-lg sm:text-xl font-bold text-slate-900 leading-tight">{secondsElapsed}s</div>
+            <div className="rounded-xl border border-[#ded8d0] bg-white px-3.5 py-2.5 text-left sm:text-right shadow-sm shrink-0 self-start sm:self-auto min-w-[88px]">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-[#8a7f72]">Elapsed</div>
+              <div className="text-lg font-bold tracking-tight text-[#111827] leading-tight">{secondsElapsed}s</div>
             </div>
           </div>
 
-          <div className="rounded-2xl sm:rounded-3xl border border-[#e5ddd0] bg-white/95 px-5 py-6 sm:px-8 sm:py-8 shadow-md backdrop-blur">
-            <div className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex items-center gap-4">
-                <div className="grid h-14 w-14 place-items-center rounded-2xl bg-[#f0ece6] text-[#5a5046] shadow-inner">
-                  <Sparkles className="h-6 w-6 animate-pulse text-[#5a5046]" />
+          <div className="rounded-xl border border-[#ded8d0] bg-white px-5 py-5 shadow-sm">
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-center gap-3">
+                <div className="grid h-11 w-11 place-items-center rounded-xl border border-[#ded8d0] bg-[#fbfaf8] text-[#2b1a10] shadow-sm">
+                  <Sparkles className="h-5 w-5 animate-pulse text-[#8a7f72]" />
                 </div>
                 <div>
-                  <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#8a7f72]">
-                    Global progress
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">
+                    Progress
                   </div>
-                  <div className="text-3xl font-extrabold text-slate-900">
+                  <div className="text-xl font-bold tracking-tight text-[#111827]">
                     {Math.round(pipelineProgress * 100)}%
                   </div>
                 </div>
               </div>
-              <div className="text-sm font-medium text-slate-600">
-                Analyzing{" "}
-                <span className="font-bold text-slate-900">{currentOrdinal}</span>{" "}
-                of {totalDocs} documents
+              <div className="text-xs font-normal text-[#8a7f72]">
+                <span className="font-medium text-[#3d3530]">{currentOrdinal}</span> of {totalDocs} docs
               </div>
             </div>
-            <div className="relative h-3 w-full overflow-hidden rounded-full bg-[#f0ece6]">
+            <div className="relative h-2.5 w-full overflow-hidden rounded-full bg-[#ede6d9]">
               <motion.div
-                className="absolute inset-y-0 left-0 rounded-full bg-slate-900"
+                className="absolute inset-y-0 left-0 rounded-full bg-[#2b1a10]"
                 animate={{ width: `${pipelineProgress * 100}%` }}
                 transition={{ ease: "easeInOut", duration: 0.3 }}
               />
@@ -1742,14 +1808,14 @@ export function WorkspacePage() {
               initial={{ opacity: 0, y: 12 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.4, ease: "easeOut" }}
-              className="flex h-full flex-col rounded-3xl border border-[#e5ddd0] bg-white p-8 shadow-md"
+              className="flex h-full flex-col rounded-xl border border-[#ded8d0] bg-white p-5 shadow-sm"
             >
-              <div className="flex items-start justify-between">
-                <div>
-                  <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#8a7f72]">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">
                     Current document
                   </div>
-                  <div className="mt-3 min-h-[56px]">
+                  <div className="mt-2 min-h-[48px]">
                     <AnimatePresence mode="wait">
                       {classificationComplete ? (
                         <motion.div
@@ -1759,10 +1825,10 @@ export function WorkspacePage() {
                           exit={{ opacity: 0, y: -6 }}
                           transition={{ duration: 0.25 }}
                         >
-                          <h2 className="text-xl font-bold leading-tight text-slate-900">
+                          <h2 className="text-base font-bold leading-tight text-[#111827] truncate">
                             {currentDoc.title}
                           </h2>
-                          <div className="mt-1 text-sm font-semibold text-slate-500">{currentDoc.type}</div>
+                          <div className="mt-1 text-xs font-normal text-[#8a7f72]">{currentDoc.type}</div>
                         </motion.div>
                       ) : (
                         <motion.div
@@ -1772,20 +1838,20 @@ export function WorkspacePage() {
                           exit={{ opacity: 0, y: -6 }}
                           transition={{ duration: 0.25 }}
                         >
-                          <h2 className="text-xl font-bold leading-tight text-slate-900">
+                          <h2 className="text-base font-bold leading-tight text-[#111827] truncate">
                             {sourceName}
                           </h2>
-                          <div className="mt-1 text-sm font-semibold text-slate-500">
-                            Identifying document type
+                          <div className="mt-1 text-xs font-normal text-[#8a7f72]">
+                            Identifying type…
                           </div>
                         </motion.div>
                       )}
                     </AnimatePresence>
                   </div>
-                  <div className="text-xs font-semibold text-[#8a7f72] mt-2">Source file · {sourceName}</div>
+                  <div className="text-xs font-normal text-[#8a7f72] mt-1 truncate">Source · {sourceName}</div>
                 </div>
-                <div className="flex items-center gap-2 rounded-full border border-[#e5ddd0] bg-[#f0ece6] px-4 py-1.5 text-xs font-bold text-[#5a5046]">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                <div className="flex items-center gap-1.5 rounded-lg border border-[#e6ded2] bg-[#fbfaf8] px-2.5 py-1 text-xs font-medium text-[#5b4b3d] shrink-0">
+                  <Loader2 className="h-3 w-3 animate-spin text-[#8a7f72]" />
                   {currentStageMeta.label}
                 </div>
               </div>

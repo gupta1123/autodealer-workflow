@@ -2,14 +2,14 @@
   display: flex;
   height: 100vh;
   overflow: hidden;
-  background-color: #f7f7f5;
+  background-color: #f9fafb;
 }
 
 .main {
   flex: 1;
   min-width: 0;
   overflow-y: auto;
-  background-color: #f7f7f5;
+  background-color: #f9fafb;
 }
 
 @media (max-width: 768px) {
@@ -18,11 +18,13 @@
     overflow: visible;
     min-height: 100dvh;
     height: auto;
+    background-color: #f9fafb;
   }
 
   .main {
     min-height: 100dvh;
     overflow-y: visible;
     padding-bottom: calc(5.25rem + env(safe-area-inset-bottom));
+    background-color: #f9fafb;
   }
 }

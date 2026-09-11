@@ -1,3 +1,5 @@
+import { listAccessPredicate } from '@/lib/access/list-scope';
+import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
@@ -26,7 +28,7 @@ function serializeError(error: unknown) {
   return String(error ?? "Unknown error");
 }
 
-export async function PATCH(
+async function PATCHHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -69,7 +71,7 @@ export async function PATCH(
       .from("packet_cases")
       .select("id, status, processing_meta")
       .eq("id", id)
-      .eq("owner_user_id", user.id)
+      .or(await listAccessPredicate(request, user.id, 'purchases.view'))
       .single();
 
     if (caseError) {
@@ -170,7 +172,7 @@ export async function PATCH(
       .from("packet_cases")
       .update({ status: nextCaseStatus })
       .eq("id", id)
-      .eq("owner_user_id", user.id);
+      .or(await listAccessPredicate(request, user.id, 'purchases.view'));
 
     if (updateCaseError) {
       throw updateCaseError;
@@ -192,3 +194,5 @@ export async function PATCH(
 export async function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
+
+export const PATCH = withTeamAccess(PATCHHandler);

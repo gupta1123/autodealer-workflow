@@ -1,3 +1,6 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {requireMasterDataset,datasetSelection} from '@/lib/access/master-store';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { toText } from "@/lib/collections";
@@ -76,7 +79,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) {
@@ -92,6 +95,31 @@ export async function GET(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
+    if (process.env.TEAM_ACCESS_ENFORCEMENT === 'true') {
+      const scope=await requireMasterDataset(request,connectionId,datasetSelection(url),'discounts.view');
+      const commands=()=>supabase.from('access_visible_commands').select('completed_at, created_at',{count:'exact'})
+        .eq('organization_id',scope.access.organizationId).eq('access_company_id',scope.link.company_id)
+        .eq('connection_id',connectionId).eq('installation_id',scope.link.installation_id)
+        .eq('company_guid',scope.link.company_guid).eq('financial_year',scope.link.financial_year)
+        .eq('visibility_permission','discounts.view').eq('status','succeeded')
+        .order('completed_at',{ascending:false}).limit(1);
+      const results=await Promise.all([
+        supabase.from('debit_note_proposals').select('updated_at, created_at',{count:'exact'})
+          .eq('access_organization_id',scope.access.organizationId).eq('access_company_id',scope.link.company_id)
+          .eq('financial_year',scope.link.financial_year).order('updated_at',{ascending:false}).limit(1),
+        commands().eq('command_type','fetch_customer_open_bills'),
+        commands().eq('command_type','create_debit_note'),
+        supabase.from('access_dataset_masters').select('last_synced_at',{count:'exact'})
+          .eq('dataset_id',scope.dataset?.id||'00000000-0000-0000-0000-000000000000')
+          .eq('master_type','ledger').eq('is_active',true).order('last_synced_at',{ascending:false}).limit(1),
+      ]);
+      for(const result of results)if(result.error)throw result.error;
+      const stamps=results.map(result=>rowTimestamp(result.data?.[0] as TimestampRow|undefined));
+      const changedAt=latestTimestamp(...stamps);
+      return jsonWithCors(request,{version:[scope.dataset?.revision||0,...results.flatMap((result,index)=>[stamps[index]||'none',result.count||0])].join('|'),
+        changedAt,counts:{debitNoteProposals:results[0].count||0,openBillScans:results[1].count||0,
+          matchingDebitNoteCommandsSeen:results[2].count||0,ledgers:results[3].count||0}});
+    }
     const { data: connection, error: connectionError } = await supabase
       .from("tally_connections")
       .select("id, owner_user_id, last_company_name, last_tally_reachable, last_company_loaded")
@@ -235,6 +263,7 @@ export async function GET(request: Request) {
       },
     });
   } catch (error) {
+    const failure=accessFailureResponse(request,error);if(failure)return failure;
     if (isMissingCollectionsTable(error)) {
       return jsonWithCors(request, {
         version: "setup-required",
@@ -247,3 +276,5 @@ export async function GET(request: Request) {
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);

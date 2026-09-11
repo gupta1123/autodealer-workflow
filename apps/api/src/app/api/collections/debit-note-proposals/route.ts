@@ -1,3 +1,9 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import { readCompleteHistory } from '@/lib/collections-history';
+import {listAccessPredicate} from '@/lib/access/list-scope';
+import {AccessError} from '@/lib/access/server';
+import {requireDataset} from '@/lib/access/dataset';
+import {requireResourceAccess} from '@/lib/access/resources';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
@@ -61,7 +67,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) {
@@ -75,25 +81,32 @@ export async function GET(request: Request) {
     let query = supabase
       .from("debit_note_proposals")
       .select("*")
-      .eq("owner_user_id", user.id)
-      .order("created_at", { ascending: false })
-      .limit(100);
+      .or(await listAccessPredicate(request,user.id,'discounts.view'))
+      .order("created_at", { ascending: false }).order('id', {ascending:false});
+    const companyName = url.searchParams.get('companyName')?.trim();
+    const financialYear = url.searchParams.get('financialYear')?.trim();
+    if (companyName) query = query.eq('company_name', companyName);
+    if (financialYear && /^\d{4}-\d{2,4}$/.test(financialYear)) query = query.or(`financial_year.eq.${financialYear},financial_year.is.null`);
 
     if (connectionId) {
       query = query.eq("connection_id", connectionId);
+      if(process.env.TEAM_ACCESS_ENFORCEMENT==='true') {
+        const scope=await requireDataset(request,connectionId,{companyName:url.searchParams.get('companyName')||undefined,financialYear:url.searchParams.get('financialYear')||undefined},'discounts.view');
+        query=query.eq('access_organization_id',scope.access.organizationId).eq('access_company_id',scope.link.company_id).eq('financial_year',scope.link.financial_year);
+      }
     }
     if (status && status !== "all") {
       query = query.eq("status", status);
     }
 
-    const { data, error } = await query;
-    if (error) throw error;
+    const data = await readCompleteHistory((from,to) => query.range(from,to));
 
     return jsonWithCors(request, {
       proposals: ((data ?? []) as unknown as DebitNoteProposalRow[]).map(serializeDebitNoteProposal),
       setupRequired: false,
     });
   } catch (error) {
+    if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
     if (isMissingTableError(error)) {
       return jsonWithCors(request, {
         proposals: [],
@@ -107,7 +120,7 @@ export async function GET(request: Request) {
   }
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) {
@@ -130,7 +143,11 @@ export async function POST(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
-    const { data: connection, error: connectionError } = await supabase
+    const dataset=process.env.TEAM_ACCESS_ENFORCEMENT==='true'?await requireDataset(request,connectionId,{
+      companyId:body.accessCompanyId,companyGuid:body.companyGuid,
+      financialYear:body.financialYear??body.financial_year,companyName:body.companyName??body.company_name,
+    },'discounts.prepare'):null;
+    const { data: connection, error: connectionError } = dataset ? {data:dataset.connection,error:null} : await supabase
       .from("tally_connections")
       .select("id, owner_user_id, last_company_name, display_name")
       .eq("id", connectionId)
@@ -143,11 +160,23 @@ export async function POST(request: Request) {
       return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
     }
 
-    const companyName = toNullableText(body.companyName ?? body.company_name, 240) ?? connection.last_company_name;
+    const companyName = dataset?.link.company_name ?? toNullableText(body.companyName ?? body.company_name, 240) ?? connection.last_company_name;
     const linkedInvoiceNumber = toNullableText(body.linkedInvoiceNumber ?? body.linked_invoice_number, 120);
+    if(dataset) {
+      const sourceId=toNullableText(body.sourceTransactionId??body.source_transaction_id,80);
+      if(sourceId) {
+        const source=await supabase.from('bank_transactions').select('bank_account_id').eq('id',sourceId).maybeSingle();
+        if(source.error||!source.data?.bank_account_id)throw new AccessError('Source transaction is unavailable.',404);
+        const {scope}=await requireResourceAccess(request,'bank_account',source.data.bank_account_id,'bank.view');
+        if(scope.company_id!==dataset.link.company_id)throw new AccessError('Source transaction belongs to another company.',403);
+      }
+      // Legacy rule IDs have no reviewed company scope. Do not attach guessed
+      // foreign keys until the rule migration establishes that identity.
+      if(body.cashDiscountRuleId||body.cash_discount_rule_id)throw new AccessError('Map the cash-discount rule to this organization before linking it.',409);
+    }
     const compatibleConnectionIds = new Set([connectionId]);
 
-    if (connection.last_company_name) {
+    if (!dataset && connection.last_company_name) {
       const { data: companyConnectionRows, error: companyConnectionError } = await supabase
         .from("tally_connections")
         .select("id")
@@ -165,7 +194,7 @@ export async function POST(request: Request) {
       const { data: existingRows, error: existingError } = await supabase
         .from("debit_note_proposals")
         .select("*")
-        .eq("owner_user_id", user.id)
+        .or(dataset ? `and(${dataset.predicate},financial_year.eq.${JSON.stringify(dataset.link.financial_year)})` : `owner_user_id.eq.${JSON.stringify(user.id)}`)
         .in("connection_id", Array.from(compatibleConnectionIds))
         .eq("party_ledger_name", partyLedgerName)
         .eq("linked_invoice_number", linkedInvoiceNumber)
@@ -183,7 +212,9 @@ export async function POST(request: Request) {
       }
     }
 
-    const { data: ledgerData } = await supabase
+    // Legacy master rows are not verified dataset identities. Do not enrich a
+    // shared proposal with another company's similarly named ledger snapshot.
+    const { data: ledgerData } = dataset ? {data:null} : await supabase
       .from("tally_masters")
       .select("tally_name, parent_name, gstin, raw_payload")
       .eq("connection_id", connectionId)
@@ -207,10 +238,11 @@ export async function POST(request: Request) {
     const partyGstin = toNullableText(body.partyGstin ?? body.party_gstin, 32) ?? ledger?.gstin ?? null;
 
     const payload = {
+      ...dataset?.columns,
       owner_user_id: user.id,
       connection_id: connectionId,
       company_name: companyName,
-      financial_year: toNullableText(body.financialYear ?? body.financial_year, 20),
+      financial_year: dataset?.link.financial_year ?? toNullableText(body.financialYear ?? body.financial_year, 20),
       source_transaction_id: toNullableText(body.sourceTransactionId ?? body.source_transaction_id, 80),
       party_ledger_name: partyLedgerName,
       party_gstin: partyGstin,
@@ -263,6 +295,7 @@ export async function POST(request: Request) {
       { status: 201 }
     );
   } catch (error) {
+    if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
     if (isMissingTableError(error)) {
       return jsonWithCors(
         request,
@@ -275,3 +308,6 @@ export async function POST(request: Request) {
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);
+export const POST = withTeamAccess(POSTHandler);

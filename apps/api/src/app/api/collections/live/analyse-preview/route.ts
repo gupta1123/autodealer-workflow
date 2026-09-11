@@ -1,3 +1,6 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {requireDataset} from '@/lib/access/dataset';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
@@ -11,7 +14,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
@@ -29,6 +32,7 @@ export async function POST(request: Request) {
     const ledgers = Array.isArray(scan.ledgers)
       ? (scan.ledgers as LiveCashDiscountLedger[]).map(liveCashDiscountLedgerRow).filter((row): row is NonNullable<typeof row> => Boolean(row))
       : [];
+    if(process.env.TEAM_ACCESS_ENFORCEMENT==='true')await requireDataset(request,connectionId,{companyName,companyGuid:body.companyGuid,financialYear:body.financialYear||scan.financialYear},'discounts.prepare');
     return jsonWithCors(request, analyseLiveCashDiscountSnapshot({
       connectionId,
       companyName,
@@ -38,9 +42,12 @@ export async function POST(request: Request) {
       preview: true,
     }));
   } catch (error) {
+    const failure=accessFailureResponse(request,error);if(failure)return failure;
     console.error("Error in POST /api/collections/live/analyse-preview:", error);
     return jsonWithCors(request, {
       error: error instanceof Error ? error.message : "Could not calculate the live Cash Discount preview.",
     }, { status: 500 });
   }
 }
+
+export const POST = withTeamAccess(POSTHandler);

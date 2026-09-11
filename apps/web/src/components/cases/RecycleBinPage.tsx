@@ -1,23 +1,20 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import {
   ChevronLeft,
   ChevronRight,
   Clock,
-  Eye,
-  FileText,
   RotateCcw,
   Search,
-  Sparkles,
-  Trash,
   Trash2,
 } from "lucide-react";
 
 import { CaseConfirmDialog } from "@/components/cases/CaseConfirmDialog";
 import { AppShell } from "@/components/dashboard/AppShell";
-import { Button } from "@/components/ui/button";
+import { PageHeader } from "@/components/dashboard/PageHeader";
+import { SelectDropdown } from "@/components/ui/select-dropdown";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
@@ -40,108 +37,75 @@ type PendingAction =
   | { type: "restore"; item: SavedCaseRecord }
   | null;
 
-const RECYCLE_BIN_PAGE_SIZE = 25;
+const ROWS_PER_PAGE_OPTIONS = [
+  { value: "10", label: "10" },
+  { value: "25", label: "25" },
+  { value: "50", label: "50" },
+];
 
-function getVisiblePages(currentPage: number, totalPages: number) {
-  const pages = new Set([1, totalPages, currentPage - 1, currentPage, currentPage + 1]);
-  return Array.from(pages)
-    .filter((page) => page >= 1 && page <= totalPages)
-    .sort((a, b) => a - b);
-}
+function formatRelativeDate(dateString: string | null) {
+  if (!dateString) return "—";
+  const date = new Date(dateString);
+  const now = new Date();
+  const isToday =
+    date.getDate() === now.getDate() &&
+    date.getMonth() === now.getMonth() &&
+    date.getFullYear() === now.getFullYear();
+  if (isToday) return "Today";
 
-function formatDateTime(value: string | null) {
-  if (!value) return "—";
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  const isYesterday =
+    date.getDate() === yesterday.getDate() &&
+    date.getMonth() === yesterday.getMonth() &&
+    date.getFullYear() === yesterday.getFullYear();
+  if (isYesterday) return "Yesterday";
 
-  return new Date(value).toLocaleString("en-US", {
+  return date.toLocaleDateString("en-US", {
     month: "short",
     day: "numeric",
     year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  }).replace(',', ' -').replace(/\s([AP]M)$/, '_$1'); // Rough match for image format
+  });
 }
 
 function calculateDaysRemaining(deletedAt: string | null) {
   if (!deletedAt) return 30;
   const deletedDate = new Date(deletedAt);
-  const expiryDate = new Date(deletedDate.getTime() + (30 * 24 * 60 * 60 * 1000));
+  const expiryDate = new Date(deletedDate.getTime() + 30 * 24 * 60 * 60 * 1000);
   const now = new Date();
   const diffTime = Math.max(0, expiryDate.getTime() - now.getTime());
-  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-  return diffDays;
+  return Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 }
 
-function RecycleBinCardSkeleton() {
-  return (
-    <div className="grid gap-3 px-4 pb-2 md:hidden">
-      {Array.from({ length: 5 }).map((_, index) => (
-        <div key={index} className="rounded-xl border border-[#e2e8f0] bg-white p-3.5 shadow-sm">
-          <div className="flex items-start gap-2.5">
-            <Skeleton className="h-8 w-8 shrink-0 rounded-lg bg-[#f8fafc]" />
-            <div className="min-w-0 flex-1 space-y-2">
-              <Skeleton className="h-3.5 w-4/5 bg-slate-100" />
-              <Skeleton className="h-3 w-3/5 bg-slate-100" />
-            </div>
-          </div>
-          <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5">
-            <Skeleton className="h-3 w-28 bg-slate-100" />
-            <Skeleton className="h-3 w-14 bg-slate-100" />
-          </div>
-          <div className="mt-2.5 flex items-center justify-end gap-2">
-            <Skeleton className="h-7 w-7 rounded-md bg-slate-100" />
-            <Skeleton className="h-7 w-7 rounded-md bg-slate-100" />
-            <Skeleton className="h-7 w-7 rounded-md bg-slate-100" />
-          </div>
-        </div>
-      ))}
-    </div>
-  );
+function toReadableCaseText(value: string) {
+  return value
+    .split(/(\/)/)
+    .map((part) => {
+      if (part === "/") return part;
+      return part
+        .split(/(\s+)/)
+        .map((word) => {
+          if (!word.trim()) return word;
+          if (/[0-9]/.test(word)) return word;
+          if (word.length <= 3 && word === word.toUpperCase()) return word;
+          return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+        })
+        .join("");
+    })
+    .join("")
+    .replace(/\s+packet$/i, " packet");
 }
 
-function RecycleBinTableSkeleton() {
-  return (
-    <div className="hidden md:block">
-      <Table className="w-full text-sm">
-        <TableHeader>
-          <TableRow className="border-b border-[#f1f5f9] hover:bg-transparent">
-            <TableHead className="h-10 pl-4 md:pl-6 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider">Document</TableHead>
-            <TableHead className="h-10 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider">Receiver</TableHead>
-            <TableHead className="h-10 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider">Expires</TableHead>
-            <TableHead className="h-10 font-medium text-[#94a3b8] text-[11px] uppercase tracking-wider text-right pr-4 md:pr-6">Actions</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {Array.from({ length: 8 }).map((_, index) => (
-            <TableRow key={index} className="border-[#f1f5f9] h-11">
-              <TableCell className="py-2 pl-4 md:pl-6">
-                <div className="flex items-center gap-2.5">
-                  <Skeleton className="h-7 w-7 shrink-0 rounded-md bg-[#f1f5f9]" />
-                  <div className="min-w-0 space-y-1.5">
-                    <Skeleton className="h-3.5 w-44 bg-slate-100" />
-                    <Skeleton className="h-3 w-28 bg-slate-100" />
-                  </div>
-                </div>
-              </TableCell>
-              <TableCell className="py-2">
-                <Skeleton className="h-3.5 w-36 bg-slate-100" />
-              </TableCell>
-              <TableCell className="py-2">
-                <Skeleton className="h-3.5 w-12 bg-slate-100" />
-              </TableCell>
-              <TableCell className="pr-4 md:pr-6 py-2">
-                <div className="flex justify-end gap-2">
-                  <Skeleton className="h-5 w-5 rounded-md bg-slate-100" />
-                  <Skeleton className="h-5 w-5 rounded-md bg-slate-100" />
-                  <Skeleton className="h-5 w-5 rounded-md bg-slate-100" />
-                </div>
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </div>
-  );
+function getCaseTitle(item: SavedCaseRecord) {
+  if (item.receiverName) return toReadableCaseText(item.receiverName);
+  if (item.buyerName) return toReadableCaseText(item.buyerName);
+  return toReadableCaseText(item.displayName);
+}
+
+function getCaseSubtitle(item: SavedCaseRecord) {
+  if (item.invoiceNumber) return `Inv: ${item.invoiceNumber}`;
+  if (item.poNumber) return `PO: ${item.poNumber}`;
+  return item.category || "Document Packet";
 }
 
 export function RecycleBinPage() {
@@ -150,6 +114,7 @@ export function RecycleBinPage() {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [pageSize, setPageSize] = useState(25);
   const [currentPage, setCurrentPage] = useState(1);
   const [totalCount, setTotalCount] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
@@ -173,7 +138,7 @@ export function RecycleBinPage() {
 
     fetchCasePage({
       scope: "deleted",
-      limit: RECYCLE_BIN_PAGE_SIZE,
+      limit: pageSize,
       page: currentPage,
       query: debouncedQuery,
       signal: controller.signal,
@@ -195,14 +160,7 @@ export function RecycleBinPage() {
     return () => {
       controller.abort();
     };
-  }, [currentPage, debouncedQuery]);
-
-  const visiblePages = useMemo(
-    () => getVisiblePages(currentPage, totalPages),
-    [currentPage, totalPages]
-  );
-  const pageStart = totalCount === 0 ? 0 : (currentPage - 1) * RECYCLE_BIN_PAGE_SIZE + 1;
-  const pageEnd = Math.min(currentPage * RECYCLE_BIN_PAGE_SIZE, totalCount);
+  }, [currentPage, debouncedQuery, pageSize]);
 
   async function handleConfirmAction() {
     if (!pendingAction) return;
@@ -221,7 +179,7 @@ export function RecycleBinPage() {
         current.filter((item) => item.id !== pendingAction.item.id)
       );
       const nextTotalCount = Math.max(0, totalCount - 1);
-      const nextTotalPages = Math.max(1, Math.ceil(nextTotalCount / RECYCLE_BIN_PAGE_SIZE));
+      const nextTotalPages = Math.max(1, Math.ceil(nextTotalCount / pageSize));
       setTotalCount(nextTotalCount);
       setTotalPages(nextTotalPages);
       if (currentPage > nextTotalPages) {
@@ -241,303 +199,249 @@ export function RecycleBinPage() {
 
   return (
     <AppShell>
-      <div className="mx-auto max-w-[1500px] w-full px-4 sm:px-6 lg:px-8 py-8 animate-in fade-in duration-700 ease-out text-[#1a1a1a]">
+      <div className="min-h-full bg-[#f7f4ef] px-4 py-5 text-[#111827] sm:px-6 lg:px-8">
+        <div className="mx-auto flex w-full max-w-[1540px] flex-col gap-4">
 
-        {/* MAIN CONTAINER matching the image's white box UI */}
-        <div className="bg-white border border-[#e5ddd0] rounded-2xl shadow-[0_2px_8px_rgba(0,0,0,0.02)] overflow-hidden flex flex-col">
-
-          {/* =========================================
-              HEADER SECTION (Matches Image)
-              ========================================= */}
-          <div className="p-6 border-b border-[#e5ddd0] flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
-
-            <div className="flex items-center gap-5">
-              <div className="w-12 h-12 bg-amber-50 border border-amber-250 text-amber-800 rounded-xl flex items-center justify-center shadow-sm">
-                <Trash2 className="w-6 h-6" />
+          {/* ── Fixed/Sticky Reusable PageHeader (Matches CasesPage) ── */}
+          <PageHeader
+            title="Recycle Bin"
+            subtitle="Manage and restore deleted cases"
+            badge={
+              <div className="flex items-center gap-1.5 rounded-lg border border-[#e6ded2] bg-[#fbfaf8] px-2.5 py-1 text-xs font-medium text-[#5b4b3d] shadow-sm">
+                <Trash2 className="h-3 w-3 text-[#8a7f72]" />
+                <span>Auto-cleans in 30 days</span>
               </div>
-              <div>
-                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200/50 text-[10px] font-bold uppercase tracking-wider text-amber-800">
-                  <Sparkles className="h-3 w-3 text-amber-600 animate-spin duration-3000" />
-                  System Cleanup
-                </div>
-                <h1 className="text-2xl font-black text-[#1a1a1a] tracking-tight mt-1.5">Recycle Bin</h1>
-                <div className="text-xs font-semibold text-slate-400 mt-1">
-                  {status === "loading" ? (
-                    <Skeleton className="mt-1 h-3.5 w-60 bg-slate-100" />
-                  ) : (
-                    `${totalCount} items • Permanently delete to reclaim storage`
-                  )}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* =========================================
-              SEARCH BAR (Matches Image)
-              ========================================= */}
-          <div className="p-6 md:px-8 md:py-6">
-            <div className="flex items-center px-4 py-2.5 border border-[#e5ddd0] rounded-xl bg-[#faf8f4]/60 shadow-sm max-w-md focus-within:border-amber-500 transition-all">
-              <Search className="w-4 h-4 text-slate-400 mr-3 shrink-0" />
+            }
+            actions={
+              <Link
+                href="/cases"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-[#ded8d0] bg-[#fbfaf8] px-3 py-1.5 text-xs font-medium text-[#3d3530] shadow-sm transition hover:bg-[#ede6d9]"
+              >
+                <span>All Cases</span>
+              </Link>
+            }
+          >
+            {/* Search Input Filter */}
+            <div className="flex h-9 max-w-md items-center gap-2 rounded-lg border border-[#ded8d0] bg-[#fbfaf8] px-3 text-xs shadow-sm focus-within:border-[#b9aa99] focus-within:bg-white transition">
+              <Search className="h-3.5 w-3.5 text-[#8a7f72]" />
               <input
                 type="text"
-                placeholder="Search deleted items..."
                 value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                className="w-full outline-none text-xs font-semibold text-[#1a1a1a] placeholder:text-slate-400 bg-transparent"
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search deleted cases, buyers, or numbers..."
+                className="w-full bg-transparent font-medium text-[#111827] outline-none placeholder:text-[#b5aaa0]"
               />
+              {query && (
+                <button
+                  type="button"
+                  onClick={() => setQuery("")}
+                  className="text-[11px] font-semibold text-[#8a7f72] hover:text-[#111827]"
+                >
+                  Clear
+                </button>
+              )}
             </div>
-          </div>
+          </PageHeader>
 
-          {/* =========================================
-              TABLE AREA
-              ========================================= */}
-          <div className="w-full overflow-x-auto pb-4">
-
+          {/* ── Cardless Table Area (Matches CasesPage) ── */}
+          <div className="w-full pt-1">
             {status === "loading" && (
-              <>
-                <RecycleBinCardSkeleton />
-                <RecycleBinTableSkeleton />
-              </>
+              <div className="space-y-3 py-4">
+                {Array.from({ length: 8 }).map((_, i) => (
+                  <div key={i} className="flex items-center gap-4 py-3 border-b border-[#ece6dc]">
+                    <Skeleton className="h-4 w-44 bg-[#eee7dd]" />
+                    <Skeleton className="h-4 w-32 bg-[#eee7dd]" />
+                    <Skeleton className="h-4 w-20 bg-[#eee7dd]" />
+                    <Skeleton className="h-4 w-20 bg-[#eee7dd]" />
+                    <Skeleton className="h-4 w-16 ml-auto bg-[#eee7dd]" />
+                  </div>
+                ))}
+              </div>
             )}
 
             {status === "error" && (
-              <div className="m-8 rounded-2xl border border-red-200 bg-red-50 p-6 text-sm text-red-700 flex items-start shadow-sm">
-                <Trash className="mr-3 h-5 w-5 text-red-500 shrink-0 mt-0.5" />
-                <div>
-                  <div className="font-medium text-base mb-1">Failed to load recycle bin</div>
-                  <div>{error}</div>
-                </div>
+              <div className="rounded-lg border border-rose-200 bg-rose-50 p-4 text-xs font-medium text-rose-700">
+                {error}
               </div>
             )}
 
-            {status === "ready" && totalCount === 0 && !debouncedQuery && (
-              <div className="flex flex-col items-center justify-center py-24 text-center px-4">
-                <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-full bg-[#f8fafc] border border-[#e2e8f0] shadow-sm">
-                  <Trash2 className="h-8 w-8 text-[#cbd5e1]" />
+            {status === "ready" && cases.length === 0 && (
+              <div className="flex min-h-[300px] flex-col items-center justify-center py-12 text-center">
+                <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-xl border border-[#ded8d0] bg-[#fbfaf8] text-[#8a7f72]">
+                  <Trash2 className="h-5 w-5" />
                 </div>
-                <h3 className="text-lg font-medium text-[#0f172a]">Recycle Bin is Empty</h3>
-                <p className="mt-2 text-sm font-medium text-[#64748b] max-w-sm">
-                  Deleted items remain here until you restore or permanently delete them.
+                <p className="text-sm font-semibold text-[#111827]">
+                  {debouncedQuery ? "No matching deleted cases found" : "Recycle bin is empty"}
                 </p>
-              </div>
-            )}
-
-            {status === "ready" && totalCount === 0 && debouncedQuery && (
-              <div className="flex flex-col items-center justify-center py-24 text-center px-4">
-                <Search className="h-10 w-10 text-[#e2e8f0] mb-4" />
-                <h3 className="text-base font-medium text-[#0f172a]">No matches found</h3>
-                <p className="mt-1 text-sm font-medium text-[#64748b]">
-                  We couldn&apos;t find any deleted items matching &quot;{debouncedQuery}&quot;.
+                <p className="mt-1 text-xs text-[#8a7f72]">
+                  {debouncedQuery
+                    ? "Try adjusting your search query."
+                    : "Cases moved to the recycle bin will appear here."}
                 </p>
-                <Button
-                  variant="link"
-                  onClick={() => setQuery("")}
-                  className="mt-2 text-amber-600 hover:text-amber-700 font-medium"
-                >
-                  Clear search
-                </Button>
+                {debouncedQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setQuery("")}
+                    className="mt-3 text-xs font-semibold text-[#2b1a10] hover:underline"
+                  >
+                    Clear search
+                  </button>
+                )}
               </div>
             )}
 
             {status === "ready" && cases.length > 0 && (
-              <>
-                <div className="grid gap-3 px-4 pb-2 md:hidden">
-                  {cases.map((item) => (
-                    <div
-                      key={item.id}
-                      className="rounded-xl border border-[#e5ddd0] bg-white p-3.5 shadow-sm"
-                    >
-                      <div className="flex items-start gap-2.5">
-                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#e5ddd0] bg-[#faf8f4]/60 text-slate-500">
-                          <FileText className="h-4 w-4" />
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <Link
-                            href={`/cases/${item.id}`}
-                            className="block truncate text-sm font-extrabold text-[#1a1a1a] hover:text-amber-600 transition-colors" title={item.displayName || "Unnamed Document"}
-                          >
-                            {item.displayName || "Unnamed Document"}
-                          </Link>
-                          <div className="mt-0.5 text-[11px] font-semibold text-slate-400">
-                            {formatDateTime(item.deletedAt)} • by Admin
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5 text-[11px] font-semibold text-slate-450">
-                        <span className="truncate max-w-[140px]" title={item.receiverName || "Receiver pending"}>{item.receiverName || "Receiver pending"}</span>
-                        <span className="flex items-center gap-1 shrink-0 text-slate-500 font-bold">
-                          <Clock className="h-3 w-3" />
-                          {calculateDaysRemaining(item.deletedAt)}d left
-                        </span>
-                      </div>
-
-                      <div className="mt-2.5 flex items-center justify-end gap-2">
-                        <Link
-                          href={`/cases/${item.id}`}
-                          className="rounded-lg border border-[#e5ddd0] p-1.5 text-slate-400 hover:text-slate-900 transition-colors hover:bg-slate-100"
-                          aria-label="View"
-                        >
-                          <Eye className="h-3.5 w-3.5" />
-                        </Link>
-                        <button
-                          className="rounded-lg border border-emerald-200 p-1.5 text-emerald-600 transition-colors hover:bg-emerald-50"
-                          aria-label="Restore"
-                          onClick={() => setPendingAction({ type: "restore", item })}
-                        >
-                          <RotateCcw className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          className="rounded-lg border border-rose-200 p-1.5 text-rose-600 transition-colors hover:bg-rose-50"
-                          aria-label="Delete Permanently"
-                          onClick={() => setPendingAction({ type: "destroy", item })}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                <div className="hidden md:block">
-                  <Table className="w-full text-sm">
-                    <TableHeader>
-                      <TableRow className="border-b border-[#e5ddd0] bg-[#fcfbfa] hover:bg-transparent">
-                        <TableHead className="h-10 pl-4 md:pl-6 font-bold text-slate-400 text-[10px] uppercase tracking-wider">Document</TableHead>
-                        <TableHead className="h-10 font-bold text-slate-400 text-[10px] uppercase tracking-wider">Receiver</TableHead>
-                        <TableHead className="h-10 font-bold text-slate-400 text-[10px] uppercase tracking-wider">Expires</TableHead>
-                        <TableHead className="h-10 font-bold text-slate-400 text-[10px] uppercase tracking-wider text-right pr-4 md:pr-6">Actions</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {cases.map((item) => (
+              <div className="w-full">
+                <Table className="w-full">
+                  <TableHeader>
+                    <TableRow className="border-b border-[#e0d8cc] bg-transparent hover:bg-transparent">
+                      <TableHead className="h-10 pl-0 pr-3 text-xs font-semibold text-[#3d3530]">
+                        Case / Document
+                      </TableHead>
+                      <TableHead className="h-10 px-3 text-xs font-semibold text-[#3d3530]">
+                        Category
+                      </TableHead>
+                      <TableHead className="h-10 px-3 text-xs font-semibold text-[#3d3530]">
+                        Deleted On
+                      </TableHead>
+                      <TableHead className="h-10 px-3 text-xs font-semibold text-[#3d3530]">
+                        Expires In
+                      </TableHead>
+                      <TableHead className="h-10 pl-3 pr-0 text-right text-xs font-semibold text-[#3d3530]">
+                        Actions
+                      </TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {cases.map((item) => {
+                      const daysRemaining = calculateDaysRemaining(item.deletedAt);
+                      return (
                         <TableRow
                           key={item.id}
-                          className="group border-b border-[#e5ddd0] hover:bg-[#fcfbfa]/60 transition-colors h-11"
+                          className="group h-[52px] border-b border-[#ece6dc] transition-colors hover:bg-[#ede6d9]/40"
                         >
-                          <TableCell className="py-2.5 pl-4 md:pl-6">
-                            <div className="flex items-center gap-2.5">
-                              <div className="w-7 h-7 rounded-lg bg-[#faf8f4]/60 border border-[#e5ddd0] text-slate-500 flex items-center justify-center shrink-0">
-                                <FileText className="w-3.5 h-3.5" />
-                              </div>
-                              <div className="min-w-0">
-                                <Link
-                                  href={`/cases/${item.id}`}
-                                  className="font-extrabold text-[#1a1a1a] text-[13px] transition-colors hover:text-amber-600 truncate block max-w-[200px] xl:max-w-[300px]" title={item.displayName || "Unnamed Document"}
-                                >
-                                  {item.displayName || "Unnamed Document"}
-                                </Link>
-                                <div className="text-[11px] font-semibold text-slate-400 mt-px">
-                                  {formatDateTime(item.deletedAt)}
-                                </div>
-                              </div>
-                            </div>
+                          {/* Title / Subtitle */}
+                          <TableCell className="pl-0 pr-3 py-2 font-medium text-[#111827]">
+                            <Link
+                              href={`/cases/${item.id}`}
+                              className="hover:underline hover:text-[#2b1a10] block max-w-[280px] truncate font-medium text-[13px]"
+                            >
+                              {getCaseTitle(item)}
+                            </Link>
+                            <span className="block text-[11px] font-normal text-[#8a7f72] truncate max-w-[260px]">
+                              {getCaseSubtitle(item)}
+                            </span>
                           </TableCell>
 
-                          <TableCell className="py-2.5">
-                            <div className="flex items-center gap-1.5">
-                              <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
-                              <span className="text-[13px] font-semibold text-slate-500 truncate max-w-[140px]" title={item.receiverName || "Receiver pending"}>
-                                {item.receiverName || "Receiver pending"}
-                              </span>
-                            </div>
+                          {/* Category */}
+                          <TableCell className="px-3 py-2 text-xs text-[#5a5046] font-normal">
+                            <span className="block max-w-[160px] truncate" title={item.category || ""}>
+                              {item.category || "—"}
+                            </span>
                           </TableCell>
 
-                          <TableCell className="py-2.5">
-                            <div className="flex items-center gap-1 text-[13px] font-bold text-slate-500">
-                              <Clock className="w-3 h-3 text-slate-400" />
-                              {calculateDaysRemaining(item.deletedAt)}d
-                            </div>
+                          {/* Deleted On Date */}
+                          <TableCell className="px-3 py-2 text-xs text-[#5a5046] font-normal whitespace-nowrap">
+                            {formatRelativeDate(item.deletedAt)}
                           </TableCell>
 
-                          <TableCell className="pr-4 md:pr-6 py-2.5 text-right">
-                            <div className="flex items-center justify-end gap-2 text-slate-400">
+                          {/* Expires In */}
+                          <TableCell className="px-3 py-2 whitespace-nowrap">
+                            <span
+                              className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium ${
+                                daysRemaining <= 5
+                                  ? "bg-[#fbf0ef] text-[#8c1d18] border-[#f2c7c4]"
+                                  : "bg-[#fef6e9] text-[#78350f] border-[#f9d8a7]"
+                              }`}
+                            >
+                              <Clock className="h-3 w-3" />
+                              <span>{daysRemaining} {daysRemaining === 1 ? "day" : "days"}</span>
+                            </span>
+                          </TableCell>
+
+                          {/* Action Buttons */}
+                          <TableCell className="pl-3 pr-0 py-2 text-right whitespace-nowrap">
+                            <div className="flex items-center justify-end gap-2">
                               <Link
                                 href={`/cases/${item.id}`}
-                                className="p-1.5 hover:text-slate-900 hover:bg-slate-100 rounded-xl transition-all"
-                                aria-label="View"
+                                className="text-xs font-semibold text-[#2b1a10] hover:text-black hover:underline"
                               >
-                                <Eye className="w-3.5 h-3.5" />
+                                View
                               </Link>
                               <button
-                                className="p-1.5 hover:text-emerald-700 hover:bg-emerald-50 border border-transparent hover:border-emerald-200 rounded-xl transition-all"
-                                aria-label="Restore"
+                                type="button"
+                                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-emerald-800 hover:bg-emerald-50 transition-colors"
                                 onClick={() => setPendingAction({ type: "restore", item })}
+                                title="Restore case"
                               >
-                                <RotateCcw className="w-3.5 h-3.5" />
+                                <RotateCcw className="h-3 w-3" />
+                                <span>Restore</span>
                               </button>
                               <button
-                                className="p-1.5 hover:text-rose-700 hover:bg-rose-50 border border-transparent hover:border-rose-200 rounded-xl transition-all"
-                                aria-label="Delete Permanently"
+                                type="button"
+                                className="rounded p-1 text-[#8a7f72] transition hover:bg-rose-50 hover:text-rose-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 focus-visible:ring-offset-2"
+                                aria-label="Delete permanently"
                                 onClick={() => setPendingAction({ type: "destroy", item })}
+                                title="Delete permanently"
                               >
-                                <Trash2 className="w-3.5 h-3.5" />
+                                <Trash2 className="h-3.5 w-3.5" />
                               </button>
                             </div>
                           </TableCell>
                         </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
-              </>
-            )}
-
-            {status === "ready" && totalCount > 0 && (
-              <div className="flex flex-col gap-3 border-t border-[#e5ddd0] px-6 pb-2 pt-4 text-xs font-semibold text-slate-400 md:flex-row md:items-center md:justify-between md:px-8">
-                <div>
-                  Showing {pageStart}-{pageEnd} of {totalCount}
-                </div>
-                <div className="flex items-center gap-1">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-8.5 w-8.5 rounded-xl border border-[#e5ddd0] bg-white px-2 font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
-                    disabled={currentPage <= 1}
-                    onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}
-                    aria-label="Previous page"
-                  >
-                    <ChevronLeft className="h-4 w-4" />
-                  </Button>
-                  {visiblePages.map((page, index) => {
-                    const previousPage = visiblePages[index - 1];
-                    return (
-                      <div key={page} className="flex items-center gap-1">
-                        {previousPage && page - previousPage > 1 && (
-                          <span className="px-1 text-slate-350">...</span>
-                        )}
-                        <Button
-                          type="button"
-                          variant={page === currentPage ? "default" : "outline"}
-                          size="sm"
-                          className={
-                            page === currentPage
-                              ? "h-8.5 min-w-8.5 bg-[#2d2d2d] px-2 font-bold text-white hover:bg-[#1a1a1a] rounded-xl shadow-sm transition-all"
-                              : "h-8.5 min-w-8.5 border border-[#e5ddd0] bg-white px-2 font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] rounded-xl shadow-sm transition-all"
-                          }
-                          onClick={() => setCurrentPage(page)}
-                        >
-                          {page}
-                        </Button>
-                      </div>
-                    );
-                  })}
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-8.5 w-8.5 rounded-xl border border-[#e5ddd0] bg-white px-2 font-bold text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all"
-                    disabled={currentPage >= totalPages}
-                    onClick={() => setCurrentPage((page) => Math.min(totalPages, page + 1))}
-                    aria-label="Next page"
-                  >
-                    <ChevronRight className="h-4 w-4" />
-                  </Button>
-                </div>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
               </div>
             )}
 
+            {/* ── Seamless Pagination Footer (Matches CasesPage) ── */}
+            {status === "ready" && totalCount > 0 && (
+              <div className="flex flex-col gap-3 pt-4 text-xs text-[#8a7f72] sm:flex-row sm:items-center sm:justify-between">
+                {/* Rows per page selector */}
+                <div className="flex items-center gap-2">
+                  <span>Rows per page:</span>
+                  <SelectDropdown
+                    size="sm"
+                    value={String(pageSize)}
+                    onChange={(val) => {
+                      setPageSize(Number(val));
+                      setCurrentPage(1);
+                    }}
+                    options={ROWS_PER_PAGE_OPTIONS}
+                    className="w-16"
+                  />
+                </div>
+
+                {/* Page Navigation */}
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    disabled={currentPage <= 1}
+                    onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                    className="inline-flex items-center gap-1 rounded-lg border border-[#ded8d0] bg-[#fbfaf8] px-3 py-1.5 text-xs font-medium text-[#3d3530] shadow-sm transition hover:bg-[#ede6d9] disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <ChevronLeft className="h-3.5 w-3.5" />
+                    <span>Previous</span>
+                  </button>
+
+                  <span className="text-xs font-medium text-[#8a7f72]">
+                    Page {currentPage} of {totalPages}
+                  </span>
+
+                  <button
+                    type="button"
+                    disabled={currentPage >= totalPages}
+                    onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                    className="inline-flex items-center gap-1 rounded-lg border border-[#ded8d0] bg-[#fbfaf8] px-3 py-1.5 text-xs font-medium text-[#3d3530] shadow-sm transition hover:bg-[#ede6d9] disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <span>Next</span>
+                    <ChevronRight className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 

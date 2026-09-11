@@ -1,3 +1,8 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import { readCompleteHistory } from '@/lib/collections-history';
+import {requireDataset} from '@/lib/access/dataset';
+import {enqueueTeamDiscount} from '@/lib/access/discount-writes';
+import {accessFailureResponse} from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { readTallyOpenBills } from "@/lib/collections-dashboard";
@@ -27,7 +32,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
@@ -56,22 +61,20 @@ export async function POST(request: Request) {
     }
 
     const supabase = createSupabaseAdminClient();
+    const team=process.env.TEAM_ACCESS_ENFORCEMENT==='true'?await requireDataset(request,connectionId,{...body,financialYear:body.financialYear||requestedProposal.financialYear},'discounts.post'):null;
+    let createdQuery=supabase.from('debit_note_proposals').select('party_ledger_name, linked_invoice_number, recoverable_amount, reason_code, financial_year')
+      .eq('company_name',companyName).eq('status','created_in_tally').order('id');
+    createdQuery=team?createdQuery.eq('access_organization_id',team.access.organizationId).eq('access_company_id',team.link.company_id):createdQuery.eq('owner_user_id',user.id);
     const [{ data: connection, error: connectionError }, { data: createdRows, error: createdRowsError }] =
       await Promise.all([
-        supabase
+        team ? Promise.resolve({data:team.connection,error:null}) : supabase
           .from("tally_connections")
           .select("id, owner_user_id, last_company_name, last_tally_reachable, last_company_loaded")
           .eq("id", connectionId)
           .eq("owner_user_id", user.id)
           .is("revoked_at", null)
           .maybeSingle(),
-        supabase
-          .from("debit_note_proposals")
-          .select("party_ledger_name, linked_invoice_number, recoverable_amount, reason_code")
-          .eq("owner_user_id", user.id)
-          .eq("company_name", companyName)
-          .eq("status", "created_in_tally")
-          .limit(1000),
+        readCompleteHistory((from,to) => createdQuery.range(from,to)).then(data => ({data,error:null})),
       ]);
     if (connectionError) throw connectionError;
     if (createdRowsError) throw createdRowsError;
@@ -132,6 +135,7 @@ export async function POST(request: Request) {
     }
 
     const alreadyCreatedReversalAmount = (createdRows ?? [])
+      .filter(row => !requestedProposal.financialYear || !row.financial_year || row.financial_year === requestedProposal.financialYear)
       .filter((row) => String(row.reason_code ?? "").startsWith("cash_discount_") &&
         normalized(row.party_ledger_name) === normalized(matchingBill.ledgerName) &&
         normalized(row.linked_invoice_number) === normalized(linkedInvoiceNumber))
@@ -204,8 +208,12 @@ export async function POST(request: Request) {
     if (body.queue !== true) {
       return jsonWithCors(request, { commandPayload });
     }
+    if(team) {
+      const queued=await enqueueTeamDiscount(team,commandPayload);
+      return jsonWithCors(request,{command:serializeTallyBridgeCommand(queued.command),proposalId:queued.proposalId,durable:true});
+    }
 
-    const idempotencyKey = [companyName, matchingBill.ledgerName, linkedInvoiceNumber]
+    const idempotencyKey = [companyName, String(requestedProposal.financialYear || ''), matchingBill.ledgerName, linkedInvoiceNumber, referenceSuffix]
       .map(normalized)
       .join("|");
     const { data: commandData, error: commandError } = await supabase
@@ -248,10 +256,12 @@ export async function POST(request: Request) {
     ]);
 
     return jsonWithCors(request, {
+      durable: true,
       commandPayload,
       command: serializeTallyBridgeCommand(commandData as unknown as TallyBridgeCommandRow),
     });
   } catch (error) {
+    const failure=accessFailureResponse(request,error);if(failure)return failure;
     console.error("Error in POST /api/collections/live/prepare-debit-note:", error);
     return jsonWithCors(
       request,
@@ -260,3 +270,5 @@ export async function POST(request: Request) {
     );
   }
 }
+
+export const POST = withTeamAccess(POSTHandler);

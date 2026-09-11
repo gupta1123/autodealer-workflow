@@ -1,3 +1,4 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
 import { NextResponse } from "next/server";
 
 import { applyCorsHeaders, jsonWithCors, optionsWithCors } from "@/lib/api/cors";
@@ -14,7 +15,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) {
@@ -64,3 +65,5 @@ export async function POST(request: Request) {
     return jsonWithCors(request, { error: "This PDF could not be prepared for preview." }, { status: 500 });
   }
 }
+
+export const POST = withTeamAccess(POSTHandler);

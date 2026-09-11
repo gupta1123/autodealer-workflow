@@ -11,6 +11,7 @@ export type LiveValidationMasterOption = {
   gstDutyHead: string | null;
   closingBalance: number | null;
   closingBalanceType: "Dr" | "Cr" | null;
+  decimalPlaces: number | null;
 };
 
 export function liveValidationMasterRow(option: LiveValidationMasterOption) {
@@ -27,6 +28,7 @@ export function liveValidationMasterRow(option: LiveValidationMasterOption) {
     gstDutyHead: option.gstDutyHead,
     closingBalance: option.closingBalance,
     closingBalanceType: option.closingBalanceType,
+    decimalPlaces: option.decimalPlaces,
   };
 }
 
@@ -36,12 +38,28 @@ export function liveValidationMasterRow(option: LiveValidationMasterOption) {
  * into the API request when the selected-master envelope is assembled.
  */
 export function liveValidationMetadata(result: Record<string, unknown>) {
+  const profile = result.companyProfile && typeof result.companyProfile === "object" && !Array.isArray(result.companyProfile)
+    ? result.companyProfile as Record<string, unknown>
+    : {};
   return {
     source: result.source,
     companyName: result.companyName,
     fetchedAt: result.fetchedAt,
+    validatedAt: result.validatedAt,
+    validation: result.validation,
     syncRunId: result.syncRunId ?? null,
     totals: result.totals,
     companyProfile: result.companyProfile,
+    catalogueIdentity: {
+      companyName: result.companyName,
+      companyGuid: profile.guid ?? null,
+      financialYear: result.financialYear ?? null,
+      fetchedAt: result.fetchedAt,
+      validatedAt: result.validatedAt,
+      catalogueDigest: result.validation && typeof result.validation === "object" && !Array.isArray(result.validation)
+        ? (result.validation as Record<string, unknown>).catalogueDigest ?? null
+        : null,
+      bridgeVersion: result.bridgeVersion ?? null,
+    },
   };
 }

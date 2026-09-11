@@ -1,5 +1,7 @@
 import { toNumber, toText, type DebitNoteProposalRow } from "@/lib/collections";
 
+export class WhatsappRejectedError extends Error {}
+
 export type Msg91TemplateLanguage = {
   name?: string;
   language?: string;
@@ -199,9 +201,13 @@ export async function sendDebitNoteWhatsapp(input: Msg91DebitNoteSendInput) {
       "content-type": "application/json",
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(20_000),
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || payload?.hasError) {
+    if ([400,401,403,404,422].includes(response.status)) {
+      throw new WhatsappRejectedError('WhatsApp provider rejected the request. Check its configuration, template and recipient before retrying.');
+    }
     throw new Error(payload?.message || payload?.error || JSON.stringify(payload?.errors ?? payload) || "MSG91 send failed.");
   }
   return { payload, request: body };

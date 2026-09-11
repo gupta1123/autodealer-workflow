@@ -1,4 +1,7 @@
 import type { Metadata } from "next";
+import { AccessProvider } from '@/components/access/AccessProvider';
+import { TallyStatusProvider } from '@/components/tally/TallyStatusProvider';
+import { PersistentAppShell } from '@/components/dashboard/PersistentAppShell';
 
 import "@fontsource/poppins/latin-400.css";
 import "@fontsource/poppins/devanagari-400.css";
@@ -30,7 +33,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className="antialiased">{children}</body>
+      <body className="antialiased"><AccessProvider><TallyStatusProvider><PersistentAppShell>{children}</PersistentAppShell></TallyStatusProvider></AccessProvider></body>
     </html>
   );
 }

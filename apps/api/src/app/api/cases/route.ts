@@ -1,5 +1,11 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import { newResourceScope } from '@/lib/access/new-resource';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { listAccessPredicate } from "@/lib/access/list-scope";
+import { AccessError,requireAccessContext } from "@/lib/access/server";
+import { CASE_LIST_COLUMNS, CASE_LIST_COLUMNS_LEGACY, restoreCaseListMetadata,
+  makeCaseCursor, readCaseCursor, cursorPredicate, missingCaseColumn } from '@/lib/case-list-query';
 
 import {
   getCaseCategoryFromProcessingMeta,
@@ -52,17 +58,11 @@ import type { CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
 const STORAGE_BUCKET = "packet-files";
 const DEFAULT_CASE_LIST_LIMIT = 25;
 const MAX_CASE_LIST_LIMIT = 500;
-const LIST_COLUMNS =
-  "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at";
-const LIST_COLUMNS_WITHOUT_RECYCLE_BIN =
-  "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta";
+const LIST_COLUMNS = CASE_LIST_COLUMNS;
+const LIST_COLUMNS_WITHOUT_RECYCLE_BIN = CASE_LIST_COLUMNS_LEGACY;
 type CaseListScope = "active" | "deleted";
-type CaseListStatusFilter = "all" | "pending" | "in_review" | "completed" | "failed";
+type CaseListStatusFilter = "all" | "pending" | "in_review" | "ongoing" | "completed" | "failed";
 type CaseListSortMode = "recent" | "oldest" | "name";
-type CaseListCursor = {
-  sortValue: string;
-  id: string;
-};
 type CaseListTiming = Partial<Record<"auth" | "caseQuery" | "serialize" | "total", number>>;
 type CaseListRow = {
   id: string;
@@ -84,12 +84,15 @@ type CaseListRow = {
 function getCaseStatusesForFilter(filter: CaseListStatusFilter) {
   if (filter === "pending") return ["draft"];
   if (filter === "in_review") return ["processing"];
+  if (filter === "ongoing") return ["processing", "pending"];
   if (filter === "completed") return ["completed", "accepted"];
   if (filter === "failed") return ["failed", "rejected"];
   return null;
 }
 
 function readCaseStatusFilter(value: string | null): CaseListStatusFilter {
+  if (value === 'draft') return 'pending';
+  if (value === 'ongoing') return 'ongoing';
   if (value === "pending" || value === "in_review" || value === "completed" || value === "failed") {
     return value;
   }
@@ -159,6 +162,7 @@ function logSlowCaseListRequest(params: {
   scope: CaseListScope;
   limit: number;
   hasSearch: boolean;
+  queryMode: string;
   timing: CaseListTiming;
 }) {
   if ((params.timing.total ?? 0) < 750) {
@@ -170,6 +174,7 @@ function logSlowCaseListRequest(params: {
     scope: params.scope,
     limit: params.limit,
     hasSearch: params.hasSearch,
+    queryMode: params.queryMode,
     timings: Object.fromEntries(
       Object.entries(params.timing).map(([key, value]) => [
         key,
@@ -177,53 +182,6 @@ function logSlowCaseListRequest(params: {
       ])
     ),
   });
-}
-
-function isMissingSearchTextColumn(error: unknown) {
-  if (!error || typeof error !== "object") {
-    return false;
-  }
-
-  const record = error as Record<string, unknown>;
-  const message = [record.message, record.details, record.hint, record.code]
-    .filter((value): value is string => typeof value === "string")
-    .join(" ");
-
-  return /search_text|schema cache|could not find|column .* does not exist|42703|PGRST/i.test(message);
-}
-
-function encodeCaseListCursor(row: CaseListRow, scope: CaseListScope) {
-  const sortValue = scope === "deleted" ? row.deleted_at : row.created_at;
-  if (!sortValue) {
-    return null;
-  }
-
-  return Buffer.from(JSON.stringify({ sortValue, id: row.id }), "utf8").toString("base64url");
-}
-
-function decodeCaseListCursor(value: string | null): CaseListCursor | null {
-  if (!value) {
-    return null;
-  }
-
-  try {
-    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Partial<CaseListCursor>;
-    if (
-      typeof parsed.sortValue === "string" &&
-      parsed.sortValue.trim().length > 0 &&
-      typeof parsed.id === "string" &&
-      parsed.id.trim().length > 0
-    ) {
-      return {
-        sortValue: parsed.sortValue,
-        id: parsed.id,
-      };
-    }
-  } catch {
-    return null;
-  }
-
-  return null;
 }
 
 function normalizeCaseSearchQuery(value: string | null) {
@@ -541,7 +499,8 @@ function duplicateCaseMessage(row: DuplicateCaseCandidate) {
 async function fetchAllOwnerCaseCandidates(
   supabase: ReturnType<typeof createSupabaseAdminClient>,
   ownerUserId: string,
-  uploadCount: number
+  uploadCount: number,
+  scope?: {access_organization_id:string;access_company_id:string}|null
 ) {
   const rows: DuplicateCaseCandidate[] = [];
   const pageSize = 1000;
@@ -550,7 +509,7 @@ async function fetchAllOwnerCaseCandidates(
     const { data, error } = await supabase
       .from("packet_cases")
       .select("id, display_name, status, created_at, upload_count, processing_meta")
-      .eq("owner_user_id", ownerUserId)
+      .or(scope ? `and(access_organization_id.eq.${JSON.stringify(scope.access_organization_id)},access_company_id.eq.${JSON.stringify(scope.access_company_id)})` : `owner_user_id.eq.${JSON.stringify(ownerUserId)}`)
       .eq("upload_count", uploadCount)
       .order("created_at", { ascending: false })
       .range(offset, offset + pageSize - 1);
@@ -673,13 +632,15 @@ async function findDuplicateCaseForUpload(params: {
   ownerUserId: string;
   files: PreparedUploadFile[];
   uploadFingerprint: string | null;
+  scope?: {access_organization_id:string;access_company_id:string}|null;
 }) {
   if (params.files.length === 0 || !params.uploadFingerprint) return null;
 
   const candidates = await fetchAllOwnerCaseCandidates(
     params.supabase,
     params.ownerUserId,
-    params.files.length
+    params.files.length,
+    params.scope
   );
   const contentSignature = getUploadContentSignature(params.files);
   const legacySignature = getLegacyUploadSignature(params.files);
@@ -997,6 +958,7 @@ async function fetchLegacyCaseListRows(params: {
   statusValues: string[] | null;
   searchQuery: string;
   sortMode: CaseListSortMode;
+  signal?: AbortSignal;
 }) {
   const pageSize = 1000;
   const rows: CaseListRow[] = [];
@@ -1018,16 +980,16 @@ async function fetchLegacyCaseListRows(params: {
       query = query.order("created_at", { ascending: params.sortMode === "oldest" }).order("id", { ascending: false });
     }
 
-    const result = await query.range(offset, offset + pageSize - 1);
+    const result = await query.range(offset, offset + pageSize - 1).abortSignal(params.signal ?? new AbortController().signal);
     if (result.error) {
       throw result.error;
     }
 
     rows.push(
-      ...((result.data ?? []) as Omit<CaseListRow, "deleted_at">[]).map((row) => ({
-        ...row,
-        deleted_at: getRecycleBinDeletedAt(row.processing_meta),
-      }))
+      ...((result.data ?? []) as unknown as Omit<CaseListRow, "deleted_at">[]).map((raw) => {
+        const row = restoreCaseListMetadata(raw);
+        return { ...row, deleted_at: getRecycleBinDeletedAt(row.processing_meta) };
+      })
     );
 
     if (!result.data || result.data.length < pageSize) break;
@@ -1065,7 +1027,7 @@ async function fetchLegacyCaseListRows(params: {
   }
   if (params.scope === "active" && params.sortMode === "oldest") {
     return [...scopedRows].sort(
-      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime() || a.id.localeCompare(b.id)
+      (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime() || b.id.localeCompare(a.id)
     );
   }
   if (params.scope === "active") {
@@ -1077,7 +1039,7 @@ async function fetchLegacyCaseListRows(params: {
   return scopedRows;
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   const startedAt = nowMs();
   const timing: CaseListTiming = {};
 
@@ -1093,6 +1055,7 @@ export async function GET(request: Request) {
       );
     }
 
+    const accessPredicate = await listAccessPredicate(request,user.id,new URL(request.url).searchParams.get('scope')==='deleted'?'purchases.recycle':'purchases.view');
     const supabase = createSupabaseAdminClient();
     const url = new URL(request.url);
     const requestedLimit = Number(url.searchParams.get("limit") ?? String(DEFAULT_CASE_LIST_LIMIT));
@@ -1110,10 +1073,12 @@ export async function GET(request: Request) {
         console.error("Failed to retry pending Storage cleanup", cleanupError);
       }
     }
-    const cursor = decodeCaseListCursor(url.searchParams.get("cursor"));
     const searchQuery = normalizeCaseSearchQuery(url.searchParams.get("q"));
     const statusFilter = readCaseStatusFilter(url.searchParams.get("status"));
     const sortMode = readCaseSortMode(url.searchParams.get("sort"));
+    let cursor;
+    try { cursor = readCaseCursor(url.searchParams.get('cursor'), scope, sortMode); }
+    catch { return jsonWithCors(request, {error:'Invalid pagination cursor. Restart from the first page.'}, {status:400}); }
     const statusValues = getCaseStatusesForFilter(statusFilter);
     const limit =
       Number.isFinite(requestedLimit) && requestedLimit > 0
@@ -1129,13 +1094,14 @@ export async function GET(request: Request) {
 
     let data: CaseListRow[] | null = null;
     let totalCount: number | null = null;
+    let queryMode = "database-pagination";
 
     try {
       const queryStartedAt = nowMs();
       let query = supabase
         .from("packet_cases")
         .select(LIST_COLUMNS, usePageNumbers ? { count: "exact" } : undefined)
-        .eq("owner_user_id", user.id);
+        .or(accessPredicate);
 
       if (scope === "deleted") {
         query = query.not("deleted_at", "is", null);
@@ -1143,7 +1109,7 @@ export async function GET(request: Request) {
           query = query.in("status", statusValues);
         }
         if (cursor) {
-          query = query.or(`deleted_at.lt.${cursor.sortValue},and(deleted_at.eq.${cursor.sortValue},id.lt.${cursor.id})`);
+          query = query.or(cursorPredicate(cursor, scope, sortMode));
         }
         query = query.order("deleted_at", { ascending: false }).order("id", { ascending: false });
       } else {
@@ -1152,7 +1118,7 @@ export async function GET(request: Request) {
           query = query.in("status", statusValues);
         }
         if (cursor) {
-          query = query.or(`created_at.lt.${cursor.sortValue},and(created_at.eq.${cursor.sortValue},id.lt.${cursor.id})`);
+          query = query.or(cursorPredicate(cursor, scope, sortMode));
         }
         if (sortMode === "name") {
           query = query.order("display_name", { ascending: true }).order("id", { ascending: true });
@@ -1167,22 +1133,24 @@ export async function GET(request: Request) {
 
       const result =
         usePageNumbers && rangeStart !== null && rangeEnd !== null
-          ? await query.range(rangeStart, rangeEnd)
-          : await query.limit(limit + 1);
+          ? await query.range(rangeStart, rangeEnd).abortSignal(request.signal)
+          : await query.limit(limit + 1).abortSignal(request.signal);
       timing.caseQuery = nowMs() - queryStartedAt;
       if (result.error) {
         throw result.error;
       }
       totalCount = usePageNumbers ? (result.count ?? 0) : null;
-      data = result.data as CaseListRow[];
+      data = (result.data as unknown as CaseListRow[]).map(restoreCaseListMetadata);
     } catch (error) {
-      if (searchQuery && isMissingSearchTextColumn(error) && !isRecycleBinSchemaMissing(error)) {
+      if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
+      if (searchQuery && missingCaseColumn(error, 'search_text')) {
+        queryMode = "database-pagination-search-fallback";
         const queryStartedAt = nowMs();
         const searchPattern = `%${escapePostgrestOrValue(escapeIlikePattern(searchQuery))}%`;
         let fallbackSearchQuery = supabase
           .from("packet_cases")
           .select(LIST_COLUMNS, usePageNumbers ? { count: "exact" } : undefined)
-          .eq("owner_user_id", user.id);
+          .or(accessPredicate);
 
         if (scope === "deleted") {
           fallbackSearchQuery = fallbackSearchQuery.not("deleted_at", "is", null);
@@ -1191,7 +1159,7 @@ export async function GET(request: Request) {
           }
           if (cursor) {
             fallbackSearchQuery = fallbackSearchQuery.or(
-              `deleted_at.lt.${cursor.sortValue},and(deleted_at.eq.${cursor.sortValue},id.lt.${cursor.id})`
+              cursorPredicate(cursor, scope, sortMode)
             );
           }
           fallbackSearchQuery = fallbackSearchQuery
@@ -1204,7 +1172,7 @@ export async function GET(request: Request) {
           }
           if (cursor) {
             fallbackSearchQuery = fallbackSearchQuery.or(
-              `created_at.lt.${cursor.sortValue},and(created_at.eq.${cursor.sortValue},id.lt.${cursor.id})`
+              cursorPredicate(cursor, scope, sortMode)
             );
           }
           if (sortMode === "name") {
@@ -1230,20 +1198,21 @@ export async function GET(request: Request) {
 
         const fallbackSearchResult =
           usePageNumbers && rangeStart !== null && rangeEnd !== null
-            ? await fallbackSearchQuery.range(rangeStart, rangeEnd)
-            : await fallbackSearchQuery.limit(limit + 1);
+            ? await fallbackSearchQuery.range(rangeStart, rangeEnd).abortSignal(request.signal)
+            : await fallbackSearchQuery.limit(limit + 1).abortSignal(request.signal);
         timing.caseQuery = (timing.caseQuery ?? 0) + nowMs() - queryStartedAt;
         if (fallbackSearchResult.error) {
           throw fallbackSearchResult.error;
         }
         totalCount = usePageNumbers ? (fallbackSearchResult.count ?? 0) : null;
-        data = fallbackSearchResult.data as CaseListRow[];
+        data = (fallbackSearchResult.data as unknown as CaseListRow[]).map(restoreCaseListMetadata);
       } else {
         if (!isRecycleBinSchemaMissing(error)) {
           throw error;
         }
 
         const queryStartedAt = nowMs();
+        if(process.env.TEAM_ACCESS_ENFORCEMENT==='true')throw new AccessError('Scoped listing requires the reviewed database migration.',503);
         const legacyRows = await fetchLegacyCaseListRows({
           supabase,
           userId: user.id,
@@ -1251,7 +1220,9 @@ export async function GET(request: Request) {
           statusValues,
           searchQuery,
           sortMode,
+          signal: request.signal,
         });
+        queryMode = "legacy-all-rows";
         timing.caseQuery = (timing.caseQuery ?? 0) + nowMs() - queryStartedAt;
 
         if (usePageNumbers && rangeStart !== null && rangeEnd !== null) {
@@ -1272,7 +1243,7 @@ export async function GET(request: Request) {
       usePageNumbers && page !== null && totalCount !== null
         ? page * limit < totalCount
         : rawRows.length > limit;
-    const nextCursor = hasMore ? encodeCaseListCursor(pageRows[pageRows.length - 1], scope) : null;
+    const nextCursor = hasMore && pageRows.length ? makeCaseCursor(pageRows[pageRows.length - 1], scope, sortMode) : null;
     const totalPages =
       usePageNumbers && totalCount !== null ? Math.max(1, Math.ceil(totalCount / limit)) : null;
 
@@ -1281,7 +1252,7 @@ export async function GET(request: Request) {
     let mismatchCountsByCaseId = new Map<string, number>();
 
     if (shouldDeriveSummaryFromDocuments && pageRows.length > 0) {
-      fieldConfiguration = await getPersistedPacketFieldConfiguration();
+      fieldConfiguration = await getPersistedPacketFieldConfiguration(process.env.TEAM_ACCESS_ENFORCEMENT==='true'?(await requireAccessContext(request)).organizationId:'default');
       documentsByCaseId = await fetchCaseDocumentsForSummary(
         supabase,
         pageRows.map((row) => row.id),
@@ -1316,10 +1287,11 @@ export async function GET(request: Request) {
     };
     timing.serialize = nowMs() - serializeStartedAt;
     timing.total = nowMs() - startedAt;
-    logSlowCaseListRequest({ scope, limit, hasSearch: Boolean(searchQuery), timing });
+    logSlowCaseListRequest({ scope, limit, hasSearch: Boolean(searchQuery), queryMode, timing });
 
     return attachCaseListTiming(jsonWithCors(request, body), timing);
   } catch (error) {
+      if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
     timing.total = nowMs() - startedAt;
     return attachCaseListTiming(
       jsonWithCors(request,
@@ -1333,7 +1305,7 @@ export async function GET(request: Request) {
   }
 }
 
-export async function POST(request: Request) {
+async function POSTHandler(request: Request) {
   let supabase: ReturnType<typeof createSupabaseAdminClient> | null = null;
   const uploadedPaths: StorageObjectCandidate[] = [];
   let caseId = "";
@@ -1346,6 +1318,7 @@ export async function POST(request: Request) {
 
     supabase = createSupabaseAdminClient();
     const formData = (await request.formData()) as unknown as WebFormData;
+    const resourceScope = await newResourceScope(request, formData.get('accessCompanyId'), 'purchases.prepare');
     const mode = typeof formData.get("mode") === "string" ? formData.get("mode") : null;
     const allowDuplicateUpload = readBooleanFormValue(formData.getAll("allowDuplicate")[0]);
     const files = formData.getAll("files").filter(isFileEntry);
@@ -1356,6 +1329,7 @@ export async function POST(request: Request) {
     const uploadFingerprint = await getUploadFingerprint(preparedFiles);
     if (!allowDuplicateUpload) {
       const duplicateCase = await findDuplicateCaseForUpload({
+        scope: resourceScope,
         supabase,
         ownerUserId: user.id,
         files: preparedFiles,
@@ -1438,7 +1412,7 @@ export async function POST(request: Request) {
 
       const { data: insertedCase, error: caseError } = await supabase
         .from("packet_cases")
-        .insert(caseRow)
+        .insert({...caseRow,...resourceScope})
         .select(
           "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
         )
@@ -1448,6 +1422,7 @@ export async function POST(request: Request) {
         if (isDuplicateUploadConstraintError(caseError)) {
           await cleanupUploadedFiles(supabase, uploadedPaths);
           const duplicate = await findDuplicateCaseForUpload({
+            scope: resourceScope,
             supabase,
             ownerUserId: user.id,
             files: preparedFiles,
@@ -1473,7 +1448,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const fieldConfiguration = await getPersistedPacketFieldConfiguration();
+    const fieldConfiguration = await getPersistedPacketFieldConfiguration(resourceScope?.access_organization_id ?? 'default');
     const documents = enrichDocumentsWithPacketGstTaxContext(
       sanitizeDocumentsForStorage(
         parseJsonField<CaseDoc[]>(formData.get("documents"), "documents"),
@@ -1558,7 +1533,7 @@ export async function POST(request: Request) {
 
     const { data: insertedCase, error: caseError } = await supabase
       .from("packet_cases")
-      .insert(caseRow)
+      .insert({...caseRow,...resourceScope})
       .select(
         "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta"
       )
@@ -1568,6 +1543,7 @@ export async function POST(request: Request) {
       if (isDuplicateUploadConstraintError(caseError)) {
         await cleanupUploadedFiles(supabase, uploadedPaths);
         const duplicate = await findDuplicateCaseForUpload({
+          scope: resourceScope,
           supabase,
           ownerUserId: user.id,
           files: preparedFiles,
@@ -1639,7 +1615,7 @@ export async function POST(request: Request) {
       {
         error: serializeError(error),
       },
-      { status: 500 }
+      { status: error instanceof AccessError?error.status:500 }
     );
   }
 }
@@ -1647,3 +1623,6 @@ export async function POST(request: Request) {
 export async function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
+
+export const GET = withTeamAccess(GETHandler);
+export const POST = withTeamAccess(POSTHandler);

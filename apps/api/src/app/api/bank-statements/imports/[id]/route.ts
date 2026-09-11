@@ -1,3 +1,6 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
+import {listAccessPredicate} from '@/lib/access/list-scope';
+import {requireResourceAccess} from '@/lib/access/resources';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { masterParentDescendsFromGroup } from "@/lib/bank-statement-ledger-safety";
@@ -9,6 +12,7 @@ import {
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createBankStatementJobResult } from "@/lib/bank-statement-worker-pool";
 import { tallyMasterFreshnessCutoff } from "@/lib/tally/masters";
+import { bankLocalStatus } from "@/lib/processing/bank-local-status.mjs";
 
 export const runtime = "nodejs";
 
@@ -57,7 +61,8 @@ async function resolveStatementBankLedger(
   connectionId: string | null,
   accountNumber: string | null,
   savedCandidates: Array<{ accountNumber?: string | null; tallyLedgerName?: string | null }>,
-  legacyProvidedLedgerName: string | null | undefined
+  legacyProvidedLedgerName: string | null | undefined,
+  scopedSavedMappingsOnly=false
 ) {
   const legacyProvidedLedger = String(legacyProvidedLedgerName ?? "").trim();
   const normalizedAccountNumber = normalizeBankAccountNumber(accountNumber);
@@ -82,6 +87,7 @@ async function resolveStatementBankLedger(
   if (savedLedgers.length > 1) {
     return { ledgerName: null, source: "ambiguous_saved_bank_account_mapping", requiresSelection: true, verified: false };
   }
+  if(scopedSavedMappingsOnly)return {ledgerName:legacyProvidedLedger||null,source:'company_scoped_mapping_required',requiresSelection:!legacyProvidedLedger,verified:false};
 
   if (!connectionId || !normalizedAccountNumber) {
     return {
@@ -232,7 +238,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(
+async function GETHandler(
   request: Request,
   context: { params: Promise<{ id: string }> }
 ) {
@@ -243,6 +249,7 @@ export async function GET(
     }
 
     const { id } = await context.params;
+    const team=process.env.TEAM_ACCESS_ENFORCEMENT==='true'?await requireResourceAccess(request,'bank_import',id,'bank.view'):null;
     const requestUrl = new URL(request.url);
     const includeTransactions = requestUrl.searchParams.get("includeTransactions") !== "false";
     const transactionsPage = Math.max(1, Number(requestUrl.searchParams.get("transactionsPage") ?? 1) || 1);
@@ -255,7 +262,7 @@ export async function GET(
       .from("bank_statement_imports")
       .select("*")
       .eq("id", id)
-      .eq("owner_user_id", user.id)
+      .or(await listAccessPredicate(request,user.id,'bank.view'))
       .single();
 
     if (importError || !importRow) {
@@ -266,7 +273,7 @@ export async function GET(
       .from("bank_statement_extraction_jobs")
       .select("*")
       .eq("import_id", id)
-      .eq("owner_user_id", user.id)
+      .or(team?'id.not.is.null':`owner_user_id.eq.${JSON.stringify(user.id)}`)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -275,7 +282,17 @@ export async function GET(
     let jobRow = latestJobRow;
 
     const processingMeta = readRecord(importRow.processing_meta);
+    const localStatus = bankLocalStatus(importRow, jobRow);
+    if (localStatus && requestUrl.searchParams.get("statusOnly") === "true") {
+      return jsonWithCors(request, localStatus, { headers: { "Cache-Control": "no-store" } });
+    }
+    if (localStatus && !jobRow) {
+      return jsonWithCors(request, { error: localStatus.job.error }, { status: 409 });
+    }
     const effectiveImportStatus = getEffectiveImportStatus(importRow as Record<string, unknown>);
+    if(team&&!jobRow&&effectiveImportStatus==='processing')return jsonWithCors(request,
+      {error:'This statement has no active analysis job. Ask an operator to retry analysis.',code:'BANK_ANALYSIS_JOB_MISSING'},
+      {status:409,headers:{'Cache-Control':'private, no-store'}});
     const previewMeta = readRecord(processingMeta.preview);
     const previewAccount = readRecord(previewMeta.account);
     const storedPreviewTransactions = isPreviewTransactionArray(previewMeta.transactions);
@@ -287,7 +304,7 @@ export async function GET(
         .from("bank_statement_import_preview_transactions")
         .select("*", { count: "exact" })
         .eq("import_id", id)
-        .eq("owner_user_id", user.id)
+        .or(team?'id.not.is.null':`owner_user_id.eq.${JSON.stringify(user.id)}`)
         .order("row_index", { ascending: true })
         .range(rangeStart, rangeStart + transactionsPageSize - 1);
 
@@ -319,7 +336,7 @@ export async function GET(
       !jobIsTerminal &&
       (effectiveImportStatus === "processing" || analysisStatus === "queued" || analysisStatus === "processing");
 
-    if (!jobRow && processing) {
+    if (!jobRow && processing && !team) {
       const { data: repairedJobRow, error: repairJobError } = await supabase
         .from("bank_statement_extraction_jobs")
         .insert({
@@ -366,7 +383,7 @@ export async function GET(
       tallyLedgerName:
         typeof processingMeta.tallyLedgerName === "string" ? processingMeta.tallyLedgerName : null,
     };
-    const candidates = Array.isArray(previewMeta.candidates)
+    const candidates = !team&&Array.isArray(previewMeta.candidates)
       ? previewMeta.candidates
       : ["ready_to_review", "ready_to_confirm", "needs_account_selection"].includes(effectiveImportStatus)
       ? await findBankAccountCandidates(supabase, user.id, {
@@ -374,7 +391,7 @@ export async function GET(
           accountNumber: account.accountNumber,
           accountHolderName: account.accountHolderName,
           ifscCode: account.ifscCode,
-        })
+        },team?{organizationId:team.scope.organization_id,companyId:team.scope.company_id!}:undefined)
       : [];
     const bankLedgerResolution = processing
       ? {
@@ -388,15 +405,16 @@ export async function GET(
           user.id,
           readConnectionIdFromMeta(processingMeta),
           account.accountNumber,
-          candidates,
-          account.tallyLedgerName
+          team?candidates.map(serializeAccount):candidates,
+          account.tallyLedgerName,
+          Boolean(team)
         );
     account.tallyLedgerName = bankLedgerResolution.ledgerName;
 
     return jsonWithCors(request, {
       import: serializeImport(importRow as Record<string, unknown>),
       account,
-      candidates: Array.isArray(previewMeta.candidates) ? candidates : candidates.map(serializeAccount),
+      candidates: !team&&Array.isArray(previewMeta.candidates) ? candidates : candidates.map(serializeAccount),
       bankLedgerResolution,
       transactions,
       transactionsTotal,
@@ -430,3 +448,5 @@ export async function GET(
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);

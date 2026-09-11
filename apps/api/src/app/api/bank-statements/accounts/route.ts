@@ -1,5 +1,8 @@
+import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { listAccessPredicate } from "@/lib/access/list-scope";
+import { AccessError } from "@/lib/access/server";
 import { serializeAccount } from "@/lib/bank-statements";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
@@ -9,7 +12,7 @@ export function OPTIONS(request: Request) {
   return optionsWithCors(request);
 }
 
-export async function GET(request: Request) {
+async function GETHandler(request: Request) {
   try {
     const user = await requireRequestUser(request);
     if (!user) {
@@ -18,11 +21,12 @@ export async function GET(request: Request) {
 
     const url = new URL(request.url);
     const query = url.searchParams.get("query")?.trim();
+    const accessPredicate=await listAccessPredicate(request,user.id,"bank.view");
     const supabase = createSupabaseAdminClient();
     let requestBuilder = supabase
       .from("bank_accounts")
       .select("*")
-      .eq("owner_user_id", user.id)
+      .or(accessPredicate)
       .order("updated_at", { ascending: false })
       .limit(50);
 
@@ -39,7 +43,10 @@ export async function GET(request: Request) {
       accounts: (data ?? []).map(serializeAccount),
     });
   } catch (error) {
+    if(error instanceof AccessError)return jsonWithCors(request,{error:error.message},{status:error.status});
     console.error("Error in GET /api/bank-statements/accounts:", error);
     return jsonWithCors(request, { error: "Internal server error" }, { status: 500 });
   }
 }
+
+export const GET = withTeamAccess(GETHandler);

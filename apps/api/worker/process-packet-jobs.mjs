@@ -6,8 +6,14 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { createClient } from "@supabase/supabase-js";
+import {assertQueuedResource,QueuedAccessDenied} from '../src/lib/access/queued-authority.mjs';
+import {bankWorkerDataset,bankMasterQuery} from '../src/lib/access/bank-worker-scope.mjs';
 import sharp from "sharp";
 import { parseWithAnydoc } from "../src/lib/processing/anydoc-parser.ts";
+import { parseBankOnAgent } from "../src/lib/processing/local-bank-parsing.mjs";
+import { publishBankJobEvent } from '../src/lib/processing/bank-job-events.mjs';
+import { markCombinedLedgerRecommendationsCompleted, markBankLedgerRecommendationsUnavailable, prepareLocalExtraction } from '../src/lib/processing/bank-local-preview.mjs';
+import { parseDate, parseAmount, textCell, firstTextCell, normalizeName, titleCaseName, cleanCounterpartyCandidate, extractCounterpartyName, detectTransactionType, detectCategory, correctPreviewRowsFromRunningBalance, normalizeIfscCode, normalizeAccountNumber, maskAccountNumber, normalizeAiTransaction, normalizeAiBankStatement } from "../src/lib/processing/bank-preview-normalization.mjs";
 
 import { suggestBankLedgersForTransactions } from "../src/lib/bank-statement-ledger-matching.ts";
 import { correctRowsFromRunningBalance } from "./bank-statement-running-balance.mjs";
@@ -335,162 +341,17 @@ function estimateVisibleTransactionRows(page) {
   }).length;
 }
 
-function parseDate(value) {
-  const raw = String(value ?? "").trim();
-  if (!raw) return null;
-  const iso = raw.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
-  if (iso) {
-    const [, year, month, day] = iso;
-    return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
-  }
-  const indian = raw.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})/);
-  if (indian) {
-    const [, day, month, yearRaw] = indian;
-    const year = yearRaw.length === 2 ? `20${yearRaw}` : yearRaw;
-    return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
-  }
-  const parsed = new Date(raw);
-  if (Number.isNaN(parsed.getTime())) return null;
-  return parsed.toISOString().slice(0, 10);
-}
 
-function parseAmount(value) {
-  if (value === null || value === undefined) return null;
-  if (typeof value === "number") return Number.isFinite(value) ? value : null;
-  const raw = String(value).trim();
-  if (!raw) return null;
-  const negative = /^\(.*\)$/.test(raw) || /^-/.test(raw);
-  const cleaned = raw.replace(/[(),₹$€£\s]/g, "").replace(/^-/, "");
-  if (!cleaned || !/^\d+(\.\d+)?$/.test(cleaned)) return null;
-  const parsed = Number(cleaned);
-  return Number.isFinite(parsed) ? (negative ? -parsed : parsed) : null;
-}
 
-function textCell(value) {
-  return String(value ?? "").trim();
-}
 
-function firstTextCell(...values) {
-  for (const value of values) {
-    const text = textCell(value);
-    if (text) return text;
-  }
-  return "";
-}
 
-function normalizeName(value) {
-  return String(value ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
-function titleCaseName(value) {
-  return value
-    .toLowerCase()
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((part) => (part.length <= 3 ? part.toUpperCase() : `${part[0]?.toUpperCase() ?? ""}${part.slice(1)}`))
-    .join(" ");
-}
 
-const COUNTERPARTY_PREFIXES = new Set([
-  "neft",
-  "rtgs",
-  "imps",
-  "upi",
-  "ach",
-  "ecs",
-  "nach",
-  "cr",
-  "dr",
-  "credit",
-  "debit",
-  "from",
-  "to",
-  "by",
-  "hdfc",
-  "icici",
-  "sbi",
-  "axis",
-  "kotak",
-  "idfc",
-  "indusind",
-  "canara",
-  "federal",
-  "yes",
-]);
 
-function cleanCounterpartyCandidate(value) {
-  let cleaned = String(value ?? "")
-    .replace(/\b(?:utr|ref|reference|invoice|bill|chq|cheque|txn|transaction)\b[\s:#/-]*[a-z0-9-]+.*$/i, "")
-    .replace(/[^a-zA-Z0-9 .&'/-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
 
-  for (let index = 0; index < 5; index += 1) {
-    const match = cleaned.match(/^([a-z0-9]+)(?:\s+|[-:/._]+)(.+)$/i);
-    if (!match) break;
-    const prefix = match[1].toLowerCase();
-    if (!COUNTERPARTY_PREFIXES.has(prefix) && !/^\d{4,}$/.test(prefix)) break;
-    cleaned = match[2].trim();
-  }
 
-  return cleaned
-    .split(/\s*[/|]\s*/)[0]
-    .replace(/[-:/._\s]+$/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
-function extractCounterpartyName(description) {
-  const raw = String(description ?? "").replace(/\s+/g, " ").trim();
-  if (!raw) return null;
-  const patterns = [
-    /\b(?:neft|rtgs|imps)\s+(?:receipt\s+)?from\s+(.+?)(?:\s+(?:utr|ref|reference|a\/c|ac|account|ifsc|on)\b|$)/i,
-    /\b(?:neft|rtgs|imps)\s+(?:payment\s+)?to\s+(.+?)(?:\s+(?:utr|ref|reference|a\/c|ac|account|ifsc|on)\b|$)/i,
-    /\b(?:neft|rtgs|imps)\s+(.+?)(?:\s+(?:utr|ref|reference|a\/c|ac|account|ifsc|on)\b|$)/i,
-    /\bupi\s+(?:payment\s+)?to\s+(.+?)(?:\s+(?:upi|ref|reference|txn|transaction|on)\b|$)/i,
-    /\bupi\s+(?:receipt\s+)?from\s+(.+?)(?:\s+(?:upi|ref|reference|txn|transaction|on)\b|$)/i,
-    /\bupi\s+(.+?)(?:\s+(?:upi|ref|reference|txn|transaction|on)\b|$)/i,
-  ];
-  for (const pattern of patterns) {
-    const match = raw.match(pattern);
-    const candidate = cleanCounterpartyCandidate(match?.[1]);
-    if (candidate && normalizeName(candidate).length >= 3) return titleCaseName(candidate);
-  }
-  return null;
-}
 
-function detectTransactionType(description) {
-  const text = String(description || "").toLowerCase();
-  if (/\bupi\b/.test(text)) return "upi";
-  if (/\bneft\b/.test(text)) return "neft";
-  if (/\brtgs\b/.test(text)) return "rtgs";
-  if (/\bimps\b/.test(text)) return "imps";
-  if (/\bcheque|chq\b/.test(text)) return "cheque";
-  if (/\bcash\b/.test(text)) return "cash";
-  if (/\bcharge|charges|fee|gst\b/.test(text)) return "bank_charge";
-  if (/\binterest\b/.test(text)) return "interest";
-  return "unknown";
-}
-
-function detectCategory(description, debitAmount, creditAmount) {
-  const text = String(description || "").toLowerCase();
-  if (/\bcharge|charges|fee|gst\b/.test(text)) return "bank_charges";
-  if (/\btax|tds|gst\b/.test(text)) return "tax";
-  if (/\bsalary|wages\b/.test(text)) return "salary";
-  if (/\bloan|emi\b/.test(text)) return "loan_or_emi";
-  if (/\bself|own account|internal transfer|transfer to own\b/.test(text)) return "internal_transfer";
-  if ((creditAmount ?? 0) > 0) return "receipt";
-  if ((debitAmount ?? 0) > 0) return "payment";
-  return "unknown";
-}
-
-function correctPreviewRowsFromRunningBalance(transactions, openingBalance = null) {
-  return correctRowsFromRunningBalance(transactions, { openingBalance, detectCategory });
-}
 
 function safeJsonParse(raw, fallback) {
   try {
@@ -524,21 +385,8 @@ function parseBankStatementAiResponse(raw) {
   }
 }
 
-function normalizeIfscCode(value) {
-  const normalized = String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
-  return normalized.slice(0, 16);
-}
 
-function normalizeAccountNumber(value) {
-  return String(value ?? "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
-}
 
-function maskAccountNumber(value) {
-  const normalized = normalizeAccountNumber(value);
-  if (!normalized) return "";
-  if (normalized.length <= 4) return normalized;
-  return `${"*".repeat(Math.max(0, normalized.length - 4))}${normalized.slice(-4)}`;
-}
 
 // Account numbers are often present in rendered Markdown even when the
 // combined extraction model omits the account object.
@@ -679,118 +527,7 @@ async function renderBankStatementPdfToImages(data, sourceName, options = {}) {
   }
 }
 
-function normalizeAiTransaction(value, rowNumber) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const row = value;
-  const transactionDate = parseDate(row.transactionDate ?? row.date ?? row.txnDate ?? row.postingDate);
-  const description = firstTextCell(
-    row.fullNarration,
-    row["full narration"],
-    row.bankNarration,
-    row["bank narration"],
-    row.transactionNarration,
-    row["transaction narration"],
-    row.description,
-    row.narration,
-    row.particulars,
-    row.remarks,
-    row.details,
-    row.transactionDetails,
-    row["transaction details"],
-    row.transactionDescription,
-    row["transaction description"],
-    row.rawLine,
-    row["raw line"]
-  );
-  if (!transactionDate || !description) return null;
 
-  const debitAmount = parseAmount(row.debitAmount ?? row.debit ?? row.withdrawal ?? row.paidOut);
-  const creditAmount = parseAmount(row.creditAmount ?? row.credit ?? row.deposit ?? row.paidIn);
-  const balanceAmount = parseAmount(row.balanceAmount ?? row.balance ?? row.runningBalance ?? row.closingBalance);
-  const hasDebit = typeof debitAmount === "number" && debitAmount > 0;
-  const hasCredit = typeof creditAmount === "number" && creditAmount > 0;
-  if (hasDebit === hasCredit) return null;
-  const transactionType = detectTransactionType(description);
-  const category = detectCategory(description, debitAmount, creditAmount);
-  const counterpartyName = extractCounterpartyName(description);
-
-  return {
-    row_index: rowNumber,
-    transaction_date: transactionDate,
-    value_date: parseDate(row.valueDate) ?? transactionDate,
-    description,
-    reference_number: textCell(row.referenceNumber ?? row.reference ?? row.utr ?? row.chequeNumber) || null,
-    debit_amount: debitAmount,
-    credit_amount: creditAmount,
-    balance_amount: balanceAmount,
-    transaction_type: transactionType,
-    category,
-    counterparty_name: counterpartyName,
-    suggested_ledger_name: textCell(row.suggestedLedgerName) || null,
-    suggestion_confidence:
-      typeof row.suggestionConfidence === "number" && Number.isFinite(row.suggestionConfidence)
-        ? Math.max(0, Math.min(1, row.suggestionConfidence))
-        : null,
-    suggestion_reason: textCell(row.suggestionReason) || null,
-    confirmed_ledger_name: textCell(row.confirmedLedgerName) || null,
-    additional_charges: transactionType === "bank_charge" ? [{ type: "bank_charge", amount: debitAmount }] : [],
-    confidence: 0.9,
-    raw_payload: { rowNumber, source: "openrouter_bank_statement_v1", row },
-  };
-}
-
-function normalizeAiBankStatement(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return {
-      account: { bankName: null, accountNumber: null, accountHolderName: null, ifscCode: null },
-      statementPeriodStart: null,
-      statementPeriodEnd: null,
-      openingBalance: null,
-      transactions: [],
-      pageResults: [],
-    };
-  }
-  const parsed = value;
-  const account = parsed.account && typeof parsed.account === "object" && !Array.isArray(parsed.account)
-    ? parsed.account
-    : parsed;
-  const transactions = Array.isArray(parsed.transactions)
-    ? parsed.transactions.flatMap((row, index) => {
-        const transaction = normalizeAiTransaction(row, index + 1);
-        return transaction ? [transaction] : [];
-      })
-    : [];
-
-  const openingBalance = parseAmount(
-    parsed.openingBalance ??
-      parsed.opening_balance ??
-      parsed.balanceForward ??
-      parsed.balance_forward ??
-      parsed.broughtForwardBalance
-  );
-  const rawPageResults = Array.isArray(parsed.pageResults)
-    ? parsed.pageResults
-    : Array.isArray(parsed.page_results)
-      ? parsed.page_results
-      : [];
-  const pageResults = rawPageResults.filter((result) =>
-    result && typeof result === "object" && !Array.isArray(result)
-  );
-
-  return {
-    account: {
-      bankName: textCell(account.bankName ?? parsed.bankName) || null,
-      accountNumber: textCell(account.accountNumber ?? parsed.accountNumber) || null,
-      accountHolderName: textCell(account.accountHolderName ?? account.accountName ?? parsed.accountHolderName) || null,
-      ifscCode: normalizeIfscCode(textCell(account.ifscCode ?? parsed.ifscCode)) || null,
-    },
-    statementPeriodStart: parseDate(parsed.statementPeriodStart) ?? parseDate(parsed.periodStart),
-    statementPeriodEnd: parseDate(parsed.statementPeriodEnd) ?? parseDate(parsed.periodEnd),
-    openingBalance,
-    transactions: correctPreviewRowsFromRunningBalance(transactions, openingBalance),
-    pageResults,
-  };
-}
 
 function bankAccountNumberFromTallyLedger(ledger) {
   const raw = ledger?.raw_payload && typeof ledger.raw_payload === "object" && !Array.isArray(ledger.raw_payload)
@@ -804,18 +541,14 @@ function bankAccountNumberFromTallyLedger(ledger) {
   return numbers.length === 1 ? numbers[0] : "";
 }
 
-async function getTallyBankAccountCandidates(ownerUserId, connectionId) {
+async function getTallyBankAccountCandidates(ownerUserId, connectionId, datasetId=null, companyName=null) {
   if (!connectionId) return [];
   const ledgers = [];
   const groups = [];
   const pageSize = 1000;
   for (const [masterType, target] of [["ledger", ledgers], ["group", groups]]) {
     for (let from = 0; from < 20000; from += pageSize) {
-      const { data, error } = await supabase
-        .from("tally_masters")
-        .select("tally_name, parent_name, raw_payload")
-        .eq("owner_user_id", ownerUserId)
-        .eq("connection_id", connectionId)
+      const { data, error } = await bankMasterQuery(supabase,'tally_name, parent_name, raw_payload',ownerUserId,connectionId,datasetId,companyName)
         .eq("master_type", masterType)
         .eq("is_active", true)
         .order("tally_name", { ascending: true })
@@ -853,16 +586,12 @@ async function getTallyBankAccountCandidates(ownerUserId, connectionId) {
   });
 }
 
-async function getTallyLedgerNames(ownerUserId, connectionId) {
+async function getTallyLedgerNames(ownerUserId, connectionId, datasetId=null, companyName=null) {
   if (!connectionId) return [];
   const names = [];
   const pageSize = 1000;
   for (let from = 0; from < 20000; from += pageSize) {
-    const { data, error } = await supabase
-      .from("tally_masters")
-      .select("tally_name")
-      .eq("owner_user_id", ownerUserId)
-      .eq("connection_id", connectionId)
+    const { data, error } = await bankMasterQuery(supabase,'tally_name',ownerUserId,connectionId,datasetId,companyName)
       .eq("master_type", "ledger")
       .eq("is_active", true)
       .order("tally_name", { ascending: true })
@@ -1913,36 +1642,6 @@ function bankLedgerMatchTransaction(row) {
   };
 }
 
-function markCombinedLedgerRecommendationsCompleted(rows, ledgerNames = []) {
-  const allowed = new Set(ledgerNames.map((name) => normalizeName(name)).filter(Boolean));
-  return rows.map((row) => {
-    const rawPayload =
-      row.raw_payload && typeof row.raw_payload === "object" && !Array.isArray(row.raw_payload)
-        ? row.raw_payload
-        : {};
-    const suggestedLedgerName = allowed.has(normalizeName(row.suggested_ledger_name))
-      ? row.suggested_ledger_name
-      : null;
-    return {
-      ...row,
-      suggested_ledger_name: suggestedLedgerName,
-      raw_payload: {
-        ...rawPayload,
-        aiLedgerRecommendation: {
-          matchType: suggestedLedgerName ? "direct_match" : "suspense",
-          action: suggestedLedgerName ? "use_existing_ledger" : "use_suspense",
-          ledgerName: suggestedLedgerName,
-          candidateLedgerNames: [],
-          confidence: row.suggestion_confidence ?? 0,
-          reason: row.suggestion_reason || null,
-          model: OPENROUTER_ANYDOC_MODEL,
-          source: "combined_ai_match",
-          status: "completed",
-        },
-      },
-    };
-  });
-}
 
 async function addBankLedgerRecommendations({
   rows,
@@ -1950,6 +1649,7 @@ async function addBankLedgerRecommendations({
   connectionId,
   accountId,
   companyName,
+  datasetId,
 }) {
   if (rows.length === 0) return rows;
 
@@ -1958,6 +1658,7 @@ async function addBankLedgerRecommendations({
     ownerUserId,
     connectionId,
     companyName,
+    datasetId,
     transactions: rows.map((row) => ({
       accountId,
       transaction: bankLedgerMatchTransaction(row),
@@ -2000,36 +1701,16 @@ async function addBankLedgerRecommendations({
   });
 }
 
-function markBankLedgerRecommendationsUnavailable(rows, reason, status = "unavailable") {
-  return rows.map((row) => {
-    const rawPayload =
-      row.raw_payload && typeof row.raw_payload === "object" && !Array.isArray(row.raw_payload)
-        ? row.raw_payload
-        : {};
-    return {
-      ...row,
-      suggested_ledger_name: null,
-      suggestion_confidence: null,
-      suggestion_reason: reason,
-      raw_payload: {
-        ...rawPayload,
-        aiLedgerRecommendation: {
-          matchType: "suspense",
-          action: "use_suspense",
-          ledgerName: null,
-          candidateLedgerNames: [],
-          confidence: null,
-          reason,
-          model: null,
-          source: "none",
-          status,
-        },
-      },
-    };
-  });
-}
 
 async function runBankStatementJob(job) {
+  let teamAccess;
+  try {
+    teamAccess=await assertQueuedResource(supabase,{actorId:job.owner_user_id,resourceType:'bank_import',resourceId:job.import_id,permission:'bank.prepare'});
+  } catch(error) {
+    if(!(error instanceof QueuedAccessDenied))throw error;
+    await updateBankJob(job.id,{status:'cancelled',error:error.message,stage:'Cancelled',locked_at:null,locked_by:null,finished_at:new Date().toISOString()});
+    return;
+  }
   const { data: importRow, error: importError } = await supabase
     .from("bank_statement_imports")
     .select("*")
@@ -2051,16 +1732,17 @@ async function runBankStatementJob(job) {
     return;
   }
 
-  await updateBankJob(job.id, { progress: 15, stage: "Downloading statement" });
-  const { data: storedFile, error: downloadError } = await supabase.storage
+  const useLocalParser = importRow.processing_meta?.selectedContext?.localParsing?.mode === "local_agent";
+  await updateBankJob(job.id, { progress: 15, stage: useLocalParser ? "Preparing document" : "Downloading statement" });
+  const { data: storedFile, error: downloadError } = useLocalParser ? { data: null, error: null } : await supabase.storage
     .from(importRow.storage_bucket || BANK_STATEMENT_BUCKET)
     .download(importRow.storage_path);
   if (downloadError) throw downloadError;
 
   const mimeType = importRow.mime_type || "";
   const fileName = importRow.original_file_name || "bank-statement";
-  const bytes = new Uint8Array(await storedFile.arrayBuffer());
-  if (bytes.byteLength === 0) {
+  const bytes = storedFile ? new Uint8Array(await storedFile.arrayBuffer()) : new Uint8Array();
+  if (!useLocalParser && bytes.byteLength === 0) {
     throw new Error(`Downloaded bank statement file "${fileName}" is empty.`);
   }
   const processingMeta =
@@ -2072,6 +1754,8 @@ async function runBankStatementJob(job) {
       ? processingMeta.selectedContext
       : {};
   const companyName = typeof selectedContext.companyName === "string" ? selectedContext.companyName : null;
+  const teamDataset = await bankWorkerDataset(supabase,job,teamAccess,selectedContext);
+  if(teamAccess && !teamDataset?.datasetId) throw new Error('Sync the selected company’s masters before analysing this document.');
   const analysisContext =
     processingMeta.analysis && typeof processingMeta.analysis === "object" && !Array.isArray(processingMeta.analysis)
       ? processingMeta.analysis
@@ -2082,11 +1766,10 @@ async function runBankStatementJob(job) {
       : typeof analysisContext.connectionId === "string"
         ? analysisContext.connectionId
         : null;
-  // An upload can outlive the browser connection that created it. Never use a
-  // revoked session for master lookup; resolve the newest live session for the
-  // same company before analysis continues.
+  // A company name is not a machine identity. Never switch this upload to
+  // another PC merely because it belongs to the same login.
   let effectiveTallyConnectionId = tallyConnectionId;
-  if (tallyConnectionId) {
+  if (tallyConnectionId && !teamAccess) {
     const { data: selectedConnection } = await supabase
       .from("tally_connections")
       .select("id, revoked_at, last_company_name")
@@ -2094,24 +1777,15 @@ async function runBankStatementJob(job) {
       .eq("owner_user_id", job.owner_user_id)
       .maybeSingle();
     if (selectedConnection?.revoked_at) {
-      const { data: replacement } = await supabase
-        .from("tally_connections")
-        .select("id")
-        .eq("owner_user_id", job.owner_user_id)
-        .is("revoked_at", null)
-        .in("status", ["company_loaded", "tally_reachable", "bridge_connected"])
-        .eq("last_company_name", companyName)
-        .order("updated_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      effectiveTallyConnectionId = replacement?.id || null;
+      throw new Error("The selected Tally pairing was revoked. Reconnect the intended machine and retry this upload.");
     }
   }
-  const liveTallyLedgerNames = Array.isArray(analysisContext.liveTallyLedgerNames)
-    ? Array.from(new Set(analysisContext.liveTallyLedgerNames.map((name) => textCell(name)).filter(Boolean))).slice(0, 20_000)
+  const ledgerContext = selectedContext.liveTallyLedgerNames ? selectedContext : analysisContext;
+  const liveTallyLedgerNames = Array.isArray(ledgerContext.liveTallyLedgerNames)
+    ? Array.from(new Set(ledgerContext.liveTallyLedgerNames.map((name) => textCell(name)).filter(Boolean))).slice(0, 20_000)
     : [];
-  const liveTallyBankAccountCandidates = Array.isArray(analysisContext.liveTallyBankAccountCandidates)
-    ? analysisContext.liveTallyBankAccountCandidates.flatMap((candidate) => {
+  const liveTallyBankAccountCandidates = Array.isArray(ledgerContext.liveTallyBankAccountCandidates)
+    ? ledgerContext.liveTallyBankAccountCandidates.flatMap((candidate) => {
         if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
         const ledgerName = textCell(candidate.ledgerName);
         const accountNumber = textCell(candidate.accountNumber).replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
@@ -2120,14 +1794,14 @@ async function runBankStatementJob(job) {
     : [];
   const bankAccountCandidates = liveTallyBankAccountCandidates.length > 0
     ? liveTallyBankAccountCandidates
-    : await getTallyBankAccountCandidates(job.owner_user_id, effectiveTallyConnectionId);
+    : await getTallyBankAccountCandidates(job.owner_user_id, effectiveTallyConnectionId,teamDataset?.datasetId,companyName);
   const ledgerNames = liveTallyLedgerNames.length > 0
     ? liveTallyLedgerNames
-    : await getTallyLedgerNames(job.owner_user_id, effectiveTallyConnectionId);
+    : await getTallyLedgerNames(job.owner_user_id, effectiveTallyConnectionId,teamDataset?.datasetId,companyName);
   console.log(
     `[worker] using ${ledgerNames.length} Tally ledger name(s) and ${bankAccountCandidates.length} bank candidate(s) for ${fileName}`
   );
-  await updateBankJob(job.id, { progress: 30, stage: "Preparing pages for AI" });
+  await updateBankJob(job.id, { progress: 30, stage: "Preparing document" });
   const isPdf = mimeType.includes("pdf") || /\.pdf$/i.test(fileName);
   const isImage = mimeType.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(fileName);
   // AI receives only the already-unlocked stored bytes and a neutral filename.
@@ -2136,7 +1810,15 @@ async function runBankStatementJob(job) {
   const stopHeartbeat = startBankJobHeartbeat(job.id);
   let extraction;
   try {
-    extraction = await extractBankStatementAdaptive({
+    if (useLocalParser) {
+      const local = await parseBankOnAgent({ supabase, job, importRow,
+        policy: selectedContext.localParsing, apiBase: APP_BASE_URL,
+        progress: (fields) => updateBankJob(job.id, fields),
+      });
+      extraction = prepareLocalExtraction(local);
+      const parsed = extraction.parsed;
+      console.log(`[worker] Local Agent ${local.diagnostics.machineName} parsed; AI returned ${parsed.transactions.length} rows (command ${local.commandId}).`);
+    } else extraction = await extractBankStatementAdaptive({
       fileName: analysisFileName,
       mimeType,
       bytes,
@@ -2188,11 +1870,10 @@ async function runBankStatementJob(job) {
     ifscCode: importRow.extracted_ifsc_code || parsed.account.ifscCode || null,
   };
   const normalizedAccountNumber = normalizeAccountNumber(account.accountNumber);
+  let accountQuery=supabase.from('bank_accounts').select('id');
+  accountQuery=teamAccess?accountQuery.eq('organization_id',teamAccess.organization_id).eq('company_id',teamAccess.company_id):accountQuery.eq('owner_user_id',job.owner_user_id);
   const { data: candidateRows, error: candidateError } = normalizedAccountNumber
-    ? await supabase
-        .from("bank_accounts")
-        .select("id")
-        .eq("owner_user_id", job.owner_user_id)
+    ? await accountQuery
         .eq("account_number_normalized", normalizedAccountNumber)
         .limit(5)
     : { data: [], error: null };
@@ -2230,6 +1911,7 @@ async function runBankStatementJob(job) {
             connectionId: effectiveTallyConnectionId,
             accountId: String(selectedAccountId || importRow.bank_account_id || ""),
             companyName,
+            datasetId:teamDataset?.datasetId,
           });
     } catch (error) {
       const detail = diagnosticError(error);
@@ -2253,18 +1935,6 @@ async function runBankStatementJob(job) {
   }
 
   await updateBankJob(job.id, { progress: 88, stage: "Saving preview rows" });
-  await supabase
-    .from("bank_statement_import_preview_transactions")
-    .delete()
-    .eq("import_id", job.import_id)
-    .eq("owner_user_id", job.owner_user_id);
-
-  if (previewRows.length > 0) {
-    const { error: previewInsertError } = await supabase
-      .from("bank_statement_import_preview_transactions")
-      .insert(previewRows);
-    if (previewInsertError) throw previewInsertError;
-  }
 
   const previousAnalysis =
     processingMeta.analysis && typeof processingMeta.analysis === "object" && !Array.isArray(processingMeta.analysis)
@@ -2272,12 +1942,10 @@ async function runBankStatementJob(job) {
       : {};
   const completedAt = new Date().toISOString();
   const analysisStage =
-    parsed.transactions.length > 0 ? "Statement analyzed" : "Extraction needs attention";
+    parsed.transactions.length > 0 && !extractionIncomplete ? "Statement analyzed" : "Extraction needs attention";
   const finalStatementPeriodStart = parsed.statementPeriodStart || importRow.statement_period_start || null;
   const finalStatementPeriodEnd = parsed.statementPeriodEnd || importRow.statement_period_end || null;
-  const { error: importUpdateError } = await supabase
-    .from("bank_statement_imports")
-    .update({
+  const importPatch = {
       bank_account_id: selectedAccountId,
       statement_period_start: finalStatementPeriodStart,
       statement_period_end: finalStatementPeriodEnd,
@@ -2318,12 +1986,8 @@ async function runBankStatementJob(job) {
           updatedAt: completedAt,
         },
       },
-    })
-    .eq("id", job.import_id)
-    .eq("owner_user_id", job.owner_user_id);
-  if (importUpdateError) throw importUpdateError;
-
-  await updateBankJob(job.id, {
+    };
+  const jobPatch = {
     status: "succeeded",
     progress: 100,
     stage: extractionIncomplete ? "Completed with unresolved pages" : "Completed",
@@ -2340,7 +2004,26 @@ async function runBankStatementJob(job) {
     locked_at: null,
     locked_by: null,
     finished_at: new Date().toISOString(),
-  });
+  };
+  if(teamAccess) {
+    await bankWorkerDataset(supabase,job,teamAccess,selectedContext);
+    const {error}=await supabase.rpc('access_bank_backend_finalize',{
+      p_job:job.id,p_attempt:job.attempt_count,p_worker:job.locked_by,p_import:importPatch,p_rows:previewRows,p_result:jobPatch.result,
+    });
+    if(error)throw error;
+    return;
+  }
+  const {error:deleteError}=await supabase.from('bank_statement_import_preview_transactions').delete()
+    .eq('import_id',job.import_id).eq('owner_user_id',job.owner_user_id);
+  if(deleteError)throw deleteError;
+  if(previewRows.length) {
+    const {error}=await supabase.from('bank_statement_import_preview_transactions').insert(previewRows);
+    if(error)throw error;
+  }
+  const {error:importUpdateError}=await supabase.from('bank_statement_imports').update(importPatch)
+    .eq('id',job.import_id).eq('owner_user_id',job.owner_user_id);
+  if(importUpdateError)throw importUpdateError;
+  await updateBankJob(job.id,jobPatch);
 }
 
 async function getJob(jobId) {
@@ -2595,6 +2278,29 @@ async function main() {
     `[worker] started name=${WORKER_NAME} pool=${WORKER_POOL} appBase=${APP_BASE_URL} pollMs=${WORKER_POLL_INTERVAL_MS} bankPdfMode=adaptive_ai batchPages=${BANK_STATEMENT_BATCH_PAGE_SIZE} concurrency=${BANK_STATEMENT_BATCH_CONCURRENCY}`
   );
   let lastIdleLogAt = 0;
+
+  // Recovery is independent of long legacy AI jobs. It only finalizes an
+  // existing structured checkpoint or expires an abandoned attempt; never AI.
+  if (process.env.BANK_LOCAL_PIPELINE_V2 === 'true') {
+    let recoveryRunning = false;
+    const recoveryTimer = setInterval(async () => {
+      if (recoveryRunning) return;
+      recoveryRunning = true;
+      try {
+        const { data, error } = await supabase.rpc('bank_local_v2_recover_next');
+        if (error) {
+          // Missing additive migration keeps legacy processing available.
+          if (error.code !== 'PGRST202') console.warn('[bank-v2] Recovery could not complete; will retry.');
+        } else if (data?.jobId) {
+          console.log(`[bank-v2] recovery job=${data.jobId} state=${data.state} revision=${data.revision ?? 0}`);
+          const type = data.state === 'completed' ? 'bank_job_completed' : data.state === 'failed' ? 'bank_job_failed' : null;
+          if (type) await publishBankJobEvent(data, type, data);
+        }
+      } catch { console.warn('[bank-v2] Recovery transport unavailable; will retry.'); }
+      finally { recoveryRunning = false; }
+    }, 5000);
+    recoveryTimer.unref();
+  }
 
   while (true) {
     try {

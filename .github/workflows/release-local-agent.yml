@@ -1,0 +1,68 @@
+name: Release Kalika Local Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Update channel
+        type: choice
+        options: [beta, stable]
+        default: beta
+      staged_percentage:
+        description: Stable rollout percentage (1-100)
+        default: "10"
+  push:
+    tags: ["local-agent-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install workspace dependencies
+        shell: pwsh
+        run: npm ci
+        env:
+          NODE_OPTIONS: --use-system-ca
+      - name: Test agent and gateway
+        shell: pwsh
+        run: |
+          npm run test:tally-bridge
+          npm run test:cash-discount-gateway
+          npm run test:local-agent
+      - name: Validate native Electron modules
+        shell: pwsh
+        run: node scripts/smoke-local-agent-native-modules.mjs
+      - name: Build signed NSIS installer
+        shell: pwsh
+        run: node scripts/build-tally-connector-installer.mjs
+        env:
+          CSC_LINK: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Add staged rollout metadata and checksums
+        shell: pwsh
+        run: |
+          $percentage = '${{ inputs.staged_percentage }}'
+          if ('${{ inputs.channel }}' -eq 'stable' -and (Test-Path installer/tally-bridge/output/latest.yml)) {
+            Add-Content installer/tally-bridge/output/latest.yml "stagingPercentage: $percentage"
+          }
+          Get-ChildItem installer/tally-bridge/output -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path | Split-Path -Leaf)" } | Set-Content installer/tally-bridge/output/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalika-local-agent-offline-installer
+          path: installer/tally-bridge/output/*
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: gh release upload "${{ github.ref_name }}" installer/tally-bridge/output/* --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

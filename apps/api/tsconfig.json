@@ -25,6 +25,8 @@
       }
     ],
     "paths": {
+      "@autodealer/shared/lib/*": ["../../packages/shared/src/lib/*"],
+      "@autodealer/shared/types/*": ["../../packages/shared/src/types/*"],
       "@/*": [
         "./src/*"
       ]

@@ -8,18 +8,16 @@ import {
   Activity,
   TrendingUp,
   FolderOpen,
-  Users,
   Plus,
-  ArrowUpRight,
+  ArrowRight,
   Clock,
   Building2,
   AlertTriangle,
-  ChevronRight,
-  Layers,
-  Sparkles
+  Shield,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
+import { PageHeader } from "@/components/dashboard/PageHeader";
 import { Skeleton } from "@/components/ui/skeleton";
 import { fetchRecentCases, type SavedCaseRecord } from "@/lib/case-persistence";
 
@@ -50,64 +48,70 @@ function getRelativeTime(dateStr: string) {
     const now = new Date();
     const diffMs = now.getTime() - d.getTime();
     if (isNaN(diffMs) || diffMs < 0) return formatDate(dateStr);
-    
+
     const diffMins = Math.floor(diffMs / 60000);
     if (diffMins < 1) return "Just now";
     if (diffMins < 60) return `${diffMins}m ago`;
-    
+
     const diffHours = Math.floor(diffMins / 60);
     if (diffHours < 24) return `${diffHours}h ago`;
-    
+
     const diffDays = Math.floor(diffHours / 24);
     if (diffDays === 1) return "Yesterday";
     if (diffDays < 7) return `${diffDays}d ago`;
-    
+
     return formatDate(dateStr);
   } catch {
     return formatDate(dateStr);
   }
 }
 
-function getRiskColor(risk: number) {
-  if (risk < 30) return "#10b981"; // Emerald / Low Risk
-  if (risk < 70) return "#f59e0b"; // Amber / Med Risk
-  return "#f43f5e"; // Rose / High Risk
+function toReadableCaseText(value: string) {
+  return value
+    .split(/(\/)/)
+    .map((part) => {
+      if (part === "/") return part;
+      return part
+        .split(/(\s+)/)
+        .map((word) => {
+          if (!word.trim()) return word;
+          if (/[0-9]/.test(word)) return word;
+          if (word.length <= 3 && word === word.toUpperCase()) return word;
+          return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+        })
+        .join("");
+    })
+    .join("")
+    .replace(/\s+packet$/i, " packet");
 }
 
 function getStatusConfig(status: string) {
   const s = status?.toLowerCase() || "";
-  if (s.includes("complete") || s === "success" || s === "ready") {
+  if (s.includes("complete") || s === "success" || s === "ready" || s === "accepted") {
     return {
-      bg: "bg-emerald-50 text-emerald-700 border-emerald-200/50",
-      dot: "bg-emerald-500",
+      bg: "bg-[#ebf5ee] text-[#1b4332] border-[#c3dfcb]",
+      dot: "bg-[#2d6a4f]",
       label: "Completed",
     };
   }
-  if (s.includes("review") || s === "in_review") {
+  if (s.includes("review") || s === "in_review" || s === "processing" || s === "pending") {
     return {
-      bg: "bg-sky-50 text-sky-700 border-sky-200/50",
-      dot: "bg-sky-500",
-      label: "In Review",
+      bg: "bg-[#fef6e9] text-[#78350f] border-[#f9d8a7]",
+      dot: "bg-[#b45309]",
+      label: "Ongoing",
     };
   }
-  if (s.includes("fail") || s === "failed" || s === "error") {
+  if (s.includes("fail") || s === "failed" || s === "error" || s === "rejected") {
     return {
-      bg: "bg-rose-50 text-rose-700 border-rose-200/50",
-      dot: "bg-rose-500",
+      bg: "bg-[#fbf0ef] text-[#8c1d18] border-[#f2c7c4]",
+      dot: "bg-[#b91c1c]",
       label: "Failed",
     };
   }
-  if (s.includes("draft")) {
-    return {
-      bg: "bg-slate-50 text-slate-600 border-slate-200/50",
-      dot: "bg-slate-400",
-      label: "Draft",
-    };
-  }
   return {
-    bg: "bg-amber-50 text-amber-700 border-amber-200/50",
-    dot: "bg-amber-500",
-    label: "Pending",
+    bg: "bg-[#efeae2] text-[#574c43] border-[#ded5c8]",
+    dot: "bg-[#8a7f72]",
+    label: "Draft",
   };
 }
 
@@ -117,22 +121,24 @@ function Sparkline({ data, color }: { data: number[]; color: string }) {
     const max = Math.max(...data, 1);
     const min = Math.min(...data, 0);
     const range = max - min || 1;
-    
-    const width = 120;
-    const height = 36;
+
+    const width = 110;
+    const height = 32;
     const padding = 2;
-    
-    return data.map((val, idx) => {
-      const x = (idx / (data.length - 1)) * (width - padding * 2) + padding;
-      const y = height - ((val - min) / range) * (height - padding * 2) - padding;
-      return `${x},${y}`;
-    }).join(" ");
+
+    return data
+      .map((val, idx) => {
+        const x = (idx / (data.length - 1)) * (width - padding * 2) + padding;
+        const y = height - ((val - min) / range) * (height - padding * 2) - padding;
+        return `${x},${y}`;
+      })
+      .join(" ");
   }, [data]);
 
-  if (!points) return <div className="h-9 w-[120px] border-b border-dashed border-slate-200" />;
+  if (!points) return <div className="h-8 w-[110px] border-b border-dashed border-[#e6ded2]" />;
 
   return (
-    <svg width="120" height="36" className="overflow-visible opacity-80">
+    <svg width="110" height="32" className="overflow-visible opacity-85">
       <polyline
         fill="none"
         stroke={color}
@@ -146,21 +152,21 @@ function Sparkline({ data, color }: { data: number[]; color: string }) {
 }
 
 function RadialProgress({ value, color }: { value: number; color: string }) {
-  const radius = 22;
+  const radius = 20;
   const circumference = 2 * Math.PI * radius;
   const strokeDashoffset = circumference - (Math.min(value, 100) / 100) * circumference;
-  
+
   return (
     <div className="relative flex items-center justify-center shrink-0">
-      <svg className="w-14 h-14 transform -rotate-90">
+      <svg className="w-12 h-12 transform -rotate-90">
         <circle
-          className="text-slate-100 dark:text-slate-800"
+          className="text-[#ede6d9]"
           strokeWidth="3.5"
           stroke="currentColor"
           fill="transparent"
           r={radius}
-          cx="28"
-          cy="28"
+          cx="24"
+          cy="24"
         />
         <circle
           className="transition-all duration-700 ease-out"
@@ -171,11 +177,11 @@ function RadialProgress({ value, color }: { value: number; color: string }) {
           stroke={color}
           fill="transparent"
           r={radius}
-          cx="28"
-          cy="28"
+          cx="24"
+          cy="24"
         />
       </svg>
-      <span className="absolute text-[11px] font-extrabold text-[#1a1a1a]">{value}%</span>
+      <span className="absolute text-[11px] font-bold text-[#111827]">{value}%</span>
     </div>
   );
 }
@@ -189,7 +195,7 @@ function VolumeChart({ cases }: { cases: SavedCaseRecord[] }) {
       count: number;
     }> = [];
     const now = new Date();
-    
+
     for (let i = 14; i >= 0; i--) {
       const d = new Date(now);
       d.setDate(now.getDate() - i);
@@ -197,7 +203,7 @@ function VolumeChart({ cases }: { cases: SavedCaseRecord[] }) {
         date: d,
         label: d.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
         localString: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`,
-        count: 0
+        count: 0,
       });
     }
 
@@ -223,11 +229,11 @@ function VolumeChart({ cases }: { cases: SavedCaseRecord[] }) {
   }, [volumeData]);
 
   const width = 800;
-  const height = 180;
+  const height = 170;
   const paddingLeft = 32;
   const paddingRight = 16;
-  const paddingTop = 20;
-  const paddingBottom = 30;
+  const paddingTop = 16;
+  const paddingBottom = 26;
 
   const chartWidth = width - paddingLeft - paddingRight;
   const chartHeight = height - paddingTop - paddingBottom;
@@ -237,12 +243,12 @@ function VolumeChart({ cases }: { cases: SavedCaseRecord[] }) {
 
   return (
     <div className="w-full overflow-x-auto">
-      <div className="min-w-[700px] h-[180px] relative">
+      <div className="min-w-[680px] h-[170px] relative">
         <svg viewBox={`0 0 ${width} ${height}`} width="100%" height="100%" className="overflow-visible">
           <defs>
             <linearGradient id="volume-bar-grad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#d97706" />
-              <stop offset="100%" stopColor="#f59e0b" />
+              <stop offset="0%" stopColor="#2b1a10" />
+              <stop offset="100%" stopColor="#5b4b3d" />
             </linearGradient>
           </defs>
 
@@ -257,15 +263,15 @@ function VolumeChart({ cases }: { cases: SavedCaseRecord[] }) {
                   y1={y}
                   x2={width - paddingRight}
                   y2={y}
-                  stroke="#f1f5f9"
+                  stroke="#ece6dc"
                   strokeWidth="1"
                 />
                 <text
                   x={paddingLeft - 8}
                   y={y + 3}
-                  fill="#94a3b8"
+                  fill="#8a7f72"
                   fontSize="9"
-                  fontWeight="700"
+                  fontWeight="600"
                   textAnchor="end"
                 >
                   {val}
@@ -279,20 +285,18 @@ function VolumeChart({ cases }: { cases: SavedCaseRecord[] }) {
             const x = paddingLeft + i * (barWidth + gap);
             const barHeight = (day.count / maxCount) * chartHeight;
             const y = paddingTop + chartHeight - barHeight;
-            
+
             return (
               <g key={day.localString} className="group cursor-pointer">
-                {/* Background light hover area */}
                 <rect
                   x={x - gap / 4}
                   y={paddingTop}
                   width={barWidth + gap / 2}
                   height={chartHeight}
                   fill="transparent"
-                  className="hover:fill-slate-50/50 transition-colors"
+                  className="hover:fill-[#ede6d9]/30 transition-colors"
                 />
 
-                {/* Main Bar */}
                 {day.count > 0 ? (
                   <rect
                     x={x}
@@ -301,46 +305,43 @@ function VolumeChart({ cases }: { cases: SavedCaseRecord[] }) {
                     height={barHeight}
                     rx="4"
                     fill="url(#volume-bar-grad)"
-                    className="transition-all duration-300 hover:brightness-105"
+                    className="transition-all duration-300 hover:brightness-125"
                   />
                 ) : (
-                  // Tiny indicator for 0-count day
                   <rect
                     x={x}
                     y={paddingTop + chartHeight - 2}
                     width={barWidth}
                     height="2"
                     rx="1"
-                    fill="#e2e8f0"
+                    fill="#ded8d0"
                   />
                 )}
 
-                {/* Count label above bar */}
                 {day.count > 0 && (
                   <text
                     x={x + barWidth / 2}
-                    y={y - 6}
-                    fill="#1a1a1a"
-                    fontSize="10"
-                    fontWeight="800"
+                    y={y - 5}
+                    fill="#111827"
+                    fontSize="9"
+                    fontWeight="700"
                     textAnchor="middle"
                   >
                     {day.count}
                   </text>
                 )}
 
-                {/* X Axis Label */}
                 <text
                   x={x + barWidth / 2}
-                  y={height - 8}
-                  fill="#64748b"
+                  y={height - 6}
+                  fill="#8a7f72"
                   fontSize="9"
-                  fontWeight="600"
+                  fontWeight="500"
                   textAnchor="middle"
                 >
                   {day.label}
                 </text>
-                
+
                 <title>{`${day.label}: ${day.count} case${day.count === 1 ? "" : "s"}`}</title>
               </g>
             );
@@ -352,30 +353,30 @@ function VolumeChart({ cases }: { cases: SavedCaseRecord[] }) {
 }
 
 function MetricValueSkeleton() {
-  return <Skeleton className="h-9 w-16 rounded-lg bg-slate-200/60" />;
+  return <Skeleton className="h-8 w-16 rounded-lg bg-[#eee7dd]" />;
 }
 
 function RecentCasesSkeleton() {
   return (
-    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
       {Array.from({ length: 4 }).map((_, index) => (
         <div
           key={index}
-          className="flex flex-col rounded-2xl border border-[#e5ddd0] bg-white p-4 shadow-sm"
+          className="flex flex-col rounded-xl border border-[#ded8d0] bg-white p-4 shadow-2xs"
         >
           <div className="flex items-start justify-between gap-3">
-            <Skeleton className="h-8 w-8 shrink-0 rounded-xl bg-[#f0ece6]" />
+            <Skeleton className="h-8 w-8 shrink-0 rounded-lg bg-[#f0ece6]" />
             <div className="flex-1 space-y-2">
-              <Skeleton className="h-4 w-32 bg-slate-100" />
-              <Skeleton className="h-3 w-20 bg-slate-100" />
+              <Skeleton className="h-3.5 w-32 bg-[#eee7dd]" />
+              <Skeleton className="h-3 w-20 bg-[#eee7dd]" />
             </div>
           </div>
           <div className="mt-4 flex flex-wrap gap-1.5">
-            <Skeleton className="h-5 w-16 rounded bg-slate-100" />
-            <Skeleton className="h-5 w-12 rounded bg-slate-100" />
+            <Skeleton className="h-5 w-16 rounded-full bg-[#eee7dd]" />
+            <Skeleton className="h-5 w-12 rounded bg-[#eee7dd]" />
           </div>
-          <div className="mt-4 border-t border-slate-100 pt-3">
-            <Skeleton className="h-3.5 w-full bg-slate-100" />
+          <div className="mt-4 border-t border-[#ece6dc] pt-3">
+            <Skeleton className="h-3.5 w-full bg-[#eee7dd]" />
           </div>
         </div>
       ))}
@@ -387,14 +388,6 @@ export function DashboardHome() {
   const [cases, setCases] = useState<SavedCaseRecord[]>([]);
   const [status, setStatus] = useState<LoadState>("loading");
   const [error, setError] = useState<string | null>(null);
-  const [greeting, setGreeting] = useState("Hello");
-
-  useEffect(() => {
-    const hours = new Date().getHours();
-    if (hours < 12) setGreeting("Good Morning");
-    else if (hours < 17) setGreeting("Good Afternoon");
-    else setGreeting("Good Evening");
-  }, []);
 
   useEffect(() => {
     let active = true;
@@ -417,7 +410,6 @@ export function DashboardHome() {
   }, []);
 
   const metrics = useMemo(() => {
-    // 1. Generate local date strings for the last 15 days
     const days: Array<{
       localString: string;
       caseCount: number;
@@ -436,7 +428,6 @@ export function DashboardHome() {
       });
     }
 
-    // 2. Count volumes daily from the cases array
     cases.forEach((c) => {
       if (!c.createdAt) return;
       try {
@@ -470,83 +461,78 @@ export function DashboardHome() {
       recentList: cases.slice(0, 8),
       docHistory,
       caseHistory,
-      issueHistory
+      issueHistory,
     };
   }, [cases]);
 
   return (
     <AppShell>
-      <div className="w-full animate-in fade-in slide-in-from-bottom-4 px-4 py-8 text-[#1a1a1a] duration-500 ease-out sm:px-8 sm:py-10">
-        
-        {/* HEADER SECTION */}
-        <header className="mb-8 flex flex-col md:flex-row md:items-center justify-between gap-6 border-b border-[#e5ddd0] pb-6">
-          <div>
-            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 border border-amber-200/50 text-[10px] font-bold uppercase tracking-wider text-amber-800">
-              <Sparkles className="h-3 w-3 text-amber-600 animate-spin duration-3000" />
-              Dealer Analytics Dashboard
+      <div className="min-h-full bg-[#f7f4ef] px-4 py-5 text-[#111827] sm:px-6 lg:px-8">
+        <div className="mx-auto flex w-full max-w-[1540px] flex-col gap-5">
+
+          {/* ── Fixed/Sticky Reusable PageHeader ── */}
+          <PageHeader
+            title="Dashboard"
+            subtitle="Real-time case analytics and document health"
+            badge={
+              <div className="flex items-center gap-1.5 rounded-lg border border-[#e6ded2] bg-[#fbfaf8] px-2.5 py-1 text-xs font-medium text-[#5b4b3d] shadow-sm">
+                <Shield className="h-3 w-3 text-[#8a7f72]" />
+                <span>Admin view</span>
+              </div>
+            }
+            actions={
+              <div className="flex items-center gap-2">
+                <Link
+                  href="/cases"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-[#ded8d0] bg-[#fbfaf8] px-3 py-1.5 text-xs font-medium text-[#3d3530] shadow-sm transition hover:bg-[#ede6d9]"
+                >
+                  <FolderOpen className="h-3.5 w-3.5 text-[#8a7f72]" />
+                  <span>All Cases</span>
+                </Link>
+                <Link
+                  href="/workspace"
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-[#2b1a10] px-3 py-1.5 text-xs font-medium text-white shadow-sm transition hover:bg-[#3b271a]"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  <span>Add Case</span>
+                </Link>
+              </div>
+            }
+          />
+
+          {error && (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 p-4 text-xs font-medium text-rose-700 flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 text-rose-500 shrink-0" />
+              <span>{error}</span>
             </div>
-            <h1 className="text-3xl font-black tracking-tight text-[#1a1a1a] mt-2 flex items-center gap-2">
-              {greeting}, Admin <span className="text-2xl">👋</span>
-            </h1>
-            <p className="text-xs font-semibold text-slate-500 mt-1">
-              Analyze document health, audit discrepancies, and monitor validation issues across your active cases.
-            </p>
-          </div>
+          )}
 
-          <div className="flex items-center gap-3">
-            <Link
-              href="/workspace"
-              className="inline-flex items-center gap-2 px-4 py-2.5 bg-[#2d2d2d] hover:bg-[#1a1a1a] text-white text-sm font-semibold rounded-xl transition-all shadow-sm hover:shadow-md active:scale-95"
-            >
-              <Plus className="h-4 w-4" />
-              Upload & Compare
-            </Link>
-          </div>
-        </header>
+          {/* ── OVERVIEW METRICS CARDS ── */}
+          <section className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
 
-        {status === "error" && (
-          <div className="mb-6 rounded-2xl border border-rose-200 bg-rose-50 px-5 py-4 text-sm font-semibold text-rose-700 flex items-center gap-3">
-            <AlertTriangle className="h-5 w-5 text-rose-500 shrink-0" />
-            <div>{error}</div>
-          </div>
-        )}
-
-        {/* OVERVIEW METRICS SECTION */}
-        <section className="mb-8">
-          <div className="mb-4 flex items-center justify-between px-1">
-            <h2 className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
-              Workflow Diagnostics
-            </h2>
-            <div className="text-[10px] font-bold text-slate-400 bg-slate-100 border border-slate-200/40 px-2 py-0.5 rounded-full">
-              Realtime Database Metrics
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4">
-            
-            {/* Metric 1: Total Documents */}
-            <div className="group relative flex flex-col justify-between overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-all duration-300 hover:-translate-y-1 hover:shadow-[0_8px_20px_rgba(0,0,0,0.05)]">
+            {/* Metric 1: Active Documents */}
+            <div className="flex flex-col justify-between rounded-xl border border-[#ded8d0] bg-white p-4 shadow-2xs transition-all hover:border-[#b9aa99] hover:shadow-xs">
               <div className="flex items-start justify-between">
-                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-50 border border-amber-100/50">
-                  <FileText className="h-4.5 w-4.5 text-amber-700" />
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#ded8d0] bg-[#fbfaf8] text-[#2b1a10]">
+                  <FileText className="h-4 w-4" />
                 </div>
                 {status === "ready" && (
-                  <Sparkline data={metrics.docHistory} color="#d97706" />
+                  <Sparkline data={metrics.docHistory} color="#2b1a10" />
                 )}
               </div>
               <div className="mt-4">
-                <div className="text-[9px] font-bold uppercase tracking-widest text-slate-400">
+                <span className="text-[11px] font-medium text-[#8a7f72]">
                   Active Documents
-                </div>
+                </span>
                 <div className="mt-1 flex items-baseline gap-2">
                   {status === "loading" ? (
                     <MetricValueSkeleton />
                   ) : (
-                    <span className="text-3xl font-extrabold text-[#1a1a1a] leading-none">
+                    <span className="text-2xl font-bold tracking-tight text-[#111827]">
                       {metrics.totalDocuments}
                     </span>
                   )}
-                  <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-100">
+                  <span className="rounded bg-[#ede6d9] px-1.5 py-0.5 text-[10px] font-semibold text-[#5b4b3d]">
                     Live
                   </span>
                 </div>
@@ -554,249 +540,237 @@ export function DashboardHome() {
             </div>
 
             {/* Metric 2: Total Cases */}
-            <div className="group relative flex flex-col justify-between overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-all duration-300 hover:-translate-y-1 hover:shadow-[0_8px_20px_rgba(0,0,0,0.05)]">
+            <div className="flex flex-col justify-between rounded-xl border border-[#ded8d0] bg-white p-4 shadow-2xs transition-all hover:border-[#b9aa99] hover:shadow-xs">
               <div className="flex items-start justify-between">
-                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#f4f5f9] border border-indigo-100/50">
-                  <Database className="h-4.5 w-4.5 text-indigo-700" />
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#ded8d0] bg-[#fbfaf8] text-[#5b4b3d]">
+                  <Database className="h-4 w-4" />
                 </div>
                 {status === "ready" && (
-                  <Sparkline data={metrics.caseHistory} color="#6366f1" />
+                  <Sparkline data={metrics.caseHistory} color="#5b4b3d" />
                 )}
               </div>
               <div className="mt-4">
-                <div className="text-[9px] font-bold uppercase tracking-widest text-slate-400">
-                  Total Active Cases
-                </div>
+                <span className="text-[11px] font-medium text-[#8a7f72]">
+                  Total Cases
+                </span>
                 <div className="mt-1 flex items-baseline gap-2">
                   {status === "loading" ? (
                     <MetricValueSkeleton />
                   ) : (
-                    <span className="text-3xl font-extrabold text-[#1a1a1a] leading-none">
+                    <span className="text-2xl font-bold tracking-tight text-[#111827]">
                       {metrics.totalCases}
                     </span>
                   )}
+                  <span className="text-[11px] text-[#8a7f72]">
+                    tracked
+                  </span>
                 </div>
               </div>
             </div>
 
-            {/* Metric 3: Mismatches */}
-            <div className="group relative flex flex-col justify-between overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-all duration-300 hover:-translate-y-1 hover:shadow-[0_8px_20px_rgba(0,0,0,0.05)]">
+            {/* Metric 3: Discovered Issues */}
+            <div className="flex flex-col justify-between rounded-xl border border-[#ded8d0] bg-white p-4 shadow-2xs transition-all hover:border-[#b9aa99] hover:shadow-xs">
               <div className="flex items-start justify-between">
-                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-rose-50 border border-rose-100/50">
-                  <Activity className="h-4.5 w-4.5 text-rose-700" />
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#f2c7c4] bg-[#fbf0ef] text-[#8c1d18]">
+                  <Activity className="h-4 w-4" />
                 </div>
                 {status === "ready" && (
-                  <Sparkline data={metrics.issueHistory} color="#f43f5e" />
+                  <Sparkline data={metrics.issueHistory} color="#8c1d18" />
                 )}
               </div>
               <div className="mt-4">
-                <div className="text-[9px] font-bold uppercase tracking-widest text-slate-400">
+                <span className="text-[11px] font-medium text-[#8a7f72]">
                   Discovered Issues
-                </div>
+                </span>
                 <div className="mt-1 flex items-baseline gap-2">
                   {status === "loading" ? (
                     <MetricValueSkeleton />
                   ) : (
-                    <span className="text-3xl font-extrabold text-rose-600 leading-none">
+                    <span className="text-2xl font-bold tracking-tight text-[#8c1d18]">
                       {metrics.totalMismatches}
                     </span>
                   )}
                   {metrics.totalMismatches > 0 && (
-                    <span className="text-[10px] font-bold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-100">
-                      Audit
+                    <span className="rounded bg-[#fbf0ef] px-1.5 py-0.5 text-[10px] font-semibold text-[#8c1d18] border border-[#f2c7c4]">
+                      Action needed
                     </span>
                   )}
                 </div>
               </div>
             </div>
 
-            {/* Metric 4: Average Risk */}
-            <div className="group relative flex flex-col justify-between overflow-hidden rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-all duration-300 hover:-translate-y-1 hover:shadow-[0_8px_20px_rgba(0,0,0,0.05)]">
+            {/* Metric 4: Average Risk Index */}
+            <div className="flex flex-col justify-between rounded-xl border border-[#ded8d0] bg-white p-4 shadow-2xs transition-all hover:border-[#b9aa99] hover:shadow-xs">
               <div className="flex items-start justify-between">
-                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-emerald-50 border border-emerald-100/50">
-                  <TrendingUp className="h-4.5 w-4.5 text-emerald-700" />
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#ded8d0] bg-[#fbfaf8] text-[#2b1a10]">
+                  <TrendingUp className="h-4 w-4" />
                 </div>
                 {status === "ready" && (
-                  <RadialProgress value={metrics.averageRisk} color={getRiskColor(metrics.averageRisk)} />
+                  <RadialProgress
+                    value={metrics.averageRisk}
+                    color={metrics.averageRisk > 50 ? "#8c1d18" : metrics.averageRisk > 25 ? "#b45309" : "#2d6a4f"}
+                  />
                 )}
               </div>
               <div className="mt-4">
-                <div className="text-[9px] font-bold uppercase tracking-widest text-slate-400">
+                <span className="text-[11px] font-medium text-[#8a7f72]">
                   Average Risk Index
-                </div>
+                </span>
                 <div className="mt-1 flex items-baseline gap-2">
                   {status === "loading" ? (
                     <MetricValueSkeleton />
                   ) : (
-                    <span className="text-3xl font-extrabold text-[#1a1a1a] leading-none">
+                    <span className="text-2xl font-bold tracking-tight text-[#111827]">
                       {metrics.averageRisk}%
                     </span>
                   )}
-                </div>
-              </div>
-            </div>
-
-          </div>
-        </section>
-
-        {/* CASE VOLUME (LAST 15 DAYS) */}
-        {status === "ready" && (
-          <section className="mb-10">
-            <div className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
-              <div className="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div>
-                  <h3 className="text-xs font-extrabold uppercase tracking-wider text-[#1a1a1a]">
-                    Case Volume by Day (Last 15 Days)
-                  </h3>
-                  <p className="text-[10px] font-bold text-slate-400 mt-0.5">
-                    Daily breakdown of validation workflows processed in the system
-                  </p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-100 flex items-center gap-1">
-                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                    Live Audit Sync
+                  <span className="text-[11px] text-[#8a7f72]">
+                    {metrics.averageRisk < 30 ? "Low risk" : metrics.averageRisk < 70 ? "Moderate" : "High risk"}
                   </span>
                 </div>
               </div>
-              <div className="pt-2">
+            </div>
+
+          </section>
+
+          {/* ── CASE VOLUME CHART ── */}
+          {status === "ready" && (
+            <section className="rounded-xl border border-[#ded8d0] bg-white p-4 sm:p-5 shadow-2xs">
+              <div className="mb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-[#ece6dc] pb-3">
+                <div>
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-[#2b1a10]">
+                    Case Volume by Day (Last 15 Days)
+                  </h3>
+                  <p className="text-[11px] font-normal text-[#8a7f72] mt-0.5">
+                    Daily validation and audit workflows processed
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-[#c3dfcb] bg-[#ebf5ee] px-2.5 py-0.5 text-[11px] font-medium text-[#1b4332]">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[#2d6a4f]" />
+                    Live Sync
+                  </span>
+                </div>
+              </div>
+              <div className="pt-1">
                 <VolumeChart cases={cases} />
               </div>
-            </div>
-          </section>
-        )}
+            </section>
+          )}
 
-        {/* RECENT CASES GRID SECTION */}
-        <section>
-          <div className="mb-5 flex items-center justify-between px-1">
-            <div className="flex items-center gap-2">
-              <h2 className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                Recent Audits
-              </h2>
-              <span className="rounded-full bg-slate-100 border border-slate-200/50 px-2.5 py-0.5 text-[9px] font-extrabold text-slate-500">
-                {status === "ready" ? `${metrics.recentList.length} Processed` : "..."}
-              </span>
-            </div>
-            <Link
-              href="/cases"
-              className="text-[10px] font-bold text-slate-500 hover:text-[#1a1a1a] transition-colors"
-            >
-              See All Cases &rarr;
-            </Link>
-          </div>
-
-          {status === "loading" ? (
-            <RecentCasesSkeleton />
-          ) : status === "ready" && metrics.recentList.length === 0 ? (
-            <div className="flex h-[280px] flex-col items-center justify-center rounded-2xl border border-dashed border-[#e5ddd0] bg-white">
-              <FolderOpen className="mb-3 h-8 w-8 text-slate-300" />
-              <p className="text-xs font-semibold text-slate-500">No cases processed yet.</p>
+          {/* ── RECENT CASES SECTION ── */}
+          <section className="space-y-3">
+            <div className="flex items-center justify-between px-0.5">
+              <div className="flex items-center gap-2">
+                <h2 className="text-xs font-bold uppercase tracking-wider text-[#2b1a10]">
+                  Recent Cases
+                </h2>
+                <span className="rounded-full bg-[#ede6d9] px-2 py-0.5 text-[10px] font-semibold text-[#5b4b3d]">
+                  {status === "ready" ? `${metrics.recentList.length} recent` : "..."}
+                </span>
+              </div>
               <Link
-                href="/workspace"
-                className="mt-4 text-xs font-bold text-amber-700 bg-amber-50 hover:bg-amber-100/60 border border-amber-200 px-4 py-2 rounded-xl transition-all"
+                href="/cases"
+                className="inline-flex items-center gap-1 text-xs font-semibold text-[#2b1a10] hover:underline"
               >
-                Upload First File
+                <span>View all directory</span>
+                <ArrowRight className="h-3 w-3" />
               </Link>
             </div>
-          ) : (
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-              {metrics.recentList.map((item) => {
-                const statusConf = getStatusConfig(item.status);
-                const showSeparatePartners = item.buyerName && item.receiverName && 
-                  item.buyerName.toLowerCase().replace(/[^a-z0-9]/g, "") !== item.receiverName.toLowerCase().replace(/[^a-z0-9]/g, "");
 
-                const cleanCategory = (() => {
-                  const cat = item.category || "";
-                  const partner = item.buyerName || item.receiverName || "";
-                  if (partner && cat.toLowerCase().includes(partner.toLowerCase())) {
-                    return "Document Verification Packet";
-                  }
-                  return cat;
-                })();
+            {status === "loading" ? (
+              <RecentCasesSkeleton />
+            ) : status === "ready" && metrics.recentList.length === 0 ? (
+              <div className="flex min-h-[220px] flex-col items-center justify-center rounded-xl border border-dashed border-[#ded8d0] bg-white p-6 text-center">
+                <FolderOpen className="mb-2 h-8 w-8 text-[#8a7f72]" />
+                <p className="text-xs font-semibold text-[#111827]">No cases processed yet</p>
+                <Link
+                  href="/workspace"
+                  className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-[#2b1a10] px-3.5 py-1.5 text-xs font-semibold text-white shadow-2xs hover:bg-[#3b271a]"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  Add First Case
+                </Link>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                {metrics.recentList.map((item) => {
+                  const statusConf = getStatusConfig(item.status);
+                  const title = item.receiverName
+                    ? toReadableCaseText(item.receiverName)
+                    : item.buyerName
+                    ? toReadableCaseText(item.buyerName)
+                    : toReadableCaseText(item.displayName);
 
-                return (
-                  <Link
-                    href={`/cases/${item.id}`}
-                    key={item.id}
-                    className="group flex flex-col justify-between rounded-2xl border border-[#e5ddd0] bg-white p-4.5 shadow-[0_2px_8px_rgba(0,0,0,0.01)] transition-all duration-300 hover:-translate-y-1 hover:border-[#cbd5e1] hover:shadow-[0_8px_24px_rgba(0,0,0,0.04)]"
-                  >
-                    <div>
-                      {/* Top Header Row of Card */}
-                      <div className="flex items-start justify-between gap-2.5">
-                        <div className="flex min-w-0 items-start gap-2.5">
-                          <div className="flex h-8.5 w-8.5 shrink-0 items-center justify-center rounded-xl border border-slate-100 bg-[#f7f7f5] text-slate-500 group-hover:bg-[#ede6d9] group-hover:text-[#2d2d2d] transition-all">
-                            <Building2 className="h-4.5 w-4.5" />
+                  return (
+                    <Link
+                      href={`/cases/${item.id}`}
+                      key={item.id}
+                      className="group flex flex-col justify-between rounded-xl border border-[#ded8d0] bg-white p-3.5 shadow-2xs transition-all hover:border-[#b9aa99] hover:shadow-xs"
+                    >
+                      <div>
+                        {/* Header Row */}
+                        <div className="flex items-start gap-2.5">
+                          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#ded8d0] bg-[#fbfaf8] text-[#5b4b3d] group-hover:bg-[#ede6d9] group-hover:text-[#2b1a10] transition-colors">
+                            <Building2 className="h-4 w-4" />
                           </div>
-                          <div className="min-w-0">
-                            <h4 className="truncate text-sm font-extrabold text-[#1a1a1a] transition-colors" title={item.displayName}>
-                              {item.displayName}
+                          <div className="min-w-0 flex-1">
+                            <h4 className="truncate text-xs font-semibold text-[#111827] group-hover:text-[#2b1a10]" title={title}>
+                              {title}
                             </h4>
-                            <div className="truncate text-[10px] font-bold text-slate-400 uppercase tracking-wide mt-0.5">
-                              {cleanCategory}
-                            </div>
+                            <span className="block truncate text-[11px] font-normal text-[#8a7f72] mt-0.5">
+                              {item.category || "Document Packet"}
+                            </span>
                           </div>
                         </div>
-                      </div>
 
-                      {/* Partners Details */}
-                      <div className="mt-4 space-y-1 text-[11px] font-semibold text-slate-500">
-                        {showSeparatePartners ? (
-                          <>
-                            <div className="flex items-center gap-1.5">
-                              <span className="text-[9px] bg-slate-100 px-1 py-0.2 rounded font-extrabold text-slate-400 shrink-0">B</span>
-                              <span className="truncate max-w-[150px]">{item.buyerName}</span>
-                            </div>
-                            <div className="flex items-center gap-1.5">
-                              <span className="text-[9px] bg-slate-100 px-1 py-0.2 rounded font-extrabold text-slate-400 shrink-0">R</span>
-                              <span className="truncate max-w-[150px]">{item.receiverName}</span>
-                            </div>
-                          </>
-                        ) : item.buyerName || item.receiverName ? (
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-[9px] bg-slate-100 px-1 py-0.2 rounded font-extrabold text-slate-400 shrink-0">Entity</span>
-                            <span className="truncate max-w-[190px]">{item.buyerName || item.receiverName}</span>
-                          </div>
-                        ) : (
-                          <div className="text-slate-400 italic text-[10px] flex items-center gap-1.5">
-                            <Users className="h-3.5 w-3.5 opacity-60" />
-                            No counterparties mapped
+                        {/* Partner counterparty if available */}
+                        {(item.buyerName || item.receiverName) && (
+                          <div className="mt-3 flex items-center gap-1.5 text-[11px] text-[#5b4b3d] truncate">
+                            <span className="rounded bg-[#ede6d9] px-1 py-0.2 text-[9px] font-bold text-[#5b4b3d]">
+                              Entity
+                            </span>
+                            <span className="truncate max-w-[190px]">
+                              {item.buyerName || item.receiverName}
+                            </span>
                           </div>
                         )}
-                      </div>
 
-                      {/* Documents / Matches summary */}
-                      <div className="mt-4 flex flex-wrap items-center gap-1.5">
-                        <span className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider ${statusConf.bg}`}>
-                          <span className={`h-1.5 w-1.5 rounded-full ${statusConf.dot}`} />
-                          {statusConf.label}
-                        </span>
-                        <span className="rounded border border-slate-100 bg-[#f7f7f5] px-2 py-0.5 text-[9px] font-bold text-slate-500">
-                          {item.documentCount} {item.documentCount === 1 ? "doc" : "docs"}
-                        </span>
-                        {item.mismatchCount > 0 && (
-                          <span className="rounded border border-rose-100 bg-rose-50 px-2 py-0.5 text-[9px] font-bold text-rose-700">
-                            {item.mismatchCount} {item.mismatchCount === 1 ? "flag" : "flags"}
+                        {/* Status & Issue tags */}
+                        <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                          <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium ${statusConf.bg}`}>
+                            <span className={`h-1.5 w-1.5 rounded-full ${statusConf.dot}`} />
+                            {statusConf.label}
                           </span>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Bottom Metadata Section */}
-                    <div className="mt-4 border-t border-slate-100 pt-3">
-                      <div className="flex items-center justify-between text-[10px] font-bold text-slate-400">
-                        <div className="flex items-center gap-1">
-                          <Clock className="h-3.5 w-3.5" />
-                          <span>{getRelativeTime(item.createdAt)}</span>
+                          <span className="rounded border border-[#e6ded2] bg-[#fbfaf8] px-1.5 py-0.5 text-[10px] font-medium text-[#5b4b3d]">
+                            {item.documentCount} {item.documentCount === 1 ? "doc" : "docs"}
+                          </span>
+                          {item.mismatchCount > 0 && (
+                            <span className="rounded border border-[#f2c7c4] bg-[#fbf0ef] px-1.5 py-0.5 text-[10px] font-semibold text-[#8c1d18]">
+                              {item.mismatchCount} {item.mismatchCount === 1 ? "issue" : "issues"}
+                            </span>
+                          )}
                         </div>
                       </div>
-                    </div>
-                  </Link>
-                );
-              })}
-            </div>
-          )}
-        </section>
 
+                      {/* Footer relative date */}
+                      <div className="mt-3.5 border-t border-[#ece6dc] pt-2.5 flex items-center justify-between text-[11px] text-[#8a7f72]">
+                        <span className="flex items-center gap-1">
+                          <Clock className="h-3 w-3" />
+                          {getRelativeTime(item.createdAt)}
+                        </span>
+                        <span className="font-semibold text-[#2b1a10] opacity-0 transition-opacity group-hover:opacity-100">
+                          Open &rarr;
+                        </span>
+                      </div>
+                    </Link>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+        </div>
       </div>
     </AppShell>
   );
