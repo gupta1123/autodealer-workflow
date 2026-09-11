@@ -47,3 +47,23 @@ test("summary VOUCHER counters and stale AlterIDs are ignored", async () => {
     workflow: "payment_followups", afterAlterId: 10,
   }), []);
 });
+
+test("the initial follow-up watermark reads only the newest eligible voucher", async () => {
+  let request = "";
+  const gateway = new TallyAgentGateway({
+    execute: async (invoke) => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (_url, options) => {
+        request = String(options.body);
+        return new Response(`<ENVELOPE><BODY><DATA><COLLECTION><VOUCHER><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME><ALTERID>99</ALTERID></VOUCHER></COLLECTION></DATA></BODY></ENVELOPE>`);
+      };
+      try { return await invoke(); } finally { globalThis.fetch = originalFetch; }
+    },
+  });
+  const rows = await gateway.workflowVouchers({ companyName: "Company" }, {
+    workflow: "payment_followups", afterAlterId: 0, limit: 1, newestFirst: true,
+  });
+  assert.match(request, /<SORT>Default:-\$AlterID<\/SORT>/);
+  assert.match(request, /<MAXCOUNT>1<\/MAXCOUNT>/);
+  assert.equal(rows[0].alterId, 99);
+});

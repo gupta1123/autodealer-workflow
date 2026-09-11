@@ -71,7 +71,7 @@ async function GETHandler(request: Request, context: { params: Promise<{ id: str
       const connection = rows.find(row => row.id === id);
       if (!connection) return jsonWithCors(request, {error: 'Tally connection not found.'}, {status: 404});
       const {data, error} = await supabase.from('tally_agent_datasets')
-        .select('company_guid,company_name,financial_year,cache_size_bytes,last_synced_at,last_reconciled_at,quarantined_at,tdl_version,local_schema_version')
+        .select('company_guid,company_name,financial_year,cache_health,cache_size_bytes,last_synced_at,last_reconciled_at,quarantined_at,tdl_version,local_schema_version')
         .eq('organization_id', access.organizationId).eq('connection_id', id)
         .eq('installation_id', connection.installation_id).limit(1000);
       if (error || (data?.length || 0) >= 1000) return jsonWithCors(request, {error: 'Scoped agent status is unavailable.'}, {status: 503});
@@ -85,7 +85,14 @@ async function GETHandler(request: Request, context: { params: Promise<{ id: str
         agent: {version: connection.agent_version, protocolVersion: connection.agent_protocol_version,
           lastSeenAt: connection.agent_last_seen_at, tdlVersion: connection.tdl_version,
           localSchemaVersion: connection.local_schema_version, status: {}},
-        datasets: (data || []).filter(row => links.some(link => link.company_guid === row.company_guid && link.financial_year === row.financial_year)),
+        datasets: (data || []).filter(row => links.some(link => link.company_guid === row.company_guid && link.financial_year === row.financial_year)).map(row => ({
+          ...row,
+          cache_health: {
+            workflowRevisions: row.cache_health && typeof row.cache_health === 'object'
+              ? (row.cache_health as Record<string, unknown>).workflowRevisions || {}
+              : {},
+          },
+        })),
       }, {headers: {'Cache-Control': 'private, no-store'}});
     }
     const { data: connection, error } = await supabase.from("tally_connections")

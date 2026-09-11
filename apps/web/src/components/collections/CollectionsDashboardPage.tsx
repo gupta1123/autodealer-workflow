@@ -724,6 +724,7 @@ export function CollectionsDashboardPage({
   const initialLoadStartedRef = useRef(false);
   const activeScanRef = useRef<AbortController | null>(null);
   const [interactiveScan, setInteractiveScan] = useState(false);
+  const followupRevisionRef = useRef<{ scope: string; revision: number | null }>({ scope: "", revision: null });
   useEffect(() => () => activeScanRef.current?.abort(new Error("Cash Discount page closed.")), []);
   const lastLoadedConnectionRef = useRef("");
   useEffect(() => {
@@ -1308,20 +1309,45 @@ export function CollectionsDashboardPage({
 
   useEffect(() => {
     if (!accessReady || !isDedicatedFollowUpsPage) return;
-    const refreshIfVisible = () => {
+    let checking = false;
+    const refreshIfChanged = async () => {
       if (document.visibilityState !== 'visible' || activeScanRef.current) return;
       const company = selectedCompany;
       if (!selectedConnectionId || !company || !isLiveTallyCompanyMatch(liveTallyConnection, selectedConnectionId, company)) return;
-      void refreshTallyOpenBills(
-        selectedConnectionId,
-        company.companyName,
-        company.financialYear,
-        company.companyGuid,
-        false,
-        false,
-        true,
-      ).then((nextDashboard) => {
+      if (checking) return;
+      checking = true;
+      try {
+        const response = await apiFetch(`/api/tally/connections/${selectedConnectionId}/agent-status`, { cache: 'no-store' });
+        if (!response.ok) return;
+        const status = await response.json() as { datasets?: Array<{
+          company_guid?: string; company_name?: string; financial_year?: string;
+          cache_health?: { workflowRevisions?: { followups?: { revision?: number } | null } };
+        }> };
+        const dataset = (status.datasets ?? []).find((row) =>
+          (!company.companyGuid || row.company_guid === company.companyGuid) &&
+          (!company.financialYear || row.financial_year === company.financialYear) &&
+          (!row.company_name || normalizeCompanyName(row.company_name) === normalizeCompanyName(company.companyName))
+        );
+        const revision = Number(dataset?.cache_health?.workflowRevisions?.followups?.revision);
+        if (!Number.isFinite(revision) || revision <= 0) return;
+        const scope = `${selectedConnectionId}|${company.companyGuid || company.companyName}|${company.financialYear || ''}`;
+        const previous = followupRevisionRef.current;
+        if (previous.scope !== scope || previous.revision === null) {
+          followupRevisionRef.current = { scope, revision };
+          return;
+        }
+        if (previous.revision === revision) return;
+        const nextDashboard = await refreshTallyOpenBills(
+          selectedConnectionId,
+          company.companyName,
+          company.financialYear,
+          company.companyGuid,
+          false,
+          false,
+          true,
+        );
         if (nextDashboard.scanSummary?.complete === false) return;
+        followupRevisionRef.current = { scope, revision };
         setDashboard((current) => paymentFollowUpDataKey(current) === paymentFollowUpDataKey(nextDashboard)
           ? current
           : nextDashboard);
@@ -1332,11 +1358,17 @@ export function CollectionsDashboardPage({
             : new Date().toLocaleTimeString(),
           complete: true,
         });
-      }).catch(() => {});
+      } catch {
+        // The current dashboard remains usable while a lightweight revision
+        // check is unavailable. Manual Refresh remains the explicit fallback.
+      } finally {
+        checking = false;
+      }
     };
-    const timer = window.setInterval(refreshIfVisible, 60_000);
+    void refreshIfChanged();
+    const timer = window.setInterval(() => void refreshIfChanged(), 15_000);
     const onVisibility = () => {
-      if (document.visibilityState === 'visible') refreshIfVisible();
+      if (document.visibilityState === 'visible') void refreshIfChanged();
     };
     document.addEventListener('visibilitychange', onVisibility);
     return () => {

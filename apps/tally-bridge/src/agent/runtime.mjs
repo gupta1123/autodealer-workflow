@@ -158,7 +158,11 @@ export class LocalAgentRuntime {
       const cursorKey = `followup-voucher-alter-id:${key}`;
       const savedCursor = await this.storage.call("getSetting", { key: cursorKey, fallback: null });
       if (savedCursor === null) {
-        const baseline = Math.max(0, Number(job.payload?.highestAlterId) || 0);
+        const { dateFrom, dateTo } = financialYearDates(job.identity.financialYear);
+        const latest = await this.gateway.workflowVouchers(job.identity, {
+          workflow: "payment_followups", dateFrom, dateTo, afterAlterId: 0, limit: 1, newestFirst: true,
+        });
+        const baseline = latest.reduce((highest, voucher) => Math.max(highest, Number(voucher.alterId || 0)), 0);
         await this.storage.call("setSetting", { key: cursorKey, value: baseline });
         // The first watcher run deliberately avoids exporting years of voucher
         // history. Expire the aggregate view once so its next read establishes
@@ -303,6 +307,33 @@ export class LocalAgentRuntime {
       this.storage.call("health"), this.storage.call("listDatasets"), this.settings(),
       active ? this.storage.call("getJob", { id: active.id }) : null,
     ]);
+    const canonicalDatasets = canonicalDatasetStatuses(datasets, this.config);
+    const datasetsWithWorkflowRevisions = await Promise.all(canonicalDatasets.map(async (dataset) => {
+      const [followupCursor, followupChange] = await Promise.all([
+        this.storage.call("getSetting", {
+          key: `followup-voucher-alter-id:${dataset.dataset_key}`,
+          fallback: null,
+        }),
+        this.storage.call("getSetting", {
+          key: `followup-last-change:${dataset.dataset_key}`,
+          fallback: null,
+        }),
+      ]);
+      const followupRevision = Number(followupChange?.cursor ?? followupCursor);
+      return {
+        ...dataset,
+        cacheHealth: {
+          ...(dataset.cacheHealth || {}),
+          workflowRevisions: {
+            ...(dataset.cacheHealth?.workflowRevisions || {}),
+            followups: Number.isFinite(followupRevision) ? {
+              revision: followupRevision,
+              changedAt: followupChange?.changedAt || null,
+            } : null,
+          },
+        },
+      };
+    }));
     return {
       agentVersion: AGENT_VERSION,
       protocolVersion: AGENT_PROTOCOL_VERSION,
@@ -311,7 +342,7 @@ export class LocalAgentRuntime {
       capabilities: AGENT_CAPABILITIES,
       resources: resourceSnapshot(),
       storage,
-      datasets: canonicalDatasetStatuses(datasets, this.config),
+      datasets: datasetsWithWorkflowRevisions,
       settings,
       activeJob: activeJob ? { id: activeJob.id, commandId: activeJob.command_id, jobClass: activeJob.job_class, progress: activeJob.progress } : null,
     };
@@ -380,6 +411,7 @@ export class LocalAgentRuntime {
     const intervalSeconds = Number(await this.storage.call("getSetting", { key: "syncIntervalSeconds", fallback: 60 })) || 60;
     if (Date.now() - this.lastWatermarkAt < Math.max(15, intervalSeconds) * 1_000 || this.scheduler.busy) return;
     this.lastWatermarkAt = Date.now();
+    const capabilities = await this.gateway.capabilities(identity);
     await this.scheduler.enqueue({
       id: `followup-watch:${createHash("sha256").update(datasetKey(identity)).digest("hex").slice(0, 20)}:${Math.floor(this.lastWatermarkAt / (Math.max(15, intervalSeconds) * 1_000))}`,
       type: "agent_sync_followup_changes", identity, payload: {
@@ -392,7 +424,6 @@ export class LocalAgentRuntime {
       await this.scheduler.enqueue({ type: "agent_sync_dataset", identity, payload: { reason: "initial_company_observation" }, jobClass: "incremental_sync", priority: 45 });
       return;
     }
-    const capabilities = await this.gateway.capabilities(identity);
     const previous = Number(existing.cacheHealth?.highestAlterId || 0);
     const reliableGlobalWatermark = capabilities.fallback !== true &&
       Number(capabilities.version || 0) > 0 &&
