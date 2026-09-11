@@ -2187,19 +2187,17 @@ export function CollectionsDashboardPage({
           <div
             aria-labelledby="debit-note-review-title"
             aria-modal="true"
-            className="max-h-[calc(100vh-2rem)] w-full max-w-2xl overflow-y-auto rounded-2xl border border-[#e5ddd0] bg-white shadow-[0_24px_56px_-12px_rgba(0,0,0,0.24)] animate-in fade-in zoom-in-95 duration-200"
+            className="max-h-[calc(100vh-2rem)] w-full max-w-5xl overflow-y-auto rounded-xl border border-[#ded8d0] bg-white shadow-[0_24px_56px_-12px_rgba(0,0,0,0.24)] animate-in fade-in zoom-in-95 duration-200"
             role="dialog"
           >
-            <div className="flex items-start justify-between gap-4 border-b border-[#e5ddd0] bg-[#fcfbfa] px-5 py-5 sm:px-6">
+            <div className="flex items-start justify-between gap-4 border-b border-[#e8e2db] bg-[#fcfbfa] px-5 py-4">
               <div className="flex gap-3">
                 <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-amber-200 bg-amber-50 text-amber-700">
                   <ShieldCheck className="h-5 w-5" />
                 </div>
                 <div>
                   <h3 className="text-base font-semibold text-[#1a1a1a]" id="debit-note-review-title">Review invoice</h3>
-                  <p className="mt-1 text-xs font-medium leading-relaxed text-slate-600">
-                    Confirm the calculation before adding this debit note to Tally.
-                  </p>
+                  <p className="mt-1 text-xs text-[#756b60]">Check the amount and accounting details before posting.</p>
                 </div>
               </div>
               <button
@@ -2216,63 +2214,33 @@ export function CollectionsDashboardPage({
               </button>
             </div>
 
-            <div className="px-5 py-5 sm:px-6">
-              <div className="flex flex-col gap-1 border-b border-[#eee7dc] pb-4">
-                <div>
-                  <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500">{reviewingProposal.partyLedgerName}</div>
-                  <div className="mt-1 text-lg font-semibold text-[#1a1a1a]">{shortText(reviewingProposal.linkedInvoiceNumber, "No invoice reference")}</div>
-                  <div className="mt-1 text-xs font-medium text-slate-500">Invoice date {formatDate(reviewingProposal.linkedInvoiceDate)}</div>
-                </div>
-              </div>
-
-              <dl className="mt-5 grid gap-3 sm:grid-cols-2">
-                <div className="rounded-xl border border-[#e5ddd0] bg-[#fcfbfa] p-3.5">
-                  <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Invoice recorded in Tally</dt>
-                  <dd className="mt-1 tabular-nums text-base font-semibold text-[#1a1a1a]">{formatMoney(reviewingProposal.originalInvoiceAmount)}</dd>
-                </div>
-                <div className="rounded-xl border border-[#e5ddd0] bg-[#fcfbfa] p-3.5">
-                  <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Outstanding at last scan</dt>
-                  <dd className="mt-1 tabular-nums text-base font-semibold text-[#1a1a1a]">{formatMoney(reviewingProposal.pendingAmount)}</dd>
-                </div>
-                <div className="rounded-xl border border-amber-200 bg-amber-50 p-3.5">
-                  <dt className="text-[10px] font-bold uppercase tracking-wider text-amber-800">Debit note to add</dt>
-                  <dd className="mt-1 tabular-nums text-base font-semibold text-amber-950">{formatMoney(reviewingProposal.recoverableAmount)}</dd>
-                </div>
-                <div className="rounded-xl border border-[#2d2d2d] bg-[#2d2d2d] p-3.5 text-white">
-                  <dt className="text-[10px] font-bold uppercase tracking-wider text-slate-300">Outstanding after creation</dt>
-                  <dd className="mt-1 tabular-nums text-base font-semibold">
-                    {formatMoney((Number(reviewingProposal.pendingAmount) || 0) + reviewingProposal.recoverableAmount)}
-                  </dd>
-                </div>
-              </dl>
-
-              {reviewingProposal.cashDiscountAnalysis?.reversalPlan ? (
-                <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/70 p-4 text-xs font-medium leading-relaxed text-amber-950">
-                  <div className="font-bold">How this amount is calculated</div>
-                  <div className="mt-1">
-                    {formatMoney(reviewingProposal.originalInvoiceAmount)} was recorded after a {reviewingProposal.cashDiscountAnalysis.reversalPlan.initialDiscount.ratePercent}% discount. Gross value {formatMoney(reviewingProposal.cashDiscountAnalysis.reversalPlan.grossInvoiceAmount)} minus the recorded invoice value equals a debit note of {formatMoney(reviewingProposal.recoverableAmount)}.
+            <div className="px-5 py-4">
+              <div className="grid gap-5 lg:grid-cols-[minmax(0,1.2fr)_minmax(320px,.8fr)]">
+                <div className="min-w-0">
+                  <div className="border-b border-[#eee7dc] pb-3">
+                    <div className="truncate text-xs font-semibold text-[#51483f]">{reviewingProposal.partyLedgerName}</div>
+                    <div className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-1"><strong className="text-lg text-[#1a1a1a]">{shortText(reviewingProposal.linkedInvoiceNumber, "No invoice reference")}</strong><span className="text-xs text-[#8a7f72]">{formatDate(reviewingProposal.linkedInvoiceDate)}</span></div>
                   </div>
-                </div>
-              ) : null}
 
-              <div className="mt-4 rounded-xl border border-[#e5ddd0] bg-white p-4 text-xs font-medium text-slate-600">
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div><span className="font-bold text-[#1a1a1a]">Discount deadline:</span> {formatDate(reviewingProposal.discountDeadline)}</div>
-                  <div><span className="font-bold text-[#1a1a1a]">Applied rule:</span> {conciseTermsLabel(reviewingProposal).replace(/^Applied rule:\s*/i, "")}</div>
-                  <div><span className="font-bold text-[#1a1a1a]">Sales ledger:</span> {shortText(reviewingProposal.sourceSalesLedgerName, "Not verified")}</div>
-                  {reviewingProposal.receiptDate || Number(reviewingProposal.amountReceived) > 0 ? (
-                    <div><span className="font-bold text-[#1a1a1a]">Payment received:</span> {formatMoney(reviewingProposal.amountReceived)} on {formatDate(reviewingProposal.receiptDate)}</div>
-                  ) : null}
+                  <dl className="mt-4 grid overflow-hidden rounded-lg border border-[#ded8d0] sm:grid-cols-3">
+                    <div className="border-b border-[#e8e2db] bg-[#fcfbfa] p-4 sm:border-b-0 sm:border-r"><dt className="text-[10px] font-semibold uppercase tracking-wide text-[#756b60]">Recorded invoice</dt><dd className="mt-1 tabular-nums text-base font-semibold">{formatMoney(reviewingProposal.originalInvoiceAmount)}</dd></div>
+                    <div className="border-b border-amber-200 bg-amber-50 p-4 sm:border-b-0 sm:border-r"><dt className="text-[10px] font-semibold uppercase tracking-wide text-amber-800">Debit note</dt><dd className="mt-1 tabular-nums text-base font-semibold text-amber-950">+ {formatMoney(reviewingProposal.recoverableAmount)}</dd></div>
+                    <div className="bg-[#2d2d2d] p-4 text-white"><dt className="text-[10px] font-semibold uppercase tracking-wide text-stone-300">New outstanding</dt><dd className="mt-1 tabular-nums text-base font-semibold">{formatMoney((Number(reviewingProposal.pendingAmount) || 0) + reviewingProposal.recoverableAmount)}</dd></div>
+                  </dl>
+
+                  {reviewingProposal.cashDiscountAnalysis?.reversalPlan ? <p className="mt-3 text-xs leading-5 text-[#756b60]"><span className="font-semibold text-[#332c26]">Calculation:</span> {formatMoney(reviewingProposal.cashDiscountAnalysis.reversalPlan.grossInvoiceAmount)} gross − {formatMoney(reviewingProposal.originalInvoiceAmount)} recorded = {formatMoney(reviewingProposal.recoverableAmount)}</p> : null}
                 </div>
-                <div className="mt-3 border-t border-[#eee7dc] pt-3">
-                  <div className="font-bold text-[#1a1a1a]">Source narration</div>
-                  <div className="mt-1 leading-relaxed">{reviewingProposal.cashDiscountAnalysis?.sourceNarration || "No narration returned by Tally."}</div>
+
+                <div className="rounded-lg border border-[#ded8d0] bg-[#fcfbfa] p-4 text-xs text-[#5f554b]">
+                  <h4 className="font-semibold text-[#1a1a1a]">Posting details</h4>
+                  <dl className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2.5"><dt className="text-[#8a7f72]">Discount deadline</dt><dd className="font-medium text-[#332c26]">{formatDate(reviewingProposal.discountDeadline)}</dd><dt className="text-[#8a7f72]">Rule</dt><dd className="font-medium text-[#332c26]">{conciseTermsLabel(reviewingProposal).replace(/^Applied rule:\s*/i, "")}</dd><dt className="text-[#8a7f72]">Sales ledger</dt><dd className="truncate font-medium text-[#332c26]" title={reviewingProposal.sourceSalesLedgerName || undefined}>{shortText(reviewingProposal.sourceSalesLedgerName, "Not verified")}</dd>{Number(reviewingProposal.pendingAmount)!==Number(reviewingProposal.originalInvoiceAmount)?<><dt className="text-[#8a7f72]">Current outstanding</dt><dd className="font-medium text-[#332c26]">{formatMoney(reviewingProposal.pendingAmount)}</dd></>:null}{reviewingProposal.receiptDate || Number(reviewingProposal.amountReceived) > 0 ? <><dt className="text-[#8a7f72]">Payment received</dt><dd className="font-medium text-[#332c26]">{formatMoney(reviewingProposal.amountReceived)} · {formatDate(reviewingProposal.receiptDate)}</dd></> : null}</dl>
+                  {reviewingProposal.cashDiscountAnalysis?.sourceNarration?<div className="mt-3 border-t border-[#e8e2db] pt-3"><div className="text-[#8a7f72]">Tally narration</div><p className="mt-1 line-clamp-2 leading-5 text-[#51483f]" title={reviewingProposal.cashDiscountAnalysis.sourceNarration}>{reviewingProposal.cashDiscountAnalysis.sourceNarration}</p></div>:null}
                 </div>
               </div>
 
               {reviewingProposal.lastError ? <p role="alert" className="mt-3 text-xs text-red-700">{reviewingProposal.lastError}</p> : null}
               {!allowed('discounts.post') ? <p className="mt-3 text-xs text-[#5a5046]">You can review this invoice, but your role cannot post debit notes.</p> : !canCreateInTally(reviewingProposal) ? <p className="mt-3 text-xs text-[#5a5046]">Creation is not available for this invoice in its current state.</p> : null}
-              <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-amber-200 bg-amber-50/70 p-4 text-xs font-medium leading-relaxed text-amber-950">
+              <label className="mt-4 flex cursor-pointer items-center gap-3 rounded-lg border border-[#ded8d0] bg-[#fcfbfa] px-4 py-3 text-xs font-medium text-[#332c26]">
                 <input
                   checked={reviewAcknowledged}
                   disabled={!allowed('discounts.post') || !canCreateInTally(reviewingProposal)}
@@ -2280,11 +2248,11 @@ export function CollectionsDashboardPage({
                   onChange={(event) => setReviewAcknowledged(event.target.checked)}
                   type="checkbox"
                 />
-                <span>I confirm that the invoice and debit note amount shown above are correct.</span>
+                <span>I checked the invoice and debit note amount.</span>
               </label>
             </div>
 
-            <div className="flex flex-col-reverse gap-3 border-t border-[#e5ddd0] bg-[#fcfbfa] px-5 py-4 sm:flex-row sm:justify-end sm:px-6">
+            <div className="flex flex-col-reverse gap-3 border-t border-[#e8e2db] bg-[#fcfbfa] px-5 py-3 sm:flex-row sm:justify-end">
               <button
                 className="inline-flex h-10 items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-5 text-xs font-medium text-[#5a5046] transition hover:bg-[#faf8f4]"
                 disabled={approvingId === reviewingProposal.id}
