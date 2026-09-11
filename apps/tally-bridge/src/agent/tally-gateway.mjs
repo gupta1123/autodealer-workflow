@@ -134,19 +134,20 @@ export class TallyAgentGateway {
     })).filter((bill) => bill.name && bill.ledgerName);
   }
 
-  async workflowVouchers(identity, { workflow, ledgerNames = [], dateFrom, dateTo, signal } = {}) {
+  async workflowVouchers(identity, { workflow, ledgerNames = [], dateFrom, dateTo, afterAlterId = 0, limit = 50, signal } = {}) {
     const ledgerFormula = ledgerNames.map((name) => `$PartyLedgerName = ${formulaString(name)}`).join(" OR ") || "Yes";
     const workflowFormula = workflow === "turnover_discount"
-      ? `$$IsSysNameEqual:$VoucherTypeName:$$SysName:Sales OR $$IsSysNameEqual:$VoucherTypeName:$$SysName:CreditNote`
-      : `$$IsSysNameEqual:$VoucherTypeName:$$SysName:Sales OR $$IsSysNameEqual:$VoucherTypeName:$$SysName:Receipt OR $$IsSysNameEqual:$VoucherTypeName:$$SysName:DebitNote`;
-    const envelope = `<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export Data</TALLYREQUEST><TYPE>Collection</TYPE><ID>KalikaWorkflowVouchers</ID></HEADER><BODY><DESC><STATICVARIABLES><SVCURRENTCOMPANY>${escapeXml(identity.companyName)}</SVCURRENTCOMPANY><SVFROMDATE>${escapeXml(dateFrom || "")}</SVFROMDATE><SVTODATE>${escapeXml(dateTo || "")}</SVTODATE><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="KalikaWorkflowVouchers"><TYPE>Voucher</TYPE><FETCH>Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,AlterID,GUID,IsCancelled,Narration,Amount</FETCH><FILTERS>KalikaWorkflowType,KalikaWorkflowLedgers</FILTERS><SORT>Default:$AlterID</SORT></COLLECTION><SYSTEM TYPE="Formulae" NAME="KalikaWorkflowType">${escapeXml(workflowFormula)}</SYSTEM><SYSTEM TYPE="Formulae" NAME="KalikaWorkflowLedgers">${escapeXml(ledgerFormula)}</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+      ? `$VoucherTypeName = "Sales" OR $VoucherTypeName = "Credit Note"`
+      : `$VoucherTypeName = "Sales" OR $VoucherTypeName = "Receipt" OR $VoucherTypeName = "Credit Note" OR $VoucherTypeName = "Debit Note" OR $VoucherTypeName = "Journal"`;
+    const envelope = `<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export Data</TALLYREQUEST><TYPE>Collection</TYPE><ID>KalikaWorkflowVouchers</ID></HEADER><BODY><DESC><STATICVARIABLES><SVCURRENTCOMPANY>${escapeXml(identity.companyName)}</SVCURRENTCOMPANY><SVFROMDATE>${escapeXml(dateFrom || "")}</SVFROMDATE><SVTODATE>${escapeXml(dateTo || "")}</SVTODATE><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES><TDL><TDLMESSAGE><COLLECTION NAME="KalikaWorkflowVouchers"><TYPE>Voucher</TYPE><FETCH>Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,AlterID,GUID,IsCancelled,Narration,Amount,AllLedgerEntries.LedgerName</FETCH><FILTERS>KalikaWorkflowType,KalikaWorkflowLedgers,KalikaWorkflowAfterAlter</FILTERS><SORT>Default:$AlterID</SORT><MAXCOUNT>${Math.max(1, Math.min(50, Number(limit) || 50))}</MAXCOUNT></COLLECTION><SYSTEM TYPE="Formulae" NAME="KalikaWorkflowType">${escapeXml(workflowFormula)}</SYSTEM><SYSTEM TYPE="Formulae" NAME="KalikaWorkflowLedgers">${escapeXml(ledgerFormula)}</SYSTEM><SYSTEM TYPE="Formulae" NAME="KalikaWorkflowAfterAlter">$AlterID &gt; ${Math.max(0, Number(afterAlterId) || 0)}</SYSTEM></TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
     const xml = await this.invoke(envelope, { signal, timeoutMs: 30_000 });
     return blocks(xml, "VOUCHER").map((block) => ({
       date: tag(block, "DATE"), effectiveDate: tag(block, "EFFECTIVEDATE"), voucherType: tag(block, "VOUCHERTYPENAME"),
       voucherNumber: tag(block, "VOUCHERNUMBER"), reference: tag(block, "REFERENCE"), partyLedgerName: tag(block, "PARTYLEDGERNAME"),
       masterId: tag(block, "MASTERID"), alterId: Number(tag(block, "ALTERID") || 0), guid: tag(block, "GUID"),
       isCancelled: /^yes$/i.test(tag(block, "ISCANCELLED")), narration: tag(block, "NARRATION"), amount: tag(block, "AMOUNT"),
-    }));
+      ledgerNames: blocks(block, "ALLLEDGERENTRIES.LIST").map((entry) => tag(entry, "LEDGERNAME")).filter(Boolean),
+    })).filter((voucher) => voucher.alterId > Number(afterAlterId || 0) && voucher.voucherType);
   }
 
   async voucherIdentity(identity, { reference, voucherNumber, dateFrom, dateTo, signal } = {}) {

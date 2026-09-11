@@ -36,6 +36,14 @@ const AGENT_COMMANDS = new Set([
   "agent_voucher_identity",
 ]);
 
+function financialYearDates(value) {
+  const match = String(value || "").match(/(\d{4})\D+(\d{2,4})/);
+  if (!match) return { dateFrom: null, dateTo: new Date().toISOString().slice(0, 10) };
+  const startYear = Number(match[1]);
+  const endYear = match[2].length === 2 ? Math.floor(startYear / 100) * 100 + Number(match[2]) : Number(match[2]);
+  return { dateFrom: `${startYear}-04-01`, dateTo: `${endYear}-03-31` };
+}
+
 function defaultAgentDirectory() {
   return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Kalika", "LocalAgent");
 }
@@ -144,6 +152,78 @@ export class LocalAgentRuntime {
       this.ledgerLookupCache.delete(datasetKey(job.identity));
       await this.ensureVectorIndex(job.identity, progress, { force: true }).catch((error) => this.onLog?.("warn", `Local ledger index: ${error.message}`));
       return result;
+    });
+    this.scheduler.register("agent_sync_followup_changes", async (job, progress) => {
+      const key = datasetKey(job.identity);
+      const cursorKey = `followup-voucher-alter-id:${key}`;
+      const savedCursor = await this.storage.call("getSetting", { key: cursorKey, fallback: null });
+      if (savedCursor === null) {
+        const baseline = Math.max(0, Number(job.payload?.highestAlterId) || 0);
+        await this.storage.call("setSetting", { key: cursorKey, value: baseline });
+        // The first watcher run deliberately avoids exporting years of voucher
+        // history. Expire the aggregate view once so its next read establishes
+        // a fresh open-bill baseline; later runs process only AlterID deltas.
+        await this.invalidateWorkflowSnapshots("cash_discount");
+        await this.invalidateWorkflowSnapshots("open_bills");
+        return { changed: 0, affectedLedgers: 0, cursor: baseline, baseline: true };
+      }
+      let cursor = Number(savedCursor) || 0;
+      const changed = [];
+      const { dateFrom, dateTo } = financialYearDates(job.identity.financialYear);
+      for (;;) {
+        await progress({ phase: "checking_followup_changes", processed: changed.length, total: null });
+        const page = await this.gateway.workflowVouchers(job.identity, {
+          workflow: "payment_followups", dateFrom, dateTo, afterAlterId: cursor, limit: 50,
+        });
+        if (!page.length) break;
+        const nextCursor = page.reduce((highest, voucher) => Math.max(highest, Number(voucher.alterId || 0)), cursor);
+        if (nextCursor <= cursor) throw new Error("Tally returned a non-advancing payment voucher AlterID page.");
+        changed.push(...page);
+        cursor = nextCursor;
+        await this.storage.call("setSetting", { key: cursorKey, value: cursor });
+        if (page.length < 50) break;
+      }
+      if (!changed.length) return { changed: 0, affectedLedgers: 0, cursor };
+      const [masters, groups] = await Promise.all([
+        this.storage.call("listMasters", { datasetKey: key, masterType: "ledger" }),
+        this.storage.call("listMasters", { datasetKey: key, masterType: "group" }),
+      ]);
+      const groupParents = new Map(groups.map((group) => [ledgerLookupKey(group.name), group.parent]));
+      const belongsToDebtors = (ledger) => {
+        let parent = String(ledger.parent || "");
+        const visited = new Set();
+        while (parent && !visited.has(ledgerLookupKey(parent))) {
+          if (/sundry\s+debtors/i.test(parent)) return true;
+          visited.add(ledgerLookupKey(parent));
+          parent = String(groupParents.get(ledgerLookupKey(parent)) || "");
+        }
+        return false;
+      };
+      const debtorNames = new Map(masters
+        .filter(belongsToDebtors)
+        .map((ledger) => [ledgerLookupKey(ledger.name), ledger.name]));
+      const affectedLedgers = [...new Set(changed.flatMap((voucher) => [voucher.partyLedgerName, ...(voucher.ledgerNames || [])])
+        .map((name) => debtorNames.get(ledgerLookupKey(name)))
+        .filter(Boolean))];
+      if (affectedLedgers.length) {
+        // Re-read the complete outstanding set for only the affected parties.
+        // An older carry-forward bill can be settled by a voucher altered today.
+        const bills = await this.gateway.openBills(job.identity, {
+          ledgerNames: affectedLedgers, dateTo: new Date().toISOString().slice(0, 10),
+        });
+        for (const ledgerName of affectedLedgers) {
+          await this.storage.call("replaceOpenBills", {
+            datasetKey: key, ledgerKey: ledgerName,
+            bills: bills.filter((bill) => ledgerLookupKey(bill.ledgerName) === ledgerLookupKey(ledgerName)),
+          });
+        }
+      }
+      await this.invalidateWorkflowSnapshots("cash_discount");
+      await this.invalidateWorkflowSnapshots("open_bills");
+      await this.storage.call("setSetting", { key: `followup-last-change:${key}`, value: {
+        changedAt: new Date().toISOString(), cursor, affectedLedgers,
+      } });
+      return { changed: changed.length, affectedLedgers: affectedLedgers.length, cursor };
     });
     this.scheduler.register("agent_reconcile_dataset", async (job, progress) => {
       const result = await this.syncDataset(job.identity, { forceReconcile: true, progress });
@@ -300,6 +380,13 @@ export class LocalAgentRuntime {
     const intervalSeconds = Number(await this.storage.call("getSetting", { key: "syncIntervalSeconds", fallback: 60 })) || 60;
     if (Date.now() - this.lastWatermarkAt < Math.max(15, intervalSeconds) * 1_000 || this.scheduler.busy) return;
     this.lastWatermarkAt = Date.now();
+    await this.scheduler.enqueue({
+      id: `followup-watch:${createHash("sha256").update(datasetKey(identity)).digest("hex").slice(0, 20)}:${Math.floor(this.lastWatermarkAt / (Math.max(15, intervalSeconds) * 1_000))}`,
+      type: "agent_sync_followup_changes", identity, payload: {
+        reason: "periodic_voucher_delta_check", highestAlterId: Number(capabilities.highestAlterId || 0),
+      },
+      jobClass: "incremental_sync", priority: 46,
+    });
     const existing = await this.storage.call("getDataset", { datasetKey: datasetKey(identity) });
     if (!existing) {
       await this.scheduler.enqueue({ type: "agent_sync_dataset", identity, payload: { reason: "initial_company_observation" }, jobClass: "incremental_sync", priority: 45 });

@@ -1,4 +1,4 @@
-export const AGENT_VERSION = "1.1.4";
+export const AGENT_VERSION = "1.1.5";
 export const AGENT_PROTOCOL_VERSION = 1;
 export const LOCAL_SCHEMA_VERSION = 3;
 export const TDL_REPORT_VERSION = 1;
@@ -22,6 +22,7 @@ export const AGENT_CAPABILITIES = Object.freeze([
   "purchase-canonical-v2",
   "purchase-bounded-reads-v1",
   "purchase-strict-readback-v1",
+  "followup-voucher-delta-v1",
 ]);
 
 export const JOB_CLASSES = Object.freeze({

@@ -1285,6 +1285,23 @@ export function CollectionsDashboardPage({
   }, [refreshAll, accessReady, accessEpoch, dashboardCacheKey]);
 
   useEffect(() => {
+    if (!accessReady || !isDedicatedFollowUpsPage) return;
+    const refreshIfVisible = () => {
+      if (document.visibilityState !== 'visible' || activeScanRef.current) return;
+      void refreshAll({ quiet: true }).catch(() => {});
+    };
+    const timer = window.setInterval(refreshIfVisible, 60_000);
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') refreshIfVisible();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [accessReady, isDedicatedFollowUpsPage, refreshAll]);
+
+  useEffect(() => {
     setPendingPage(1);
     setCreatedPage(1);
     setFollowUpsPage(1);
