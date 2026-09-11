@@ -400,6 +400,21 @@ function sortPaymentFollowUpRows(rows: PaymentFollowUp[], sort: PaymentFollowUpS
   });
 }
 
+function paymentFollowUpDataKey(payload: DashboardPayload | null) {
+  return (payload?.tabs?.paymentFollowUps ?? [])
+    .map((row) => [
+      row.partyLedgerName,
+      row.linkedInvoiceNumber,
+      row.linkedInvoiceDate,
+      row.outstandingAmount,
+      row.followUpStatus,
+      row.ageDays,
+      row.ageBasis,
+    ].join("\u001f"))
+    .sort()
+    .join("\u001e");
+}
+
 function isPendingDebitNote(proposal: DebitNoteProposal) {
   return ["draft", "pending_approval", "approved", "queued_in_tally", "failed"].includes(proposal.status);
 }
@@ -829,7 +844,7 @@ export function CollectionsDashboardPage({
   }, []);
 
   const refreshTallyOpenBills = useCallback(
-    async (connectionId: string, companyName?: string | null, financialYear?: string | null, companyGuid?: string | null, resume = false, forceRefresh = false) => {
+    async (connectionId: string, companyName?: string | null, financialYear?: string | null, companyGuid?: string | null, resume = false, forceRefresh = false, quiet = false) => {
       const resolvedCompanyName = String(companyName ?? "").trim();
       if (!connectionId || !resolvedCompanyName) {
         throw new Error("Select the live Tally company before refreshing Cash Discounts.");
@@ -842,7 +857,7 @@ export function CollectionsDashboardPage({
       if (activeScanRef.current) throw new Error("A Cash Discount scan is already running. Wait or cancel it before refreshing.");
       const controller = new AbortController();
       activeScanRef.current = controller;
-      setMessage({ tone: "info", text: "Connected—reading eligible customers from Tally…" });
+      if (!quiet) setMessage({ tone: "info", text: "Connected—reading eligible customers from Tally…" });
       const requestEpoch = accessCacheEpoch();
       try { let result = await runCashDiscountLiveRequest<DashboardPayload>({
         signal: controller.signal,
@@ -853,22 +868,24 @@ export function CollectionsDashboardPage({
         operation: isDedicatedFollowUpsPage ? "followups_scan" : "scan",
         payload: { resume, forceRefresh, moduleName: isDedicatedFollowUpsPage ? "followups" : "cashDiscount" },
         onProgress: (progressMessage) => {
-          setMessage({ tone: "info", text: progressMessage });
+          if (!quiet) setMessage({ tone: "info", text: progressMessage });
         },
         onPreview: (preview) => {
-          setDashboard(preview as DashboardPayload);
-          setMessage({ tone: "info", text: "Live Cash Discount results are ready. Confirming debit-note history…" });
+          if (!quiet) {
+            setDashboard(preview as DashboardPayload);
+            setMessage({ tone: "info", text: "Live Cash Discount results are ready. Confirming debit-note history…" });
+          }
         },
       });
         if (result.cache?.stale && !forceRefresh && requestEpoch === accessCacheEpoch()) {
-          setDashboard(result);
-          setMessage({ tone: 'info', text: 'Showing saved results · Updating from Tally…' });
+          if (!quiet) setDashboard(result);
+          if (!quiet) setMessage({ tone: 'info', text: 'Showing saved results · Updating from Tally…' });
           const saved = result;
           try {
             const fresh = await runCashDiscountLiveRequest<DashboardPayload>({
               signal: controller.signal, connectionId, companyName: resolvedCompanyName, companyGuid, financialYear,
               operation: isDedicatedFollowUpsPage ? 'followups_scan' : 'scan', payload: { forceRefresh: true, moduleName: isDedicatedFollowUpsPage ? "followups" : "cashDiscount" },
-              onProgress: text => setMessage({ tone: 'info', text: `Showing saved results · ${text}` }),
+              onProgress: text => { if (!quiet) setMessage({ tone: 'info', text: `Showing saved results · ${text}` }); },
             });
             if (fresh.scanSummary?.complete === false) throw new Error('The refresh was incomplete.');
             result = fresh;
@@ -877,7 +894,7 @@ export function CollectionsDashboardPage({
             result = { ...saved, cache: { ...saved.cache!, refreshError: error instanceof Error ? error.message : 'Refresh failed.' } };
           }
         }
-        setLastScan({scope:`${connectionId}|${resolvedCompanyName}|${financialYear || ''}`,at:result.cache?.updatedAt ? new Date(result.cache.updatedAt).toLocaleString() : new Date().toLocaleTimeString(),complete:result.scanSummary?.complete !== false});
+        if (!quiet) setLastScan({scope:`${connectionId}|${resolvedCompanyName}|${financialYear || ''}`,at:result.cache?.updatedAt ? new Date(result.cache.updatedAt).toLocaleString() : new Date().toLocaleTimeString(),complete:result.scanSummary?.complete !== false});
         return result;
       } finally {
         if (activeScanRef.current === controller) activeScanRef.current = null;
@@ -936,7 +953,7 @@ export function CollectionsDashboardPage({
       if (activeScanRef.current) return;
       try {
         if (!options?.quiet) setLoading(true);
-        setMessage(null);
+        if (!options?.quiet) setMessage(null);
         const bootstrap = await loadCompanies();
         const nextCompanies = bootstrap.companies;
         let company =
@@ -980,15 +997,17 @@ export function CollectionsDashboardPage({
         // Set this before the asynchronous Tally scan so the selection effect
         // does not start a second, overlapping scan for the same company.
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
-        const nextDashboard = await refreshTallyOpenBills(connectionId, company?.companyName, company?.financialYear, company?.companyGuid, false, options?.refreshTally === true);
+        const nextDashboard = await refreshTallyOpenBills(connectionId, company?.companyName, company?.financialYear, company?.companyGuid, false, options?.refreshTally === true, options?.quiet === true);
         if (requestEpoch !== accessCacheEpoch()) return;
         if (nextDashboard.scanSummary?.complete === false) {
-          setMessage({ tone: 'error', text: 'Refresh incomplete. Any previously displayed complete results have been kept.' });
+          if (!options?.quiet) setMessage({ tone: 'error', text: 'Refresh incomplete. Any previously displayed complete results have been kept.' });
           setDashboard(current => current?.scanSummary?.complete === true ? current : nextDashboard);
           return;
         }
-        setDashboard(nextDashboard);
-        setMessage(null);
+        setDashboard((current) => options?.quiet && isDedicatedFollowUpsPage && paymentFollowUpDataKey(current) === paymentFollowUpDataKey(nextDashboard)
+          ? current
+          : nextDashboard);
+        if (!options?.quiet) setMessage(null);
         lastLoadedConnectionRef.current = `${connectionId}::${company?.companyName ?? ""}`;
         const nextLastScan = {
           scope: `${connectionId}|${company?.companyName ?? ''}|${company?.financialYear ?? ''}`,
@@ -1007,12 +1026,12 @@ export function CollectionsDashboardPage({
         });
       } catch (error) {
         if (requestEpoch !== accessCacheEpoch()) return;
-        setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
+        if (!options?.quiet) setMessage({ tone: "error", text: error instanceof Error ? error.message : "Could not load Cash Discounts data." });
       } finally {
         if (requestEpoch === accessCacheEpoch()) setLoading(false);
       }
     },
-    [accessReady, dashboardCacheKey, loadCompanies, refreshTallyOpenBills, selectedCompanyId, selectedConnectionId]
+    [accessReady, dashboardCacheKey, isDedicatedFollowUpsPage, loadCompanies, refreshTallyOpenBills, selectedCompanyId, selectedConnectionId]
   );
 
   async function createDebitNoteForProposal(proposal: DebitNoteProposal) {
