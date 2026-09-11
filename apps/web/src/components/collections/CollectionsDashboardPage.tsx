@@ -723,6 +723,7 @@ export function CollectionsDashboardPage({
   const [message, setMessage] = useState<{ tone: "success" | "error" | "info"; text: string } | null>(null);
   const initialLoadStartedRef = useRef(false);
   const activeScanRef = useRef<AbortController | null>(null);
+  const [interactiveScan, setInteractiveScan] = useState(false);
   useEffect(() => () => activeScanRef.current?.abort(new Error("Cash Discount page closed.")), []);
   const lastLoadedConnectionRef = useRef("");
   useEffect(() => {
@@ -857,6 +858,7 @@ export function CollectionsDashboardPage({
       if (activeScanRef.current) throw new Error("A Cash Discount scan is already running. Wait or cancel it before refreshing.");
       const controller = new AbortController();
       activeScanRef.current = controller;
+      if (!quiet) setInteractiveScan(true);
       if (!quiet) setMessage({ tone: "info", text: "Connected—reading eligible customers from Tally…" });
       const requestEpoch = accessCacheEpoch();
       try { let result = await runCashDiscountLiveRequest<DashboardPayload>({
@@ -898,6 +900,7 @@ export function CollectionsDashboardPage({
         return result;
       } finally {
         if (activeScanRef.current === controller) activeScanRef.current = null;
+        if (!quiet) setInteractiveScan(false);
       }
     },
     [enforcementRequired,accessSnapshot,isDedicatedFollowUpsPage]
@@ -1307,7 +1310,29 @@ export function CollectionsDashboardPage({
     if (!accessReady || !isDedicatedFollowUpsPage) return;
     const refreshIfVisible = () => {
       if (document.visibilityState !== 'visible' || activeScanRef.current) return;
-      void refreshAll({ quiet: true }).catch(() => {});
+      const company = selectedCompany;
+      if (!selectedConnectionId || !company || !isLiveTallyCompanyMatch(liveTallyConnection, selectedConnectionId, company)) return;
+      void refreshTallyOpenBills(
+        selectedConnectionId,
+        company.companyName,
+        company.financialYear,
+        company.companyGuid,
+        false,
+        false,
+        true,
+      ).then((nextDashboard) => {
+        if (nextDashboard.scanSummary?.complete === false) return;
+        setDashboard((current) => paymentFollowUpDataKey(current) === paymentFollowUpDataKey(nextDashboard)
+          ? current
+          : nextDashboard);
+        setLastScan({
+          scope: `${selectedConnectionId}|${company.companyName}|${company.financialYear || ''}`,
+          at: nextDashboard.cache?.updatedAt
+            ? new Date(nextDashboard.cache.updatedAt).toLocaleString()
+            : new Date().toLocaleTimeString(),
+          complete: true,
+        });
+      }).catch(() => {});
     };
     const timer = window.setInterval(refreshIfVisible, 60_000);
     const onVisibility = () => {
@@ -1318,7 +1343,7 @@ export function CollectionsDashboardPage({
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, [accessReady, isDedicatedFollowUpsPage, refreshAll]);
+  }, [accessReady, isDedicatedFollowUpsPage, liveTallyConnection, refreshTallyOpenBills, selectedCompany, selectedConnectionId]);
 
   useEffect(() => {
     setPendingPage(1);
@@ -1676,7 +1701,7 @@ export function CollectionsDashboardPage({
         }
       />
 
-      {activeScanRef.current ? (
+      {interactiveScan ? (
         <button type="button" className="mb-3 rounded-lg border px-3 py-1 text-xs" onClick={() =>
           activeScanRef.current?.abort(new Error("Scan cancelled. Tally may still be finishing its current read; wait before retrying."))}>
           Cancel scan
