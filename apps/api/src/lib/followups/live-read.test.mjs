@@ -13,8 +13,8 @@ test('authenticated scoped gateway read returns connector evidence',async()=>{
   else socket.send(JSON.stringify({type:'result',requestId:m.requestId,success:true,data:{byLedger:{Customer:{openBills:[]}}}}));
  }));
  try{
-  const result=await readReminderBills(new Request('http://localhost',{headers:{authorization:'Bearer fixture'}}),{connectionId:'connection',companyName:'Company',financialYear:'2026-27',organizationId:'organization'},'Customer');
+  const result=await readReminderBills(new Request('http://localhost',{headers:{authorization:'Bearer fixture'}}),{connectionId:'connection',companyName:'Company',financialYear:'2026-27',organizationId:'organization'},['Customer','Second customer','Customer']);
   assert.equal(seen[0].token,'fixture');assert.equal(seen[0].organizationId,'organization');
-  assert.deepEqual(seen[1].payload.ledgerNames,['Customer']);assert.equal(seen[1].financialYear,'2026-27');assert.deepEqual(result.byLedger.Customer.openBills,[]);
+  assert.deepEqual(seen[1].payload.ledgerNames,['Customer','Second customer']);assert.equal(seen[1].financialYear,'2026-27');assert.deepEqual(result.byLedger.Customer.openBills,[]);
  }finally{if(previous===undefined)delete process.env.CASH_DISCOUNT_GATEWAY_URL;else process.env.CASH_DISCOUNT_GATEWAY_URL=previous;for(const client of server.clients)client.terminate();await new Promise(r=>server.close(r));}
 });

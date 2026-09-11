@@ -1,4 +1,4 @@
-import {createHash} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import {withTeamAccess} from '@/lib/access/route-boundary';
 import {requireDataset} from '@/lib/access/dataset';
 import {AccessError} from '@/lib/access/server';
@@ -20,6 +20,10 @@ async function context(request:Request,body:Record<string,unknown>,permission:st
   return requireDataset(request,String(body.connectionId||''),scopeOf(body),permission);
 }
 function phone(raw:unknown) {const value=normalizeWhatsappPhone(raw);if(!/^91\d{10}$/.test(value))throw new AccessError('Enter a valid Indian WhatsApp number.',400);return value;}
+const batchItems=(value:unknown)=>{
+  if(!Array.isArray(value)||!value.length||value.length>100)throw new AccessError('Select between 1 and 100 invoices.',400);
+  return value as Array<Record<string,unknown>>;
+};
 async function GETHandler(request:Request) {
   try {
     const body=Object.fromEntries(new URL(request.url).searchParams);
@@ -50,9 +54,56 @@ async function POSTHandler(request:Request) {
   try {
     const body=await request.json();
     let action=String(body.action||'');
-    const permission=action==='history'||action==='statuses'?'followups.view':action==='send'||action==='send_once'||action==='preview'?'followups.export':action==='save_template'?'settings.manage':'followups.prepare';
+    const permission=action==='history'||action==='statuses'?'followups.view':action==='send'||action==='send_once'||action==='preview'||action==='bulk_send'||action==='bulk_send_once'?'followups.export':action==='save_template'?'settings.manage':'followups.prepare';
     const {access,link,connection}=await context(request,body,permission);
     const db=createSupabaseAdminClient();
+    if(action.startsWith('bulk_')) {
+      const items=batchItems(body.items);
+      const results:Array<{key:string;status:string;message?:string;row?:unknown}>=[];
+      const keyOf=(item:Record<string,unknown>)=>String(item.key||item.id||item.invoice||'').slice(0,500);
+      if(action==='bulk_enroll'||action==='bulk_send_once') {
+        const once=action==='bulk_send_once';
+        const defaults=(await reminderDefaults(access.organizationId)).value;
+        if(!defaults)throw new AccessError('Set up Payment reminders in Settings first.',409);
+        if(once&&(!process.env.MSG91_AUTHKEY||!process.env.MSG91_WHATSAPP_NUMBER))throw new AccessError('Configure the WhatsApp sender before sending.',409);
+        const plan=validateReminderPlan(once?{name:'One-time reminder',stages:[{name:'One-time reminder',template:defaults.onceTemplate,delay:0,every:1,unit:'days',limit:1}]}:defaults.plan);
+        const valid=items.map(item=>({item,customer:String(item.customer||'').trim(),invoice:String(item.invoice||'').trim(),invoiceDate:String(item.invoiceDate||''),recipient:phone(item.recipient)}));
+        if(valid.some(x=>!x.customer||!x.invoice||!/^\d{4}-\d{2}-\d{2}$/.test(x.invoiceDate)))throw new AccessError('Every selection needs a customer, invoice and invoice date.',400);
+        const evidence=await readReminderBills(request,{connectionId:connection.id,companyName:link.company_name,financialYear:link.financial_year,organizationId:access.organizationId},valid.map(x=>x.customer));
+        const byLedger=evidence.byLedger as Record<string,{openBills?:Parameters<typeof verificationOutcome>[0]}>|undefined;
+        if(evidence.complete===false||!byLedger)throw new AccessError('Tally verification is incomplete. Nothing was changed.',409);
+        for(const x of valid){
+          try{
+            const bills=byLedger[x.customer]?.openBills;if(!Array.isArray(bills))throw new Error('Tally did not return this customer completely.');
+            const outcome=verificationOutcome(bills,x.invoice,x.invoiceDate);if(outcome.status!=='active')throw new Error('Invoice is settled or needs review in Tally.');
+            const invoiceKey=createHash('sha256').update(JSON.stringify([x.customer,x.invoice,x.invoiceDate])).digest('hex');
+            if(!once){const unfinished=checked(await db.from('invoice_followup_pipelines').select('id').eq('organization_id',access.organizationId).eq('company_id',link.company_id).eq('installation_id',connection.installation_id).eq('company_guid',link.company_guid).eq('financial_year',link.financial_year).eq('invoice_key',invoiceKey).eq('mode','pipeline').not('status','in','(settled,finished,stopped)').limit(1));if(unfinished?.length)throw new Error('A reminder schedule already exists.');}
+            const id=/^[0-9a-f-]{36}$/i.test(String(x.item.requestId||''))?String(x.item.requestId):randomUUID();
+            const inserted=checked(await db.from('invoice_followup_pipelines').insert({id,organization_id:access.organizationId,company_id:link.company_id,connection_id:connection.id,installation_id:connection.installation_id,session_generation:connection.session_generation,company_guid:link.company_guid,company_name:link.company_name,financial_year:link.financial_year,customer:x.customer,invoice:x.invoice,invoice_date:x.invoiceDate,invoice_key:invoiceKey,recipient:x.recipient,plan_name:plan.name,stages:plan.stages,next_due_at:new Date(Date.now()+stageMs(plan.stages[0],'delay')).toISOString(),created_by:access.member.user_id,mode:once?'once':'pipeline',outstanding:outcome.outstanding,verified_at:new Date().toISOString(),verification_expires_at:new Date(Date.now()+REMINDER_CHECK_MS).toISOString()}).select('*').single()) as Pipeline;
+            if(x.item.savePhoneToTally===true){const queued=await db.rpc('followup_queue_phone',{p_actor:access.member.user_id,p_org:access.organizationId,p_id:inserted.id});if(!queued.error)await wakeTallyConnector(connection.id).catch(()=>{});}
+            if(!once){results.push({key:keyOf(x.item),status:'enrolled',row:inserted});continue;}
+            const claim=checked(await db.rpc('followup_claim_send',{p_id:inserted.id,p_revision:inserted.revision,p_actor:access.member.user_id,p_org:access.organizationId,p_company:link.company_id,p_installation:connection.installation_id,p_generation:connection.session_generation}));
+            let sendStatus='uncertain',provider:string|null=null,sendError:string|null=null;try{provider=await submitReminder(plan.stages[0].template,inserted,x.recipient);sendStatus='accepted';}catch(reason){sendStatus=reason instanceof WhatsappRejectedError?'rejected':'uncertain';sendError=reason instanceof Error?reason.message:'Submission needs verification.';}
+            const next=sendStatus==='accepted'?advanceReminder(plan.stages,0,0):null;checked(await db.rpc('followup_finish_send',{p_id:inserted.id,p_attempt:claim.attempt_id,p_status:sendStatus,p_provider:provider,p_error:sendError,p_next:next}));results.push({key:keyOf(x.item),status:sendStatus,message:sendError||undefined});
+          }catch(error){results.push({key:keyOf(x.item),status:'skipped',message:error instanceof Error?error.message:'Could not process invoice.'});}
+        }
+        return jsonWithCors(request,{results});
+      }
+      const ids=items.map(item=>String(item.id||'')).filter(id=>/^[0-9a-f-]{36}$/i.test(id));if(ids.length!==items.length)throw new AccessError('Every selected schedule must have a valid identifier.',400);
+      const rows=checked(await db.from('invoice_followup_pipelines').select('*').eq('organization_id',access.organizationId).eq('company_id',link.company_id).eq('installation_id',connection.installation_id).eq('company_guid',link.company_guid).eq('financial_year',link.financial_year).in('id',ids).limit(100)) as Pipeline[];
+      const rowById=new Map(rows.map(row=>[row.id,row]));
+      let evidence:Record<string,unknown>|null=null;if(action==='bulk_check'||action==='bulk_send')evidence=await readReminderBills(request,{connectionId:connection.id,companyName:link.company_name,financialYear:link.financial_year,organizationId:access.organizationId},[...new Set(rows.map(row=>row.customer))]);
+      for(const item of items){const row=rowById.get(String(item.id));try{if(!row)throw new Error('Schedule was not found.');if(row.revision!==Number(item.revision))throw new Error('Schedule changed. Refresh and retry.');
+        if(action==='bulk_pause'||action==='bulk_resume'||action==='bulk_stop'){const target=action==='bulk_pause'?'paused':action==='bulk_resume'?'active':'stopped';if(action==='bulk_pause'&&row.status!=='active')throw new Error('Only active schedules can be paused.');if(action==='bulk_resume'&&row.status!=='paused')throw new Error('Only paused schedules can be resumed.');if(action==='bulk_stop'&&!['active','paused','review'].includes(row.status))throw new Error('Schedule cannot be stopped in its current state.');const updated=checked(await db.from('invoice_followup_pipelines').update({status:target,revision:row.revision+1,updated_at:new Date().toISOString(),verification_expires_at:null,...(target==='active'?{next_due_at:new Date().toISOString()}:{})}).eq('id',row.id).eq('revision',row.revision).select('*').maybeSingle());if(!updated)throw new Error('Schedule changed. Refresh and retry.');results.push({key:keyOf(item),status:target,row:updated});continue;}
+        if(action==='bulk_plan'){if(!['active','paused','review'].includes(row.status))throw new Error('The reminder sequence cannot be changed in its current state.');const plan=validateReminderPlan(item.plan||body.plan);if(plan.stages.some(s=>!reminderMessages().some(m=>m.key===s.template)))throw new Error('The selected reminder sequence is invalid.');const updated=checked(await db.from('invoice_followup_pipelines').update({plan_name:plan.name,stages:plan.stages,stage_index:0,stage_sent:0,next_due_at:new Date(Date.now()+stageMs(plan.stages[0],'delay')).toISOString(),revision:row.revision+1,updated_at:new Date().toISOString(),verification_expires_at:null}).eq('id',row.id).eq('revision',row.revision).select('*').maybeSingle());if(!updated)throw new Error('Schedule changed. Refresh and retry.');results.push({key:keyOf(item),status:'updated',row:updated});continue;}
+        if(['sending','uncertain'].includes(row.status))throw new Error('The previous submission needs provider verification before another action.');
+        if(!['active','review','paused'].includes(row.status))throw new Error('Schedule cannot be checked in its current state.');
+        const byLedger=evidence?.byLedger as Record<string,{openBills?:Parameters<typeof verificationOutcome>[0]}>|undefined;const bills=byLedger?.[row.customer]?.openBills;if(evidence?.complete===false||!Array.isArray(bills))throw new Error('Tally did not return complete invoice evidence.');const outcome=verificationOutcome(bills,row.invoice,row.invoice_date,evidence?.settlementEvidence as Parameters<typeof verificationOutcome>[3],row.customer);
+        const updated=checked(await db.from('invoice_followup_pipelines').update({outstanding:outcome.outstanding,status:row.status==='paused'&&outcome.status==='active'?'paused':outcome.status,note:outcome.note,verified_at:new Date().toISOString(),verification_expires_at:outcome.status==='active'?new Date(Date.now()+REMINDER_CHECK_MS).toISOString():null,...(outcome.status==='settled'?{next_due_at:null}:{}),revision:row.revision+1,updated_at:new Date().toISOString()}).eq('id',row.id).eq('revision',row.revision).select('*').maybeSingle()) as Pipeline|null;if(!updated)throw new Error('Schedule changed. Refresh and retry.');
+        if(action==='bulk_check'){results.push({key:keyOf(item),status:outcome.status,row:updated});continue;}if(row.status!=='active')throw new Error('Only active schedules can send due reminders.');if(outcome.status!=='active')throw new Error('Invoice is settled or needs review.');if(!updated.next_due_at||Date.parse(updated.next_due_at)>Date.now())throw new Error('Reminder is not due yet.');const claim=checked(await db.rpc('followup_claim_send',{p_id:updated.id,p_revision:updated.revision,p_actor:access.member.user_id,p_org:access.organizationId,p_company:link.company_id,p_installation:connection.installation_id,p_generation:connection.session_generation}));let sendStatus='uncertain',provider:string|null=null,sendError:string|null=null;try{provider=await submitReminder(updated.stages[updated.stage_index].template,updated,updated.recipient);sendStatus='accepted';}catch(reason){sendStatus=reason instanceof WhatsappRejectedError?'rejected':'uncertain';sendError=reason instanceof Error?reason.message:'Submission needs verification.';}const next=sendStatus==='accepted'?advanceReminder(updated.stages,updated.stage_index,updated.stage_sent):null;checked(await db.rpc('followup_finish_send',{p_id:updated.id,p_attempt:claim.attempt_id,p_status:sendStatus,p_provider:provider,p_error:sendError,p_next:next}));results.push({key:keyOf(item),status:sendStatus,message:sendError||undefined});
+      }catch(error){results.push({key:keyOf(item),status:'skipped',message:error instanceof Error?error.message:'Could not process schedule.'});}}
+      return jsonWithCors(request,{results});
+    }
     if(action==='statuses') {
       type InvoiceSelection = { customer: string; invoice: string; date: string };
       if(!Array.isArray(body.invoices)||body.invoices.length>200||body.invoices.some((value:unknown)=>{

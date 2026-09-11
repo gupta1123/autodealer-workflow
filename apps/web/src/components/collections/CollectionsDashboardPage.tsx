@@ -695,6 +695,11 @@ export function CollectionsDashboardPage({
   const [reminderToolbar,setReminderToolbar]=useState<HTMLDivElement|null>(null);
   const [reminderTab,setReminderTab]=useState<'outstanding'|'due'|'pipelines'>('due');
   const [reminderInvoice, setReminderInvoice] = useState<{partyLedgerName:string;linkedInvoiceNumber:string|null;linkedInvoiceDate:string|null;partyPhone:string|null}|null>(null);
+  const [selectedFollowUpIds,setSelectedFollowUpIds]=useState<Set<string>>(()=>new Set());
+  const [followUpBulkMode,setFollowUpBulkMode]=useState<'enroll'|'send_once'|null>(null);
+  const [followUpBulkPhones,setFollowUpBulkPhones]=useState<Record<string,string>>({});
+  const [followUpBulkBusy,setFollowUpBulkBusy]=useState(false);
+  const [followUpBulkSavePhones,setFollowUpBulkSavePhones]=useState(true);
   const [loading, setLoading] = useState(() => !initialCachedView);
   const [lastScan, setLastScan] = useState<{scope:string; at:string; complete:boolean} | null>(() => initialCachedView?.lastScan ?? null);
   const [approvingId, setApprovingId] = useState("");
@@ -1520,6 +1525,17 @@ export function CollectionsDashboardPage({
   const pagedPendingProposals = visiblePendingProposals.slice((safePendingPage - 1) * pageSize, safePendingPage * pageSize);
   const pagedCreatedProposals = visibleCreatedProposals.slice((safeCreatedPage - 1) * pageSize, safeCreatedPage * pageSize);
   const pagedPaymentFollowUps = sortedPaymentFollowUps.slice((safeFollowUpsPage - 1) * pageSize, safeFollowUpsPage * pageSize);
+  const selectedFollowUps=sortedPaymentFollowUps.filter(row=>selectedFollowUpIds.has(row.id));
+  const openFollowUpBulk=(mode:'enroll'|'send_once')=>{setFollowUpBulkPhones(Object.fromEntries(selectedFollowUps.map(row=>[row.id,row.partyPhone||''])));setFollowUpBulkMode(mode);};
+  const submitFollowUpBulk=async()=>{
+    if(!followUpBulkMode||!selectedCompany||!selectedFollowUps.length||followUpBulkBusy)return;
+    setFollowUpBulkBusy(true);setMessage(null);
+    try{
+      const response=await apiFetch('/api/collections/follow-ups/pipelines',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({connectionId:selectedConnectionId,companyId:selectedCompany.accessCompanyId,companyGuid:selectedCompany.companyGuid,companyName:selectedCompany.companyName,financialYear:selectedCompany.financialYear,action:followUpBulkMode==='enroll'?'bulk_enroll':'bulk_send_once',items:selectedFollowUps.map(row=>({key:row.id,requestId:crypto.randomUUID(),customer:row.partyLedgerName,invoice:row.linkedInvoiceNumber,invoiceDate:row.linkedInvoiceDate,recipient:followUpBulkPhones[row.id]||row.partyPhone,savePhoneToTally:followUpBulkSavePhones&&!row.partyPhone}))})});
+      const result=await response.json();if(!response.ok)throw new Error(result.error||'Bulk reminder action failed.');const rows=result.results||[];const completed=rows.filter((item:{status:string})=>!['skipped','rejected','uncertain'].includes(item.status)).length;const attention=rows.length-completed;setMessage({tone:attention?'info':'success',text:`${completed} completed${attention?` · ${attention} need attention`:''}.`});setFollowUpBulkMode(null);setSelectedFollowUpIds(new Set());setReminderTab(followUpBulkMode==='enroll'?'pipelines':'due');
+    }catch(error){setMessage({tone:'error',text:error instanceof Error?error.message:'Bulk reminder action failed.'});}finally{setFollowUpBulkBusy(false);}
+  };
+  const exportSelectedFollowUps=()=>{if(!selectedFollowUps.length)return;const q=(value:unknown)=>`"${String(value??'').replaceAll('"','""')}"`;const csv=[['Customer','Invoice','Invoice date','Outstanding','Phone','Payment age'],...selectedFollowUps.map(row=>[row.partyLedgerName,row.linkedInvoiceNumber,row.linkedInvoiceDate,row.outstandingAmount,row.partyPhone||'',row.ageLabel])].map(line=>line.map(q).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\ufeff',csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='unpaid-invoices.csv';a.click();URL.revokeObjectURL(url);};
   const scheduleStatuses=useReminderStatuses({connectionId:selectedConnectionId,companyId:selectedCompany?.accessCompanyId,companyGuid:selectedCompany?.companyGuid,companyName:selectedCompany?.companyName||'',financialYear:selectedCompany?.financialYear||''},pagedPaymentFollowUps,activeView==='followUps'&&reminderTab==='outstanding'&&!reminderInvoice);
   const selectablePendingProposals = tallyCompanyVerified ? pendingProposals.filter(canCreateInTally) : [];
   const selectablePendingOnPage = tallyCompanyVerified ? pagedPendingProposals.filter(canCreateInTally) : [];
@@ -1979,8 +1995,8 @@ export function CollectionsDashboardPage({
         </section>
       ) : null}
 
-      {!companyContextLocked && activeView==='followUps'?<div className="flex shrink-0 flex-wrap items-center justify-between gap-x-5 border-b border-[#ded8d0]"><nav aria-label="Payment follow-up views" className="flex min-w-0 gap-5 overflow-x-auto text-sm">{([['due','Reminders due'],['outstanding','Unpaid invoices'],['pipelines','Reminder tracking']] as const).map(([key,label])=><button key={key} type="button" aria-current={reminderTab===key?'page':undefined} className={`whitespace-nowrap border-b-2 px-1 py-3 ${reminderTab===key?'border-[#2d2d2d] font-medium text-[#1a1a1a]':'border-transparent text-[#82776a]'}`} onClick={()=>{setReminderTab(key);setReminderInvoice(null);setFocusedReminder('');}}>{label}{key==='due'&&remindersDue!==null&&remindersDue>0?<span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900">{remindersDue}</span>:null}</button>)}</nav><div className="ml-auto flex items-center gap-2 py-1.5">          {reminderTab==='outstanding'&&!reminderInvoice&&paymentFollowUps.length > 0 ? (
-            <div className="flex justify-end">
+      {!companyContextLocked && activeView==='followUps'?<div className="flex shrink-0 flex-wrap items-center justify-between gap-x-5 border-b border-[#ded8d0]"><nav aria-label="Payment follow-up views" className="flex min-w-0 gap-5 overflow-x-auto text-sm">{([['due','Reminders due'],['outstanding','Unpaid invoices'],['pipelines','Reminder tracking']] as const).map(([key,label])=><button key={key} type="button" aria-current={reminderTab===key?'page':undefined} className={`whitespace-nowrap border-b-2 px-1 py-3 ${reminderTab===key?'border-[#2d2d2d] font-medium text-[#1a1a1a]':'border-transparent text-[#82776a]'}`} onClick={()=>{setReminderTab(key);setReminderInvoice(null);setFocusedReminder('');setSelectedFollowUpIds(new Set());}}>{label}{key==='due'&&remindersDue!==null&&remindersDue>0?<span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900">{remindersDue}</span>:null}</button>)}</nav><div className="ml-auto flex items-center gap-2 py-1.5">          {reminderTab==='outstanding'&&!reminderInvoice&&paymentFollowUps.length > 0 ? (
+            <div className="flex flex-wrap justify-end gap-2">{selectedFollowUpIds.size?<><span className="self-center text-xs font-semibold text-[#51483f]">{selectedFollowUpIds.size} selected</span><button className={styles.messageAction} onClick={()=>openFollowUpBulk('enroll')}>Start reminders</button><button className={styles.messageAction} onClick={()=>openFollowUpBulk('send_once')}>Send once</button><button className={styles.messageAction} onClick={exportSelectedFollowUps}>CSV</button><button className={styles.messageAction} onClick={()=>setSelectedFollowUpIds(new Set())}>Clear</button></>:null}
             <label className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
               Sort
               <select
@@ -2009,6 +2025,7 @@ export function CollectionsDashboardPage({
               <div tabIndex={0} role="region" aria-label="Payment follow-ups table">
                 <table className={styles.createdTable}>
                   <thead><tr>
+                    <th scope="col" className="w-9"><input type="checkbox" aria-label="Select unpaid invoices on this page" checked={pagedPaymentFollowUps.length>0&&pagedPaymentFollowUps.every(row=>selectedFollowUpIds.has(row.id))} onChange={event=>setSelectedFollowUpIds(current=>{const next=new Set(current);for(const row of pagedPaymentFollowUps)event.target.checked?next.add(row.id):next.delete(row.id);return next;})}/></th>
                     <th scope="col">Customer</th>
                     <th scope="col" style={{width:'23%'}}>Invoice</th>
                     <th scope="col" style={{width:140}} className="text-right">Outstanding</th>
@@ -2017,7 +2034,7 @@ export function CollectionsDashboardPage({
                   </tr></thead>
                   <tbody>{pagedPaymentFollowUps.map(followUp => (
                     <tr key={followUp.id}>
-                      <td><span className={styles.customerName} title={followUp.partyLedgerName}>{followUp.partyLedgerName}</span>
+                      <td><input type="checkbox" aria-label={`Select ${followUp.linkedInvoiceNumber||followUp.partyLedgerName}`} disabled={!followUp.linkedInvoiceNumber||!followUp.linkedInvoiceDate} checked={selectedFollowUpIds.has(followUp.id)} onChange={event=>setSelectedFollowUpIds(current=>{const next=new Set(current);event.target.checked?next.add(followUp.id):next.delete(followUp.id);return next;})}/></td><td><span className={styles.customerName} title={followUp.partyLedgerName}>{followUp.partyLedgerName}</span>
                         <span className={styles.secondary}>{followUp.partyPhone || followUp.partyEmail || 'No contact'}</span></td>
                       <td><details className={styles.invoiceDetails}>
                         <summary title={followUp.linkedInvoiceNumber || 'No linked invoice'}>{shortText(followUp.linkedInvoiceNumber,'No linked invoice')}</summary>
@@ -2156,6 +2173,14 @@ export function CollectionsDashboardPage({
           )}
         </section>
       ) : null}
+
+      <Dialog open={followUpBulkMode!==null} onOpenChange={open=>{if(!open&&!followUpBulkBusy)setFollowUpBulkMode(null);}}>
+        <DialogContent className="flex max-h-[88dvh] max-w-2xl flex-col overflow-hidden rounded-xl border-[#ded8d0] p-0" showClose={!followUpBulkBusy}>
+          <div className="border-b border-[#e8e2db] px-5 py-4 pr-14"><DialogTitle className="text-base">{followUpBulkMode==='enroll'?'Start reminders':'Send once'}</DialogTitle><DialogDescription className="mt-1 text-xs">{selectedFollowUps.length} invoices selected. Tally will verify them together before anything is changed.</DialogDescription></div>
+          <div className="min-h-0 overflow-y-auto p-5"><div className="overflow-hidden rounded-lg border border-[#e8e2db]"><table className="w-full text-left text-xs"><thead className="bg-[#faf8f5]"><tr><th className="p-3">Customer / invoice</th><th className="p-3">Outstanding</th><th className="p-3">WhatsApp number</th></tr></thead><tbody>{selectedFollowUps.map(row=><tr className="border-t border-[#e8e2db]" key={row.id}><td className="p-3"><strong>{row.partyLedgerName}</strong><span className="mt-1 block text-[#756b60]">{row.linkedInvoiceNumber}</span></td><td className="p-3 tabular-nums">{formatMoney(row.outstandingAmount)}</td><td className="p-3"><input className="h-9 w-full rounded-lg border border-[#ded8d0] px-3" inputMode="tel" aria-label={`WhatsApp number for ${row.partyLedgerName}`} value={followUpBulkPhones[row.id]||''} onChange={event=>setFollowUpBulkPhones(current=>({...current,[row.id]:event.target.value}))}/></td></tr>)}</tbody></table></div>{selectedFollowUps.some(row=>!row.partyPhone)&&allowed('connections.manage')?<label className="mt-4 flex items-start gap-2 text-xs"><input type="checkbox" className="mt-0.5" checked={followUpBulkSavePhones} onChange={event=>setFollowUpBulkSavePhones(event.target.checked)}/><span>Save newly entered numbers in the corresponding Tally customer ledgers.</span></label>:null}</div>
+          <DialogFooter className="m-0 border-t border-[#e8e2db] px-5 py-4"><button className={styles.messageAction} disabled={followUpBulkBusy} onClick={()=>setFollowUpBulkMode(null)}>Cancel</button><button className="rounded-lg bg-[#2f2924] px-4 py-2 text-xs font-semibold text-white disabled:opacity-40" disabled={followUpBulkBusy||selectedFollowUps.some(row=>!(followUpBulkPhones[row.id]||row.partyPhone||'').trim())} onClick={()=>void submitFollowUpBulk()}>{followUpBulkBusy?'Checking Tally…':followUpBulkMode==='enroll'?`Start ${selectedFollowUps.length} schedules`:`Send ${selectedFollowUps.length} messages`}</button></DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {reviewingProposal ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-4 backdrop-blur-sm">
