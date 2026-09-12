@@ -295,29 +295,21 @@
 /* ── Top Horizontal Document Cards Strip ── */
 .topDocumentStrip {
   display: grid;
-  grid-template-columns: repeat(10, minmax(0, 1fr));
+  grid-template-columns: repeat(var(--top-document-columns, 10), minmax(110px, 1fr));
   gap: 8px;
   padding: 12px 26px 10px;
   background: var(--cd-surface);
   border-bottom: 1px solid var(--cd-line);
   flex: none;
-}
-
-@media (max-width: 1280px) {
-  .topDocumentStrip {
-    display: flex;
-    align-items: stretch;
-    gap: 8px;
-    overflow-x: auto;
-    scrollbar-width: thin;
-    grid-template-columns: none;
-  }
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
 
 .topDocCard {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 82px;
   flex: 1 1 0;
   padding: 8px 10px;
   background: #ffffff;
@@ -330,12 +322,8 @@
   box-shadow: 0 1px 2px rgba(43, 26, 16, 0.02);
 }
 
-@media (max-width: 1280px) {
-  .topDocCard {
-    min-width: 110px;
-    max-width: 150px;
-    flex: 0 0 auto;
-  }
+.topDocumentStripComparing .topDocCard {
+  min-height: 106px;
 }
 
 .topDocCard:hover {
@@ -349,6 +337,31 @@
   border: 2px solid #4f46e5 !important;
   background: #f8f7ff !important;
   box-shadow: 0 2px 10px rgba(79, 70, 229, 0.14) !important;
+}
+
+.topDocCardComparedMatched {
+  border-color: #86efac;
+  background: #f0fdf4;
+  box-shadow: inset 0 0 0 1px rgba(22, 163, 74, 0.08);
+}
+
+.topDocCardComparedMismatch {
+  border-color: #fda4af;
+  background: #fff1f2;
+  box-shadow: inset 0 0 0 1px rgba(220, 38, 38, 0.08);
+}
+
+.topDocCardComparedAbsent {
+  opacity: 0.38;
+  filter: saturate(0.35);
+}
+
+.topDocCardActive.topDocCardComparedMatched {
+  background: #f0fdf4 !important;
+}
+
+.topDocCardActive.topDocCardComparedMismatch {
+  background: #fff1f2 !important;
 }
 
 .topDocCardHeader {
@@ -391,6 +404,10 @@
   background: #dc2626;
 }
 
+.topDocDotMuted {
+  background: #94a3b8;
+}
+
 .topDocTitle {
   font-size: 12.5px;
   font-weight: 700;
@@ -408,6 +425,19 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.topDocValue {
+  display: -webkit-box;
+  margin-top: 5px;
+  overflow: hidden;
+  color: #334155;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .redesignFullViewer {
@@ -751,38 +781,6 @@
   white-space: nowrap;
 }
 
-.redesignFocusChip {
-  display: inline-flex;
-  max-width: 220px;
-  align-items: center;
-  gap: 5px;
-  overflow: hidden;
-  border: 1px solid var(--cd-amber-line);
-  border-radius: 999px;
-  background: var(--cd-amber-soft);
-  padding: 4px 9px;
-  color: var(--cd-amber);
-  font-size: 11px;
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.redesignFocusChip > i {
-  width: 6px;
-  height: 6px;
-  flex: none;
-  border-radius: 50%;
-  background: currentColor;
-}
-
-.redesignFocusChip svg {
-  width: 12px;
-  height: 12px;
-  flex: none;
-}
-
 .redesignViewerSpacer {
   flex: 1;
 }
@@ -1099,42 +1097,23 @@
   border-bottom: 0;
 }
 
-.redesignLineTable tbody tr {
-  cursor: pointer;
-  transition: background 120ms ease;
-}
-
-.redesignLineTable tbody tr:hover {
-  background: var(--cd-surface);
-}
-
-.redesignLineTable tbody .redesignDataRowActive {
-  background: var(--cd-amber-soft);
-}
-
-.redesignTermsList > button {
+.redesignTermsList > article {
   display: flex;
   width: 100%;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
   border: 0;
   border-bottom: 1px solid var(--cd-line-soft);
   background: transparent;
   padding: 9px 4px;
   text-align: left;
-  cursor: pointer;
-  transition: background 120ms ease;
 }
 
-.redesignTermsList > button:last-of-type {
+.redesignTermsList > article:last-of-type {
   border-bottom: 0;
 }
 
-.redesignTermsList > button:hover {
-  background: var(--cd-surface);
-}
-
-.redesignTermsList button > span {
+.redesignTermsList article > span {
   min-width: 0;
   flex: 1;
 }
@@ -1151,16 +1130,17 @@
 }
 
 .redesignTermsList small {
-  overflow: hidden;
   margin-top: 2px;
   color: var(--cd-body);
   font-size: 11.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .redesignTermsList em {
   flex: none;
+  margin-top: 1px;
   border-radius: 999px;
   padding: 3px 8px;
   font-size: 10px;
@@ -1569,20 +1549,6 @@
   flex-wrap: wrap;
 }
 
-.splitHoverHint {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: #64748b;
-}
-
-.splitHoverIcon {
-  width: 14px;
-  height: 14px;
-  color: #64748b;
-}
-
 .splitPreviewStage {
   flex: 1;
   min-height: 520px;
@@ -1592,46 +1558,6 @@
   align-items: stretch;
   justify-content: center;
   overflow: auto;
-}
-
-.splitStampStrip {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 18px;
-  background: #fafaf9;
-  border-top: 1px solid var(--cd-line-soft);
-  flex-wrap: wrap;
-}
-
-.stampBoxActive {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 8px 16px;
-  border: 1.5px solid #93c5fd;
-  background: #eff6ff;
-  color: #1d4ed8;
-  border-radius: 8px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-}
-
-.stampBoxDashed {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 8px 16px;
-  border: 1.5px dashed #cbd5e1;
-  background: #ffffff;
-  color: #94a3b8;
-  border-radius: 8px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
 }
 
 /* ── Split Extracted Data Pane ── */
@@ -1739,35 +1665,9 @@
   color: #8a99ad;
 }
 
-.splitSectionAction {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
 .splitFailureState {
   font-size: 11.5px;
   color: #94a3b8;
-}
-
-.splitClearMismatchBtn {
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid #fecaca;
-  background: #ffffff;
-  color: #e11d48;
-  font-size: 11px;
-  font-weight: 600;
-  border-radius: 999px;
-  padding: 2px 10px;
-  text-decoration: none;
-  cursor: pointer;
-  transition: all 120ms ease;
-}
-
-.splitClearMismatchBtn:hover {
-  background: #fef2f2;
-  border-color: #f87171;
 }
 
 .splitFieldList {
@@ -1785,18 +1685,18 @@
   padding: 7px 6px 8px;
   border-bottom: 1px solid var(--cd-line-soft);
   border-radius: 0;
-  transition: background 120ms ease;
   cursor: pointer;
-  user-select: none;
+  transition: background 120ms ease, box-shadow 120ms ease;
 }
 
-.splitFieldItem:hover {
-  background: #f8fafc;
+.splitFieldItem:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: -2px;
 }
 
-.splitFieldItemActive {
-  background: #f5f2ed;
-  box-shadow: inset 2px 0 0 #8a7f72;
+.splitFieldItemComparisonActive {
+  background: #eef2ff;
+  box-shadow: inset 3px 0 0 #4f46e5;
 }
 
 .splitFieldTopRow {

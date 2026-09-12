@@ -182,7 +182,7 @@ function textContains(actual, expected) {
 }
 
 function documentMatchesExpectation(document, expectedDocument) {
-  if (expectedDocument.type && document.document_type !== expectedDocument.type) return false;
+  if (expectedDocument.type && !valuesMatch(document.document_type, expectedDocument.type)) return false;
   if (expectedDocument.titleIncludes && !textContains(document.title, expectedDocument.titleIncludes)) return false;
   if (expectedDocument.sourceFileName && !valuesMatch(document.source_file_name, expectedDocument.sourceFileName)) return false;
   if (expectedDocument.sourceHintIncludes && !textContains(document.source_hint, expectedDocument.sourceHintIncludes)) return false;
@@ -309,6 +309,14 @@ function validateRegressionCase(regressionCase, state) {
           lineItem[field],
           expected
         );
+      }
+
+      for (const field of lineExpectation.absentFields || []) {
+        if (lineItem[field] !== undefined && lineItem[field] !== null && String(lineItem[field]).trim() !== "") {
+          errors.push(
+            `${regressionCase.name}.${expectedDocument.type}.lineItems[${matchLabel}].${field}: expected absent, got ${lineItem[field]}`
+          );
+        }
       }
     }
   }

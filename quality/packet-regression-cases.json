@@ -9,7 +9,7 @@
       },
       "documents": [
         {
-          "type": "Tax Invoice",
+          "type": "Invoice",
           "fields": {
             "invoiceNumber": "VTL/009/26-27",
             "eWayBillNumber": "242186042810",
@@ -464,6 +464,68 @@
               }
             }
           ]
+        }
+      ]
+    },
+    {
+      "name": "a-h-enterprises-unit-and-row-integrity",
+      "caseId": "105c1325-8f45-4bd4-b17f-8af0017d6d4b",
+      "expectCase": {
+        "status": "completed",
+        "mismatchCount": 0
+      },
+      "forbiddenMismatchFields": ["netWeight"],
+      "documents": [
+        {
+          "type": "Purchase Order",
+          "fields": {
+            "poNumber": "SNX/PO/26-27/4108"
+          },
+          "lineItemCount": 1,
+          "lineItems": [
+            {
+              "match": { "hsnSac": "72031000" },
+              "fields": {
+                "description": "M S Scrap & Sponge Iron",
+                "quantity": { "amount": "21" },
+                "unit": "MT",
+                "rate": { "amount": "33650" },
+                "taxableAmount": { "amount": "706650" }
+              },
+              "absentFields": ["itemCode"]
+            }
+          ]
+        },
+        {
+          "type": { "oneOf": ["Invoice", "Tax Invoice"] },
+          "fields": {
+            "invoiceNumber": "AHE/26-27/868",
+            "referencePoNumber": "SNX/PO/26-27/4108"
+          },
+          "lineItemCount": 1
+        },
+        {
+          "type": "E-Way Bill",
+          "fields": {
+            "documentDate": "02-09-2026 10:35 AM"
+          },
+          "lineItemCount": 1
+        },
+        {
+          "type": "Lorry Receipt",
+          "fields": {
+            "documentDate": "02-09-2026",
+            "netWeight": "21.000 MTS"
+          },
+          "lineItemCount": 0
+        },
+        {
+          "type": "Weighment Slip",
+          "fields": {
+            "documentDate": "03-09-2026 08:42 AM",
+            "netWeight": "21,000 kg"
+          },
+          "lineItemCount": 0
         }
       ]
     }

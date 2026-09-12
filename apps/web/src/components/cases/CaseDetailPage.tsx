@@ -93,6 +93,7 @@ type PreviewFocus = {
   pageNumber?: number;
   occurrence?: number;
 };
+type DocumentFieldComparison = { key: string; label: string } | null;
 const DEFAULT_DATA_PANE_WIDTH = 576;
 const DEFAULT_PREVIEW_ZOOM = 1;
 const MIN_DATA_PANE_WIDTH = 280;
@@ -944,11 +945,6 @@ function CaseDetailSkeleton() {
                 </div>
               </div>
             </div>
-            <div className={styles.splitStampStrip}>
-              <Skeleton className="h-7 w-20 rounded-lg bg-[#eee7dd]" />
-              <Skeleton className="h-7 w-24 rounded-lg bg-[#eee7dd]" />
-              <Skeleton className="h-7 w-20 rounded-lg bg-[#eee7dd]" />
-            </div>
           </div>
           <div className={styles.splitDataPane}>
             <div className={styles.splitDataHeader}>
@@ -1170,6 +1166,8 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   const [previewFocus, setPreviewFocus] = useState<PreviewFocus | null>(null);
   const [previewPdfPage, setPreviewPdfPage] = useState<number | null>(null);
   const [previewPdfPageCount, setPreviewPdfPageCount] = useState(1);
+  const [documentFieldComparison, setDocumentFieldComparison] =
+    useState<DocumentFieldComparison>(null);
   const [dataPaneWidth, setDataPaneWidth] = useState(DEFAULT_DATA_PANE_WIDTH);
   const [isPaneResizing, setIsPaneResizing] = useState(false);
   const [signedFileUrls, setSignedFileUrls] = useState<Record<string, string | null>>({});
@@ -1219,7 +1217,28 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     setLoadingPreviewFileId(null);
     setPreviewUrlError(null);
     setDataPaneWidth(DEFAULT_DATA_PANE_WIDTH);
+    setDocumentFieldComparison(null);
   }, [caseId]);
+
+  useEffect(() => {
+    if (!documentFieldComparison) return;
+
+    const clearComparisonWhenClickingOutside = (event: PointerEvent) => {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest("[data-document-comparison-trigger]")?.getAttribute("data-document-comparison-trigger") ===
+          documentFieldComparison.key
+      ) {
+        return;
+      }
+
+      setDocumentFieldComparison(null);
+    };
+
+    document.addEventListener("pointerdown", clearComparisonWhenClickingOutside);
+    return () => document.removeEventListener("pointerdown", clearComparisonWhenClickingOutside);
+  }, [documentFieldComparison]);
 
   useEffect(() => {
     const workspace = desktopWorkspaceRef.current;
@@ -1665,9 +1684,30 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     activePreviewFile?.originalName || activeDocument?.sourceFileName || activeDocument?.sourceHint
   );
   const activeDocumentSourcePage = getDocumentSourcePage(activeDocument);
+  const inferredPdfPageCount = useMemo(() => {
+    const activeSourceName = normalizeText(
+      activeDocument?.sourceFileName || activeDocument?.sourceHint || ""
+    );
+    const activeDocumentPageEnd =
+      activeDocumentSourcePage + Math.max(1, activeDocument?.pageCount || 1) - 1;
+
+    if (!activeSourceName) return activeDocumentPageEnd;
+
+    return displayDocuments.reduce((highestPage, document) => {
+      const documentSourceName = normalizeText(
+        document.sourceFileName || document.sourceHint || ""
+      );
+      if (documentSourceName !== activeSourceName) return highestPage;
+
+      return Math.max(
+        highestPage,
+        getDocumentSourcePage(document) + Math.max(1, document.pageCount || 1) - 1
+      );
+    }, activeDocumentPageEnd);
+  }, [activeDocument, activeDocumentSourcePage, displayDocuments]);
   const activePdfPage = Math.min(
     Math.max(1, previewPdfPage ?? activeDocumentSourcePage),
-    Math.max(1, previewPdfPageCount)
+    Math.max(1, previewPdfPageCount, inferredPdfPageCount)
   );
   const canGoToPreviousPreviewPage = activeSourceIsImage
     ? previewPageIndex > 0
@@ -1683,9 +1723,9 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     setPreviewPageIndex(0);
     setPreviewZoom(DEFAULT_PREVIEW_ZOOM);
     setPreviewFocus(null);
-    setPreviewPdfPage(null);
-    setPreviewPdfPageCount(Math.max(1, activeDocument?.pageCount || 1));
-  }, [activeDocument?.pageCount, activeDocumentId]);
+    setPreviewPdfPage(activeDocumentSourcePage);
+    setPreviewPdfPageCount(inferredPdfPageCount);
+  }, [activeDocumentId, activeDocumentSourcePage, inferredPdfPageCount]);
 
   useEffect(() => {
     setPreviewPageIndex((current) => Math.min(current, Math.max(activeDocumentFiles.length - 1, 0)));
@@ -1839,7 +1879,9 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   }
 
   function handleDocumentSelection(documentId: string) {
+    const selectedDocument = displayDocuments.find((document) => document.id === documentId);
     setActiveDocumentId(documentId);
+    setPreviewPdfPage(getDocumentSourcePage(selectedDocument));
     setActiveTab("preview");
   }
 
@@ -2166,6 +2208,21 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       const extractedFieldCount = Object.values(document.extractedFields || {}).filter(
         (val) => val !== null && val !== undefined && String(val).trim() !== ""
       ).length;
+      const comparisonValue = documentFieldComparison
+        ? document.extractedFields?.[documentFieldComparison.key]
+        : undefined;
+      const normalizedComparisonValue = String(comparisonValue ?? "").trim().toLowerCase();
+      const hasComparisonValue = Boolean(
+        normalizedComparisonValue &&
+        !["-", "not detected", "n/a", "na", "null", "undefined"].includes(normalizedComparisonValue)
+      );
+      const participatesInComparisonMismatch = documentFieldComparison
+        ? visibleMismatches.some(
+            (mismatch) =>
+              mismatch.fieldName === documentFieldComparison.key &&
+              mismatch.values.some((entry) => Boolean(entry.docId && identifiers.includes(entry.docId)))
+          )
+        : false;
       return {
         id: document.id,
         type: index.type,
@@ -2176,6 +2233,18 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
         hasIssue: visibleMismatches.some((mismatch) =>
           mismatch.values.some((entry) => Boolean(entry.docId && identifiers.includes(entry.docId)))
         ),
+        comparisonState: documentFieldComparison
+          ? !hasComparisonValue
+            ? "absent"
+            : participatesInComparisonMismatch
+              ? "mismatch"
+              : "matched"
+          : undefined,
+        comparisonValue: documentFieldComparison
+          ? hasComparisonValue
+            ? displayValue(comparisonValue)
+            : "—"
+          : undefined,
       };
     });
     const extractedDate = displayDocuments
@@ -2222,9 +2291,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
             url={activeFileUrl}
             pageNumber={activePdfPage}
             zoom={previewZoom}
-            highlightText={previewFocus?.query}
-            highlightLabel={previewFocus?.label}
-            highlightOccurrence={previewFocus?.occurrence}
             searchPageStart={activeDocumentSourcePage}
             searchPageEnd={
               activeDocumentSourcePage + Math.max(1, activeDocument?.pageCount || 1) - 1
@@ -2282,50 +2348,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       }
     }
 
-    const stampBadgesNode = activeDocument?.extractedFields ? (
-      <>
-        <div
-          className={
-            activeDocument.extractedFields.hasStoreStamp === true ||
-            String(activeDocument.extractedFields.hasStoreStamp).toLowerCase() === "yes"
-              ? styles.stampBoxActive
-              : styles.stampBoxDashed
-          }
-        >
-          {activeDocument.extractedFields.hasStoreStamp === true ||
-          String(activeDocument.extractedFields.hasStoreStamp).toLowerCase() === "yes"
-            ? "STORE STAMP"
-            : "NO STORE STAMP"}
-        </div>
-        <div
-          className={
-            activeDocument.extractedFields.hasVendorStamp === true ||
-            String(activeDocument.extractedFields.hasVendorStamp).toLowerCase() === "yes"
-              ? styles.stampBoxActive
-              : styles.stampBoxDashed
-          }
-        >
-          {activeDocument.extractedFields.hasVendorStamp === true ||
-          String(activeDocument.extractedFields.hasVendorStamp).toLowerCase() === "yes"
-            ? "VENDOR STAMP"
-            : "NO VENDOR STAMP"}
-        </div>
-        <div
-          className={
-            activeDocument.extractedFields.hasGateStamp === true ||
-            String(activeDocument.extractedFields.hasGateStamp).toLowerCase() === "yes"
-              ? styles.stampBoxActive
-              : styles.stampBoxDashed
-          }
-        >
-          {activeDocument.extractedFields.hasGateStamp === true ||
-          String(activeDocument.extractedFields.hasGateStamp).toLowerCase() === "yes"
-            ? "GATE STAMP"
-            : "NO GATE STAMP"}
-        </div>
-      </>
-    ) : null;
-
     const lineItemsDocumentTotal = formatMoney(activeDocument ? getInvoiceAmount(activeDocument) : null);
     const lineItemsContent = (
       <div className={styles.redesignDataContent}>
@@ -2341,22 +2363,9 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
               <thead><tr>{activeDocumentLineItemColumns.map((column) => <th key={column.key}>{column.label}</th>)}</tr></thead>
               <tbody>
                 {activeDocumentLineItems.map((item, itemIndex) => {
-                  const lineLabel = `Line item ${item.lineNumber || itemIndex + 1}`;
-                  const lineQuery = item.rawText || item.description || item.itemCode || item.lineNumber || "";
-                  const linePageNumber = getLineItemPreviewPage(activeDocument, item);
-                  const focusId = `line-item-${activeDocument?.id || "document"}-${itemIndex}`;
                   return (
                     <tr
                       key={`${item.lineNumber ?? itemIndex}-${item.description ?? item.rawText ?? ""}`}
-                      className={previewFocus?.id === focusId ? styles.redesignDataRowActive : undefined}
-                      tabIndex={0}
-                      onClick={() => handlePreviewFocus({ id: focusId, label: lineLabel, query: lineQuery, pageNumber: linePageNumber })}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          handlePreviewFocus({ id: focusId, label: lineLabel, query: lineQuery, pageNumber: linePageNumber });
-                        }
-                      }}
                     >
                       {activeDocumentLineItemColumns.map((column) => {
                         const cellValue = column.key === "lineNumber"
@@ -2379,36 +2388,22 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
         <div className={styles.redesignDataGroupLabel}>Purchase-order terms</div>
         <div className={styles.redesignTermsList}>
           {activeTermsChecklistRows.map((row) => (
-            <button
-              type="button"
+            <article
               key={row.key}
-              onClick={() => handlePreviewFocus({
-                id: `term-${activeDocument?.id || "document"}-${row.key}`,
-                label: row.label,
-                query: row.value,
-                pageNumber: activeDocumentSourcePage,
-              })}
             >
               <span><strong>{row.label}</strong><small>{row.value}</small></span>
               <em className={row.issue ? styles.redesignTermIssue : styles.redesignTermClear}>
                 {row.issue ? "Needs review" : "Fulfilled"}
               </em>
-            </button>
+            </article>
           ))}
           {unmatchedTermsIssues.map((issue) => (
-            <button
-              type="button"
+            <article
               key={issue.id}
-              onClick={() => handlePreviewFocus({
-                id: `term-issue-${issue.id}`,
-                label: "Terms review item",
-                query: issue.analysis || issue.fixPlan || getTermsIssueText(issue),
-                pageNumber: activeDocumentSourcePage,
-              })}
             >
               <span><strong>Review item</strong><small>{issue.analysis || issue.fixPlan || getTermsIssueText(issue)}</small></span>
               <em className={styles.redesignTermIssue}>Needs review</em>
-            </button>
+            </article>
           ))}
           {activeTermsChecklistRows.length === 0 && unmatchedTermsIssues.length === 0 ? (
             <div className={styles.redesignDataEmpty}>No purchase-order terms were extracted for this document.</div>
@@ -2419,17 +2414,13 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
     const dataNode = (
       <ExtractedFieldsPanel
-        caseId={caseId}
         fields={extractedFieldItems}
         lineItemCount={activeDocumentLineItems.length}
-        activeFocusId={previewFocus?.id || null}
-        onFocusField={({ id, label, query }) =>
-          handlePreviewFocus({
-            id,
-            label,
-            query,
-            pageNumber: activeDocumentSourcePage,
-          })
+        activeComparisonFieldKey={documentFieldComparison?.key || null}
+        onCompareField={(field) =>
+          setDocumentFieldComparison((current) =>
+            current?.key === field.key ? null : field
+          )
         }
         activeDataView={activeDataView}
         onDataViewChange={setActiveDataView}
@@ -2487,6 +2478,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           decisionError={decisionStatus === "error" ? decisionError : null}
           onDecision={(decision) => void handleCaseDecision(decision)}
           documents={redesignedDocuments}
+          comparisonFieldLabel={documentFieldComparison?.label}
           activeDocumentId={activeDocumentId}
           onSelectDocument={handleDocumentSelection}
           mismatchCount={visibleMismatches.length}
@@ -2502,8 +2494,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           sourceReference={currentDocumentIndex?.fileName || activeSourceLabel}
           previewNode={previewNode}
           dataNode={dataNode}
-          previewFocusLabel={previewFocus?.label}
-          onClearPreviewFocus={() => setPreviewFocus(null)}
           canPreviousPage={canGoToPreviousPreviewPage}
           canNextPage={canGoToNextPreviewPage}
           showPageControls={activeSourceIsImage ? previewPageCount > 1 : previewPdfPageCount > 1}
@@ -2524,7 +2514,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           onZoomOut={() => setPreviewZoom((current) => Math.max(0.75, Number((current - 0.25).toFixed(2))))}
           onZoomIn={() => setPreviewZoom((current) => Math.min(3, Number((current + 0.25).toFixed(2))))}
           onResetZoom={() => setPreviewZoom(DEFAULT_PREVIEW_ZOOM)}
-          stampBadgesNode={stampBadgesNode}
         />
 
         <AnalysisOptionsDialog

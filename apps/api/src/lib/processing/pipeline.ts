@@ -62,7 +62,7 @@ const PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY = "Vehicle number is not clearly vis
 const PO_NUMBER_FIELD_KEYS: FieldKey[] = ["poNumber", "referencePoNumber"];
 const INDENT_LABEL_PATTERN = /\b(?:indent|ind\.?\s*no|indent\s*(?:no|number|form|ref|reference)?)\b/i;
 const PURCHASE_ORDER_LABEL_PATTERN = /\b(?:(?:p\.?\s*o\.?|po|purchase\s+order)\s*(?:no|number|#)?|order\s*(?:no|number|#))\b/i;
-const INTERNAL_PO_REFERENCE_PATTERN = /\b[A-Z]{1,4}\/\d{2}-\d{2}\/[A-Z0-9][A-Z0-9/-]{2,}\b/g;
+const INTERNAL_PO_REFERENCE_PATTERN = /\b[A-Z]{1,4}\/(?:[A-Z]{1,4}\/)?\d{2}-\d{2}\/[A-Z0-9][A-Z0-9/-]{2,}\b/g;
 const IMAGE_HANDWRITTEN_EXTRACTION_INSTRUCTION =
   "Some packet documents are handwritten/manual or mixed printed and handwritten. Treat handwritten entries as first-class visible text, not as noise. Carefully inspect handwritten numbers, dates, party names, vehicle numbers, challan/receipt/permit/certificate numbers, financial amounts, weights, quantities, table cells, stamps, and signatures. Preserve readable handwriting in visibleText. Do not infer a handwritten value from other documents, file names, or nearby labels; if a value is only partly legible, omit the structured field and keep the uncertain transcription in visibleText. ";
 const TEXT_HANDWRITTEN_EXTRACTION_INSTRUCTION =
@@ -352,6 +352,7 @@ function getDocumentSpecificExtractionInstruction(docType: DocType) {
     case "Lorry Receipt":
       return (
         "For Lorry Receipt documents, prioritize lorryReceiptNumber, vehicleNumber, routeFrom, routeTo, transporterName, netWeight, and authorized signature presence. " +
+        "Extract the receipt/consignment date as documentDate. Preserve the printed weight unit (for example KG, MT, or MTS) in netWeight; a declared weight in MTS must not be returned as a unitless number. " +
         "Lorry No is the vehicleNumber. G.C. Note, LR No, Consignment No, or Transporter Doc No is lorryReceiptNumber. " +
         "Do not return package, freight, weight, amount, total, to-pay, or to-be-billed rows as lineItems; keep logistics quantities and weights in fields only. " +
         "Read Indian vehicle numbers carefully from the image; distinguish letters from similar-looking digits, especially G/9, J/S, O/0, S/5, T/7, D/G, and C/G. "
@@ -373,6 +374,7 @@ function getDocumentSpecificExtractionInstruction(docType: DocType) {
     case "Weighment Slip":
       return (
         "For Weighment Slip documents, prioritize vehicleNumber/lorry number, grossWeight, tareWeight, netWeight, weighmentNumber, weighbridgeName, and authorized signature presence. " +
+        "Extract the weighment date or date-time as documentDate. Preserve the printed unit (for example KG, MT, or MTS) in grossWeight, tareWeight, and netWeight. " +
         "Lorry No or Vehicle No on a weighment slip is the vehicleNumber, not lorryReceiptNumber. Do not use RST No, receipt number, ticket number, tare/gross/net weight, date, or charges as vehicleNumber. " +
         "Do not return weighment rows or weight tables as lineItems; keep gross, tare, and net weights in fields only. " +
         "Read Indian vehicle numbers carefully from the image; distinguish letters from similar-looking digits, especially G/9, L/1, O/0, S/5, T/7, D/G, and C/G. "
@@ -591,6 +593,11 @@ function isInternalPoReference(value?: string) {
 }
 
 function findBestInternalPoReference(visibleText: string) {
+  const labelledReference = visibleText.match(
+    /\b(?:reference\s+po|p\.?\s*o\.?\s*(?:no|number)?|purchase\s+order\s*(?:no|number)?)\s*[:#-]?\s*([A-Z]{1,4}\/(?:[A-Z]{1,4}\/)?\d{2}-\d{2}\/[A-Z0-9][A-Z0-9/-]{2,})\b/i
+  )?.[1];
+  if (labelledReference) return cleanPoReferenceCandidate(labelledReference.toUpperCase());
+
   const matches = [...visibleText.toUpperCase().matchAll(INTERNAL_PO_REFERENCE_PATTERN)]
     .map((match) => ({
       value: cleanPoReferenceCandidate(match[0]),
@@ -3168,6 +3175,7 @@ function cleanVisibleItemCodeCandidate(value: string, hsnSac?: string) {
     .replace(/\s+/g, " ")
     .trim();
   if (!cleaned || cleaned.length > 80) return null;
+  if (/^\*{0,2}\s*(?:item\s*)?(?:quantity|qty|unit|hsn(?:\/sac)?|sac|rate|taxable|amount|total|gst|cgst|sgst|igst|description)\s*\*{0,2}\s*:/i.test(cleaned)) return null;
 
   const compact = cleaned.replace(/[^A-Z0-9]/gi, "").toUpperCase();
   const hsnCompact = hsnSac?.replace(/[^A-Z0-9]/gi, "").toUpperCase();
@@ -3210,6 +3218,7 @@ function isWeakExtractedItemCode(value?: string, description?: string) {
   const compact = value.replace(/[^A-Z0-9]/gi, "").toUpperCase();
   if (compact.length <= 2) return true;
   if (description && compact === description.replace(/[^A-Z0-9]/gi, "").toUpperCase()) return true;
+  if (/^\*{0,2}\s*(?:item\s*)?(?:quantity|qty|unit|hsn(?:\/sac)?|sac|rate|taxable|amount|total|gst|cgst|sgst|igst|description)\b/i.test(value)) return true;
   return /\b(?:guide|roller|cylinder|gas|spares?|parts?)\b/i.test(value);
 }
 
@@ -3227,13 +3236,61 @@ function fillVisibleItemCodes(lineItems: CommercialLineItem[] | undefined, visib
     codesByHsn.set(hsnKey, codes);
     const candidate = codes.shift();
     if (!isWeakExtractedItemCode(item.itemCode, item.description)) return item;
-    if (!candidate || candidate === item.itemCode) return item;
+    if (!candidate) {
+      if (!item.itemCode) return item;
+      changed = true;
+      const withoutItemCode = { ...item };
+      delete withoutItemCode.itemCode;
+      return withoutItemCode;
+    }
+    if (candidate === item.itemCode) return item;
 
     changed = true;
     return { ...item, itemCode: candidate };
   });
 
   return changed ? next : lineItems;
+}
+
+const WEIGHT_FIELD_KEYS: FieldKey[] = ["grossWeight", "tareWeight", "netWeight"];
+
+function restoreVisibleDocumentDate(
+  docType: DocType,
+  current: string | undefined,
+  visibleText: string
+) {
+  if (current || !visibleText.trim()) return current;
+  const label =
+    docType === "E-Way Bill"
+      ? "(?:generated(?:\\s+date|\\s+on)|e-?way\\s+bill\\s+date)"
+      : docType === "Lorry Receipt"
+        ? "(?:receipt|consignment|lr)\\s+date"
+        : docType === "Weighment Slip"
+          ? "(?:weighment\\s+)?date(?:\\s*\\/\\s*time)?"
+          : null;
+  if (!label) return current;
+  return visibleText.match(new RegExp(`\\b${label}\\s*[:#-]?\\s*(${EWAY_DATE_PATTERN})`, "i"))?.[1]?.trim();
+}
+
+function restoreVisibleWeightUnit(
+  field: FieldKey,
+  value: string | undefined,
+  visibleText: string
+) {
+  if (!value || /\b(?:kg|kgs?|m\.?t\.?s?\.?|metric\s*ton(?:ne)?s?|tonnes?|tons?)\b/i.test(value)) return value;
+  const numeric = parseLooseNumber(value);
+  if (numeric === null) return value;
+
+  const label = field === "grossWeight" ? "gross" : field === "tareWeight" ? "tare" : "(?:net|declared)";
+  const labelled = new RegExp(`${label}\\s*(?:weight)?[^\\d]{0,30}([\\d,.]+)\\s*(kg|kgs?|m\\.?t\\.?s?\\.?|metric\\s*ton(?:ne)?s?|tonnes?|tons?)`, "i");
+  const labelledMatch = visibleText.match(labelled);
+  if (labelledMatch && numbersClose(parseLooseNumber(labelledMatch[1]) ?? Number.NaN, numeric)) {
+    return `${value.trim()} ${labelledMatch[2].toUpperCase().replace(/\.$/, "")}`;
+  }
+
+  const candidates = [...visibleText.matchAll(/([\d,.]+)\s*(kg|kgs?|m\.?t\.?s?\.?|metric\s*ton(?:ne)?s?|tonnes?|tons?)\b/gi)];
+  const match = candidates.find((candidate) => numbersClose(parseLooseNumber(candidate[1]) ?? Number.NaN, numeric));
+  return match ? `${value.trim()} ${match[2].toUpperCase().replace(/\.$/, "")}` : value;
 }
 
 function normalizeLineItemDisplayFields(lineItems: CommercialLineItem[] | undefined, visibleText = "") {
@@ -3254,6 +3311,7 @@ function normalizeLineItemDisplayFields(lineItems: CommercialLineItem[] | undefi
 function normalizeIdentifierDisplayFields(documents: CaseDoc[]) {
   return documents.map((doc) => {
     const fields = { ...doc.fields };
+    const visibleText = getVisibleTextFromMarkdown(doc.md);
     let changed = false;
 
     const supplierGstin = normalizeGstinForDisplay(fields.supplierGstin, "supplierGstin");
@@ -3316,7 +3374,27 @@ function normalizeIdentifierDisplayFields(documents: CaseDoc[]) {
       changed = true;
     }
 
-    const lineItems = normalizeLineItemDisplayFields(doc.lineItems, doc.md ?? "");
+    for (const field of WEIGHT_FIELD_KEYS) {
+      const restored = restoreVisibleWeightUnit(field, fields[field], visibleText);
+      if (restored && restored !== fields[field]) {
+        fields[field] = restored;
+        changed = true;
+      }
+    }
+
+    const fieldsWithPoReference = applyInvoicePoReferenceFallback(fields, doc.type, visibleText);
+    if (fieldsWithPoReference !== fields) {
+      Object.assign(fields, fieldsWithPoReference);
+      changed = true;
+    }
+
+    const documentDate = restoreVisibleDocumentDate(doc.type, fields.documentDate, visibleText);
+    if (documentDate && documentDate !== fields.documentDate) {
+      fields.documentDate = documentDate;
+      changed = true;
+    }
+
+    const lineItems = normalizeLineItemDisplayFields(doc.lineItems, visibleText);
     if (lineItems !== doc.lineItems) {
       changed = true;
     }

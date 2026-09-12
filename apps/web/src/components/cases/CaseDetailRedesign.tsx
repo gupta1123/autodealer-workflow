@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState, type ReactNode } from "react";
+import { useState, type CSSProperties, type ReactNode } from "react";
 import {
   Activity,
   ArrowLeft,
@@ -12,7 +12,6 @@ import {
   Eye,
   Loader2,
   RotateCw,
-  Search,
   ShieldCheck,
   TriangleAlert,
   X,
@@ -33,6 +32,8 @@ export type RedesignedDocumentCard = {
   pageCount: number;
   hasIssue: boolean;
   fieldCount?: number;
+  comparisonState?: "matched" | "mismatch" | "absent";
+  comparisonValue?: string;
 };
 
 type CaseDetailRedesignProps = {
@@ -52,6 +53,7 @@ type CaseDetailRedesignProps = {
   decisionError: string | null;
   onDecision: (decision: "accepted" | "rejected") => void;
   documents: RedesignedDocumentCard[];
+  comparisonFieldLabel?: string | null;
   activeDocumentId: string | null;
   onSelectDocument: (documentId: string) => void;
   mismatchCount: number;
@@ -67,8 +69,6 @@ type CaseDetailRedesignProps = {
   sourceReference: string;
   previewNode: ReactNode;
   dataNode: ReactNode;
-  previewFocusLabel?: string | null;
-  onClearPreviewFocus: () => void;
   canPreviousPage: boolean;
   canNextPage: boolean;
   showPageControls: boolean;
@@ -81,7 +81,6 @@ type CaseDetailRedesignProps = {
   onZoomOut: () => void;
   onZoomIn: () => void;
   onResetZoom: () => void;
-  stampBadgesNode?: ReactNode;
 };
 
 function getStatusClass(status: string) {
@@ -108,6 +107,7 @@ export function CaseDetailRedesign({
   decisionError,
   onDecision,
   documents,
+  comparisonFieldLabel,
   activeDocumentId,
   onSelectDocument,
   mismatchCount,
@@ -123,8 +123,6 @@ export function CaseDetailRedesign({
   sourceReference,
   previewNode,
   dataNode,
-  previewFocusLabel,
-  onClearPreviewFocus,
   canPreviousPage,
   canNextPage,
   showPageControls,
@@ -137,7 +135,6 @@ export function CaseDetailRedesign({
   onZoomOut,
   onZoomIn,
   onResetZoom,
-  stampBadgesNode,
 }: CaseDetailRedesignProps) {
   const [section, setSection] = useState<CaseSection>("documents");
 
@@ -239,29 +236,70 @@ export function CaseDetailRedesign({
       {section === "documents" ? (
         <>
           {/* ── Top Horizontal Document Cards Strip (matching packet review design) ── */}
-          <section className={styles.topDocumentStrip} aria-label="Documents in packet">
+          <section
+            className={`${styles.topDocumentStrip} ${
+              comparisonFieldLabel ? styles.topDocumentStripComparing : ""
+            }`}
+            aria-label="Documents in packet"
+            style={{
+              "--top-document-columns": Math.max(7, Math.min(documents.length, 10)),
+            } as CSSProperties}
+          >
             {documents.map((document, index) => {
               const isSelected = activeDocumentId === document.id;
+              const comparisonClass =
+                document.comparisonState === "matched"
+                  ? styles.topDocCardComparedMatched
+                  : document.comparisonState === "mismatch"
+                    ? styles.topDocCardComparedMismatch
+                    : document.comparisonState === "absent"
+                      ? styles.topDocCardComparedAbsent
+                      : "";
+              const comparisonStatus =
+                document.comparisonState === "matched"
+                  ? "Matched"
+                  : document.comparisonState === "mismatch"
+                    ? "Mismatch"
+                    : document.comparisonState === "absent"
+                      ? "Not present"
+                      : null;
+              const comparisonValue = document.comparisonValue?.trim() || "—";
               return (
                 <button
                   type="button"
                   key={document.id}
-                  className={`${styles.topDocCard} ${isSelected ? styles.topDocCardActive : ""}`}
+                  className={`${styles.topDocCard} ${isSelected ? styles.topDocCardActive : ""} ${comparisonClass}`}
                   onClick={() => onSelectDocument(document.id)}
+                  aria-label={
+                    comparisonFieldLabel && comparisonStatus
+                      ? `${document.type}: ${comparisonFieldLabel} — ${comparisonValue}; ${comparisonStatus}`
+                      : document.type
+                  }
                 >
                   <div className={styles.topDocCardHeader}>
                     <span className={styles.topDocNum}>{index + 1}</span>
                     <span
                       className={`${styles.topDocDot} ${
-                        document.hasIssue ? styles.topDocDotBad : styles.topDocDotGood
+                        document.comparisonState === "absent"
+                          ? styles.topDocDotMuted
+                          : document.comparisonState === "mismatch" || (!document.comparisonState && document.hasIssue)
+                            ? styles.topDocDotBad
+                            : styles.topDocDotGood
                       }`}
                     />
                   </div>
                   <div className={styles.topDocTitle} title={document.type}>
                     {document.type}
                   </div>
-                  <div className={styles.topDocSub}>
-                    {document.fieldCount ? `${document.fieldCount} fields` : document.pageLabel}
+                  <div
+                    className={comparisonFieldLabel ? styles.topDocValue : styles.topDocSub}
+                    title={comparisonFieldLabel ? comparisonValue : undefined}
+                  >
+                    {comparisonFieldLabel
+                      ? comparisonValue
+                      : document.fieldCount
+                        ? `${document.fieldCount} fields`
+                        : document.pageLabel}
                   </div>
                 </button>
               );
@@ -277,21 +315,6 @@ export function CaseDetailRedesign({
                   <span className={styles.splitDocRef} title={sourceReference}>{sourceReference}</span>
                 </div>
                 <div className={styles.splitPreviewControls}>
-                  {previewFocusLabel ? (
-                    <button
-                      type="button"
-                      className={styles.redesignFocusChip}
-                      onClick={onClearPreviewFocus}
-                      title="Clear highlight"
-                    >
-                      <i /> {previewFocusLabel} <X />
-                    </button>
-                  ) : (
-                    <div className={styles.splitHoverHint}>
-                      <Search className={styles.splitHoverIcon} />
-                      <span>Hover a field to find it on the page</span>
-                    </div>
-                  )}
                   {showPageControls ? <div className={styles.redesignPageControls}>
                     <button
                       type="button"
@@ -344,12 +367,6 @@ export function CaseDetailRedesign({
               <div className={styles.splitPreviewStage}>
                 {previewNode}
               </div>
-
-              {stampBadgesNode ? (
-                <div className={styles.splitStampStrip}>
-                  {stampBadgesNode}
-                </div>
-              ) : null}
             </div>
 
             {/* Right Column: Extracted Items Review Pane */}

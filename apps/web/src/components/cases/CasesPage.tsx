@@ -173,7 +173,6 @@ export function CasesPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
   const [selectedStatus, setSelectedStatus] = useState("all");
-  const [selectedCategory, setSelectedCategory] = useState("all");
   const [selectedReconciliation, setSelectedReconciliation] = useState("all");
 
   // Pagination
@@ -249,7 +248,7 @@ export function CasesPage() {
     return () => controller.abort();
   }, [cacheKey, currentPage, debouncedSearchQuery, pageSize]);
 
-  // Client-side filtration for instant category / status / reconciliation adjustments
+  // Client-side filtration for instant status / reconciliation adjustments
   const filteredCases = useMemo(() => {
     return cases.filter((item) => {
       if (selectedStatus !== "all") {
@@ -266,9 +265,6 @@ export function CasesPage() {
           return false;
         }
       }
-      if (selectedCategory !== "all" && item.category !== selectedCategory) {
-        return false;
-      }
       if (selectedReconciliation !== "all") {
         if (selectedReconciliation === "issues" && item.mismatchCount === 0) {
           return false;
@@ -279,15 +275,7 @@ export function CasesPage() {
       }
       return true;
     });
-  }, [cases, selectedCategory, selectedReconciliation, selectedStatus]);
-
-  const categories = useMemo(() => {
-    const set = new Set<string>();
-    cases.forEach((c) => {
-      if (c.category) set.add(c.category);
-    });
-    return Array.from(set);
-  }, [cases]);
+  }, [cases, selectedReconciliation, selectedStatus]);
 
   async function handleConfirmDelete() {
     if (!pendingCase) return;
@@ -362,7 +350,7 @@ export function CasesPage() {
             }
           >
             {showFilters && (
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
                 {/* Customer / Case Search */}
                 <div className="flex h-9 items-center gap-2 rounded-lg border border-[#ded8d0] bg-[#fbfaf8] px-3 text-xs shadow-sm focus-within:border-[#b9aa99] focus-within:bg-white transition">
                   <Search className="h-3.5 w-3.5 text-[#8a7f72]" />
@@ -381,17 +369,6 @@ export function CasesPage() {
                   onChange={setSelectedStatus}
                   options={STATUS_OPTIONS}
                   placeholder="All Statuses"
-                />
-
-                {/* Category Filter */}
-                <SelectDropdown
-                  value={selectedCategory}
-                  onChange={setSelectedCategory}
-                  options={[
-                    { value: "all", label: "All Categories" },
-                    ...categories.map((cat) => ({ value: cat, label: cat })),
-                  ]}
-                  placeholder="All Categories"
                 />
 
                 {/* Reconciliation / Mismatch Filter */}

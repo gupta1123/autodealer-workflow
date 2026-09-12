@@ -1,7 +1,6 @@
 "use client";
 
 import React, { useMemo } from "react";
-import Link from "next/link";
 import { FIELD_SECTION_ORDER, getFieldSection, type FieldSectionKey } from "@/lib/field-sections";
 import styles from "@/components/cases/CaseDetailPage.module.css";
 
@@ -13,11 +12,10 @@ export type ExtractedFieldItem = {
 };
 
 export type ExtractedFieldsPanelProps = {
-  caseId: string;
   fields: ExtractedFieldItem[];
   lineItemCount: number;
-  activeFocusId: string | null;
-  onFocusField: (field: { id: string; label: string; query: string }) => void;
+  activeComparisonFieldKey: string | null;
+  onCompareField: (field: { key: string; label: string }) => void;
   activeDataView: "fields" | "lineItems" | "terms";
   onDataViewChange: (view: "fields" | "lineItems" | "terms") => void;
   termsCount?: number;
@@ -27,11 +25,10 @@ export type ExtractedFieldsPanelProps = {
 };
 
 export function ExtractedFieldsPanel({
-  caseId,
   fields,
   lineItemCount,
-  activeFocusId,
-  onFocusField,
+  activeComparisonFieldKey,
+  onCompareField,
   activeDataView,
   onDataViewChange,
   termsCount = 0,
@@ -109,22 +106,13 @@ export function ExtractedFieldsPanel({
                   <div className={styles.splitSectionHeader}>
                     <span className={styles.splitSectionTitle}>{section}</span>
                     {isChecks && hasAnyCheckMismatch ? (
-                      <div className={styles.splitSectionAction}>
-                        <span className={styles.splitFailureState}>Failure state</span>
-                        <Link
-                          href={`/cases/${caseId}/mismatches`}
-                          className={styles.splitClearMismatchBtn}
-                        >
-                          Clear the mismatch
-                        </Link>
-                      </div>
+                      <span className={styles.splitFailureState}>Failure state</span>
                     ) : null}
                   </div>
 
                   <div className={styles.splitFieldList}>
                     {sectionFields.map((field) => {
-                      const focusId = `field-${field.key}`;
-                      const isActive = activeFocusId === focusId;
+                      const isComparisonActive = activeComparisonFieldKey === field.key;
                       const isFalseCheck =
                         isChecks &&
                         (field.value.toLowerCase() === "no" || field.value.toLowerCase() === "false");
@@ -133,33 +121,18 @@ export function ExtractedFieldsPanel({
                         <div
                           key={field.key}
                           className={`${styles.splitFieldItem} ${
-                            isActive ? styles.splitFieldItemActive : ""
+                            isComparisonActive ? styles.splitFieldItemComparisonActive : ""
                           }`}
-                          onClick={() =>
-                            onFocusField({
-                              id: focusId,
-                              label: field.label,
-                              query: field.value,
-                            })
-                          }
-                          onMouseEnter={() =>
-                            onFocusField({
-                              id: focusId,
-                              label: field.label,
-                              query: field.value,
-                            })
-                          }
+                          data-document-comparison-trigger={field.key}
+                          onClick={() => onCompareField({ key: field.key, label: field.label })}
                           tabIndex={0}
                           role="button"
-                          aria-label={`Find ${field.label} on page`}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.preventDefault();
-                              onFocusField({
-                                id: focusId,
-                                label: field.label,
-                                query: field.value,
-                              });
+                          aria-pressed={isComparisonActive}
+                          aria-label={`Compare ${field.label} across documents`}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              onCompareField({ key: field.key, label: field.label });
                             }
                           }}
                         >
