@@ -180,14 +180,15 @@ export function CasesPage() {
   const [pageSize, setPageSize] = useState(10);
   const [totalCount, setTotalCount] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
+  const [listRevision, setListRevision] = useState(0);
 
   // Deletion
   const [pendingCase, setPendingCase] = useState<SavedCaseRecord | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
 
   const cacheKey = useMemo(
-    () => `${cacheEpoch}:${snapshot?.member.user_id||'legacy'}:${snapshot?.organizationId||''}:${snapshot?.revision||0}:`+getCaseListCacheKey(debouncedSearchQuery, currentPage, pageSize),
-    [currentPage, debouncedSearchQuery, pageSize,cacheEpoch,snapshot?.member.user_id,snapshot?.organizationId,snapshot?.revision]
+    () => `${cacheEpoch}:${listRevision}:${snapshot?.member.user_id||'legacy'}:${snapshot?.organizationId||''}:${snapshot?.revision||0}:`+getCaseListCacheKey(debouncedSearchQuery, currentPage, pageSize),
+    [currentPage, debouncedSearchQuery, pageSize,cacheEpoch,listRevision,snapshot?.member.user_id,snapshot?.organizationId,snapshot?.revision]
   );
 
   useEffect(() => {
@@ -286,21 +287,14 @@ export function CasesPage() {
       await recycleCase(pendingCase.id);
       const nextTotalCount = Math.max(0, totalCount - 1);
       const nextTotalPages = Math.max(1, Math.ceil(nextTotalCount / pageSize));
+      const nextPage = Math.min(currentPage, nextTotalPages);
 
-      setCases((current) => {
-        const nextCases = current.filter((item) => item.id !== pendingCase.id);
-        cacheCaseList(cacheKey, {
-          cases: nextCases,
-          totalCount: nextTotalCount,
-          totalPages: nextTotalPages,
-        });
-        return nextCases;
-      });
+      setCases((current) => current.filter((item) => item.id !== pendingCase.id));
       setTotalCount(nextTotalCount);
       setTotalPages(nextTotalPages);
-      if (currentPage > nextTotalPages) {
-        setCurrentPage(nextTotalPages);
-      }
+      caseListCache.clear();
+      setCurrentPage(nextPage);
+      setListRevision((current) => current + 1);
       setPendingCase(null);
     } catch (mutationError) {
       setError(
