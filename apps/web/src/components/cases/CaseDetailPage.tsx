@@ -52,6 +52,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
+  getComparableFieldValue,
   getComparisonModeLabel,
   isPrimaryComparisonField,
   readComparisonOptions,
@@ -79,6 +80,8 @@ import type {
   CaseAnalysisMode,
   CommercialLineItem,
   ComparisonOptions,
+  DocType,
+  FieldKey,
   PipelineStageProgress,
   QueuedUpload,
 } from "@/types/pipeline";
@@ -621,6 +624,78 @@ function areDuplicateInvoiceDisplayCopies(left: CaseDetailDocument, right: CaseD
   if (!leftInvoice || !rightInvoice || leftInvoice !== rightInvoice) return false;
 
   return invoiceAmountsMatch(left, right) && invoicePartiesCompatible(left, right);
+}
+
+function inferSellerChainRoleSelection(
+  documents: SavedCaseDetail["documents"]
+): SellerChainRoleSelectionMeta | null {
+  const invoices = documents.filter(isInvoiceDocument);
+  const purchaseOrders = documents.filter((document) =>
+    PURCHASE_ORDER_DOCUMENT_TYPES.has(document.documentType)
+  );
+  if (invoices.length < 2 || !purchaseOrders.length) return null;
+
+  const identitiesMatch = (leftName: string, leftGstin: string, rightName: string, rightGstin: string) => {
+    const normalizedLeftGstin = normalizeInvoiceCopyValue(leftGstin);
+    const normalizedRightGstin = normalizeInvoiceCopyValue(rightGstin);
+    if (normalizedLeftGstin && normalizedRightGstin) return normalizedLeftGstin === normalizedRightGstin;
+    return invoicePartyNameMatches(normalizeInvoiceCopyValue(leftName), normalizeInvoiceCopyValue(rightName));
+  };
+  const poBuyers = purchaseOrders.map((document) => ({
+    name: getStringField(document, "buyerName"),
+    gstin: getStringField(document, "buyerGstin"),
+  }));
+  const poVendors = purchaseOrders.map((document) => ({
+    name: getStringField(document, "vendorName"),
+    gstin: getStringField(document, "supplierGstin"),
+  }));
+  const matchesAny = (name: string, gstin: string, parties: Array<{ name: string; gstin: string }>) =>
+    parties.some((party) => identitiesMatch(name, gstin, party.name, party.gstin));
+
+  const primaryInvoices = invoices.filter((document) =>
+    matchesAny(
+      getStringField(document, "buyerName"),
+      getStringField(document, "buyerGstin"),
+      poBuyers
+    )
+  );
+  if (!primaryInvoices.length) return null;
+
+  const primarySuppliers = [
+    ...poVendors,
+    ...primaryInvoices.map((document) => ({
+      name: getStringField(document, "vendorName"),
+      gstin: getStringField(document, "supplierGstin"),
+    })),
+  ];
+  const upstreamInvoices = invoices.filter((document) => {
+    if (primaryInvoices.some((primary) => primary.id === document.id)) return false;
+    const buyerName = getStringField(document, "buyerName");
+    const buyerGstin = getStringField(document, "buyerGstin");
+    return !matchesAny(buyerName, buyerGstin, poBuyers) && matchesAny(buyerName, buyerGstin, primarySuppliers);
+  });
+  if (!upstreamInvoices.length) return null;
+
+  const upstreamReferences = new Set(
+    upstreamInvoices
+      .map((document) => normalizeInvoiceCopyValue(getStringField(document, "invoiceNumber")))
+      .filter(Boolean)
+  );
+  const contextDocumentIds = documents
+    .filter((document) => {
+      if (upstreamInvoices.some((invoice) => invoice.id === document.id)) return true;
+      const reference = normalizeInvoiceCopyValue(
+        getStringField(document, "referenceInvoiceNumber") || getStringField(document, "invoiceNumber")
+      );
+      return Boolean(reference && upstreamReferences.has(reference));
+    })
+    .map((document) => document.id);
+
+  return {
+    primaryDocumentIds: primaryInvoices.map((document) => document.id),
+    contextDocumentIds,
+    note: "Seller chain identified from the purchase-order buyer and supplier relationships.",
+  };
 }
 
 function invoiceDisplayText(document: CaseDetailDocument) {
@@ -2172,7 +2247,9 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
         : `${pendingMismatchCount || visibleMismatches.length} open`
       : `${displayDocuments.length} checked`;
   const splitAnalysisMeta = readSplitAnalysisMeta(detail?.case.processingMeta);
-  const sellerChainRoleMeta = readSellerChainRoleSelectionMeta(detail?.case.processingMeta);
+  const sellerChainRoleMeta =
+    readSellerChainRoleSelectionMeta(detail?.case.processingMeta) ??
+    (detail ? inferSellerChainRoleSelection(displayDocuments) : null);
   const packetPageCount = displayDocuments.reduce(
     (total, document) => total + Math.max(1, document.pageCount || 1),
     0
@@ -2209,7 +2286,10 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
         (val) => val !== null && val !== undefined && String(val).trim() !== ""
       ).length;
       const comparisonValue = documentFieldComparison
-        ? document.extractedFields?.[documentFieldComparison.key]
+        ? getComparableFieldValue(
+            { type: document.documentType as DocType, fields: document.extractedFields },
+            documentFieldComparison.key as FieldKey
+          )
         : undefined;
       const normalizedComparisonValue = String(comparisonValue ?? "").trim().toLowerCase();
       const hasComparisonValue = Boolean(
@@ -2244,6 +2324,11 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           ? hasComparisonValue
             ? displayValue(comparisonValue)
             : "—"
+          : undefined,
+        chainRole: sellerChainRoleMeta
+          ? sellerChainRoleMeta.contextDocumentIds.includes(document.id)
+            ? "supporting"
+            : "approval"
           : undefined,
       };
     });

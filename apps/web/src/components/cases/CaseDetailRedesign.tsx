@@ -34,6 +34,7 @@ export type RedesignedDocumentCard = {
   fieldCount?: number;
   comparisonState?: "matched" | "mismatch" | "absent";
   comparisonValue?: string;
+  chainRole?: "approval" | "supporting";
 };
 
 type CaseDetailRedesignProps = {
@@ -145,6 +146,77 @@ export function CaseDetailRedesign({
       ? caseName.split(" / ")[0]
       : caseName;
 
+  const hasSellerChain = documents.some((document) => document.chainRole === "supporting");
+  const approvalDocuments = hasSellerChain
+    ? documents.filter((document) => document.chainRole !== "supporting")
+    : documents;
+  const supportingDocuments = hasSellerChain
+    ? documents.filter((document) => document.chainRole === "supporting")
+    : [];
+
+  const renderDocumentCard = (document: RedesignedDocumentCard, index: number) => {
+    const isSelected = activeDocumentId === document.id;
+    const comparisonClass =
+      document.comparisonState === "matched"
+        ? styles.topDocCardComparedMatched
+        : document.comparisonState === "mismatch"
+          ? styles.topDocCardComparedMismatch
+          : document.comparisonState === "absent"
+            ? styles.topDocCardComparedAbsent
+            : "";
+    const comparisonStatus =
+      document.comparisonState === "matched"
+        ? "Matched"
+        : document.comparisonState === "mismatch"
+          ? "Mismatch"
+          : document.comparisonState === "absent"
+            ? "Not present"
+            : null;
+    const comparisonValue = document.comparisonValue?.trim() || "—";
+
+    return (
+      <button
+        type="button"
+        key={document.id}
+        className={`${styles.topDocCard} ${isSelected ? styles.topDocCardActive : ""} ${comparisonClass} ${
+          document.chainRole === "supporting" ? styles.topDocCardSupporting : ""
+        }`}
+        onClick={() => onSelectDocument(document.id)}
+        aria-label={
+          comparisonFieldLabel && comparisonStatus
+            ? `${document.type}: ${comparisonFieldLabel} — ${comparisonValue}; ${comparisonStatus}`
+            : document.chainRole === "supporting"
+              ? `${document.type}, supporting source-chain document`
+              : document.type
+        }
+      >
+        <div className={styles.topDocCardHeader}>
+          <span className={styles.topDocNum}>{index + 1}</span>
+          <span
+            className={`${styles.topDocDot} ${
+              document.comparisonState === "absent"
+                ? styles.topDocDotMuted
+                : document.comparisonState === "mismatch" || (!document.comparisonState && document.hasIssue)
+                  ? styles.topDocDotBad
+                  : styles.topDocDotGood
+            }`}
+          />
+        </div>
+        <div className={styles.topDocTitle} title={document.type}>{document.type}</div>
+        <div
+          className={comparisonFieldLabel ? styles.topDocValue : styles.topDocSub}
+          title={comparisonFieldLabel ? comparisonValue : undefined}
+        >
+          {comparisonFieldLabel
+            ? comparisonValue
+            : document.fieldCount
+              ? `${document.fieldCount} fields`
+              : document.pageLabel}
+        </div>
+      </button>
+    );
+  };
+
   return (
     <div className={styles.redesignPage}>
       <header className={styles.compactHeader}>
@@ -241,69 +313,43 @@ export function CaseDetailRedesign({
               comparisonFieldLabel ? styles.topDocumentStripComparing : ""
             }`}
             aria-label="Documents in packet"
-            style={{
-              "--top-document-columns": Math.max(7, Math.min(documents.length, 10)),
-            } as CSSProperties}
           >
-            {documents.map((document, index) => {
-              const isSelected = activeDocumentId === document.id;
-              const comparisonClass =
-                document.comparisonState === "matched"
-                  ? styles.topDocCardComparedMatched
-                  : document.comparisonState === "mismatch"
-                    ? styles.topDocCardComparedMismatch
-                    : document.comparisonState === "absent"
-                      ? styles.topDocCardComparedAbsent
-                      : "";
-              const comparisonStatus =
-                document.comparisonState === "matched"
-                  ? "Matched"
-                  : document.comparisonState === "mismatch"
-                    ? "Mismatch"
-                    : document.comparisonState === "absent"
-                      ? "Not present"
-                      : null;
-              const comparisonValue = document.comparisonValue?.trim() || "—";
-              return (
-                <button
-                  type="button"
-                  key={document.id}
-                  className={`${styles.topDocCard} ${isSelected ? styles.topDocCardActive : ""} ${comparisonClass}`}
-                  onClick={() => onSelectDocument(document.id)}
-                  aria-label={
-                    comparisonFieldLabel && comparisonStatus
-                      ? `${document.type}: ${comparisonFieldLabel} — ${comparisonValue}; ${comparisonStatus}`
-                      : document.type
-                  }
+            {hasSellerChain ? (
+              <div className={styles.topDocumentGroup}>
+                <div className={styles.topDocumentGroupHeader}>
+                  <span className={styles.topDocumentGroupTitle}>Approval documents</span>
+                  <span className={styles.topDocumentGroupHint}>Used for reconciliation and Tally</span>
+                </div>
+                <div
+                  className={styles.topDocumentGrid}
+                  style={{ "--top-document-columns": Math.max(4, Math.min(approvalDocuments.length, 10)) } as CSSProperties}
                 >
-                  <div className={styles.topDocCardHeader}>
-                    <span className={styles.topDocNum}>{index + 1}</span>
-                    <span
-                      className={`${styles.topDocDot} ${
-                        document.comparisonState === "absent"
-                          ? styles.topDocDotMuted
-                          : document.comparisonState === "mismatch" || (!document.comparisonState && document.hasIssue)
-                            ? styles.topDocDotBad
-                            : styles.topDocDotGood
-                      }`}
-                    />
-                  </div>
-                  <div className={styles.topDocTitle} title={document.type}>
-                    {document.type}
-                  </div>
-                  <div
-                    className={comparisonFieldLabel ? styles.topDocValue : styles.topDocSub}
-                    title={comparisonFieldLabel ? comparisonValue : undefined}
-                  >
-                    {comparisonFieldLabel
-                      ? comparisonValue
-                      : document.fieldCount
-                        ? `${document.fieldCount} fields`
-                        : document.pageLabel}
-                  </div>
-                </button>
-              );
-            })}
+                  {approvalDocuments.map((document) => renderDocumentCard(document, documents.indexOf(document)))}
+                </div>
+              </div>
+            ) : (
+              <div
+                className={styles.topDocumentGrid}
+                style={{ "--top-document-columns": Math.max(7, Math.min(documents.length, 10)) } as CSSProperties}
+              >
+                {documents.map(renderDocumentCard)}
+              </div>
+            )}
+
+            {supportingDocuments.length ? (
+              <div className={`${styles.topDocumentGroup} ${styles.topDocumentGroupSupporting}`}>
+                <div className={styles.topDocumentGroupHeader}>
+                  <span className={styles.topDocumentGroupTitle}>Source chain</span>
+                  <span className={styles.topDocumentSupportingBadge}>Supporting only · not payable</span>
+                </div>
+                <div
+                  className={styles.topDocumentGrid}
+                  style={{ "--top-document-columns": Math.max(3, Math.min(supportingDocuments.length, 10)) } as CSSProperties}
+                >
+                  {supportingDocuments.map((document) => renderDocumentCard(document, documents.indexOf(document)))}
+                </div>
+              </div>
+            ) : null}
           </section>
 
           {/* ── Split Document Workspace (Left PDF + Right Extracted Items) ── */}
