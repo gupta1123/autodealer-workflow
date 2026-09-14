@@ -416,6 +416,19 @@ const operations = {
       ...row, identity: fromJson(row.identity_json, {}), cursors: fromJson(row.cursor_json, {}), cacheHealth: fromJson(row.cache_health_json, {}),
     }));
   },
+  getDatasetMetrics({ datasetKey }) {
+    const masterCounts = db.prepare(`select master_type,count(*) as count from master_cache
+      where dataset_key=? and is_deleted=0 group by master_type`).all(datasetKey);
+    const vector = db.prepare(`select count(*) as count,max(updated_at) as updated_at
+      from vector_document_state where dataset_key=?`).get(datasetKey);
+    return {
+      masterCounts: Object.fromEntries(masterCounts.map((row) => [row.master_type, Number(row.count || 0)])),
+      ledgerCount: Number(masterCounts.find((row) => row.master_type === "ledger")?.count || 0),
+      vectorCount: Number(vector?.count || 0),
+      vectorUpdatedAt: vector?.updated_at || null,
+      vectorMetadata: operations.getVectorMetadata({ datasetKey }),
+    };
+  },
   markDatasetSync({ datasetKey, cursors, cacheHealth = {}, reconciled = false }) {
     const at = nowIso();
     const current = operations.getDataset({ datasetKey });

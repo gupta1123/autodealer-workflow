@@ -58,7 +58,7 @@ export function PaymentReminderSettings(){
 
  return <section className="w-full rounded-xl border border-[#ded8d0] bg-white p-5 text-sm shadow-[0_1px_2px_rgba(52,42,32,0.04)] sm:p-6">
   <div className="flex flex-col gap-4 border-b border-[#e8e2db] pb-5 lg:flex-row lg:items-start lg:justify-between">
-   <div><h2 className="text-lg font-semibold tracking-[-0.02em] text-[#1f1b17]">Reminder sequence</h2><p className="mt-1 text-xs leading-5 text-[#756a60]">Choose when reminders become due. Your team checks the balance and sends them.</p></div>
+   <div><h2 className="text-base font-bold tracking-tight text-[#111827]">Reminder sequence</h2><p className="mt-1 text-xs text-[#5b4b3d]">Choose when reminders become due. Your team checks the balance and sends them.</p></div>
    <div className="flex shrink-0 items-center gap-2 self-start rounded-full border border-[#ded8d0] bg-[#faf8f5] px-3 py-2 text-xs text-[#675d54]"><Info aria-hidden="true" className="size-3.5"/><span>{plan.stages.length} {plan.stages.length===1?'stage':'stages'} · Up to {totalReminders} reminders</span></div>
   </div>
 
@@ -67,17 +67,17 @@ export function PaymentReminderSettings(){
 
   <fieldset disabled={busy} className="mt-5 space-y-5 disabled:opacity-60">
    <div className="flex flex-col gap-2 rounded-lg border border-[#e5dfd8] bg-[#faf8f5] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-    <div><p className="text-xs font-semibold text-[#312b25]">“Send once” template</p><p className="mt-0.5 text-[11px] text-[#756a60]">A single message, without adding the invoice to this sequence.</p></div>
+    <div><p className="text-xs font-semibold text-[#111827]">“Send once” template</p><p className="mt-0.5 text-xs text-[#8a7f72]">A single message, without adding the invoice to this sequence.</p></div>
     <select aria-label="One-time reminder template" className={`${input} w-full sm:w-64`} value={once} onChange={event=>setOnce(event.target.value)}>{templateOptions}</select>
    </div>
 
    <div className="relative">
     <div className="relative grid grid-cols-[repeat(auto-fit,minmax(min(100%,290px),1fr))] items-stretch gap-4">
      {plan.stages.map((stage,index)=><article key={index} className="flex min-w-0 flex-col">
-      <div className="mb-2 flex items-center gap-2"><span className="grid size-6 shrink-0 place-items-center rounded-full border border-[#d8d0c7] bg-[#f3eee8] text-[11px] font-semibold text-[#51483f]">{index+1}</span><span className="text-[11px] text-[#756a60]">{index===0?'When an invoice is added':'After the previous stage'}</span></div>
+      <div className="mb-2 flex items-center gap-2"><span className="grid size-6 shrink-0 place-items-center rounded-full border border-[#d8d0c7] bg-[#f3eee8] text-[11px] font-semibold text-[#51483f]">{index+1}</span><span className="text-xs text-[#8a7f72]">{index===0?'When an invoice is added':'After the previous stage'}</span></div>
       <div className="flex-1 overflow-hidden rounded-xl border border-[#dcd4cb] bg-white">
        <header className="flex items-center gap-2 border-b border-[#e8e2db] bg-[#faf8f5] px-4 py-3">
-        <input aria-label={`Stage ${index+1} name`} title={stage.name} className="min-w-0 flex-1 rounded bg-transparent text-sm font-semibold text-[#27221e] outline-none focus:ring-2 focus:ring-[#ded8d0]" value={stage.name} maxLength={80} onChange={event=>updateStage(index,{name:event.target.value})}/>
+        <input aria-label={`Stage ${index+1} name`} title={stage.name} className="min-w-0 flex-1 rounded bg-transparent text-sm font-bold text-[#111827] outline-none focus:ring-2 focus:ring-[#ded8d0]" value={stage.name} maxLength={80} onChange={event=>updateStage(index,{name:event.target.value})}/>
         <button type="button" aria-label={`Duplicate ${stage.name}`} title="Duplicate stage" disabled={plan.stages.length>=8} className="rounded-md p-1.5 text-[#776b61] hover:bg-white hover:text-[#27221e] disabled:opacity-35" onClick={()=>duplicateStage(index)}><Copy aria-hidden="true" className="size-3.5"/></button>
         <button type="button" aria-label={`Remove ${stage.name}`} title="Remove stage" disabled={plan.stages.length===1} className="rounded-md p-1.5 text-[#776b61] hover:bg-white hover:text-red-700 disabled:opacity-35" onClick={()=>removeStage(index)}><Trash2 aria-hidden="true" className="size-3.5"/></button>
        </header>
@@ -85,7 +85,7 @@ export function PaymentReminderSettings(){
         <label className="grid grid-cols-[1fr_72px_104px] items-center gap-2 text-xs text-[#51483f]"><span>Starts after</span><input aria-label={`${stage.name} start delay`} className={input} type="number" min={0} max={365} value={stage.delay} onChange={event=>updateStage(index,{delay:Number(event.target.value)})}/><select aria-label={`${stage.name} time unit`} className={input} value={stage.unit} onChange={event=>updateStage(index,{unit:event.target.value as ReminderStage['unit']})}><option value="days">Days</option><option value="hours">Hours</option><option value="minutes">Minutes</option></select></label>
         <label className="grid grid-cols-[1fr_72px_104px] items-center gap-2 text-xs text-[#51483f]"><span>Repeat every</span><input aria-label={`${stage.name} repeat interval`} className={input} type="number" min={1} max={365} value={stage.every} onChange={event=>updateStage(index,{every:Number(event.target.value)})}/><span className="px-3 text-[#82766b]">{stage.unit}</span></label>
         <label className="grid grid-cols-[1fr_72px_104px] items-center gap-2 text-xs text-[#51483f]"><span>Send up to</span><input aria-label={`${stage.name} reminder limit`} className={input} type="number" min={1} max={100} value={stage.limit} onChange={event=>updateStage(index,{limit:Number(event.target.value)})}/><span className="px-3 text-[#756a60]">reminders</span></label>
-        <p className="text-[11px] leading-4 text-[#756a60]">{stage.limit===1?'One reminder in this stage; no repeats.':index===plan.stages.length-1?'The sequence ends after this stage.':'Then move to the next stage.'}</p>
+        <p className="text-xs text-[#8a7f72]">{stage.limit===1?'One reminder in this stage; no repeats.':index===plan.stages.length-1?'The sequence ends after this stage.':'Then move to the next stage.'}</p>
         <div className="border-t border-[#e8e2db] pt-3"><label className="flex flex-col gap-1.5 text-xs font-medium text-[#51483f]">Message template<select className={`${input} w-full`} value={stage.template} onChange={event=>updateStage(index,{template:event.target.value})}>{templateOptions}</select></label></div>
        </div>
       </div>
@@ -95,7 +95,7 @@ export function PaymentReminderSettings(){
 
    <div className="flex flex-col-reverse gap-3 border-t border-[#e8e2db] pt-5 sm:flex-row sm:items-center sm:justify-between">
     <button type="button" disabled={plan.stages.length>=8} className="inline-flex items-center justify-center gap-2 rounded-lg border border-[#ded8d0] bg-[#faf8f5] px-4 py-2.5 text-xs font-semibold text-[#332c26] hover:bg-[#f3eee8] disabled:cursor-not-allowed disabled:opacity-40" onClick={addStage}><Plus aria-hidden="true" className="size-4"/>Add stage</button>
-    <div className="flex flex-col gap-2 sm:items-end"><p className="text-[11px] text-[#756a60]">Changes apply to newly added invoices.</p><button type="button" disabled={busy||!messages.length} className="rounded-lg bg-[#2f2924] px-5 py-2.5 text-xs font-semibold text-white shadow-sm hover:bg-[#1f1b18] disabled:cursor-not-allowed disabled:opacity-45" onClick={save}>{busy?'Please wait…':'Save changes'}</button></div>
+    <div className="flex flex-col gap-2 sm:items-end"><p className="text-xs text-[#8a7f72]">Changes apply to newly added invoices.</p><button type="button" disabled={busy||!messages.length} className="rounded-lg bg-[#2b1a10] px-5 py-2.5 text-xs font-semibold text-white shadow-sm hover:bg-[#3b271a] disabled:cursor-not-allowed disabled:opacity-45" onClick={save}>{busy?'Please wait…':'Save changes'}</button></div>
    </div>
   </fieldset>
  </section>;

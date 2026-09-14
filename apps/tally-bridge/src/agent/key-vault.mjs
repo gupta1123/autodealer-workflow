@@ -14,9 +14,10 @@ function atomicWrite(filePath, bytes) {
 
 function powershellProtectedData(mode, bytes) {
   const powershell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const loadProtectedData = "Add-Type -AssemblyName System.Security;";
   const script = mode === "protect"
-    ? "$v=[Console]::In.ReadToEnd().Trim();$b=[Convert]::FromBase64String($v);$p=[Security.Cryptography.ProtectedData]::Protect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);[Console]::Out.Write([Convert]::ToBase64String($p))"
-    : "$v=[Console]::In.ReadToEnd().Trim();$b=[Convert]::FromBase64String($v);$p=[Security.Cryptography.ProtectedData]::Unprotect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);[Console]::Out.Write([Convert]::ToBase64String($p))";
+    ? `${loadProtectedData}$v=[Console]::In.ReadToEnd().Trim();$b=[Convert]::FromBase64String($v);$p=[Security.Cryptography.ProtectedData]::Protect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);[Console]::Out.Write([Convert]::ToBase64String($p))`
+    : `${loadProtectedData}$v=[Console]::In.ReadToEnd().Trim();$b=[Convert]::FromBase64String($v);$p=[Security.Cryptography.ProtectedData]::Unprotect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);[Console]::Out.Write([Convert]::ToBase64String($p))`;
   const result = execFileSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], {
     input: Buffer.from(bytes).toString("base64"),
     windowsHide: true,

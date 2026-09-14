@@ -6,6 +6,13 @@ import {CONNECTION_STATUS_PERMISSIONS} from './route-policy';
 import {hashSecret} from '@/lib/tally/connections';
 import {restoreConnectionCompanyLinks} from './connection-company-links';
 
+function canonicalFinancialYear(value:unknown) {
+  const match=/^(20\d{2})-(\d{2}|20\d{2})$/.exec(String(value||'').trim().replace(/[–—]/g,'-'));
+  if(!match)return String(value||'').trim();
+  const end=match[2].length===2?`20${match[2]}`:match[2];
+  return `${match[1]}-${end}`;
+}
+
 export async function authorizeLiveConnection(request:Request,body:Record<string,unknown>) {
   const access=await requireAccessContext(request);
   const operation=String(body.operation||'');
@@ -52,7 +59,7 @@ export async function authorizeLiveConnection(request:Request,body:Record<string
   // A name may select a previously verified mapping, but never supplies its
   // identity. Ambiguity across years/datasets must be resolved explicitly.
   const matches=eligible.filter(link=>(!body.companyGuid||link.company_guid===body.companyGuid)
-    && (!body.financialYear||link.financial_year===body.financialYear)
+    && (!body.financialYear||canonicalFinancialYear(link.financial_year)===canonicalFinancialYear(body.financialYear))
     && link.company_name===body.companyName);
   if(matches.length!==1)throw new AccessError('Select one verified company and financial year.',409);
   const link=matches[0];

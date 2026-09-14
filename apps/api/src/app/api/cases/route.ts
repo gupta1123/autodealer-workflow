@@ -62,6 +62,8 @@ const LIST_COLUMNS = CASE_LIST_COLUMNS;
 const LIST_COLUMNS_WITHOUT_RECYCLE_BIN = CASE_LIST_COLUMNS_LEGACY;
 type CaseListScope = "active" | "deleted";
 type CaseListStatusFilter = "all" | "pending" | "in_review" | "ongoing" | "completed" | "failed";
+type CaseListApprovalFilter = "all" | "approved" | "pending" | "rejected";
+type CaseListReconciliationFilter = "all" | "clean" | "issues";
 type CaseListSortMode = "recent" | "oldest" | "name";
 type CaseListTiming = Partial<Record<"auth" | "caseQuery" | "serialize" | "total", number>>;
 type CaseListRow = {
@@ -102,6 +104,14 @@ function readCaseStatusFilter(value: string | null): CaseListStatusFilter {
 function readCaseSortMode(value: string | null): CaseListSortMode {
   if (value === "oldest" || value === "name") return value;
   return "recent";
+}
+
+function readCaseApprovalFilter(value: string | null): CaseListApprovalFilter {
+  return value === "approved" || value === "pending" || value === "rejected" ? value : "all";
+}
+
+function readCaseReconciliationFilter(value: string | null): CaseListReconciliationFilter {
+  return value === "clean" || value === "issues" ? value : "all";
 }
 type PreparedUploadFile = {
   originalName: string;
@@ -1075,6 +1085,8 @@ async function GETHandler(request: Request) {
     }
     const searchQuery = normalizeCaseSearchQuery(url.searchParams.get("q"));
     const statusFilter = readCaseStatusFilter(url.searchParams.get("status"));
+    const approvalFilter = readCaseApprovalFilter(url.searchParams.get("approval"));
+    const reconciliationFilter = readCaseReconciliationFilter(url.searchParams.get("reconciliation"));
     const sortMode = readCaseSortMode(url.searchParams.get("sort"));
     let cursor;
     try { cursor = readCaseCursor(url.searchParams.get('cursor'), scope, sortMode); }
@@ -1126,6 +1138,12 @@ async function GETHandler(request: Request) {
           query = query.order("created_at", { ascending: sortMode === "oldest" }).order("id", { ascending: false });
         }
       }
+
+      if (approvalFilter === "approved") query = query.eq("status", "accepted");
+      if (approvalFilter === "rejected") query = query.eq("status", "rejected");
+      if (approvalFilter === "pending") query = query.not("status", "in", "(accepted,rejected)");
+      if (reconciliationFilter === "clean") query = query.eq("mismatch_count", 0);
+      if (reconciliationFilter === "issues") query = query.gt("mismatch_count", 0);
 
       if (searchQuery) {
         query = query.ilike("search_text", `%${escapeIlikePattern(searchQuery.toLowerCase())}%`);
@@ -1185,6 +1203,12 @@ async function GETHandler(request: Request) {
               .order("id", { ascending: false });
           }
         }
+
+        if (approvalFilter === "approved") fallbackSearchQuery = fallbackSearchQuery.eq("status", "accepted");
+        if (approvalFilter === "rejected") fallbackSearchQuery = fallbackSearchQuery.eq("status", "rejected");
+        if (approvalFilter === "pending") fallbackSearchQuery = fallbackSearchQuery.not("status", "in", "(accepted,rejected)");
+        if (reconciliationFilter === "clean") fallbackSearchQuery = fallbackSearchQuery.eq("mismatch_count", 0);
+        if (reconciliationFilter === "issues") fallbackSearchQuery = fallbackSearchQuery.gt("mismatch_count", 0);
 
         fallbackSearchQuery = fallbackSearchQuery.or(
           [

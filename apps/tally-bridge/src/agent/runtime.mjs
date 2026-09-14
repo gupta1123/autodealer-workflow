@@ -12,7 +12,6 @@ import {
   LocalVectorService,
   deterministicLedgerCandidates,
   ledgerSearchText,
-  localLedgerEmbedding,
   LOCAL_LEDGER_VECTOR_DIMENSIONS,
   LOCAL_LEDGER_VECTOR_INDEX_VERSION,
   LOCAL_LEDGER_VECTOR_MODEL,
@@ -134,8 +133,9 @@ export class LocalAgentRuntime {
     this.gateway = new TallyAgentGateway({ tallyUrl: config.tallyUrl, execute: tallyExecutor });
     this.sync = new IncrementalSyncEngine({ storage: this.storage, gateway: this.gateway });
     this.browserUpload = new BrowserDocumentUpload({ temporaryDirectory: this.storage.paths.temporary });
-    this.documents = new LocalDocumentService({ temporaryDirectory: this.storage.paths.temporary, browserUpload: this.browserUpload });
     this.vectors = new LocalVectorService({ vectorsDirectory: this.storage.paths.vectors, enabled: false });
+    this.documents = new LocalDocumentService({ temporaryDirectory: this.storage.paths.temporary, browserUpload: this.browserUpload,
+      suggestLedgerBatch: (queries, options) => this.suggestLedgerBatch(queries, options) });
     this.scheduler = new AgentJobScheduler({ storage: this.storage });
     this.onProgress = onProgress;
     this.onLog = onLog;
@@ -145,6 +145,7 @@ export class LocalAgentRuntime {
     this.activeIdentityObservedAt = 0;
     this.ledgerLookupCache = new Map();
     this.vectorIndexCheckedAt = new Map();
+    this.vectorIndexPromises = new Map();
     this.datasetSyncPromises = new Map();
 
     this.scheduler.register("agent_sync_dataset", async (job, progress) => {
@@ -282,6 +283,20 @@ export class LocalAgentRuntime {
   async start() {
     if (this.started) return;
     await this.storage.call("health");
+    const semanticV3Migrated = await this.storage.call("getSetting", {
+      key: "semanticEmbeddingV3Migrated",
+      fallback: false,
+    });
+    if (semanticV3Migrated !== true) {
+      await this.storage.call("setSetting", { key: "localZvecEnabled", value: true });
+      if (this.config.organizationId) {
+        await this.storage.call("setSetting", {
+          key: `zvec:${this.config.organizationId}`,
+          value: true,
+        });
+      }
+      await this.storage.call("setSetting", { key: "semanticEmbeddingV3Migrated", value: true });
+    }
     await this.runMaintenance();
     const pendingVectorCleanup = await this.storage.call("getSetting", { key: "pendingVectorCleanup", fallback: [] });
     for (const oldDatasetKey of pendingVectorCleanup || []) this.vectors.reset(oldDatasetKey);
@@ -309,7 +324,7 @@ export class LocalAgentRuntime {
     ]);
     const canonicalDatasets = canonicalDatasetStatuses(datasets, this.config);
     const datasetsWithWorkflowRevisions = await Promise.all(canonicalDatasets.map(async (dataset) => {
-      const [followupCursor, followupChange] = await Promise.all([
+      const [followupCursor, followupChange, metrics] = await Promise.all([
         this.storage.call("getSetting", {
           key: `followup-voucher-alter-id:${dataset.dataset_key}`,
           fallback: null,
@@ -318,10 +333,12 @@ export class LocalAgentRuntime {
           key: `followup-last-change:${dataset.dataset_key}`,
           fallback: null,
         }),
+        this.storage.call("getDatasetMetrics", { datasetKey: dataset.dataset_key }),
       ]);
       const followupRevision = Number(followupChange?.cursor ?? followupCursor);
       return {
         ...dataset,
+        metrics,
         cacheHealth: {
           ...(dataset.cacheHealth || {}),
           workflowRevisions: {
@@ -348,6 +365,24 @@ export class LocalAgentRuntime {
     };
   }
 
+  async syncActiveDataset({ forceReconcile = false } = {}) {
+    const identity = this.activeIdentity;
+    if (!identity) throw new Error("Open a company in Tally Prime before synchronizing ledgers.");
+    const operation = forceReconcile ? "reconcile" : "sync";
+    const progress = async (value = {}) => this.onProgress?.({ ...value, operation, localUi: true });
+    const dataset = await this.syncDataset(identity, { forceReconcile, progress });
+    const vector = await this.ensureVectorIndex(identity, progress, { force: true });
+    return { dataset, vector, identity };
+  }
+
+  async rebuildActiveVectorIndex() {
+    const identity = this.activeIdentity;
+    if (!identity) throw new Error("Open a company in Tally Prime before updating the matching index.");
+    const progress = async (value = {}) => this.onProgress?.({ ...value, operation: "vector", localUi: true });
+    const vector = await this.ensureVectorIndex(identity, progress, { force: true });
+    return { vector, identity };
+  }
+
   async updateSettings(settings = {}) {
     const allowed = ["localAnydocEnabled", "localZvecEnabled", "localDataModules", "cacheLimitBytes", "diagnosticRetentionDays", "markdownRetentionDays", "completedJobRetentionDays", "deliveredOutboxRetentionDays", "workflowSnapshotRetentionDays", "syncIntervalSeconds", "startWithWindows", "updateChannel"];
     for (const key of allowed) {
@@ -363,7 +398,7 @@ export class LocalAgentRuntime {
 
   async settings() {
     const entries = await Promise.all([
-      ["localAnydocEnabled", true], ["localZvecEnabled", false], ["cacheLimitBytes", 1024 ** 3],
+      ["localAnydocEnabled", true], ["localZvecEnabled", true], ["cacheLimitBytes", 1024 ** 3],
       ["localDataModules", { purchase: true, bank: true, cashDiscount: true, followups: true }],
       ["diagnosticRetentionDays", 14], ["markdownRetentionDays", 30], ["completedJobRetentionDays", 7],
       ["deliveredOutboxRetentionDays", 7], ["workflowSnapshotRetentionDays", 7],
@@ -408,6 +443,8 @@ export class LocalAgentRuntime {
       stateCode: String(company.gstin || "").match(/^\d{2}/)?.[0] || null,
     };
     this.activeIdentityObservedAt = Date.now();
+    void this.ensureVectorIndex(identity)
+      .catch((error) => this.onLog?.("warn", `Local ledger index: ${error.message}`));
     const intervalSeconds = Number(await this.storage.call("getSetting", { key: "syncIntervalSeconds", fallback: 60 })) || 60;
     if (Date.now() - this.lastWatermarkAt < Math.max(15, intervalSeconds) * 1_000 || this.scheduler.busy) return;
     this.lastWatermarkAt = Date.now();
@@ -491,9 +528,23 @@ export class LocalAgentRuntime {
     return catalogue;
   }
 
-  async ensureVectorIndex(identity = this.activeIdentity, progress = async () => {}, { force = false } = {}) {
+  async ensureVectorIndex(identity = this.activeIdentity, progress = async () => {}, options = {}) {
     if (!identity) return { indexed: 0, skipped: true };
-    const enabled = await this.storage.call("getSetting", { key: `zvec:${identity.organizationId}`, fallback: false });
+    const key = datasetKey(identity);
+    const existing = this.vectorIndexPromises.get(key);
+    if (existing) return existing;
+    const work = this.buildVectorIndex(identity, progress, options);
+    this.vectorIndexPromises.set(key, work);
+    try {
+      return await work;
+    } finally {
+      if (this.vectorIndexPromises.get(key) === work) this.vectorIndexPromises.delete(key);
+    }
+  }
+
+  async buildVectorIndex(identity = this.activeIdentity, progress = async () => {}, { force = false } = {}) {
+    if (!identity) return { indexed: 0, skipped: true };
+    const enabled = await this.storage.call("getSetting", { key: `zvec:${identity.organizationId}`, fallback: true });
     if (enabled !== true) return { indexed: 0, skipped: true };
     const key = datasetKey(identity);
     if (!force && Date.now() - Number(this.vectorIndexCheckedAt.get(key) || 0) < 30_000) return { indexed: 0, skipped: true, fresh: true };
@@ -525,7 +576,7 @@ export class LocalAgentRuntime {
       if (previous.get(id)?.contentHash === contentHash) continue;
       changed.push({
         id,
-        embedding: localLedgerEmbedding(text),
+        text: `Ledger: ${ledger.name || ""}\nGroup: ${ledger.parent || "Unspecified"}\nDetails: ${text}`,
         entityKey: id,
         contentHash,
         alterId: Number(ledger.alterId || 0),
@@ -533,11 +584,13 @@ export class LocalAgentRuntime {
     }
     const removed = [...previous.keys()].filter((id) => !activeIds.has(id));
     this.vectors.enabled = true;
-    for (let offset = 0; offset < changed.length; offset += 500) {
-      const batch = changed.slice(offset, offset + 500);
+    for (let offset = 0; offset < changed.length; offset += 256) {
+      const batch = changed.slice(offset, offset + 256);
       await progress({ phase: "indexing_ledger_names", processed: offset, total: changed.length });
-      await this.vectors.upsert({ datasetKey: key, dimensions: LOCAL_LEDGER_VECTOR_DIMENSIONS, documents: batch });
-      await this.storage.call("upsertVectorDocumentStates", { datasetKey: key, documents: batch });
+      const embeddings = await this.requestSemanticEmbeddings(batch.map((document) => document.text));
+      const documents = batch.map((document, index) => ({ ...document, embedding: embeddings[index] }));
+      await this.vectors.upsert({ datasetKey: key, dimensions: LOCAL_LEDGER_VECTOR_DIMENSIONS, documents });
+      await this.storage.call("upsertVectorDocumentStates", { datasetKey: key, documents });
     }
     if (removed.length) {
       await this.vectors.delete({ datasetKey: key, dimensions: LOCAL_LEDGER_VECTOR_DIMENSIONS, ids: removed });
@@ -555,6 +608,39 @@ export class LocalAgentRuntime {
     return { indexed: changed.length, removed: removed.length, total: ledgers.length };
   }
 
+  async requestSemanticEmbeddings(inputs) {
+    if (!Array.isArray(inputs) || inputs.length === 0 || inputs.length > 256) {
+      throw new Error("Semantic embedding batches require 1-256 inputs.");
+    }
+    const response = await fetch(`${this.config.apiBase}/api/tally/bridge/embeddings`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.config.bridgeToken}`,
+      },
+      body: JSON.stringify({ connectionId: this.config.connectionId, inputs }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(String(payload?.error || `Semantic embedding request failed (${response.status}).`));
+    }
+    if (
+      payload?.model !== LOCAL_LEDGER_VECTOR_MODEL ||
+      Number(payload?.dimensions) !== LOCAL_LEDGER_VECTOR_DIMENSIONS ||
+      !Array.isArray(payload?.embeddings) ||
+      payload.embeddings.length !== inputs.length ||
+      payload.embeddings.some((embedding) =>
+        !Array.isArray(embedding) ||
+        embedding.length !== LOCAL_LEDGER_VECTOR_DIMENSIONS ||
+        embedding.some((value) => !Number.isFinite(value))
+      )
+    ) {
+      throw new Error("The semantic embedding service returned an incompatible response.");
+    }
+    return payload.embeddings;
+  }
+
   async suggestLedgers(query, { identity = this.activeIdentity, ledgers, savedMappings = [] } = {}) {
     if (!identity) return { suggestions: [], deterministic: [], vectorEnabled: false };
     const key = datasetKey(identity);
@@ -568,14 +654,15 @@ export class LocalAgentRuntime {
     }
     const shortlist = shortlistLedgers(query, lookup, savedMappings);
     const deterministic = deterministicLedgerCandidates(query, shortlist, savedMappings).slice(0, 8);
-    const enabled = await this.storage.call("getSetting", { key: `zvec:${identity.organizationId}`, fallback: false });
+    const enabled = await this.storage.call("getSetting", { key: `zvec:${identity.organizationId}`, fallback: true });
     if (enabled !== true) return { suggestions: deterministic.slice(0, 5), deterministic: deterministic.slice(0, 5), vectorEnabled: false };
     await this.ensureVectorIndex(identity);
     this.vectors.enabled = true;
+    const [embedding] = await this.requestSemanticEmbeddings([String(query?.name || query || "").trim()]);
     const hits = await this.vectors.query({
       datasetKey: key,
       dimensions: LOCAL_LEDGER_VECTOR_DIMENSIONS,
-      embedding: localLedgerEmbedding(query?.name || query),
+      embedding,
       topK: 8,
     });
     const byId = new Map(rows.map((ledger) => [String(ledger.guid || ledger.masterId || ledger.id || ledger.name), ledger]));
@@ -598,13 +685,60 @@ export class LocalAgentRuntime {
     if (!identity) return {};
     const key = datasetKey(identity);
     const rows = await this.storage.call("listMasters", { datasetKey: key, masterType: "ledger" });
-    const results = {};
-    for (const query of queries.slice(0, 100)) {
-      results[String(query.id || query.name || Object.keys(results).length)] = await this.suggestLedgers(query, {
-        identity, ledgers: rows, savedMappings,
-      });
+    let lookup = this.ledgerLookupCache.get(key);
+    if (!lookup || lookup.rows.length !== rows.length) {
+      lookup = buildLedgerLookup(rows);
+      this.ledgerLookupCache.set(key, lookup);
     }
-    return results;
+    const prepared = queries.slice(0, 256).map((query, index) => {
+      const shortlist = shortlistLedgers(query, lookup, savedMappings);
+      return {
+        id: String(query.id || query.name || index),
+        query,
+        deterministic: deterministicLedgerCandidates(query, shortlist, savedMappings).slice(0, 8),
+      };
+    });
+    const enabled = await this.storage.call("getSetting", { key: `zvec:${identity.organizationId}`, fallback: true });
+    if (enabled !== true) {
+      return Object.fromEntries(prepared.map((item) => [item.id, {
+        suggestions: item.deterministic.slice(0, 5),
+        deterministic: item.deterministic.slice(0, 5),
+        vectorEnabled: false,
+      }]));
+    }
+    await this.ensureVectorIndex(identity);
+    this.vectors.enabled = true;
+    const embeddings = await this.requestSemanticEmbeddings(
+      prepared.map((item) => String(item.query?.name || item.query || "").trim())
+    );
+    const hitBatches = await Promise.all(embeddings.map((embedding) => this.vectors.query({
+      datasetKey: key,
+      dimensions: LOCAL_LEDGER_VECTOR_DIMENSIONS,
+      embedding,
+      topK: 8,
+    })));
+    const byId = new Map(rows.map((ledger) => [String(ledger.guid || ledger.masterId || ledger.id || ledger.name), ledger]));
+    return Object.fromEntries(prepared.map((item, index) => {
+      const vector = hitBatches[index].flatMap((hit) => {
+        const ledger = byId.get(String(hit.id));
+        return ledger ? [{ ledger, score: Number(hit.score || 0), source: "openrouter_vector" }] : [];
+      });
+      const seen = new Set();
+      const suggestions = [...item.deterministic.filter((entry) => entry.score >= 0.94), ...vector, ...item.deterministic]
+        .filter((entry) => {
+          const id = String(entry.ledger?.guid || entry.ledger?.masterId || entry.ledger?.name || "");
+          if (!id || seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        })
+        .slice(0, 8);
+      return [item.id, {
+        suggestions,
+        deterministic: item.deterministic.slice(0, 5),
+        vectorEnabled: true,
+        embeddingModel: LOCAL_LEDGER_VECTOR_MODEL,
+      }];
+    }));
   }
 
   async localMasterCatalogue(scope = {}, { moduleName = "bank" } = {}) {

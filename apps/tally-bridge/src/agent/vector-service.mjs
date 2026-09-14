@@ -1,5 +1,5 @@
 import { fork } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
@@ -10,9 +10,9 @@ function normalized(value) {
   return String(value || "").normalize("NFKC").toLocaleLowerCase("en-IN").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
 
-export const LOCAL_LEDGER_VECTOR_MODEL = "kalika-hashed-ngrams-v1";
-export const LOCAL_LEDGER_VECTOR_DIMENSIONS = 256;
-export const LOCAL_LEDGER_VECTOR_INDEX_VERSION = 2;
+export const LOCAL_LEDGER_VECTOR_MODEL = "openai/text-embedding-3-small";
+export const LOCAL_LEDGER_VECTOR_DIMENSIONS = 512;
+export const LOCAL_LEDGER_VECTOR_INDEX_VERSION = 3;
 
 function hashToken(token) {
   let hash = 2166136261;
@@ -114,7 +114,10 @@ export class LocalVectorService {
     });
   }
 
-  indexPath(datasetKey) { return path.join(this.vectorsDirectory, Buffer.from(datasetKey).toString("base64url")); }
+  indexPath(datasetKey) {
+    const identityHash = createHash("sha256").update(String(datasetKey)).digest("hex");
+    return path.join(this.vectorsDirectory, identityHash);
+  }
   upsert({ datasetKey, dimensions, documents }) { return this.call("upsert", { indexPath: this.indexPath(datasetKey), dimensions, documents }); }
   delete({ datasetKey, dimensions, ids }) { return this.call("delete", { indexPath: this.indexPath(datasetKey), dimensions, ids }); }
   query({ datasetKey, dimensions, embedding, topK = 5 }) { return this.call("query", { indexPath: this.indexPath(datasetKey), dimensions, embedding, topK }); }

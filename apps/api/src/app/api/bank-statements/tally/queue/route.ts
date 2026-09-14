@@ -1,6 +1,7 @@
 import { withTeamAccess } from '@/lib/access/route-boundary';
 import {requireMasterDataset} from '@/lib/access/master-store';
 import {AccessError} from '@/lib/access/server';
+import { validateBankVoucherBillPolicy } from "@/lib/bank-voucher-bill-policy";
 import {accessFailureResponse} from '@/lib/access/failures';
 import {wakeTallyConnector} from '@/lib/tally/command-wake';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
@@ -32,6 +33,13 @@ type QueuePayload = {
   accountId?: string;
   bankLedgerName?: string;
   counterpartyLedgerName?: string;
+  liveLedgerContext?: Array<{
+    name?: string;
+    guid?: string | null;
+    parent?: string | null;
+    billWiseEnabled?: boolean | null;
+    ledgerType?: string | null;
+  }>;
   outgoingAction?: "verify" | "post";
   transactions?: Array<{
     transactionId?: string;
@@ -43,6 +51,9 @@ type QueuePayload = {
       referenceName?: string;
       amount?: number | string;
     }>;
+    billMatchingVerified?: boolean;
+    directPosting?: boolean;
+    duplicateCheckVerified?: boolean;
     saveMapping?: boolean;
   }>;
 };
@@ -65,6 +76,7 @@ type BankTransactionRow = {
   suggestion_confidence: number | string | null;
   confirmed_ledger_name: string | null;
   fingerprint: string;
+  raw_payload?: Record<string, unknown> | null;
 };
 
 type BankAccountRow = {
@@ -97,7 +109,10 @@ type TransactionStatusSummaryRow = {
 
 type TallyLedgerRow = {
   tally_name: string;
+  tally_guid?: string | null;
   parent_name: string | null;
+  raw_payload?: Record<string, unknown> | null;
+  ledger_type?: string | null;
 };
 
 type MappingRow = {
@@ -133,6 +148,9 @@ type TransactionLedgerSelection = {
     referenceName: string;
     amount: number;
   }>;
+  billMatchingVerified: boolean;
+  directPosting: boolean;
+  duplicateCheckVerified: boolean;
 };
 
 type TallyCommandInsert = {
@@ -185,13 +203,48 @@ function billAllocationTotal(allocations: Array<{ amount: number }>) {
   return Number(allocations.reduce((sum, allocation) => sum + allocation.amount, 0).toFixed(2));
 }
 
+function readLiveLedgerContext(value: unknown): TallyLedgerRow[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 100).flatMap((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const row = entry as Record<string, unknown>;
+    const name = toText(row.name, 500);
+    if (!name) return [];
+    const billWiseEnabled = typeof row.billWiseEnabled === "boolean" ? row.billWiseEnabled : null;
+    return [{
+      tally_name: name,
+      tally_guid: toText(row.guid, 500) || null,
+      parent_name: toText(row.parent, 240) || null,
+      ledger_type: toText(row.ledgerType, 80) || null,
+      raw_payload: { billWiseEnabled },
+    }];
+  });
+}
+
+function buildVoucherNarration(description: string, referenceNumber: string) {
+  const narration = toText(description, 1600);
+  const reference = toText(referenceNumber, 200);
+  if (!reference || normalizeName(narration).includes(normalizeName(reference))) return narration;
+  return `${narration}${narration ? " | " : ""}UTR/Ref: ${reference}`.slice(0, 1900);
+}
+
 function isSuspenseLedger(value?: string | null) {
   const normalized = normalizeName(value);
   return normalized.includes("suspense");
 }
 
 function isValidTransactionDate(value: unknown) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(String(value ?? "").trim());
+  const text = String(value ?? "").trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return false;
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  return date.getUTCFullYear() === Number(match[1]) &&
+    date.getUTCMonth() === Number(match[2]) - 1 &&
+    date.getUTCDate() === Number(match[3]);
+}
+
+function getVoucherDate(transaction: Pick<BankTransactionRow, "transaction_date" | "value_date">) {
+  return transaction.transaction_date;
 }
 
 function getVoucherType(transaction: BankTransactionRow) {
@@ -299,11 +352,15 @@ async function POSTHandler(request: Request) {
               createLedgerName,
               createLedgerParentName,
               billAllocations,
+              billMatchingVerified: transaction?.billMatchingVerified === true,
+              directPosting: transaction?.directPosting === true,
+              duplicateCheckVerified: transaction?.duplicateCheckVerified === true,
             },
           ] as const,
         ];
       })
     );
+    const liveLedgerContext = readLiveLedgerContext(body.liveLedgerContext);
     const saveMappingTransactionIds = new Set(
       (Array.isArray(body.transactions) ? body.transactions : []).flatMap((transaction) => {
         const transactionId = toText(transaction?.transactionId, 80);
@@ -569,6 +626,8 @@ async function POSTHandler(request: Request) {
       invalidAmount: 0,
       invalidDirection: 0,
       invalidBillAllocation: 0,
+      billMatchingNotVerified: 0,
+      sameContraLedger: 0,
     };
     type SkippedReason = keyof typeof skipped;
     const skippedRows: Array<{
@@ -586,15 +645,15 @@ async function POSTHandler(request: Request) {
       return [] as TallyCommandInsert[];
     }
 
-    const activeLedgers: TallyLedgerRow[] = [];
+    const activeLedgers: TallyLedgerRow[] = [...liveLedgerContext];
     const masterTable=teamScope?'access_dataset_masters':'tally_masters';
     const masterPredicate=teamScope?`dataset_id.eq.${teamScope.dataset!.id}`:
       `and(owner_user_id.eq.${user.id},connection_id.eq.${connectionId},company_name.eq.${JSON.stringify(expectedCompanyName)})`;
     const ledgerPageSize = 1000;
-    for (let from = 0; from < 20000; from += ledgerPageSize) {
+    for (let from = 0; activeLedgers.length === 0 && from < 20000; from += ledgerPageSize) {
       const { data: ledgerRows, error: ledgerError } = await supabase
         .from(masterTable)
-        .select("tally_name, parent_name")
+        .select("tally_name, tally_guid, parent_name, raw_payload")
         .or(masterPredicate)
         .eq("master_type", "ledger")
         .eq("is_active", true)
@@ -643,6 +702,17 @@ async function POSTHandler(request: Request) {
         ledger.parent_name ?? "",
       ])
     );
+    const ledgerGuidByName = new Map(
+      activeLedgers.map((ledger) => [normalizeName(ledger.tally_name), ledger.tally_guid ?? null])
+    );
+    const ledgerBillWiseEnabledByName = new Map(
+      activeLedgers.map((ledger) => [
+        normalizeName(ledger.tally_name),
+        typeof ledger.raw_payload?.billWiseEnabled === "boolean"
+          ? ledger.raw_payload.billWiseEnabled
+          : null,
+      ])
+    );
 
     function ledgerExists(ledgerName: string) {
       return syncedLedgerNames.has(normalizeName(ledgerName));
@@ -688,7 +758,9 @@ async function POSTHandler(request: Request) {
         transaction,
         counterpartyLedgerName,
         createLedgerName,
-        createLedgerParentName: selectedLedger?.createLedgerParentName || "Sundry Creditors",
+        createLedgerParentName:
+          selectedLedger?.createLedgerParentName ||
+          (isIncomingReceipt(transaction) ? "Sundry Debtors" : "Sundry Creditors"),
       };
     });
 
@@ -700,11 +772,12 @@ async function POSTHandler(request: Request) {
         }
         const account = accountsById.get(transaction.bank_account_id);
         const amount = getTransactionAmount(transaction);
+        const voucherDate = getVoucherDate(transaction);
         const bankLedgerName = toText(body.bankLedgerName, 500) || account?.tally_ledger_name || "";
         if (!account) {
           return skipTransaction(transaction, "missingAccount");
         }
-        if (!isValidTransactionDate(transaction.transaction_date)) {
+        if (!isValidTransactionDate(voucherDate)) {
           return skipTransaction(transaction, "invalidDate");
         }
         if (!bankLedgerName) {
@@ -727,6 +800,8 @@ async function POSTHandler(request: Request) {
           return skipTransaction(transaction, "invalidDirection");
         }
         const billAllocations = ledgerSelectionByTransactionId.get(transaction.id)?.billAllocations ?? [];
+        const billMatchingVerified = ledgerSelectionByTransactionId.get(transaction.id)?.billMatchingVerified === true;
+        const directPosting = ledgerSelectionByTransactionId.get(transaction.id)?.directPosting === true;
         const originalVoucherType = getVoucherType(transaction);
         const statementImport = transaction.statement_import_id
           ? importsById.get(transaction.statement_import_id)
@@ -750,7 +825,7 @@ async function POSTHandler(request: Request) {
               bankAccountId: account.id,
               fingerprint: transaction.fingerprint,
               companyName: expectedCompanyName,
-              voucherDate: transaction.transaction_date,
+              voucherDate,
               bankLedgerName,
               counterpartyLedgerName: counterpartyLedgerName || null,
               matchedLedgerName: counterpartyLedgerName || null,
@@ -780,6 +855,17 @@ async function POSTHandler(request: Request) {
         const counterpartyIsPartyLedger = shouldCreateCounterpartyLedger
           ? isPartyParent(createLedgerParentName)
           : isPartyLedger(counterpartyLedgerName);
+        const counterpartyRequiresBillMatching = counterpartyIsPartyLedger && (
+          shouldCreateCounterpartyLedger ||
+          ledgerBillWiseEnabledByName.get(normalizeName(counterpartyLedgerName)) !== false
+        );
+        const billPolicyError = validateBankVoucherBillPolicy({
+          directPosting,
+          requiresBillMatching: counterpartyRequiresBillMatching,
+          billMatchingVerified,
+          allocationCount: billAllocations.length,
+        });
+        if (billPolicyError) return skipTransaction(transaction, billPolicyError);
         if (
           (counterpartyIsPartyLedger && billAllocations.length > 0 && Math.abs(billAllocationTotal(billAllocations) - amount) >= 0.005) ||
           (!counterpartyIsPartyLedger && billAllocations.length > 0)
@@ -794,6 +880,12 @@ async function POSTHandler(request: Request) {
             normalizeName(counterpartyParentName) === normalizeName(rootGroupName) ||
             masterParentDescendsFromGroup(counterpartyParentName, groupIdentities, rootGroupName)
         );
+        if (
+          counterpartyIsBankOrCashLedger &&
+          normalizeName(counterpartyLedgerName) === normalizeName(bankLedgerName)
+        ) {
+          return skipTransaction(transaction, "sameContraLedger");
+        }
         const nextCommands: TallyCommandInsert[] = [];
         const createLedgerKey = normalizeName(createLedgerName);
         if (shouldCreateCounterpartyLedger && createLedgerKey && !queuedCreateLedgerKeys.has(createLedgerKey)) {
@@ -824,16 +916,20 @@ async function POSTHandler(request: Request) {
             bankAccountId: account.id,
             fingerprint: transaction.fingerprint,
             companyName: expectedCompanyName,
-            voucherType: outgoingPayment && counterpartyIsBankOrCashLedger ? "Contra" : originalVoucherType,
-            voucherDate: transaction.transaction_date,
+            voucherType: counterpartyIsBankOrCashLedger ? "Contra" : originalVoucherType,
+            voucherDate,
             bankLedgerName,
+            bankLedgerGuid: ledgerGuidByName.get(normalizeName(bankLedgerName)) || null,
             counterpartyLedgerName,
+            counterpartyLedgerGuid: shouldCreateCounterpartyLedger
+              ? null
+              : ledgerGuidByName.get(normalizeName(counterpartyLedgerName)) || null,
             matchedLedgerName: counterpartyLedgerName,
             counterpartyIsPartyLedger,
             postingFallbackReason: isSuspenseLedger(counterpartyLedgerName) ? "unresolved_counterparty" : null,
             bankLedgerEntryIsDebit: bankEntryIsDebit(transaction),
             amount,
-            narration: transaction.description,
+            narration: buildVoucherNarration(transaction.description, referenceNumber),
             referenceNumber,
             transactionType: transaction.transaction_type,
             category: transaction.category,

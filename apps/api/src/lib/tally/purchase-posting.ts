@@ -2110,7 +2110,11 @@ export function preparePurchasePosting(params: {
   const tallyPayload = {
     companyName: params.companyName,
     voucherType: "Purchase",
-    voucherNumber: purchaseVoucherNumber(review.invoiceNumber, review.invoiceDate),
+    // The standard Purchase voucher type is automatically numbered by Tally.
+    // Supplying the supplier's invoice identity as VOUCHERNUMBER overrides that
+    // sequence and Tally may reject the import without a field-level error.
+    // Keep the supplier invoice in REFERENCE/BILLALLOCATIONS and read back the
+    // voucher number assigned by Tally after creation.
     supplierInvoiceNumber: review.invoiceNumber,
     supplierInvoiceDate: review.invoiceDate,
     voucherDate: review.voucherDate,

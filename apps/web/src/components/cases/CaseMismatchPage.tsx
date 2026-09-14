@@ -1,24 +1,26 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ArrowLeft,
   Check,
   CheckCircle2,
   ChevronDown,
   Database,
   Loader2,
-  PlugZap,
   RefreshCw,
   ShieldAlert,
   X,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
+import { TallyConnectionPill } from "@/components/tally/TallyConnectionPill";
 import {
   TallyPurchasePostingPanel,
   type TallyPurchaseHeaderState,
+  type TallyPurchaseValidationState,
 } from "@/components/cases/TallyPurchasePostingPanel";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -755,8 +757,28 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
   const [decisionStatus, setDecisionStatus] = useState<"idle" | "updating" | "error">("idle");
   const [decisionError, setDecisionError] = useState<string | null>(null);
   const [tallyHeaderState, setTallyHeaderState] = useState<TallyPurchaseHeaderState | null>(null);
+  const [tallyValidationState, setTallyValidationState] = useState<TallyPurchaseValidationState>({
+    blockers: [],
+    warnings: [],
+    checking: true,
+  });
+  const [allowedTallyBlockerKeys, setAllowedTallyBlockerKeys] = useState<Set<string>>(() => new Set());
   const [refreshingTallyHeader, setRefreshingTallyHeader] = useState(false);
   const tallyPurchaseRefreshRef = useRef<(() => Promise<void>) | null>(null);
+  const handleTallyValidationStateChange = useCallback((next: TallyPurchaseValidationState) => {
+    setTallyValidationState(next);
+  }, []);
+  const toggleTallyBlockerOverride = useCallback((key: string) => {
+    setAllowedTallyBlockerKeys((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+  useEffect(() => {
+    setAllowedTallyBlockerKeys(new Set());
+  }, [caseId]);
   const [selectedMismatchIds, setSelectedMismatchIds] = useState<Set<string>>(() => new Set());
   const [comparisonGroups, setComparisonGroups] = useState<ComparisonFieldGroup[]>(
     () => DEFAULT_COMPARISON_FIELD_GROUPS
@@ -1093,6 +1115,9 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
     tallyHeaderState?.tallyVoucherNumber &&
       ["created", "verification_required"].includes(tallyHeaderState?.postingStatus ?? "")
   );
+  const remainingTallyBlockerCount = tallyValidationState.blockers.filter(
+    (item) => !allowedTallyBlockerKeys.has(item.overrideKey)
+  ).length;
   const tallyHeaderTitle = refreshingTallyHeader
     ? "Checking Tally company"
     : tallyVoucherVerified
@@ -1104,11 +1129,6 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
         : tallyCompanyContextMismatch
           ? "Switch company in Tally"
           : "Tally unavailable";
-  const tallyHeaderToneClass = tallyVoucherVerified || tallyCompanyContextVerified
-    ? "border-[#c3dfcb] bg-[#ebf5ee]/80"
-    : tallyHeaderState?.selectedConnectionId
-      ? "border-[#f9d8a7] bg-[#fef6e9]"
-      : "border-[#e5ddd0] bg-white";
 
   return (
     <AppShell defaultSidebarCollapsed>
@@ -1155,62 +1175,29 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
             </div>
           </div>
           {reviewMode === "tally" ? (
-            <div className={`hidden min-w-0 shrink-0 items-center gap-3 rounded-xl border px-3 py-2 shadow-sm transition-colors md:inline-flex ${tallyHeaderToneClass}`}>
-              <div className="flex min-w-0 items-center gap-2">
-                {refreshingTallyHeader ? (
-                  <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[#8a7f72]" />
-                ) : tallyVoucherVerified || tallyCompanyContextVerified ? (
-                  <CheckCircle2 className="h-4 w-4 shrink-0 text-[#2d6a4f]" />
-                ) : (
-                  <ShieldAlert className="h-4 w-4 shrink-0 text-[#b45309]" />
-                )}
-                <div className="min-w-0">
-                  <div className={`text-xs font-bold ${
-                    tallyVoucherVerified || tallyCompanyContextVerified
-                      ? "text-[#1b4332]"
-                      : tallyHeaderState?.selectedConnectionId
-                        ? "text-[#78350f]"
-                        : "text-[#111827]"
-                  }`}>{tallyHeaderTitle}</div>
-                  <div
-                    className={`mt-0.5 max-w-[285px] truncate text-[11px] font-semibold ${
-                      tallyVoucherVerified || tallyCompanyContextVerified
-                        ? "text-[#2d6a4f]"
-                        : tallyHeaderState?.selectedConnectionId
-                          ? "text-[#b45309]"
-                          : "text-[#b5aaa0]"
-                    }`}
-                    title={tallyVoucherVerified
-                      ? `Supplier invoice ${tallyHeaderState?.invoiceNumber || "—"} was verified in Tally.`
-                      : `Kalika: ${kalikaCompanyName} - Tally: ${activeTallyCompanyName}`}
-                  >
-                    {tallyVoucherVerified
-                      ? `Supplier invoice ${tallyHeaderState?.invoiceNumber || "—"} · verified`
-                      : `Kalika: ${kalikaCompanyName} - Tally: ${activeTallyCompanyName}`}
-                  </div>
-                </div>
-              </div>
-              <button
-                className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-bold text-[#5a5046] shadow-sm transition hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-60"
-                disabled={refreshingTallyHeader}
-                onClick={() => void refreshTallyHeader()}
-                type="button"
-              >
-                {refreshingTallyHeader ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <RefreshCw className="h-3.5 w-3.5" />
-                )}
-                Refresh
-              </button>
-              <Link
-                className="inline-flex h-8 items-center gap-1.5 rounded-xl bg-[#2d2d2d] px-3.5 text-xs font-bold text-white shadow-sm transition hover:bg-[#1a1a1a]"
-                href="/tally-prime?view=connection"
-              >
-                <PlugZap className="h-3.5 w-3.5" />
-                {tallyConnectionReady ? "Manage Tally" : "Connect Tally"}
-              </Link>
-            </div>
+            <TallyConnectionPill
+              className="hidden shrink-0 md:inline-flex"
+              title={tallyHeaderTitle}
+              subtitle={
+                tallyVoucherVerified
+                  ? `Supplier invoice ${tallyHeaderState?.invoiceNumber || "—"} · verified`
+                  : `Kalika: ${kalikaCompanyName} - Tally: ${activeTallyCompanyName}`
+              }
+              status={
+                refreshingTallyHeader
+                  ? "checking"
+                  : tallyVoucherVerified || tallyCompanyContextVerified
+                    ? "verified"
+                    : "warning"
+              }
+              avatarName={kalikaCompanyName}
+              refreshing={refreshingTallyHeader}
+              onRefresh={() => void refreshTallyHeader()}
+              secondaryAction={{
+                label: tallyConnectionReady ? "Manage Tally" : "Connect Tally",
+                href: "/tally-prime?view=connection",
+              }}
+            />
           ) : null}
         </header>
 
@@ -1268,7 +1255,19 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                 <div className="border-b border-[#ece6dc] bg-[#fbfaf8] px-4 py-3">
                   <h3 className="text-xs font-semibold tracking-wide text-[#3d3530]">Review</h3>
                   <p className="mt-0.5 text-xs font-normal text-[#8a7f72]">
-                    {visibleMismatches.length === 0 ? "No issues" : `${acceptedMismatchCount + rejectedMismatchCount} of ${visibleMismatches.length} done · ${pendingMismatchCount} left`}
+                    {reviewMode === "tally"
+                      ? tallyValidationState.checking
+                        ? "Checking Tally data"
+                        : remainingTallyBlockerCount > 0
+                          ? `${remainingTallyBlockerCount} to fix`
+                          : tallyValidationState.blockers.length > 0
+                            ? `${tallyValidationState.blockers.length} allowed`
+                          : tallyValidationState.warnings.length > 0
+                            ? `${tallyValidationState.warnings.length} warning${tallyValidationState.warnings.length === 1 ? "" : "s"}`
+                            : "Ready for approval"
+                      : visibleMismatches.length === 0
+                        ? "No issues"
+                        : `${acceptedMismatchCount + rejectedMismatchCount} of ${visibleMismatches.length} done · ${pendingMismatchCount} left`}
                   </p>
                 </div>
 
@@ -1293,7 +1292,67 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                   </div>
                 )}
 
-                {visibleMismatches.length === 0 ? (
+                {reviewMode === "tally" ? (
+                  <div className="min-h-0 flex-1 overflow-y-auto">
+                    {tallyValidationState.checking ? (
+                      <div className="flex items-center gap-2 px-4 py-4 text-xs text-[#8a7f72]">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        Checking validations…
+                      </div>
+                    ) : tallyValidationState.blockers.length === 0 && tallyValidationState.warnings.length === 0 ? (
+                      <div className="flex items-start gap-2 px-4 py-4 text-xs text-[#55725f]">
+                        <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                        No Tally issues. Ready for approval.
+                      </div>
+                    ) : (
+                      <div className="divide-y divide-[#f0ece4]">
+                        {tallyValidationState.blockers.map((item, index) => (
+                          <div
+                            className="flex w-full items-start gap-2.5 px-3 py-3 transition hover:bg-rose-50/70"
+                            key={`blocker:${item.code}:${item.lineId ?? index}`}
+                          >
+                            <input
+                              aria-label={`Allow ${item.label} and continue`}
+                              checked={allowedTallyBlockerKeys.has(item.overrideKey)}
+                              className="mt-0.5 h-3.5 w-3.5 shrink-0 rounded border-rose-300 accent-rose-700"
+                              onChange={() => toggleTallyBlockerOverride(item.overrideKey)}
+                              type="checkbox"
+                            />
+                            <button
+                              className="min-w-0 flex-1 text-left"
+                              onClick={() => document.getElementById(item.targetId)?.scrollIntoView({ behavior: "smooth", block: "start" })}
+                              type="button"
+                            >
+                              <span className="flex items-start gap-2">
+                                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-600" />
+                                <span className="min-w-0">
+                                  <strong className="block text-[11px] font-semibold leading-4 text-rose-800">{item.label}</strong>
+                                  <span className="mt-0.5 block text-[10px] leading-4 text-[#8f5a58]">
+                                    {allowedTallyBlockerKeys.has(item.overrideKey) ? "Allowed for this posting" : "Check to allow anyway"}
+                                  </span>
+                                </span>
+                              </span>
+                            </button>
+                          </div>
+                        ))}
+                        {tallyValidationState.warnings.map((item, index) => (
+                          <button
+                            className="flex w-full items-start gap-2.5 px-3 py-3 text-left transition hover:bg-amber-50/70"
+                            key={`warning:${item.code}:${item.lineId ?? index}`}
+                            onClick={() => document.getElementById(item.targetId)?.scrollIntoView({ behavior: "smooth", block: "start" })}
+                            type="button"
+                          >
+                            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />
+                            <span className="min-w-0">
+                              <strong className="block text-[11px] font-semibold leading-4 text-amber-900">{item.label}</strong>
+                              <span className="mt-0.5 block text-[10px] leading-4 text-[#8a6a42]">Warning</span>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : visibleMismatches.length === 0 ? (
                   <div className="p-5 text-xs font-normal text-[#8a7f72]">All clear — no issues to review.</div>
                 ) : (
                   <div className="flex min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
@@ -1387,6 +1446,8 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                           : undefined
                       }
                       onHeaderStateChange={setTallyHeaderState}
+                      onValidationStateChange={handleTallyValidationStateChange}
+                      allowedBlockerKeys={Array.from(allowedTallyBlockerKeys)}
                       onRefreshReady={(refresh) => {
                         tallyPurchaseRefreshRef.current = refresh;
                       }}

@@ -48,8 +48,8 @@ function cacheCaseList(key:string,value:CachedCaseList){
   while(caseListCache.size>20)caseListCache.delete(caseListCache.keys().next().value!);
 }
 
-function getCaseListCacheKey(query: string, page: number, pageSize: number) {
-  return `active:${query.trim().toLowerCase()}:page:${page}:limit:${pageSize}`;
+function getCaseListCacheKey(query: string, approval: string, reconciliation: string, page: number, pageSize: number) {
+  return `active:${query.trim().toLowerCase()}:approval:${approval}:reconciliation:${reconciliation}:page:${page}:limit:${pageSize}`;
 }
 
 function formatRelativeDate(value: string) {
@@ -76,34 +76,25 @@ function formatRelativeDate(value: string) {
   });
 }
 
-function getStatusPill(status: string) {
+function getApprovalPill(status: string) {
   switch (status.toLowerCase()) {
-    case "completed":
     case "accepted":
       return {
-        label: "Completed",
+        label: "Approved",
         className: "bg-[#ebf5ee] text-[#1b4332] border-[#c3dfcb]",
         dotColor: "bg-[#2d6a4f]",
       };
-    case "processing":
-    case "pending":
-      return {
-        label: "Ongoing",
-        className: "bg-[#fef6e9] text-[#78350f] border-[#f9d8a7]",
-        dotColor: "bg-[#b45309]",
-      };
-    case "failed":
     case "rejected":
       return {
-        label: "Failed",
+        label: "Rejected",
         className: "bg-[#fbf0ef] text-[#8c1d18] border-[#f2c7c4]",
         dotColor: "bg-[#b91c1c]",
       };
     default:
       return {
-        label: status ? status.charAt(0).toUpperCase() + status.slice(1) : "Draft",
-        className: "bg-[#efeae2] text-[#574c43] border-[#ded5c8]",
-        dotColor: "bg-[#8a7f72]",
+        label: "Pending approval",
+        className: "bg-[#fef6e9] text-[#78350f] border-[#f9d8a7]",
+        dotColor: "bg-[#b45309]",
       };
   }
 }
@@ -133,18 +124,11 @@ function getCaseTitle(item: SavedCaseRecord) {
   return toReadableCaseText(item.displayName);
 }
 
-function getCaseSubtitle(item: SavedCaseRecord) {
-  if (item.invoiceNumber) return `Inv: ${item.invoiceNumber}`;
-  if (item.poNumber) return `PO: ${item.poNumber}`;
-  return item.category || "Document Packet";
-}
-
-const STATUS_OPTIONS = [
-  { value: "all", label: "All Statuses" },
-  { value: "completed", label: "Completed" },
-  { value: "ongoing", label: "Ongoing" },
-  { value: "failed", label: "Failed" },
-  { value: "draft", label: "Draft" },
+const APPROVAL_OPTIONS = [
+  { value: "all", label: "All Approval States" },
+  { value: "approved", label: "Approved" },
+  { value: "pending", label: "Pending Approval" },
+  { value: "rejected", label: "Rejected" },
 ];
 
 const RECONCILIATION_OPTIONS = [
@@ -172,7 +156,7 @@ export function CasesPage() {
   const [showFilters, setShowFilters] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
-  const [selectedStatus, setSelectedStatus] = useState("all");
+  const [selectedApproval, setSelectedApproval] = useState("all");
   const [selectedReconciliation, setSelectedReconciliation] = useState("all");
 
   // Pagination
@@ -187,8 +171,8 @@ export function CasesPage() {
   const [isDeleting, setIsDeleting] = useState(false);
 
   const cacheKey = useMemo(
-    () => `${cacheEpoch}:${listRevision}:${snapshot?.member.user_id||'legacy'}:${snapshot?.organizationId||''}:${snapshot?.revision||0}:`+getCaseListCacheKey(debouncedSearchQuery, currentPage, pageSize),
-    [currentPage, debouncedSearchQuery, pageSize,cacheEpoch,listRevision,snapshot?.member.user_id,snapshot?.organizationId,snapshot?.revision]
+    () => `${cacheEpoch}:${listRevision}:${snapshot?.member.user_id||'legacy'}:${snapshot?.organizationId||''}:${snapshot?.revision||0}:`+getCaseListCacheKey(debouncedSearchQuery, selectedApproval, selectedReconciliation, currentPage, pageSize),
+    [currentPage, debouncedSearchQuery, selectedApproval, selectedReconciliation, pageSize,cacheEpoch,listRevision,snapshot?.member.user_id,snapshot?.organizationId,snapshot?.revision]
   );
 
   useEffect(() => {
@@ -224,6 +208,8 @@ export function CasesPage() {
       limit: pageSize,
       page: currentPage,
       query: debouncedSearchQuery,
+      approvalFilter: selectedApproval as "all" | "approved" | "pending" | "rejected",
+      reconciliationFilter: selectedReconciliation as "all" | "clean" | "issues",
       signal: controller.signal,
     })
       .then((payload) => {
@@ -248,35 +234,6 @@ export function CasesPage() {
 
     return () => controller.abort();
   }, [cacheKey, currentPage, debouncedSearchQuery, pageSize]);
-
-  // Client-side filtration for instant status / reconciliation adjustments
-  const filteredCases = useMemo(() => {
-    return cases.filter((item) => {
-      if (selectedStatus !== "all") {
-        if (selectedStatus === "completed" && item.status !== "completed" && item.status !== "accepted") {
-          return false;
-        }
-        if (selectedStatus === "ongoing" && item.status !== "processing" && item.status !== "pending") {
-          return false;
-        }
-        if (selectedStatus === "failed" && item.status !== "failed" && item.status !== "rejected") {
-          return false;
-        }
-        if (selectedStatus === "draft" && item.status !== "draft") {
-          return false;
-        }
-      }
-      if (selectedReconciliation !== "all") {
-        if (selectedReconciliation === "issues" && item.mismatchCount === 0) {
-          return false;
-        }
-        if (selectedReconciliation === "clean" && item.mismatchCount > 0) {
-          return false;
-        }
-      }
-      return true;
-    });
-  }, [cases, selectedReconciliation, selectedStatus]);
 
   async function handleConfirmDelete() {
     if (!pendingCase) return;
@@ -357,18 +314,24 @@ export function CasesPage() {
                   />
                 </div>
 
-                {/* Status Filter */}
+                {/* Approval Filter */}
                 <SelectDropdown
-                  value={selectedStatus}
-                  onChange={setSelectedStatus}
-                  options={STATUS_OPTIONS}
-                  placeholder="All Statuses"
+                  value={selectedApproval}
+                  onChange={(value) => {
+                    setSelectedApproval(value);
+                    setCurrentPage(1);
+                  }}
+                  options={APPROVAL_OPTIONS}
+                  placeholder="All Approval States"
                 />
 
                 {/* Reconciliation / Mismatch Filter */}
                 <SelectDropdown
                   value={selectedReconciliation}
-                  onChange={setSelectedReconciliation}
+                  onChange={(value) => {
+                    setSelectedReconciliation(value);
+                    setCurrentPage(1);
+                  }}
                   options={RECONCILIATION_OPTIONS}
                   placeholder="All Reconciliation"
                 />
@@ -399,7 +362,7 @@ export function CasesPage() {
               </div>
             )}
 
-            {status === "ready" && filteredCases.length === 0 && (
+            {status === "ready" && cases.length === 0 && (
               <div className="flex min-h-[300px] flex-col items-center justify-center py-12 text-center">
                 <p className="text-sm font-semibold text-[#111827]">
                   {debouncedSearchQuery ? "No matching cases found" : "No cases yet"}
@@ -421,7 +384,7 @@ export function CasesPage() {
               </div>
             )}
 
-            {status === "ready" && filteredCases.length > 0 && (
+            {status === "ready" && cases.length > 0 && (
               <div className="w-full">
                 <Table className="w-full">
                   <TableHeader>
@@ -430,10 +393,10 @@ export function CasesPage() {
                         Customer Name
                       </TableHead>
                       <TableHead className="h-10 px-3 text-xs font-semibold text-[#3d3530]">
-                        Category
+                        Invoice
                       </TableHead>
                       <TableHead className="h-10 px-3 text-xs font-semibold text-[#3d3530]">
-                        Status
+                        Approval
                       </TableHead>
                       <TableHead className="h-10 px-3 text-xs font-semibold text-[#3d3530]">
                         Reconciliation
@@ -450,8 +413,8 @@ export function CasesPage() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {filteredCases.map((item) => {
-                      const pill = getStatusPill(item.status);
+                    {cases.map((item) => {
+                      const pill = getApprovalPill(item.status);
                       return (
                         <TableRow
                           key={item.id}
@@ -467,19 +430,16 @@ export function CasesPage() {
                             >
                               {getCaseTitle(item)}
                             </Link>
-                            <span className="block text-[11px] font-normal text-[#8a7f72] truncate max-w-[240px]">
-                              {getCaseSubtitle(item)}
-                            </span>
                           </TableCell>
 
-                          {/* Category / Buyer */}
+                          {/* Invoice */}
                           <TableCell className="px-3 py-2 text-xs text-[#5a5046] font-normal">
-                            <span className="block max-w-[160px] truncate" title={item.buyerName ? toReadableCaseText(item.buyerName) : item.category || ""}>
-                              {item.buyerName ? toReadableCaseText(item.buyerName) : item.category || "—"}
+                            <span className="block max-w-[180px] truncate" title={item.invoiceNumber || ""}>
+                              {item.invoiceNumber || "—"}
                             </span>
                           </TableCell>
 
-                          {/* Status Pill with subtle warm indicator dot */}
+                          {/* Approval decision */}
                           <TableCell className="px-3 py-2 whitespace-nowrap">
                             <span
                               className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium shadow-[0_1px_2px_rgba(0,0,0,0.02)] ${pill.className}`}

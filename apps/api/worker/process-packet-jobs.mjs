@@ -6,18 +6,39 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { createClient } from "@supabase/supabase-js";
+import {
+  createCoalescingWakeSignal,
+  resolvePostgresWakeUrl,
+  startPostgresJobWake,
+} from "./postgres-job-wake.mjs";
 import {assertQueuedResource,QueuedAccessDenied} from '../src/lib/access/queued-authority.mjs';
 import {bankWorkerDataset,bankMasterQuery} from '../src/lib/access/bank-worker-scope.mjs';
 import sharp from "sharp";
 import { parseWithAnydoc } from "../src/lib/processing/anydoc-parser.ts";
+import { extractMarkdownBatches } from "./bank-statement-markdown-batches.mjs";
+import { deterministicTransactionsFromAnydoc } from "./bank-statement-deterministic.mjs";
 import { parseBankOnAgent } from "../src/lib/processing/local-bank-parsing.mjs";
 import { publishBankJobEvent } from '../src/lib/processing/bank-job-events.mjs';
 import { markCombinedLedgerRecommendationsCompleted, markBankLedgerRecommendationsUnavailable, prepareLocalExtraction } from '../src/lib/processing/bank-local-preview.mjs';
 import { parseDate, parseAmount, textCell, firstTextCell, normalizeName, titleCaseName, cleanCounterpartyCandidate, extractCounterpartyName, detectTransactionType, detectCategory, correctPreviewRowsFromRunningBalance, normalizeIfscCode, normalizeAccountNumber, maskAccountNumber, normalizeAiTransaction, normalizeAiBankStatement } from "../src/lib/processing/bank-preview-normalization.mjs";
 
 import { suggestBankLedgersForTransactions } from "../src/lib/bank-statement-ledger-matching.ts";
-import { correctRowsFromRunningBalance } from "./bank-statement-running-balance.mjs";
-import { validateRunningBalanceContinuity } from "./bank-statement-balance-validation.mjs";
+import {
+  bankStatementAccountDiagnostics,
+  combinedLedgerCatalogueDecision,
+  extractAccountFromBankStatementMarkdown,
+  mergeBankStatementAccount,
+} from "./bank-statement-account.mjs";
+import {
+  correctRowsFromRunningBalance,
+  validateRunningBalanceContinuity,
+} from "./bank-statement-running-balance.mjs";
+import {
+  extractBankStatementMarkdownAmounts,
+  reconcileBankStatementMarkdownAmounts,
+} from "./bank-statement-markdown-amounts.mjs";
+import { auditSourceCoverage, recoverSourceCoverage, sourceDate } from "./bank-statement-source-coverage.mjs";
+import { readBankStatementPhysicalColumns } from "./bank-statement-pdf-columns.mjs";
 import {
   addBankStatementPageProvenance,
   shouldAttemptBankStatementSingleShot,
@@ -62,6 +83,9 @@ const BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT = Math.max(
   0,
   Number(process.env.BANK_STATEMENT_SINGLE_PAGE_RECOVERY_LIMIT ?? 50)
 );
+// Source-row verification remains disabled until every supported bank layout
+// has a deterministic source reader. Running-balance validation still gates posting.
+const BANK_STATEMENT_SOURCE_COVERAGE_VERIFIER_ENABLED = false;
 const BANK_STATEMENT_TEXT_PROMPT_MAX_CHARS = Number(process.env.BANK_STATEMENT_TEXT_PROMPT_MAX_CHARS ?? 80_000);
 const BANK_STATEMENT_SINGLE_SHOT_MAX_INPUT_CHARS = Number(
   process.env.BANK_STATEMENT_SINGLE_SHOT_MAX_INPUT_CHARS ?? 36_000
@@ -298,6 +322,22 @@ async function extractBankStatementPdfTextPages(data, options = {}) {
     pages,
     truncated: pdf.numPages > pageCount,
   };
+}
+
+async function readBankStatementPdfPageCount(data) {
+  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  if ("GlobalWorkerOptions" in pdfjsLib) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_SRC;
+  }
+  const pdf = await pdfjsLib.getDocument({
+    data: new Uint8Array(data),
+    disableWorker: true,
+    useSystemFonts: true,
+    verbosity: pdfjsLib.VerbosityLevel?.ERRORS,
+  }).promise;
+  const pageCount = pdf.numPages;
+  await pdf.destroy?.();
+  return pageCount;
 }
 
 function hasUsableBankStatementText(pages) {
@@ -1304,7 +1344,17 @@ async function recoverSinglePages({
   };
 }
 
-async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, isImage, jobId, bankAccountCandidates = [], ledgerNames = [] }) {
+async function extractBankStatementAdaptive({
+  fileName,
+  mimeType,
+  bytes,
+  isPdf,
+  isImage,
+  jobId,
+  bankAccountCandidates = [],
+  ledgerNames = [],
+  onExtractionSource,
+}) {
   const diagnostics = {
     pipeline: null,
     pageCount: isImage ? 1 : null,
@@ -1323,6 +1373,15 @@ async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, 
   let extractionError = null;
   let textInfo = { pages: [], pageCount: isImage ? 1 : 0, truncated: false };
 
+  if (isPdf) {
+    try {
+      diagnostics.pageCount = await readBankStatementPdfPageCount(bytes);
+    } catch (error) {
+      diagnostics.errors.push({ stage: "pdf_page_count", error: diagnosticError(error) });
+    }
+  }
+
+  let authoritativeMarkdownRows = [];
   if (isPdf && BANK_STATEMENT_ANYDOC_ENABLED) {
     try {
       await updateBankJob(jobId, { progress: 32, stage: "Converting PDF to Markdown" });
@@ -1334,41 +1393,217 @@ async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, 
         tableCount: anydocResult.tableCount,
         error: anydocResult.error ?? null,
       };
-      if (anydocResult.success && anydocResult.markdownText.trim()) {
-        await updateBankJob(jobId, { progress: 45, stage: "Running quick Markdown + ledger AI" });
-        const markdownAiStartedAt = Date.now();
-        parsed = await extractAndMatchBankStatementFromMarkdown(
-          fileName,
-          anydocResult.markdownText,
-          bankAccountCandidates,
-          ledgerNames,
-          {
-            model: OPENROUTER_ANYDOC_MODEL,
-            reasoningTokens: OPENROUTER_ANYDOC_REASONING_TOKENS,
-            maxOutputTokens: OPENROUTER_ANYDOC_MAX_OUTPUT_TOKENS,
-          },
-        );
-        diagnostics.anydoc.markdownAiMs = Date.now() - markdownAiStartedAt;
-        if (parsed.transactions.length > 0) {
-          parsed = {
-            ...parsed,
-            transactions: addBankStatementPageProvenance(parsed.transactions, {
-              startPage: 1,
-              endPage: Math.max(1, anydocResult.tableCount),
-              method: "anydoc_markdown_v1",
-            }),
+      const markdownPages = [{ pageNumber: 1, text: anydocResult.markdownText }];
+      if (
+        anydocResult.success &&
+        anydocResult.markdownText.trim() &&
+        hasUsableBankStatementText(markdownPages)
+      ) {
+        // --- DETERMINISTIC FAST PATH: no LLM for table, use parseAllTables (handles PNB fused header + multipage) ---
+        const deterministic = deterministicTransactionsFromAnydoc(anydocResult.markdownText);
+        if (deterministic && deterministic.transactions.length > 0) {
+          const deterministicAccount = extractAccountFromBankStatementMarkdown(anydocResult.markdownText);
+          const deterministicSource = extractBankStatementMarkdownAmounts(anydocResult.markdownText);
+          const deterministicBalance = validateRunningBalanceContinuity(
+            deterministic.transactions,
+            deterministicSource.openingBalance,
+          );
+          diagnostics.anydoc.deterministic = {
+            rowCount: deterministic.transactions.length,
+            headers: deterministic.headers,
+            normalized: true,
+            balanceValidation: deterministicBalance,
+            used: deterministicBalance.status !== "failed",
           };
-          extractionSource = "anydoc_markdown_combined_ai";
-          diagnostics.pipeline = extractionSource;
-          diagnostics.coverageComplete = true;
-          return { parsed, extractionSource, extractionError: null, diagnostics };
+          if (deterministicBalance.status !== "failed") {
+            parsed = {
+              account: deterministicAccount,
+              statementPeriodStart: null,
+              statementPeriodEnd: null,
+              openingBalance: deterministicSource.openingBalance,
+              transactions: deterministic.transactions,
+              pageResults: [],
+            };
+            parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
+            diagnostics.anydoc.account = bankStatementAccountDiagnostics(parsed.account, deterministicAccount);
+            parsed.transactions = addBankStatementPageProvenance(parsed.transactions, { startPage: 1, endPage: Math.max(1, Number(diagnostics.pageCount || 1)), method: "deterministic_anydoc" });
+            extractionSource = "deterministic_anydoc";
+            diagnostics.pipeline = "deterministic_anydoc";
+            diagnostics.coverageComplete = true;
+            return { parsed, extractionSource, extractionError: null, diagnostics };
+          }
+        }
+        // Extraction must pass source coverage before any ledger matching runs.
+        // Keep the existing standalone ledger matcher, inputs and retry rules.
+        const combinedDecision = { ...combinedLedgerCatalogueDecision(ledgerNames), useCombined: false, reason: "verify_coverage_before_matching" };
+        diagnostics.anydoc.combinedLedgerCatalogue = combinedDecision;
+        const nextExtractionSource = combinedDecision.useCombined
+          ? "anydoc_markdown_combined_ai"
+          : "anydoc_markdown_ai";
+        await onExtractionSource?.(nextExtractionSource);
+        await updateBankJob(jobId, {
+          progress: 45,
+          stage: combinedDecision.useCombined
+            ? "Running quick Markdown + ledger AI"
+            : "Extracting statement from Markdown",
+        });
+        const markdownAiStartedAt = Date.now();
+        const markdownAiOptions = {
+          model: OPENROUTER_ANYDOC_MODEL,
+          reasoningTokens: OPENROUTER_ANYDOC_REASONING_TOKENS,
+          maxOutputTokens: OPENROUTER_ANYDOC_MAX_OUTPUT_TOKENS,
+        };
+        const markdownSource = extractBankStatementMarkdownAmounts(anydocResult.markdownText, { includeSourceDetails: true });
+        if(auditSourceCoverage([],markdownSource.rows).supported) authoritativeMarkdownRows=markdownSource.rows;
+        if (markdownSource.rows.length > 25) {
+          const firstHeader=anydocResult.markdownText.indexOf(markdownSource.rows[0].sourceHeader.split('\n')[0]);
+          const context=firstHeader>=0?anydocResult.markdownText.slice(0,firstHeader):'';
+          const batched=await extractMarkdownBatches({sourceRows:markdownSource.rows,context,
+            onBatch:({index,total})=>updateBankJob(jobId,{progress:45+Math.floor(15*(index-1)/total),stage:`Extracting transactions: batch ${index} of ${total}`}),
+            extract:markdown=>extractBankStatementFromText(fileName,[{pageNumber:1,text:markdown}],bankAccountCandidates,markdownAiOptions)});
+          parsed=batched.parsed;
+          diagnostics.anydoc.rowBatches=batched.batches;
+        } else parsed = combinedDecision.useCombined
+          ? await extractAndMatchBankStatementFromMarkdown(
+              fileName,
+              anydocResult.markdownText,
+              bankAccountCandidates,
+              ledgerNames,
+              markdownAiOptions
+            )
+          : await extractBankStatementFromText(
+              fileName,
+              markdownPages,
+              bankAccountCandidates,
+              markdownAiOptions
+            );
+        diagnostics.anydoc.markdownAiMs = Date.now() - markdownAiStartedAt;
+        const deterministicAccount = extractAccountFromBankStatementMarkdown(anydocResult.markdownText);
+        // PNB continuation pages omit headings and AnyDoc changes empty cells.
+        // Central Bank tables commonly have an empty cheque/reference column.
+        // In both layouts the physical amount columns are authoritative.
+        let physicalColumns=null;
+        const hasStrictPhysicalLayout =
+          (/Txn No\.?/i.test(anydocResult.markdownText) && /Dr Amount/i.test(anydocResult.markdownText) && /Cr Amount/i.test(anydocResult.markdownText)) ||
+          (/Post Date/i.test(anydocResult.markdownText) && /Transaction Description/i.test(anydocResult.markdownText) && /\bDebit\b/i.test(anydocResult.markdownText) && /\bCredit\b/i.test(anydocResult.markdownText));
+        const hasGenericPhysicalLayout =
+          (/(?:Post(?:ing)?|Transaction|Txn)?\s*Date/i.test(anydocResult.markdownText) &&
+            /(?:Transaction Description|Description|Particulars?|Narration|Details?)/i.test(anydocResult.markdownText) &&
+            /(?:\bDebit\b|Dr Amount|Withdrawal|Paid Out)/i.test(anydocResult.markdownText) &&
+            /(?:\bCredit\b|Cr Amount|Deposit|Paid In)/i.test(anydocResult.markdownText));
+        if (hasStrictPhysicalLayout || hasGenericPhysicalLayout) {
+          const physicalCandidate=await readBankStatementPhysicalColumns(bytes,PDFJS_WORKER_SRC,BANK_STATEMENT_MAX_TOTAL_PAGES);
+          if (!physicalCandidate.detected && hasStrictPhysicalLayout) {
+            throw new Error('Known bank statement physical columns could not be read; use PDF recovery.');
+          }
+          if (physicalCandidate.detected) physicalColumns=physicalCandidate;
+        }
+        if (physicalColumns) {
+          const references=parsed.transactions.map(row=>String(row.reference_number||'').replace(/[^a-z0-9]/gi,'').toUpperCase());
+          const referenceCoverageValid = physicalColumns.layout !== 'pnb'
+            ? physicalColumns.rows.every(row=>sourceDate(row.sourceDate) && String(row.narration||'').trim())
+            : physicalColumns.matchByOrder ||
+              (new Set(references).size===references.length && physicalColumns.rows.every(row=>references.includes(row.reference)));
+          if(BANK_STATEMENT_SOURCE_COVERAGE_VERIFIER_ENABLED &&
+            (physicalColumns.rows.length!==references.length||!referenceCoverageValid)) {
+            throw new Error(`${physicalColumns.layout === 'pnb' ? 'PNB' : 'Bank statement'} physical transaction coverage could not be verified; use PDF recovery.`);
+          }
+          diagnostics.anydoc.physicalColumns = {
+            layout: physicalColumns.layout,
+            rowCount: physicalColumns.rows.length,
+            matchByOrder: physicalColumns.matchByOrder,
+          };
+        }
+        parsed = reconcileBankStatementMarkdownAmounts(parsed, anydocResult.markdownText,physicalColumns);
+        diagnostics.anydoc.markdownAmounts = parsed.markdownAmountDiagnostics;
+        let coverageComplete = Boolean(physicalColumns);
+        if (BANK_STATEMENT_SOURCE_COVERAGE_VERIFIER_ENABLED && physicalColumns && physicalColumns.layout !== 'pnb') {
+          const physicalCoverage = auditSourceCoverage(parsed.transactions, physicalColumns.rows);
+          diagnostics.anydoc.sourceCoverage = {
+            sourceRowCount: physicalColumns.rows.length,
+            extractedRowCount: parsed.transactions.length,
+            missingRowCount: physicalCoverage.missing.length,
+            unexpectedRowCount: physicalCoverage.unexpected.length,
+            complete: physicalCoverage.complete,
+            supported: physicalCoverage.supported,
+          };
+          if (!physicalCoverage.complete) {
+            throw new Error('Physical transaction coverage could not be verified; review is required.');
+          }
+          parsed.transactions = physicalCoverage.matched.map(
+            match => parsed.transactions[match.transactionIndex]
+          );
+        }
+        if (BANK_STATEMENT_SOURCE_COVERAGE_VERIFIER_ENABLED && !physicalColumns) {
+          const source = extractBankStatementMarkdownAmounts(anydocResult.markdownText, { includeSourceDetails: true });
+          const recovered = await recoverSourceCoverage({
+            parsed,
+            sourceRows: source.rows,
+            recover: async (markdown) => {
+              await updateBankJob(jobId, { progress: 65, stage: "Recovering missing statement rows" });
+              return extractBankStatementFromText(fileName, [{pageNumber:1,text:markdown}], bankAccountCandidates, markdownAiOptions);
+            },
+          });
+          diagnostics.anydoc.sourceCoverage = recovered.diagnostics;
+          // Unsupported layouts use the existing page-by-page extraction path;
+          // a non-empty AI response is not evidence of complete coverage.
+          if (!recovered.diagnostics.supported) throw new Error("Markdown source coverage is unavailable; use page recovery.");
+          parsed = recovered.parsed;
+          coverageComplete = recovered.diagnostics.complete;
+          if (!coverageComplete) {
+            parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
+            parsed.transactions = addBankStatementPageProvenance(parsed.transactions, {
+              startPage: 1,
+              endPage: Math.max(1, Number(diagnostics.pageCount || 1)),
+              method: "anydoc_markdown_v1",
+            });
+            extractionSource = nextExtractionSource;
+            diagnostics.pipeline = nextExtractionSource;
+            diagnostics.coverageComplete = false;
+            return {
+              parsed,
+              extractionSource,
+              extractionError: "Statement transaction coverage could not be verified after targeted recovery.",
+              diagnostics,
+            };
+          }
+        }
+        if (!BANK_STATEMENT_SOURCE_COVERAGE_VERIFIER_ENABLED) {
+          coverageComplete = true;
+          diagnostics.anydoc.sourceCoverage = {
+            complete: true,
+            supported: false,
+            skipped: true,
+            reason: "source_coverage_verifier_disabled",
+            extractedRowCount: parsed.transactions.length,
+          };
+        }
+        parsed.account = mergeBankStatementAccount(parsed.account, deterministicAccount);
+        diagnostics.anydoc.account = bankStatementAccountDiagnostics(parsed.account, deterministicAccount);
+        if (parsed.transactions.length > 0 || !coverageComplete) {
+          parsed.transactions = addBankStatementPageProvenance(parsed.transactions, {
+            startPage: 1,
+            endPage: Math.max(1, Number(diagnostics.pageCount || 1)),
+            method: "anydoc_markdown_v1",
+          });
+          extractionSource = nextExtractionSource;
+          diagnostics.pipeline = nextExtractionSource;
+          diagnostics.coverageComplete = coverageComplete;
+          return { parsed, extractionSource, extractionError: coverageComplete ? null : "Statement transaction coverage could not be verified after targeted recovery.", diagnostics };
         }
       }
     } catch (error) {
-      diagnostics.errors.push({ stage: "anydoc_markdown_combined_ai", error: diagnosticError(error) });
-      console.warn(`[worker] AnyDoc fast path skipped for ${fileName}: ${diagnosticError(error)}`);
+      diagnostics.anydoc = {
+        ...diagnostics.anydoc,
+        success: false,
+        error: diagnosticError(error),
+      };
+      parsed = null;
+      console.warn(`[worker] AnyDoc extraction skipped for ${fileName}: ${diagnosticError(error)}`);
     }
   }
+
+  await onExtractionSource?.("openrouter_bank_statement_v1");
 
   if (isPdf) {
     try {
@@ -1382,7 +1617,9 @@ async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, 
     }
   }
 
-  const canUseSingleShot = shouldAttemptBankStatementSingleShot({
+  // PDF fallback must retain per-page coverage/recovery. Do not route an
+  // unsupported Markdown layout into another non-empty-means-complete shortcut.
+  const canUseSingleShot = !isPdf && shouldAttemptBankStatementSingleShot({
     isPdf,
     pageCount: Number(textInfo.pageCount || 0),
     pages: textInfo.pages,
@@ -1517,6 +1754,14 @@ async function extractBankStatementAdaptive({ fileName, mimeType, bytes, isPdf, 
             ? `The statement has ${textInfo.pageCount} pages, but this worker is configured to analyze at most ${BANK_STATEMENT_MAX_TOTAL_PAGES}.`
             : null;
       diagnostics.coverageComplete = unresolvedPages.length === 0 && !textInfo.truncated;
+      if(authoritativeMarkdownRows.length) {
+        const coverage=auditSourceCoverage(parsed.transactions,authoritativeMarkdownRows);
+        diagnostics.fallbackSourceCoverage={complete:coverage.complete,missingRows:coverage.missing.length,unexpectedRows:coverage.unexpected.length};
+        if(!coverage.complete) {
+          diagnostics.coverageComplete=false;
+          extractionError='Recovered statement rows do not match the source. Review is required.';
+        }
+      }
       return { parsed, extractionSource, extractionError, diagnostics };
     }
   } catch (error) {
@@ -2278,6 +2523,14 @@ async function main() {
     `[worker] started name=${WORKER_NAME} pool=${WORKER_POOL} appBase=${APP_BASE_URL} pollMs=${WORKER_POLL_INTERVAL_MS} bankPdfMode=adaptive_ai batchPages=${BANK_STATEMENT_BATCH_PAGE_SIZE} concurrency=${BANK_STATEMENT_BATCH_CONCURRENCY}`
   );
   let lastIdleLogAt = 0;
+  let lastLeaseCleanupAt = 0;
+  const workerWake = createCoalescingWakeSignal();
+  startPostgresJobWake({
+    connectionString: resolvePostgresWakeUrl(),
+    workerPool: WORKER_POOL,
+    wakeSignal: workerWake,
+    reconnectDelayMs: WORKER_POLL_INTERVAL_MS,
+  });
 
   // Recovery is independent of long legacy AI jobs. It only finalizes an
   // existing structured checkpoint or expires an abandoned attempt; never AI.
@@ -2304,6 +2557,13 @@ async function main() {
 
   while (true) {
     try {
+      if (Date.now() - lastLeaseCleanupAt >= 60_000) {
+        lastLeaseCleanupAt = Date.now();
+        const { error } = await supabase.rpc("quarantine_expired_tally_commands");
+        if (error && error.code !== "PGRST202") {
+          console.warn("[worker] command lease cleanup unavailable:", error.code);
+        }
+      }
       const tallyQueueJob = await claimNextTallyQueueJob();
       if (tallyQueueJob) {
         try {
@@ -2343,7 +2603,7 @@ async function main() {
           console.log("[worker] idle: no queued Tally, bank statement, or packet jobs claimed");
           lastIdleLogAt = now;
         }
-        await sleep(WORKER_POLL_INTERVAL_MS);
+        await workerWake.wait(WORKER_POLL_INTERVAL_MS);
         continue;
       }
 
@@ -2369,7 +2629,7 @@ async function main() {
     } catch (error) {
       const message = formatError(error);
       console.error(`[worker] polling failed: ${message}`);
-      await sleep(WORKER_POLL_INTERVAL_MS);
+      await workerWake.wait(WORKER_POLL_INTERVAL_MS);
     }
   }
 }

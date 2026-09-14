@@ -91,15 +91,15 @@ const PURCHASE_VALIDATION_GROUPS = [
   {
     title: "GST identity",
     rules: [
-      ["buyerGstinMissing", "Buyer GSTIN missing", "Unregistered and non-GST purchases can remain valid."],
-      ["supplierGstinMissing", "Supplier GSTIN missing", "Unregistered suppliers can be posted without a GSTIN."],
+      ["buyerGstinMissing", "Buyer GSTIN missing", "Allows unregistered purchases."],
+      ["supplierGstinMissing", "Supplier GSTIN missing", "Allows unregistered suppliers."],
       ["supplierLedgerGstinMismatch", "Supplier and ledger GSTIN differ", "Protects against selecting the wrong supplier ledger."],
     ],
   },
   {
     title: "Item mapping",
     rules: [
-      ["hsnMissing", "HSN missing", "The selected Tally item or group may already supply the HSN."],
+      ["hsnMissing", "HSN missing", "Skipped when the Tally item already supplies it."],
       ["stockItemHsnMismatch", "Stock-item HSN differs", "Ask for review when invoice and Tally classification differ."],
       ["stockItemUnitMismatch", "Stock-item unit differs", "Tally may support an alternate unit or conversion."],
     ],
@@ -1371,7 +1371,7 @@ export default function SettingsPage() {
                         Choose which deductions Kalika should handle
                       </h2>
                       <p className="mt-1 text-xs text-[#5b4b3d]">
-                        Leave a rule off when your business does not use it. GST and transporter deductions follow their evidence rules; Section 194Q is confirmed separately on each Purchase voucher because one invoice cannot prove annual eligibility.
+                        Leave a rule off when your business does not use it.
                       </p>
                     </div>
 
@@ -1380,17 +1380,17 @@ export default function SettingsPage() {
                         {
                           key: "purchaseGoodsTdsEnabled" as const,
                           label: "Purchase TDS on goods",
-                          description: "Records that this business commonly uses Section 194Q. The reviewer still confirms it on each Purchase voucher; Kalika then calculates 0.1% on the confirmed basis.",
+                          description: "Applies 0.1% Section 194Q on the reviewer-confirmed basis. One invoice cannot prove annual eligibility.",
                         },
                         {
                           key: "transporterTdsEnabled" as const,
                           label: "Transporter TDS",
-                          description: "Subtracts the confirmed transporter TDS and posts it to the transporter TDS ledger. Freight itself is included only when it appears on the invoice.",
+                          description: "Posts transporter TDS to the TDS ledger. Freight is included only when billed on the invoice.",
                         },
                         {
                           key: "gstTdsEnabled" as const,
                           label: "GST TDS, including metal scrap",
-                          description: "For qualifying registered-party MS Scrap purchases from 10 October 2024, automatically withholds 1% CGST + 1% SGST or 2% IGST on the taxable scrap value above the contract threshold. Other GST TDS remains invoice-confirmed.",
+                          description: "Withholds 2% GST TDS on qualifying MS scrap purchases (from 10 Oct 2024). Other cases stay invoice-confirmed.",
                         },
                       ].map((rule) => {
                         const enabled = purchaseAccountingSettings[rule.key];
@@ -1423,7 +1423,7 @@ export default function SettingsPage() {
                     <div className="flex flex-col gap-2 border-b border-[#f0ece4] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
                       <div>
                         <p className="text-[11px] font-bold uppercase tracking-wider text-[#8a7f72]">Validation policy</p>
-                        <h2 className="mt-1 text-base font-bold tracking-tight text-[#111827]">Choose what blocks a Purchase voucher</h2>
+                        <h2 className="mt-1 text-base font-bold tracking-tight text-[#111827]">Set blocking and warning rules</h2>
                       </div>
                       <div className="flex items-center gap-4 text-xs font-medium text-[#746d63]" aria-label="Validation severity legend">
                         <span className="inline-flex items-center"><span className="mr-1.5 inline-block h-2 w-2 rounded-full bg-rose-500" />Block</span>

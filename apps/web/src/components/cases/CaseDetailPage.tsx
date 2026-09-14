@@ -292,17 +292,6 @@ function getDocumentFieldLabel(documentType: string | undefined, key: string) {
   return FIELD_LABEL_LOOKUP[key] || key;
 }
 
-function hasExtractedTerms(document: SavedCaseDetail["documents"][number] | null) {
-  if (!document || !PURCHASE_ORDER_DOCUMENT_TYPES.has(document.documentType)) {
-    return false;
-  }
-
-  return TERMS_FIELD_KEYS.some((key) => {
-    const value = document.extractedFields[key];
-    return value !== null && value !== undefined && String(value).trim().length > 0;
-  });
-}
-
 function getTermValue(value: unknown) {
   return value === null || value === undefined ? "" : String(value).trim();
 }
@@ -1692,12 +1681,8 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   );
 
   useEffect(() => {
-    setActiveDataView(
-      hasExtractedTerms(activeDocument) || activeDocumentLineItems.length === 0
-        ? "fields"
-        : "lineItems"
-    );
-  }, [activeDocument, activeDocumentId, activeDocumentLineItems.length]);
+    setActiveDataView("fields");
+  }, [activeDocumentId]);
 
   const activeDocumentFiles = useMemo(() => {
     if (!detail || !activeDocument) return [];

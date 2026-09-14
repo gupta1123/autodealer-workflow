@@ -58,7 +58,7 @@ export function TeamAccessPanel() {
       <div className="flex items-center gap-2.5">
         <span className="grid h-8 w-8 place-items-center rounded-lg border border-[#e8e2db] bg-[#faf8f5] text-[#8a7f72]"><Users className="h-4 w-4" /></span>
         <div>
-          <h2 className="text-sm font-bold tracking-tight text-[#111827]">Team</h2>
+          <h2 className="text-base font-bold tracking-tight text-[#111827]">Team</h2>
           <p className="text-xs text-[#8a7f72]">{total || members.length ? `${total || members.length} members · ${roles.length} roles` : `${roles.length} roles`} {s && <span className={`ml-1.5 inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${s.sharingEnabled ? 'border-[#c3dfcb] bg-[#ebf5ee] text-[#1b4332]' : 'border-[#f9d8a7] bg-[#fef6e9] text-[#78350f]'}`}>{s.sharingEnabled ? 'Sharing on' : 'Setup only'}</span>}</p>
         </div>
       </div>
@@ -105,8 +105,8 @@ export function TeamAccessPanel() {
                       {members.map(m => (
                         <tr key={m.user_id} className="border-b border-[#ece6dc] last:border-0 transition hover:bg-[#ede6d9]/40">
                           <td className="px-4 py-3">
-                            <p className="text-[13px] font-semibold text-[#111827]">{m.display_name}{m.is_owner ? <span className="ml-1.5 inline-flex items-center rounded-md border border-[#e6ded2] bg-[#fbfaf8] px-1.5 py-0.5 text-[10px] font-medium text-[#5b4b3d]">Owner</span> : null}</p>
-                            <p className="text-[11px] font-normal text-[#8a7f72]">{m.email}</p>
+                            <p className="text-xs font-semibold text-[#111827]">{m.display_name}{m.is_owner ? <span className="ml-1.5 inline-flex items-center rounded-md border border-[#e6ded2] bg-[#fbfaf8] px-1.5 py-0.5 text-[10px] font-medium text-[#5b4b3d]">Owner</span> : null}</p>
+                            <p className="text-xs font-normal text-[#8a7f72]">{m.email}</p>
                           </td>
                           <td className="px-4 py-3 text-xs font-medium text-[#5b4b3d]">{roles.find(r => r.id === m.role_id)?.name || '—'}</td>
                           <td className="px-4 py-3 text-xs text-[#5b4b3d]">{m.all_companies ? <span className="inline-flex items-center rounded-full border border-[#c3dfcb] bg-[#ebf5ee] px-2 py-0.5 text-xs font-medium text-[#1b4332]">All companies</span> : <span className="text-xs font-medium text-[#5b4b3d]">{m.company_ids.length} selected</span>}</td>

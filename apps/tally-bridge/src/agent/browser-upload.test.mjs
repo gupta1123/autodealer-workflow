@@ -113,6 +113,25 @@ async function contextRequest(f, body = contextBody, extraHeaders = {}) {
   return fetch(`${f.base}/document/context`, { method: 'POST', headers: { ...f.headers, 'Content-Type': 'application/json', ...extraHeaders }, body: JSON.stringify(body) });
 }
 
+test('v2 reports an unregistered context as pending rather than conflicting', async t => {
+  const f = await setup(t);
+  const response = await contextRequest(f);
+  assert.equal(response.status, 202);
+  assert.equal((await response.json()).code, 'CONTEXT_NOT_READY');
+});
+
+test('v2 accepts an empty browser ledger catalogue for connector-local vector retrieval', async t => {
+  const f = await setup(t);
+  const pending = assert.rejects(f.server.waitForUpload({ ...f.ticket, pipelineVersion: 2, identity }), /cancelled/);
+  const body = { ...contextBody, ledgerNames: [], bankAccountCandidates: [] };
+  assert.equal((await contextRequest(f, body)).status, 200);
+  const context = await f.server.waitForContext(f.ticket.tokenHash);
+  assert.deepEqual(context.ledgerNames, []);
+  assert.deepEqual(context.bankAccountCandidates, []);
+  assert.equal((await fetch(`${f.base}/document/cancel`, { method: 'POST', headers: f.headers })).status, 200);
+  await pending;
+});
+
 for (const contextFirst of [true, false]) {
   test(`v2 context may arrive ${contextFirst ? 'before' : 'after'} PDF transfer without changing ledger order`, async t => {
     const f = await setup(t);

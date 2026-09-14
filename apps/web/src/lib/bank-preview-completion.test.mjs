@@ -20,14 +20,14 @@ test('an early notification does not expose preview before commit', async () => 
     committed = true; await waiter.check(); await waiter.promise; assert.equal(previews, 1);
   } finally { waiter.stop(); }
 });
-test('offline fallback polls, reconnect reads immediately, terminal stops polling', async () => {
+test('durable fallback keeps polling while socket is online and terminal stops polling', async () => {
   let count = 0, ready = false;
   const waiter = createBankPreviewCompletion({ pollMs: 10, snapshot: async () => { count++; return { processing: !ready }; },
     preview: async () => ({ processing: false }) });
   try {
     await new Promise(resolve => setTimeout(resolve, 30)); assert.ok(count > 0);
     waiter.setOnline(true); await waiter.check(); const onlineCount = count;
-    await new Promise(resolve => setTimeout(resolve, 30)); assert.equal(count, onlineCount);
+    await new Promise(resolve => setTimeout(resolve, 30)); assert.ok(count > onlineCount);
     ready = true; await waiter.check(); await waiter.promise; const finalCount = count;
     await new Promise(resolve => setTimeout(resolve, 20)); assert.equal(count, finalCount);
   } finally { waiter.stop(); }

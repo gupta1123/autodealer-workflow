@@ -79,9 +79,10 @@ test("direct PDF job queues only an upload ticket and never accesses cloud stora
   } finally { if (prior === undefined) delete process.env.AGENT_JOB_TOKEN_SECRET; else process.env.AGENT_JOB_TOKEN_SECRET = prior; }
 });
 
-test("local frontend bypasses PDF preview upload and cloud file form data", () => {
+test("local frontend unlocks protected previews before keeping analysis local", () => {
   const ui = readFileSync(new URL("../../../../web/src/components/bank-statements/BankStatementsPage.tsx", import.meta.url), "utf8");
-  assert.match(ui, /nextPreview.kind === "pdf" && mode === "local_agent"[\s\S]*?URL.createObjectURL\(nextFile\)[\s\S]*?return;/);
+  assert.doesNotMatch(ui, /nextPreview.kind === "pdf" && mode === "local_agent"[\s\S]*?URL.createObjectURL\(nextFile\)[\s\S]*?return;/);
+  assert.match(ui, /apiFetch\("\/api\/bank-statements\/pdf-preview"[\s\S]*?const unlockedPdf = new File[\s\S]*?setFile\(unlockedPdf\)/);
   assert.match(ui, /if \(parsingMode === "local_agent"\) \{\s+formData.set\("localDocument"[\s\S]*?\} else \{\s+formData.set\("file", nextFile\)/);
   const route = readFileSync(new URL("../../app/api/bank-statements/imports/route.ts", import.meta.url), "utf8");
   assert.match(route, /const asset = localDocument \? \{[\s\S]*?storageBucket: "", storagePath: ""[\s\S]*?\} : await ensureStorageAsset/);

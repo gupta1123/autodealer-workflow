@@ -5,7 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import { datasetKey, assertAgentIdentity } from "./identity.mjs";
 import { createInlinePriorityScheduler } from "./scheduler.mjs";
-import { deterministicLedgerCandidates, localLedgerEmbedding } from "./vector-service.mjs";
+import {
+  deterministicLedgerCandidates,
+  localLedgerEmbedding,
+  LOCAL_LEDGER_VECTOR_DIMENSIONS,
+  LOCAL_LEDGER_VECTOR_MODEL,
+} from "./vector-service.mjs";
+import { LocalVectorService } from "./vector-service.mjs";
 import { LocalAgentStorage, windowsAclHardeningCommands } from "./storage.mjs";
 import { IncrementalSyncEngine } from "./sync-engine.mjs";
 
@@ -63,13 +69,26 @@ test("deterministic matching ranks identifier, saved mapping, exact name, then f
   assert.deepEqual(result.map((item) => item.source), ["exact_identifier", "saved_mapping", "exact_name", "fuzzy"]);
 });
 
-test("local embeddings favor spelling variants without a paid provider", () => {
+test("semantic vectors use the Gajkesari OpenRouter model and dimensions", () => {
+  assert.equal(LOCAL_LEDGER_VECTOR_MODEL, "openai/text-embedding-3-small");
+  assert.equal(LOCAL_LEDGER_VECTOR_DIMENSIONS, 512);
+  // The deterministic fallback remains useful when semantic suggestions are
+  // explicitly disabled, but it is no longer used to populate ZVec.
   const query = localLedgerEmbedding("Surya Steel Trading Company");
   const close = localLedgerEmbedding("Surya Steel Trading Co.");
   const unrelated = localLedgerEmbedding("Bank Charges and Commission");
   const similarity = (left, right) => left.reduce((sum, value, index) => sum + value * right[index], 0);
   assert.ok(similarity(query, close) > similarity(query, unrelated));
-  assert.equal(query.length, 256);
+  assert.equal(query.length, 512);
+});
+
+test("vector index paths stay below Windows path limits without losing identity isolation", () => {
+  const service = new LocalVectorService({ vectorsDirectory: "C:\\Kalika\\vectors" });
+  const first = service.indexPath("org|machine|company|2026-27".repeat(20));
+  const second = service.indexPath("org|machine|company|2025-26".repeat(20));
+  assert.match(path.basename(first), /^[a-f0-9]{64}$/);
+  assert.ok(first.length < 100);
+  assert.notEqual(first, second);
 });
 
 test("encrypted storage rejects a wrong key and clear cache preserves settings and receipts", async (t) => {

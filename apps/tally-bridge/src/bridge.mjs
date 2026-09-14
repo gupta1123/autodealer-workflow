@@ -2,6 +2,8 @@
 
 import fs from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
+import http from "node:http";
+import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
@@ -20,6 +22,7 @@ import { readScopedOpenBills } from "./open-bill-discovery.mjs";
 import { AGENT_CAPABILITIES, AGENT_PROTOCOL_VERSION, AGENT_VERSION, jobClassForCommand } from "./agent/protocol.mjs";
 
 const BRIDGE_VERSION = AGENT_VERSION;
+const MAX_COMMANDS_PER_CYCLE = 50;
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
@@ -27,6 +30,8 @@ const TALLY_IMPORT_TIMEOUT_MS = 30_000;
 // Exports can be larger than imports, but they must still release the bridge
 // cycle if Tally is busy or has stopped responding.
 const TALLY_EXPORT_TIMEOUT_MS = 60_000;
+const BANK_MATCH_READ_TIMEOUT_MS = 20_000;
+const BANK_MATCH_MAX_XML_BYTES = 8 * 1024 * 1024;
 const OPEN_BILL_LEDGER_BATCH_SIZE = 50;
 const CASH_DISCOUNT_VOUCHER_DAYS_PER_CHUNK = 31;
 const CASH_DISCOUNT_EVIDENCE_LEDGER_BATCH_SIZE = 20;
@@ -1050,6 +1055,53 @@ export function buildBankVoucherXml(payload, fallbackCompanyName, options = {}) 
   });
 }
 
+export function buildBankVoucherBatchXml(payloads, fallbackCompanyName) {
+  if (!Array.isArray(payloads) || payloads.length === 0) {
+    throw new Error("Bank voucher batch requires at least one voucher.");
+  }
+
+  const companyName = payloads[0]?.companyName || fallbackCompanyName;
+  const voucherDate = toIsoLikeDate(payloads[0]?.voucherDate);
+  const messages = payloads.map((payload) => {
+    const voucherXml = buildBankVoucherXml(payload, companyName);
+    const message = voucherXml.match(/<TALLYMESSAGE\b[\s\S]*?<\/TALLYMESSAGE>/i)?.[0];
+    if (!message) {
+      throw new Error("Could not build a Tally message for a bank voucher batch.");
+    }
+    return message;
+  });
+
+  return wrapVoucherMessagesXml({
+    companyName,
+    voucherDate,
+    messages,
+    legacyEnvelope: true,
+  });
+}
+
+export function explainBankVoucherTallyError(outcome, payload) {
+  return explainVoucherTallyError(outcome, payload);
+}
+
+export function isStrongBankReference(value) {
+  const normalized = String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return normalized.length >= 8 && /[a-z]/.test(normalized) && /\d/.test(normalized);
+}
+
+export function baseBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes = new Set(), byDate = null) {
+  const voucherDate = typeof normalizeDateForCompare === "function" ? normalizeDateForCompare(transaction.voucherDate) : String(transaction.voucherDate || "").trim();
+  const amount = Number(transaction.amount || 0);
+  const entries = byDate ? byDate.get(voucherDate) || [] : vouchers.map((voucher, index) => ({ voucher, index }));
+  return entries.flatMap(({ voucher, index }) => {
+    if (reservedVoucherIndexes.has(index)) return [];
+    const date = typeof normalizeDateForCompare === "function" ? normalizeDateForCompare(voucher.effectiveDate || voucher.date) : String(voucher.effectiveDate || voucher.date || "").trim();
+    if (!voucherDate || date !== voucherDate) return [];
+    const bankEntry = getBankLedgerEntry(voucher, bankLedgerName, amount, transaction.expectedDirection);
+    if (!voucherDate || date !== voucherDate || !bankEntry) return [];
+    return [{ voucher, index, bankEntry }];
+  });
+}
+
 function toSignedMoney(value, label, options = {}) {
   const parsed = Number(String(value ?? "").replace(/,/g, ""));
   if (!Number.isFinite(parsed) || (!options.allowZero && parsed === 0)) {
@@ -1082,20 +1134,24 @@ function buildPurchaseInventoryEntryXml(item) {
   const formattedQuantity = `${quantityText} ${unit}`;
   const formattedRate = `${rateText}/${unit}`;
   const formattedAmount = amount.toFixed(2);
-  const godownName = String(item?.godownName || "").trim();
+  // Tally persists inventory vouchers against its built-in default godown even
+  // when the operator did not explicitly choose a location in Kalika.
+  const godownName = String(item?.godownName || "Main Location").trim();
   const batchName = String(item?.batchName || "").trim();
-  const batchAllocation = godownName || batchName
-    ? [
-        "<BATCHALLOCATIONS.LIST>",
-        godownName ? `<GODOWNNAME>${escapeXml(godownName)}</GODOWNNAME>` : "",
-        batchName ? `<BATCHNAME>${escapeXml(batchName)}</BATCHNAME>` : "",
-        godownName ? `<DESTINATIONGODOWNNAME>${escapeXml(godownName)}</DESTINATIONGODOWNNAME>` : "",
-        `<AMOUNT>-${formattedAmount}</AMOUNT>`,
-        `<ACTUALQTY>${escapeXml(formattedQuantity)}</ACTUALQTY>`,
-        `<BILLEDQTY>${escapeXml(formattedQuantity)}</BILLEDQTY>`,
-        "</BATCHALLOCATIONS.LIST>",
-      ].join("")
-    : "";
+  // Tally's Item Invoice import requires an inventory allocation even when
+  // the selected stock item has batch-wise tracking disabled. Vouchers entered
+  // through Tally itself persist this implicit bucket as "Primary Batch".
+  // Omitting the list produces EXCEPTIONS=1 with no LINEERROR and no voucher.
+  const batchAllocation = [
+    "<BATCHALLOCATIONS.LIST>",
+    `<GODOWNNAME>${escapeXml(godownName)}</GODOWNNAME>`,
+    `<BATCHNAME>${escapeXml(batchName || "Primary Batch")}</BATCHNAME>`,
+    `<DESTINATIONGODOWNNAME>${escapeXml(godownName)}</DESTINATIONGODOWNNAME>`,
+    `<AMOUNT>-${formattedAmount}</AMOUNT>`,
+    `<ACTUALQTY>${escapeXml(formattedQuantity)}</ACTUALQTY>`,
+    `<BILLEDQTY>${escapeXml(formattedQuantity)}</BILLEDQTY>`,
+    "</BATCHALLOCATIONS.LIST>",
+  ].join("");
 
   return [
     "<ALLINVENTORYENTRIES.LIST>",
@@ -1154,7 +1210,13 @@ function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
   const voucherDate = toIsoLikeDate(payload?.voucherDate || payload?.supplierInvoiceDate);
   const supplierInvoiceDate = toIsoLikeDate(payload?.supplierInvoiceDate);
   const supplierInvoiceNumber = String(payload?.supplierInvoiceNumber || "").trim();
-  const requestedVoucherNumber = String(payload?.voucherNumber || supplierInvoiceNumber).trim();
+  // Tally owns numbering for the standard automatically-numbered Purchase
+  // voucher type. Only emit VOUCHERNUMBER when a caller deliberately opts into
+  // a manual/custom-number voucher type; never fall back to the supplier bill
+  // number, which belongs in REFERENCE and BILLALLOCATIONS.
+  const requestedVoucherNumber = payload?.useCustomVoucherNumber === true
+    ? String(payload?.voucherNumber || "").trim()
+    : "";
   const supplierLedgerName = String(payload?.supplierLedgerName || "").trim();
   const baseNarration = String(payload?.narration || "").trim();
   const vehicleNumber = String(payload?.vehicleNumber || "").trim();
@@ -1600,7 +1662,14 @@ function parseTallyImportResult(text, httpStatus) {
   const ignoredText = text.match(/<IGNORED[^>]*>([^<]+)<\/IGNORED>/i)?.[1]?.trim() ?? null;
   const cancelledText = text.match(/<CANCELLED[^>]*>([^<]+)<\/CANCELLED>/i)?.[1]?.trim() ?? null;
   const exceptionsText = text.match(/<EXCEPTIONS[^>]*>([^<]+)<\/EXCEPTIONS>/i)?.[1]?.trim() ?? null;
-  const lastVchId = getTagText(text, "LASTVCHID") || getTagText(text, "LASTVCHID.LIST");
+  const reportedLastVchId = getTagText(text, "LASTVCHID") || getTagText(text, "LASTVCHID.LIST");
+  const lastCreatedVchId = getTagText(text, "LASTCREATEDVCHID");
+  const lastVchId = Number(reportedLastVchId || 0) > 0
+    ? reportedLastVchId
+    : Number(lastCreatedVchId || 0) > 0
+      ? lastCreatedVchId
+      : null;
+  const voucherNumber = getTagText(text, "VCHNUMBER");
   const errors = errorsText ? Number(errorsText) : null;
   const exceptions = exceptionsText ? Number(exceptionsText) : null;
   const responseError =
@@ -1623,6 +1692,7 @@ function parseTallyImportResult(text, httpStatus) {
       altered: alteredText ? Number(alteredText) : null,
       created: createdText ? Number(createdText) : null,
       lastVchId,
+      voucherNumber,
       errors,
       exceptions,
       ignored: ignoredText ? Number(ignoredText) : null,
@@ -1711,8 +1781,10 @@ function purchaseVoucherReadbackComparison(voucher, payload, options = {}) {
     const actualRate = splitRate(actual.rate);
     if (!closeMoney(actualRate.value, Number(expected.rate))) differences.push(`Line ${index + 1} rate differs.`);
     if (actualRate.unit && actualRate.unit !== normalizeLooseName(expected.unit)) differences.push(`Line ${index + 1} rate unit differs.`);
-    if (normalizeLooseName(actual.godownName) !== normalizeLooseName(expected.godownName)) differences.push(`Line ${index + 1} godown differs.`);
-    if (normalizeLooseName(actual.batchName) !== normalizeLooseName(expected.batchName)) differences.push(`Line ${index + 1} batch differs.`);
+    const expectedGodownName = String(expected.godownName || "Main Location").trim();
+    const expectedBatchName = String(expected.batchName || "Primary Batch").trim();
+    if (normalizeLooseName(actual.godownName) !== normalizeLooseName(expectedGodownName)) differences.push(`Line ${index + 1} godown differs.`);
+    if (normalizeLooseName(actual.batchName) !== normalizeLooseName(expectedBatchName)) differences.push(`Line ${index + 1} batch differs.`);
     if (Number(actual.signedAmount) >= 0) differences.push(`Line ${index + 1} accounting direction differs.`);
   });
 
@@ -1729,6 +1801,11 @@ function purchaseVoucherReadbackComparison(voucher, payload, options = {}) {
   const withholdingEntries = new Set(Array.isArray(payload?.withholdings) ? payload.withholdings : []);
   const expectedSignedLedgerRows = [
     { name: payload?.supplierLedgerName, signedAmount: Number(payload?.finalPayableAmount), role: "supplier" },
+    ...expectedItems.map((item) => ({
+      name: item?.purchaseLedgerName,
+      signedAmount: -Math.abs(Number(item?.taxableAmount)),
+      role: "purchase ledger",
+    })),
     ...expectedAllocations.map((entry) => ({
       name: entry.name,
       signedAmount: entry.kind === "round_off"
@@ -1983,6 +2060,20 @@ function purchasePayloadMasterNames(payload) {
   };
 }
 
+function purchaseValidationExceptionApproved(payload, code, lineId = null) {
+  const approvedBlockers = Array.isArray(payload?.validationOverrides?.blockers)
+    ? payload.validationOverrides.blockers
+    : [];
+  const acknowledgedWarnings = Array.isArray(payload?.validationAcknowledgement?.warnings)
+    ? payload.validationAcknowledgement.warnings
+    : [];
+  return [...approvedBlockers, ...acknowledgedWarnings].some((entry) => {
+    if (String(entry?.code || "") !== code) return false;
+    const approvedLineId = String(entry?.lineId || "").trim();
+    return !approvedLineId || !lineId || approvedLineId === String(lineId);
+  });
+}
+
 async function validatePurchasePayloadMasters(tallyUrl, companyName, payload) {
   const { ledgerNames, stockItemNames, godownNames } = purchasePayloadMasterNames(payload);
   if (ledgerNames.length === 0 || stockItemNames.length === 0) {
@@ -2048,7 +2139,12 @@ async function validatePurchasePayloadMasters(tallyUrl, companyName, payload) {
   const supplier = liveLedgerByName.get(normalizeLooseName(payload?.supplierLedgerName));
   const expectedSupplierGstin = String(payload?.supplierGstin || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   const liveSupplierGstin = String(supplier?.gstin || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
-  if (expectedSupplierGstin && liveSupplierGstin && expectedSupplierGstin !== liveSupplierGstin) {
+  if (
+    expectedSupplierGstin &&
+    liveSupplierGstin &&
+    expectedSupplierGstin !== liveSupplierGstin &&
+    !purchaseValidationExceptionApproved(payload, "SUPPLIER_LEDGER_GSTIN_MISMATCH")
+  ) {
     throw new Error(`${supplier.name} now uses GSTIN ${supplier.gstin} in Tally, not ${payload.supplierGstin}. Refresh and review the supplier.`);
   }
 
@@ -2081,12 +2177,22 @@ async function validatePurchasePayloadMasters(tallyUrl, companyName, payload) {
     const liveStock = liveStockByName.get(normalizeLooseName(item?.stockItemName));
     const selectedUnit = normalizeLooseName(item?.unit);
     const liveUnit = normalizeLooseName(liveStock?.unitName);
-    if (selectedUnit && liveUnit && selectedUnit !== liveUnit) {
+    if (
+      selectedUnit &&
+      liveUnit &&
+      selectedUnit !== liveUnit &&
+      !purchaseValidationExceptionApproved(payload, "STOCK_ITEM_UNIT_MISMATCH", item?.lineId)
+    ) {
       throw new Error(`${liveStock.name} now uses ${liveStock.unitName} in Tally, not ${item.unit}. Refresh and review the item.`);
     }
     const selectedHsn = String(item?.hsn || "").replace(/\D/g, "");
     const liveHsn = String(liveStock?.hsnCode || "").replace(/\D/g, "");
-    if (selectedHsn && liveHsn && selectedHsn !== liveHsn) {
+    if (
+      selectedHsn &&
+      liveHsn &&
+      selectedHsn !== liveHsn &&
+      !purchaseValidationExceptionApproved(payload, "STOCK_ITEM_HSN_MISMATCH", item?.lineId)
+    ) {
       throw new Error(`${liveStock.name} now uses HSN ${liveStock.hsnCode} in Tally, not ${item.hsn}. Refresh and review the item.`);
     }
   }
@@ -2221,6 +2327,100 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName, options = {})
     };
   }
   if (!importOutcome.success) {
+    const tallyAnswered = Number(importOutcome.result?.httpStatus || 0) >= 200 &&
+      Number(importOutcome.result?.httpStatus || 0) < 300;
+    const importExceptions = Number(importOutcome.result?.exceptions || 0);
+    if (tallyAnswered && importExceptions > 0) {
+      options.onStage?.("verifying_voucher", {
+        lastVchId: importOutcome.result?.lastVchId ?? null,
+        created: importOutcome.result?.created ?? null,
+        exceptions: importExceptions,
+      });
+      try {
+        const exceptionReadback = await measure("exceptionReadbackVerification", () =>
+          verifyPurchaseVoucherInTally(
+            { tallyUrl, companyName },
+            payload,
+            {
+              preferredMasterId: importOutcome.result?.lastVchId,
+              searchFinancialYear: true,
+              comparisonOptions: {
+                ignoreVoucherDate: true,
+                ignoreBillDate: true,
+                ignoreSourceDocumentIdentity: true,
+              },
+            }
+          )
+        );
+        timings.totalMs = Date.now() - totalStartedAt;
+        if (exceptionReadback.result?.verificationStatus === "verified") {
+          return {
+            outcome: {
+              success: true,
+              result: {
+                ...(importOutcome.result || {}),
+                ...exceptionReadback.result,
+                verification: exceptionReadback.result,
+                importReportedException: true,
+                sourceDocumentVerified: Boolean(payload?.sourceDocumentPath),
+                timings,
+              },
+            },
+            xml,
+          };
+        }
+        if (exceptionReadback.result?.verificationStatus === "missing") {
+          return {
+            outcome: {
+              success: false,
+              error:
+                `Tally rejected the Purchase voucher during import (${importExceptions} exception${importExceptions === 1 ? "" : "s"}). ` +
+                "No voucher was created, and Tally did not provide a field-level reason. Review the selected masters and tax/deduction setup, then retry.",
+              result: {
+                ...(importOutcome.result || {}),
+                verification: exceptionReadback.result,
+                verifiedAbsent: true,
+                voucherCreated: false,
+                uncertainWrite: false,
+                diagnosedReason: "tally_import_exception_without_detail",
+                timings,
+              },
+            },
+            xml,
+          };
+        }
+        return {
+          outcome: {
+            success: false,
+            error: "Tally returned an import exception and the voucher read-back was inconclusive. Verify the voucher in Tally before retrying.",
+            result: {
+              ...(importOutcome.result || {}),
+              verification: exceptionReadback.result,
+              uncertainWrite: true,
+              uncertaintyReason: "exception_readback_inconclusive",
+              timings,
+            },
+          },
+          xml,
+        };
+      } catch (error) {
+        timings.totalMs = Date.now() - totalStartedAt;
+        return {
+          outcome: {
+            success: false,
+            error: "Tally returned an import exception and the voucher could not be read back. Verify it in Tally before retrying.",
+            result: {
+              ...(importOutcome.result || {}),
+              uncertainWrite: true,
+              uncertaintyReason: "exception_readback_failed",
+              verificationError: error instanceof Error ? error.message : String(error),
+              timings,
+            },
+          },
+          xml,
+        };
+      }
+    }
     const explained = explainVoucherTallyError(importOutcome, payload);
     return {
       outcome: {
@@ -2357,6 +2557,404 @@ async function postBankVoucher(tallyUrl, payload, companyName) {
   );
 
   return { outcome: primaryOutcome, xml: primaryXml, retriedWithLegacyHeader: false };
+}
+
+function normalizedGuid(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+export function resolveBankVoucherLedgerIdentities(payloads, liveMasters) {
+  const byGuid = new Map();
+  const byName = new Map();
+  for (const master of liveMasters || []) {
+    const guid = normalizedGuid(master?.guid);
+    const name = String(master?.name || "").trim();
+    if (guid) byGuid.set(guid, master);
+    if (name) byName.set(normalizeLooseName(name), master);
+  }
+  const resolve = (nameValue, guidValue, label) => {
+    const name = String(nameValue || "").trim();
+    const guid = normalizedGuid(guidValue);
+    const master = guid ? byGuid.get(guid) : byName.get(normalizeLooseName(name));
+    if (!master) {
+      throw new Error(`${label} '${name || guid || "unknown"}' is not present in the active Tally company. Refresh masters and review this row before posting.`);
+    }
+    return { name: master.name, guid: master.guid || guidValue || null };
+  };
+  return (payloads || []).map((payload) => {
+    const bank = resolve(payload?.bankLedgerName, payload?.bankLedgerGuid, "Bank ledger");
+    const counterparty = resolve(payload?.counterpartyLedgerName, payload?.counterpartyLedgerGuid, "Counterparty ledger");
+    return {
+      ...payload,
+      bankLedgerName: bank.name,
+      bankLedgerGuid: bank.guid,
+      counterpartyLedgerName: counterparty.name,
+      counterpartyLedgerGuid: counterparty.guid,
+      matchedLedgerName: counterparty.name,
+      liveMasterValidation: {
+        checkedAt: new Date().toISOString(),
+        bankLedger: bank,
+        counterpartyLedger: counterparty,
+      },
+    };
+  });
+}
+
+async function resolveBankVoucherLedgerPayloads(tallyUrl, payloads, companyName) {
+  const identities = (payloads || []).flatMap((payload) => [
+    { name: payload?.bankLedgerName, guid: payload?.bankLedgerGuid },
+    { name: payload?.counterpartyLedgerName, guid: payload?.counterpartyLedgerGuid },
+  ]).filter((identity) => identity.name || identity.guid);
+  const names = identities.map((identity) => identity.name).filter(Boolean);
+  const guids = identities.map((identity) => String(identity.guid || "").trim()).filter(Boolean);
+  const nameFormula = buildRequestedLedgerFormula(names, ["$Name"]);
+  const guidFormula = guids
+    .map((guid) => `($$IsEqual:$GUID:${tallyFormulaString(guid)})`)
+    .join(" OR ");
+  const formula = [nameFormula, guidFormula].filter(Boolean).map((part) => `(${part})`).join(" OR ");
+  const filterName = "KalikaBankVoucherLedgerIdentity";
+  const xml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Kalika Bank Voucher Ledger Identity",
+    tallyType: "Ledger",
+    fetchFields: "Name,GUID,Parent,IsBillWiseOn",
+    companyName,
+    formulae: [{ name: filterName, formula }],
+    filterNames: [filterName],
+    timeoutMs: 20_000,
+    maxResponseBytes: 1024 * 1024,
+  });
+  return resolveBankVoucherLedgerIdentities(payloads, parseBankStatementMasterCollection(xml, "LEDGER"));
+}
+
+async function validateBankVoucherBillAllocationsLive(config, payloads, companyName) {
+  const allocatedPayloads = (payloads || []).filter((payload) =>
+    Array.isArray(payload?.billAllocations) && payload.billAllocations.length > 0
+  );
+  if (allocatedPayloads.length === 0) return payloads;
+  const ledgerNames = Array.from(new Set(
+    allocatedPayloads.map((payload) => String(payload.counterpartyLedgerName || "").trim()).filter(Boolean)
+  ));
+  const asOfDate = allocatedPayloads
+    .map((payload) => normalizeDateForCompare(payload.voucherDate))
+    .filter(Boolean)
+    .sort()
+    .at(-1) || null;
+  const outcome = await fetchCustomerOpenBillsFromTally(
+    config,
+    {
+      companyName,
+      ledgerNames,
+      asOfDate,
+      queryPurpose: "bank_statement_match",
+    }
+  );
+  const byLedger = outcome.result?.byLedger || {};
+  const consumed = new Map();
+  for (const payload of allocatedPayloads) {
+    const ledgerName = String(payload.counterpartyLedgerName || "").trim();
+    const bucket = byLedger[ledgerName];
+    if (!bucket || !Array.isArray(bucket.openBills)) {
+      throw new Error(`Open bills for '${ledgerName}' could not be verified immediately before posting.`);
+    }
+    const billByReference = new Map(
+      bucket.openBills.map((bill) => [normalizeExactReference(bill.referenceName || bill.voucherNumber), bill])
+    );
+    for (const allocation of payload.billAllocations) {
+      if (!/^agst\s+ref$/i.test(String(allocation?.referenceType || "").trim())) continue;
+      const referenceKey = normalizeExactReference(allocation?.referenceName);
+      const bill = billByReference.get(referenceKey);
+      if (!referenceKey || !bill) {
+        throw new Error(`Bill '${allocation?.referenceName || "unknown"}' is no longer open in '${ledgerName}'.`);
+      }
+      const amount = Math.abs(Number(allocation?.amount || 0));
+      const consumedKey = `${normalizeLooseName(ledgerName)}|${referenceKey}`;
+      const nextConsumed = Number(((consumed.get(consumedKey) || 0) + amount).toFixed(2));
+      const pendingAmount = Math.abs(Number(bill.pendingAmount ?? bill.amount ?? 0));
+      if (!(amount > 0) || nextConsumed - pendingAmount >= 0.005) {
+        throw new Error(`Bill '${allocation.referenceName}' changed in Tally. Refresh matching before posting.`);
+      }
+      consumed.set(consumedKey, nextConsumed);
+    }
+  }
+  const checkedAt = new Date().toISOString();
+  return (payloads || []).map((payload) => ({
+    ...payload,
+    liveBillValidation: Array.isArray(payload?.billAllocations) && payload.billAllocations.length > 0
+      ? { checkedAt, source: "live_tally_immediate_read" }
+      : null,
+  }));
+}
+
+export function getBankVoucherCommandBatchKey(payload = {}, fallbackCompanyName = null) {
+  return [
+    normalizeLooseName(payload.companyName || fallbackCompanyName),
+    normalizeLooseName(payload.bankLedgerName),
+  ].join("::");
+}
+
+async function runBankVoucherCommandBatch(config, commands, options = {}) {
+  const groups = new Map();
+  for (const command of commands) {
+    const payload = command?.payload || {};
+    // A Tally import envelope can contain different voucher types and each
+    // TALLYMESSAGE carries its own bill allocations. Splitting on those fields
+    // reduced a mixed bank statement to batches of one even though all commands
+    // had been claimed together. Keep only the values shared by the duplicate
+    // pre/post-flight lookup; this lets up to 50 statement vouchers use one
+    // Tally request without weakening per-command result isolation.
+    const key = getBankVoucherCommandBatchKey(payload, config.companyName);
+    const group = groups.get(key) || [];
+    group.push(command);
+    groups.set(key, group);
+  }
+
+  for (const unresolvedGroup of groups.values()) {
+    let group;
+    try {
+      const companyName = unresolvedGroup[0]?.payload?.companyName || config.companyName || null;
+      const resolvedPayloads = await resolveBankVoucherLedgerPayloads(
+        config.tallyUrl,
+        unresolvedGroup.map((command) => command.payload || {}),
+        companyName
+      );
+      const validatedPayloads = await validateBankVoucherBillAllocationsLive(
+        config,
+        resolvedPayloads,
+        companyName
+      );
+      group = unresolvedGroup.map((command, index) => ({ ...command, payload: validatedPayloads[index] }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await sendCommandResults(config, unresolvedGroup.map((command) => ({
+        command,
+        outcome: {
+          success: false,
+          error: message,
+          result: {
+            transactionId: command.payload?.transactionId,
+            sourceBankTransactionId: command.payload?.transactionId,
+            beforeExecution: true,
+            liveMasterValidationFailed: true,
+          },
+        },
+      })));
+      console.log(`Bank voucher batch blocked before import: ${message}`);
+      continue;
+    }
+    let preflightByTransactionId = null;
+    try {
+      const targets = new Set(group.map((command) => JSON.stringify(command.payload?.target)));
+      if (targets.size !== 1) throw new Error("A Tally batch cannot cross company or connector sessions.");
+      await assertCommandTarget(config, group[0]);
+      const firstPayload = group[0]?.payload || {};
+      const batchPreflight = await reconcileBankTransactionsInTally(config, {
+        companyName: firstPayload.companyName || config.companyName || null,
+        bankLedgerName: firstPayload.bankLedgerName,
+        // Duplicate detection only needs the voucher collection. Fetching the
+        // bank closing balance here added another unrelated Tally request to
+        // every post and could consume the full export timeout.
+        includeBalanceProof: false,
+        transactions: group.map((command) => ({
+          ...command.payload,
+          expectedDirection:
+            command.payload?.expectedDirection ||
+            (/receipt/i.test(String(command.payload?.voucherType || "")) ? "incoming" : "outgoing"),
+        })),
+      });
+      preflightByTransactionId = new Map(
+        (batchPreflight.result?.transactions || []).map((row) => [String(row.transactionId || ""), row])
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await sendCommandResults(config, group.map((command) => ({
+        command,
+        outcome: {
+          success: false,
+          error: `Duplicate check could not be completed. Nothing was posted. ${message}`,
+          result: {
+            transactionId: command.payload?.transactionId,
+            sourceBankTransactionId: command.payload?.transactionId,
+            beforeExecution: true,
+            duplicateCheckIncomplete: true,
+          },
+        },
+      })));
+      console.warn(`Bank voucher batch blocked because duplicate preflight was unavailable: ${message}`);
+      continue;
+    }
+
+    const pendingCommands = [];
+    for (const command of group) {
+      try {
+        const transactionId = String(command.payload?.transactionId || "");
+        const preflight = preflightByTransactionId?.get(transactionId) || null;
+        if (preflight?.verificationStatus === "found") {
+          await sendCommandResult(config, command, {
+            success: true,
+            result: {
+              alreadyInTally: true,
+              created: 0,
+              altered: 0,
+              voucherId: preflight.voucherId,
+              voucherNumber: preflight.voucherNumber,
+              voucherDate: preflight.voucherDate,
+              duplicateCheck: preflight,
+              transactionId,
+            },
+          });
+          console.log(`Command ${command.id} completed: bank transaction already existed in Tally.`);
+          continue;
+        }
+        if (preflight?.verificationStatus === "ambiguous") {
+          await sendCommandResult(config, command, {
+            success: false,
+            error: "Possible existing bank transaction found in Tally. Review before posting to avoid a duplicate.",
+            result: {
+              possibleDuplicateInTally: true,
+              duplicateCheck: preflight,
+              transactionId,
+            },
+          });
+          console.log(`Command ${command.id} needs review: possible duplicate bank transaction.`);
+          continue;
+        }
+
+        if (preflight?.verificationStatus !== "missing") {
+          await sendCommandResult(config, command, {
+            success: false,
+            error: "Duplicate check returned an incomplete result. Nothing was posted.",
+            result: { transactionId, beforeExecution: true, duplicateCheckIncomplete: true },
+          });
+          continue;
+        }
+        pendingCommands.push(command);
+      } catch (error) {
+        console.error(
+          `Command ${command.id} failed without blocking the remaining vouchers: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+
+    if (pendingCommands.length === 0) continue;
+
+    const firstPayload = pendingCommands[0].payload || {};
+    const companyName = firstPayload.companyName || config.companyName || null;
+    let batchXml = null;
+    let batchOutcome = null;
+    const batchStartedAt = Date.now();
+    try {
+      batchXml = buildBankVoucherBatchXml(
+        pendingCommands.map((command) => command.payload),
+        companyName
+      );
+      await assertCommandTarget(config, pendingCommands[0]);
+      batchOutcome = await invokeTallyXml(config.tallyUrl, batchXml);
+    } catch (error) {
+      batchOutcome = {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        result: {},
+      };
+    }
+
+    const batchElapsedMs = Date.now() - batchStartedAt;
+    // Tally import counters acknowledge the envelope, not each voucher. Always
+    // read every target back, even when CREATED equals the requested batch size.
+    let postflightByTransactionId = null;
+    try {
+      const postflight = await reconcileBankTransactionsInTally(config, {
+        companyName,
+        bankLedgerName: firstPayload.bankLedgerName,
+        includeBalanceProof: false,
+        transactions: pendingCommands.map((command) => ({
+          ...command.payload,
+          expectedDirection:
+            command.payload?.expectedDirection ||
+            (/receipt/i.test(String(command.payload?.voucherType || "")) ? "incoming" : "outgoing"),
+        })),
+      });
+      postflightByTransactionId = new Map(
+        (postflight.result?.transactions || []).map((row) => [String(row.transactionId || ""), row])
+      );
+    } catch (error) {
+      console.warn(
+        `Batch postflight verification was unavailable: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+
+    const acknowledgementEntries = [];
+    for (const command of pendingCommands) {
+      const transactionId = String(command.payload?.transactionId || "");
+      const postflight = postflightByTransactionId?.get(transactionId) || null;
+      if (postflight?.verificationStatus === "found") {
+        acknowledgementEntries.push({ command, outcome: {
+          success: true,
+          result: {
+            created: 1,
+            transactionId,
+            sourceBankTransactionId: transactionId,
+            voucherId: postflight.voucherId || command.payload?.referenceNumber || command.id,
+            voucherNumber: postflight.voucherNumber || command.payload?.referenceNumber || null,
+            duplicateCheck: postflight,
+            verificationStatus: "verified",
+            requestXml: batchXml ? previewXml(batchXml) : null,
+            batchImport: true,
+            batchSize: pendingCommands.length,
+            batchElapsedMs,
+          },
+        }});
+        continue;
+      }
+
+      // A successful import followed by a missing/failed read-back is uncertain,
+      // never proof that it is safe to create the voucher again.
+      if (batchOutcome.success || !postflight || postflight.verificationStatus !== "missing") {
+        acknowledgementEntries.push({ command, outcome: {
+          success: false,
+          error: "The batch import outcome is uncertain. Read back Tally before retrying.",
+          result: {
+            transactionId,
+            reconciliationRequired: true,
+            possibleDuplicateInTally: true,
+            uncertaintyReason: !postflight ? "readback_unavailable" : "readback_did_not_confirm_import",
+            importSummary: batchOutcome.result || {},
+          },
+        }});
+        continue;
+      }
+      try {
+        await runCommand(
+          config,
+          {
+            ...command,
+            payload: {
+              ...command.payload,
+              preflightVerifyExisting: postflightByTransactionId === null,
+            },
+          },
+          options
+        );
+      } catch (error) {
+        console.error(
+          `Command ${command.id} failed after batch isolation: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+
+    // The Tally import and postflight are already batch operations. Acknowledging
+    // each command one by one made a 50-row post spend roughly two minutes on
+    // avoidable API round trips. Keep per-command state, but report it in bounded
+    // concurrent groups so Supabase and the bridge remain protected.
+    if (acknowledgementEntries.length > 0) {
+      await sendCommandResults(config, acknowledgementEntries, 10);
+    }
+  }
 }
 
 async function postCustomerAdvanceAdjustment(tallyUrl, payload, companyName) {
@@ -3201,34 +3799,54 @@ async function fetchLedgerClosingBalance(tallyUrl, options) {
   return parseTallyAmount(getTagText(xml, "CLOSINGBALANCE"));
 }
 
-function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes, dateIndex) {
-  const voucherDate = normalizeDateForCompare(transaction.voucherDate);
-  const amount = Number(transaction.amount || 0);
+function indexBankVouchersByDate(vouchers) {
+  const byDate = new Map();
+  vouchers.forEach((voucher, index) => {
+    const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
+    if (!byDate.has(date)) byDate.set(date, []);
+    byDate.get(date).push({ voucher, index });
+  });
+  return byDate;
+}
+
+function financialYearBounds(value) {
+  const normalized = normalizeDateForCompare(value);
+  if (!normalized) return null;
+  const [year, month] = normalized.split("-").map(Number);
+  const startYear = month >= 4 ? year : year - 1;
+  return { dateFrom: `${startYear}-04-01`, dateTo: `${startYear + 1}-03-31` };
+}
+
+function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes, byDate = null) {
   const referenceNumber = String(transaction.referenceNumber || "").trim();
   const counterpartyLedgerName = String(transaction.counterpartyLedgerName || "").trim();
-  const source = dateIndex?.get(voucherDate) || (dateIndex ? [] : vouchers.map((voucher, index) => ({ voucher, index })));
-  const baseCandidates = source.flatMap(({ voucher, index }) => {
-    if (reservedVoucherIndexes.has(index)) return [];
-    const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
-    const bankEntry = getBankLedgerEntry(
-      voucher,
-      bankLedgerName,
-      amount,
-      transaction.expectedDirection
-    );
-    if (!voucherDate || date !== voucherDate || !bankEntry) return [];
-    return [{ voucher, index, bankEntry }];
-  });
+  const baseCandidates = baseBankTransactionCandidates(
+    vouchers,
+    transaction,
+    bankLedgerName,
+    reservedVoucherIndexes,
+    byDate
+  );
 
-  const hasUsableReference = normalizeExactReference(referenceNumber).length >= 5;
+  const hasUsableReference = isStrongBankReference(referenceNumber);
   const counterpartyKey = normalizeLooseName(counterpartyLedgerName);
   const hasUsableCounterparty = Boolean(counterpartyKey && !counterpartyKey.includes("suspense"));
   const identityInsufficient = !hasUsableReference && !hasUsableCounterparty;
   let candidates;
   if (hasUsableReference) {
-    // An exact usable bank reference is independent transaction identity. Party
-    // mismatch must not hide a voucher when the selected ledger was wrong.
-    candidates = baseCandidates.filter(({ voucher }) => voucherHasExactReference(voucher, referenceNumber));
+    // A bank reference can reveal a duplicate posted on the wrong date. Search
+    // the bounded financial-year identity export as well as same-date rows, but
+    // still require bank ledger, amount and accounting direction.
+    candidates = vouchers.flatMap((voucher, index) => {
+      if (reservedVoucherIndexes.has(index) || !voucherHasExactReference(voucher, referenceNumber)) return [];
+      const bankEntry = getBankLedgerEntry(
+        voucher,
+        bankLedgerName,
+        Number(transaction.amount || 0),
+        transaction.expectedDirection
+      );
+      return bankEntry ? [{ voucher, index, bankEntry }] : [];
+    });
   } else if (hasUsableCounterparty) {
     // Without a bank reference, the exact selected counterparty is mandatory.
     // Same-date and same-amount vouchers belonging to another ledger are not a
@@ -3263,6 +3881,113 @@ function serializeStrictVoucherMatch(candidate) {
   };
 }
 
+async function fetchBankReconciliationVouchers(
+  tallyUrl,
+  { companyName, dateFrom, dateTo, bankLedgerName, transactions },
+  dependencies = {}
+) {
+  const exportCollection = dependencies.exportCollection || exportTallyCollection;
+  const startedAt = Date.now();
+  const strongReferences = Array.from(new Set(
+    (transactions || [])
+      .map((transaction) => String(transaction.referenceNumber || "").trim())
+      .filter(isStrongBankReference)
+  ));
+  const needsSameDateScan = (transactions || []).some(
+    (transaction) => !isStrongBankReference(transaction.referenceNumber)
+  );
+  // Secondary collection: gather this bank's vouchers directly, instead of
+  // gathering all company vouchers and applying FilterCount afterwards.
+  // Fetch bank-allocation references with the primary export
+  // so a missing top-level Reference does not trigger another serial Tally
+  // request for the same vouchers.
+  const leanXml = needsSameDateScan
+    ? await exportCollection(tallyUrl, {
+        collectionName: "Kalika Bank Statement Reconciliation",
+        tallyType: "Vouchers : Ledger",
+        childOf: tallyFormulaString(bankLedgerName),
+        fetchFields:
+          "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
+        companyName,
+        dateFrom,
+        dateTo,
+        timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
+        maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+      })
+    : "<ENVELOPE><COLLECTION></COLLECTION></ENVELOPE>";
+  const leanCompletedAt = Date.now();
+  checkReadBudget(cashDiscountReadContext.getStore());
+  if (!/<\/ENVELOPE\s*>/i.test(leanXml) ||
+      !/<(?:COLLECTION|VOUCHER)(?:\s|\/?>)/i.test(leanXml)) {
+    throw new Error("Tally did not return a complete bank voucher collection. Duplicate checking could not be completed.");
+  }
+  const sameDateVouchers = parseVoucherCollection(leanXml).filter(
+    (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
+  );
+  let crossDateVouchers = [];
+  let crossDateExportMs = 0;
+  const financialYear = financialYearBounds(dateFrom);
+  if (strongReferences.length > 0 && financialYear) {
+    const crossDateStartedAt = Date.now();
+    const filterName = "KalikaBankReferenceIdentity";
+    const referenceFormula = strongReferences
+      .map((reference) => `($$IsEqual:$Reference:${tallyFormulaString(reference)})`)
+      .join(" OR ");
+    const crossDateXml = await exportCollection(tallyUrl, {
+      collectionName: "Kalika Bank Reference Identity",
+      tallyType: "Vouchers : Ledger",
+      childOf: tallyFormulaString(bankLedgerName),
+      fetchFields:
+        "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
+      companyName,
+      dateFrom: financialYear.dateFrom,
+      dateTo: financialYear.dateTo,
+      formulae: [{ name: filterName, formula: referenceFormula }],
+      filterNames: [filterName],
+      timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
+      maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+    });
+    checkReadBudget(cashDiscountReadContext.getStore());
+    if (!/<\/ENVELOPE\s*>/i.test(crossDateXml)) {
+      throw new Error("Tally did not return a complete financial-year duplicate lookup.");
+    }
+    crossDateVouchers = parseVoucherCollection(crossDateXml).filter(
+      (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
+    );
+    crossDateExportMs = Date.now() - crossDateStartedAt;
+  }
+  const voucherByIdentity = new Map();
+  for (const voucher of [...sameDateVouchers, ...crossDateVouchers]) {
+    const key = [
+      voucher.masterId || "",
+      voucher.voucherNumber || "",
+      normalizeDateForCompare(voucher.effectiveDate || voucher.date) || "",
+      voucher.reference || "",
+    ].join("|");
+    if (!voucherByIdentity.has(key)) voucherByIdentity.set(key, voucher);
+  }
+  const vouchers = Array.from(voucherByIdentity.values());
+
+  return {
+    vouchers,
+    diagnostics: {
+      leanExportMs: leanCompletedAt - startedAt,
+      referenceExportMs: 0,
+      crossDateExportMs,
+      totalMs: Date.now() - startedAt,
+      scannedVoucherCount: vouchers.length,
+      detailedVoucherCount: 0,
+      detailBatchCount: 0,
+      primaryIncludesBankReferences: true,
+      queryMode: strongReferences.length > 0
+        ? needsSameDateScan
+          ? "bank_ledger_plus_financial_year_reference"
+          : "financial_year_reference"
+        : "bank_ledger_child_of",
+    },
+  };
+}
+
 async function reconcileBankTransactionsInTally(config, commandPayload = {}, dependencies = {}) {
   const transactions = Array.isArray(commandPayload.transactions) ? commandPayload.transactions : [];
   const companyName = commandPayload.companyName || null;
@@ -3287,59 +4012,13 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
   const dates = normalizedTransactions.map((transaction) => transaction.voucherDate).sort();
   const dateFrom = dates[0];
   const dateTo = dates.at(-1);
-  const bankEntryFormulaName = "AutodealerBankLedgerEntry";
-  const bankVoucherFormulaName = "AutodealerBankVoucher";
-
-  const vouchers = [];
-  const chunks = [];
-  for (let cursor = dateFrom; cursor <= dateTo; cursor = addUtcDays(cursor, 7)) {
-    if (chunks.length >= 160) throw new Error("Statement period is too large. Check a shorter statement.");
-    chunks.push({ dateFrom: cursor, dateTo: [addUtcDays(cursor, 6), dateTo].sort()[0] });
-  }
-  for (const [chunkIndex, chunk] of chunks.entries()) {
-  checkReadBudget(cashDiscountReadContext.getStore());
-  cashDiscountReadContext.getStore()?.onProgress?.(`Checking bank vouchers: period ${chunkIndex + 1} of ${chunks.length}`);
-  const xml = await (dependencies.exportCollection || exportTallyCollection)(tallyUrl, {
-    collectionName: "Kalika Bank Statement Reconciliation",
-    tallyType: "Voucher",
-    fetchFields:
-      "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,AlterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName",
-    companyName,
-    dateFrom: chunk.dateFrom,
-    dateTo: chunk.dateTo,
-    formulae: [
-      {
-        name: bankEntryFormulaName,
-        formula: buildRequestedLedgerFormula([bankLedgerName], ["$LedgerName"]),
-      },
-      {
-        name: bankVoucherFormulaName,
-        formula: `$$FilterCount:AllLedgerEntries:${bankEntryFormulaName} > 0`,
-      },
-    ],
-    // Do not filter by exact VoucherTypeName: Tally companies frequently use
-    // custom voucher types derived from Receipt/Payment/Contra/Journal.
-    filterNames: [bankVoucherFormulaName],
-  });
-  vouchers.push(...parseVoucherCollection(xml).filter(
-    (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
-  ));
-  if (vouchers.length > 50_000) throw new Error("Too many bank vouchers. Use a shorter statement period.");
-  await new Promise(resolve => setImmediate(resolve));
-  }
-  const dateIndex = new Map();
-  vouchers.forEach((voucher, index) => {
-    const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
-    if (!dateIndex.has(date)) dateIndex.set(date, []);
-    dateIndex.get(date).push({ voucher, index });
-  });
+  const voucherRequest = { companyName, dateFrom, dateTo, bankLedgerName, transactions: normalizedTransactions };
+  const { vouchers, diagnostics: queryDiagnostics } = dependencies.voucherProvider
+    ? await dependencies.voucherProvider(tallyUrl, voucherRequest, dependencies)
+    : await fetchBankReconciliationVouchers(tallyUrl, voucherRequest, dependencies);
   const reservedVoucherIndexes = new Set();
-  const results = [];
-  for (const [rowIndex, transaction] of normalizedTransactions.entries()) {
-    if (rowIndex % 25 === 0) {
-      await new Promise(resolve => setImmediate(resolve));
-      checkReadBudget(cashDiscountReadContext.getStore());
-    }
+  const vouchersByDate = indexBankVouchersByDate(vouchers);
+  const results = normalizedTransactions.map((transaction) => {
     const {
       candidates,
       baseCandidateCount,
@@ -3350,16 +4029,13 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
       vouchers,
       transaction,
       bankLedgerName,
-      reservedVoucherIndexes, dateIndex
+      reservedVoucherIndexes,
+      vouchersByDate
     );
-    // An exact bank reference is expected to identify one economic transaction.
-    // If Tally contains that same strict reference more than once, the statement
-    // row is unquestionably already posted; the extra vouchers are a Tally data
-    // quality issue, not a reason to post the bank row again.
     const duplicateInTally = hasUsableReference && candidates.length > 1;
     const verificationStatus = identityInsufficient && candidates.length > 0
       ? "ambiguous"
-      : candidates.length === 1 || duplicateInTally
+      : candidates.length === 1
       ? "found"
       : candidates.length > 1
         ? "ambiguous"
@@ -3369,7 +4045,7 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
       indexesToReserve.forEach((index) => reservedVoucherIndexes.add(index));
     }
     const selectedCandidate = verificationStatus === "found" ? candidates[0] : null;
-    results.push({
+    return {
       transactionId: transaction.transactionId || null,
       verificationStatus,
       matchCount: candidates.length,
@@ -3396,30 +4072,33 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
             ? "Date, amount and direction matched, but the exact UTR/reference did not."
             : "No unused Tally voucher matched the date, selected bank ledger, amount and direction.",
       matches: candidates.slice(0, 5).map(serializeStrictVoucherMatch),
-    });
-  }
+    };
+  });
 
   const statementBalance = validateStatementBalanceSequence(normalizedTransactions);
   const periodBankEntries = vouchers.flatMap((voucher) => voucher.ledgerEntries.filter(
     (entry) => normalizeLooseName(entry.ledgerName) === normalizeLooseName(bankLedgerName)
   ));
   const tallyMovement = periodBankEntries.reduce((sum, entry) => sum - Number(entry.amount || 0), 0);
+  const includeBalanceProof = commandPayload.includeBalanceProof !== false;
   let tallyClosingBalance = null;
-  let balanceError = null;
-  try {
-    const rawTallyClosingBalance = await (dependencies.fetchClosingBalance || fetchLedgerClosingBalance)(tallyUrl, {
-      companyName,
-      ledgerName: bankLedgerName,
-      dateFrom,
-      dateTo,
-    });
-    // Tally's internal amount sign is opposite to the bank statement view for
-    // asset bank ledgers: debit balances are negative internally.
-    tallyClosingBalance = Number.isFinite(rawTallyClosingBalance)
-      ? -Number(rawTallyClosingBalance)
-      : null;
-  } catch (error) {
-    balanceError = error instanceof Error ? error.message : String(error);
+  let balanceError = includeBalanceProof ? null : "Balance proof skipped for posting duplicate preflight.";
+  if (includeBalanceProof) {
+    try {
+      const rawTallyClosingBalance = await fetchLedgerClosingBalance(tallyUrl, {
+        companyName,
+        ledgerName: bankLedgerName,
+        dateFrom,
+        dateTo,
+      });
+      // Tally's internal amount sign is opposite to the bank statement view for
+      // asset bank ledgers: debit balances are negative internally.
+      tallyClosingBalance = Number.isFinite(rawTallyClosingBalance)
+        ? -Number(rawTallyClosingBalance)
+        : null;
+    } catch (error) {
+      balanceError = error instanceof Error ? error.message : String(error);
+    }
   }
   const derivedTallyOpeningBalance = Number.isFinite(tallyClosingBalance)
     ? Number(tallyClosingBalance) - tallyMovement
@@ -3437,6 +4116,7 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
       dateTo,
       bankLedgerName,
       scannedCount: vouchers.length,
+      queryDiagnostics,
       transactions: results,
       balanceProof: {
         available: statementBalance.available && Number.isFinite(tallyClosingBalance),
@@ -5491,10 +6171,11 @@ async function testTally(tallyUrl) {
   }
 }
 
-async function receiveNextCommand(config) {
+async function receiveNextCommands(config, limit = MAX_COMMANDS_PER_CYCLE) {
   const url = new URL(`${config.apiBase}/api/tally/bridge/commands/next`);
   url.searchParams.set("connectionId", config.connectionId);
   url.searchParams.set("bridgeVersion", BRIDGE_VERSION);
+  url.searchParams.set("limit", String(Math.max(1, Math.min(MAX_COMMANDS_PER_CYCLE, limit))));
 
   const response = await fetch(url, {
     method: "GET",
@@ -5508,7 +6189,11 @@ async function receiveNextCommand(config) {
     throw new Error(payload.error || `Command poll failed with HTTP ${response.status}.`);
   }
 
-  return payload.command ?? null;
+  return Array.isArray(payload.commands)
+    ? payload.commands
+    : payload.command
+      ? [payload.command]
+      : [];
 }
 
 async function sendCommandResult(config, command, outcome, existingOutboxItem = null) {
@@ -5561,6 +6246,72 @@ function safeDocumentPathSegment(value, fallback) {
   return sanitized || fallback;
 }
 
+function downloadTrustedDocument(url, { timeoutMs = 60_000, redirectCount = 0 } = {}) {
+  return new Promise((resolve, reject) => {
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      reject(new Error("The source invoice download link is invalid."));
+      return;
+    }
+
+    const client = parsedUrl.protocol === "https:" ? https : http;
+    const request = client.get(parsedUrl, {
+      ...(parsedUrl.protocol === "https:" ? { ca: trustedCaCertificates() } : {}),
+      headers: { Accept: "application/pdf,*/*;q=0.8" },
+    }, (response) => {
+      const status = response.statusCode || 0;
+      const location = response.headers.location;
+      if (status >= 300 && status < 400 && location) {
+        response.resume();
+        if (redirectCount >= 5) {
+          reject(new Error("The source invoice download redirected too many times."));
+          return;
+        }
+        resolve(downloadTrustedDocument(new URL(location, parsedUrl).toString(), {
+          timeoutMs,
+          redirectCount: redirectCount + 1,
+        }));
+        return;
+      }
+      if (status < 200 || status >= 300) {
+        response.resume();
+        reject(new Error(`The source invoice download returned HTTP ${status || "unknown"}.`));
+        return;
+      }
+
+      const declaredLength = Number(response.headers["content-length"] || 0);
+      if (declaredLength > MAX_PURCHASE_SOURCE_PDF_BYTES) {
+        response.destroy();
+        reject(new Error("The source invoice PDF is larger than the 25 MB connector limit."));
+        return;
+      }
+
+      const chunks = [];
+      let receivedBytes = 0;
+      response.on("data", (chunk) => {
+        receivedBytes += chunk.length;
+        if (receivedBytes > MAX_PURCHASE_SOURCE_PDF_BYTES) {
+          response.destroy(new Error("The source invoice PDF is larger than the 25 MB connector limit."));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on("end", () => resolve(Buffer.concat(chunks)));
+      response.on("error", reject);
+    });
+
+    request.setTimeout(timeoutMs, () => {
+      request.destroy(new Error("The source invoice download timed out after 60 seconds."));
+    });
+    request.on("error", (error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      reject(new Error(`The connector could not download the source invoice PDF: ${detail}`));
+    });
+  });
+}
+
 async function materializePurchaseSourceDocument(payload) {
   const source = payload?.sourceDocument;
   if (!source || typeof source !== "object") {
@@ -5601,21 +6352,12 @@ async function materializePurchaseSourceDocument(payload) {
     throw new Error("Purchase source document does not have a valid download URL.");
   }
 
-  const response = await fetch(downloadUrl, { signal: AbortSignal.timeout(60_000) });
-  if (!response.ok) {
-    throw new Error(`Purchase source document download failed with HTTP ${response.status}.`);
-  }
-  const declaredLength = Number(response.headers.get("content-length") || 0);
-  if (declaredLength > MAX_PURCHASE_SOURCE_PDF_BYTES) {
-    throw new Error("Purchase source PDF is larger than the 25 MB connector limit.");
-  }
-
-  const bytes = Buffer.from(await response.arrayBuffer());
+  const bytes = await downloadTrustedDocument(downloadUrl);
   if (bytes.length === 0 || bytes.length > MAX_PURCHASE_SOURCE_PDF_BYTES) {
-    throw new Error("Purchase source PDF is empty or larger than the 25 MB connector limit.");
+    throw new Error("The source invoice PDF is empty or larger than the 25 MB connector limit.");
   }
   if (bytes.subarray(0, 5).toString("ascii") !== "%PDF-") {
-    throw new Error("Purchase source document is not a valid PDF.");
+    throw new Error("The downloaded source invoice is not a valid PDF.");
   }
 
   const sha256 = createHash("sha256").update(bytes).digest("hex").toUpperCase();
@@ -5638,6 +6380,63 @@ async function materializePurchaseSourceDocument(payload) {
     sourceDocumentSha256: sha256,
     sourceDocumentId: String(source.id || documentId).trim() || documentId,
   };
+}
+
+async function assertCommandTarget(config, command) {
+  const runtime = config.__agentRuntime;
+  if (runtime) {
+    runtime.validateCommandIdentity(command);
+    return;
+  }
+  const target = command?.payload?.target;
+  if (!target) return;
+  if (
+    String(target.connectionId || "") !== String(config.connectionId || "") ||
+    String(target.installationId || "") !== String(config.installationId || config.bridgeMachineId || "") ||
+    Number(target.sessionGeneration || 0) !== Number(config.sessionGeneration || 0)
+  ) {
+    throw new Error("The command targets an old or different connector session. Review it before retrying.");
+  }
+}
+
+async function prepareBankVoucherCommandForBatch(config, command) {
+  const runtime = config.__agentRuntime;
+  try {
+    await assertCommandTarget(config, command);
+    if (!runtime) return true;
+    await runtime.invalidateWorkflowSnapshots("open_bills");
+    const cached = await runtime.cachedWriteOutcome(command);
+    if (cached) {
+      await sendCommandResult(config, command, cached);
+      return false;
+    }
+    const receipt = await runtime.writeReceipt(command);
+    if (receipt?.status === "running") {
+      const verification = await verifyBankTransactionInTally(config, command.payload);
+      const status = verification?.result?.verificationStatus;
+      if (["verified", "found"].includes(status)) {
+        await sendCommandResult(config, command, verification);
+        return false;
+      }
+      if (verification && status !== "missing") {
+        await sendCommandResult(config, command, {
+          success: false,
+          result: verification.result || {},
+          error: "Tally write outcome is uncertain and could not be retried safely.",
+        });
+        return false;
+      }
+    }
+    await runtime.markWriteStarted(command);
+    return true;
+  } catch (error) {
+    await sendCommandResult(config, command, {
+      success: false,
+      result: { beforeExecution: true },
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
 }
 
 async function runCommand(config, command, options = {}) {
@@ -5870,25 +6669,29 @@ async function runCommand(config, command, options = {}) {
   }
 
   if (command.commandType === "create_purchase_voucher") {
+    const commandStartedAt = Date.now();
+    const commandTimings = {};
+    let failureStage = "preparing_source";
+    const commandMeasure = async (name, operation) => {
+      const startedAt = Date.now();
+      try {
+        return await operation();
+      } finally {
+        commandTimings[`${name}Ms`] = Date.now() - startedAt;
+      }
+    };
     try {
-      const commandStartedAt = Date.now();
-      const commandTimings = {};
-      const commandMeasure = async (name, operation) => {
-        const startedAt = Date.now();
-        try {
-          return await operation();
-        } finally {
-          commandTimings[`${name}Ms`] = Date.now() - startedAt;
-        }
+      const reportStage = (phase, details = {}) => {
+        failureStage = phase;
+        void sendAgentProgress(config, {
+          commandId: command.id,
+          phase,
+          processed: null,
+          total: null,
+          elapsedMs: Date.now() - commandStartedAt,
+          ...details,
+        }).catch(() => {});
       };
-      const reportStage = (phase, details = {}) => void sendAgentProgress(config, {
-        commandId: command.id,
-        phase,
-        processed: null,
-        total: null,
-        elapsedMs: Date.now() - commandStartedAt,
-        ...details,
-      }).catch(() => {});
       // Tally readiness and the signed source-PDF download are independent.
       // Starting both together removes the remote document latency from the
       // otherwise fully sequential posting path.
@@ -5897,6 +6700,7 @@ async function runCommand(config, command, options = {}) {
         commandMeasure("tallyReadiness", () => testTally(config.tallyUrl)),
         commandMeasure("sourceDocument", () => materializePurchaseSourceDocument(command.payload)),
       ]);
+      failureStage = "checking_tally";
       const requestedCompany = String(command.payload?.companyName || "").trim();
       if (!live.tallyReachable || !live.companyLoaded) {
         throw new Error(live.error || "TallyPrime is not ready for Purchase voucher creation.");
@@ -5947,6 +6751,15 @@ async function runCommand(config, command, options = {}) {
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error ?? "Purchase voucher creation failed.");
+      const failedBeforeTallyWrite = [
+        "preparing_source",
+        "checking_tally",
+        "checking_duplicates",
+        "validating_masters",
+      ].includes(failureStage);
+      const userMessage = failedBeforeTallyWrite
+        ? `${message} Nothing was sent to Tally; you can safely retry.`
+        : `${message} Check whether the voucher exists in Tally before retrying.`;
       await sendCommandResult(config, command, {
         success: false,
         result: {
@@ -5954,10 +6767,17 @@ async function runCommand(config, command, options = {}) {
           caseId: command.payload?.caseId,
           revision: command.payload?.revision,
           idempotencyKey: command.payload?.idempotencyKey,
+          failureStage,
+          voucherCreated: failedBeforeTallyWrite ? false : null,
+          uncertainWrite: !failedBeforeTallyWrite,
+          timings: {
+            ...commandTimings,
+            commandTotalMs: Date.now() - commandStartedAt,
+          },
         },
-        error: message,
+        error: userMessage,
       });
-      console.log(`Command ${command.id} failed: ${message}`);
+      console.log(`Command ${command.id} failed at ${failureStage}: ${userMessage}`);
     }
     return;
   }
@@ -6305,6 +7125,16 @@ async function sendHeartbeat(config, testResult, availableCompanies = [], livene
   return payload;
 }
 
+async function sendCommandResults(config, entries, concurrency = 10) {
+  for (let index = 0; index < entries.length; index += concurrency) {
+    await Promise.all(
+      entries
+        .slice(index, index + concurrency)
+        .map(({ command, outcome }) => sendCommandResult(config, command, outcome))
+    );
+  }
+}
+
 function adoptHeartbeatIdentity(config, payload, persist = writeConfig) {
   const identity = payload?.agentIdentity;
   if (!identity || typeof identity !== "object") return false;
@@ -6367,7 +7197,7 @@ async function runOnce(config, options = {}) {
   // flow hostage for a minute.
   let deferredCommand = null;
   try {
-    const command = await receiveNextCommand(config);
+    const [command = null] = await receiveNextCommands(config, 1);
     const isVerifiedDebitNotePdf =
       command &&
       (command.commandType === "export_debit_note_pdf" ||
@@ -6863,15 +7693,40 @@ async function fetchCommandRealtimeConfig(config) {
   return payload.realtime ?? null;
 }
 
+async function processClaimedCommands(config, commands, options = {}) {
+  const bankVoucherCommands = [];
+  for (const command of commands) {
+    if (command.commandType === "post_bank_voucher") {
+      if (await prepareBankVoucherCommandForBatch(config, command)) {
+        bankVoucherCommands.push(command);
+      }
+      continue;
+    }
+    try {
+      await runCommand(config, command, options);
+    } catch (error) {
+      console.error(
+        `Command ${command.id} failed without blocking the remaining queue: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+  if (bankVoucherCommands.length > 0) {
+    await runBankVoucherCommandBatch(config, bankVoucherCommands, options);
+  }
+}
+
 async function drainPendingCommands(config, options = {}) {
   let processed = 0;
-  // A wake can represent several commands queued together. Drain a bounded
-  // batch so each command starts immediately without monopolising the bridge.
-  while (processed < 25) {
-    const command = await receiveNextCommand(config);
-    if (!command) break;
-    await runCommand(config, command, options);
-    processed += 1;
+  while (processed < MAX_COMMANDS_PER_CYCLE) {
+    const commands = await receiveNextCommands(
+      config,
+      Math.min(MAX_COMMANDS_PER_CYCLE - processed, MAX_COMMANDS_PER_CYCLE)
+    );
+    if (commands.length === 0) break;
+    await processClaimedCommands(config, commands, options);
+    processed += commands.length;
   }
   return processed;
 }
@@ -7192,6 +8047,12 @@ function createBridgeRunner(options = {}) {
     stop,
     async runOnce() {
       await runSerially();
+    },
+    syncAgentDataset(options = {}) {
+      return agentRuntime.syncActiveDataset(options);
+    },
+    rebuildAgentVectorIndex() {
+      return agentRuntime.rebuildActiveVectorIndex();
     },
     getAgentStatus() {
       return agentRuntime.status();

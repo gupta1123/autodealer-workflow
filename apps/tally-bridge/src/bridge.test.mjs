@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildCollectionExportXml,
   collectCashDiscountCustomerEvidence,
+  buildBankVoucherBatchXml,
   buildBankVoucherXml,
   buildPurchaseVoucherXml,
   buildRequestedLedgerFormula,
@@ -25,8 +26,53 @@ import {
   purchasePayloadMasterNames,
   purchaseVoucherFinancialYearRange,
   purchaseVoucherReadbackComparison,
+  getBankVoucherCommandBatchKey,
+  resolveBankVoucherLedgerIdentities,
   strictBankTransactionCandidates,
 } from "./bridge.mjs";
+
+test("bank posting resolves stale display names by stable Tally GUID", () => {
+  const [resolved] = resolveBankVoucherLedgerIdentities([{
+    bankLedgerName: "HDFC Bank",
+    bankLedgerGuid: "bank-guid",
+    counterpartyLedgerName: "Task Metcorp Global (Opc) Private Limited ? Jalna",
+    counterpartyLedgerGuid: "party-guid",
+  }], [
+    { name: "HDFC Bank", guid: "BANK-GUID" },
+    { name: "Task Metcorp Global (Opc) Private Limited – Jalna", guid: "PARTY-GUID" },
+  ]);
+  assert.equal(resolved.counterpartyLedgerName, "Task Metcorp Global (Opc) Private Limited – Jalna");
+  assert.throws(() => resolveBankVoucherLedgerIdentities([{
+    bankLedgerName: "HDFC Bank", bankLedgerGuid: "bank-guid",
+    counterpartyLedgerName: "Missing", counterpartyLedgerGuid: "missing-guid",
+  }], [{ name: "HDFC Bank", guid: "bank-guid" }]), /not present in the active Tally company/);
+});
+
+test("bank voucher batch puts fifty mixed statement vouchers in one Tally request", () => {
+  const common = {
+    companyName: "Solution Nyx",
+    voucherDate: "2026-08-22",
+    bankLedgerName: "Axis Bank",
+    amount: 1000,
+  };
+  const payloads = Array.from({ length: 50 }, (_, index) => ({
+    ...common,
+    voucherType: index % 3 === 0 ? "Receipt" : index % 3 === 1 ? "Payment" : "Contra",
+    counterpartyLedgerName: index % 3 === 2 ? "Cash" : `Party ${index + 1}`,
+    counterpartyIsPartyLedger: index % 3 !== 2,
+    bankLedgerEntryIsDebit: index % 3 === 0,
+    referenceNumber: `BATCH-REF-${index + 1}`,
+    billAllocations: index === 0
+      ? [{ referenceName: "INV-1", referenceType: "Agst Ref", amount: 1000 }]
+      : [],
+  }));
+  const xml = buildBankVoucherBatchXml(payloads, null);
+  assert.equal((xml.match(/<TALLYMESSAGE\b/g) || []).length, 50);
+  assert.equal((xml.match(/<VOUCHER\b/g) || []).length, 50);
+  assert.match(xml, /<VOUCHERNUMBER>BATCH-REF-1<\/VOUCHERNUMBER>/);
+  assert.match(xml, /<VOUCHERNUMBER>BATCH-REF-50<\/VOUCHERNUMBER>/);
+  assert.equal(new Set(payloads.map((payload) => getBankVoucherCommandBatchKey(payload))).size, 1);
+});
 
 test("Supabase binary broadcast wake frames decode without financial payloads", () => {
   const topic = "realtime:tally-command:522c18c7-95fa-41ff-a6fe-ed27d8675ed7";

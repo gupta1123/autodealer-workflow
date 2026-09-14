@@ -273,10 +273,10 @@
 
 .tallyStatusChip {
   display: flex;
-  min-height: 36px;
+  min-height: 48px;
   align-items: center;
-  gap: 0.5rem;
-  padding: 0.5rem 0.625rem;
+  gap: 0.625rem;
+  padding: 0.625rem 0.7rem;
   border: 1px solid;
   border-radius: 8px;
   text-decoration: none;
@@ -309,6 +309,25 @@
   letter-spacing: -0.005em;
 }
 
+.tallyStatusCopy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tallyStatusCompany {
+  overflow: hidden;
+  color: currentColor;
+  font-size: 0.5625rem;
+  font-weight: 600;
+  line-height: 1.15;
+  opacity: 0.68;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tallyStatusIcon {
   width: 13px;
   height: 13px;
@@ -320,7 +339,8 @@
 .tallyStatus_connected {
   color: #167451;
   border-color: #bddfce;
-  background: #e9f6ef;
+  background: linear-gradient(135deg, #edf9f2 0%, #e3f3ea 100%);
+  box-shadow: 0 4px 14px rgba(22, 116, 81, 0.08);
 }
 
 .tallyStatus_connected:hover {
@@ -356,6 +376,20 @@
 .tallyStatus_disconnected:hover {
   border-color: #dda39c;
   background: #f7e2df;
+}
+
+.sidebar.collapsed .tallyStatusWrapper {
+  padding-inline: 0.4rem;
+}
+
+.sidebar.collapsed .tallyStatusChip {
+  justify-content: center;
+  min-height: 38px;
+  padding: 0.5rem;
+}
+
+.sidebar.collapsed .tallyStatusCopy {
+  display: none;
 }
 
 @keyframes tallyStatusPulse {

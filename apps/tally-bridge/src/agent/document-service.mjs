@@ -8,10 +8,11 @@ import { fileURLToPath } from "node:url";
 const WORKER_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "document-worker.mjs");
 
 export class LocalDocumentService {
-  constructor({ temporaryDirectory, browserUpload, timeoutMs = 120_000, resultTimeoutMs = 225_000, forkWorker = fork }) {
+  constructor({ temporaryDirectory, browserUpload, suggestLedgerBatch, timeoutMs = 120_000, resultTimeoutMs = 225_000, forkWorker = fork }) {
     this.browserUpload = browserUpload;
     this.forkWorker = forkWorker;
     this.temporaryDirectory = temporaryDirectory;
+    this.suggestLedgerBatch = suggestLedgerBatch;
     this.timeoutMs = timeoutMs;
     this.resultTimeoutMs = resultTimeoutMs;
     this.parserTail = Promise.resolve();
@@ -61,17 +62,35 @@ export class LocalDocumentService {
     this.browserUpload.reportPhase(tokenHash, 'preparing_document');
     const context = await contextPromise;
     signal?.throwIfAborted();
+    if (!parsed.parsed?.transactions?.length) throw new Error('The connector could not normalize statement rows deterministically.');
+    if (typeof this.suggestLedgerBatch !== 'function') throw new Error('Local vector matching is unavailable.');
+    this.browserUpload.reportPhase(tokenHash, 'vector_matching');
+    const vectorStartedAt = performance.now();
+    const queries = parsed.parsed.transactions.map((transaction, index) => ({ id: String(index), name: transaction.description }));
+    const matches = {};
+    for (let offset = 0; offset < queries.length; offset += 256) {
+      Object.assign(matches, await this.suggestLedgerBatch(queries.slice(offset, offset + 256), { identity: payload.agentIdentity }));
+    }
+    const vectorCandidates = queries.map((query) => (matches[String(query.id)]?.suggestions || []).map((candidate, rank) => ({
+      ledgerName: candidate.ledger?.name || candidate.ledger?.masterName || candidate.name,
+      tallyGuid: candidate.ledger?.guid || candidate.ledger?.masterId || null,
+      parentGroup: candidate.ledger?.parent || null,
+      vectorScore: Number(candidate.score || 0), rank: rank + 1,
+    })).filter(candidate => candidate.ledgerName));
+    if (vectorCandidates.some(candidates => candidates.length === 0)) throw new Error('The local vector index returned no candidates for one or more transactions.');
+    const vectorSearchMs = performance.now() - vectorStartedAt;
     const result = await uploadDocumentEnvelope({ url: payload.resultUploadUrl, statusUrl: payload.resultStatusUrl,
-      token: payload.resultUploadToken, deadlineAt: Number(payload.documentDeadlineAt),
-      envelope: { pipelineVersion: 2, jobId: payload.bankStatementJobId, commandId: payload.commandId,
-        identity: payload.agentIdentity, markdown: parsed.markdown, ledgerNames: context.ledgerNames,
+      token: payload.resultUploadToken, deadlineAt: Math.trunc(Number(payload.documentDeadlineAt)),
+      envelope: { pipelineVersion: 2, schemaVersion: 3, jobId: payload.bankStatementJobId, commandId: payload.commandId,
+        identity: payload.agentIdentity, parsed: parsed.parsed, parserDiagnostics: parsed.parserDiagnostics,
+        vectorCandidates, ledgerNames: context.ledgerNames,
         bankAccountCandidates: context.bankAccountCandidates, contextHash: context.contextHash,
-        sourceHash: payload.expectedSha256.toLowerCase(), measurements: { parseMs: parsed.parseMs, markdownBytes: parsed.markdownBytes } },
+        sourceHash: payload.expectedSha256.toLowerCase(), measurements: { parseMs: parsed.parseMs, vectorSearchMs, markdownBytes: parsed.markdownBytes } },
       onProgress: message => this.browserUpload.reportPhase(tokenHash, message.phase),
     });
     if (result.state !== 'completed') throw new Error(result.state === 'recovery'
       ? 'Analysis finished; saving will resume automatically. Check statement status.' : 'Document processing did not complete.');
-    return { uploaded: true, pipelineVersion: 2, sha256: parsed.sha256, parseMs: parsed.parseMs, markdownBytes: parsed.markdownBytes, result };
+    return { uploaded: true, pipelineVersion: 2, sha256: parsed.sha256, parseMs: parsed.parseMs, vectorSearchMs, markdownBytes: parsed.markdownBytes, result };
   }
 
   async parseInWorker(payload) {

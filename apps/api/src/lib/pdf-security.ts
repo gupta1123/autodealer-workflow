@@ -105,7 +105,7 @@ finish({"ok": True, "encrypted": encrypted, "decrypted": encrypted})
 
 function execFileWithInput(command: string, args: string[], input: string) {
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-    const child = execFile(command, args, { encoding: "utf8" }, (error, stdout, stderr) => {
+    const child = execFile(command, args, { encoding: "utf8", timeout: 10_000, windowsHide: true }, (error, stdout, stderr) => {
       if (error) {
         reject(Object.assign(error, { stdout, stderr }));
         return;
@@ -123,8 +123,8 @@ function getPythonCandidates(): PythonCandidate[] {
 
   if (process.platform === "win32") {
     candidates.push(
-      { command: "py", prefixArgs: ["-3"] },
       { command: "python", prefixArgs: [] },
+      { command: "py", prefixArgs: ["-3"] },
       { command: "python3", prefixArgs: [] }
     );
   } else {
@@ -258,4 +258,3 @@ export async function unlockPdfIfNeeded(bytes: Uint8Array, password: string) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
-

@@ -34,6 +34,13 @@ test('status failure stops rather than resending uncertain data', async () => {
   assert.equal(uploads,1);
 });
 
+test('fractional database deadlines are normalized before creating timeout signals', async () => {
+  const result = await uploadDocumentEnvelope({ url: 'http://test/result', statusUrl: 'http://test/status', token: 'secret',
+    envelope: {}, deadlineAt: Date.now() + 60_000.354, fetchImpl: async () =>
+      new Response('{"type":"result","state":"completed"}\n') });
+  assert.equal(result.state, 'completed');
+});
+
 test('checkpoint recovery waits for saving without resending the AI input', async () => {
   const calls = [];
   const result = await uploadDocumentEnvelope({ url: 'http://test/result', statusUrl: 'http://test/status', token: 'secret',

@@ -208,7 +208,8 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
           }
         >
           <span className={styles.tallyStatusDot} aria-hidden="true" />
-          <span className={styles.tallyStatusText}>
+          <span className={styles.tallyStatusCopy}>
+            <span className={styles.tallyStatusText}>
             {tallyStatus === "connected"
               ? "Tally connected"
               : tallyStatus === "checking"
@@ -218,6 +219,10 @@ export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSi
                   : tallyStatus === "unavailable"
                     ? "Status unavailable"
                     : "Tally disconnected"}
+            </span>
+            {tallyCompanyName && tallyStatus === "connected" ? (
+              <span className={styles.tallyStatusCompany}>{tallyCompanyName}</span>
+            ) : null}
           </span>
           <PlugZap className={styles.tallyStatusIcon} aria-hidden="true" />
         </Link>

@@ -252,6 +252,30 @@ function purchaseStageMessage(phase: string) {
   } as Record<string, string>)[phase] ?? `Tally: ${phase.replaceAll("_", " ")}…`;
 }
 
+function purchasePostingFailureMessage(
+  error: string | null | undefined,
+  result: Record<string, unknown> | null | undefined
+) {
+  const raw = error?.trim() || "";
+  const stage = typeof result?.failureStage === "string" ? result.failureStage : "";
+  const sourceDownloadFailed =
+    stage === "preparing_source" ||
+    /fetch failed|source (invoice|document).*(download|pdf)|download.*(invoice|pdf)|certificate|tls/i.test(raw);
+
+  if (sourceDownloadFailed) {
+    return "The connector could not download the source invoice PDF, so nothing was sent to Tally. Check the connector's internet access and retry.";
+  }
+  if (/currently open to|switch to .* before posting/i.test(raw)) return raw;
+  if (/not ready|not reachable|econnrefused|connect.*tally/i.test(raw)) {
+    return "Tally is not ready for posting. Keep the correct company open in Tally, refresh the connection, and retry.";
+  }
+  if (/tally reported \d+ import exception/i.test(raw)) {
+    return "Tally rejected the Purchase voucher during import. No voucher was created, but Tally did not provide a field-level reason. Review the selected masters and tax/deduction setup, then retry.";
+  }
+  if (raw) return raw;
+  return "The Purchase voucher could not be created. Check Tally and retry.";
+}
+
 function FieldIssues({ issues }: { issues?: TallyPostingIssue[] }) {
   if (!issues?.length) return null;
   return (
@@ -394,7 +418,15 @@ function MasterCombobox({
     () => searchPurchaseMasterOptions(options, suggestedNames, search),
     [options, search, suggestedNames]
   );
-  const visibleOptions = visibleState.visibleOptions;
+  const visibleOptions = useMemo(() => {
+    const current = visibleState.visibleOptions;
+    if (search.trim() || !selected || current.some((option) => option.id === selected.id)) {
+      return current;
+    }
+    // Large catalogues are capped for responsive rendering. Keep the current
+    // value visible even when it falls outside that first window.
+    return [selected, ...current.slice(0, 79)];
+  }, [search, selected, visibleState.visibleOptions]);
   const detail = (option: TallyMasterOption) =>
     option.type === "ledger"
       ? [option.groupPath || option.parent, closingBalanceLabel(option)].filter(Boolean)
@@ -569,7 +601,7 @@ function MasterCombobox({
                 ))}
                 {visibleState.hasMore ? (
                   <p className="px-3 py-2 text-center text-[10px] text-slate-400">
-                    Showing the first {visibleOptions.length.toLocaleString("en-IN")} matches. Type more to narrow the list.
+                    Showing {visibleOptions.length.toLocaleString("en-IN")} for speed. Search checks all {options.length.toLocaleString("en-IN")} masters.
                   </p>
                 ) : null}
                 </>
@@ -647,16 +679,31 @@ export type TallyPurchaseHeaderState = {
   verifiedAt: string | null;
 };
 
+export type TallyPurchaseValidationItem = TallyPostingIssue & {
+  targetId: string;
+  overrideKey: string;
+};
+
+export type TallyPurchaseValidationState = {
+  blockers: TallyPurchaseValidationItem[];
+  warnings: TallyPurchaseValidationItem[];
+  checking: boolean;
+};
+
 export function TallyPurchasePostingPanel({
   caseId,
   onApprovePacket,
   onHeaderStateChange,
   onRefreshReady,
+  onValidationStateChange,
+  allowedBlockerKeys = [],
 }: {
   caseId: string;
   onApprovePacket?: () => Promise<void>;
   onHeaderStateChange?: (state: TallyPurchaseHeaderState) => void;
   onRefreshReady?: (refresh: () => Promise<void>) => void;
+  onValidationStateChange?: (state: TallyPurchaseValidationState) => void;
+  allowedBlockerKeys?: string[];
 }) {
   const [payload, setPayload] = useState<TallyPostingResponse | null>(null);
   const approval = usePurchaseApproval(caseId);
@@ -679,6 +726,7 @@ export function TallyPurchasePostingPanel({
   const [editingGstRate, setEditingGstRate] = useState(false);
   const [supplierLedgerMatch, setSupplierLedgerMatch] = useState<SupplierLedgerMatch | null>(null);
   const [matchingSupplierLedger, setMatchingSupplierLedger] = useState(false);
+  const [matchingIndexedSupplierLedger, setMatchingIndexedSupplierLedger] = useState(false);
   const [supplierLedgerMatchError, setSupplierLedgerMatchError] = useState<string | null>(null);
   const [lineMasterMatches, setLineMasterMatches] = useState<PurchaseLineMasterSuggestion[]>([]);
   const [matchingLineMasters, setMatchingLineMasters] = useState(false);
@@ -714,7 +762,14 @@ export function TallyPurchasePostingPanel({
       setSelectedConnectionId(hydrated.selectedConnectionId ?? connectionId ?? "");
       setSelectedCompanyName(hydrated.selectedCompanyName ?? companyName ?? "");
       if (replaceReview || (!dirty && !review)) setReview(hydrated.review);
-      setError(null);
+      setError(
+        hydrated.posting?.status === "failed"
+          ? purchasePostingFailureMessage(
+              hydrated.posting.lastError,
+              hydrated.posting.verificationResult
+            )
+          : null
+      );
       setState("ready");
       return hydrated;
     } catch (loadError) {
@@ -724,17 +779,21 @@ export function TallyPurchasePostingPanel({
     }
   }, [caseId, dirty, review, withLiveMasterOptions]);
 
-  // Resolve the selected connection once, then read a brand-new catalogue
-  // directly through the local gateway. This replaces the old Supabase
-  // command queue + one-second polling loop and also prevents two initial
-  // tally-posting requests from racing each other.
+  // Catalogue load is cache-first: phase 1 fills the ledger dropdowns instantly
+  // from the connector's incrementally synced SQL catalogue (no server
+  // prepare, so no stale snapshot flags), phase 2 verifies against Tally and
+  // runs the server prepare that unlocks auto-matching. Connectors without a
+  // ready local catalogue fall back to a full live read in phase 1.
+  // This replaces the old always-fresh full export on every page open.
   useEffect(() => {
     if(approval.enabled&&approval.loading)return;
     if (automaticLiveRefreshRef.current === caseId) return;
     automaticLiveRefreshRef.current = caseId;
     setLiveMastersReady(false);
+    let cancelled = false;
     void (async () => {
       const next = await load(false, null, true);
+      if (cancelled) return;
       if(approval.enabled&&(!canAccess(approval.snapshot,'purchases.prepare')||approval.workflow?.state!=='draft'))return;
       const connection = next?.connection;
       if (
@@ -745,55 +804,172 @@ export function TallyPurchasePostingPanel({
         !connection.tallyReachable ||
         !connection.companyLoaded
       ) return;
-      try {
-        setRefreshingMasters(true);
-        setNotice("Reading the latest masters from Tally…");
-        const liveMasters = await runCashDiscountLiveRequest({
-          connectionId: next.selectedConnectionId,
-          companyName: next.selectedCompanyName,
-          operation: "ledger_masters",
-          payload: {
-            moduleName: "purchase",
-            persist: false,
-            requireFresh: true,
-            requestedMasterTypes: ["ledger", "group", "stock_item", "unit", "gst_ledger", "tax_ledger"],
-            includeInventoryLocations: Boolean(
-              next.review?.lines.some((line) => line.godownName.trim() || line.batchName.trim())
-            ),
-          },
-          onProgress: (message) => setNotice(message),
-        });
+      const cataloguePayload = {
+        moduleName: "purchase",
+        persist: false,
+        requestedMasterTypes: ["ledger", "group", "stock_item", "unit", "gst_ledger", "tax_ledger"],
+        includeInventoryLocations: Boolean(
+          next.review?.lines.some((line) => line.godownName.trim() || line.batchName.trim())
+        ),
+      };
+      const connectionId = next.selectedConnectionId;
+      const companyName = next.selectedCompanyName;
+      const applyCatalogue = async (liveMasters: unknown, noticeText: string) => {
         const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, next.review);
         liveMasterResultRef.current = liveCatalogue.compactResult;
         liveMasterOptionsRef.current = liveCatalogue.masterOptions;
         const prepared = await prepareTallyPurchasePostingFromLive(
           caseId,
-          next.selectedConnectionId,
-          next.selectedCompanyName,
+          connectionId,
+          companyName,
           liveCatalogue.compactResult
         );
+        if (cancelled) return false;
         const hydrated = withLiveMasterOptions(prepared);
         setPayload(hydrated);
         setReview(hydrated.review);
         setSupplierLedgerMatch(hydrated.supplierLedgerMatch ?? null);
         setLineMasterMatches(hydrated.lineMasterMatches ?? []);
+        setSupplierLedgerMatchError(null);
+        setLineMasterMatchError(null);
         setLiveMastersReady(true);
-        setNotice("Latest live Tally data loaded.");
+        setNotice(noticeText === "Latest live Tally data loaded." ? null : noticeText);
+        return true;
+      };
+      // Fill dropdowns and resolve fixed masters from SQL immediately. This
+      // preview is non-authoritative; the live incremental pass below remains
+      // responsible for approval freshness and final validation.
+      const applyCachedOptions = async (liveMasters: unknown) => {
+        const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, next.review);
+        liveMasterResultRef.current = liveCatalogue.compactResult;
+        liveMasterOptionsRef.current = liveCatalogue.masterOptions;
+        setPayload((current) => current ? { ...current, masterOptions: liveCatalogue.masterOptions } : current);
+        setLiveMastersReady(true);
+        try {
+          // Resolve fixed/deterministic masters from SQL immediately. Supplier
+          // selection stays independent and is populated only by its dedicated
+          // exact/GSTIN/vector path. Live validation still runs before approval.
+          const prepared = await prepareTallyPurchasePostingFromLive(
+            caseId,
+            connectionId,
+            companyName,
+            liveCatalogue.compactResult,
+            true
+          );
+          if (cancelled) return;
+          const hydrated = withLiveMasterOptions(prepared);
+          const cachedReview = {
+            ...hydrated.review,
+            supplierLedgerName: next.review.supplierLedgerName,
+          };
+          setPayload({ ...hydrated, review: cachedReview, liveMatchingComplete: false });
+          setReview(cachedReview);
+          setLineMasterMatches(hydrated.lineMasterMatches ?? []);
+        } catch {
+          // An unusable cached preview must never prevent the authoritative
+          // incremental Tally validation that follows.
+        }
+      };
+      const servedFromCache = (liveMasters: unknown) => {
+        const record = liveMasters as { validation?: { mode?: unknown }; cache?: { source?: unknown } } | null;
+        return (
+          record?.validation?.mode === "incremental_alter_id" ||
+          record?.cache?.source === "encrypted_local_agent_incremental"
+        );
+      };
+      const verifyFreshCatalogue = async (hadCachedOptions: boolean) => {
+        try {
+          const liveMasters = await runCashDiscountLiveRequest({
+            connectionId,
+            companyName,
+            operation: "ledger_masters",
+            payload: { ...cataloguePayload, requireFresh: true },
+            onProgress: (message) => { if (!cancelled) setNotice(message); },
+          });
+          if (cancelled) return;
+          await applyCatalogue(liveMasters, "Latest live Tally data loaded.");
+        } catch (verifyError) {
+          if (cancelled) return;
+          if (hadCachedOptions) {
+            setNotice("Saved catalogue loaded. Live verification unavailable — refresh to retry.");
+          } else {
+            setError(verifyError instanceof Error ? verifyError.message : "Live Tally refresh is unavailable.");
+            setNotice(null);
+          }
+        }
+      };
+      try {
+        setRefreshingMasters(true);
+        setNotice("Loading saved Tally catalogue…");
+        const cachedMasters = await runCashDiscountLiveRequest({
+          connectionId,
+          companyName,
+          operation: "ledger_masters",
+          payload: cataloguePayload,
+          onProgress: (message) => { if (!cancelled) setNotice(message); },
+        });
+        if (cancelled) return;
+        if (!servedFromCache(cachedMasters)) {
+          // No local catalogue: the connector already did a full live read.
+          await applyCatalogue(cachedMasters, "Latest live Tally data loaded.");
+          return;
+        }
+        try {
+          await applyCachedOptions(cachedMasters);
+        } catch {
+          // Cached shape unusable: fall through to the fresh read below.
+          await verifyFreshCatalogue(false);
+          return;
+        }
+        if (cancelled) return;
+        setNotice("Loaded saved catalogue. Verifying latest changes…");
+        await verifyFreshCatalogue(true);
       } catch (refreshError) {
-        setError(refreshError instanceof Error ? refreshError.message : "Live Tally refresh is unavailable.");
-        setNotice(null);
+        if (cancelled) return;
+        // Phase 1 failed (no connector response): one fresh attempt, matching
+        // the old single-read behavior, before surfacing an error.
+        try {
+          const liveMasters = await runCashDiscountLiveRequest({
+            connectionId,
+            companyName,
+            operation: "ledger_masters",
+            payload: { ...cataloguePayload, requireFresh: true },
+            onProgress: (message) => { if (!cancelled) setNotice(message); },
+          });
+          if (cancelled) return;
+          await applyCatalogue(liveMasters, "Latest live Tally data loaded.");
+        } catch (fallbackError) {
+          if (!cancelled) {
+            setError(fallbackError instanceof Error ? fallbackError.message : "Live Tally refresh is unavailable.");
+            setNotice(null);
+          }
+        }
       } finally {
-        setRefreshingMasters(false);
+        if (!cancelled) setRefreshingMasters(false);
       }
     })();
+    return () => {
+      cancelled = true;
+      // This effect can be restarted before its asynchronous catalogue load
+      // completes (notably by React Strict Mode and approval-state changes).
+      // Release this run's guard so the replacement effect is allowed to load
+      // the cached catalogue and perform its incremental live verification.
+      if (automaticLiveRefreshRef.current === caseId) {
+        automaticLiveRefreshRef.current = null;
+      }
+    };
   }, [caseId,approval.enabled,approval.loading]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (!liveMastersReady || !selectedConnectionId || !selectedCompanyName || !review?.supplierName) return;
+    if (!liveMastersReady || !selectedConnectionId || !selectedCompanyName || !review?.supplierName) {
+      setMatchingIndexedSupplierLedger(false);
+      return;
+    }
     const key = JSON.stringify([selectedConnectionId, selectedCompanyName, review.supplierName, review.supplierGstin]);
     if (localSupplierSuggestionKeyRef.current === key) return;
     localSupplierSuggestionKeyRef.current = key;
     let cancelled = false;
+    setMatchingIndexedSupplierLedger(true);
     void runCashDiscountLiveRequest<{
       matches?: Record<string, { suggestions?: Array<{ ledger?: { name?: string } }> }>;
     }>({
@@ -822,7 +998,9 @@ export function TallyPurchasePostingPanel({
           reason: current?.reason || "Closest ledger names from the encrypted Local Agent index.",
         };
       });
-    }).catch(() => {});
+    }).catch(() => {}).finally(() => {
+      if (!cancelled) setMatchingIndexedSupplierLedger(false);
+    });
     return () => { cancelled = true; };
   }, [liveMastersReady, review?.supplierGstin, review?.supplierName, selectedCompanyName, selectedConnectionId]);
 
@@ -854,12 +1032,25 @@ export function TallyPurchasePostingPanel({
             if (!terminal) continue;
             if (!cancelled) {
               if (terminal.status !== "succeeded") {
-                // Failure and verification-required states carry richer server
-                // diagnostics than the compact command result. They are rare,
-                // so retain the full refresh only for those paths.
-                await load(true, connectionId, false, payload?.selectedCompanyName);
+                const failureMessage = purchasePostingFailureMessage(terminal.error, terminal.result);
+                // Keep the already-loaded live master catalogue and validated
+                // selections. A plain posting reload has no live catalogue and
+                // temporarily turns valid selections into false "missing"
+                // corrections after an unrelated connector failure.
+                setPayload((current) => {
+                  if (!current?.posting) return current;
+                  return {
+                    ...current,
+                    posting: {
+                      ...current.posting,
+                      status: "failed",
+                      lastError: failureMessage,
+                      updatedAt: terminal.updatedAt ?? current.posting.updatedAt,
+                    },
+                  };
+                });
                 setNotice(null);
-                setError(terminal.error ?? "Tally could not create the Purchase voucher.");
+                setError(failureMessage);
                 return;
               }
               const result = terminal.result ?? {};
@@ -954,7 +1145,10 @@ export function TallyPurchasePostingPanel({
 
     if (status === "failed") {
       setNotice(null);
-      setError(payload?.posting?.lastError || "Tally could not create the Purchase voucher.");
+      setError(purchasePostingFailureMessage(
+        payload?.posting?.lastError,
+        payload?.posting?.verificationResult
+      ));
       return;
     }
 
@@ -1050,6 +1244,7 @@ export function TallyPurchasePostingPanel({
     const supplierGstin = review?.supplierGstin?.trim() ?? "";
     if (
       locked ||
+      refreshingMasters ||
       payload?.liveMatchingComplete ||
       review?.supplierLedgerName?.trim() ||
       (!supplierName && !supplierGstin) ||
@@ -1094,6 +1289,7 @@ export function TallyPurchasePostingPanel({
   }, [
     caseId,
     locked,
+    refreshingMasters,
     payload?.liveMatchingComplete,
     payload?.connection?.masterSnapshotComplete,
     payload?.connection?.masterSnapshotFresh,
@@ -1109,6 +1305,7 @@ export function TallyPurchasePostingPanel({
   useEffect(() => {
     if (
       locked ||
+      refreshingMasters ||
       payload?.liveMatchingComplete ||
       !review ||
       !selectedConnectionId ||
@@ -1177,6 +1374,7 @@ export function TallyPurchasePostingPanel({
   }, [
     caseId,
     locked,
+    refreshingMasters,
     payload?.liveMatchingComplete,
     payload?.connection?.masterSnapshotComplete,
     payload?.connection?.masterSnapshotFresh,
@@ -1237,17 +1435,14 @@ export function TallyPurchasePostingPanel({
     },
     [ledgerOptions]
   );
+  const supplierLedgerLoading = matchingSupplierLedger || matchingIndexedSupplierLedger;
+  const masterValidationPending =
+    !liveMastersReady || refreshingMasters || supplierLedgerLoading || matchingLineMasters;
   const correctionBlockers = useMemo(
-    () => ["created", "verification_required"].includes(payload?.posting?.status ?? "")
+    () => masterValidationPending || ["created", "verification_required"].includes(payload?.posting?.status ?? "")
       ? []
       : (payload?.blockers ?? []).filter((issue) => {
       if (issue.scope === "case" || issue.scope === "company") return false;
-      if (!liveMastersReady && (
-        issue.code === "STOCK_ITEM_REQUIRED" ||
-        issue.code === "PURCHASE_LEDGER_REQUIRED" ||
-        issue.code === "SUPPLIER_LEDGER_REQUIRED" ||
-        issue.code.endsWith("_LEDGER_REQUIRED")
-      )) return false;
       // Server blockers describe the last saved review. Clear date errors as
       // soon as the current browser value is valid; Save still performs the
       // authoritative server validation before approval.
@@ -1255,7 +1450,13 @@ export function TallyPurchasePostingPanel({
       if (issue.code === "VOUCHER_DATE_REQUIRED" && isValidDateInput(review?.voucherDate)) return false;
       return true;
     }),
-    [liveMastersReady, payload?.blockers, payload?.posting?.status, review?.invoiceDate, review?.voucherDate]
+    [masterValidationPending, payload?.blockers, payload?.posting?.status, review?.invoiceDate, review?.voucherDate]
+  );
+  const remainingCorrectionBlockers = useMemo(
+    () => correctionBlockers.filter((item) =>
+      !allowedBlockerKeys.includes(`${item.code}:${item.lineId ?? item.scope}`)
+    ),
+    [allowedBlockerKeys, correctionBlockers]
   );
   const acknowledgementWarnings = useMemo(
     () => (payload?.warnings ?? []).filter((warning) => warning.requiresAcknowledgement),
@@ -1276,6 +1477,22 @@ export function TallyPurchasePostingPanel({
     }
     return map;
   }, [payload?.warnings]);
+
+  useEffect(() => {
+    onValidationStateChange?.({
+      blockers: correctionBlockers.map((item) => ({
+        ...item,
+        targetId: issueAnchor(item),
+        overrideKey: `${item.code}:${item.lineId ?? item.scope}`,
+      })),
+      warnings: (payload?.warnings ?? []).map((item) => ({
+        ...item,
+        targetId: issueAnchor(item),
+        overrideKey: `${item.code}:${item.lineId ?? item.scope}`,
+      })),
+      checking: masterValidationPending,
+    });
+  }, [correctionBlockers, masterValidationPending, onValidationStateChange, payload?.warnings]);
 
   const issuesByScope = useMemo(() => {
     const map = new Map<string, TallyPostingIssue[]>();
@@ -1404,13 +1621,33 @@ export function TallyPurchasePostingPanel({
       setApprovingPacket(true);
       setError(null);
       await onApprovePacket();
-      const next = await load(
-        true,
-        selectedConnectionId || null,
-        false,
-        selectedCompanyName || null
-      );
+      const liveApprovalContext = liveMasterResultRef.current && liveMasterOptionsRef.current && review
+        ? prepareLiveTallyApprovalContext(
+            liveMasterResultRef.current,
+            review,
+            liveMasterOptionsRef.current
+          )
+        : null;
+      const next = liveApprovalContext && selectedConnectionId && selectedCompanyName
+        ? await prepareTallyPurchasePostingFromLive(
+            caseId,
+            selectedConnectionId,
+            selectedCompanyName,
+            liveApprovalContext,
+            true
+          )
+        : await load(
+            true,
+            selectedConnectionId || null,
+            false,
+            selectedCompanyName || null
+          );
       if (!next) return;
+      const hydrated = withLiveMasterOptions(next);
+      setPayload(hydrated);
+      setReview(hydrated.review);
+      setSelectedConnectionId(hydrated.selectedConnectionId ?? selectedConnectionId);
+      setSelectedCompanyName(hydrated.selectedCompanyName ?? selectedCompanyName);
       setNotice("Packet approved. The Purchase voucher can now be sent to Tally.");
     } catch (approvalError) {
       setError(
@@ -1425,7 +1662,7 @@ export function TallyPurchasePostingPanel({
 
   async function handleApproveAndQueue() {
     if (
-      !payload?.readyForApproval ||
+      !effectivelyReadyForApproval ||
       dirty ||
       connectionDirty ||
       postingLocked ||
@@ -1456,6 +1693,7 @@ export function TallyPurchasePostingPanel({
       const next = await approveAndQueueTallyPurchasePosting(
         caseId,
         acknowledgementWarnings.map((warning) => warning.code),
+        allowedBlockerKeys,
         selectedConnectionId,
         selectedCompanyName,
         approvalContext,
@@ -1596,7 +1834,8 @@ export function TallyPurchasePostingPanel({
       connection.companyName &&
       (!connection.masterSnapshotFresh || !connection.masterSnapshotComplete)
   );
-  const masterSelectionDisabled = locked || refreshingMasters;
+  const deterministicMastersLoading = refreshingMasters && !liveMastersReady;
+  const masterSelectionDisabled = locked || deterministicMastersLoading;
   const selectedMatchesActive = Boolean(
     connectionReadable &&
       connection?.companyName &&
@@ -1609,10 +1848,19 @@ export function TallyPurchasePostingPanel({
   // master refresh instead of queueing one on every page open.
   const tallyReviewRefreshing = refreshingMasters;
   const staleMastersBlocking = Boolean(
-    payload?.blockers.some((blocker) => blocker.code === "TALLY_MASTERS_STALE")
+    payload?.blockers.some((blocker) =>
+      blocker.code === "TALLY_MASTERS_STALE" &&
+      !allowedBlockerKeys.includes(`${blocker.code}:${blocker.lineId ?? blocker.scope}`)
+    )
   );
+  const allBlockersAllowed = Boolean(
+    payload?.blockers.length && payload.blockers.every((blocker) =>
+      allowedBlockerKeys.includes(`${blocker.code}:${blocker.lineId ?? blocker.scope}`)
+    )
+  );
+  const effectivelyReadyForApproval = Boolean(payload?.readyForApproval || allBlockersAllowed);
   const canApprove = Boolean(
-    payload?.readyForApproval &&
+    effectivelyReadyForApproval &&
     payload?.posting &&
     !hasUnsavedChanges &&
     !postingLocked &&
@@ -1624,7 +1872,7 @@ export function TallyPurchasePostingPanel({
   const masterContext = {
     companyName: connection?.companyName ?? selectedCompanyName,
     syncedAt: connection?.masterSyncedAt,
-    syncing: refreshingMasters,
+    syncing: deterministicMastersLoading,
   };
   if (state === "loading" && !payload) {
     return (
@@ -1920,40 +2168,7 @@ export function TallyPurchasePostingPanel({
         </section>
       ) : null}
 
-      {payload.posting?.status === "created" ? null : correctionBlockers.length > 0 ? (
-        <section className="rounded-2xl border border-rose-200 bg-white p-4 shadow-sm">
-          <div className="flex items-start gap-3">
-            <div className="rounded-lg bg-rose-50 p-2 text-rose-600">
-              <AlertTriangle className="h-4 w-4" />
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <h3 className="text-sm font-semibold text-rose-950">
-                    {correctionBlockers.length} item{correctionBlockers.length === 1 ? "" : "s"} required before approval
-                  </h3>
-                  <p className="mt-0.5 text-xs text-rose-700">Select an item to go to the field that needs attention.</p>
-                </div>
-                {hasUnsavedChanges ? (
-                  <Badge variant="outline" className="border-amber-200 bg-amber-50 text-amber-700">Save to check changes</Badge>
-                ) : null}
-              </div>
-              <div className="mt-3 flex flex-wrap gap-2">
-                {correctionBlockers.map((blocker, index) => (
-                  <button
-                    className="rounded-full border border-rose-200 bg-rose-50 px-3 py-1.5 text-left text-xs font-medium text-rose-800 transition hover:border-rose-300 hover:bg-rose-100"
-                    key={`${blocker.code}:${blocker.lineId ?? index}`}
-                    onClick={() => document.getElementById(issueAnchor(blocker))?.scrollIntoView({ behavior: "smooth", block: "start" })}
-                    type="button"
-                  >
-                    {blocker.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-        </section>
-      ) : tallyReviewRefreshing ? (
+      {payload.posting?.status !== "created" && correctionBlockers.length === 0 && tallyReviewRefreshing ? (
         <section className="flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-[11px] text-blue-800">
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
           Checking latest Tally data…
@@ -1975,8 +2190,6 @@ export function TallyPurchasePostingPanel({
           </div>
         </section>
       ) : null}
-
-      <ReviewWarnings warnings={scopeWarnings("case")} />
 
       <section className="scroll-mt-24 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" id="tally-invoice">
         <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2.5 sm:px-5">
@@ -2028,7 +2241,7 @@ export function TallyPurchasePostingPanel({
             <MasterCombobox
               {...masterContext}
               compact
-              disabled={masterSelectionDisabled}
+              disabled={locked || !liveMastersReady || supplierLedgerLoading}
               emptyMessage="No ledger matched this search in the selected Tally company."
               id="field-supplier-ledger"
               issues={scopeIssues("invoice", ["SUPPLIER_LEDGER_REQUIRED", "SUPPLIER_LEDGER_GSTIN_MISMATCH"])}
@@ -2039,32 +2252,9 @@ export function TallyPurchasePostingPanel({
                 ...(supplierLedgerMatch?.ledgerName ? [supplierLedgerMatch.ledgerName] : []),
                 ...(supplierLedgerMatch?.candidateLedgerNames ?? []),
               ]}
+              syncing={!liveMastersReady || supplierLedgerLoading}
               value={review.supplierLedgerName}
             />
-            {matchingSupplierLedger ? (
-              <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] font-medium text-slate-600 lg:col-span-2">
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-600" />
-                Checking the supplier against all Tally ledgers…
-              </div>
-            ) : null}
-            {supplierLedgerMatch?.matchType === "close_match" && supplierLedgerMatch.candidateLedgerNames.length > 0 ? (
-              <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 lg:col-span-2">
-                <div className="text-[10px] font-semibold uppercase tracking-wide text-amber-800">Close matches — choose one</div>
-                <p className="mt-1 text-[10px] leading-4 text-amber-700">{supplierLedgerMatch.reason || "More than one Tally ledger may represent this supplier."}</p>
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  {supplierLedgerMatch.candidateLedgerNames.map((ledgerName) => (
-                    <button
-                      className="rounded-lg border border-amber-200 bg-white px-2.5 py-1.5 text-left text-[11px] font-semibold text-slate-800 shadow-sm transition hover:border-emerald-300 hover:bg-emerald-50"
-                      key={ledgerName}
-                      onClick={() => updateReview("supplierLedgerName", ledgerName)}
-                      type="button"
-                    >
-                      {ledgerName}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ) : null}
             {supplierLedgerMatch?.matchType === "suspense" ? (
               <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-[10px] leading-4 text-slate-500 lg:col-span-2">
                 No ledger was safe to select automatically. Search the complete ledger list above.
@@ -2204,16 +2394,6 @@ export function TallyPurchasePostingPanel({
                     suggestedNames={rankedStockItems.suggestedNames}
                     value={line.stockItemName}
                   />
-                  {masterMatch?.stockItem.matchType === "close_match" ? (
-                    <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] text-amber-900">
-                      <div className="font-semibold">Choose the matching stock item</div>
-                      <div className="mt-1 flex flex-wrap gap-1">
-                        {stockCandidates.map((name) => (
-                          <button className="rounded-full border border-amber-200 bg-white px-2 py-1 font-medium hover:border-emerald-300 hover:text-emerald-700" key={name} onClick={() => updateLine(index, "stockItemName", name)} type="button">{name}</button>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
                 </div>
                 <div>
                   <MasterCombobox
@@ -2229,16 +2409,6 @@ export function TallyPurchasePostingPanel({
                     suggestedNames={rankedPurchaseLedgers.suggestedNames}
                     value={line.purchaseLedgerName}
                   />
-                  {masterMatch?.purchaseLedger.matchType === "close_match" ? (
-                    <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] text-amber-900">
-                      <div className="font-semibold">Choose the purchase ledger</div>
-                      <div className="mt-1 flex flex-wrap gap-1">
-                        {purchaseCandidates.map((name) => (
-                          <button className="rounded-full border border-amber-200 bg-white px-2 py-1 font-medium hover:border-emerald-300 hover:text-emerald-700" key={name} onClick={() => updateLine(index, "purchaseLedgerName", name)} type="button">{name}</button>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
                 </div>
                 <div>
                   <MasterCombobox
@@ -2683,19 +2853,23 @@ export function TallyPurchasePostingPanel({
         <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2.5 sm:px-5">
           <h3 className="text-sm font-semibold text-slate-950">Confirm Purchase voucher</h3>
           <div className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-semibold ${
-            correctionBlockers.length > 0
+            remainingCorrectionBlockers.length > 0
               ? "border-rose-200 bg-rose-50 text-rose-700"
+              : correctionBlockers.length > 0
+                ? "border-amber-200 bg-amber-50 text-amber-700"
               : hasUnsavedChanges
                 ? "border-amber-200 bg-amber-50 text-amber-700"
                 : "border-emerald-200 bg-emerald-50 text-emerald-700"
           }`}>
-            {correctionBlockers.length > 0 ? (
+            {remainingCorrectionBlockers.length > 0 ? (
               <AlertTriangle className="h-3.5 w-3.5" />
             ) : (
               <CheckCircle2 className="h-3.5 w-3.5" />
             )}
-            {correctionBlockers.length > 0
-              ? `${correctionBlockers.length} correction${correctionBlockers.length === 1 ? "" : "s"} remaining`
+            {remainingCorrectionBlockers.length > 0
+              ? `${remainingCorrectionBlockers.length} correction${remainingCorrectionBlockers.length === 1 ? "" : "s"} remaining`
+              : correctionBlockers.length > 0
+                ? `${correctionBlockers.length} override${correctionBlockers.length === 1 ? "" : "s"} allowed`
               : hasUnsavedChanges
                 ? "Save to check"
                 : "Accounting checks passed"}
@@ -2843,7 +3017,7 @@ export function TallyPurchasePostingPanel({
         </div>
       </section>
 
-      <PurchaseApprovalControls approval={approval} hasUnsavedChanges={hasUnsavedChanges} ready={Boolean(payload.posting&&payload.readyForApproval)} />
+      <PurchaseApprovalControls approval={approval} hasUnsavedChanges={hasUnsavedChanges} ready={Boolean(payload.posting && effectivelyReadyForApproval)} />
       {(error || notice) ? (
         <div className={`sticky bottom-24 z-20 rounded-xl border px-4 py-3 text-sm shadow-lg ${
           error

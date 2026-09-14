@@ -29,7 +29,7 @@ export async function readDocumentProgress(response: Response, onStatus: (status
   let complete = false;
   const labels: Record<string, string> = {
     preparing_document: "Preparing document", parsing_document: "Document parsing",
-    analyzing_document: "Analyzing transactions", complete: "Finalizing results",
+    vector_matching: "Finding ledger candidates", analyzing_document: "Selecting ledgers", complete: "Finalizing results",
     saving_preview: "Finalizing results", recovery_pending: "Finalizing results",
   };
   try {
@@ -106,7 +106,7 @@ export async function sendLedgerContextToLocalAgent(token: string, context: Loca
     });
     const result = await response.json();
     if (response.ok && result.accepted === true) return result.contextHash as string;
-    if (response.status !== 409 || result.code !== 'CONTEXT_NOT_READY') throw new Error(result.error || 'Ledger context was rejected.');
+    if (response.status !== 202 || result.code !== 'CONTEXT_NOT_READY') throw new Error(result.error || 'Ledger context was rejected.');
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
   throw new Error('The selected agent did not accept the ledger context before its deadline.');

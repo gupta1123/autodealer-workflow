@@ -1,4 +1,4 @@
-export const AGENT_VERSION = "1.1.7";
+export const AGENT_VERSION = "1.2.5";
 export const AGENT_PROTOCOL_VERSION = 1;
 export const LOCAL_SCHEMA_VERSION = 3;
 export const TDL_REPORT_VERSION = 1;
@@ -14,7 +14,7 @@ export const AGENT_CAPABILITIES = Object.freeze([
   "browser-document-upload-v1",
   "bank-local-pipeline-v2",
   "local-zvec-v1",
-  "local-ledger-embeddings-v2",
+  "openrouter-ledger-embeddings-v3",
   "shared-incremental-catalogue-v1",
   "purchase-catalogue-freshness-v1",
   "stable-dataset-identity-v1",
@@ -23,6 +23,9 @@ export const AGENT_CAPABILITIES = Object.freeze([
   "purchase-bounded-reads-v1",
   "purchase-strict-readback-v1",
   "followup-voucher-delta-v1",
+  "bank-voucher-batch-v1",
+  "bank-reference-preflight-v1",
+  "document-cli-v1",
 ]);
 
 export const JOB_CLASSES = Object.freeze({

@@ -5,6 +5,10 @@ import { prepareLocalPreview } from './bank-local-preview.mjs';
 import { cancellableFetch } from './bank-local-v2-cancellation.mjs';
 
 export const BANK_LOCAL_V2_CAPABILITY = 'bank-local-pipeline-v2';
+export function effectiveEnvelopeLedgerCount(envelope) {
+  if (envelope.ledgerNames.length) return new Set(envelope.ledgerNames.map(name => name.trim().toLocaleLowerCase('en-IN')).filter(Boolean)).size;
+  return new Set((envelope.vectorCandidates || []).flat().map(candidate => candidate.ledgerName?.trim().toLocaleLowerCase('en-IN')).filter(Boolean)).size;
+}
 export const contextDigest = context => createHash('sha256').update(JSON.stringify({
   ledgerNames: context.ledgerNames, bankAccountCandidates: context.bankAccountCandidates,
 })).digest('hex');
@@ -12,8 +16,11 @@ export const contextDigest = context => createHash('sha256').update(JSON.stringi
 export function decodeLocalBankEnvelope(bytes) {
   if (!bytes.length || bytes.length > 25 * 1024 * 1024) throw new Error('Invalid document envelope size.');
   const envelope = JSON.parse(gunzipSync(bytes, { maxOutputLength: 100 * 1024 * 1024 }).toString('utf8'));
-  if (envelope.pipelineVersion !== 2 || typeof envelope.markdown !== 'string' || !envelope.markdown.trim()
-    || !Array.isArray(envelope.ledgerNames) || envelope.ledgerNames.length < 1 || envelope.ledgerNames.length > 20000
+  const hasMarkdown = typeof envelope.markdown === 'string' && envelope.markdown.trim();
+  const hasStructured = envelope.schemaVersion === 3 && envelope.parsed && Array.isArray(envelope.parsed.transactions)
+    && Array.isArray(envelope.vectorCandidates) && envelope.vectorCandidates.length === envelope.parsed.transactions.length;
+  if (envelope.pipelineVersion !== 2 || (!hasMarkdown && !hasStructured)
+    || !Array.isArray(envelope.ledgerNames) || (!hasStructured && envelope.ledgerNames.length < 1) || envelope.ledgerNames.length > 20000
     || envelope.ledgerNames.some(name => typeof name !== 'string') || !Array.isArray(envelope.bankAccountCandidates)
     || !/^[a-f0-9]{64}$/i.test(envelope.sourceHash || '') || !envelope.identity || !envelope.jobId || !envelope.commandId
     || contextDigest(envelope) !== envelope.contextHash) throw new Error('Invalid document envelope or context hash.');
@@ -46,14 +53,21 @@ export async function processLocalBankV2({ envelope, store, analyze = (input, co
     signal?.throwIfAborted();
     // These are the exact complete inputs of the existing v1 invocation. There
     // is deliberately no filtering, new prompt or second matching pass here.
-    const extraction = await measured('aiMs', () => analyze({ markdown: envelope.markdown,
-      ledgerNames: envelope.ledgerNames, bankAccountCandidates: envelope.bankAccountCandidates,
-      traceId: envelope.commandId }, { signal }));
+    const analysisInput = { markdown: envelope.markdown, ledgerNames: envelope.ledgerNames, identity: envelope.identity,
+      bankAccountCandidates: envelope.bankAccountCandidates, traceId: envelope.commandId,
+      ...(envelope.parsed ? { parsed: envelope.parsed, vectorCandidates: envelope.vectorCandidates,
+        parserDiagnostics: envelope.parserDiagnostics, connectorMeasurements: envelope.measurements } : {}) };
+    const extraction = await measured('aiMs', () => analyze(analysisInput, { signal }));
     signal?.throwIfAborted();
+    const effectiveLedgerNames = envelope.ledgerNames.length ? envelope.ledgerNames
+      : [...new Set((envelope.vectorCandidates || []).flat().map(candidate => candidate.ledgerName).filter(Boolean))];
     prepared = await measured('validationMs', () => prepareLocalPreview({ data: extraction.data,
       diagnostics: { source: 'local_agent', sourceRetention: 'local_only', installationId: envelope.identity.installationId,
-        auditHash: createHash('sha256').update(envelope.markdown).digest('hex'), markdownChars: envelope.markdown.length,
-        aiMs: extraction.aiMs, coverage: extraction.coverage } }, envelope.ledgerNames));
+        auditHash: createHash('sha256').update(envelope.markdown || JSON.stringify(envelope.parsed)).digest('hex'),
+        markdownChars: envelope.markdown?.length || 0,
+        aiMs: extraction.aiMs, coverage: extraction.coverage, mode: extraction.mode,
+        parserDiagnostics: extraction.parserDiagnostics, vectorCandidateCount: extraction.vectorCandidateCount,
+        vectorCandidates: extraction.vectorCandidates, connectorMeasurements: extraction.connectorMeasurements } }, effectiveLedgerNames));
     digest = createHash('sha256').update(JSON.stringify(prepared)).digest('hex');
     await report({ phase: 'saving_preview' });
   } catch (error) {

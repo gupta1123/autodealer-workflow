@@ -13,7 +13,16 @@ export async function teamBankParsing(request:Request,connectionId:string,select
  if(error)throw error;
  if(!data)throw new AccessError('The selected connector pairing changed.',409);
  const policy=bankParsingPolicy(data,{companyName:scope.link.company_name,year:scope.link.financial_year,ownerUserId:scope.connection.owner_user_id});
- if(policy.mode==='local_agent'&&(!policy.identity||policy.identity.organizationId!==scope.access.organizationId||policy.identity.companyGuid!==scope.link.company_guid))
-  throw new AccessError('The paired agent does not match this organization and company.',409);
+ if(policy.mode==='local_agent') {
+  if(!policy.identity||policy.identity.organizationId!==scope.access.organizationId||policy.identity.companyGuid!==scope.link.company_guid)
+   throw new AccessError('The paired agent does not match this organization and company.',409);
+  // The agent policy normalizes short financial years (2026-27) for matching
+  // against Tally's snapshot. Once verified, keep the persisted access-link
+  // identity in the ticket because every live/queued authorization check is
+  // bound to that exact dataset key.
+  policy.identity.companyGuid=scope.link.company_guid;
+  policy.identity.companyName=scope.link.company_name;
+  policy.identity.financialYear=scope.link.financial_year;
+ }
  return {scope,connection:data,policy};
 }

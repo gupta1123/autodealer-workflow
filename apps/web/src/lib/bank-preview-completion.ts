@@ -18,7 +18,9 @@ export function createBankPreviewCompletion<T extends Snapshot>(options: {
   const fail = (error: Error) => { if (!terminal) { terminal = true; cleanup(); reject(error); } };
   const schedule = () => {
     clearTimeout(polling);
-    if (!terminal && !online) polling = setTimeout(() => { void check().finally(schedule); }, options.pollMs ?? 15000);
+    // The socket is only a low-latency hint. It can remain connected while a
+    // terminal job event is missed, so durable status polling must never stop.
+    if (!terminal) polling = setTimeout(() => { void check().finally(schedule); }, options.pollMs ?? 15000);
   };
   const check = () => {
     if (terminal) return Promise.resolve();

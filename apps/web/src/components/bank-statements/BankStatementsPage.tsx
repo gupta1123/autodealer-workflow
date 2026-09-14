@@ -1,11 +1,12 @@
 "use client";
 
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {useActionAccess} from '@/components/access/useActionAccess';
 import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import {
   AlertTriangle,
+  Download,
   ArrowLeftRight,
   ArrowRight,
   CalendarDays,
@@ -23,18 +24,28 @@ import {
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
+import { TallyConnectionPill } from "@/components/tally/TallyConnectionPill";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { CompanyAvatar } from "@/components/ui/company-avatar";
 import { apiFetch } from "@/lib/api-client";
 import {companyOptionIdentity} from '@/lib/company-option-identity';
 import {useAccess} from '@/components/access/AccessProvider';
 import { localPdfMetadata, sendPdfToLocalAgent, sendLedgerContextToLocalAgent, cancelLocalDocument, assertLocalBankContextIdentity } from "@/lib/local-bank-document";
 import { createBankPreviewCompletion } from '@/lib/bank-preview-completion';
 import { watchBankJob } from '@/lib/cash-discount-live';
-import { allocateReceiptByFifo } from "@/lib/bank-statement-bill-allocation";
+import { allocateReceiptByFifo, applyFifoAllocationsToBills } from "@/lib/bank-statement-bill-allocation";
+import { buildBankBookCsv } from "@/lib/bank-book-csv";
+import { isPreviewExtractionIncomplete } from "@/lib/bank-statement-extraction-state";
+import { isReadyForTallyPosting } from "@/lib/bank-statement-posting-readiness";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 import { pdfToImagePages } from "@/services/pdf";
+
+const MAX_BANK_LEDGER_MENU_OPTIONS = 80;
+const MAX_INITIAL_LEDGER_MENU_OPTIONS = 80;
+const ledgerParentIndexCache = new WeakMap<TallyMaster[], Map<string, string | null>>();
+const ledgerMasterIndexCache = new WeakMap<TallyMaster[], Map<string, TallyMaster>>();
 
 type BankAccount = {
   id: string;
@@ -65,6 +76,7 @@ type CompanyOption = {
   connectionId: string;
   companyName: string;
   financialYear: string;
+  companyGuid?: string | null;
   status: string;
   bridgeConnected: boolean;
   tallyReachable: boolean;
@@ -263,6 +275,7 @@ type PreviewTransaction = {
   confirmedLedgerName?: string | null;
   rawPayload?: {
     aiLedgerRecommendation?: LedgerRecommendation | null;
+    vectorLedgerCandidates?: Array<{ ledgerName?: string | null; tallyGuid?: string | null; parentGroup?: string | null }>;
   } | null;
 };
 
@@ -354,14 +367,20 @@ type DocumentPreviewKind = "csv" | "text" | "pdf" | "image" | "unsupported";
 
 type DocumentPreviewState = {
   fileName: string;
+  fileSize?: number | null;
+  fileLastModified?: number | null;
   kind: DocumentPreviewKind;
   headers: string[];
   rows: string[][];
   totalRows: number;
+  totalColumns?: number | null;
   textLines: string[];
   objectUrl: string | null;
   error: string | null;
 };
+
+const MAX_STATEMENT_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_PDF_PREVIEW_PAGES = 30;
 
 type ApiErrorPayload = {
   error?: string;
@@ -371,13 +390,36 @@ type ApiErrorPayload = {
   diagnostics?: unknown;
 };
 
+function ExtractionEngineBadge({ source }: { source?: string | null }) {
+  if (!source) return null;
+  const isQuick = source === "connector_anydoc_vector_v1" || source === "anydoc_markdown_v1" || source === "csv_text_v1";
+
+  return (
+    <span
+      aria-label={isQuick ? "Quick AnyDoc extraction" : "Slow extraction path"}
+      title={isQuick ? "Quick AnyDoc Markdown extraction" : "Slow PDF/image extraction"}
+      className={`inline-flex h-5 min-w-5 items-center justify-center rounded-full border px-1.5 text-[10px] font-black transition-all ${
+        isQuick
+          ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+          : "border-amber-200 bg-amber-50 text-amber-800"
+      }}`}
+    >
+      {isQuick ? "Q" : "S"}
+    </span>
+  );
+}
+
 type TallyMaster = {
   key: string;
+  guid?: string | null;
   name: string;
   type: string;
   parent?: string | null;
   billWiseEnabled?: boolean | null;
   ledgerType?: string | null;
+  raw?: {
+    billWiseEnabled?: boolean | null;
+  } | null;
   bankName?: string | null;
   bankAccountNumber?: string | null;
   ifscCode?: string | null;
@@ -386,6 +428,24 @@ type TallyMaster = {
   closingBalanceType?: "Dr" | "Cr" | null;
   lastSyncedAt?: string | null;
 };
+
+function connectorCandidateMasters(transactions: PreviewTransaction[]) {
+  const byName = new Map<string, TallyMaster>();
+  const add = (value: unknown, guid?: string | null, parent?: string | null) => {
+    const name = String(value ?? '').trim(), key = normalizeName(name);
+    if (!name || !key || byName.has(key)) return;
+    byName.set(key, { key: String(guid || `connector:${key}`), guid: guid || null, name, type: 'ledger', parent: parent || null });
+  };
+  for (const transaction of transactions) {
+    for (const candidate of transaction.rawPayload?.vectorLedgerCandidates || []) add(candidate.ledgerName, candidate.tallyGuid, candidate.parentGroup);
+    const recommendation = transaction.rawPayload?.aiLedgerRecommendation;
+    if (recommendation?.ledgerName) {
+      add(recommendation.ledgerName, null, recommendation.ledgerGroup);
+      for (const name of recommendation.candidateLedgerNames || []) add(name);
+    }
+  }
+  return [...byName.values()];
+}
 
 type QueueTransaction = {
   id: string;
@@ -440,6 +500,28 @@ type TallyPostingStatus = {
   paymentCheckCompleted: number;
   paymentCheckFailed: number;
 };
+
+type QueueLedgerContext = {
+  name: string;
+  guid: string | null;
+  parent: string | null;
+  billWiseEnabled: boolean | null;
+  ledgerType: string | null;
+};
+
+function buildQueueLedgerContext(ledgerMasters: TallyMaster[], names: Array<string | null | undefined>) {
+  const requestedNames = new Set(names.map(normalizeName).filter(Boolean));
+  return ledgerMasters
+    .filter((ledger) => requestedNames.has(normalizeName(ledger.name)))
+    .slice(0, 100)
+    .map((ledger): QueueLedgerContext => ({
+      name: ledger.name,
+      guid: ledger.guid ?? null,
+      parent: ledger.parent ?? null,
+      billWiseEnabled: typeof ledger.billWiseEnabled === "boolean" ? ledger.billWiseEnabled : null,
+      ledgerType: ledger.ledgerType ?? null,
+    }));
+}
 
 type LedgerSelection = {
   name: string;
@@ -742,13 +824,89 @@ function ledgerNameSimilarity(left: string, right: string) {
   return Math.max(editScore, substringScore, coreScore, tokenScore);
 }
 
+function withoutRecordKey<T>(record: Record<string, T>, key: string) {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) return record;
+  const next = { ...record };
+  delete next[key];
+  return next;
+}
+
+function masterParentDescendsFromGroupMap(
+  parentName: string | null | undefined,
+  parentByName: Map<string, string | null>,
+  targetGroupName: string
+) {
+  const target = normalizeName(targetGroupName);
+  const visited = new Set<string>();
+  let currentName = parentName;
+
+  while (currentName) {
+    const normalized = normalizeName(currentName);
+    if (!normalized || visited.has(normalized)) return false;
+    if (normalized === target) return true;
+    visited.add(normalized);
+    currentName = parentByName.get(normalized) ?? null;
+  }
+
+  return false;
+}
+
+function masterParentDescendsFromGroup(
+  parentName: string | null | undefined,
+  groups: TallyMaster[],
+  targetGroupName: string
+) {
+  let parentByName = ledgerParentIndexCache.get(groups);
+  if (!parentByName) {
+    parentByName = new Map(
+      groups
+        .map((group) => [normalizeName(group.name), group.parent ?? null] as const)
+        .filter(([name]) => Boolean(name))
+    );
+    ledgerParentIndexCache.set(groups, parentByName);
+  }
+  return masterParentDescendsFromGroupMap(parentName, parentByName, targetGroupName);
+}
+
+function normalizeLiveLedgerMasters(ledgers: TallyMaster[], groups: TallyMaster[]) {
+  const parentByName = new Map(
+    groups
+      .map((group) => [normalizeName(group.name), group.parent ?? null] as const)
+      .filter(([name]) => Boolean(name))
+  );
+  return ledgers.map((ledger) => {
+    const ledgerType = masterParentDescendsFromGroupMap(ledger.parent, parentByName, "Sundry Debtors")
+      ? "customer"
+      : masterParentDescendsFromGroupMap(ledger.parent, parentByName, "Sundry Creditors")
+        ? "supplier"
+        : ledger.ledgerType ?? "other";
+    const rawBillWiseEnabled = ledger.raw?.billWiseEnabled;
+
+    return {
+      ...ledger,
+      key: ledger.key || ledger.guid || normalizeName(ledger.name),
+      type: ledger.type || "ledger",
+      ledgerType,
+      billWiseEnabled:
+        typeof ledger.billWiseEnabled === "boolean"
+          ? ledger.billWiseEnabled
+          : typeof rawBillWiseEnabled === "boolean"
+            ? rawBillWiseEnabled
+            : null,
+    };
+  });
+}
+
 function findLedgerByNormalizedName(ledgerMasters: TallyMaster[], ledgerName?: string | null) {
   const normalizedLedgerName = normalizeName(ledgerName);
   if (!normalizedLedgerName) return null;
 
-  return (
-    ledgerMasters.find((ledger) => normalizeName(ledger.name) === normalizedLedgerName) ?? null
-  );
+  let index = ledgerMasterIndexCache.get(ledgerMasters);
+  if (!index) {
+    index = new Map(ledgerMasters.map((ledger) => [normalizeName(ledger.name), ledger]));
+    ledgerMasterIndexCache.set(ledgerMasters, index);
+  }
+  return index.get(normalizedLedgerName) ?? null;
 }
 
 function formatLedgerClosingBalance(
@@ -983,6 +1141,22 @@ function hasValidTransactionDate(value: string | null | undefined) {
   return !Number.isNaN(date.getTime());
 }
 
+function getEffectiveTransactionDate(transaction: {
+  transactionDate: string;
+  valueDate?: string | null;
+}) {
+  return hasValidTransactionDate(transaction.valueDate)
+    ? String(transaction.valueDate)
+    : transaction.transactionDate;
+}
+
+function getEffectiveTransactionDateLabel(transaction: {
+  transactionDate: string;
+  valueDate?: string | null;
+}) {
+  return hasValidTransactionDate(transaction.valueDate) ? "Value Date" : "Transaction Date";
+}
+
 function transactionIsValid(transaction: ReviewTransaction) {
   return Boolean(
     hasValidTransactionDate(transaction.transactionDate) &&
@@ -991,13 +1165,26 @@ function transactionIsValid(transaction: ReviewTransaction) {
   );
 }
 
+const bankAmountFormatter = new Intl.NumberFormat(undefined, {
+  maximumFractionDigits: 2,
+  minimumFractionDigits: 0,
+});
+
+const bankCurrencyInputFormatter = new Intl.NumberFormat(undefined, {
+  maximumFractionDigits: 2,
+  minimumFractionDigits: 2,
+});
+
+const bankShortDateFormatter = new Intl.DateTimeFormat("en-IN", {
+  day: "2-digit",
+  month: "short",
+  year: "numeric",
+});
+
 function formatAmount(value: string | number | null | undefined) {
   const parsed = parseNumber(value) ?? 0;
   if (!Number.isFinite(parsed) || parsed === 0) return "";
-  return new Intl.NumberFormat(undefined, {
-    maximumFractionDigits: 2,
-    minimumFractionDigits: 0,
-  }).format(parsed);
+  return bankAmountFormatter.format(parsed);
 }
 
 function formatCurrencyAmount(value: string | number | null | undefined) {
@@ -1008,10 +1195,7 @@ function formatCurrencyAmount(value: string | number | null | undefined) {
 function formatCurrencyInputAmount(value: string | number | null | undefined) {
   const parsed = parseNumber(value) ?? 0;
   if (!Number.isFinite(parsed) || parsed === 0) return "";
-  return new Intl.NumberFormat(undefined, {
-    maximumFractionDigits: 2,
-    minimumFractionDigits: 2,
-  }).format(parsed);
+  return bankCurrencyInputFormatter.format(parsed);
 }
 
 function formatDataLabel(value?: string | null) {
@@ -1288,16 +1472,21 @@ function LedgerSearchSelect({
   groups,
   placeholder,
   onChange,
+  onCommit,
 }: {
   value: string;
   groups: LedgerSearchGroup[];
   placeholder: string;
   onChange: (value: string) => void;
+  onCommit?: (value: string) => void;
 }) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const [activeOptionIndex, setActiveOptionIndex] = useState(0);
   const deferredQuery = useDeferredValue(query);
+  const [hasSearchStarted, setHasSearchStarted] = useState(false);
+  const [activeOptionIndex, setActiveOptionIndex] = useState(0);
   const uniqueGroups = useMemo(() => {
     const seen = new Set<string>();
     return groups
@@ -1312,62 +1501,114 @@ function LedgerSearchSelect({
       }))
       .filter((group) => group.options.length > 0);
   }, [groups]);
+  const optionMetadataByName = useMemo(() => {
+    const metadata = new Map<string, { balance: string | null; searchText: string }>();
+    uniqueGroups.forEach((group) => {
+      group.options.forEach((option) => {
+        const balance = formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType);
+        metadata.set(normalizeName(option.name), {
+          balance,
+          searchText: normalizeName(`${option.name} ${option.helper ?? ""} ${balance ?? ""} ${group.label}`),
+        });
+      });
+    });
+    return metadata;
+  }, [uniqueGroups]);
   const filteredGroups = useMemo(() => {
-    const normalizedQuery = normalizeName(deferredQuery);
+    const normalizedQuery = hasSearchStarted ? normalizeName(deferredQuery) : "";
     if (!normalizedQuery) return uniqueGroups;
     return uniqueGroups
       .map((group) => ({
         ...group,
         options: group.options.filter((option) =>
-          normalizeName(`${option.name} ${option.helper ?? ""} ${formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType) ?? ""} ${group.label}`).includes(normalizedQuery)
+          optionMetadataByName.get(normalizeName(option.name))?.searchText.includes(normalizedQuery)
         ),
       }))
       .filter((group) => group.options.length > 0);
-  }, [deferredQuery, uniqueGroups]);
-  const renderedGroups = useMemo(() => {
-    let remaining = 80;
-    return filteredGroups.flatMap((group) => {
-      if (remaining <= 0) return [];
-      const options = group.options.slice(0, remaining);
-      remaining -= options.length;
-      return options.length > 0 ? [{ ...group, options }] : [];
-    });
-  }, [filteredGroups]);
+  }, [deferredQuery, hasSearchStarted, optionMetadataByName, uniqueGroups]);
   const visibleOptions = useMemo(
+    () => filteredGroups.flatMap((group) => group.options),
+    [filteredGroups]
+  );
+  const renderedGroups = useMemo(() => {
+    let remaining = MAX_BANK_LEDGER_MENU_OPTIONS;
+    return filteredGroups
+      .map((group) => {
+        if (remaining <= 0) return { ...group, options: [] };
+        const options = group.options.slice(0, remaining);
+        remaining -= options.length;
+        return { ...group, options };
+      })
+      .filter((group) => group.options.length > 0);
+  }, [filteredGroups]);
+  const menuOptions = useMemo(
     () => renderedGroups.flatMap((group) => group.options),
     [renderedGroups]
   );
+  const menuOptionIndexByName = useMemo(
+    () => new Map(menuOptions.map((option, index) => [normalizeName(option.name), index])),
+    [menuOptions]
+  );
 
-  function chooseLedger(name: string) {
-    onChange(name);
+  function chooseLedger(name: string, commit = false) {
     setQuery("");
+    setHasSearchStarted(false);
     setOpen(false);
     setActiveOptionIndex(0);
+    startTransition(() => {
+      if (commit && onCommit) onCommit(name);
+      else onChange(name);
+    });
   }
 
+  useLayoutEffect(() => {
+    if (!open) return;
+    const activeOption = menuRef.current?.querySelector<HTMLElement>(
+      `[data-ledger-option-index="${activeOptionIndex}"]`
+    );
+    activeOption?.scrollIntoView({ block: "nearest" });
+  }, [activeOptionIndex, open]);
+
   return (
-    <div className="relative">
+    <div
+      className="relative"
+      onBlur={(event) => {
+        const nextTarget = event.relatedTarget;
+        if (nextTarget instanceof Node && rootRef.current?.contains(nextTarget)) return;
+        setOpen(false);
+        setQuery("");
+        setHasSearchStarted(false);
+      }}
+      ref={rootRef}
+    >
       <div className="relative">
-        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#9a8d7f]" />
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3 w-3 -translate-y-1/2 text-[#9a8d7f]" />
         <input
+          role="combobox"
+          aria-activedescendant={open && menuOptions[activeOptionIndex] ? `bank-ledger-option-${activeOptionIndex}` : undefined}
+          aria-autocomplete="list"
+          aria-controls="bank-ledger-listbox"
+          aria-expanded={open}
+          aria-haspopup="listbox"
           autoFocus
-          className="h-8 w-full rounded-md border border-[#d8cbbb] bg-white px-2.5 pl-8 text-[11px] font-medium text-[#2b241d] outline-none transition placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
-          onBlur={() => window.setTimeout(() => setOpen(false), 120)}
+          className="h-7 w-full rounded-md border border-[#d8cbbb] bg-white px-2.5 pl-7 text-[10px] font-semibold text-[#2b241d] outline-none transition placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
           onChange={(event) => {
             setQuery(event.target.value);
+            setHasSearchStarted(true);
             setOpen(true);
             setActiveOptionIndex(0);
           }}
           onFocus={(event) => {
-            const input = event.currentTarget;
             setOpen(true);
-            setActiveOptionIndex(0);
-            window.requestAnimationFrame(() => input.select());
+            setActiveOptionIndex(menuOptionIndexByName.get(normalizeName(value)) ?? 0);
+            event.currentTarget.select();
           }}
           onKeyDown={(event) => {
             if (event.key === "Escape") {
               event.preventDefault();
               setOpen(false);
+              setQuery("");
+              setHasSearchStarted(false);
               return;
             }
             if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -1375,53 +1616,63 @@ function LedgerSearchSelect({
               setOpen(true);
               const direction = event.key === "ArrowDown" ? 1 : -1;
               setActiveOptionIndex((current) => {
-                if (visibleOptions.length === 0) return 0;
-                return (current + direction + visibleOptions.length) % visibleOptions.length;
+                if (menuOptions.length === 0) return 0;
+                return (current + direction + menuOptions.length) % menuOptions.length;
               });
               return;
             }
-            if (event.key === "Enter" && open && visibleOptions[activeOptionIndex]) {
+            if (event.key === "Enter" && open && menuOptions[activeOptionIndex]) {
               event.preventDefault();
-              chooseLedger(visibleOptions[activeOptionIndex].name);
+              chooseLedger(menuOptions[activeOptionIndex].name, true);
             }
           }}
           placeholder={placeholder}
-          value={open ? query : value}
+          value={hasSearchStarted ? query : value}
         />
       </div>
 
       {open ? (
-        <div className="absolute z-30 mt-2 max-h-72 w-full overflow-auto rounded-xl border border-[#d8cbbb] bg-white p-1 shadow-xl">
-          {renderedGroups.length > 0 ? (
+        <div
+          id="bank-ledger-listbox"
+          className="absolute z-30 mt-1 max-h-64 w-full overflow-auto rounded-lg border border-[#d8cbbb] bg-white p-1 shadow-xl"
+          ref={menuRef}
+          role="listbox"
+        >
+          {filteredGroups.length > 0 ? (
             renderedGroups.map((group) => (
               <div className="mb-1 last:mb-0" key={group.label}>
-                <div className="px-2.5 pb-0.5 pt-1.5 text-[8px] font-bold uppercase tracking-[0.14em] text-[#9a8d7f]">
+                <div className="px-2.5 pb-0.5 pt-1.5 text-[9px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
                   {group.label}
                 </div>
                 {group.options.map((option) => {
-                  const optionIndex = visibleOptions.findIndex((candidate) => candidate.name === option.name);
+                  const optionIndex = menuOptionIndexByName.get(normalizeName(option.name)) ?? -1;
                   const keyboardActive = optionIndex === activeOptionIndex;
+                  const closingBalance = optionMetadataByName.get(normalizeName(option.name))?.balance;
                   return (
                     <button
-                      className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left text-[11px] font-semibold leading-4 transition hover:bg-[#fbf4ea] ${
+                      aria-selected={option.name === value}
+                      className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left text-[11px] font-bold leading-[14px] transition hover:bg-[#fbf4ea] ${
                         option.name === value || keyboardActive
                           ? "bg-[#f6efe6] text-[#4b3828]"
                           : "text-[#2b241d]"
                       }`}
+                      data-ledger-option-index={optionIndex}
+                      id={`bank-ledger-option-${optionIndex}`}
                       key={option.name}
                       onMouseDown={(event) => {
                         event.preventDefault();
                         chooseLedger(option.name);
                       }}
+                      role="option"
                       type="button"
                     >
                       <span className="min-w-0">
                         <span className="block truncate">{option.name}</span>
-                        <span className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[9px] font-medium leading-3 text-[#8a7f72]">
+                        <span className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[9px] font-semibold leading-[12px] text-[#8a7f72]">
                           {option.helper ? <span className="truncate">{option.helper}</span> : null}
-                          {formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType) ? (
+                          {closingBalance ? (
                             <span className="whitespace-nowrap font-bold text-[#6f4e2f]">
-                              {formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType)}
+                              {closingBalance}
                             </span>
                           ) : (
                             <span className="whitespace-nowrap text-slate-400">Closing balance unavailable</span>
@@ -1435,10 +1686,15 @@ function LedgerSearchSelect({
               </div>
             ))
           ) : (
-            <div className="px-2.5 py-3 text-[11px] font-semibold text-[#8a7f72]">
+            <div className="px-2.5 py-3 text-[10px] font-semibold text-[#8a7f72]">
               No matching ledger found.
             </div>
           )}
+          {visibleOptions.length > menuOptions.length ? (
+            <div className="sticky bottom-0 border-t border-[#eee7dc] bg-[#fffdf9] px-2.5 py-1.5 text-[9px] font-bold text-[#7a6c5f]">
+              Type to search {visibleOptions.length - menuOptions.length} more ledgers
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -1474,7 +1730,7 @@ function LedgerReviewSelect({
   const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
   const [popoverPosition, setPopoverPosition] = useState<{
     bottom?: number;
     left: number;
@@ -1483,13 +1739,26 @@ function LedgerReviewSelect({
     width: number;
   } | null>(null);
   const [query, setQuery] = useState("");
+  const deferredQuery = useDeferredValue(query);
+  const [hasSearchStarted, setHasSearchStarted] = useState(false);
   const [activeOptionIndex, setActiveOptionIndex] = useState(0);
   const groups = useMemo(
     () => buildLedgerPickerGroups(transaction, ledgerMasters),
     [ledgerMasters, transaction]
   );
-  const deferredQuery = useDeferredValue(query);
   const normalizedQuery = normalizeName(deferredQuery);
+  const optionSearchTextByKey = useMemo(() => {
+    const index = new Map<string, string>();
+    for (const group of groups) {
+      for (const option of group.options) {
+        index.set(
+          option.key,
+          normalizeName(`${group.label} ${option.label} ${option.name} ${option.helper ?? ""} ${option.badge ?? ""} ${formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType) ?? ""}`)
+        );
+      }
+    }
+    return index;
+  }, [groups]);
   const filteredGroups = useMemo(() => {
     if (!normalizedQuery) return groups;
 
@@ -1497,53 +1766,65 @@ function LedgerReviewSelect({
       .map((group) => ({
         ...group,
         options: group.options.filter((option) => {
-          const searchable = `${group.label} ${option.label} ${option.name} ${option.helper ?? ""} ${option.badge ?? ""} ${formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType) ?? ""}`;
           return (
-            normalizeName(searchable).includes(normalizedQuery) ||
+            optionSearchTextByKey.get(option.key)?.includes(normalizedQuery) ||
             ledgerNameSimilarity(deferredQuery, option.name) >= 0.78
           );
         }),
       }))
       .filter((group) => group.options.length > 0);
-  }, [deferredQuery, groups, normalizedQuery]);
-  const renderedGroups = useMemo(() => {
-    let remaining = 80;
-    return filteredGroups.flatMap((group) => {
-      if (remaining <= 0) return [];
-      const options = group.options.slice(0, remaining);
-      remaining -= options.length;
-      return options.length > 0 ? [{ ...group, options }] : [];
-    });
-  }, [filteredGroups]);
-  const displayValue = open ? query : getLedgerPickerDisplayValue(transaction);
+  }, [deferredQuery, groups, normalizedQuery, optionSearchTextByKey]);
   const visibleOptions = useMemo(
+    () => filteredGroups.flatMap((group) => group.options),
+    [filteredGroups]
+  );
+  const renderedGroups = useMemo(() => {
+    let remaining = MAX_INITIAL_LEDGER_MENU_OPTIONS;
+    return filteredGroups
+      .map((group) => {
+        if (remaining <= 0) return { ...group, options: [] };
+        const options = group.options.slice(0, remaining);
+        remaining -= options.length;
+        return { ...group, options };
+      })
+      .filter((group) => group.options.length > 0);
+  }, [filteredGroups]);
+  const menuOptions = useMemo(
     () => renderedGroups.flatMap((group) => group.options),
     [renderedGroups]
   );
+  const menuOptionIndexByKey = useMemo(
+    () => new Map(menuOptions.map((option, index) => [option.key, index])),
+    [menuOptions]
+  );
+  const displayValue = hasSearchStarted
+    ? query
+    : transaction.selectedLedgerName || getLedgerPickerDisplayValue(transaction);
 
   function selectOption(option: LedgerSelection) {
-    onChange(option);
     setQuery("");
+    setHasSearchStarted(false);
     setOpen(false);
+    startTransition(() => onChange(option));
   }
 
   function openMenu() {
     const rect = rootRef.current?.getBoundingClientRect();
     if (rect) {
       const gutter = 16;
-      const width = Math.min(480, window.innerWidth - gutter * 2);
+      const width = Math.min(440, window.innerWidth - gutter * 2);
       const left = Math.min(
         Math.max(gutter, rect.right - width),
         Math.max(gutter, window.innerWidth - width - gutter)
       );
       const spaceBelow = window.innerHeight - rect.bottom;
       const spaceAbove = rect.top;
-      const shouldOpenAbove = spaceBelow < 360 && spaceAbove > spaceBelow;
+      const shouldOpenAbove = spaceBelow < 330 && spaceAbove > spaceBelow;
       const availableHeight = Math.max(220, shouldOpenAbove ? spaceAbove - gutter * 2 : spaceBelow - gutter * 2);
       setPopoverPosition({
         bottom: shouldOpenAbove ? window.innerHeight - rect.top + 8 : undefined,
         left,
-        maxHeight: Math.min(420, availableHeight),
+        maxHeight: Math.min(390, availableHeight),
         top: shouldOpenAbove ? undefined : rect.bottom + 8,
         width,
       });
@@ -1552,14 +1833,30 @@ function LedgerReviewSelect({
     setOpen(true);
   }
 
-  useEffect(() => {
-    const frame = window.requestAnimationFrame(() => {
-      inputRef.current?.focus();
-      openMenu();
-    });
-    return () => window.cancelAnimationFrame(frame);
-    // This editor is mounted only when a row enters edit mode. Opening once
-    // after layout guarantees that the first cell click can be measured.
+  useLayoutEffect(() => {
+    const input = inputRef.current;
+    const rect = rootRef.current?.getBoundingClientRect();
+    if (rect) {
+      const gutter = 16;
+      const width = Math.min(440, window.innerWidth - gutter * 2);
+      const left = Math.min(
+        Math.max(gutter, rect.right - width),
+        Math.max(gutter, window.innerWidth - width - gutter)
+      );
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const spaceAbove = rect.top;
+      const shouldOpenAbove = spaceBelow < 330 && spaceAbove > spaceBelow;
+      const availableHeight = Math.max(220, shouldOpenAbove ? spaceAbove - gutter * 2 : spaceBelow - gutter * 2);
+      setPopoverPosition({
+        bottom: shouldOpenAbove ? window.innerHeight - rect.top + 8 : undefined,
+        left,
+        maxHeight: Math.min(390, availableHeight),
+        top: shouldOpenAbove ? undefined : rect.bottom + 8,
+        width,
+      });
+    }
+    input?.focus();
+    input?.select();
   }, []);
 
   useEffect(() => {
@@ -1572,17 +1869,27 @@ function LedgerReviewSelect({
       if (rootRef.current?.contains(target) || popoverRef.current?.contains(target)) return;
 
       setOpen(false);
-      onCancel();
+      startTransition(onCancel);
     }
 
     document.addEventListener("pointerdown", handleOutsidePointerDown, true);
     return () => document.removeEventListener("pointerdown", handleOutsidePointerDown, true);
   }, [onCancel, open]);
 
+  useLayoutEffect(() => {
+    if (!open) return;
+    popoverRef.current
+      ?.querySelector<HTMLElement>(`[data-ledger-option-index="${activeOptionIndex}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [activeOptionIndex, open]);
+
   const popover = open && popoverPosition ? (
     <div
+      id="transaction-ledger-listbox"
+      aria-label="Choose Tally ledger"
       className="fixed z-[1000] overflow-auto rounded-xl border border-[#d8cbbb] bg-white p-1 shadow-2xl"
       ref={popoverRef}
+      role="listbox"
       style={{
         bottom: popoverPosition.bottom,
         left: popoverPosition.left,
@@ -1591,33 +1898,37 @@ function LedgerReviewSelect({
         width: popoverPosition.width,
       }}
     >
-      {renderedGroups.length > 0 ? (
+      {filteredGroups.length > 0 ? (
         renderedGroups.map((group) => (
-          <div className="mb-1 last:mb-0" key={group.label}>
-            <div className="px-2.5 pb-0.5 pt-1.5 text-[8px] font-bold uppercase tracking-[0.14em] text-[#9a8d7f]">
+          <div className="mb-0.5 last:mb-0" key={group.label}>
+            <div className="px-2.5 pb-0.5 pt-1.5 text-[9px] font-black uppercase tracking-[0.14em] text-[#9a8d7f]">
               {group.label}
             </div>
             {group.options.map((option) => {
               const selected =
                 normalizeName(option.name) === normalizeName(transaction.selectedLedgerName) &&
                 option.action === transaction.ledgerAction;
-              const optionIndex = visibleOptions.findIndex((candidate) => candidate.key === option.key);
+              const optionIndex = menuOptionIndexByKey.get(option.key) ?? -1;
               const keyboardActive = optionIndex === activeOptionIndex;
               return (
                 <button
-                  className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left text-[11px] font-semibold leading-4 transition hover:bg-[#fbf4ea] ${
+                  aria-selected={selected}
+                  className={`flex w-full items-center justify-between gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[11px] font-semibold leading-4 transition hover:bg-[#fbf4ea] ${
                     selected || keyboardActive ? "bg-[#f6efe6] text-[#4b3828]" : "text-[#2b241d]"
                   }`}
+                  data-ledger-option-index={optionIndex}
+                  id={`transaction-ledger-option-${optionIndex}`}
                   key={option.key}
                   onMouseDown={(event) => {
                     event.preventDefault();
                     selectOption(option);
                   }}
+                  role="option"
                   type="button"
                 >
                   <span className="min-w-0">
                     <span className="block whitespace-normal break-words">{option.label}</span>
-                    <span className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[9px] font-medium leading-3 text-[#8a7f72]">
+                    <span className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[9px] font-medium leading-[13px] text-[#8a7f72]">
                       {option.helper ? <span className="whitespace-normal break-words">{option.helper}</span> : null}
                       {formatLedgerClosingBalance(option.closingBalance, option.closingBalanceType) ? (
                         <span className="whitespace-nowrap font-bold text-[#6f4e2f]">
@@ -1628,9 +1939,9 @@ function LedgerReviewSelect({
                       )}
                     </span>
                   </span>
-                  <span className="flex shrink-0 items-center gap-2">
+                  <span className="flex shrink-0 items-center gap-1.5">
                     {option.badge ? (
-                        <Badge className="h-4 border-[#d8cbbb] bg-white px-1.5 py-0 text-[8px] leading-none text-[#6f4e2f]" variant="outline">
+                      <Badge className="h-5 border-[#d8cbbb] bg-white px-2 py-0 text-[8px] font-bold text-[#6f4e2f]" variant="outline">
                         {option.badge}
                       </Badge>
                     ) : null}
@@ -1640,54 +1951,61 @@ function LedgerReviewSelect({
               );
             })}
           </div>
-        ))
+          ))
       ) : ledgerMasters.length === 0 ? (
-        <div className="px-2.5 py-3 text-[11px] font-semibold text-[#8a7f72]">
+        <div className="px-2.5 py-3 text-[10px] font-semibold text-[#8a7f72]">
           Tally ledgers are not loaded. Use Sync above, then search again.
         </div>
       ) : (
-        <div className="px-2.5 py-3 text-[11px] font-semibold text-[#8a7f72]">
+        <div className="px-2.5 py-3 text-[10px] font-semibold text-[#8a7f72]">
           No matching ledger found.
         </div>
       )}
+      {visibleOptions.length > menuOptions.length ? (
+        <div className="sticky bottom-0 border-t border-[#eee7dc] bg-[#fffdf9] px-2.5 py-1.5 text-[9px] font-bold text-[#7a6c5f]">
+          Type to search {visibleOptions.length - menuOptions.length} more ledgers
+        </div>
+      ) : null}
     </div>
   ) : null;
 
   return (
     <div className="relative" ref={rootRef}>
       <div className="relative">
-        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9a8d7f]" />
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#9a8d7f]" />
         <input
-          autoFocus
+          role="combobox"
+          aria-activedescendant={open && menuOptions[activeOptionIndex] ? `transaction-ledger-option-${activeOptionIndex}` : undefined}
+          aria-autocomplete="list"
+          aria-controls="transaction-ledger-listbox"
+          aria-expanded={open}
+          aria-haspopup="listbox"
+          aria-label="Search or choose transaction ledger"
           className="h-8 w-full rounded-md border border-[#d8cbbb] bg-white px-2.5 pl-8 text-[11px] font-medium text-[#2b241d] outline-none transition placeholder:text-[#9a8d7f] focus:border-[#7c5f3f] focus:ring-2 focus:ring-[#7c5f3f]/10"
-          onBlur={() => {
-            window.setTimeout(() => {
-              const focusedElement = document.activeElement;
-              if (
-                focusedElement instanceof Node &&
-                !rootRef.current?.contains(focusedElement) &&
-                !popoverRef.current?.contains(focusedElement)
-              ) {
-                setOpen(false);
-                onCancel();
-              }
-            }, 0);
+          onBlur={(event) => {
+            const nextTarget = event.relatedTarget;
+            if (
+              nextTarget instanceof Node &&
+              (rootRef.current?.contains(nextTarget) || popoverRef.current?.contains(nextTarget))
+            ) return;
+            setOpen(false);
+            startTransition(onCancel);
           }}
           onChange={(event) => {
             setQuery(event.target.value);
+            setHasSearchStarted(true);
             setActiveOptionIndex(0);
             openMenu();
           }}
           onFocus={(event) => {
-            const input = event.currentTarget;
-            openMenu();
-            window.requestAnimationFrame(() => input.select());
+            setOpen(true);
+            event.currentTarget.select();
           }}
           onKeyDown={(event) => {
             if (event.key === "Escape") {
               event.preventDefault();
               setOpen(false);
-              onCancel();
+              startTransition(onCancel);
               return;
             }
             if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -1695,14 +2013,14 @@ function LedgerReviewSelect({
               if (!open) openMenu();
               const direction = event.key === "ArrowDown" ? 1 : -1;
               setActiveOptionIndex((current) => {
-                if (visibleOptions.length === 0) return 0;
-                return (current + direction + visibleOptions.length) % visibleOptions.length;
+                if (menuOptions.length === 0) return 0;
+                return (current + direction + menuOptions.length) % menuOptions.length;
               });
               return;
             }
-            if (event.key === "Enter" && open && visibleOptions[activeOptionIndex]) {
+            if (event.key === "Enter" && open && menuOptions[activeOptionIndex]) {
               event.preventDefault();
-              selectOption(visibleOptions[activeOptionIndex]);
+              selectOption(menuOptions[activeOptionIndex]);
             }
           }}
           placeholder="Search or choose action"
@@ -1984,7 +2302,7 @@ function outgoingVerificationFromCommand(command?: TallyCommand | null): Outgoin
 function formatShortDate(value: string) {
   const date = new Date(`${value}T00:00:00`);
   if (Number.isNaN(date.getTime())) return value || "-";
-  return date.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+  return bankShortDateFormatter.format(date);
 }
 
 function formatDateTime(value?: string | null) {
@@ -2006,6 +2324,31 @@ function getLedgerGroupLabel(transaction: ReviewTransaction, ledgerMasters: Tall
 
 function getSelectedLedger(transaction: ReviewTransaction, ledgerMasters: TallyMaster[]) {
   return findLedgerByNormalizedName(ledgerMasters, transaction.selectedLedgerName);
+}
+
+type ProposedBankVoucherType = "Receipt" | "Payment" | "Contra";
+
+function getProposedBankVoucherType(
+  transaction: ReviewTransaction,
+  ledgerMasters: TallyMaster[],
+  selectedLedgerOverride?: TallyMaster | null
+): ProposedBankVoucherType | null {
+  const selectedLedger = selectedLedgerOverride ?? getSelectedLedger(transaction, ledgerMasters);
+  const parentName = selectedLedger?.parent || transaction.ledgerGroup;
+  const counterpartyIsBankOrCash = Boolean(
+    selectedLedger &&
+      (["Bank Accounts", "Bank OD A/c", "Cash-in-Hand"].some(
+        (rootGroupName) =>
+          normalizeName(parentName) === normalizeName(rootGroupName) ||
+          masterParentDescendsFromGroup(parentName, ledgerMasters, rootGroupName)
+      ) ||
+        isBankLedgerMaster(selectedLedger))
+  );
+
+  if (counterpartyIsBankOrCash) return "Contra";
+  if (isIncomingReceiptRow(transaction)) return "Receipt";
+  if (isOutgoingPaymentRow(transaction)) return "Payment";
+  return null;
 }
 
 type PartyBillMatchContext = {
@@ -2160,20 +2503,6 @@ function buildAdvanceReference(transaction: ReviewTransaction) {
   const date = transaction.transactionDate.replace(/-/g, "");
   const suffix = normalizeReferenceToken(transaction.referenceNumber || transaction.id).slice(-8) || transaction.id.slice(0, 8);
   return `ADV-${date}-${suffix}`.slice(0, 80);
-}
-
-function buildDirectPostingAdvanceAllocation(
-  transaction: ReviewTransaction,
-  ledgerMasters: TallyMaster[]
-) {
-  const context = getPartyBillMatchContext(transaction, ledgerMasters);
-  if (!context.eligible || context.amount <= 0) return [];
-
-  return [{
-    referenceType: "Advance" as const,
-    referenceName: buildAdvanceReference(transaction),
-    amount: context.amount,
-  }];
 }
 
 function isAllocationTotalValid(receiptAmount: number, totalAllocatedAmount: number) {
@@ -2466,8 +2795,35 @@ function isPdfFile(file: File) {
   return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
 }
 
+async function pdfHasEncryptionMarker(file: File) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const marker = [0x2f, 0x45, 0x6e, 0x63, 0x72, 0x79, 0x70, 0x74]; // /Encrypt
+  for (let offset = 0; offset <= bytes.length - marker.length; offset += 1) {
+    let matched = true;
+    for (let index = 0; index < marker.length; index += 1) {
+      if (bytes[offset + index] !== marker[index]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) return true;
+  }
+  return false;
+}
+
 function isImageFile(file: File) {
-  return file.type.startsWith("image/");
+  if (file.type.startsWith("image/")) return true;
+  const extension = file.name.toLowerCase().split(".").pop() ?? "";
+  return ["jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif"].includes(extension);
+}
+
+function previewIdentityMatches(preview: DocumentPreviewState | null, file: File) {
+  if (!preview) return false;
+  return (
+    preview.fileName === file.name &&
+    (preview.fileSize ?? null) === (file.size ?? null) &&
+    (preview.fileLastModified ?? null) === (file.lastModified ?? null)
+  );
 }
 
 function parseCsvRows(text: string) {
@@ -2523,9 +2879,12 @@ function parseCsvRows(text: string) {
 async function buildDocumentPreview(file: File): Promise<DocumentPreviewState> {
   const basePreview = {
     fileName: file.name,
+    fileSize: file.size,
+    fileLastModified: file.lastModified,
     headers: [],
     rows: [],
     totalRows: 0,
+    totalColumns: null as number | null,
     textLines: [],
     objectUrl: null,
   };
@@ -2612,6 +2971,7 @@ async function buildDocumentPreview(file: File): Promise<DocumentPreviewState> {
       headers: headers.slice(0, 8),
       rows: meaningfulRows.slice(0, 6).map((row) => headers.slice(0, 8).map((_, index) => row[index] ?? "")),
       totalRows: meaningfulRows.length,
+      totalColumns: headers.length,
       error: null,
     };
   } catch (error) {
@@ -2737,6 +3097,7 @@ function ScrollablePdfPreview({ objectUrl, fileName }: { objectUrl: string; file
 
   useEffect(() => {
     let cancelled = false;
+    let renderedCount = 0;
     void (async () => {
       setLoading(true);
       setError(null);
@@ -2750,9 +3111,11 @@ function ScrollablePdfPreview({ objectUrl, fileName }: { objectUrl: string; file
         const renderedPages = (await pdfToImagePages(previewFile, {
           scale: 1.2,
           quality: 0.82,
-          shouldCancel: () => cancelled,
+          shouldCancel: () => cancelled || renderedCount >= MAX_PDF_PREVIEW_PAGES,
           onPage: (page, _pageNumber, pageCount) => {
             if (cancelled || !page.startsWith("data:image/")) return;
+            renderedCount += 1;
+            if (renderedCount > MAX_PDF_PREVIEW_PAGES) return;
             setTotalPages(pageCount);
             setPages((current) => [...current, page]);
           },
@@ -2772,7 +3135,7 @@ function ScrollablePdfPreview({ objectUrl, fileName }: { objectUrl: string; file
   return (
     <div className="bg-[#f3f0e9]">
       <div className="flex min-h-10 flex-wrap items-center justify-between gap-2 border-b border-[#ddd6ca] bg-white px-3 py-2 text-[11px] font-semibold text-[#71695f]">
-        <span>{loading ? `Rendering PDF pages${totalPages ? ` ${pages.length}/${totalPages}` : ""}…` : error ? "Preview unavailable" : `${pages.length} page${pages.length === 1 ? "" : "s"}`}</span>
+        <span>{loading ? `Rendering PDF pages${totalPages ? ` ${pages.length}/${Math.min(totalPages, MAX_PDF_PREVIEW_PAGES)}` : ""}…` : error ? "Preview unavailable" : totalPages > pages.length ? `Showing first ${pages.length} of ${totalPages} pages` : `${pages.length} page${pages.length === 1 ? "" : "s"}`}</span>
         {!loading && !error ? <span>Scroll inside the preview to see every page</span> : null}
       </div>
       <div
@@ -2828,6 +3191,7 @@ export function BankStatementsPage() {
   const {enforcementRequired:accessEnforced}=useAccess();
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const previewRequestRef = useRef(0);
   const [file, setFile] = useState<File | null>(null);
   const [documentPreview, setDocumentPreview] = useState<DocumentPreviewState | null>(null);
   const [documentPreviewLoading, setDocumentPreviewLoading] = useState(false);
@@ -3157,35 +3521,11 @@ export function BankStatementsPage() {
     const stateLabel = "Fresh Tally sync before analysis";
     const readyText = "The latest ledgers will be fetched from the current Tally company before statement analysis starts.";
 
-    if (!tallyConnectionId || !selectedCompanyName) {
+    if (setupErrorMessage) {
       return {
         tone: "warning" as const,
         title: stateLabel,
-        text: "Sync cannot run until you select a Tally company.",
-      };
-    }
-
-    if (!tallyConnected) {
-      return {
-        tone: "warning" as const,
-        title: stateLabel,
-        text: "Sync cannot run because the connector or Tally is not reachable. Open Tally Prime, load the company, then refresh.",
-      };
-    }
-
-    if (!activeTallyCompanyName) {
-      return {
-        tone: "warning" as const,
-        title: stateLabel,
-        text: "Refresh Kalika to confirm the company currently open in Tally before upload.",
-      };
-    }
-
-    if (!tallyCompanyContextVerified) {
-      return {
-        tone: "warning" as const,
-        title: stateLabel,
-        text: `Tally is open to ${activeTallyCompanyName}. Switch Tally Prime to ${selectedCompanyName}, then refresh before analysis.`,
+        text: setupErrorMessage,
       };
     }
 
@@ -3194,13 +3534,26 @@ export function BankStatementsPage() {
       title: stateLabel,
       text: readyText,
     };
-  }, [
-    activeTallyCompanyName,
-    selectedCompanyName,
-    tallyCompanyContextVerified,
-    tallyConnected,
-    tallyConnectionId,
-  ]);
+  }, [setupErrorMessage]);
+  const analyzeDisabledReason = !documentPreview
+    ? null
+    : !allowed('bank.prepare')
+      ? "Your role can view bank statements but cannot analyze new files."
+      : documentPreview.error
+      ? "Fix the file issue before analysis."
+      : loading || documentPreviewLoading || statementPasswordChecking
+        ? "Wait for the current step to finish."
+        : statementPasswordRequired && (!statementPassword.trim() || !statementPasswordVerified)
+          ? "Unlock the PDF to continue."
+        : documentPreview.kind === "pdf" && !documentPreview.objectUrl
+          ? "Wait for the PDF preview to finish preparing."
+          : !file
+            ? "Select a bank statement file."
+            : !uploadContextReady
+              ? setupErrorMessage || "Complete setup before upload."
+              : statementPasswordError && !statementPasswordRequired
+                  ? "Resolve the preview error first."
+                  : null;
   const pendingBillEligibleTransactions = useMemo(
     () => validTransactions.filter(
       (transaction) =>
@@ -3815,7 +4168,7 @@ export function BankStatementsPage() {
     return nextCompanies;
   }, [selectedCompanyId, tallyConnectionId]);
 
-  const loadLedgerMasters = useCallback(async (connectionId: string, exactScope?: { companyName: string; financialYear: string; identity: Record<string, unknown> }) => {
+  const loadLedgerMasters = useCallback(async (connectionId: string, exactScope?: { companyName: string; companyGuid?: string | null; financialYear: string; identity: Record<string, unknown> }) => {
     const loadSeq = ledgerLoadSeqRef.current + 1;
     ledgerLoadSeqRef.current = loadSeq;
 
@@ -3846,6 +4199,7 @@ export function BankStatementsPage() {
     }>({
       connectionId,
       companyName: exactScope?.companyName || connectionCompany?.companyName || selectedCompanyName,
+      companyGuid: exactScope?.companyGuid || connectionCompany?.companyGuid,
       financialYear: exactScope?.financialYear || connectionCompany?.financialYear,
       operation: "ledger_masters",
       payload: { persist: false, ...(exactScope ? { bankDocumentIdentity: exactScope.identity } : {}) },
@@ -4611,6 +4965,17 @@ export function BankStatementsPage() {
   }
 
   function updateStatementContext(nextCompanyId: string) {
+    if (file || documentPreview) {
+      const confirmed = typeof window === "undefined" ? true : window.confirm("Switching the Tally company will discard the uploaded file preview. Continue?");
+      if (!confirmed) {
+        return;
+      }
+    }
+    setStatementPassword("");
+    setStatementPasswordRequired(false);
+    setStatementPasswordError(null);
+    setStatementPasswordChecking(false);
+    setStatementPasswordVerified(false);
     if (!nextCompanyId) {
       if (!selectedCompanyId) return;
       setSelectedCompanyId("");
@@ -4678,10 +5043,14 @@ export function BankStatementsPage() {
     fallbackAccount = EMPTY_ACCOUNT,
     ledgerMastersForReview = ledgerMasters
   ) {
+    const candidateMasters = connectorCandidateMasters(payload.transactions);
+    const effectiveLedgerMasters = Array.from(new Map([...ledgerMastersForReview, ...candidateMasters]
+      .map(ledger => [normalizeName(ledger.name), ledger])).values());
+    if (candidateMasters.length) setLedgerMasters(effectiveLedgerMasters);
     // Only the API's exact-account resolution may automatically select a ledger.
     // In particular, never retain a ledger from the preceding statement.
     const statementAccountNumber = normalizeBankAccountNumber(payload.account.accountNumber);
-    const bankLedgersForExactMatch = [...bankLedgerOptions, ...ledgerMastersForReview.filter(isBankLedgerMaster)];
+    const bankLedgersForExactMatch = [...bankLedgerOptions, ...effectiveLedgerMasters.filter(isBankLedgerMaster)];
     const exactLiveLedgerNames = Array.from(
       new Set(
         bankLedgersForExactMatch
@@ -4717,7 +5086,7 @@ export function BankStatementsPage() {
     setBankLedgerChangeMode(false);
     setPendingBankLedgerName("");
     setTransactions(
-      payload.transactions.map((transaction) => normalizeReviewTransaction(transaction, ledgerMastersForReview))
+      payload.transactions.map((transaction) => normalizeReviewTransaction(transaction, effectiveLedgerMasters))
     );
     setReviewPage(1);
     setEditingLedgerIds(new Set());
@@ -4788,9 +5157,11 @@ export function BankStatementsPage() {
   }
 
   async function resolvePdfParsingPolicy() {
+    const selected = companyOptions.find((company) => company.id === selectedCompanyId);
     const response = await apiFetch("/api/bank-statements/parsing-policy", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connectionId: tallyConnectionId, companyName: selectedCompanyName, financialYear: selectedFinancialYear }),
+      body: JSON.stringify({ connectionId: tallyConnectionId, companyId: selected?.accessCompanyId,
+        companyGuid: selected?.companyGuid, companyName: selectedCompanyName, financialYear: selectedFinancialYear }),
     });
     const policy = await response.json();
     if (!response.ok) throw new Error(policy.error || "Cannot verify the PDF parsing settings.");
@@ -4810,12 +5181,9 @@ export function BankStatementsPage() {
     const abort = new AbortController();
     // Start the existing fresh read immediately, with its original scope and
     // ordering. Import creation and PDF parsing do not wait on this promise.
-    const mastersPromise = loadLedgerMasters(tallyConnectionId, { companyName: selectedCompanyName, financialYear: String(identity.financialYear), identity }).then(masters => {
-      if (!masters?.length) throw new Error('Could not fetch the latest ledgers from Tally. Keep Tally and the connector open, then retry.');
-      ledgerReadyMs = performance.now() - started;
-      return masters;
-    });
-    mastersPromise.catch(() => {});
+    // Gajkesari parity: parsing and retrieval use the connector's prepared
+    // local catalogue. Never block an upload on retransferring 12k ledgers.
+    const mastersPromise = Promise.resolve(ledgerMasters);
     const form = new FormData();
     form.set('pipelineVersion', '2');
     form.set('localDocument', JSON.stringify(await localPdfMetadata(nextFile)));
@@ -4823,6 +5191,9 @@ export function BankStatementsPage() {
     form.set('connectionId', tallyConnectionId);
     form.set('companyName', selectedCompanyName);
     form.set('financialYear', selectedFinancialYear);
+    const selected = companyOptions.find((company) => company.id === selectedCompanyId);
+    if (selected?.accessCompanyId) form.set('companyId', selected.accessCompanyId);
+    if (selected?.companyGuid) form.set('companyGuid', selected.companyGuid);
     form.set('bankLedgerName', '');
     form.set('syncBeforeAnalysis', 'false');
     const response = await apiFetch('/api/bank-statements/imports', { method: 'POST', body: form });
@@ -4844,19 +5215,11 @@ export function BankStatementsPage() {
     });
     setBanner({ tone: 'info', text: 'Preparing document' });
     const context = mastersPromise.then(async masters => {
-      trace('ledger_preparation_complete', { ledgerPreparationMs: Math.round(ledgerReadyMs), ledgerCount: masters.length });
+      ledgerReadyMs = performance.now() - started;
+      trace('local_ledger_context_selected', { ledgerPreparationMs: Math.round(ledgerReadyMs), cachedLedgerCount: masters.length });
       assertLocalBankContextIdentity(identity, ticket.identity);
-      // Same normalization/limits as the existing import route, without a
-      // Supabase round trip or persisting the full ledger catalogue.
-      const ledgerNames = Array.from(new Set(masters.map(ledger => ledger.name.trim()).filter(Boolean)));
-      const normalizedNames = Array.from(new Set(ledgerNames.map(name => name.trim().slice(0, 500)).filter(Boolean))).slice(0, 20000);
-      const bankAccountCandidates = masters.flatMap(ledger => {
-        const accountNumber = normalizeBankAccountNumber(ledger.bankAccountNumber).replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 40);
-        const ledgerName = ledger.name.trim().slice(0, 500);
-        return accountNumber && ledgerName ? [{ ledgerName, accountNumber }] : [];
-      }).slice(0, 1000);
       await sendLedgerContextToLocalAgent(ticket.token, { pipelineVersion: 2, identity: ticket.identity,
-        ledgerNames: normalizedNames, bankAccountCandidates }, abort.signal);
+        ledgerNames: [], bankAccountCandidates: [] }, abort.signal);
       trace('context_transferred');
       return masters;
     }).catch(async error => {
@@ -4905,9 +5268,20 @@ export function BankStatementsPage() {
       return;
     }
     if (!uploadContextReady) {
-      setBanner({ tone: "error", text: setupErrorMessage || "Complete the Tally company setup before upload." });
+      setBanner({ tone: "error", text: setupErrorMessage || "Complete setup before upload." });
       return;
     }
+    if (nextFile.size > MAX_STATEMENT_FILE_BYTES) {
+      setBanner({ tone: "error", text: `This file is ${formatFileSize(nextFile.size)}. Choose a statement under ${formatFileSize(MAX_STATEMENT_FILE_BYTES)}.` });
+      return;
+    }
+    const requestId = previewRequestRef.current + 1;
+    previewRequestRef.current = requestId;
+    const isLatest = () => previewRequestRef.current === requestId;
+    setDocumentPreview((current) => {
+      if (current?.objectUrl) URL.revokeObjectURL(current.objectUrl);
+      return null;
+    });
     setDocumentPreviewLoading(true);
     setBanner(null);
     setStatementDoneSummary(null);
@@ -4917,29 +5291,48 @@ export function BankStatementsPage() {
     setStatementPasswordError(null);
     setStatementPasswordChecking(false);
     setStatementPasswordVerified(false);
-    setFile(nextFile);
     try {
       const mode = isPdfFile(nextFile) ? await resolvePdfParsingMode() : "backend";
+      if (!isLatest()) return;
       const nextPreview = await buildDocumentPreview(nextFile);
-      if (nextPreview.kind === "pdf" && mode === "local_agent") {
-        nextPreview.objectUrl = URL.createObjectURL(nextFile);
-        setDocumentPreview(nextPreview);
+      if (!isLatest()) {
+        if (nextPreview.objectUrl) URL.revokeObjectURL(nextPreview.objectUrl);
         return;
       }
+      setFile(nextFile);
       setDocumentPreview(nextPreview);
       if (nextPreview.kind === "pdf" && !nextPreview.error) {
-        await unlockStatementPdfPreview(nextFile, "");
+        if (await pdfHasEncryptionMarker(nextFile)) {
+          setStatementPasswordRequired(true);
+          setStatementPasswordChecking(false);
+          return;
+        }
+        await unlockStatementPdfPreview(nextFile, "", mode);
       }
     } catch (error) {
-      setFile(null);
-      setDocumentPreview(null);
-      setBanner({ tone: "error", text: error instanceof Error ? error.message : "Cannot prepare document." });
+      if (!isLatest()) return;
+      const message = error instanceof Error ? error.message : "Cannot prepare document.";
+      setFile(nextFile);
+      setDocumentPreview({
+        fileName: nextFile.name,
+        fileSize: nextFile.size,
+        fileLastModified: nextFile.lastModified,
+        kind: isPdfFile(nextFile) ? "pdf" : isCsvFile(nextFile) ? "csv" : isImageFile(nextFile) ? "image" : isTextFile(nextFile) ? "text" : "unsupported",
+        headers: [],
+        rows: [],
+        totalRows: 0,
+        totalColumns: null,
+        textLines: [],
+        objectUrl: null,
+        error: message,
+      });
+      setBanner({ tone: "error", text: message });
     } finally {
-      setDocumentPreviewLoading(false);
+      if (isLatest()) setDocumentPreviewLoading(false);
     }
   }
 
-  async function unlockStatementPdfPreview(nextFile = file, password = statementPassword) {
+  async function unlockStatementPdfPreview(nextFile = file, password = statementPassword, _modeOverride?: string) {
     if (!nextFile || !isPdfFile(nextFile)) return false;
 
     setStatementPasswordChecking(true);
@@ -4947,10 +5340,6 @@ export function BankStatementsPage() {
     setStatementPasswordVerified(false);
 
     try {
-      if (await resolvePdfParsingMode() === "local_agent") {
-        setDocumentPreview(current => current ? { ...current, objectUrl: URL.createObjectURL(nextFile), error: null } : current);
-        return true;
-      }
       const formData = new FormData();
       formData.set("file", nextFile);
       if (password) {
@@ -4978,10 +5367,6 @@ export function BankStatementsPage() {
           setStatementPasswordError(
             payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT" ? message : null
           );
-          if (payload.code === "BANK_STATEMENT_PASSWORD_INCORRECT") {
-            setStatementPassword("");
-            setBanner({ tone: "error", text: message });
-          }
           return false;
         }
 
@@ -4991,14 +5376,20 @@ export function BankStatementsPage() {
         return false;
       }
 
-      const unlockedPdfUrl = URL.createObjectURL(await response.blob());
+      const unlockedPdf = new File([await response.blob()], nextFile.name, {
+        type: "application/pdf",
+        lastModified: nextFile.lastModified,
+      });
+      const unlockedPdfUrl = URL.createObjectURL(unlockedPdf);
       setDocumentPreview((current) => {
-        if (!current || current.fileName !== nextFile.name) {
+        if (!current || !previewIdentityMatches(current, nextFile)) {
           URL.revokeObjectURL(unlockedPdfUrl);
           return current;
         }
+        if (current.objectUrl) URL.revokeObjectURL(current.objectUrl);
         return { ...current, objectUrl: unlockedPdfUrl, error: null };
       });
+      setFile(unlockedPdf);
 
       if (password) {
         setStatementPasswordRequired(true);
@@ -5017,8 +5408,12 @@ export function BankStatementsPage() {
   }
 
   function clearSelectedStatementFile() {
+    previewRequestRef.current += 1;
+    setDocumentPreview((current) => {
+      if (current?.objectUrl) URL.revokeObjectURL(current.objectUrl);
+      return null;
+    });
     setFile(null);
-    setDocumentPreview(null);
     setDocumentPreviewLoading(false);
     setStatementPassword("");
     setStatementPasswordRequired(false);
@@ -5146,12 +5541,8 @@ export function BankStatementsPage() {
       setBanner({ tone: "error", text: "Select the Tally company before upload." });
       return;
     }
-    if (!tallyConnected) {
-      setBanner({ tone: "error", text: "Tally company is not ready. Open Tally Prime and refresh the connection." });
-      return;
-    }
-    if (!tallyCompanyContextVerified) {
-      setBanner({ tone: "error", text: setupErrorMessage || "Refresh Kalika to verify the Tally company before upload." });
+    if (!uploadContextReady) {
+      setBanner({ tone: "error", text: setupErrorMessage || "Complete setup before upload." });
       return;
     }
     if (
@@ -5834,11 +6225,25 @@ export function BankStatementsPage() {
       );
       return;
     }
-    const selectedTallyWorkTransactions = mode === "post_receipts"
+    const candidateTallyWorkTransactions = mode === "post_receipts"
       ? receiptTransactionsNeedingPost
       : mode === "post_payments"
         ? outgoingTransactionsNeedingPost
         : transactionsNeedingTallyWork;
+    const selectedTallyWorkTransactions = candidateTallyWorkTransactions.filter((transaction) =>
+      isReadyForTallyPosting({
+        directPosting: skipBillMatching,
+        ledgerName: transaction.selectedLedgerName,
+        ledgerNeedsReview: getReviewStatus(transaction) === "needs_review",
+        presence: tallyPresenceByTransactionId[transaction.id],
+        billRequired: isBillMatchEligibleTransaction(transaction, ledgerMasters),
+        amount: Math.max(
+          parseNumber(transaction.creditAmount) ?? 0,
+          parseNumber(transaction.debitAmount) ?? 0
+        ),
+        allocation: billAllocationsByTransactionId[transaction.id],
+      })
+    );
     if (selectedTallyWorkTransactions.length === 0) {
       showToast(
         "info",
@@ -5992,10 +6397,36 @@ export function BankStatementsPage() {
         body: JSON.stringify({
           connectionId: tallyConnectionId,
           companyName: selectedCompanyName,
+          companyId: selectedCompany?.accessCompanyId,
+          companyGuid: selectedCompany?.companyGuid,
+          financialYear: selectedFinancialYear,
           async: true,
           accountId: confirmPayload.account.id,
           transactionIds: queueRows.map((transaction) => transaction.id),
           bankLedgerName,
+          liveLedgerContext: buildQueueLedgerContext([
+            ...ledgerMasters,
+            ...bankLedgerOptions.map((ledger, index): TallyMaster => ({
+              key: `live-bank:${index}:${normalizeName(ledger.name)}`,
+              name: ledger.name,
+              type: "ledger",
+              parent: ledger.parent ?? "Bank Accounts",
+              bankName: ledger.bankName ?? null,
+              bankAccountNumber: ledger.bankAccountNumber ?? null,
+              closingBalance: ledger.closingBalance ?? null,
+              closingBalanceType: ledger.closingBalanceType ?? null,
+            })),
+          ], [
+            bankLedgerName,
+            ...queueRows.flatMap((transaction) => {
+              const reviewedTransaction = reviewedTransactionsByKey.get(transactionQueueKey(transaction));
+              return [
+                reviewedTransaction?.selectedLedgerName,
+                transaction.confirmedLedgerName,
+                transaction.suggestedLedgerName,
+              ];
+            }),
+          ]),
           outgoingAction: "post",
           transactions: queueRows.map((transaction) => ({
             transactionId: transaction.id,
@@ -6004,6 +6435,9 @@ export function BankStatementsPage() {
               const billAllocation = reviewedTransaction
                 ? billAllocationsByTransactionId[reviewedTransaction.id]
                 : null;
+              const postingBillAllocations = !skipBillMatching && billAllocation?.status === "ready_to_post"
+                ? billAllocation.allocations
+                : [];
               return {
                 counterpartyLedgerName:
                   reviewedTransaction?.selectedLedgerName ||
@@ -6012,17 +6446,21 @@ export function BankStatementsPage() {
                   "Suspense",
                 createLedgerName: "",
                 createLedgerParentName: "",
-                billAllocations: skipBillMatching
-                  ? reviewedTransaction
-                    ? buildDirectPostingAdvanceAllocation(reviewedTransaction, ledgerMasters)
-                    : []
-                  : billAllocation?.status === "ready_to_post"
-                    ? billAllocation.allocations.map((allocation) => ({
+                directPosting: skipBillMatching,
+                billMatchingVerified:
+                  !reviewedTransaction ||
+                  !isBillMatchEligibleTransaction(reviewedTransaction, ledgerMasters) ||
+                  postingBillAllocations.length > 0,
+                duplicateCheckVerified:
+                  reviewedTransaction != null &&
+                  tallyPresenceByTransactionId[reviewedTransaction.id]?.status === "missing",
+                billAllocations: postingBillAllocations.length > 0
+                  ? postingBillAllocations.map((allocation) => ({
                         referenceType: allocation.referenceType,
                         referenceName: allocation.referenceName,
                         amount: allocation.allocatedAmount,
                       }))
-                    : [],
+                  : [],
               };
             })(),
             saveMapping: (() => {
@@ -6311,10 +6749,10 @@ export function BankStatementsPage() {
           </div>
         </div>
       ) : null}
-      <div className={`bank-statements-workflow flex min-h-full flex-col bg-[#f7f7f5] text-[#1a1a1a] ${preview ? "pb-20" : ""}`}>
-        <div className="min-w-0 flex-1 px-0 py-3 sm:py-4">
-          <div className="flex w-full max-w-none flex-col gap-2.5">
-          <header className={`flex flex-col gap-2 px-2 md:flex-row md:items-center md:justify-between ${preview ? "border-b border-[#e5ddd0] pb-2" : ""}`}>
+      <div className={`bank-statements-workflow flex min-h-full flex-col bg-[#f7f4ef] text-[#1a1a1a] ${preview ? "pb-20" : ""}`}>
+        <div className="min-w-0 flex-1 px-4 py-5 sm:px-6 lg:px-8">
+          <div className="mx-auto flex w-full max-w-[1540px] flex-col gap-5">
+          <header className={`flex flex-col gap-2 md:flex-row md:items-center md:justify-between ${preview ? "border-b border-[#e5ddd0] pb-2" : ""}`}>
             <h1 className="flex shrink-0 flex-wrap items-center gap-2 text-xl font-black tracking-tight text-[#1a1a1a] sm:text-2xl">
                 Bank Statements
                 {preview && (
@@ -6338,66 +6776,53 @@ export function BankStatementsPage() {
                   <Info className="h-4 w-4" />
                 </button>
             </h1>
-            <div className="inline-flex max-w-full flex-wrap items-center gap-3 rounded-xl border border-[#e5ddd0] bg-white px-3.5 py-2 shadow-sm">
-              <div className="flex min-w-0 items-center gap-2">
-                {tallyConnected ? (
-                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
-                ) : (
-                  <AlertTriangle className="h-4 w-4 shrink-0 text-amber-700" />
-                )}
-                <div className="min-w-0">
-                  <div className="text-xs font-medium text-[#1a1a1a]">
-                    {!selectedCompanyName
-                      ? "Select Tally company"
-                      : !tallyConnected
-                      ? "Tally unavailable"
-                      : checkingLiveTallyCompany
-                        ? "Checking Tally company"
-                        : tallyCompanyContextVerified
-                          ? "Tally company verified"
-                          : "Switch company in Tally"}
-                  </div>
-                  <div className="truncate text-[11px] font-semibold text-slate-400 mt-0.5">
-                    Kalika: {selectedCompanyName || "Not selected"} - Tally: {checkingLiveTallyCompany ? "Checking..." : activeTallyCompanyName || "Not detected"}
-                  </div>
-                </div>
-              </div>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={refreshTallyConnectionStatus}
-                  disabled={refreshingConnections}
-                  className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-all disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {refreshingConnections ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <RefreshCw className="h-3.5 w-3.5" />
-                  )}
-                  Refresh
-                </button>
-                {!tallyCompanyContextVerified ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setBanner({
-                        tone: "info",
-                        text: tallyConnected
-                          ? "In Tally Prime: press F3 (Company), select the company for this workflow, then return here and refresh."
-                          : "Open Tally Prime, load the company for this workflow, then return here and refresh.",
-                      });
-                    }}
-                    className="inline-flex h-8 items-center rounded-xl bg-[#2d2d2d] px-3.5 text-xs font-medium text-white hover:bg-[#1a1a1a] shadow-sm transition-all"
-                  >
-                    {tallyConnected ? "Show switch steps" : "Connection steps"}
-                  </button>
-                ) : null}
-              </div>
-            </div>
+            <TallyConnectionPill
+              title={
+                !tallyConnectionId
+                  ? "Connect Tally"
+                  : !selectedCompanyName
+                  ? "Select Tally company"
+                  : !tallyConnected
+                  ? "Tally unavailable"
+                  : checkingLiveTallyCompany
+                    ? "Checking Tally company"
+                    : tallyCompanyContextVerified
+                      ? "Tally company verified"
+                      : "Switch company in Tally"
+              }
+              subtitle={
+                checkingLiveTallyCompany
+                  ? "Checking the company open in Tally"
+                  : tallyCompanyContextVerified
+                    ? `${selectedCompanyName} is active in Tally`
+                    : selectedCompanyName
+                      ? `Selected: ${selectedCompanyName} · Tally: ${activeTallyCompanyName || "Not detected"}`
+                      : "No company selected"
+              }
+              status={checkingLiveTallyCompany ? "checking" : tallyCompanyContextVerified ? "verified" : "warning"}
+              avatarName={selectedCompanyName}
+              refreshing={refreshingConnections}
+              onRefresh={refreshTallyConnectionStatus}
+              secondaryAction={
+                tallyCompanyContextVerified
+                  ? null
+                  : {
+                      label: tallyConnected ? "Show switch steps" : "Connection steps",
+                      onClick: () => {
+                        setBanner({
+                          tone: "info",
+                          text: setupErrorMessage || (tallyConnected
+                            ? "In Tally Prime: press F3 (Company), select the company for this workflow, then return here and refresh."
+                            : "Open Tally Prime, load the company for this workflow, then return here and refresh."),
+                        });
+                      },
+                    }
+              }
+            />
           </header>
 
           {!preview ? (
-            <div className="flex w-full min-w-0 flex-wrap items-center gap-1 rounded-xl border border-[#e5ddd0] bg-white px-2 py-1 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+            <div className="flex w-full min-w-0 flex-wrap items-center gap-2 rounded-xl border border-[#e5ddd0] bg-white px-3 py-2 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
               {[
                 ["Upload", "Upload statement"],
                 ["Review", "Review file"],
@@ -6411,7 +6836,7 @@ export function BankStatementsPage() {
                     aria-label={fullLabel}
                     key={fullLabel}
                     title={fullLabel}
-                    className={`flex items-center gap-1.5 rounded-lg px-2 py-1 text-[10px] font-extrabold ${
+                    className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] font-extrabold ${
                       complete
                         ? "bg-emerald-50 text-emerald-800"
                         : current
@@ -6532,21 +6957,26 @@ export function BankStatementsPage() {
               >
                 <div className="space-y-4">
                   <label className="block">
-                    <span className="text-xs font-medium text-[#5a5046]">Company</span>
-                    <select
-                      className="mt-1.5 h-11 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
-                      onChange={(event) => updateStatementContext(event.target.value)}
-                      value={selectedCompanyId}
-                    >
-                      <option value="" disabled>
-                        {companyOptions.length === 0 ? "No connected Tally company" : "Select Tally company"}
-                      </option>
-                      {companyOptions.map((company) => (
-                        <option key={company.id} value={company.id}>
-                          {formatCompanyOptionLabel(company)}
+                    <span className="text-[10px] font-extrabold uppercase tracking-wider text-[#7d7165]">Tally company</span>
+                    <span className="relative mt-1 block">
+                      {selectedCompanyName ? (
+                        <CompanyAvatar className="pointer-events-none absolute left-2 top-2 z-10" name={selectedCompanyName} />
+                      ) : null}
+                      <select
+                        className={`h-11 w-full rounded-xl border border-[#e5ddd0] bg-white pr-3 text-xs font-bold text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100 ${selectedCompanyName ? "pl-11" : "pl-3"}`}
+                        onChange={(event) => updateStatementContext(event.target.value)}
+                        value={selectedCompanyId}
+                      >
+                        <option value="" disabled>
+                          {companyOptions.length === 0 ? "No connected Tally company" : "Select Tally company"}
                         </option>
-                      ))}
-                    </select>
+                        {companyOptions.map((company) => (
+                          <option key={company.id} value={company.id}>
+                            {formatCompanyOptionLabel(company)}
+                          </option>
+                        ))}
+                      </select>
+                    </span>
                   </label>
 
                   <div
@@ -6559,37 +6989,21 @@ export function BankStatementsPage() {
                           <span className="text-xs font-semibold text-[#1a1a1a]">
                             Fetch latest Tally ledgers before analysis
                           </span>
-                          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800">
-                            Auto
-                          </span>
                         </span>
                         <span
                           id="bank-statement-sync-mode-status"
                           className="mt-1.5 block text-xs font-normal leading-5 text-[#6f6256]"
                         >
-                          {syncModeStatus.tone === "warning"
-                            ? "Fresh ledger fetch will run before analysis once the selected Tally company is verified."
-                            : syncModeStatus.text}
+                          {syncModeStatus.text}
                         </span>
                       </span>
-                      <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
+                      {syncModeStatus.tone === "warning" ? (
+                        <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
+                      ) : (
+                        <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
+                      )}
                     </span>
                   </div>
-
-                  {syncModeStatus.tone === "warning" ? (
-                    <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs font-semibold text-amber-900">
-                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
-                      <span>
-                        <span className="block font-semibold">{syncModeStatus.title}</span>
-                        <span className="mt-0.5 block leading-5">{syncModeStatus.text}</span>
-                      </span>
-                    </div>
-                  ) : !documentPreview && !documentPreviewLoading ? (
-                    <div className="flex items-center gap-2 px-1 text-xs font-medium text-emerald-800">
-                      <CheckCircle2 className="h-4 w-4 shrink-0" />
-                      Ready to upload.
-                    </div>
-                  ) : null}
                 </div>
               </div>
 
@@ -6597,15 +7011,13 @@ export function BankStatementsPage() {
                 className={
                   documentPreview
                     ? "min-w-0"
-                    : `rounded-2xl border border-[#e5ddd0] bg-white shadow-[0_2px_8px_rgba(0,0,0,0.02)] ${
-                        documentPreviewLoading ? "p-3 sm:p-4" : "p-6"
-                      }`
+                    : `rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]`
                 }
               >
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".csv,.txt,.pdf,image/*"
+                  accept=".csv,.txt,.pdf,.png,.jpg,.jpeg,.webp,.gif,.bmp,.heic,.heif,image/*"
                   disabled={!allowed('bank.prepare')}
                   className="hidden"
                   onClick={(event) => {
@@ -6651,7 +7063,7 @@ export function BankStatementsPage() {
                       }
                       void handleSelectedStatementFile(nextFile);
                     }}
-                    className={`flex min-h-[420px] w-full flex-col items-center justify-center rounded-2xl border-2 border-dashed px-6 py-10 text-center transition-all duration-300 ${
+                    className={`flex min-h-[360px] w-full flex-col items-center justify-center rounded-2xl border-2 border-dashed px-4 py-8 text-center transition-all duration-300 ${
                       dragActive
                         ? "border-amber-500 bg-amber-50/40"
                         : uploadContextReady
@@ -6673,12 +7085,12 @@ export function BankStatementsPage() {
                   </button>
                 ) : null}
                 {documentPreviewLoading && !documentPreview ? (
-                  <div className="flex min-h-[420px] w-full flex-col items-center justify-center rounded-2xl border border-[#e5ddd0] bg-[#fffdf9] px-6 py-10 text-center">
+                  <div className="flex min-h-[360px] w-full flex-col items-center justify-center rounded-2xl border border-[#e5ddd0] bg-[#fffdf9] px-4 py-8 text-center">
                     <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-xl bg-[#2d2d2d] text-white shadow-sm">
                       <Loader2 className="h-6 w-6 animate-spin" />
                     </div>
-                    <div className="text-lg font-semibold text-[#1a1a1a]">Reading file...</div>
-                    <div className="mt-1 text-xs font-semibold text-slate-400">Preparing preview before analysis</div>
+                    <div className="text-lg font-semibold text-[#1a1a1a]">Preparing preview...</div>
+                    <div className="mt-1 text-xs font-semibold text-slate-400">Reading the file and checking PDF security. You can continue once the preview appears.</div>
                   </div>
                 ) : null}
                 {documentPreview ? (
@@ -6687,79 +7099,87 @@ export function BankStatementsPage() {
                     <div className="space-y-3 p-4">
                       <label className="block min-w-0">
                         <span className="text-[10px] font-bold uppercase tracking-wider text-[#8b7a68]">Company</span>
-                        <select
-                          className="mt-1 h-9 w-full rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
-                          onChange={(event) => updateStatementContext(event.target.value)}
-                          value={selectedCompanyId}
-                        >
-                          <option value="" disabled>
-                            {companyOptions.length === 0 ? "No connected Tally company" : "Select Tally company"}
-                          </option>
-                          {companyOptions.map((company) => (
-                            <option key={company.id} value={company.id}>
-                              {formatCompanyOptionLabel(company)}
+                        <span className="relative mt-1 block">
+                          {selectedCompanyName ? (
+                            <CompanyAvatar className="pointer-events-none absolute left-1 top-1 z-10 h-7 w-7" name={selectedCompanyName} />
+                          ) : null}
+                          <select
+                            className={`h-9 w-full rounded-xl border border-[#e5ddd0] bg-white pr-3 text-xs font-bold text-[#1a1a1a] shadow-sm outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100 ${selectedCompanyName ? "pl-10" : "pl-3"}`}
+                            onChange={(event) => updateStatementContext(event.target.value)}
+                            value={selectedCompanyId}
+                          >
+                            <option value="" disabled>
+                              {companyOptions.length === 0 ? "No connected Tally company" : "Select Tally company"}
                             </option>
-                          ))}
-                        </select>
+                            {companyOptions.map((company) => (
+                              <option key={company.id} value={company.id}>
+                                {formatCompanyOptionLabel(company)}
+                              </option>
+                            ))}
+                          </select>
+                        </span>
                       </label>
 
                       <div
-                        className="flex min-h-9 items-center justify-between gap-3 rounded-xl border border-amber-200 bg-[#fffaf2] px-3 py-2 transition"
+                        className={`flex min-h-9 items-center justify-between gap-3 rounded-xl px-3 py-2 transition ${
+                          syncModeStatus.tone === "warning"
+                            ? "border border-amber-200 bg-[#fffaf2]"
+                            : "border border-emerald-100 bg-emerald-50/60"
+                        }`}
                         aria-describedby="bank-statement-sync-mode-status-preview"
                       >
                         <span className="min-w-0">
-                          <span className="flex flex-wrap items-center gap-2">
-                            <span className="text-xs font-semibold text-[#1a1a1a]">Fresh Tally fetch first</span>
-                            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800">
-                              Auto
+                          <span className="text-xs font-semibold text-[#1a1a1a]">
+                            {syncModeStatus.tone === "warning" ? "Tally setup needed" : "Tally ledgers refresh before analysis"}
+                          </span>
+                          {syncModeStatus.tone === "warning" ? (
+                            <span id="bank-statement-sync-mode-status-preview" className="mt-1 block text-xs font-normal leading-5 text-[#6f6256]">
+                              {syncModeStatus.text}
                             </span>
-                          </span>
-                          <span
-                            id="bank-statement-sync-mode-status-preview"
-                            className="sr-only"
-                          >
-                            {syncModeStatus.text}
-                          </span>
+                          ) : (
+                            <span id="bank-statement-sync-mode-status-preview" className="sr-only">{syncModeStatus.text}</span>
+                          )}
                         </span>
-                        <CheckCircle2 className="h-4 w-4 shrink-0 text-amber-700" />
+                        {syncModeStatus.tone === "warning" ? (
+                          <AlertTriangle className="h-4 w-4 shrink-0 text-amber-700" />
+                        ) : (
+                          <CheckCircle2 className="h-4 w-4 shrink-0 text-amber-700" />
+                        )}
                       </div>
 
                       <div className="grid grid-cols-2 gap-2">
                         <button
                           type="button"
+                          disabled={documentPreviewLoading || statementPasswordChecking}
                           onClick={() => {
-                            clearSelectedStatementFile();
                             fileInputRef.current?.click();
                           }}
-                          className="inline-flex h-9 w-full items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#5a5046] transition hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
+                          className="inline-flex h-9 w-full items-center justify-center rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#5a5046] transition hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
                         >
-                          Upload another
+                          Replace file
                         </button>
                         <button
                           type="button"
+                          aria-busy={loading}
                           disabled={
-                            !allowed('bank.prepare') || Boolean(documentPreview.error) ||
-                            loading ||
-                            documentPreviewLoading ||
-                            statementPasswordChecking ||
-                            (documentPreview.kind === "pdf" && !documentPreview.objectUrl) ||
-                            !file ||
-                            !selectedCompanyId ||
-                            !uploadContextReady ||
-                            (statementPasswordRequired &&
-                              (!statementPassword.trim() ||
-                                !statementPasswordVerified ||
-                                statementPasswordChecking)) ||
-                            Boolean(statementPasswordError && !statementPasswordRequired)
+                            !allowed('bank.prepare') || Boolean(analyzeDisabledReason)
                           }
+                          title={analyzeDisabledReason ?? "Analyze the reviewed file"}
+                          aria-describedby={analyzeDisabledReason ? "bank-analyze-disabled-reason" : undefined}
                           onClick={() => {
                             if (file) void analyzeFile(file);
                           }}
                           className="inline-flex h-9 w-full items-center justify-center rounded-xl bg-[#2d2d2d] px-3 text-xs font-medium text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
                         >
-                          Analyze file
+                          {loading ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+                          {loading ? "Analyzing…" : "Analyze file"}
                         </button>
                       </div>
+                      {analyzeDisabledReason ? (
+                        <p id="bank-analyze-disabled-reason" className="text-[11px] font-semibold leading-4 text-[#7a6c5f]">
+                          {analyzeDisabledReason}
+                        </p>
+                      ) : null}
                     </div>
 
                     <div className="space-y-3 border-t border-[#eee5d8] bg-[#fffaf2] p-4">
@@ -6775,11 +7195,13 @@ export function BankStatementsPage() {
                             {documentPreview.error ? (
                               "Preview needs attention"
                             ) : documentPreview.kind === "csv" ? (
-                              `${formatFileSize(file?.size)} - ${documentPreview.totalRows} transaction row${documentPreview.totalRows === 1 ? "" : "s"} found. Showing ${documentPreview.rows.length}.`
+                              `${formatFileSize(file?.size)} - ${documentPreview.totalRows} transaction row${documentPreview.totalRows === 1 ? "" : "s"} found. Showing ${documentPreview.rows.length}${(documentPreview.totalColumns ?? 0) > documentPreview.headers.length ? ` of ${documentPreview.totalColumns} columns` : ""}.`
                             ) : documentPreview.kind === "text" ? (
                               `${formatFileSize(file?.size)} - ${documentPreview.totalRows} readable line${documentPreview.totalRows === 1 ? "" : "s"} found. Showing ${documentPreview.textLines.length}.`
                             ) : documentPreview.kind === "pdf" ? (
-                              `${formatFileSize(file?.size)} - PDF selected. Review it below before analysis.`
+                              statementPasswordRequired && !statementPasswordVerified
+                                ? `${formatFileSize(file?.size)} · Password protected`
+                                : `${formatFileSize(file?.size)} · PDF ready to review`
                             ) : documentPreview.kind === "image" ? (
                               `${formatFileSize(file?.size)} - Image selected. Review it below before analysis.`
                             ) : (
@@ -6801,13 +7223,12 @@ export function BankStatementsPage() {
                         >
                           <label className={statementPasswordVerified ? "hidden" : "block"}>
                             <span className="text-[10px] font-bold uppercase tracking-wider text-amber-800">
-                              Statement password
+                              Unlock protected PDF
                             </span>
-                            <div className="mt-2 flex gap-2">
+                            <div className="mt-2 grid gap-2">
                               <input
                                 autoComplete="off"
-                                autoFocus={statementPasswordRequired}
-                                className="h-9 min-w-0 flex-1 rounded-xl border border-[#e5ddd0] bg-white px-3 text-sm font-semibold text-[#1a1a1a] outline-none transition placeholder:text-slate-300 focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
+                                className="h-10 w-full min-w-0 rounded-xl border border-[#e5ddd0] bg-white px-3 text-sm font-semibold text-[#1a1a1a] outline-none transition placeholder:text-slate-400 focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
                                 disabled={statementPasswordChecking}
                                 onChange={(event) => {
                                   setStatementPassword(event.target.value);
@@ -6826,7 +7247,7 @@ export function BankStatementsPage() {
                                 value={statementPassword}
                               />
                               <button
-                                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-3 text-xs font-medium text-white transition hover:bg-black disabled:cursor-not-allowed disabled:opacity-50"
+                                className="inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-3 text-xs font-bold text-white shadow-sm transition hover:bg-black disabled:cursor-not-allowed disabled:bg-[#d2cfca] disabled:text-white"
                                 disabled={!statementPassword.trim() || statementPasswordChecking}
                                 onClick={() => void unlockStatementPdfPreview(file, statementPassword)}
                                 type="button"
@@ -6834,41 +7255,20 @@ export function BankStatementsPage() {
                                 {statementPasswordChecking ? (
                                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                                 ) : null}
-                                {statementPasswordChecking ? "Checking" : "Unlock preview"}
+                                {statementPasswordChecking ? "Unlocking PDF…" : "Unlock PDF"}
                               </button>
                             </div>
                           </label>
-                          <div
-                            aria-live="polite"
-                            className={`flex items-start gap-2 text-xs font-semibold ${
-                              statementPasswordVerified
-                                ? "text-emerald-800"
-                                : statementPasswordError
-                                  ? "mt-2 text-rose-800"
-                                  : "mt-2 text-[#7a6c5f]"
-                            }`}
-                          >
+                          <div aria-live="polite" className={`mt-2 flex items-start gap-2 text-[11px] font-semibold leading-4 ${
+                            statementPasswordVerified ? "text-emerald-800" : statementPasswordError ? "text-rose-800" : "text-[#7a6c5f]"
+                          }`}>
                             {statementPasswordVerified ? (
-                              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-700" />
-                            ) : (
-                              <AlertTriangle
-                                className={`mt-0.5 h-4 w-4 shrink-0 ${
-                                  statementPasswordError ? "text-rose-700" : "text-amber-700"
-                                }`}
-                              />
-                            )}
-                            <span>
-                              {statementPasswordVerified
-                                ? "PDF unlocked. Preview and analysis are ready."
-                                : statementPasswordError ||
-                                  "This PDF is protected. Enter its password to unlock the preview."}
-                            </span>
+                              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-700" />
+                            ) : statementPasswordError ? (
+                              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-700" />
+                            ) : null}
+                            <span>{statementPasswordVerified ? "PDF unlocked and ready." : statementPasswordError || "Used only to unlock this file. The password is not saved."}</span>
                           </div>
-                          {statementPasswordRequired && !statementPasswordVerified ? (
-                            <div className="mt-1 text-[11px] font-semibold text-[#7a6c5f]">
-                              The password is used only to unlock this PDF for analysis. It is not saved.
-                            </div>
-                          ) : null}
                         </div>
                       ) : null}
                     </div>

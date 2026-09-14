@@ -19,7 +19,7 @@ async function boundedBody(request, limit) {
 
 // Transport helper has no database or credentials of its own. Route-injected
 // token verification and the transactional store remain the authorities.
-export async function handleLocalBankV2(request, { verifyToken, store, notify = async (_type, _value, _identity) => {}, analyze = undefined, keepaliveMs = 10000, diagnostic = (_metrics) => {},
+export async function handleLocalBankV2(request, { verifyToken, store, notify = async (_type, _value, _identity) => {}, analyze = /** @type {any} */ (undefined), keepaliveMs = 10000, diagnostic = (_metrics) => {},
   watchAnalysis = (_envelope) => /** @type {{signal: AbortSignal, stop: () => void} | undefined} */ (undefined) }) {
   const receivedAt = performance.now();
   let claims;
@@ -53,7 +53,7 @@ export async function handleLocalBankV2(request, { verifyToken, store, notify = 
         // Counts/timings only. Never pass the envelope, context or AI response
         // to a logger, including when a diagnostic callback throws.
         try { diagnostic({ jobId: envelope.jobId, commandId: envelope.commandId, state: result.state,
-          compressedBytes, markdownBytes: Buffer.byteLength(envelope.markdown),
+          compressedBytes, markdownBytes: Buffer.byteLength(envelope.markdown || ''),
           contextBytes: Buffer.byteLength(JSON.stringify({ ledgerNames: envelope.ledgerNames, bankAccountCandidates: envelope.bankAccountCandidates })),
           ledgerCount: envelope.ledgerNames.length, backendElapsedMs: performance.now() - receivedAt,
           timings: result.timings || {} }); } catch { /* diagnostics are not job authority */ }

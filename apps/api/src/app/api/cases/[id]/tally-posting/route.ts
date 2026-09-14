@@ -1292,7 +1292,7 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
       if (
         !context.connection ||
         !hasCompleteMasterSnapshot(context) ||
-        !isMasterSnapshotFresh(context)
+        (body.allowStalePreview !== true && !isMasterSnapshotFresh(context))
       ) {
         return jsonWithCors(request, { error: "The live Tally master read is incomplete or stale." }, { status: 409 });
       }
@@ -1458,10 +1458,21 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
     if (!prepared.source || !prepared.review || !prepared.tallyPayload) {
       return jsonWithCors(request, { error: "This case does not have one eligible invoice." }, { status: 409 });
     }
-    if (prepared.blockers.length > 0) {
+    const allowedBlockerKeys = new Set(
+      Array.isArray(body.allowedBlockerKeys)
+        ? body.allowedBlockerKeys.filter(
+            (key: unknown): key is string => typeof key === "string" && Boolean(key.trim())
+          )
+        : []
+    );
+    const blockerKey = (blocker: typeof prepared.blockers[number]) =>
+      `${blocker.code}:${blocker.lineId ?? blocker.scope}`;
+    const allowedBlockers = prepared.blockers.filter((blocker) => allowedBlockerKeys.has(blockerKey(blocker)));
+    const unallowedBlockers = prepared.blockers.filter((blocker) => !allowedBlockerKeys.has(blockerKey(blocker)));
+    if (unallowedBlockers.length > 0) {
       return jsonWithCors(request, {
         error: "Resolve every Tally posting blocker before approval.",
-        blockers: prepared.blockers,
+        blockers: unallowedBlockers,
       }, { status: 409 });
     }
     const acknowledgedWarningCodes = new Set(
@@ -1551,6 +1562,16 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
           policyRule: warning.policyRule ?? null,
         })),
       } : null,
+      validationOverrides: allowedBlockers.length > 0 ? {
+        allowedBy: user.id,
+        allowedAt: now,
+        blockers: allowedBlockers.map((blocker) => ({
+          code: blocker.code,
+          label: blocker.label,
+          scope: blocker.scope,
+          lineId: blocker.lineId ?? null,
+        })),
+      } : null,
     };
     const approvedPayloadHash = createHash("sha256")
       .update(JSON.stringify(frozenPayload))
@@ -1602,6 +1623,9 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
           validationAcknowledgement: acknowledgementWarnings.length > 0 ? {
             warningCodes: acknowledgementWarnings.map((warning) => warning.code),
             policyRules: acknowledgementWarnings.map((warning) => warning.policyRule).filter(Boolean),
+          } : null,
+          validationOverrides: allowedBlockers.length > 0 ? {
+            blockerKeys: allowedBlockers.map(blockerKey),
           } : null,
         },
       }),

@@ -1,7 +1,7 @@
 {
   "name": "kalika-local-agent",
   "productName": "Kalika Local Agent",
-  "version": "1.1.7",
+  "version": "1.2.5",
   "description": "Secure local workflow agent connecting Kalika to Tally Prime.",
   "author": "Kalika",
   "private": true,
@@ -13,8 +13,9 @@
   },
   "dependencies": {
     "@autodealer/tally-bridge": "file:../../../apps/tally-bridge",
-    "@firecrawl/anydoc": "0.1.9",
-    "@zvec/zvec": "0.7.0",
+    "@firecrawl/anydoc": "0.2.4",
+    "@zvec/bindings-win32-x64": "0.7.1",
+    "@zvec/zvec": "0.7.1",
     "better-sqlite3-multiple-ciphers": "12.11.1",
     "electron-updater": "6.8.9",
     "ws": "8.21.1"
@@ -52,6 +53,18 @@
         "filter": [
           "*.ps1"
         ]
+      },
+      {
+        "from": "../../../apps/api/worker",
+        "to": "bank-statement-worker",
+        "filter": [
+          "bank-statement-deterministic.mjs",
+          "bank-statement-account.mjs",
+          "bank-statement-markdown-amounts.mjs",
+          "bank-statement-running-balance.mjs",
+          "bank-statement-resilience.mjs",
+          "bank-statement-pdf-columns.mjs"
+        ]
       }
     ],
     "npmRebuild": false,
@@ -59,7 +72,8 @@
     "asarUnpack": [
       "node_modules/better-sqlite3-multiple-ciphers/**/*",
       "node_modules/@firecrawl/anydoc/**/*",
-      "node_modules/@zvec/zvec/**/*"
+      "node_modules/@zvec/zvec/**/*",
+      "node_modules/@zvec/bindings-win32-x64/**/*"
     ],
     "win": {
       "target": [

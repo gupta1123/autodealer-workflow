@@ -39,14 +39,17 @@ export async function readDocumentResultStream(response, onProgress = () => {}) 
 
 export async function uploadDocumentEnvelope({ url, token, envelope, statusUrl, deadlineAt, onProgress, fetchImpl = fetch,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
+  const normalizedDeadlineAt = Math.trunc(Number(deadlineAt));
+  if (!Number.isFinite(normalizedDeadlineAt)) throw new Error('Document job deadline is invalid.');
+  const remainingMs = maximum => Math.max(1, Math.trunc(Math.min(maximum, normalizedDeadlineAt - Date.now())));
   const bytes = gzipSync(JSON.stringify(envelope));
   const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/vnd.kalika.bank-document-v2+json', 'Content-Encoding': 'gzip' };
   let uncertain = false;
-  const pause = ms => sleep(Math.max(0, Math.min(ms, deadlineAt - Date.now())));
-  while (Date.now() < deadlineAt) {
+  const pause = ms => sleep(Math.max(0, Math.trunc(Math.min(ms, normalizedDeadlineAt - Date.now()))));
+  while (Date.now() < normalizedDeadlineAt) {
     if (uncertain) {
       // Never resend a possibly accepted result without consulting durable state.
-      const response = await fetchImpl(statusUrl, { headers: { Authorization: headers.Authorization }, signal: AbortSignal.timeout(Math.max(1, Math.min(10000, deadlineAt-Date.now()))) });
+      const response = await fetchImpl(statusUrl, { headers: { Authorization: headers.Authorization }, signal: AbortSignal.timeout(remainingMs(10000)) });
       if (!response.ok) throw new Error('Cannot determine document job status. No AI retry was attempted.');
       const current = await response.json();
       if (['completed','failed','cancelled'].includes(current.state)) return current;
@@ -54,7 +57,7 @@ export async function uploadDocumentEnvelope({ url, token, envelope, statusUrl, 
       uncertain = false;
     }
     try {
-      const response = await fetchImpl(url, { method: 'POST', headers, body: bytes, signal: AbortSignal.timeout(Math.max(1, deadlineAt-Date.now())) });
+      const response = await fetchImpl(url, { method: 'POST', headers, body: bytes, signal: AbortSignal.timeout(remainingMs(Number.MAX_SAFE_INTEGER)) });
       const result = await readDocumentResultStream(response, onProgress);
       if (result.state === 'busy') { await pause(Math.min(30000, Math.max(1000, (result.retryAfterSeconds || 5)*1000))); continue; }
       if (['analyzing', 'saving', 'recovery'].includes(result.state)) { uncertain = true; continue; }

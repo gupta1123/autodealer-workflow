@@ -90,7 +90,7 @@ export function searchPurchaseMasterOptions(
   options: TallyMasterOption[],
   suggestedNames: string[],
   search: string,
-  limit = 120
+  limit = 80
 ) {
   const index = searchIndex(options);
   const query = search.trim().toLowerCase();

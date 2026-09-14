@@ -23,7 +23,7 @@ function setup(overrides = {}) {
     }, ...overrides,
   };
   return { calls, notices, store, run: extra => processLocalBankV2({ envelope, store,
-    analyze: async input => { calls.push('ai'); assert.deepEqual(input, { markdown: envelope.markdown, ledgerNames: envelope.ledgerNames,
+    analyze: async input => { calls.push('ai'); assert.deepEqual(input, { markdown: envelope.markdown, ledgerNames: envelope.ledgerNames, identity: envelope.identity,
       bankAccountCandidates: envelope.bankAccountCandidates, traceId: envelope.commandId }); return structuredClone(ai); },
     notify: async (type, data) => { notices.push({ type, data }); if (type === 'bank_job_completed') assert.ok(calls.includes('finalize')); },
     sleep: async () => {}, ...extra }) };
@@ -37,6 +37,14 @@ test('v2 preserves complete ordered AI inputs and does one AI invocation before 
 test('compressed envelope validates context digest without sorting or dropping ledger names', () => {
   assert.deepEqual(decodeLocalBankEnvelope(gzipSync(JSON.stringify(envelope))), envelope);
   assert.throws(() => decodeLocalBankEnvelope(gzipSync(JSON.stringify({ ...envelope, ledgerNames: [...envelope.ledgerNames].reverse() }))), /context hash/);
+});
+test('structured vector envelope accepts an empty transferred ledger catalogue', () => {
+  const { markdown: _markdown, ...base } = envelope;
+  const structured = { ...base, schemaVersion: 3, ledgerNames: [],
+    parsed: { account: {}, transactions: [{ row_index: 1, description: 'Receipt', credit_amount: 20 }] },
+    vectorCandidates: [[{ ledgerName: 'Customer A', vectorScore: 0.91, rank: 1 }]] };
+  structured.contextHash = contextDigest(structured);
+  assert.deepEqual(decodeLocalBankEnvelope(gzipSync(JSON.stringify(structured))), structured);
 });
 for (const state of ['completed','analyzing','cancelled','failed','busy']) test(`a ${state} claim cannot start AI again`, async () => {
   const f = setup({ claim: async () => ({ state }) });

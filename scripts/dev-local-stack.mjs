@@ -8,6 +8,14 @@ const serviceDefinitions = [
   ["cash-discount-gateway", "npm run dev --workspace @autodealer/cash-discount-gateway", 3002],
 ];
 
+// The checked-in local stack includes the prepared v2 bank-document pipeline.
+// Keep the gate enabled across restarts instead of relying on a one-off shell
+// environment variable, which otherwise silently sends documents through v1.
+const localStackEnv = {
+  ...process.env,
+  BANK_LOCAL_PIPELINE_V2: process.env.BANK_LOCAL_PIPELINE_V2 ?? "true",
+};
+
 function portIsListening(port) {
   return new Promise((resolve) => {
     const socket = net.createConnection({ host: "127.0.0.1", port });
@@ -58,12 +66,12 @@ for (const [name, command] of services) {
   const child = process.platform === "win32"
     ? spawn("cmd.exe", ["/d", "/s", "/c", command], {
         cwd: process.cwd(),
-        env: process.env,
+        env: localStackEnv,
         stdio: "inherit",
       })
     : spawn("sh", ["-c", command], {
         cwd: process.cwd(),
-        env: process.env,
+        env: localStackEnv,
         stdio: "inherit",
       });
 

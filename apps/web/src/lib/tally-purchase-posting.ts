@@ -311,7 +311,32 @@ function liveRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function liveText(value: unknown) {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
+  if (typeof value !== "string") return null;
+  let decoded = value;
+  // Older connector catalogues can contain Tally's encoded hierarchy control
+  // marker, sometimes escaped more than once before it reaches the browser.
+  for (let index = 0; index < 5; index += 1) {
+    const next = decoded
+      .replace(/&#x([0-9a-f]+);/gi, (_, code: string) => {
+        const parsed = Number.parseInt(code, 16);
+        return Number.isFinite(parsed) && parsed >= 32 ? String.fromCodePoint(parsed) : " ";
+      })
+      .replace(/&#(\d+);/g, (_, code: string) => {
+        const parsed = Number.parseInt(code, 10);
+        return Number.isFinite(parsed) && parsed >= 32 ? String.fromCodePoint(parsed) : " ";
+      })
+      .replaceAll("&amp;", "&")
+      .replaceAll("&lt;", "<")
+      .replaceAll("&gt;", ">");
+    if (next === decoded) break;
+    decoded = next;
+  }
+  const cleaned = decoded
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s*_\s*>\s*/g, " > ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || null;
 }
 
 function liveNumber(value: unknown) {
@@ -740,6 +765,7 @@ export async function selectTallyPurchaseInvoice(
 export async function approveAndQueueTallyPurchasePosting(
   caseId: string,
   acknowledgedWarningCodes: string[] = [],
+  allowedBlockerKeys: string[] = [],
   connectionId?: string | null,
   companyName?: string | null,
   liveMasters?: unknown,
@@ -752,6 +778,7 @@ export async function approveAndQueueTallyPurchasePosting(
       action: "approve_and_queue",
       workflowRevision,
       acknowledgedWarningCodes,
+      allowedBlockerKeys,
       connectionId,
       companyName,
       liveMasters,
@@ -783,7 +810,8 @@ export async function prepareTallyPurchasePostingFromLive(
   caseId: string,
   connectionId: string,
   companyName: string,
-  liveMasters: unknown
+  liveMasters: unknown,
+  allowStalePreview = false
 ) {
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
     method: "POST",
@@ -793,6 +821,7 @@ export async function prepareTallyPurchasePostingFromLive(
       connectionId,
       companyName,
       liveMasters,
+      allowStalePreview,
       compactResponse: true,
     }),
   });

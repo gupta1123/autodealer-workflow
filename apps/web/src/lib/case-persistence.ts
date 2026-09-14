@@ -161,6 +161,8 @@ export type FetchCasesOptions = {
   query?: string;
   sortMode?: "recent" | "oldest" | "name";
   statusFilter?: "all" | "pending" | "in_review" | "completed" | "failed";
+  approvalFilter?: "all" | "approved" | "pending" | "rejected";
+  reconciliationFilter?: "all" | "clean" | "issues";
   signal?: AbortSignal;
 };
 
@@ -599,6 +601,8 @@ export async function fetchCasePage({
   query: searchQuery,
   sortMode,
   statusFilter,
+  approvalFilter,
+  reconciliationFilter,
   signal,
 }: FetchCasesOptions): Promise<RecentCasesResponse> {
   const query = new URLSearchParams();
@@ -614,6 +618,12 @@ export async function fetchCasePage({
   }
   if (statusFilter && statusFilter !== "all") {
     query.set("status", statusFilter);
+  }
+  if (approvalFilter && approvalFilter !== "all") {
+    query.set("approval", approvalFilter);
+  }
+  if (reconciliationFilter && reconciliationFilter !== "all") {
+    query.set("reconciliation", reconciliationFilter);
   }
   if (sortMode && sortMode !== "recent") {
     query.set("sort", sortMode);

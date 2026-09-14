@@ -869,6 +869,29 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       <PageHeader sticky={false} className="mb-4" title="Tally Connection"
         subtitle="Connect Tally Prime to sync workflows and post entries" />
 
+      <section className="relative mb-5 max-w-5xl overflow-hidden rounded-2xl border border-[#ddd5c9] bg-white shadow-[0_10px_28px_rgba(64,51,35,0.06)]">
+        <div className="absolute inset-y-0 right-0 hidden w-[42%] bg-[#f6f0e6] sm:block">
+          <img
+            alt=""
+            className="h-full w-full object-cover opacity-90 mix-blend-multiply"
+            src={selectedConnection?.companyLoaded ? "/images/tally/connection-ready.webp" : "/images/tally/connection-waiting.webp"}
+          />
+          <div className="absolute inset-0 bg-gradient-to-r from-white via-white/75 to-transparent" />
+        </div>
+        <div className="relative max-w-[68%] px-6 py-6 sm:min-h-[176px] sm:px-7 sm:py-7">
+          <div className="flex items-center gap-2 text-[9px] font-extrabold uppercase tracking-[0.16em] text-[#8a7f72]">
+            <span className={`h-2 w-2 rounded-full ${companyLoaded ? "bg-emerald-500 shadow-[0_0_0_4px_rgba(16,185,129,0.12)]" : "bg-amber-500 shadow-[0_0_0_4px_rgba(245,158,11,0.12)]"}`} />
+            {companyLoaded ? "Connection ready" : connectorActive ? "Connector online" : "Setup required"}
+          </div>
+          <h2 className="mt-2 text-xl font-black tracking-tight text-[#1a1a1a] sm:text-2xl">
+            {companyLoaded ? `Connected to ${selectedConnection?.lastCompanyName || "Tally Prime"}` : "Bring Tally Prime online"}
+          </h2>
+          <p className="mt-2 max-w-md text-xs font-semibold leading-5 text-[#6f6255]">
+            {companyLoaded ? "Your connector, Tally Prime, and company are ready for Kalika workflows." : "Connect this workstation to sync companies, masters, and accounting entries."}
+          </p>
+        </div>
+      </section>
+
       {message ? (
         <div
           className={`mb-6 rounded-xl border px-4 py-3 text-xs font-medium ${
@@ -882,7 +905,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       ) : null}
 
       {!connectorActive ? (
-        <section className="mb-5 rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+        <section className="mb-5 rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-shadow duration-300 hover:shadow-[0_6px_18px_rgba(64,51,35,0.05)]">
           <div className="mb-4">
             <div className="text-xs font-medium text-[#8a7f72]">
               Tally target
@@ -971,7 +994,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         </div>
       ) : selectedConnection ? (
         <div className="space-y-5">
-          <div className="rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
+          <div className="rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-shadow duration-300 hover:shadow-[0_6px_18px_rgba(64,51,35,0.05)]">
             <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
               <div className="flex min-w-0 items-start gap-4">
                 <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-amber-50 border border-amber-100/50 text-amber-700">
@@ -1088,7 +1111,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           ) : null}
         </div>
       ) : (
-        <div className="flex min-h-[320px] items-center justify-center rounded-2xl border-2 border-dashed border-[#e5ddd0] bg-white p-8 text-center shadow-sm">
+        <div className="flex min-h-[260px] items-center justify-center rounded-2xl border border-[#e5ddd0] bg-white p-8 text-center shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-shadow duration-300 hover:shadow-[0_6px_18px_rgba(64,51,35,0.05)]">
           <div>
             <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-amber-50 border border-amber-200/50 text-amber-700">
               <PlugZap className="h-6 w-6 animate-pulse" />

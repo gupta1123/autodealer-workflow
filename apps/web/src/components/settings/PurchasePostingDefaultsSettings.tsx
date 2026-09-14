@@ -249,10 +249,10 @@ export function PurchasePostingDefaultsSettings() {
   return (
     <div className="mt-5 space-y-4">
       <section className="rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5">
-        <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#8a7f72]">Per-company Tally defaults</p>
-        <h2 className="mt-1 text-lg font-medium tracking-tight text-[#20201c]">Choose the masters used for Purchase vouchers</h2>
+        <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">Per-company Tally defaults</p>
+        <h2 className="mt-1 text-base font-bold tracking-tight text-[#111827]">Choose the masters used for Purchase vouchers</h2>
         <div className="mt-1 flex flex-wrap items-center justify-between gap-3">
-          <p className="text-[13px] leading-5 text-[#6b6a60]">Supplier ledgers remain searchable from the complete Tally catalogue and are remembered by GSTIN after confirmation.</p>
+          <p className="text-xs text-[#5b4b3d]">Supplier ledgers remain searchable from the complete Tally catalogue and are remembered by GSTIN after confirmation.</p>
           <Button
             disabled={loading || refreshing || !connectionId || !companyName}
             onClick={() => void refreshLiveMasters()}
@@ -265,12 +265,12 @@ export function PurchasePostingDefaultsSettings() {
         </div>
         {liveSummary ? <p className="mt-2 text-xs font-medium text-emerald-700"><Check className="mr-1 inline h-4 w-4" />{liveSummary}</p> : null}
         <div className="mt-4 grid gap-3 sm:grid-cols-2">
-          <label className="text-xs font-medium text-[#514b43]">Tally workstation
+          <label className="text-xs font-medium text-[#5b4b3d]">Tally workstation
             <select className="mt-1 h-10 w-full rounded-lg border border-[#ddd7cc] bg-white px-3" onChange={(event) => setConnectionId(event.target.value)} value={connectionId}>
               {connections.map((connection) => <option key={connection.id} value={connection.id}>{connection.displayName || "Tally workstation"}</option>)}
             </select>
           </label>
-          <label className="text-xs font-medium text-[#514b43]">Tally company
+          <label className="text-xs font-medium text-[#5b4b3d]">Tally company
             <select className="mt-1 h-10 w-full rounded-lg border border-[#ddd7cc] bg-white px-3" onChange={(event) => setCompanyName(event.target.value)} value={companyName}>
               {companies.map((company) => <option key={company.id} value={company.companyName}>{company.companyName}</option>)}
             </select>
@@ -278,15 +278,15 @@ export function PurchasePostingDefaultsSettings() {
         </div>
       </section>
 
-      {loading ? <div className="flex items-center justify-center rounded-lg border border-[#e8e5de] bg-white p-8 text-sm text-[#6b6a60]"><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading saved Tally masters…</div> : SECTIONS.map((section) => (
+      {loading ? <div className="flex items-center justify-center rounded-lg border border-[#e8e5de] bg-white p-8 text-xs text-[#5b4b3d]"><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading saved Tally masters…</div> : SECTIONS.map((section) => (
         <section className="rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5" key={section.title}>
-          <h3 className="text-sm font-semibold text-[#20201c]">{section.title}</h3>
-          <p className="mt-1 text-xs text-[#6b6a60]">{section.description}</p>
+          <h3 className="text-sm font-bold text-[#111827]">{section.title}</h3>
+          <p className="mt-1 text-xs text-[#8a7f72]">{section.description}</p>
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
             {section.fields.map(([id, label, kind]) => {
               const options = kind === "stock" ? stockOptions : ledgerOptions;
-              return <label className="text-xs font-medium text-[#514b43]" key={id}>{label}
-                <select className="mt-1 h-10 w-full rounded-lg border border-[#ddd7cc] bg-white px-3 text-sm" onChange={(event) => setDefaults((current) => ({ ...current, [id]: event.target.value }))} value={defaults[id] || ""}>
+              return <label className="text-xs font-medium text-[#5b4b3d]" key={id}>{label}
+                <select className="mt-1 h-10 w-full rounded-lg border border-[#ddd7cc] bg-white px-3 text-xs" onChange={(event) => setDefaults((current) => ({ ...current, [id]: event.target.value }))} value={defaults[id] || ""}>
                   <option value="">Choose from Tally…</option>
                   {options.map((option) => <option key={`${option.type}:${option.id}`} value={option.name}>{option.name}{option.parent ? ` — ${option.parent}` : ""}</option>)}
                 </select>

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
+import { processBankStatementMarkdownLocal } from "../document-parsing/parser.mjs";
 
 const MAX_BYTES = 25 * 1024 * 1024;
 const MAX_PAGES = 300;
@@ -85,6 +86,10 @@ async function parseDocument(job) {
     if (!hasUsefulText(markdown)) {
       throw errorWithCode("This PDF appears to be scanned or image-only. Local OCR is not enabled in Local Agent v1.", "SCAN_REQUIRES_OCR");
     }
+    let structured = null;
+    if (job.pipelineVersion === 2 && extension.toLowerCase() === ".pdf") {
+      structured = await processBankStatementMarkdownLocal(markdown, { pageCount, pdfBytes: bytes });
+    }
     const compressed = gzipSync(Buffer.from(markdown, "utf8"));
     if (resultUploadUrl) {
       const response = await fetch(resultUploadUrl, {
@@ -106,7 +111,9 @@ async function parseDocument(job) {
         throw errorWithCode(message, code);
       }
     }
-    return { sha256, pageCount, parseMs, markdownBytes: Buffer.byteLength(markdown), markdownGzip: compressed, markdown: resultUploadUrl ? null : markdown, uploaded: Boolean(resultUploadUrl) };
+    return { sha256, pageCount, parseMs: Math.round(performance.now() - parseStarted), markdownBytes: Buffer.byteLength(markdown),
+      markdownGzip: compressed, markdown: resultUploadUrl ? null : markdown, parsed: structured?.parsed || null,
+      parserDiagnostics: structured?.diagnostics || null, uploaded: Boolean(resultUploadUrl) };
   } finally {
     fs.rmSync(temporaryPath, { force: true });
   }

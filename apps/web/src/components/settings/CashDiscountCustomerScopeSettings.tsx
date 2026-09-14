@@ -88,8 +88,8 @@ function formatGroupRefreshTime(value: string | null) {
 
 function Toggle({ checked }: { checked: boolean }) {
   return (
-    <span className={`relative h-5 w-9 rounded-full transition ${checked ? "bg-[#1f6b52]" : "bg-[#d8d4c9]"}`}>
-      <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition ${checked ? "left-[18px]" : "left-0.5"}`} />
+    <span aria-hidden="true" className={`relative inline-flex h-5 w-9 shrink-0 rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${checked ? "bg-[#2b1a10]" : "bg-[#ded8d0]"}`}>
+      <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm ring-0 transition duration-200 ease-in-out ${checked ? "translate-x-4" : "translate-x-0"}`} />
     </span>
   );
 }
@@ -407,14 +407,14 @@ export function CashDiscountCustomerScopeSettings() {
       <section className="rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5">
         <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
           <div className="max-w-2xl">
-            <p className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#8a7f72]">Cash Discount discovery</p>
-            <h2 className="mt-1 text-lg font-medium tracking-tight text-[#20201c]">Choose where customer ledgers live</h2>
-            <p className="mt-1 text-[13px] leading-5 text-[#6b6a60]">This is saved separately for each Tally company. Every refresh still reads open bills and evidence live from Tally.</p>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">Cash Discount discovery</p>
+            <h2 className="mt-1 text-base font-bold tracking-tight text-[#111827]">Choose where customer ledgers live</h2>
+            <p className="mt-1 text-xs text-[#5b4b3d]">Saved separately for each Tally company.</p>
           </div>
           <div className="min-w-[280px] space-y-3">
             {connections.length > 1 ? (
               <label className="block">
-                <span className="mb-1.5 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-[0.16em] text-[#8a7f72]">
+                <span className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">
                   <Monitor className="h-3.5 w-3.5" /> Tally workstation
                 </span>
                 <select className="h-10 w-full rounded-lg border border-[#ddd8ce] bg-white px-3 text-[13px] outline-none focus:border-[#1f6b52]" onChange={(event) => setConnectionId(event.target.value)} value={connectionId}>
@@ -430,7 +430,7 @@ export function CashDiscountCustomerScopeSettings() {
 
             {companies.length > 1 ? (
               <label className="block">
-                <span className="mb-1.5 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-[0.16em] text-[#8a7f72]">
+                <span className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">
                   <Building2 className="h-3.5 w-3.5" /> Tally company
                 </span>
                 <select className="h-10 w-full rounded-lg border border-[#ddd8ce] bg-white px-3 text-[13px] outline-none focus:border-[#1f6b52]" onChange={(event) => setCompanyName(event.target.value)} value={companyName}>
@@ -457,8 +457,8 @@ export function CashDiscountCustomerScopeSettings() {
 
       <section className="rounded-[10px] border border-[#e8e5de] bg-white p-5">
         <div>
-          <p className="text-[10px] font-medium uppercase tracking-[0.17em] text-[#8a7f72]">Step 1</p>
-          <h3 className="mt-1 text-sm font-semibold text-[#20201c]">How should Kalika find customers?</h3>
+          <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">Step 1</p>
+          <h3 className="mt-1 text-sm font-bold text-[#111827]">How should Kalika find customers?</h3>
         </div>
         <div className="mt-4 grid gap-3 md:grid-cols-2" role="radiogroup" aria-label="Customer discovery method">
           <button
@@ -478,8 +478,8 @@ export function CashDiscountCustomerScopeSettings() {
               <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#dff1e8] text-[#1f6b52]"><ShieldCheck className="h-4 w-4" /></span>
               {!manualSelection ? <Check className="h-4 w-4 text-[#1f6b52]" /> : null}
             </span>
-            <span className="mt-3 block text-[13px] font-semibold text-[#20201c]">Recommended</span>
-            <span className="mt-1 block text-[12px] leading-5 text-[#5f625d]">Use {recommendedGroupName}, its subgroups, and include an outside ledger only when a Sales invoice proves it is a customer.</span>
+            <span className="mt-3 block text-sm font-bold text-[#111827]">Recommended</span>
+            <span className="mt-1 block text-xs text-[#5b4b3d]">Use {recommendedGroupName} and its subgroups.</span>
           </button>
           <button
             aria-checked={manualSelection}
@@ -495,8 +495,8 @@ export function CashDiscountCustomerScopeSettings() {
               <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#f1eee7] text-[#665f55]"><SlidersHorizontal className="h-4 w-4" /></span>
               {manualSelection ? <Check className="h-4 w-4 text-[#1f6b52]" /> : null}
             </span>
-            <span className="mt-3 block text-[13px] font-semibold text-[#20201c]">Choose groups manually</span>
-            <span className="mt-1 block text-[12px] leading-5 text-[#5f625d]">Use this when your company keeps customers in custom Tally groups.</span>
+            <span className="mt-3 block text-sm font-bold text-[#111827]">Choose groups manually</span>
+            <span className="mt-1 block text-xs text-[#5b4b3d]">Use this when your company keeps customers in custom Tally groups.</span>
           </button>
         </div>
       </section>
@@ -506,7 +506,7 @@ export function CashDiscountCustomerScopeSettings() {
           <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="flex items-center gap-2 text-sm font-semibold text-[#173f32]"><ShieldCheck className="h-4 w-4" />Recommended scope is ready</p>
-              <p className="mt-1 text-xs leading-5 text-[#526b61]">{recommendedGroupName}{descendantGroupCount > 0 ? ` + ${descendantGroupCount} nested group${descendantGroupCount === 1 ? "" : "s"}` : ""}. Customer count is checked live during each Cash Discount refresh.</p>
+              <p className="mt-1 text-xs leading-5 text-[#526b61]">{recommendedGroupName}{descendantGroupCount > 0 ? ` + ${descendantGroupCount} nested group${descendantGroupCount === 1 ? "" : "s"}` : ""}.</p>
             </div>
             <button className="text-left text-xs font-semibold text-[#1f6b52] underline-offset-4 hover:underline" onClick={() => setScope((current) => ({ ...current, mode: "custom" }))} type="button">Customize groups</button>
           </div>
@@ -515,9 +515,9 @@ export function CashDiscountCustomerScopeSettings() {
         <section className="rounded-[10px] border border-[#e8e5de] bg-white p-5">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div>
-              <p className="text-[10px] font-medium uppercase tracking-[0.17em] text-[#8a7f72]">Step 2</p>
-              <h3 className="mt-1 text-sm font-semibold text-[#20201c]">Which Tally groups contain customers?</h3>
-              <p className="mt-1 text-xs leading-5 text-[#656860]">We show likely customer groups first. You can still choose any Tally group.</p>
+              <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">Step 2</p>
+              <h3 className="mt-1 text-sm font-bold text-[#111827]">Which Tally groups contain customers?</h3>
+              <p className="mt-1 text-xs text-[#5b4b3d]">You can choose any Tally group.</p>
             </div>
             <div className="flex flex-col items-stretch gap-2 sm:items-end">
               <div className="flex flex-wrap items-center justify-end gap-2">
@@ -543,7 +543,7 @@ export function CashDiscountCustomerScopeSettings() {
 
           {scope.selectedGroupNames.length > 0 ? (
             <div className="mt-4 flex flex-wrap items-center gap-2 rounded-lg bg-[#f6f4ee] px-3 py-2.5">
-              <span className="mr-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-[#777065]">Selected</span>
+              <span className="mr-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-[#8a7f72]">Selected</span>
               {scope.selectedGroupNames.map((name) => <span className="rounded-full border border-[#cfe5da] bg-white px-2.5 py-1 text-xs font-medium text-[#245b47]" key={name}>{name}</span>)}
               <span className="ml-auto text-xs text-[#686b64]">{scope.includeNestedGroups ? `${descendantGroupCount} nested included` : "Nested groups excluded"}</span>
             </div>
@@ -552,7 +552,7 @@ export function CashDiscountCustomerScopeSettings() {
           {unusualSelectedGroups.length > 0 ? (
             <div className="mt-3 flex gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-5 text-amber-900">
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span><strong>{unusualSelectedGroups.map((group) => group.name).join(", ")}</strong> does not look like a usual customer group. Kalika will still use it because you selected it.</span>
+              <span><strong>{unusualSelectedGroups.map((group) => group.name).join(", ")}</strong> is unusual for customers, but will be used as selected.</span>
             </div>
           ) : null}
 
@@ -611,11 +611,11 @@ export function CashDiscountCustomerScopeSettings() {
                     >
                       <span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded border ${explicitlySelected ? "border-[#1f6b52] bg-[#1f6b52] text-white" : inheritedFrom ? "border-[#72a58f] bg-[#dff1e8] text-[#1f6b52]" : "border-[#bbb5aa] bg-white"}`}>{effectivelySelected ? <Check className="h-3.5 w-3.5" /> : null}</span>
                       <span className="min-w-0 flex-1">
-                        <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] font-medium text-[#20201c]">
+                        <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs font-semibold text-[#111827]">
                           {group.name}
-                          {childCount > 0 ? <span className="text-[10px] font-medium text-[#777a72]">{childCount} direct subgroup{childCount === 1 ? "" : "s"}</span> : null}
+                          {childCount > 0 ? <span className="text-[11px] font-medium text-[#8a7f72]">{childCount} direct subgroup{childCount === 1 ? "" : "s"}</span> : null}
                         </span>
-                        <span className="block text-[11px] text-[#777a72]">Under {group.parent || "Primary"}</span>
+                        <span className="block text-xs text-[#8a7f72]">Under {group.parent || "Primary"}</span>
                       </span>
                       {inheritedFrom ? <span className="hidden shrink-0 rounded-full border border-[#cfe5da] bg-white px-2 py-1 text-[10px] font-semibold text-[#2d664f] sm:inline">Included via {inheritedFrom}</span> : looksLikeCustomerGroup(group) ? <span className="hidden shrink-0 rounded-full bg-[#e8f4ed] px-2 py-1 text-[10px] font-semibold text-[#2d664f] sm:inline">Likely customer group</span> : null}
                     </button>
@@ -626,13 +626,13 @@ export function CashDiscountCustomerScopeSettings() {
             </div>
           </div>
 
-          <button aria-pressed={scope.includeNestedGroups} type="button" onClick={() => setScope((current) => ({ ...current, includeNestedGroups: !current.includeNestedGroups }))} className="mt-4 flex w-full items-center justify-between gap-4 rounded-lg border border-[#e8e5de] px-4 py-3 text-left hover:bg-[#faf9f6]"><span><span className="block text-[13px] font-medium text-[#20201c]">Include nested subgroups</span><span className="mt-0.5 block text-xs text-[#656860]">Recommended when customers are split by region, channel, or salesperson.</span></span><Toggle checked={scope.includeNestedGroups} /></button>
+          <button aria-pressed={scope.includeNestedGroups} type="button" onClick={() => setScope((current) => ({ ...current, includeNestedGroups: !current.includeNestedGroups }))} className="mt-4 flex w-full items-center justify-between gap-4 rounded-lg border border-[#e8e5de] px-4 py-3 text-left hover:bg-[#faf9f6]"><span><span className="block text-xs font-semibold text-[#111827]">Include nested subgroups</span><span className="mt-0.5 block text-xs text-[#8a7f72]">Includes subgroups split by region, channel, or salesperson.</span></span><Toggle checked={scope.includeNestedGroups} /></button>
         </section>
       )}
 
       {manualSelection ? <section className="overflow-hidden rounded-[10px] border border-[#e8e5de] bg-white">
         <button aria-expanded={showAdvanced} className="flex w-full items-center justify-between gap-4 px-5 py-4 text-left hover:bg-[#faf9f6]" onClick={() => setShowAdvanced((current) => !current)} type="button">
-          <span><span className="block text-[13px] font-semibold text-[#20201c]">Advanced safety</span><span className="mt-0.5 block text-xs text-[#656860]">Control whether verified customers outside your chosen groups can appear.</span></span>
+          <span><span className="block text-sm font-bold text-[#111827]">Advanced safety</span><span className="mt-0.5 block text-xs text-[#8a7f72]">Safety net for ledgers outside your groups.</span></span>
           <ChevronDown className={`h-4 w-4 text-[#71695f] transition ${showAdvanced ? "rotate-180" : ""}`} />
         </button>
         {showAdvanced ? (
@@ -646,7 +646,7 @@ export function CashDiscountCustomerScopeSettings() {
               })}
               type="button"
             >
-              <span><span className="flex items-center gap-2 text-[13px] font-medium text-[#20201c]"><ShieldCheck className="h-4 w-4 text-[#1f6b52]" />Include verified customers outside these groups</span><span className="mt-1 block text-xs leading-5 text-[#656860]">Only include an outside ledger when its open bill links to an actual Sales voucher. Turn this off to scan selected groups only.</span></span>
+              <span><span className="flex items-center gap-2 text-xs font-semibold text-[#111827]"><ShieldCheck className="h-4 w-4 text-[#1f6b52]" />Include verified customers outside these groups</span><span className="mt-1 block text-xs text-[#5b4b3d]">Only include an outside ledger when its open bill links to an actual Sales voucher. Turn this off to scan selected groups only.</span></span>
               <Toggle checked={scope.detectSalesLinkedExceptions} />
             </button>
           </div>
@@ -656,10 +656,10 @@ export function CashDiscountCustomerScopeSettings() {
       <div className="sticky bottom-4 z-10 flex flex-col gap-3 rounded-xl border border-[#d9d4c9] bg-white/95 px-4 py-3 shadow-[0_12px_36px_rgba(45,39,30,0.14)] backdrop-blur sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0">
           <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#777065]">What Kalika will scan</p>
-          <p className="mt-0.5 truncate text-[13px] font-medium text-[#20201c]">{scope.selectedGroupNames.join(", ") || "No customer group selected"}{scope.includeNestedGroups ? ` · ${descendantGroupCount} nested` : ""}{scope.detectSalesLinkedExceptions ? " · verified outside customers" : " · selected groups only"}</p>
-          <p className={`mt-0.5 text-xs ${hasUnsavedChanges ? "text-amber-700" : "text-[#777a72]"}`}>{hasUnsavedChanges ? "You have unsaved changes." : "Saved and ready for the next live refresh."}</p>
+          <p className="mt-0.5 truncate text-xs font-semibold text-[#111827]">{scope.selectedGroupNames.join(", ") || "No customer group selected"}{scope.includeNestedGroups ? ` · ${descendantGroupCount} nested` : ""}{scope.detectSalesLinkedExceptions ? " · verified outside customers" : " · selected groups only"}</p>
+          <p className={`mt-0.5 text-xs ${hasUnsavedChanges ? "text-amber-700" : "text-[#777a72]"}`}>{hasUnsavedChanges ? "You have unsaved changes." : "Saved."}</p>
         </div>
-        <Button type="button" disabled={loading || saving || !connectionId || !companyName || !hasUnsavedChanges || scope.selectedGroupNames.length === 0} onClick={save} className="h-10 shrink-0 rounded-lg bg-[#20201c] px-5 text-white hover:bg-[#111]">{saving ? <><Loader2 className="h-4 w-4 animate-spin" />Saving</> : "Save customer scope"}</Button>
+        <Button type="button" disabled={loading || saving || !connectionId || !companyName || !hasUnsavedChanges || scope.selectedGroupNames.length === 0} onClick={save} className="h-10 shrink-0 rounded-lg bg-[#2b1a10] px-5 text-white hover:bg-[#3b271a]">{saving ? <><Loader2 className="h-4 w-4 animate-spin" />Saving</> : "Save customer scope"}</Button>
       </div>
     </main>
   );

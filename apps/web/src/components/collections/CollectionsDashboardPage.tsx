@@ -1767,10 +1767,11 @@ export function CollectionsDashboardPage({
           </div>
         </details> : null}
       </div>
-      {dashboard?.cache?.stale ? <div role="status" className="mb-2 text-xs text-amber-800">Showing saved results. {dashboard.cache.refreshError ? `Could not refresh: ${dashboard.cache.refreshError}` : 'Updating from Tally…'}</div> : null}
+      {dashboard?.cache?.stale && dashboard?.scanSummary?.complete !== false ? <div role="status" className="mb-2 text-xs text-amber-800">Showing saved results. {dashboard.cache.refreshError ? `Could not refresh: ${dashboard.cache.refreshError}` : 'Updating from Tally…'}</div> : null}
       {dashboard?.scanSummary?.complete === false ? (
         <div role="alert" className="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">
           <p>{dashboard.scanSummary.completed}/{dashboard.scanSummary.total} customers checked. Remaining customers need review; no missing evidence has been treated as zero.</p>
+          {dashboard?.cache?.stale ? <p className="mt-1 text-xs">Showing saved results. {dashboard.cache.refreshError ? `Could not refresh: ${dashboard.cache.refreshError}` : 'Updating from Tally…'}</p> : null}
           {dashboard.scanSummary.resumable ? <button type="button" className="mt-2 rounded-lg border px-3 py-1" disabled={Boolean(activeScanRef.current)} onClick={() => {
             void refreshTallyOpenBills(selectedConnectionId, selectedCompany?.companyName, selectedCompany?.financialYear, selectedCompany?.companyGuid, true)
               .then((value) => { setDashboard(value); setMessage(null); })
@@ -1792,7 +1793,7 @@ export function CollectionsDashboardPage({
           <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
           <span>{message.text}</span>
         </div>
-      ) : message ? (
+      ) : message && !companyContextLocked && !scanFailed ? (
         <div
           className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${message.tone === "success"
               ? "border-emerald-200 bg-emerald-50 text-emerald-800"
@@ -1820,7 +1821,7 @@ export function CollectionsDashboardPage({
               </div>
               <div>
                 <h2 className="text-sm font-semibold text-[#1a1a1a]">
-                  {liveCompanyCheckPending ? "Verifying the live Tally company" : "Cash Discount review is locked"}
+                  {liveCompanyCheckPending ? "Verifying the live Tally company" : isDedicatedFollowUpsPage ? "Payment follow-up review is locked" : "Cash Discount review is locked"}
                 </h2>
                 <p className="mt-1 max-w-3xl text-xs font-medium leading-relaxed text-slate-600">
                   {liveCompanyCheckPending
@@ -1847,7 +1848,7 @@ export function CollectionsDashboardPage({
 
       {dashboard?.setupRequired && !companyContextLocked ? (
         <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-800 shadow-sm">
-          Cash Discounts tables are not ready. Run the database migration.
+          {isDedicatedFollowUpsPage ? "Payment follow-up tables are not ready. Run the database migration." : "Cash Discounts tables are not ready. Run the database migration."}
         </div>
       ) : null}
 
@@ -1855,10 +1856,13 @@ export function CollectionsDashboardPage({
         <section className="mb-6 rounded-2xl border border-red-200 bg-red-50 px-5 py-5 shadow-sm">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div>
-              <h2 className="text-sm font-semibold text-red-900">Cash Discount results are unavailable</h2>
+              <h2 className="text-sm font-semibold text-red-900">{isDedicatedFollowUpsPage ? "Payment follow-up results are unavailable" : "Cash Discount results are unavailable"}</h2>
               <p className="mt-1 text-xs font-medium leading-relaxed text-red-800">
                 The latest Tally scan did not complete, so this page is not reporting zero open bills or zero recoverable amount.
               </p>
+              {message?.tone === "error" ? (
+                <p className="mt-1 text-xs leading-relaxed text-red-700">{message.text}</p>
+              ) : null}
             </div>
             <button
               className="inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-xl border border-red-200 bg-white px-3 text-xs font-medium text-red-800 shadow-sm transition hover:bg-red-100"

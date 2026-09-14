@@ -27,6 +27,8 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const connectionId = url.searchParams.get("connectionId") ?? "";
     const bridgeVersion = url.searchParams.get("bridgeVersion") ?? null;
+    const requestedLimit = Number(url.searchParams.get("limit") || 1);
+    const limit = Math.max(1, Math.min(50, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 1));
     const token = getBridgeToken(request);
 
     if (!connectionId || !token) {
@@ -34,18 +36,22 @@ export async function GET(request: Request) {
     }
 
     if (isLocalDbMode()) {
-      const result = await claimNextLocalTallyCommand({
-        connectionId,
-        token,
-        bridgeVersion,
-      });
-
-      if (result.unauthorized) {
-        return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
+      const commands = [];
+      for (let index = 0; index < limit; index += 1) {
+        const result = await claimNextLocalTallyCommand({
+          connectionId,
+          token,
+          bridgeVersion,
+        });
+        if (result.unauthorized) {
+          return jsonWithCors(request, { error: "Invalid bridge token." }, { status: 401 });
+        }
+        if (!result.command) break;
+        commands.push(serializeTallyBridgeCommand(result.command));
       }
-
       return jsonWithCors(request, {
-        command: result.command ? serializeTallyBridgeCommand(result.command) : null,
+        command: commands[0] ?? null,
+        commands,
       });
     }
 
@@ -71,14 +77,19 @@ export async function GET(request: Request) {
     }
 
     if (process.env.TEAM_ACCESS_ENFORCEMENT === 'true') {
-      const claimed = await supabase.rpc('access_claim_next_command', {
-        p_connection: connection.id, p_installation: connection.installation_id,
-        p_generation: connection.session_generation, p_bridge_version: bridgeVersion,
-      });
-      if (claimed.error) {
-        return jsonWithCors(request, { error: 'Command authorization or pairing is unavailable.' }, { status: claimed.error.code === '42501' ? 403 : 503 });
+      const commands = [];
+      for (let index = 0; index < limit; index += 1) {
+        const claimed = await supabase.rpc('access_claim_next_command', {
+          p_connection: connection.id, p_installation: connection.installation_id,
+          p_generation: connection.session_generation, p_bridge_version: bridgeVersion,
+        });
+        if (claimed.error) {
+          return jsonWithCors(request, { error: 'Command authorization or pairing is unavailable.' }, { status: claimed.error.code === '42501' ? 403 : 503 });
+        }
+        if (!claimed.data) break;
+        commands.push(serializeTallyBridgeCommand(claimed.data as TallyBridgeCommandRow));
       }
-      return jsonWithCors(request, { command: claimed.data ? serializeTallyBridgeCommand(claimed.data as TallyBridgeCommandRow) : null });
+      return jsonWithCors(request, { command: commands[0] ?? null, commands });
     }
 
     const now = new Date().toISOString();
@@ -193,6 +204,7 @@ export async function GET(request: Request) {
 
     return jsonWithCors(request, {
       command: serializeTallyBridgeCommand(claimedData as unknown as TallyBridgeCommandRow),
+      commands: [serializeTallyBridgeCommand(claimedData as unknown as TallyBridgeCommandRow)],
     });
   } catch (error) {
     console.error("Error in GET /api/tally/bridge/commands/next:", error);

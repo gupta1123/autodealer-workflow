@@ -107,7 +107,10 @@ export class BrowserDocumentUpload {
     const key = createHash("sha256").update(token).digest("hex");
     const context = this.contexts.get(key);
     if (req.method === 'POST' && req.url === '/document/context') {
-      if (!context || Date.now() > context.expiresAt) return reply(409, { code: 'CONTEXT_NOT_READY', error: 'Document context is not ready or expired.' });
+      // The browser can reach localhost before the authenticated cloud command
+      // has registered its one-use ticket. That is normal pending state, not a
+      // conflict; genuine replacement/conflicting contexts still return 409.
+      if (!context || Date.now() > context.expiresAt) return reply(202, { code: 'CONTEXT_NOT_READY', error: 'Document context is not ready or expired.' });
       if (origin !== context.origin) return reply(403, { error: 'Upload origin mismatch.' });
       try {
         const chunks = []; let size = 0;
@@ -117,7 +120,11 @@ export class BrowserDocumentUpload {
         for (const field of ['organizationId','ownerUserId','connectionId','installationId','sessionGeneration','companyGuid','companyName','financialYear']) {
           if (String(body.identity?.[field] ?? '') !== String(context.identity?.[field] ?? '')) return reply(403, { error: 'Document context identity mismatch.' });
         }
-        if (!Array.isArray(body.ledgerNames) || !body.ledgerNames.length || body.ledgerNames.length > 20000 || body.ledgerNames.some(x => typeof x !== 'string') || !Array.isArray(body.bankAccountCandidates)) throw new Error('Invalid ledger context.');
+        // V2 schema 3 performs retrieval against the connector's prepared local
+        // vector index. In that mode the browser intentionally sends no ledger
+        // catalogue; retaining support for a populated list keeps older clients
+        // compatible during rolling upgrades.
+        if (!Array.isArray(body.ledgerNames) || body.ledgerNames.length > 20000 || body.ledgerNames.some(x => typeof x !== 'string') || !Array.isArray(body.bankAccountCandidates)) throw new Error('Invalid ledger context.');
         const value = { ledgerNames: body.ledgerNames, bankAccountCandidates: body.bankAccountCandidates };
         const hash = createHash('sha256').update(JSON.stringify(value)).digest('hex');
         if (context.hash && context.hash !== hash) return reply(409, { error: 'Conflicting document context.' });

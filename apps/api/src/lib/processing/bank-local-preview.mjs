@@ -88,13 +88,17 @@ export function prepareLocalExtraction(local) {
   const coverageVerified = local.diagnostics?.coverage?.complete === true && local.diagnostics.coverage.sourceRows === parsed.transactions.length;
   parsed.transactions = parsed.transactions.map((transaction, index) => {
     const sourcePage = transaction.raw_payload?.row?.sourcePage;
-    return { ...transaction, raw_payload: { ...transaction.raw_payload, extractionProvenance: {
+    return { ...transaction, raw_payload: { ...transaction.raw_payload,
+      vectorLedgerCandidates: local.diagnostics?.vectorCandidates?.[index] || [], extractionProvenance: {
       startPage: sourcePage || null, endPage: sourcePage || null, sourceIndex: index, method: 'local_agent_markdown_source_rows_v1',
     } } };
   });
-  return { parsed, extractionSource: 'anydoc_markdown_combined_ai',
+  const connectorVector = local.diagnostics?.mode === 'connector_anydoc_vector_v1';
+  return { parsed, extractionSource: connectorVector ? 'connector_anydoc_vector_v1' : 'anydoc_markdown_combined_ai',
     extractionError: coverageVerified ? null : 'Source transaction coverage could not be verified. Review is required before posting.',
-    diagnostics: { pipeline: 'local_agent_markdown_combined_ai', localParsing: local.diagnostics, coverageComplete: coverageVerified,
+    diagnostics: { pipeline: connectorVector ? 'connector_anydoc_vector_v1' : 'local_agent_markdown_combined_ai', localParsing: local.diagnostics,
+      connectorParser: local.diagnostics?.parserDiagnostics || null, vectorCandidateCount: local.diagnostics?.vectorCandidateCount || 0,
+      connectorTiming: local.diagnostics?.connectorMeasurements || null, coverageComplete: coverageVerified,
       errors: coverageVerified ? [] : ['Source transaction coverage could not be verified.'] } };
 }
 
