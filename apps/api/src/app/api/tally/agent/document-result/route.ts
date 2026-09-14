@@ -10,7 +10,36 @@ import { localBankV2Store } from '@/lib/processing/bank-local-v2-store';
 import { publishBankJobEvent, subscribeBankJobEvents } from '@/lib/processing/bank-job-events.mjs';
 import { watchBankAnalysis } from '@/lib/processing/bank-local-v2-cancellation.mjs';
 import {subscribeAccessChanges} from '@/lib/access/events';
-import { suggestBankLedgersForTransactions } from '@/lib/bank-statement-ledger-matching';
+import { suggestBankLedgersForTransactions, type VectorLedgerCandidate } from '@/lib/bank-statement-ledger-matching';
+
+type ParsedBankTransaction = {
+  transaction_date?: string | null;
+  value_date?: string | null;
+  description?: string | null;
+  reference_number?: string | null;
+  debit_amount?: number | null;
+  credit_amount?: number | null;
+  balance_amount?: number | null;
+  transaction_type?: string | null;
+  category?: string | null;
+  counterparty_name?: string | null;
+  raw_payload?: { extractionProvenance?: { startPage?: number | null } } | null;
+};
+
+type LocalBankAnalysisInput = {
+  parsed?: {
+    account?: unknown;
+    statementPeriodStart?: string | null;
+    statementPeriodEnd?: string | null;
+    openingBalance?: number | null;
+    transactions: ParsedBankTransaction[];
+  };
+  identity: { ownerUserId: string; connectionId: string; companyName: string };
+  vectorCandidates: Array<VectorLedgerCandidate[] | undefined>;
+  parserDiagnostics?: { pipeline?: string } & Record<string, unknown>;
+  connectorMeasurements?: unknown;
+  [key: string]: unknown;
+};
 
 export function OPTIONS(request: Request) { return optionsWithCors(request); }
 
@@ -18,22 +47,22 @@ export async function POST(request: Request) {
   if (request.headers.get('content-type')?.split(';')[0].trim() === BANK_LOCAL_V2_CONTENT_TYPE) {
     const db = createSupabaseAdminClient();
     return handleLocalBankV2(request, { verifyToken: verifyAgentJobToken, store: localBankV2Store(db),
-      analyze: (async (input: any) => {
+      analyze: async (input: LocalBankAnalysisInput) => {
         if (!input.parsed) return matchBankMarkdown(input);
         const started = performance.now();
         const sourceRows = input.parsed.transactions;
         const matching = await suggestBankLedgersForTransactions({ supabase: db,
           ownerUserId: input.identity.ownerUserId, connectionId: input.identity.connectionId,
           companyName: input.identity.companyName, vectorCandidates: input.vectorCandidates,
-          transactions: sourceRows.map((row: any) => ({ accountId: '', transaction: {
-            transactionDate: row.transaction_date, valueDate: row.value_date, description: row.description,
+          transactions: sourceRows.map((row: ParsedBankTransaction) => ({ accountId: '', transaction: {
+            transactionDate: row.transaction_date || '', valueDate: row.value_date, description: row.description || '',
             referenceNumber: row.reference_number, debitAmount: row.debit_amount, creditAmount: row.credit_amount,
-            balanceAmount: row.balance_amount, transactionType: row.transaction_type, category: row.category,
+            balanceAmount: row.balance_amount, transactionType: row.transaction_type || undefined, category: row.category || undefined,
             counterpartyName: row.counterparty_name,
           } })) });
         const data = { account: input.parsed.account, statementPeriodStart: input.parsed.statementPeriodStart,
           statementPeriodEnd: input.parsed.statementPeriodEnd, openingBalance: input.parsed.openingBalance,
-          transactions: sourceRows.map((row: any, index: number) => ({ transactionDate: row.transaction_date, valueDate: row.value_date,
+          transactions: sourceRows.map((row: ParsedBankTransaction, index: number) => ({ transactionDate: row.transaction_date, valueDate: row.value_date,
             description: row.description, referenceNumber: row.reference_number, debitAmount: row.debit_amount,
             creditAmount: row.credit_amount, balanceAmount: row.balance_amount, transactionType: row.transaction_type,
             category: row.category, counterpartyName: row.counterparty_name,
@@ -45,8 +74,8 @@ export async function POST(request: Request) {
             sourceRows: sourceRows.length, returnedRows: sourceRows.length }, mode: 'connector_anydoc_vector_v1',
           parserDiagnostics: input.parserDiagnostics, connectorMeasurements: input.connectorMeasurements,
           vectorCandidates: input.vectorCandidates,
-          vectorCandidateCount: input.vectorCandidates.reduce((total: number, rows: any[]) => total + rows.length, 0) };
-      }) as any,
+          vectorCandidateCount: input.vectorCandidates.reduce((total: number, rows) => total + (rows?.length || 0), 0) };
+      },
       watchAnalysis: envelope => watchBankAnalysis({ identity: envelope.identity, jobId: envelope.jobId,
         subscribeAccess:process.env.TEAM_ACCESS_ENFORCEMENT==='true'?subscribeAccessChanges:undefined,
         subscribe: subscribeBankJobEvents, readStatus: async () => {
