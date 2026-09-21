@@ -7587,7 +7587,52 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
         data.benchmarkDiagnostics = benchmarkDiagnostics;
       }
       log("info", `Cash Discount ${operation} ${requestId} completed in ${Math.round(performance.now() - startedAt)} ms.`);
-      sendOperationResult({ type: "operation_result", success: true, companyName: message.companyName, data });
+      // Purchase catalogue results historically carried every master twice:
+      // once under `masters` and again in flat top-level arrays. Large Tally
+      // companies could consequently exceed the gateway WebSocket frame limit
+      // and appear to the browser as a connector disconnect. Browser consumers
+      // use the canonical nested shape, so keep one copy on this transport.
+      const responseData = operation === "ledger_masters" && data?.masters
+        ? (() => {
+            const compactMaster = (value) => {
+              if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+              const raw = value.raw && typeof value.raw === "object" && !Array.isArray(value.raw)
+                ? value.raw
+                : {};
+              const pick = (key) => value[key] ?? raw[key] ?? null;
+              return Object.fromEntries(Object.entries({
+                guid: pick("guid"),
+                name: pick("name"),
+                parent: pick("parent"),
+                gstin: pick("gstin"),
+                hsnCode: pick("hsnCode"),
+                unitName: pick("unitName"),
+                taxRate: pick("taxRate"),
+                taxType: pick("taxType"),
+                gstDutyHead: pick("gstDutyHead"),
+                closingBalance: pick("closingBalance"),
+                closingBalanceType: pick("closingBalanceType"),
+                decimalPlaces: pick("decimalPlaces"),
+              }).filter(([, fieldValue]) => fieldValue !== null && fieldValue !== undefined && fieldValue !== ""));
+            };
+            const compactMasters = {
+              ...data.masters,
+              ledgers: Array.isArray(data.masters.ledgers) ? data.masters.ledgers.map(compactMaster) : [],
+              groups: Array.isArray(data.masters.groups) ? data.masters.groups.map(compactMaster) : [],
+              stockItems: Array.isArray(data.masters.stockItems) ? data.masters.stockItems.map(compactMaster) : [],
+              units: Array.isArray(data.masters.units) ? data.masters.units.map(compactMaster) : [],
+              godowns: Array.isArray(data.masters.godowns) ? data.masters.godowns.map(compactMaster) : [],
+            };
+            const compact = { ...data, masters: compactMasters };
+            delete compact.ledgers;
+            delete compact.groups;
+            delete compact.stockItems;
+            delete compact.units;
+            delete compact.godowns;
+            return compact;
+          })()
+        : data;
+      sendOperationResult({ type: "operation_result", success: true, companyName: message.companyName, data: responseData });
     } catch (error) {
       if (!benchmarkFinished) {
         if (isRead) readRecoveryUntil = Date.now() + 30_000;
