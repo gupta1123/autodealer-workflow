@@ -859,7 +859,8 @@ export function TallyPurchasePostingPanel({
           const hydrated = withLiveMasterOptions(prepared);
           const cachedReview = {
             ...hydrated.review,
-            supplierLedgerName: next.review.supplierLedgerName,
+            supplierLedgerName:
+              next.review?.supplierLedgerName ?? hydrated.review.supplierLedgerName,
           };
           setPayload({ ...hydrated, review: cachedReview, liveMatchingComplete: false });
           setReview(cachedReview);
