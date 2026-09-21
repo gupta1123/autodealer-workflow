@@ -35,9 +35,9 @@ jobs:
       - name: Test agent and gateway
         shell: pwsh
         run: |
-          npm run test:tally-bridge
-          npm run test:cash-discount-gateway
-          npm run test:local-agent
+          node --test --test-force-exit apps/tally-bridge/src/bridge.test.mjs
+          node --test --test-force-exit apps/cash-discount-gateway/src/server.test.mjs
+          node --test --test-force-exit apps/tally-bridge/src/agent/local-agent.test.mjs
       - name: Validate native Electron modules
         shell: pwsh
         run: node scripts/smoke-local-agent-native-modules.mjs
