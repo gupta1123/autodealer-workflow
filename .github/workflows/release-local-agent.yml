@@ -63,6 +63,11 @@ jobs:
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
-        run: gh release upload "${{ github.ref_name }}" installer/tally-bridge/output/* --clobber
+        run: |
+          gh release view "${{ github.ref_name }}" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "${{ github.ref_name }}" --title "Kalika Local Agent ${{ github.ref_name }}" --generate-notes
+          }
+          gh release upload "${{ github.ref_name }}" installer/tally-bridge/output/* --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
