@@ -1610,7 +1610,7 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
       ? await context.supabase.rpc('access_enqueue_purchase', {
           p_actor: user.id, p_org: team.access.organizationId, p_case: id,
           p_workflow_revision: body.workflowRevision, p_source_revision: team.scope.source_revision,
-          p_financial_digest: purchaseFinancialDigest(context.documents.map(({id,document_type,extracted_fields}) => ({id,document_type,extracted_fields})), context.posting.review_patch, { companyId: team.scope.company_id, connectionId: context.posting.connection_id }),
+          p_financial_digest: purchaseFinancialDigest(context.documents.map(({id,document_type,extracted_fields}) => ({id,document_type,extracted_fields})), context.posting.review_patch, { companyId: team.scope.company_id, connectionId: context.connection.id }),
           p_args: queueArgs,
         })
       : await context.supabase.rpc('queue_purchase_invoice_tally_posting', queueArgs);

@@ -762,14 +762,10 @@ export function TallyPurchasePostingPanel({
       setSelectedConnectionId(hydrated.selectedConnectionId ?? connectionId ?? "");
       setSelectedCompanyName(hydrated.selectedCompanyName ?? companyName ?? "");
       if (replaceReview || (!dirty && !review)) setReview(hydrated.review);
-      setError(
-        hydrated.posting?.status === "failed"
-          ? purchasePostingFailureMessage(
-              hydrated.posting.lastError,
-              hydrated.posting.verificationResult
-            )
-          : null
-      );
+      // A failed posting loaded from storage is history, not a failure of the
+      // current page operation. Keep it in the footer/status area; only a new
+      // live request or posting transition should raise the prominent banner.
+      setError(null);
       setState("ready");
       return hydrated;
     } catch (loadError) {
@@ -1239,6 +1235,7 @@ export function TallyPurchasePostingPanel({
       companyName: selectedCompanyName,
       supplierName,
       supplierGstin,
+      liveMasters: liveMasterResultRef.current,
     })
       .then((match) => {
         setSupplierLedgerMatch(match);
@@ -1305,6 +1302,7 @@ export function TallyPurchasePostingPanel({
       connectionId: selectedConnectionId,
       companyName: selectedCompanyName,
       review,
+      liveMasters: liveMasterResultRef.current,
     })
       .then((matches) => {
         setLineMasterMatches(matches);

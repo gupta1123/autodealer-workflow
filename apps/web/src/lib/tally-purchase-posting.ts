@@ -835,6 +835,7 @@ export async function matchTallyPurchaseSupplierLedger(
     companyName: string;
     supplierName: string;
     supplierGstin: string;
+    liveMasters: unknown;
   }
 ) {
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
@@ -861,6 +862,7 @@ export async function matchTallyPurchaseLineMasters(
     connectionId: string;
     companyName: string;
     review: TallyPostingReview;
+    liveMasters: unknown;
   }
 ) {
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
