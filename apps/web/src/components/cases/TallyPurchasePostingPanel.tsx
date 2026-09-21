@@ -857,6 +857,9 @@ export function TallyPurchasePostingPanel({
           );
           if (cancelled) return;
           const hydrated = withLiveMasterOptions(prepared);
+          if (!hydrated.review) {
+            throw new Error("The cached Tally catalogue did not return a purchase review.");
+          }
           const cachedReview = {
             ...hydrated.review,
             supplierLedgerName:
