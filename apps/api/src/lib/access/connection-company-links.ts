@@ -204,3 +204,77 @@ export async function bindConnectionCompanyLink(input: {
   await writeStableLinks(db, [link], now);
   return link;
 }
+
+export async function automaticallyLinkObservedActiveCompanies(input: {
+  organizationId: string;
+  connectionId: string;
+  installationId: string;
+  companies: Array<Record<string, unknown>>;
+  now?: string;
+  db?: AdminClient;
+}) {
+  const db = input.db || createSupabaseAdminClient();
+  const candidates = input.companies.flatMap((row) => {
+    const companyGuid = text(row.companyGuid ?? row.company_guid ?? row.guid);
+    const companyName = text(row.companyName ?? row.company_name ?? row.name);
+    const financialYear = text(row.financialYear ?? row.financial_year);
+    return row.isActive === true && companyGuid && companyName && financialYear
+      ? [{ companyGuid, companyName, financialYear, isActive: true }]
+      : [];
+  });
+  if (!candidates.length) return { linked: 0, skipped: 0 };
+
+  const [companyResult, linkResult] = await Promise.all([
+    db.from('access_companies').select('id,name,erp_identity')
+      .eq('organization_id', input.organizationId).limit(1000),
+    db.from('access_company_links').select('company_id,company_guid,financial_year')
+      .eq('organization_id', input.organizationId).eq('connection_id', input.connectionId)
+      .eq('installation_id', input.installationId).limit(1000),
+  ]);
+  if (companyResult.error) throw companyResult.error;
+  if (linkResult.error) throw linkResult.error;
+  if ((companyResult.data?.length || 0) >= 1000 || (linkResult.data?.length || 0) >= 1000) {
+    throw new Error('Automatic company linking could not verify all candidates.');
+  }
+
+  const applicationCompanies = [...(companyResult.data || [])] as ApplicationCompanyIdentity[];
+  const links = [...(linkResult.data || [])];
+  let linked = 0;
+  let skipped = 0;
+  for (const company of candidates) {
+    if (links.some((link) => link.company_guid === company.companyGuid && link.financial_year === company.financialYear)) continue;
+    const target = chooseAutomaticCompanyTarget(company, applicationCompanies);
+    if (target.kind === 'ambiguous') { skipped += 1; continue; }
+    let applicationCompany = target.kind === 'existing' ? target.company : null;
+    let evidence = target.kind === 'existing' ? target.evidence : 'automatic-active-company-created';
+    if (!applicationCompany) {
+      const created = await db.from('access_companies').insert({
+        organization_id: input.organizationId,
+        name: company.companyName,
+        erp_identity: target.erpIdentity,
+      }).select('id,name,erp_identity').single();
+      if (created.error) {
+        const existing = await db.from('access_companies').select('id,name,erp_identity')
+          .eq('organization_id', input.organizationId).eq('erp_identity', target.erpIdentity).maybeSingle();
+        if (existing.error || !existing.data) throw created.error;
+        applicationCompany = existing.data as ApplicationCompanyIdentity;
+        evidence = 'automatic-exact-erp-identity';
+      } else applicationCompany = created.data as ApplicationCompanyIdentity;
+      applicationCompanies.push(applicationCompany);
+    }
+    const link = await bindConnectionCompanyLink({
+      db,
+      organizationId: input.organizationId,
+      companyId: applicationCompany.id,
+      connectionId: input.connectionId,
+      installationId: input.installationId,
+      companyGuid: company.companyGuid,
+      financialYear: company.financialYear,
+      evidence,
+      now: input.now,
+    });
+    links.push(link);
+    linked += 1;
+  }
+  return { linked, skipped };
+}

@@ -3,6 +3,7 @@ import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { isLocalDbMode } from "@/lib/local/mode";
 import { updateLocalTallyHeartbeat } from "@/lib/local/tally-store";
 import { canonicalAgentDatasetRows } from "@/lib/tally/agent-datasets";
+import { automaticallyLinkObservedActiveCompanies } from "@/lib/access/connection-company-links";
 import {
   hashSecret,
   connectorSupportsReliableActiveCompany,
@@ -341,6 +342,22 @@ export async function POST(request: Request) {
 
     if (updateError) {
       throw updateError;
+    }
+
+    try {
+      await automaticallyLinkObservedActiveCompanies({
+        db: supabase,
+        organizationId: connection.organization_id!,
+        connectionId: connection.id,
+        installationId: connection.installation_id!,
+        companies: companies as Array<Record<string, unknown>>,
+        now,
+      });
+    } catch (linkError) {
+      console.error("Automatic active-company linking failed after heartbeat was accepted:", {
+        connectionId: connection.id,
+        error: linkError,
+      });
     }
 
     let datasetStatus: { accepted: number; rejected: number; errorCode: string | null } | undefined;
