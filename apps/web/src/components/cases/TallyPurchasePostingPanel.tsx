@@ -779,12 +779,11 @@ export function TallyPurchasePostingPanel({
     }
   }, [caseId, dirty, review, withLiveMasterOptions]);
 
-  // Catalogue load is cache-first: phase 1 fills the ledger dropdowns instantly
-  // from the connector's incrementally synced SQL catalogue (no server
-  // prepare, so no stale snapshot flags), phase 2 verifies against Tally and
-  // runs the server prepare that unlocks auto-matching. Connectors without a
-  // ready local catalogue fall back to a full live read in phase 1.
-  // This replaces the old always-fresh full export on every page open.
+  // Page-open catalogue load is cache-first. The connector returns its local
+  // incrementally synced catalogue immediately; explicit Refresh remains the
+  // place for an authoritative Tally read. Avoid starting a second full read
+  // on mount: it made the dropdowns disappear and doubled the failure surface
+  // when a live channel reconnected during the request.
   useEffect(() => {
     if(approval.enabled&&approval.loading)return;
     if (automaticLiveRefreshRef.current === caseId) return;
@@ -877,27 +876,6 @@ export function TallyPurchasePostingPanel({
           record?.cache?.source === "encrypted_local_agent_incremental"
         );
       };
-      const verifyFreshCatalogue = async (hadCachedOptions: boolean) => {
-        try {
-          const liveMasters = await runCashDiscountLiveRequest({
-            connectionId,
-            companyName,
-            operation: "ledger_masters",
-            payload: { ...cataloguePayload, requireFresh: true },
-            onProgress: (message) => { if (!cancelled) setNotice(message); },
-          });
-          if (cancelled) return;
-          await applyCatalogue(liveMasters, "Latest live Tally data loaded.");
-        } catch (verifyError) {
-          if (cancelled) return;
-          if (hadCachedOptions) {
-            setNotice("Saved catalogue loaded. Live verification unavailable — refresh to retry.");
-          } else {
-            setError(verifyError instanceof Error ? verifyError.message : "Live Tally refresh is unavailable.");
-            setNotice(null);
-          }
-        }
-      };
       try {
         setRefreshingMasters(true);
         setNotice("Loading saved Tally catalogue…");
@@ -917,32 +895,17 @@ export function TallyPurchasePostingPanel({
         try {
           await applyCachedOptions(cachedMasters);
         } catch {
-          // Cached shape unusable: fall through to the fresh read below.
-          await verifyFreshCatalogue(false);
+          setError("The saved Tally catalogue could not be opened. Refresh it from Tally.");
+          setNotice(null);
           return;
         }
         if (cancelled) return;
-        setNotice("Loaded saved catalogue. Verifying latest changes…");
-        await verifyFreshCatalogue(true);
+        setNotice(null);
       } catch (refreshError) {
         if (cancelled) return;
-        // Phase 1 failed (no connector response): one fresh attempt, matching
-        // the old single-read behavior, before surfacing an error.
-        try {
-          const liveMasters = await runCashDiscountLiveRequest({
-            connectionId,
-            companyName,
-            operation: "ledger_masters",
-            payload: { ...cataloguePayload, requireFresh: true },
-            onProgress: (message) => { if (!cancelled) setNotice(message); },
-          });
-          if (cancelled) return;
-          await applyCatalogue(liveMasters, "Latest live Tally data loaded.");
-        } catch (fallbackError) {
-          if (!cancelled) {
-            setError(fallbackError instanceof Error ? fallbackError.message : "Live Tally refresh is unavailable.");
-            setNotice(null);
-          }
+        if (!cancelled) {
+          setError(refreshError instanceof Error ? refreshError.message : "Saved Tally catalogue is unavailable.");
+          setNotice(null);
         }
       } finally {
         if (!cancelled) setRefreshingMasters(false);

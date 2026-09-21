@@ -693,11 +693,24 @@ async function loadContext(
     connections,
     invoiceBuyerName(documents)
   );
+  const healthyConnections = connections.filter((candidate) => {
+    const status = serializeTallyConnectionStatus(candidate);
+    return (
+      status.bridgeConnected &&
+      status.tallyReachable &&
+      status.companyLoaded &&
+      !status.heartbeatStale
+    );
+  });
   const selectedConnectionId =
     lockedConnectionId ||
     requestedUsableConnectionId ||
     savedUsableConnectionId ||
     buyerMatchedConnection?.id ||
+    // Historical/stale rows must not make an otherwise unambiguous live
+    // connector look unselected. This is common on client PCs after pairing
+    // again or replacing an installation.
+    (healthyConnections.length === 1 ? healthyConnections[0].id : null) ||
     (connections.length === 1 ? connections[0].id : null);
   const connection = selectedConnectionId
     ? allConnections.find((candidate) => candidate.id === selectedConnectionId) ?? null

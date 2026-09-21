@@ -1079,14 +1079,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
   }
 
   const selectedTallyConnection = tallyHeaderState?.connection;
-  const detectedTallyConnection =
-    tallyHeaderState?.connectionOptions.find(
-      (option) =>
-        option.bridgeConnected &&
-        option.tallyReachable &&
-        option.companyLoaded &&
-        !option.heartbeatStale
-    ) ?? tallyHeaderState?.connectionOptions[0];
+  const tallyHeaderChecking = tallyHeaderState === null || refreshingTallyHeader;
   const tallyConnectionReady = Boolean(
     selectedTallyConnection?.bridgeConnected &&
     selectedTallyConnection?.tallyReachable &&
@@ -1098,7 +1091,6 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
     (selectedTallyConnection?.companyLoaded
       ? selectedTallyConnection.activeCompanyName
       : null) ||
-    detectedTallyConnection?.companyName ||
     "Not detected";
   const tallyCompanyNameMatches = Boolean(
     tallyConnectionReady &&
@@ -1118,7 +1110,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
   const remainingTallyBlockerCount = tallyValidationState.blockers.filter(
     (item) => !allowedTallyBlockerKeys.has(item.overrideKey)
   ).length;
-  const tallyHeaderTitle = refreshingTallyHeader
+  const tallyHeaderTitle = tallyHeaderChecking
     ? "Checking Tally company"
     : tallyVoucherVerified
       ? `Tally voucher ${tallyHeaderState?.tallyVoucherNumber || "created"}`
@@ -1184,14 +1176,14 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                   : `Kalika: ${kalikaCompanyName} - Tally: ${activeTallyCompanyName}`
               }
               status={
-                refreshingTallyHeader
+                tallyHeaderChecking
                   ? "checking"
                   : tallyVoucherVerified || tallyCompanyContextVerified
                     ? "verified"
                     : "warning"
               }
               avatarName={kalikaCompanyName}
-              refreshing={refreshingTallyHeader}
+              refreshing={tallyHeaderChecking}
               onRefresh={() => void refreshTallyHeader()}
               secondaryAction={{
                 label: tallyConnectionReady ? "Manage Tally" : "Connect Tally",
