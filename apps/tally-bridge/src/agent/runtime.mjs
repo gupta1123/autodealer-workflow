@@ -19,6 +19,7 @@ import {
 import { AGENT_CAPABILITIES, AGENT_PROTOCOL_VERSION, AGENT_VERSION, LOCAL_SCHEMA_VERSION, TDL_REPORT_VERSION, jobClassForCommand } from "./protocol.mjs";
 import { assertAgentIdentity, identityFromCommand, datasetKey, normalizeFinancialYear } from "./identity.mjs";
 import { resourceSnapshot } from "./resource-policy.mjs";
+import { automaticCatalogueSyncPlan } from "./sync-policy.mjs";
 
 const AGENT_COMMANDS = new Set([
   "agent_sync_dataset",
@@ -147,6 +148,7 @@ export class LocalAgentRuntime {
     this.vectorIndexCheckedAt = new Map();
     this.vectorIndexPromises = new Map();
     this.datasetSyncPromises = new Map();
+    this.fallbackCatalogueLogKeys = new Set();
 
     this.scheduler.register("agent_sync_dataset", async (job, progress) => {
       const result = await this.syncDataset(job.identity, { progress });
@@ -448,25 +450,33 @@ export class LocalAgentRuntime {
     const intervalSeconds = Number(await this.storage.call("getSetting", { key: "syncIntervalSeconds", fallback: 60 })) || 60;
     if (Date.now() - this.lastWatermarkAt < Math.max(15, intervalSeconds) * 1_000 || this.scheduler.busy) return;
     this.lastWatermarkAt = Date.now();
+    const key = datasetKey(identity);
+    const existing = await this.storage.call("getDataset", { datasetKey: key });
+    const cachedPlan = automaticCatalogueSyncPlan(existing);
+    if (!cachedPlan.probeCapabilities) {
+      if (!this.fallbackCatalogueLogKeys.has(key)) {
+        this.fallbackCatalogueLogKeys.add(key);
+        this.onLog?.("info", "Using the saved Tally catalogue without automatic fallback scans. Use Refresh or Sync now to check for master changes.");
+      }
+      return;
+    }
     const capabilities = await this.gateway.capabilities(identity);
+    const plan = automaticCatalogueSyncPlan(existing, capabilities);
+    if (!existing) {
+      await this.scheduler.enqueue({ type: "agent_sync_dataset", identity, payload: { reason: "initial_company_observation" }, jobClass: "incremental_sync", priority: 45 });
+      return;
+    }
+    if (!plan.probeCapabilities) return;
+    this.fallbackCatalogueLogKeys.delete(key);
     await this.scheduler.enqueue({
-      id: `followup-watch:${createHash("sha256").update(datasetKey(identity)).digest("hex").slice(0, 20)}:${Math.floor(this.lastWatermarkAt / (Math.max(15, intervalSeconds) * 1_000))}`,
+      id: `followup-watch:${createHash("sha256").update(key).digest("hex").slice(0, 20)}:${Math.floor(this.lastWatermarkAt / (Math.max(15, intervalSeconds) * 1_000))}`,
       type: "agent_sync_followup_changes", identity, payload: {
         reason: "periodic_voucher_delta_check", highestAlterId: Number(capabilities.highestAlterId || 0),
       },
       jobClass: "incremental_sync", priority: 46,
     });
-    const existing = await this.storage.call("getDataset", { datasetKey: datasetKey(identity) });
-    if (!existing) {
-      await this.scheduler.enqueue({ type: "agent_sync_dataset", identity, payload: { reason: "initial_company_observation" }, jobClass: "incremental_sync", priority: 45 });
-      return;
-    }
-    const previous = Number(existing.cacheHealth?.highestAlterId || 0);
-    const reliableGlobalWatermark = capabilities.fallback !== true &&
-      Number(capabilities.version || 0) > 0 &&
-      Number(capabilities.highestAlterId || 0) > 0;
-    if (reliableGlobalWatermark && Number(capabilities.highestAlterId || 0) === previous) return;
-    await this.scheduler.enqueue({ type: "agent_sync_dataset", identity, payload: { reason: reliableGlobalWatermark ? "alter_id_watermark_changed" : "per_type_cursor_validation" }, jobClass: "incremental_sync", priority: 45 });
+    if (!plan.sync) return;
+    await this.scheduler.enqueue({ type: "agent_sync_dataset", identity, payload: { reason: plan.reason }, jobClass: "incremental_sync", priority: 45 });
   }
 
   async moduleEnabled(moduleName) {

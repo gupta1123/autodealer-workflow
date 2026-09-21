@@ -25,8 +25,9 @@ const BRIDGE_VERSION = AGENT_VERSION;
 const MAX_COMMANDS_PER_CYCLE = 50;
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
-const DEFAULT_COMPANY_LIST_INTERVAL_MS = 60_000;
+const DEFAULT_COMPANY_LIST_INTERVAL_MS = 5 * 60_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
+const TALLY_READINESS_TIMEOUT_MS = 5_000;
 // Exports can be larger than imports, but they must still release the bridge
 // cycle if Tally is busy or has stopped responding.
 const TALLY_EXPORT_TIMEOUT_MS = 60_000;
@@ -1533,6 +1534,7 @@ async function fetchAvailableCompanies(tallyUrl, activeCompanyName = null) {
       tallyType: "Company",
       fetchFields: "Name,Guid,StartingFrom,BooksFrom,FinancialYearFrom,CurrentPeriod,AlterID,MasterID,PartyGSTIN,GSTIN,GSTRegistrationNumber,StateName,CountryName",
       companyName: null,
+      timeoutMs: 8_000,
     });
     const seen = new Set();
 
@@ -6106,7 +6108,7 @@ async function testTally(tallyUrl) {
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), readContext
-    ? Math.max(1, Math.min(5_000, readContext.deadlineAt - Date.now())) : TALLY_IMPORT_TIMEOUT_MS);
+    ? Math.max(1, Math.min(TALLY_READINESS_TIMEOUT_MS, readContext.deadlineAt - Date.now())) : TALLY_READINESS_TIMEOUT_MS);
   try {
     const response = await fetch(tallyUrl, {
       method: "POST",
