@@ -76,6 +76,43 @@ test("keeps source-backed positive and negative round-off exact", () => {
   assert.equal(negative.totalDifference, "0.00");
 });
 
+test("rounds the final payable after TDS to a whole rupee", () => {
+  // Client voucher SSTC-26/27-091: 7,53,257.20 before round-off -> 7,53,257.00.
+  const client = calculator.calculatePurchaseVoucher(input({
+    taxMode: "cgst_sgst",
+    lines: [{ lineId: "a", taxableAmount: "649920.00", taxRate: "18" }],
+    invoiceGstAmount: "116985.60",
+    invoiceTotal: "766906.00",
+    sourceRoundOffAmount: "0.40",
+    confirmedRoundOffAmount: "0.40",
+    tds194qEnabled: true,
+    tds194qBasisAmount: "649920.00",
+    tds194qRounding: "nearest_rupee",
+    cgstTdsAmount: "6499.20",
+    sgstTdsAmount: "6499.20",
+  }));
+  assert.equal(client.roundOffAmount, "-0.20");
+  assert.equal(client.calculatedPayable, "753257.00");
+  assert.equal(client.totalDifference, "0.00");
+  // SSTC-26/27-182: 4,84,206.80 before round-off -> 4,84,207.00.
+  const up = calculator.calculatePurchaseVoucher(input({
+    taxMode: "cgst_sgst",
+    lines: [{ lineId: "a", taxableAmount: "417780.00", taxRate: "18" }],
+    invoiceGstAmount: "75200.40",
+    invoiceTotal: "492980.00",
+    sourceRoundOffAmount: "-0.40",
+    confirmedRoundOffAmount: "-0.40",
+    tds194qEnabled: true,
+    tds194qBasisAmount: "417780.00",
+    tds194qRounding: "nearest_rupee",
+    cgstTdsAmount: "4177.80",
+    sgstTdsAmount: "4177.80",
+  }));
+  assert.equal(up.roundOffAmount, "0.20");
+  assert.equal(up.calculatedPayable, "484207.00");
+  assert.equal(up.totalDifference, "0.00");
+});
+
 test("uses one shared 194Q nearest-rupee rule", () => {
   const below = calculator.calculatePurchaseVoucher(input({ tds194qEnabled: true, tds194qBasisAmount: "1490.00", tds194qRounding: "nearest_rupee" }));
   const above = calculator.calculatePurchaseVoucher(input({ tds194qEnabled: true, tds194qBasisAmount: "1500.00", tds194qRounding: "nearest_rupee" }));

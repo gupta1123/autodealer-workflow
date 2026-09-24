@@ -803,9 +803,9 @@ export function TallyPurchasePostingPanel({
         moduleName: "purchase",
         persist: false,
         requestedMasterTypes: ["ledger", "group", "stock_item", "unit", "gst_ledger", "tax_ledger"],
-        includeInventoryLocations: Boolean(
-          next.review?.lines.some((line) => line.godownName.trim() || line.batchName.trim())
-        ),
+        // Always fetch godowns so a location can be chosen even when the
+        // invoice prints none.
+        includeInventoryLocations: true,
       };
       const connectionId = next.selectedConnectionId;
       const companyName = next.selectedCompanyName;
@@ -1409,13 +1409,18 @@ export function TallyPurchasePostingPanel({
       : (payload?.blockers ?? []).filter((issue) => {
       if (issue.scope === "case" || issue.scope === "company") return false;
       // Server blockers describe the last saved review. Clear date errors as
-      // soon as the current browser value is valid; Save still performs the
+      // (and a picked live round-off ledger) as soon as the current browser
+      // value is valid; Save still performs the
       // authoritative server validation before approval.
       if (issue.code === "INVOICE_DATE_REQUIRED" && isValidDateInput(review?.invoiceDate)) return false;
       if (issue.code === "VOUCHER_DATE_REQUIRED" && isValidDateInput(review?.voucherDate)) return false;
+      if (
+        issue.code === "ROUND_OFF_LEDGER_REQUIRED" &&
+        roundOffOptions.some((option) => option.name === review?.roundOffLedgerName)
+      ) return false;
       return true;
     }),
-    [masterValidationPending, payload?.blockers, payload?.posting?.status, review?.invoiceDate, review?.voucherDate]
+    [masterValidationPending, payload?.blockers, payload?.posting?.status, review?.invoiceDate, review?.voucherDate, review?.roundOffLedgerName, roundOffOptions]
   );
   const remainingCorrectionBlockers = useMemo(
     () => correctionBlockers.filter((item) =>
@@ -1727,9 +1732,9 @@ export function TallyPurchasePostingPanel({
           persist: false,
           requireFresh: true,
           requestedMasterTypes: ["ledger", "group", "stock_item", "unit", "gst_ledger", "tax_ledger"],
-          includeInventoryLocations: Boolean(
-            review?.lines.some((line) => line.godownName.trim() || line.batchName.trim())
-          ),
+          // Always fetch godowns so a location can be chosen even when the
+          // invoice prints none.
+          includeInventoryLocations: true,
         },
         onProgress: (message) => setNotice(message),
       });
@@ -1961,7 +1966,6 @@ export function TallyPurchasePostingPanel({
   const invoiceSgstTdsKnown = Boolean(payload.source?.invoiceSgstTdsAmount?.trim());
   const invoiceIgstTdsKnown = Boolean(payload.source?.invoiceIgstTdsAmount?.trim());
   const invoiceTcsKnown = Boolean(payload.source?.invoiceTcsAmount?.trim());
-  const invoiceRoundOffKnown = Boolean(payload.source?.invoiceRoundOffAmount?.trim());
   const itemValuesReady =
     review.lines.length > 0 &&
     review.lines.every(
@@ -1998,7 +2002,11 @@ export function TallyPurchasePostingPanel({
     Number(review.freightAmount) > 0 ||
     scopeIssues("tax", ["FREIGHT_LEDGER_REQUIRED", "FREIGHT_GST_RATE_REQUIRED"]).length > 0;
   const showFreight = freightRelevant;
-  const showRoundOff = Boolean(Number(payload.source?.invoiceRoundOffAmount));
+  // Tally round-off makes the final payable (after TDS) a whole rupee. The
+  // supplier's printed round-off only reconciles the invoice total.
+  const tallyRoundOff = Number(calculation?.roundOffAmount || 0);
+  const showRoundOff = tallyRoundOff !== 0;
+  const signedRoundOff = `${tallyRoundOff > 0 ? "+" : "−"} ${money(String(Math.abs(tallyRoundOff)))}`;
   const reviewedTcsValue = Number(String(review.tcsAmount || "0").replace(/,/g, ""));
   const liveTcsAmount = review.tcsReceivable && Number.isFinite(reviewedTcsValue)
     ? Math.abs(reviewedTcsValue)
@@ -2752,13 +2760,11 @@ export function TallyPurchasePostingPanel({
                   {showRoundOff ? (
                     <div className="grid grid-cols-[100px_105px_95px_100px_minmax(200px,1fr)_72px] items-center gap-2 border-t border-slate-100 px-3 py-2">
                       <div className="text-xs font-semibold text-slate-900">Round-off</div>
-                      <div className="pt-1 text-xs text-slate-400">After tax</div>
-                      <div className={`pt-1 text-xs ${invoiceRoundOffKnown ? "text-slate-700" : "font-medium text-amber-700"}`}>{moneyOrMissing(payload.source?.invoiceRoundOffAmount)}</div>
-                      <Field compact hideLabel disabled={locked} label="Confirmed round-off amount" onChange={(value) => updateReview("roundOffAmount", value)} sourceValue={payload.source?.invoiceRoundOffAmount} value={review.roundOffAmount} />
+                      <div className="pt-1 text-xs text-slate-400">To whole rupee</div>
+                      <div className="pt-1 text-xs text-slate-400">—</div>
+                      <div className="pt-1 text-xs font-semibold text-slate-900" title="Rounds the final payable after deductions to a whole rupee">{signedRoundOff}</div>
                       <MasterCombobox {...masterContext} compact hideLabel id="field-round-off-ledger" disabled={masterSelectionDisabled} emptyMessage="No live Tally ledger is available." issues={scopeIssues("tax", ["ROUND_OFF_LEDGER_REQUIRED"])} label="Round-off ledger" onChange={(value) => updateReview("roundOffLedgerName", value)} options={roundOffOptions} suggestedNames={roundOffRanked.suggestedNames} value={review.roundOffLedgerName} />
-                      <div className={`pt-1 text-xs font-semibold ${invoiceRoundOffKnown && Math.abs(Number(numericDifference(payload.source?.invoiceRoundOffAmount, review.roundOffAmount))) > 1 ? "text-rose-600" : invoiceRoundOffKnown ? "text-emerald-700" : "text-slate-400"}`}>
-                        {invoiceRoundOffKnown ? money(numericDifference(payload.source?.invoiceRoundOffAmount, review.roundOffAmount)) : "—"}
-                      </div>
+                      <div className="pt-1 text-xs text-slate-400">—</div>
                     </div>
                   ) : null}
                 </div>
@@ -2782,10 +2788,10 @@ export function TallyPurchasePostingPanel({
                       <span>{money(calculation?.totalWithholdingAmount)} deductions</span>
                       <span className="text-[#8a7f72]">+</span>
                       <span>{money(String(liveTcsAmount))} TCS</span>
-                      {Number(calculation?.roundOffAmount) !== 0 ? (
+                      {showRoundOff ? (
                         <>
-                          <span className="text-[#8a7f72]">±</span>
-                          <span>{money(calculation?.roundOffAmount)} round-off</span>
+                          <span className="text-[#8a7f72]">{tallyRoundOff > 0 ? "+" : "−"}</span>
+                          <span>{money(String(Math.abs(tallyRoundOff)))} round-off</span>
                         </>
                       ) : null}
                     </div>

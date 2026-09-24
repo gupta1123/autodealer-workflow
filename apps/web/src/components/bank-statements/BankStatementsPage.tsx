@@ -4641,8 +4641,12 @@ export function BankStatementsPage() {
     if (localLedgerSuggestionKeyRef.current === key) return;
     localLedgerSuggestionKeyRef.current = key;
     let cancelled = false;
+    const lineAmount = (value: string) => Number(String(value || "").replace(/,/g, "")) || 0;
     void runCashDiscountLiveRequest<{
-      matches?: Record<string, { suggestions?: Array<{ ledger?: TallyMaster; score?: number; source?: string }>; vectorEnabled?: boolean }>;
+      matches?: Record<string, { suggestions?: Array<{
+        ledger?: TallyMaster; score?: number; source?: string;
+        openBill?: { referenceName?: string; invoiceDate?: string | null; pendingAmount?: number };
+      }>; vectorEnabled?: boolean }>;
     }>({
       connectionId: tallyConnectionId,
       companyName: selectedCompany.companyName,
@@ -4650,26 +4654,49 @@ export function BankStatementsPage() {
       operation: "ledger_suggestions",
       payload: {
         moduleName: "bank",
-        queries: eligible.map((transaction) => ({
-          id: transaction.id,
-          name: transaction.counterpartyName || transaction.description,
-        })),
+        queries: eligible.map((transaction) => {
+          const credit = lineAmount(transaction.creditAmount);
+          const debit = lineAmount(transaction.debitAmount);
+          return {
+            id: transaction.id,
+            name: transaction.counterpartyName || transaction.description,
+            // Money in is a receipt, money out a payment: lets the connector
+            // match a party by an open bill of exactly this amount.
+            amount: credit > 0 ? credit : debit > 0 ? debit : null,
+            direction: credit > 0 ? "receipt" : debit > 0 ? "payment" : null,
+          };
+        }),
       },
     }).then((result) => {
       if (cancelled || !result.matches) return;
       setTransactions((current) => current.map((transaction) => {
         if (transaction.ledgerSelectionTouched) return transaction;
         const match = result.matches?.[transaction.id];
-        const names = (match?.suggestions || [])
-          .map((entry) => entry.ledger?.name?.trim())
-          .filter((name): name is string => typeof name === "string" && Boolean(name) && !isSuspenseLedgerName(name));
-        const candidateLedgerNames = Array.from(new Set([...transaction.candidateLedgerNames, ...names])).slice(0, 8);
+        const suggestions = (match?.suggestions || []).filter((entry) => {
+          const name = entry.ledger?.name?.trim();
+          return Boolean(name) && !isSuspenseLedgerName(name as string);
+        });
+        const names = suggestions.map((entry) => (entry.ledger?.name as string).trim());
+        const amountMatches = suggestions.filter((entry) => entry.source === "open_bill_amount" || entry.source === "open_bill_amount_near");
+        // Parties with an open bill of this exact amount come first.
+        const candidateLedgerNames = Array.from(new Set([
+          ...amountMatches.map((entry) => (entry.ledger?.name as string).trim()),
+          ...transaction.candidateLedgerNames,
+          ...names,
+        ])).slice(0, 8);
         if (!candidateLedgerNames.length || candidateLedgerNames.join("|") === transaction.candidateLedgerNames.join("|")) return transaction;
+        const amountReason = amountMatches.map((entry) => {
+          const bill = entry.openBill;
+          const amount = Number(bill?.pendingAmount || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+          return `Open ${bill?.referenceName ? `bill ${bill.referenceName}` : "bill"} of ${entry.ledger?.name} is ${entry.source === "open_bill_amount" ? "exactly" : "within ₹1 of"} ₹${amount}`;
+        }).join("; ");
         return {
           ...transaction,
           candidateLedgerNames,
           requiresUserConfirmation: true,
-          suggestionReason: `Closest local Tally ledger matches: ${candidateLedgerNames.join(", ")}.`,
+          suggestionReason: amountReason
+            ? `${amountReason}.`
+            : `Closest local Tally ledger matches: ${candidateLedgerNames.join(", ")}.`,
         };
       }));
     }).catch(() => {

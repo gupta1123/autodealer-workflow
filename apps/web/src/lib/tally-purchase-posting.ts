@@ -599,7 +599,6 @@ export function prepareLiveTallyCatalogue(
     ...(review?.lines ?? []).map((line) => liveKey(line.unit)),
     ...Array.from(compactStockByName.values()).map((option) => liveKey(option.unitName)),
   ].filter(Boolean));
-  const selectedGodowns = new Set((review?.lines ?? []).map((line) => liveKey(line.godownName)).filter(Boolean));
 
   return {
     compactResult: {
@@ -610,7 +609,10 @@ export function prepareLiveTallyCatalogue(
         groups: [],
         stockItems: compactStockItems,
         units: unitOptions.filter((option) => relevantUnits.has(liveKey(option.name))).map(liveValidationMasterRow),
-        godowns: godownOptions.filter((option) => selectedGodowns.has(liveKey(option.name))).map(liveValidationMasterRow),
+        // Godown lists are short. Send all of them: this envelope is built when
+        // the catalogue loads, before the reviewer picks a godown, and the
+        // server drops any godown it cannot find here.
+        godowns: godownOptions.map(liveValidationMasterRow),
       },
     },
     masterOptions: {

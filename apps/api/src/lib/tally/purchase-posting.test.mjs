@@ -184,7 +184,8 @@ test("invoice total after round-off is not mistaken for the round-off amount", (
 
   assert.equal(result.source.invoiceRoundOffAmount, "-0.40");
   assert.equal(result.review.roundOffAmount, "-0.40");
-  assert.equal(result.calculation.roundOffAmount, "-0.40");
+  // The printed round-off reconciles the invoice; the Tally payable is already whole.
+  assert.equal(result.calculation.roundOffAmount, "0.00");
   assert.equal(result.calculation.totalDifference, "0.00");
 });
 
@@ -679,11 +680,10 @@ test("round-off is invoice-driven and cannot be added only through the review", 
   document.extracted_fields.roundOffAmount = "-0.50";
   const withEvidence = prepare(document);
   assert.equal(withEvidence.review.roundOffAmount, "-0.50");
-  assert.equal(withEvidence.calculation.roundOffAmount, "-0.50");
-  assert.deepEqual(withEvidence.tallyPayload.ledgers.roundOff, {
-    name: "Round Off",
-    amount: "-0.50",
-  });
+  assert.equal(withEvidence.calculation.totalDifference, "0.00");
+  // Tally rounds only the final payable, which is already a whole rupee here.
+  assert.equal(withEvidence.calculation.roundOffAmount, "0.00");
+  assert.equal(withEvidence.tallyPayload.ledgers.roundOff, null);
 });
 
 test("freight is a separate charge, expands the GST basis, and has its own TDS", () => {
@@ -1231,10 +1231,13 @@ test("supplier invoice total stays separate from the post-TDS payable", () => {
     },
   });
 
-  assert.equal(result.calculation.roundOffAmount, "-0.40");
+  // Supplier rounds before TDS (-0.40); Tally rounds the post-TDS payable
+  // 4,84,206.80 to 4,84,207.00, like the client's manual vouchers.
+  assert.equal(result.calculation.roundOffAmount, "0.20");
   assert.equal(result.calculation.calculatedInvoiceTotal, "492980.00");
   assert.equal(result.calculation.totalWithholdingAmount, "8773.60");
-  assert.equal(result.calculation.calculatedPayable, "484206.40");
+  assert.equal(result.calculation.calculatedPayable, "484207.00");
+  assert.deepEqual(result.tallyPayload.ledgers.roundOff, { name: "Round Off", amount: "0.20" });
   assert.equal(result.calculation.totalDifference, "0.00");
 });
 

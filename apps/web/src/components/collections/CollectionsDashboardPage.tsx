@@ -200,15 +200,6 @@ type DebitNoteProposal = {
   adjustOriginalInvoice?: boolean | null;
 };
 
-type TallyMaster = {
-  name: string;
-  parent?: string | null;
-  type?: string | null;
-  ledgerType?: string | null;
-  billWiseEnabled?: boolean | null;
-  phone?: string | null;
-};
-
 type WhatsappSendResult = {
   verificationRequired?: boolean;
   error?: string;
@@ -725,7 +716,9 @@ export function CollectionsDashboardPage({
   const [whatsappPhoneInputs, setWhatsappPhoneInputs] = useState<Record<string, string>>({});
   const [whatsappSaveToTally, setWhatsappSaveToTally] = useState(true);
   const [whatsappDialogSending, setWhatsappDialogSending] = useState(false);
-  const [message, setMessage] = useState<{ tone: "success" | "error" | "info"; text: string } | null>(null);
+  // "info" = work in progress (shown with a spinner); "notice" = finished, but
+  // the user should read it (no spinner).
+  const [message, setMessage] = useState<{ tone: "success" | "error" | "info" | "notice"; text: string } | null>(null);
   const initialLoadStartedRef = useRef(false);
   const activeScanRef = useRef<AbortController | null>(null);
   const [interactiveScan, setInteractiveScan] = useState(false);
@@ -865,7 +858,7 @@ export function CollectionsDashboardPage({
       const controller = new AbortController();
       activeScanRef.current = controller;
       if (!quiet) setInteractiveScan(true);
-      if (!quiet) setMessage({ tone: "info", text: "Connected—reading eligible customers from Tally…" });
+      if (!quiet) setMessage({ tone: "info", text: "Checking customer dues…" });
       const requestEpoch = accessCacheEpoch();
       try { let result = await runCashDiscountLiveRequest<DashboardPayload>({
         signal: controller.signal,
@@ -1090,7 +1083,7 @@ export function CollectionsDashboardPage({
         try {
           await refreshCreatedDebitNotesFromStore(selectedConnectionId);
         } catch {
-          setMessage({ tone: "info", text: "Debit note created in Tally. Saved history could not be refreshed; do not create it again." });
+          setMessage({ tone: "notice", text: "Debit note created in Tally. Saved history could not be refreshed; do not create it again." });
           setActiveView("done");
           return;
         }
@@ -1116,18 +1109,6 @@ export function CollectionsDashboardPage({
     });
     if (!response.ok) throw new Error(await readError(response));
     return (await response.json().catch(() => ({}))) as WhatsappSendResult;
-  }
-
-  async function readTallyLedgerPhone(connectionId: string, ledgerName: string) {
-    const response = await apiFetch(`/api/tally/connections/${connectionId}/masters?type=ledger&limit=5000`, {
-      cache: "no-store",
-    });
-    if (!response.ok) throw new Error(await readError(response));
-    const payload = (await response.json()) as { masters?: TallyMaster[] };
-    const ledger = (payload.masters ?? []).find(
-      (master) => master.name.trim().toLowerCase() === ledgerName.trim().toLowerCase()
-    );
-    return ledger?.phone ?? null;
   }
 
   async function prepareNativeTallyPdf(proposal: DebitNoteProposal) {
@@ -1280,11 +1261,14 @@ export function CollectionsDashboardPage({
       setSelectedCreatedIds(new Set());
       if (selectedConnectionId) {
         await refreshCreatedDebitNotesFromStore(selectedConnectionId).catch(() => {
-          setMessage({ tone: "info", text: "WhatsApp submission completed. Saved history could not be refreshed; do not resend automatically." });
+          setMessage({ tone: "notice", text: "WhatsApp submission completed. Saved history could not be refreshed; do not resend automatically." });
         });
       }
     } catch (error) {
-      setMessage({ tone: "error", text: `${acceptedCount} submissions accepted. ${error instanceof Error ? error.message : "Submission stopped."} Check status before resending.` });
+      const reason = error instanceof Error ? error.message : "Submission stopped.";
+      setMessage({ tone: "error", text: acceptedCount === 0
+        ? `Nothing was sent. ${reason}`
+        : `${acceptedCount} ${acceptedCount === 1 ? "message was" : "messages were"} submitted before this stopped. ${reason} Check their status before resending.` });
       if (selectedConnectionId) await refreshCreatedDebitNotesFromStore(selectedConnectionId).catch(() => undefined);
     } finally {
       setWhatsappDialogSending(false);
@@ -1351,8 +1335,11 @@ export function CollectionsDashboardPage({
           false,
           true,
         );
-        if (nextDashboard.scanSummary?.complete === false) return;
+        // Record the revision even when the scan was incomplete: retrying the
+        // same revision every 15 seconds kept Tally busy indefinitely. The next
+        // Tally change (or a manual Refresh) tries again.
         followupRevisionRef.current = { scope, revision };
+        if (nextDashboard.scanSummary?.complete === false) return;
         setDashboard((current) => paymentFollowUpDataKey(current) === paymentFollowUpDataKey(nextDashboard)
           ? current
           : nextDashboard);
@@ -1535,7 +1522,7 @@ export function CollectionsDashboardPage({
       const result=await response.json();if(!response.ok)throw new Error(result.error||'Bulk reminder action failed.');const rows=result.results||[];const completed=rows.filter((item:{status:string})=>!['skipped','rejected','uncertain'].includes(item.status)).length;const attention=rows.length-completed;setMessage({tone:attention?'info':'success',text:`${completed} completed${attention?` · ${attention} need attention`:''}.`});setFollowUpBulkMode(null);setSelectedFollowUpIds(new Set());setReminderTab(followUpBulkMode==='enroll'?'pipelines':'due');
     }catch(error){setMessage({tone:'error',text:error instanceof Error?error.message:'Bulk reminder action failed.'});}finally{setFollowUpBulkBusy(false);}
   };
-  const exportSelectedFollowUps=()=>{if(!selectedFollowUps.length)return;const q=(value:unknown)=>`"${String(value??'').replaceAll('"','""')}"`;const csv=[['Customer','Invoice','Invoice date','Outstanding','Phone','Payment age'],...selectedFollowUps.map(row=>[row.partyLedgerName,row.linkedInvoiceNumber,row.linkedInvoiceDate,row.outstandingAmount,row.partyPhone||'',row.ageLabel])].map(line=>line.map(q).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\ufeff',csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='unpaid-invoices.csv';a.click();URL.revokeObjectURL(url);};
+  const exportSelectedFollowUps=()=>{if(!selectedFollowUps.length)return;const q=(value:unknown)=>`"${String(value??'').replaceAll('"','""')}"`;const csv=[['Customer','Invoice','Invoice date','Outstanding','Phone','Payment age'],...selectedFollowUps.map(row=>[row.partyLedgerName,row.linkedInvoiceNumber,row.linkedInvoiceDate,row.outstandingAmount,row.partyPhone||'',row.ageLabel])].map(line=>line.map(q).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\ufeff',csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='unpaid-invoices.csv';a.click();window.setTimeout(()=>URL.revokeObjectURL(url),1000);};
   const scheduleStatuses=useReminderStatuses({connectionId:selectedConnectionId,companyId:selectedCompany?.accessCompanyId,companyGuid:selectedCompany?.companyGuid,companyName:selectedCompany?.companyName||'',financialYear:selectedCompany?.financialYear||''},pagedPaymentFollowUps,activeView==='followUps'&&reminderTab==='outstanding'&&!reminderInvoice);
   const selectablePendingProposals = tallyCompanyVerified ? pendingProposals.filter(canCreateInTally) : [];
   const selectablePendingOnPage = tallyCompanyVerified ? pagedPendingProposals.filter(canCreateInTally) : [];
@@ -1758,11 +1745,15 @@ export function CollectionsDashboardPage({
       <div className="mb-2 flex min-h-6 flex-wrap items-center justify-end gap-2 text-[10px] leading-4 text-[#756b60]">
         {selectedCompany?.financialYear ? <span title="Selected financial year">FY {selectedCompany.financialYear}</span> : null}
         {lastScan && lastScan.scope === `${selectedConnectionId}|${selectedCompany?.companyName}|${selectedCompany?.financialYear || ''}` ?
-          <span>· {lastScan.complete ? 'Synced' : 'Partial scan'} {lastScan.at}</span> : null}
+          <span>· {lastScan.complete ? 'Checked' : 'Partial check'} {lastScan.at}</span> : null}
+        {dashboard?.cache?.source === 'prepared_customer_dues' ? <span title="Read from Kalika Local Agent, kept current from Tally">· From customer dues</span>
+          : dashboard?.cache?.source === 'live_tally' ? <span title="Customer dues are not ready for this company. Open Kalika Local Agent → Customer dues to make this page faster.">· Read live from Tally</span> : null}
         {!isDedicatedFollowUpsPage && dashboard ? <details className="relative">
           <summary aria-label="About these figures" className="cursor-pointer rounded px-1 py-1 text-[#5a5046] focus-visible:outline focus-visible:outline-2">About</summary>
           <div className="absolute right-0 z-20 mt-2 w-72 max-w-[calc(100vw-3rem)] rounded-xl border border-[#e0d8cc] bg-white p-4 text-xs leading-relaxed shadow-lg">
-            <p>Figures reflect the last scan, not a continuously updated Tally balance.</p>
+            <p>{dashboard.cache?.source === 'prepared_customer_dues'
+              ? 'Figures come from customer dues in Kalika Local Agent, which follows changes in Tally about every minute.'
+              : 'Figures were read from Tally at the time shown. Refresh to check again.'}</p>
             <p className="mt-2">Configured policy: 1.5% for 7 calendar days; 1% for 15 calendar days. Narration supplies the rates, not the day counts. Posting always rechecks the invoice.</p>
           </div>
         </details> : null}
@@ -1797,8 +1788,11 @@ export function CollectionsDashboardPage({
         <div
           className={`mb-6 rounded-xl border px-4 py-3 text-sm font-medium ${message.tone === "success"
               ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-              : "border-red-200 bg-red-50 text-red-800"
+              : message.tone === "notice"
+                ? "border-amber-200 bg-amber-50 text-amber-900"
+                : "border-red-200 bg-red-50 text-red-800"
             }`}
+          role={message.tone === "error" ? "alert" : "status"}
         >
           {message.text}
         </div>
@@ -1858,7 +1852,7 @@ export function CollectionsDashboardPage({
             <div>
               <h2 className="text-sm font-semibold text-red-900">{isDedicatedFollowUpsPage ? "Payment follow-up results are unavailable" : "Cash Discount results are unavailable"}</h2>
               <p className="mt-1 text-xs font-medium leading-relaxed text-red-800">
-                The latest Tally scan did not complete, so this page is not reporting zero open bills or zero recoverable amount.
+                The latest check did not complete, so this page is not showing zero open bills or zero recovery. Make sure Kalika Local Agent is running and Tally is open, then try again.
               </p>
               {message?.tone === "error" ? (
                 <p className="mt-1 text-xs leading-relaxed text-red-700">{message.text}</p>
@@ -1870,7 +1864,7 @@ export function CollectionsDashboardPage({
               type="button"
             >
               <RefreshCw className="h-3.5 w-3.5" />
-              Retry Tally scan
+              Try again
             </button>
           </div>
         </section>

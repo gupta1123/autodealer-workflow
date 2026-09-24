@@ -52,6 +52,7 @@ function compactPurchaseResult(result: Record<string, unknown>) {
     cancelled: result.cancelled ?? null,
     lastVchId: positiveTallyId(result.lastVchId),
   };
+  const verifiedAbsent = result.verifiedAbsent === true || result.voucherCreated === false;
   const rawTimings = result.timings && typeof result.timings === "object"
     ? result.timings as Record<string, unknown>
     : {};
@@ -71,17 +72,18 @@ function compactPurchaseResult(result: Record<string, unknown>) {
           .slice(0, 20)
           .map((value) => value.trim().slice(0, 500))
       : [],
-    voucherNumber: verification.voucherNumber ?? result.voucherNumber ?? null,
-    masterId:
-      positiveTallyId(verification.masterId) ??
-      positiveTallyId(verification.voucherId) ??
-      positiveTallyId(result.lastVchId),
-    guid: verification.guid ?? result.guid ?? null,
+    voucherNumber: verifiedAbsent ? null : verification.voucherNumber ?? result.voucherNumber ?? null,
+    masterId: verifiedAbsent
+      ? null
+      : positiveTallyId(verification.masterId) ??
+        positiveTallyId(verification.voucherId) ??
+        positiveTallyId(result.lastVchId),
+    guid: verifiedAbsent ? null : verification.guid ?? result.guid ?? null,
     uncertainWrite: result.uncertainWrite === true,
     uncertaintyReason: toNullableText(result.uncertaintyReason, 100),
     verificationOnly: result.verificationOnly === true,
     verifiedAbsent: result.verifiedAbsent === true,
-    voucherCreated: Boolean(
+    voucherCreated: verifiedAbsent ? false : Boolean(
       result.voucherCreatedButVerificationFailed ||
       Number(result.created ?? 0) > 0 ||
       verification.voucherNumber ||
@@ -462,6 +464,7 @@ export async function POST(
         toNullableText(verification.verificationStatus, 80) ??
         toNullableText(result.uncertaintyReason, 80);
       const alreadyInTally = success && Boolean(result.alreadyInTally);
+      const verifiedAbsent = result.verifiedAbsent === true || result.voucherCreated === false;
       const verified = success && (verificationStatus === "verified" || alreadyInTally);
       const correctionRequired = Boolean(
         result.voucherCreatedButVerificationFailed ||
@@ -477,22 +480,25 @@ export async function POST(
         : correctionRequired
           ? "verification_required"
           : "failed";
-      const voucherNumber =
-        toNullableText(verification.voucherNumber, 500) ??
-        toNullableText(result.voucherNumber, 500);
-      const masterId =
-        positiveTallyId(verification.masterId) ??
-        positiveTallyId(verification.voucherId) ??
-        positiveTallyId(result.lastVchId);
-      const tallyGuid =
-        toNullableText(verification.guid, 500) ??
-        toNullableText(result.guid, 500);
-      const voucherWasCreated = verified || Boolean(
+      const voucherNumber = verifiedAbsent
+        ? null
+        : toNullableText(verification.voucherNumber, 500) ??
+          toNullableText(result.voucherNumber, 500);
+      const masterId = verifiedAbsent
+        ? null
+        : positiveTallyId(verification.masterId) ??
+          positiveTallyId(verification.voucherId) ??
+          positiveTallyId(result.lastVchId);
+      const tallyGuid = verifiedAbsent
+        ? null
+        : toNullableText(verification.guid, 500) ??
+          toNullableText(result.guid, 500);
+      const voucherWasCreated = !verifiedAbsent && (verified || Boolean(
         result.voucherCreatedButVerificationFailed ||
         Number(result.created ?? 0) > 0 ||
         voucherNumber ||
         masterId
-      );
+      ));
 
       if (postingId) {
         const { error: postingUpdateError } = await supabase

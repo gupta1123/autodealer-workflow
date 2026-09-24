@@ -142,9 +142,14 @@ export function calculatePurchaseVoucher(input: PurchaseCalculationInput) {
   const tcs = Math.abs(purchaseMoneyPaise(input.tcsAmount) ?? 0);
   const sourceRoundOff = purchaseMoneyPaise(input.sourceRoundOffAmount);
   const confirmedRoundOff = purchaseMoneyPaise(input.confirmedRoundOffAmount);
-  const roundOff = sourceRoundOff !== null && sourceRoundOff !== 0 ? (confirmedRoundOff ?? sourceRoundOff) : 0;
-  const gross = basic + freight + gst + tcs + roundOff;
-  const payable = gross - withholdings;
+  // The supplier rounds its printed total before our deductions; that figure
+  // only reconciles the invoice. The Tally voucher rounds the final payable
+  // (after TDS) to the nearest rupee, like the client's manual entries.
+  const invoiceRoundOff = sourceRoundOff !== null && sourceRoundOff !== 0 ? (confirmedRoundOff ?? sourceRoundOff) : 0;
+  const unroundedPayable = basic + freight + gst + tcs - withholdings;
+  const roundOff = Math.round(unroundedPayable / 100) * 100 - unroundedPayable;
+  const gross = basic + freight + gst + tcs + invoiceRoundOff;
+  const payable = unroundedPayable + roundOff;
   const invoiceGst = purchaseMoneyPaise(input.invoiceGstAmount) ?? 0;
   const invoiceTotal = purchaseMoneyPaise(input.invoiceTotal) ?? 0;
   const invoiceWithholding = Math.abs(purchaseMoneyPaise(input.invoiceWithholdingAmount) ?? 0);

@@ -11,6 +11,7 @@ const HOST = process.env.CASH_DISCOUNT_GATEWAY_HOST || "0.0.0.0";
 let apiBaseUrl = (process.env.CASH_DISCOUNT_API_BASE_URL || "http://localhost:3001").replace(/\/+$/, "");
 const AUTH_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 4 * 60_000;
+const SERIAL_OPERATION_WAIT_MS = 20_000;
 const MAX_MESSAGE_BYTES = 30 * 1024 * 1024;
 
 const metadata = new WeakMap();
@@ -105,7 +106,7 @@ function startPending({ requestId, browser, connector, connectionId, ownerUserId
     operation,
     proposal,
     payload,
-    phase: operation === "company_check"
+    phase: operation === 'test_purchase_document_folder' ? operation : operation === "company_check"
     ? "company_check"
     : operation === "bank_ledgers" || operation === "ledger_masters" || operation === "ledger_suggestions" || operation === "verify_bank_transaction" || operation === "fetch_customer_open_bills"
       ? operation
@@ -197,7 +198,7 @@ async function authorizeLiveOperation(meta,message,previous) {
 async function handleBrowserRequest(socket, message, meta) {
   const requestId = String(message.requestId || randomUUID());
   const operation = String(message.operation ?? "");
-  if (!['company_check', 'bank_ledgers', 'ledger_masters', 'ledger_suggestions', 'verify_bank_transaction', 'fetch_customer_open_bills', 'scan', 'followups_scan', 'create_debit_note'].includes(operation)) {
+  if (!['test_purchase_document_folder', 'company_check', 'bank_ledgers', 'ledger_masters', 'ledger_suggestions', 'verify_bank_transaction', 'fetch_customer_open_bills', 'scan', 'followups_scan', 'create_debit_note'].includes(operation)) {
     send(socket, { type: "result", requestId, success: false, error: "Unsupported Cash Discount operation." });
     return;
   }
@@ -226,12 +227,23 @@ async function handleBrowserRequest(socket, message, meta) {
   if (["scan", "followups_scan", "create_debit_note"].includes(operation)) {
     const version = /^(\d+)\.(\d+)\.(\d+)$/.exec(connectorMeta.bridgeVersion);
     if (!version || (Number(version[1]) === 0 && (Number(version[2]) < 1 || (Number(version[2]) === 1 && Number(version[3]) < 63)))) {
-      send(socket, { type: "result", requestId, success: false, error: "Install Kalika Tally Connector 0.1.63 or later on the Tally PC before scanning Cash Discounts." });
+      send(socket, { type: "result", requestId, success: false, error: "Update Kalika Local Agent on the Tally computer before checking Cash Discounts or Payment Follow-ups." });
       return;
     }
-    if ([...pending.values()].some((item) => item.connectionId === meta.connectionId && ["scan", "followups_scan", "create_debit_note"].includes(item.operation))) {
-      send(socket, { type: "result", requestId, success: false, error: "A Cash Discount scan or debit note is already running on this connector. Wait or cancel the current scan." });
-      return;
+    // Only one scan or debit note runs per connector at a time. Scans now take
+    // seconds, so wait briefly for the running one instead of failing.
+    const busy = () => [...pending.values()].some((item) => item.connectionId === meta.connectionId && ["scan", "followups_scan", "create_debit_note"].includes(item.operation));
+    if (busy()) {
+      send(socket, { type: "progress", requestId, message: "Waiting for the current check to finish…" });
+      const waitUntil = Date.now() + SERIAL_OPERATION_WAIT_MS;
+      while (busy() && Date.now() < waitUntil && socket.readyState === WebSocket.OPEN) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      if (socket.readyState !== WebSocket.OPEN) return;
+      if (busy()) {
+        send(socket, { type: "result", requestId, success: false, error: "Another Cash Discount or Payment Follow-up check is still running on this computer. Try again in a moment." });
+        return;
+      }
     }
   }
   const debitNoteKey = operation === "create_debit_note"
@@ -268,7 +280,7 @@ async function handleBrowserRequest(socket, message, meta) {
     type: "operation",
     requestId,
     deadlineAt: Date.now() + 90_000,
-      operation: operation === "company_check"
+      operation: operation === "test_purchase_document_folder" ? operation : operation === "company_check"
         ? "company_check"
         : operation === "bank_ledgers"
           ? "bank_ledgers"
@@ -317,7 +329,7 @@ async function handleConnectorResult(socket, message, meta) {
     return;
   }
 
-  if (["bank_ledgers", "ledger_masters", "ledger_suggestions", "verify_bank_transaction", "fetch_customer_open_bills"].includes(item.phase)) {
+  if (["test_purchase_document_folder", "bank_ledgers", "ledger_masters", "ledger_suggestions", "verify_bank_transaction", "fetch_customer_open_bills"].includes(item.phase)) {
     clearPending(requestId);
     send(item.browser, { type: "result", requestId, success: true, data: message.data });
     return;
@@ -327,7 +339,7 @@ async function handleConnectorResult(socket, message, meta) {
     try {
       const connectorResultAt = Date.now();
       const connectorDiagnostics = message.data?.benchmarkDiagnostics ?? null;
-      send(item.browser, { type: "progress", requestId, message: item.operation === 'followups_scan' ? 'Tally read finished. Preparing payment follow-ups...' : "Tally read finished. Checking debit-note history and calculating results..." });
+      send(item.browser, { type: "progress", requestId, message: item.operation === 'followups_scan' ? 'Customer dues checked. Preparing payment follow-ups…' : "Customer dues checked. Calculating cash discounts and checking debit-note history…" });
       const analysisStartedAt = Date.now();
       const dashboard = await apiRequest(item.operation === 'followups_scan' ? '/api/collections/follow-ups/analyse' : '/api/collections/live/analyse', {
         organizationId:item.organizationId,

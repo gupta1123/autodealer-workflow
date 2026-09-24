@@ -1,5 +1,6 @@
 /** A socket login is not permission to perform every operation on that socket. */
 export const LIVE_OPERATION_PERMISSIONS:Readonly<Record<string,readonly string[]>> = {
+  test_purchase_document_folder:['settings.manage'],
   company_check:['connections.manage','purchases.view','bank.view','discounts.view','followups.view'],
   bank_ledgers:['bank.prepare'],
   ledger_masters:['bank.prepare','purchases.prepare'],

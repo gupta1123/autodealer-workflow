@@ -21,6 +21,11 @@ test('verified and already-existing vouchers preserve verification information',
  assert.equal(purchaseCompletion(true,{alreadyInTally:true},null).verificationStatus,'already_in_tally');
  assert.equal(purchaseCompletion(true,{lastVchId:0},null).masterId,null);
 });
+test('verified-absent failures never preserve a stale Tally master id',()=>{
+ const result=purchaseCompletion(false,{verifiedAbsent:true,voucherCreated:false,lastVchId:'140111',voucherNumber:'1'},'rejected');
+ assert.equal(result.verified,false);assert.equal(result.voucherCreated,false);
+ assert.equal(result.masterId,null);assert.equal(result.voucherNumber,null);assert.equal(result.guid,null);
+});
 test('completion uses one atomic RPC and propagates a persistence conflict',async()=>{
  const calls=[];const input={commandId:'cmd',connectionId:'conn',bridgeTokenHash:'hash',success:true,
   result:{verification:{verificationStatus:'verified'}},compactResult:{verificationStatus:'verified'},error:null,

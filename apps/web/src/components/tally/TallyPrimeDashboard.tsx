@@ -6,14 +6,11 @@ import { PageHeader } from '@/components/dashboard/PageHeader';
 import {
   ArrowRight,
   CheckCircle2,
-  Download,
   FileText,
   Loader2,
   MoreHorizontal,
   PlugZap,
-  RefreshCw,
   Server,
-  Sparkles,
   TriangleAlert,
 } from "lucide-react";
 
@@ -24,6 +21,7 @@ import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { LocalAgentPanel } from "@/components/tally/LocalAgentPanel";
 import { TallyCompanyLinkingPanel } from "@/components/tally/TallyCompanyLinkingPanel";
+import { CaseConfirmDialog } from "@/components/cases/CaseConfirmDialog";
 
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_LAN_TALLY_URL = "http://192.168.1.10:9000";
@@ -289,7 +287,7 @@ function HubCard({
           {description}
         </p>
       </div>
-      <div className="mt-6 w-fit rounded-full border border-amber-250 bg-amber-50 px-3 py-1 text-[11px] font-medium text-amber-800">
+      <div className="mt-6 w-fit rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-[11px] font-medium text-amber-800">
         {status}
       </div>
     </button>
@@ -310,7 +308,10 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   const [creating, setCreating] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [disconnectingOthers, setDisconnectingOthers] = useState(false);
-  const [testing, setTesting] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<"disconnect" | "disconnect_others" | null>(null);
+  // localStorage is only read after mount so the first client render matches
+  // the server render.
+  const [mounted, setMounted] = useState(false);
   const [setupMode, setSetupMode] = useState<TallySetupMode>("same_machine");
   const [tallyUrlInput, setTallyUrlInput] = useState("");
   const [message, setMessage] = useState<{
@@ -325,13 +326,13 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     null;
   const selectedConnectionId = selectedConnection?.id ?? "";
   const expectedMachineId =
-    typeof window !== "undefined" && selectedConnectionId
+    mounted && selectedConnectionId
       ? window.localStorage.getItem(
           `${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnectionId}`,
         )
       : null;
   const selectedControlToken =
-    typeof window !== "undefined" && selectedConnectionId
+    mounted && selectedConnectionId
       ? window.localStorage.getItem(
           `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnectionId}`,
         )
@@ -373,7 +374,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     connectionBelongsToThisBrowser &&
     selectedConnection?.companyLoaded === true;
   const companyDetail = !connectionBelongsToThisBrowser
-    ? "Another connector replaced this connection. Reconnect this computer."
+    ? "This connection is managed from another browser or computer. Click Reconnect to use this computer instead."
     : selectedConnection?.lastCompanyName ||
       selectedCompany?.companyName ||
       (selectedConnection?.companyLoaded
@@ -489,13 +490,9 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         ),
       );
     } catch (error) {
-      setMessage({
-        tone: "error",
-        text:
-          error instanceof Error
-            ? error.message
-            : "Failed to refresh Tally status.",
-      });
+      // A single failed background poll is retried on the next tick; don't
+      // leave a sticky error banner for a transient network blip.
+      console.warn("Tally status refresh failed:", error);
     } finally {
       statusRefreshInFlight.current = false;
     }
@@ -720,53 +717,16 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     }
   }
 
-  async function requestTest() {
-    if (!selectedConnection) return;
-
-    try {
-      setTesting(true);
-      setMessage(null);
-      const response = await apiFetch(
-        `/api/tally/connections/${selectedConnection.id}/test`,
-        {
-          method: "POST",
-        },
-      );
-      if (!response.ok) {
-        throw new Error(await readError(response));
-      }
-
-      const payload = (await response.json()) as StatusResponse;
-      if (payload.connection) {
-        setConnections((current) =>
-          current.map((connection) =>
-            connection.id === payload.connection?.id
-              ? payload.connection
-              : connection,
-          ),
-        );
-      }
-
-      setMessage({
-        tone: "success",
-        text: "Connection checked.",
-      });
-    } catch (error) {
-      setMessage({
-        tone: "error",
-        text:
-          error instanceof Error
-            ? error.message
-            : "Failed to test Tally connection.",
-      });
-    } finally {
-      setTesting(false);
-    }
-  }
-
   useEffect(() => {
+    setMounted(true);
     void loadConnections();
   }, []);
+
+  useEffect(() => {
+    if (message?.tone !== "success") return;
+    const timer = window.setTimeout(() => setMessage(null), 6_000);
+    return () => window.clearTimeout(timer);
+  }, [message]);
 
   useEffect(() => {
     const tallyUrl = selectedConnection?.tallyUrl || DEFAULT_TALLY_URL;
@@ -778,10 +738,17 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     if (!selectedConnectionId) return;
     void refreshStatus(selectedConnectionId);
     const timer = window.setInterval(() => {
-      void refreshStatus(selectedConnectionId);
+      if (document.visibilityState === "visible") void refreshStatus(selectedConnectionId);
     }, 15_000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void refreshStatus(selectedConnectionId);
+    };
+    document.addEventListener("visibilitychange", onVisible);
 
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [refreshStatus, selectedConnectionId]);
 
   useEffect(() => {
@@ -856,7 +823,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
             description="Import, review, and post digitized bank statement entries."
             icon={<FileText className="h-5.5 w-5.5" />}
             onClick={() => router.push("/bank-statements")}
-            status="Open Ledgers"
+            status="Open statements"
             title="Bank Statements"
           />
         </div>
@@ -878,7 +845,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           />
           <div className="absolute inset-0 bg-gradient-to-r from-white via-white/75 to-transparent" />
         </div>
-        <div className="relative max-w-[68%] px-6 py-6 sm:min-h-[176px] sm:px-7 sm:py-7">
+        <div className="relative px-6 sm:max-w-[68%] py-6 sm:min-h-[176px] sm:px-7 sm:py-7">
           <div className="flex items-center gap-2 text-[9px] font-extrabold uppercase tracking-[0.16em] text-[#8a7f72]">
             <span className={`h-2 w-2 rounded-full ${companyLoaded ? "bg-emerald-500 shadow-[0_0_0_4px_rgba(16,185,129,0.12)]" : "bg-amber-500 shadow-[0_0_0_4px_rgba(245,158,11,0.12)]"}`} />
             {companyLoaded ? "Connection ready" : connectorActive ? "Connector online" : "Setup required"}
@@ -896,8 +863,8 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         <div
           className={`mb-6 rounded-xl border px-4 py-3 text-xs font-medium ${
             message.tone === "success"
-              ? "border-emerald-255 bg-emerald-50 text-emerald-800"
-              : "border-red-255 bg-red-50 text-red-800"
+              ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+              : "border-red-200 bg-red-50 text-red-800"
           }`}
         >
           {message.text}
@@ -954,7 +921,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                 LAN/server
               </div>
               <div className="mt-1 text-xs font-normal leading-5 text-[#8a7f72]">
-                Connector reaches Tally on a Gold LAN machine.
+                Tally runs on another computer or server on your network.
               </div>
             </button>
           </div>
@@ -1008,11 +975,11 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                     <Badge
                       className={
                         statusTone === "success"
-                          ? "border-emerald-250 bg-emerald-50 text-emerald-800"
+                          ? "border-emerald-200 bg-emerald-50 text-emerald-800"
                           : statusTone === "error"
-                            ? "border-red-255 bg-red-55 text-red-855"
+                            ? "border-red-200 bg-red-50 text-red-800"
                             : statusTone === "warning"
-                              ? "border-amber-250 bg-amber-50 text-amber-800"
+                              ? "border-amber-200 bg-amber-50 text-amber-800"
                               : "border-[#e5ddd0] bg-white text-[#8a7f72]"
                       }
                       variant="outline"
@@ -1052,8 +1019,8 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                       </PopoverTrigger>
                       <PopoverContent align="end" className="w-64 rounded-xl border-[#e5ddd0] p-2 shadow-xl">
                         <p className="px-2 pb-1 pt-1 text-[11px] font-semibold text-[#8a7f72]">Connection</p>
-                        <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-amber-800 hover:bg-amber-50 disabled:opacity-50" disabled={disconnecting} onClick={() => { if (window.confirm("Pause this Tally connection? Active Kalika workflows will stop until you reconnect.")) void disconnectConnector(); }} type="button"><PlugZap className="h-3.5 w-3.5" />Pause connection…</button>
-                        {otherActiveConnectionCount > 0 ? <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50" disabled={disconnectingOthers} onClick={() => { if (window.confirm(`Disconnect ${otherActiveConnectionCount} other active connector session${otherActiveConnectionCount === 1 ? "" : "s"}?`)) void disconnectOtherConnectors(); }} type="button"><PlugZap className="h-3.5 w-3.5" />Disconnect other sessions…</button> : null}
+                        <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-amber-800 hover:bg-amber-50 disabled:opacity-50" disabled={disconnecting} onClick={() => setConfirmAction("disconnect")} type="button"><PlugZap className="h-3.5 w-3.5" />Disconnect…</button>
+                        {otherActiveConnectionCount > 0 ? <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50" disabled={disconnectingOthers} onClick={() => setConfirmAction("disconnect_others")} type="button"><PlugZap className="h-3.5 w-3.5" />Disconnect other sessions…</button> : null}
                         <div className="mt-1 border-t border-slate-100 px-2 pt-2 text-[11px] leading-4 text-[#8a7f72]">Last heartbeat {formatTime(selectedConnection.lastHeartbeatAt)}</div>
                       </PopoverContent>
                     </Popover>
@@ -1064,9 +1031,13 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
 
           <div className="grid gap-4 md:grid-cols-3">
             <StatusCard
-              detail={`Cloud heartbeat · Version ${selectedConnection.bridgeVersion || "unknown"} · ${formatTime(selectedConnection.lastHeartbeatAt)}`}
+              detail={`Last seen ${formatTime(selectedConnection.lastHeartbeatAt)}${
+                selectedConnection.agentUpdate?.updateAvailable
+                  ? " · Update available: open Kalika Local Agent → ⋮ → Connector updates"
+                  : ""
+              }`}
               ok={connectorActive}
-              title="Agent link"
+              title="Connector"
               value={connectorActive ? "Online" : "Waiting"}
             />
             <StatusCard
@@ -1088,21 +1059,6 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               value={companyLoaded ? "Loaded" : "Not detected"}
             />
           </div>
-          {selectedConnection.agentUpdate?.updateAvailable ? (
-            <div className="flex flex-col gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <div className="text-sm font-semibold text-amber-950">Local Agent update available</div>
-                <div className="mt-1 text-xs text-amber-800">
-                  Version {selectedConnection.agentUpdate.latestVersion} keeps the local cache across reconnects and updates automatically after download.
-                </div>
-              </div>
-              <Button asChild className="shrink-0 rounded-xl bg-amber-950 text-xs text-white hover:bg-amber-900">
-                <a href={selectedConnection.agentUpdate.downloadUrl} rel="noreferrer">
-                  <Download className="mr-1.5 h-3.5 w-3.5" /> Download update
-                </a>
-              </Button>
-            </div>
-          ) : null}
           {connectorActive ? (
             <>
               <TallyCompanyLinkingPanel connectionId={selectedConnection.id} onLinked={() => loadConnections({ quiet: true })} />
@@ -1120,8 +1076,8 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               No Tally connection found
             </h3>
             <p className="mt-1.5 text-xs font-normal text-[#8a7f72] max-w-sm">
-              Bridge this workstation to start the Tally Prime desktop agent and
-              sync ledgers.
+              Install and open Kalika Local Agent on this computer, then connect
+              it to Tally Prime to sync ledgers.
             </p>
             <Button
               className="mt-6 rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] px-6 py-5 text-xs font-medium text-white shadow-md transition-all"
@@ -1134,11 +1090,30 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               ) : (
                 <PlugZap className="h-3.5 w-3.5 mr-1.5" />
               )}
-              Connect Bridge
+              Connect Tally Prime
             </Button>
           </div>
         </div>
       )}
+      <CaseConfirmDialog
+        confirmLabel={confirmAction === "disconnect_others" ? "Disconnect others" : "Disconnect"}
+        description={
+          confirmAction === "disconnect_others"
+            ? `${otherActiveConnectionCount} other active connector session${otherActiveConnectionCount === 1 ? "" : "s"} will stop and must reconnect from their own computer.`
+            : "Kalika workflows that use Tally will stop. You will need to click Reconnect and approve the Local Agent again."
+        }
+        footnote={null}
+        loading={disconnecting || disconnectingOthers}
+        onConfirm={() => {
+          const action = confirmAction;
+          setConfirmAction(null);
+          if (action === "disconnect") void disconnectConnector();
+          if (action === "disconnect_others") void disconnectOtherConnectors();
+        }}
+        onOpenChange={(open) => { if (!open) setConfirmAction(null); }}
+        open={confirmAction !== null}
+        title={confirmAction === "disconnect_others" ? "Disconnect other sessions?" : "Disconnect Tally?"}
+      />
     </div>
   );
 }

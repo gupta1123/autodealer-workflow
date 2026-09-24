@@ -5,6 +5,7 @@ import {accessFailureResponse} from '@/lib/access/failures';
 import { listAccessPredicate } from '@/lib/access/list-scope';
 import { purchaseFinancialDigest } from '@/lib/access/purchase-digest';
 import { createHash } from "node:crypto";
+import { readPurchaseDocumentFolder, purchaseDocumentCompanyKey } from '@/lib/purchase-document-folder';
 
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -296,6 +297,8 @@ function asSavedReview(value: unknown): Partial<PurchasePostingReview> | null {
       "taxableAmount",
       "stockItemName",
       "purchaseLedgerName",
+      "godownName",
+      "batchName",
     ] as const;
     output.lines = input.lines.slice(0, 100).flatMap((candidate) => {
       if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
@@ -1552,6 +1555,18 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
         finalPayableAmount: prepared.tallyPayload?.finalPayableAmount,
       }))
       .digest("hex");
+    const team = process.env.TEAM_ACCESS_ENFORCEMENT === 'true'
+      ? await requireResourceAccess(request, 'case', id, 'purchases.post') : null;
+    if (team && !Number.isSafeInteger(body.workflowRevision)) {
+      return jsonWithCors(request, { error: 'Reload the approved purchase revision before posting.' }, { status: 409 });
+    }
+    const sourceDocumentFolder = await readPurchaseDocumentFolder(
+      team?.access.organizationId ?? user.id,
+      purchaseDocumentCompanyKey(team?.scope.company_id ?? undefined, context.connection.id, context.selectedCompanyName || '')
+    );
+    if (sourceDocumentFolder && !context.connectionStatus?.agentCapabilities?.includes('purchase-shared-folder-v1')) {
+      return jsonWithCors(request, { error: 'Update and reconnect the connector to use the configured shared invoice folder.' }, { status: 409 });
+    }
     const frozenPayload = {
       ...prepared.tallyPayload,
       calculationDigest,
@@ -1560,6 +1575,7 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
       caseId: id,
       sourceFileId: sourceFile?.id ?? null,
       sourceDocument,
+      sourceDocumentFolder,
       revision: context.posting.revision,
       idempotencyKey: idem,
       duplicateKey: duplicate,
@@ -1601,11 +1617,6 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
       p_tally_payload: frozenPayload,
       p_revision: context.posting.revision,
     };
-    const team = process.env.TEAM_ACCESS_ENFORCEMENT === 'true'
-      ? await requireResourceAccess(request, 'case', id, 'purchases.post') : null;
-    if (team && !Number.isSafeInteger(body.workflowRevision)) {
-      return jsonWithCors(request, { error: 'Reload the approved purchase revision before posting.' }, { status: 409 });
-    }
     const commandResult = team
       ? await context.supabase.rpc('access_enqueue_purchase', {
           p_actor: user.id, p_org: team.access.organizationId, p_case: id,

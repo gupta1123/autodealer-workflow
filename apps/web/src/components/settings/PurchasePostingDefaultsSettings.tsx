@@ -4,12 +4,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Check, Loader2, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { PurchaseDocumentFolderSettings } from './PurchaseDocumentFolderSettings';
 import { apiFetch } from "@/lib/api-client";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 
 type Connection = { id: string; displayName?: string | null };
-type Company = { id: string; companyName: string };
+type Company = { id: string; companyName: string; companyGuid?: string | null; financialYear?: string | null };
 type Master = { id: string; type: string; name: string; parent: string | null };
 type Defaults = Record<string, string>;
 
@@ -266,7 +267,7 @@ export function PurchasePostingDefaultsSettings() {
         {liveSummary ? <p className="mt-2 text-xs font-medium text-emerald-700"><Check className="mr-1 inline h-4 w-4" />{liveSummary}</p> : null}
         <div className="mt-4 grid gap-3 sm:grid-cols-2">
           <label className="text-xs font-medium text-[#5b4b3d]">Tally workstation
-            <select className="mt-1 h-10 w-full rounded-lg border border-[#ddd7cc] bg-white px-3" onChange={(event) => setConnectionId(event.target.value)} value={connectionId}>
+            <select className="mt-1 h-10 w-full rounded-lg border border-[#ddd7cc] bg-white px-3" onChange={(event) => { setCompanyName(''); setCompanies([]); setConnectionId(event.target.value); }} value={connectionId}>
               {connections.map((connection) => <option key={connection.id} value={connection.id}>{connection.displayName || "Tally workstation"}</option>)}
             </select>
           </label>
@@ -278,6 +279,9 @@ export function PurchasePostingDefaultsSettings() {
         </div>
       </section>
 
+      <PurchaseDocumentFolderSettings connectionId={connectionId} companyName={companyName}
+        companyGuid={companies.find(company => company.companyName === companyName)?.companyGuid}
+        financialYear={companies.find(company => company.companyName === companyName)?.financialYear} />
       {loading ? <div className="flex items-center justify-center rounded-lg border border-[#e8e5de] bg-white p-8 text-xs text-[#5b4b3d]"><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading saved Tally masters…</div> : SECTIONS.map((section) => (
         <section className="rounded-[10px] border border-[#e8e5de] bg-white px-6 py-5" key={section.title}>
           <h3 className="text-sm font-bold text-[#111827]">{section.title}</h3>

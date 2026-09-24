@@ -19,6 +19,8 @@ type CaseConfirmDialogProps = {
   confirmLabel: string;
   loading?: boolean;
   variant?: "danger" | "default";
+  /** Overrides the case-specific footnote; pass null to hide it. */
+  footnote?: string | null;
   onOpenChange: (open: boolean) => void;
   onConfirm: () => void;
 };
@@ -30,6 +32,7 @@ export function CaseConfirmDialog({
   confirmLabel,
   loading = false,
   variant = "danger",
+  footnote,
   onOpenChange,
   onConfirm,
 }: CaseConfirmDialogProps) {
@@ -75,9 +78,11 @@ export function CaseConfirmDialog({
               {confirmLabel}
             </Button>
           </DialogFooter>
-          <p className="mt-3 text-center text-[11px] font-normal leading-4 text-[#8a7f72] sm:text-right">
-            {isDanger ? "This moves the case to Recycle Bin — you can restore it within 30 days." : "You can change this decision later from the case page."}
-          </p>
+          {footnote === null ? null : (
+            <p className="mt-3 text-center text-[11px] font-normal leading-4 text-[#8a7f72] sm:text-right">
+              {footnote ?? (isDanger ? "This moves the case to Recycle Bin — you can restore it within 30 days." : "You can change this decision later from the case page.")}
+            </p>
+          )}
         </div>
       </DialogContent>
     </Dialog>

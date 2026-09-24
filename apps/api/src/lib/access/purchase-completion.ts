@@ -9,13 +9,14 @@ export function purchaseCompletion(success: boolean, result: Record<string, unkn
   const verification = result.verification && typeof result.verification === 'object'
     ? result.verification as Record<string, unknown> : result;
   const alreadyInTally = success && result.alreadyInTally === true;
+  const verifiedAbsent = result.verifiedAbsent === true || result.voucherCreated === false;
   const uncertaintyReason = text(result.uncertaintyReason);
   const verificationStatus = text(verification.verificationStatus) || uncertaintyReason;
   const verified = success && (verificationStatus === 'verified' || alreadyInTally);
-  const voucherNumber = text(verification.voucherNumber) || text(result.voucherNumber);
+  const voucherNumber = verifiedAbsent ? null : text(verification.voucherNumber) || text(result.voucherNumber);
   const rawId = verification.masterId ?? verification.voucherId ?? result.lastVchId;
-  const masterId = rawId !== undefined && rawId !== null && /^\d+$/.test(String(rawId)) && Number(rawId) > 0 ? String(rawId).slice(0, 500) : null;
-  const guid = text(verification.guid) || text(result.guid);
+  const masterId = !verifiedAbsent && rawId !== undefined && rawId !== null && /^\d+$/.test(String(rawId)) && Number(rawId) > 0 ? String(rawId).slice(0, 500) : null;
+  const guid = verifiedAbsent ? null : text(verification.guid) || text(result.guid);
   const differences = Array.isArray(verification.differences)
     ? verification.differences.filter((v): v is string => typeof v === 'string' && Boolean(v.trim())).slice(0, 5).map(v => v.trim().slice(0, 300)) : [];
   return {
@@ -23,7 +24,7 @@ export function purchaseCompletion(success: boolean, result: Record<string, unkn
     uncertainWrite: result.uncertainWrite === true,
     uncertaintyReason,
     verificationStatus: alreadyInTally ? 'already_in_tally' : verificationStatus,
-    voucherCreated: verified || result.voucherCreatedButVerificationFailed === true || Number(result.created || 0) > 0 || Boolean(voucherNumber || masterId),
+    voucherCreated: verifiedAbsent ? false : verified || result.voucherCreatedButVerificationFailed === true || Number(result.created || 0) > 0 || Boolean(voucherNumber || masterId),
     error: verified ? null : differences.length
       ? `Tally verification needs attention: ${differences.join(' ')}`.slice(0, 2000)
       : error?.slice(0, 2000) || 'The issued Tally write was not verified. Verify the existing voucher before retrying.',
