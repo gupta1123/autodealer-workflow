@@ -546,9 +546,10 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         );
       }
 
+      // Reconnect may resume the same connection; replace it rather than list it twice.
       setConnections((current) => [
         payload.connection as TallyConnection,
-        ...current,
+        ...current.filter((connection) => connection.id !== payload.connection?.id),
       ]);
       setSelectedId(payload.connection.id);
       window.localStorage.setItem(

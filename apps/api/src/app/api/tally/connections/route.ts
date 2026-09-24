@@ -22,6 +22,8 @@ import {
 } from "@/lib/tally/connections";
 
 const DEFAULT_TALLY_URL = "http://localhost:9000";
+// Revocations that mean "paused by the user"; Reconnect resumes these.
+const RESUMABLE_REVOKE_REASONS = ["Disconnected by user.", "Disconnected by connector."];
 
 function normalizeTallyUrl(value: unknown) {
   if (typeof value !== "string" || value.trim().length === 0) {
@@ -234,18 +236,53 @@ async function POSTHandler(request: Request) {
         ? body.reuseConnectionId.trim()
         : null;
 
-    if (reuseConnectionId) {
-      const { data: existing, error: existingError } = await supabase
+    // Disconnect is a pause: reconnecting resumes the same connection, so its
+    // mappings, folder setting and posting history stay attached. Only a
+    // connection the user (or its connector) disconnected is resumed; ones
+    // superseded, expired or disconnected from another session stay retired.
+    const scopeFilter = teamContext ? `organization_id.eq.${JSON.stringify(teamContext.organizationId)}` : 'id.not.is.null';
+    let resumeId = reuseConnectionId;
+    if (!resumeId) {
+      const { data: live, error: liveError } = await supabase
+        .from("tally_connections")
+        .select("id")
+        .eq("owner_user_id", user.id)
+        .or(scopeFilter)
+        .is("revoked_at", null)
+        .not("bridge_token_hash", "is", null)
+        .limit(1);
+      if (liveError) throw liveError;
+      if (!live?.length) {
+        // No live connector for this user: resume their latest disconnected one.
+        const { data: paused, error: pausedError } = await supabase
+          .from("tally_connections")
+          .select("id")
+          .eq("owner_user_id", user.id)
+          .or(scopeFilter)
+          .in("revoked_reason", RESUMABLE_REVOKE_REASONS)
+          .is("bridge_token_hash", null)
+          .order("revoked_at", { ascending: false })
+          .limit(1);
+        if (pausedError) throw pausedError;
+        resumeId = paused?.[0]?.id ?? null;
+      }
+    }
+
+    if (resumeId) {
+      const { data: existingData, error: existingError } = await supabase
         .from("tally_connections")
         .select(TALLY_CONNECTION_SELECT)
-        .eq("id", reuseConnectionId)
+        .eq("id", resumeId)
         .eq("owner_user_id", user.id)
-        .or(teamContext?`organization_id.eq.${JSON.stringify(teamContext.organizationId)}`:'id.not.is.null')
-        .is("revoked_at", null)
+        .or(scopeFilter)
         .is("bridge_token_hash", null)
         .maybeSingle();
       if (existingError) throw existingError;
-      if (existing) {
+      const existing = existingData as unknown as TallyConnectionRow | null;
+      const resumable = existing && (
+        !existing.revoked_at || RESUMABLE_REVOKE_REASONS.includes(existing.revoked_reason ?? "")
+      );
+      if (existing && resumable) {
         const { data: resumed, error: resumeError } = await supabase
           .from("tally_connections")
           .update({
@@ -253,19 +290,23 @@ async function POSTHandler(request: Request) {
             pairing_code_hash: hashSecret(pairingCode),
             pairing_code_expires_at: createPairingExpiry(),
             control_token_hash: hashSecret(controlToken),
+            revoked_at: null,
+            revoked_reason: null,
             last_error: null,
             updated_at: new Date().toISOString(),
           })
-          .eq("id", reuseConnectionId)
+          .eq("id", resumeId)
           .select(TALLY_CONNECTION_SELECT)
           .single();
         if (resumeError) throw resumeError;
         await logConnectionEvent(
-          reuseConnectionId,
+          resumeId,
           user.id,
           "connection_resume_requested",
-          "Temporary Kalika Tally connection resume requested.",
-          { reused: true },
+          existing.revoked_at
+            ? "Disconnected Kalika Tally connection resumed."
+            : "Temporary Kalika Tally connection resume requested.",
+          { reused: true, resumedAfterDisconnect: Boolean(existing.revoked_at) },
         );
         return jsonWithCors(request, {
           connection: serializeTallyConnection(resumed as unknown as TallyConnectionRow),
