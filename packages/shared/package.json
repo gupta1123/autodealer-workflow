@@ -8,6 +8,7 @@
     "./lib/reminder-preset": "./src/lib/reminder-preset.ts",
     "./lib/access": "./src/lib/access.ts",
     "./lib/access-routes": "./src/lib/access-routes.ts",
+    "./lib/collections-query": "./src/lib/collections-query.ts",
     "./lib/case-summary": "./src/lib/case-summary.ts",
     "./lib/purchase-voucher": "./src/lib/purchase-voucher.ts",
     "./lib/comparison": "./src/lib/comparison.ts",

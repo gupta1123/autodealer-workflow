@@ -1,5 +1,5 @@
 // GENERATED from apps/api/src/lib/collections.ts by scripts/build-connector-collections-analysis.mjs.
-// Do not edit: change the API source and run the script.
+// Do not edit: change the source and run the script.
 export function toText(value, maxLength = 500) {
     if (value === null || value === undefined)
         return "";

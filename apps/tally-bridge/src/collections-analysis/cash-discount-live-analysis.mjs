@@ -1,5 +1,5 @@
 // GENERATED from apps/api/src/lib/cash-discount-live-analysis.ts by scripts/build-connector-collections-analysis.mjs.
-// Do not edit: change the API source and run the script.
+// Do not edit: change the source and run the script.
 import { invoiceIdentityKey, normalizeLedgerName, serializePaymentFollowUp, serializeTallyCandidate, todayText, } from "./collections-dashboard.mjs";
 import { derivePaymentFollowUpTiming, isCollectionOnlyPaymentFollowUp, sortPaymentFollowUpsByPriority, } from "./payment-follow-up.mjs";
 import { analyseCashDiscountNarration, } from "./cash-discount-narration.mjs";

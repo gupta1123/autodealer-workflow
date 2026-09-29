@@ -1,5 +1,5 @@
 // GENERATED from apps/api/src/lib/payment-follow-up.ts by scripts/build-connector-collections-analysis.mjs.
-// Do not edit: change the API source and run the script.
+// Do not edit: change the source and run the script.
 export const PAYMENT_FOLLOW_UP_GRACE_DAYS = 7;
 export function isCollectionOnlyPaymentFollowUp(row) {
     return row.followUpStatus !== "debit_note_required";

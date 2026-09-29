@@ -1,5 +1,5 @@
 // GENERATED from apps/api/src/lib/collections-dashboard.ts by scripts/build-connector-collections-analysis.mjs.
-// Do not edit: change the API source and run the script.
+// Do not edit: change the source and run the script.
 import { businessDateText } from "./business-date.mjs";
 import { currentCashDiscountEligibility, } from "./cash-discount-narration.mjs";
 import { toNumber, toText, } from "./collections.mjs";

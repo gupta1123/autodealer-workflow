@@ -1,5 +1,5 @@
 // GENERATED from apps/api/src/lib/cash-discount-narration.ts by scripts/build-connector-collections-analysis.mjs.
-// Do not edit: change the API source and run the script.
+// Do not edit: change the source and run the script.
 export const DEFAULT_CASH_DISCOUNT_DAYS = {
     1.5: 7,
     1: 15,

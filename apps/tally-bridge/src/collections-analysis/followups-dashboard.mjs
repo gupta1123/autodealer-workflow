@@ -1,5 +1,5 @@
 // GENERATED from apps/api/src/lib/access/followups-dashboard.ts by scripts/build-connector-collections-analysis.mjs.
-// Do not edit: change the API source and run the script.
+// Do not edit: change the source and run the script.
 /** Explicit projection: follow-up access must not expose debit-note history. */
 export function followUpsDashboard(input) {
     return {

@@ -22,10 +22,15 @@ const modules = [
   "cash-discount-live-analysis",
   "access/followups-dashboard",
   "cash-discount-live-dashboard",
+  "collections-query",
 ];
 
+// Shared with the web page (packages/shared), not part of the API's lib.
+const sharedModules = { "collections-query": path.join(root, "packages/shared/src/lib/collections-query.ts") };
+
 function generate(name) {
-  const source = fs.readFileSync(path.join(sourceDirectory, `${name}.ts`), "utf8");
+  const sourcePath = sharedModules[name] ?? path.join(sourceDirectory, `${name}.ts`);
+  const source = fs.readFileSync(sourcePath, "utf8");
   const { outputText } = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022, verbatimModuleSyntax: false },
     fileName: `${name}.ts`,
@@ -35,7 +40,7 @@ function generate(name) {
     return `from ${quote}./${path.basename(target)}.mjs${quote}`;
   });
   if (/from\s+["'](?!\.\/)/.test(javascript)) throw new Error(`${name}.ts imports a package; the connector analysis must stay dependency-free.`);
-  return `// GENERATED from apps/api/src/lib/${name}.ts by scripts/build-connector-collections-analysis.mjs.\n// Do not edit: change the API source and run the script.\n${javascript.replace(/\r\n/g, "\n")}`;
+  return `// GENERATED from ${path.relative(root, sourcePath).replace(/\\/g, "/")} by scripts/build-connector-collections-analysis.mjs.\n// Do not edit: change the source and run the script.\n${javascript.replace(/\r\n/g, "\n")}`;
 }
 
 const check = process.argv.includes("--check");

@@ -17,6 +17,7 @@ import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallySc
 import { createLocalAgentRuntime } from "./agent/runtime.mjs";
 import { openBillAmountIndexFromFields, openBillFromFields, openBillsByLedgerFromFields } from "./agent/receivable-fields.mjs";
 import { buildLiveCashDiscountDashboard } from "./collections-analysis/cash-discount-live-dashboard.mjs";
+import { collectionRowsById, dashboardShell, queryCollections } from "./collections-analysis/collections-query.mjs";
 import { powershellProtectedData } from "./agent/key-vault.mjs";
 import { workflowCacheState } from './agent/workflow-cache-policy.mjs';
 import { startDetachedDocument } from "./agent/detached-document.mjs";
@@ -5840,6 +5841,35 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
   return snapshot;
 }
 
+// Analysed Cash Discount / Payment Follow-ups dashboards held for paging:
+// the latest one per company, year and kind, plus the one before it so a page
+// still open on the previous result keeps working until it refreshes.
+const collectionsDashboards = new Map();
+const COLLECTIONS_DASHBOARDS_KEPT_PER_SCOPE = 2;
+
+function storeCollectionsDashboard(config, { companyName, financialYear, followUps, dashboard }) {
+  const scope = [config.connectionId, normalizeLooseName(companyName), financialYear || "", followUps ? "followups" : "discounts"].join("|");
+  const shell = dashboardShell(dashboard);
+  const dashboardId = `${scope}|${shell.summary.revision}`;
+  collectionsDashboards.delete(dashboardId);
+  collectionsDashboards.set(dashboardId, { scope, dashboard });
+  const sameScope = [...collectionsDashboards.keys()].filter((key) => collectionsDashboards.get(key).scope === scope);
+  for (const key of sameScope.slice(0, Math.max(0, sameScope.length - COLLECTIONS_DASHBOARDS_KEPT_PER_SCOPE))) collectionsDashboards.delete(key);
+  return { ...shell, dashboardId };
+}
+
+function answerCollectionsRequest(config, operation, message) {
+  const dashboardId = String(message.payload?.dashboardId || "");
+  // Only this connection's dashboards; the id alone is never enough.
+  if (!dashboardId.startsWith(`${config.connectionId}|`)) throw new Error("This dashboard belongs to another connection.");
+  const held = collectionsDashboards.get(dashboardId);
+  if (!held) throw new Error("These results have been replaced by a newer check. Refresh to continue.");
+  if (operation === "collections_query") return queryCollections(held.dashboard, message.payload?.query || {});
+  const view = String(message.payload?.view || "");
+  if (!["followUps", "pending", "created"].includes(view)) throw new Error("Unknown collections list.");
+  return { view, rows: collectionRowsById(held.dashboard, view, Array.isArray(message.payload?.ids) ? message.payload.ids : []) };
+}
+
 // The same per-customer result as collectCashDiscountCustomerEvidence, from
 // customer dues held as fields in memory: no Tally read and no XML parsing.
 // Customers are calculated in batches of 250 with the invoices and receipts
@@ -7835,6 +7865,16 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
     const requestId = String(message.requestId || "").trim();
     const operation = String(message.operation || "");
     if (!requestId) return;
+    // Pages and rows of an analysed dashboard held here: answered from memory
+    // at once, never queued behind Tally work.
+    if (operation === "collections_query" || operation === "collections_rows") {
+      try {
+        send({ type: "operation_result", requestId, success: true, data: answerCollectionsRequest(config, operation, message) });
+      } catch (error) {
+        send({ type: "operation_result", requestId, success: false, error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
     const isBankRead = ["ledger_masters", "verify_bank_transaction", "fetch_customer_open_bills"].includes(operation);
     const isPurchaseRead = operation === "ledger_masters" &&
       Array.isArray(message.payload?.requestedMasterTypes) &&
@@ -8150,6 +8190,14 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
             followUps: context.followUps === true,
           });
           log("info", `Cash Discount scan ${requestId}: analysed on this computer in ${Math.round(performance.now() - analysisStarted)} ms.`);
+          // A page that pages its lists gets only the shell (KPIs, counts,
+          // revision); the lists stay here and are read a page at a time.
+          if (message.payload?.paged === true) {
+            const shell = storeCollectionsDashboard(config, {
+              companyName: message.companyName, financialYear: snapshot.financialYear, followUps: context.followUps === true, dashboard,
+            });
+            return { analysed: true, dashboard: shell, cache: snapshot.cache ?? null, scanSummary: snapshot.scanSummary ?? null };
+          }
           return { analysed: true, dashboard, cache: snapshot.cache ?? null, scanSummary: snapshot.scanSummary ?? null };
         }
         if (operation === "cash_discount_execute_debit_note") {
@@ -9214,6 +9262,8 @@ async function main() {
 }
 
 export {
+  storeCollectionsDashboard,
+  answerCollectionsRequest,
   BRIDGE_VERSION,
   CONFIG_DIR,
   CONFIG_PATH,

@@ -1,5 +1,5 @@
 // GENERATED from apps/api/src/lib/cash-discount-live-dashboard.ts by scripts/build-connector-collections-analysis.mjs.
-// Do not edit: change the API source and run the script.
+// Do not edit: change the source and run the script.
 // Builds the Cash Discount / Payment Follow-ups dashboard from a connector
 // scan. Used by /api/collections/live/analyse and, generated into plain
 // JavaScript (scripts/build-connector-collections-analysis.mjs), by the
