@@ -19,8 +19,36 @@ const connectors = new Map();
 const pending = new Map();
 const activeDebitNotes = new Set();
 
+// Timeline of each live request as seen by the gateway, so a slow page can be
+// explained from the server log alone: when the browser's request arrived,
+// each step, and every message sent back (type and size).
+const requestTimeline = new Map();
+function trace(requestId, step) {
+  if (!requestId) return;
+  const startedAt = requestTimeline.get(requestId) ?? Date.now();
+  requestTimeline.set(requestId, startedAt);
+  console.log(`Live request ${String(requestId).slice(0, 8)} +${Date.now() - startedAt} ms: ${step}`);
+}
+
 function send(socket, payload) {
-  if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
+  if (socket.readyState !== WebSocket.OPEN) return;
+  const text = JSON.stringify(payload);
+  socket.send(text);
+  if (metadata.get(socket)?.role === "browser" && payload?.requestId && requestTimeline.has(payload.requestId)) {
+    trace(payload.requestId, `sent ${payload.type}${payload.success === false ? " (failed)" : ""} to the browser, ${text.length} bytes, ${socket.bufferedAmount} bytes still queued`);
+    if (payload.type === "result") {
+      // When the result has fully left the server (a slow download shows here).
+      const requestId = payload.requestId;
+      const sentAt = Date.now();
+      const check = setInterval(() => {
+        if (socket.bufferedAmount > 0 && socket.readyState === WebSocket.OPEN && Date.now() - sentAt < 120_000) return;
+        clearInterval(check);
+        trace(requestId, socket.bufferedAmount > 0 ? `result still not delivered after ${Date.now() - sentAt} ms` : `result handed to the network after ${Date.now() - sentAt} ms`);
+        requestTimeline.delete(requestId);
+      }, 100);
+      check.unref?.();
+    }
+  }
 }
 
 function closeWithError(socket, message, code = 1008) {
@@ -206,8 +234,9 @@ async function handleBrowserRequest(socket, message, meta) {
     send(socket, { type: "result", requestId, success: false, error: "This live request is already running." });
     return;
   }
+  trace(requestId, `${operation} request received from the browser`);
   let authority;
-  try { authority=await authorizeLiveOperation(meta,message); }
+  try { authority=await authorizeLiveOperation(meta,message); trace(requestId, "authorised"); }
   catch(error){send(socket,{type:'result',requestId,success:false,error:error.message});return;}
   // Concurrent duplicate messages may both have waited for authorization.
   if(pending.has(requestId)){send(socket,{type:'result',requestId,success:false,error:'This live request is already running.'});return;}
@@ -234,6 +263,7 @@ async function handleBrowserRequest(socket, message, meta) {
     // seconds, so wait briefly for the running one instead of failing.
     const busy = () => [...pending.values()].some((item) => item.connectionId === meta.connectionId && ["scan", "followups_scan", "create_debit_note"].includes(item.operation));
     if (busy()) {
+      trace(requestId, "waiting: another check is running on this connector");
       send(socket, { type: "progress", requestId, message: "Waiting for the current check to finish…" });
       const waitUntil = Date.now() + SERIAL_OPERATION_WAIT_MS;
       while (busy() && Date.now() < waitUntil && socket.readyState === WebSocket.OPEN) {
@@ -297,6 +327,7 @@ async function handleBrowserRequest(socket, message, meta) {
     item.contextMs = Date.now() - contextStartedAt;
     if (!pending.has(requestId)) return;
   }
+  trace(requestId, "sent to the connector");
   send(connector, {
     type: "operation",
     requestId,
@@ -347,6 +378,7 @@ async function handleConnectorResult(socket, message, meta) {
   const requestId = String(message.requestId ?? "");
   const item = pending.get(requestId);
   if (!item || item.connector !== socket || item.connectionId !== meta.connectionId) return;
+  trace(requestId, `connector result received (${message.success === true ? "success" : "failed"})`);
   if (message.success !== true) {
     failPending(requestId, new Error(String(message.error ?? "Tally could not complete the live request.")));
     return;
