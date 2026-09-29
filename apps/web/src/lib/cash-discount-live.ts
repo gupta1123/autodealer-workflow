@@ -8,7 +8,7 @@ type LiveRequest = {
   companyName: string;
   companyGuid?: string | null;
   financialYear?: string | null;
-  operation: "test_purchase_document_folder" | "company_check" | "bank_ledgers" | "ledger_masters" | "ledger_suggestions" | "verify_bank_transaction" | "fetch_customer_open_bills" | "scan" | "followups_scan" | "create_debit_note";
+  operation: "test_purchase_document_folder" | "company_check" | "bank_ledgers" | "ledger_masters" | "ledger_suggestions" | "verify_bank_transaction" | "fetch_customer_open_bills" | "scan" | "followups_scan" | "create_debit_note" | "collections_query" | "collections_rows";
   payload?: Record<string, unknown>;
   companyNames?: string[];
   proposal?: Record<string, unknown>;
@@ -327,7 +327,8 @@ export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
         session.pending.delete(requestId);
         reject(new Error("The live Tally request timed out. Check the connector and try again."));
       },
-      4 * 60_000
+      // Pages of a held dashboard are answered from memory; scans read Tally.
+      request.operation === "collections_query" || request.operation === "collections_rows" ? 30_000 : 4 * 60_000
     );
     session.pending.set(requestId, {
       operation: request.operation,

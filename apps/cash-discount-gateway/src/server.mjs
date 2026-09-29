@@ -251,7 +251,7 @@ function handleCollectionsRequest(socket, message, meta, requestId, operation) {
   item.phase = "collections";
   send(connector, {
     type: "operation", requestId, operation, deadlineAt: Date.now() + 30_000,
-    payload: { dashboardId, query: message.payload?.query, view: message.payload?.view, ids: message.payload?.ids },
+    payload: { dashboardId, query: message.payload?.query, view: message.payload?.view, ids: message.payload?.ids, invoiceKeys: message.payload?.invoiceKeys },
   });
 }
 

@@ -31,6 +31,16 @@ import {useReminderStatuses,invoiceKey,reminderLabel} from './useReminderStatuse
 import {useAccess} from '@/components/access/AccessProvider';
 import {canAccess} from '@autodealer/shared/lib/access';
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
+import { canCreateInTally as canCreateDebitNoteInTally, invoiceKey as proposalListInvoiceKey } from '@autodealer/shared/lib/collections-query';
+import {
+  collectionsRevision,
+  collectionsSummary,
+  fetchCollectionsRows,
+  fetchCollectionsRowsByInvoice,
+  useCollectionsList,
+  type CollectionsRemote,
+  type CollectionsSummary,
+} from './collections-source';
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 
 type CompanyOption = {
@@ -279,6 +289,11 @@ type DashboardPayload = {
   };
   narrationAnalysis?: NarrationAnalysisRow[];
   notes?: string[];
+  // A paged dashboard (Kalika Local Agent 1.2.25+): the lists stay on the
+  // connector and are read a page at a time; only the summary arrives here.
+  paged?: boolean;
+  dashboardId?: string;
+  summary?: CollectionsSummary;
 };
 
 type ActiveView = "needsAction" | "followUps" | "done";
@@ -359,55 +374,11 @@ function followUpStatusLabel(status: PaymentFollowUp["followUpStatus"]) {
   return "Needs follow-up";
 }
 
-function sortPaymentFollowUpRows(rows: PaymentFollowUp[], sort: PaymentFollowUpSort) {
-  const basisRank: Record<PaymentFollowUp["ageBasis"], number> = {
-    due_date: 1,
-    invoice_date: 2,
-    missing_dates: 3,
-  };
-  const compareName = (left: PaymentFollowUp, right: PaymentFollowUp) =>
-    left.partyLedgerName.localeCompare(right.partyLedgerName);
-  const compareAmount = (left: PaymentFollowUp, right: PaymentFollowUp) =>
-    right.outstandingAmount - left.outstandingAmount;
-  const compareAge = (left: PaymentFollowUp, right: PaymentFollowUp) => {
-    const basisDifference = basisRank[left.ageBasis] - basisRank[right.ageBasis];
-    if (basisDifference !== 0) return basisDifference;
-    return (right.ageDays ?? -1) - (left.ageDays ?? -1);
-  };
 
-  return [...rows].sort((left, right) => {
-    if (sort === "customer") return compareName(left, right);
-    if (sort === "highest_outstanding") return compareAmount(left, right) || compareAge(left, right) || compareName(left, right);
-    if (sort === "oldest_invoice") {
-      const leftDate = Date.parse(`${left.linkedInvoiceDate ?? ""}T00:00:00.000Z`) || Number.MAX_SAFE_INTEGER;
-      const rightDate = Date.parse(`${right.linkedInvoiceDate ?? ""}T00:00:00.000Z`) || Number.MAX_SAFE_INTEGER;
-      return leftDate - rightDate || compareAmount(left, right) || compareName(left, right);
-    }
-    if (sort === "most_overdue") return compareAge(left, right) || compareAmount(left, right) || compareName(left, right);
-
-    const leftPriority = basisRank[left.ageBasis];
-    const rightPriority = basisRank[right.ageBasis];
-    return leftPriority - rightPriority || compareAge(left, right) || compareAmount(left, right) || compareName(left, right);
-  });
-}
-
+// Unchanged results keep the current view (no reload, no flicker). The
+// revision covers every list, so a paged dashboard needs no rows to compare.
 function paymentFollowUpDataKey(payload: DashboardPayload | null) {
-  return (payload?.tabs?.paymentFollowUps ?? [])
-    .map((row) => [
-      row.partyLedgerName,
-      row.linkedInvoiceNumber,
-      row.linkedInvoiceDate,
-      row.outstandingAmount,
-      row.followUpStatus,
-      row.ageDays,
-      row.ageBasis,
-    ].join("\u001f"))
-    .sort()
-    .join("\u001e");
-}
-
-function isPendingDebitNote(proposal: DebitNoteProposal) {
-  return ["draft", "pending_approval", "approved", "queued_in_tally", "failed"].includes(proposal.status);
+  return collectionsRevision(payload);
 }
 
 function isCreatedDebitNote(proposal: DebitNoteProposal) {
@@ -667,6 +638,8 @@ export function CollectionsDashboardPage({
   const [selectedConnectionId, setSelectedConnectionId] = useState(() => initialCachedView?.selectedConnectionId ?? "");
   const [selectedCompanyId, setSelectedCompanyId] = useState(() => initialCachedView?.selectedCompanyId ?? "");
   const [dashboard, setDashboard] = useState<DashboardPayload | null>(() => initialCachedView?.dashboard ?? null);
+  const dashboardRef = useRef<DashboardPayload | null>(dashboard);
+  dashboardRef.current = dashboard;
   const [liveTallyConnection, setLiveTallyConnection] = useState<LiveTallyConnection | null>(null);
   const [checkingLiveTallyCompany, setCheckingLiveTallyCompany] = useState(true);
   const [activeView, setActiveView] = useState<ActiveView>(initialView);
@@ -689,6 +662,9 @@ export function CollectionsDashboardPage({
   const [selectedFollowUpIds,setSelectedFollowUpIds]=useState<Set<string>>(()=>new Set());
   const [followUpBulkMode,setFollowUpBulkMode]=useState<'enroll'|'send_once'|null>(null);
   const [followUpBulkPhones,setFollowUpBulkPhones]=useState<Record<string,string>>({});
+  // Selected rows are loaded by id when an action needs them (they may be on other pages).
+  const [followUpBulkRows,setFollowUpBulkRows]=useState<PaymentFollowUp[]>([]);
+  const [bulkMessageable,setBulkMessageable]=useState<DebitNoteProposal[]>([]);
   const [followUpBulkBusy,setFollowUpBulkBusy]=useState(false);
   const [followUpBulkSavePhones,setFollowUpBulkSavePhones]=useState(true);
   const [loading, setLoading] = useState(() => !initialCachedView);
@@ -867,7 +843,8 @@ export function CollectionsDashboardPage({
         companyGuid,
         financialYear,
         operation: isDedicatedFollowUpsPage ? "followups_scan" : "scan",
-        payload: { resume, forceRefresh, moduleName: isDedicatedFollowUpsPage ? "followups" : "cashDiscount" },
+        // paged: the connector keeps the lists and this page reads them a page at a time.
+        payload: { resume, forceRefresh, paged: true, moduleName: isDedicatedFollowUpsPage ? "followups" : "cashDiscount" },
         onProgress: (progressMessage) => {
           if (!quiet) setMessage({ tone: "info", text: progressMessage });
         },
@@ -885,7 +862,7 @@ export function CollectionsDashboardPage({
           try {
             const fresh = await runCashDiscountLiveRequest<DashboardPayload>({
               signal: controller.signal, connectionId, companyName: resolvedCompanyName, companyGuid, financialYear,
-              operation: isDedicatedFollowUpsPage ? 'followups_scan' : 'scan', payload: { forceRefresh: true, moduleName: isDedicatedFollowUpsPage ? "followups" : "cashDiscount" },
+              operation: isDedicatedFollowUpsPage ? 'followups_scan' : 'scan', payload: { forceRefresh: true, paged: true, moduleName: isDedicatedFollowUpsPage ? "followups" : "cashDiscount" },
               onProgress: text => { if (!quiet) setMessage({ tone: 'info', text: `Showing saved results · ${text}` }); },
             });
             if (fresh.scanSummary?.complete === false) throw new Error('The refresh was incomplete.');
@@ -905,8 +882,17 @@ export function CollectionsDashboardPage({
     [enforcementRequired,accessSnapshot,isDedicatedFollowUpsPage]
   );
 
-  const refreshCreatedDebitNotesFromStore = useCallback(async (connectionId: string) => {
-    if (isDedicatedFollowUpsPage) return;
+  // Returns the refreshed dashboard (or null when there is none to refresh).
+  const refreshCreatedDebitNotesFromStore = useCallback(async (connectionId: string): Promise<DashboardPayload | null> => {
+    if (isDedicatedFollowUpsPage) return null;
+    // A paged dashboard is re-analysed on the connector from its customer dues
+    // with the latest debit-note history (no Tally scan); the lists reload.
+    if (dashboardRef.current?.paged) {
+      const next = await refreshTallyOpenBills(connectionId, selectedCompany?.companyName, selectedCompany?.financialYear, selectedCompany?.companyGuid, false, false, true);
+      if (next.scanSummary?.complete === false) throw new Error('The refresh was incomplete.');
+      setDashboard(next);
+      return next;
+    }
     const response = await apiFetch(
       `/api/collections/debit-note-proposals?${new URLSearchParams({
         connectionId,
@@ -921,32 +907,35 @@ export function CollectionsDashboardPage({
     const created = payload.proposals ?? [];
     const createdKeys = new Set(created.map(proposalInvoiceKey));
 
-    setDashboard((current) => {
-      if (!current) return current;
-      const existing = current.tabs?.debitNoteQueue ?? [];
-      const pending = existing.filter(
-        (proposal) => !isCreatedDebitNote(proposal) && !createdKeys.has(proposalInvoiceKey(proposal))
-      );
-      const proposals = [...pending, ...created];
-      return {
-        ...current,
-        kpis: {
-          ...(current.kpis ?? {}),
-          cdExpired: pending.length,
-          debitNotesPendingApproval: pending.length,
-          needsAttention: pending.length,
-          totalOutstanding: sumRecoverable(pending),
-          createdDebitNotes: created.length,
-          createdDebitNoteAmount: sumRecoverable(created),
-        },
-        tabs: {
-          ...(current.tabs ?? {}),
-          cashDiscountTracker: proposals,
-          debitNoteQueue: proposals,
-        },
-      };
-    });
-  }, [selectedCompany?.companyName,selectedCompany?.financialYear,isDedicatedFollowUpsPage]);
+    // A whole dashboard (older connector) is updated here, as before.
+    const current = dashboardRef.current;
+    if (!current) return null;
+    const existing = current.tabs?.debitNoteQueue ?? [];
+    const pending = existing.filter(
+      (proposal) => !isCreatedDebitNote(proposal) && !createdKeys.has(proposalInvoiceKey(proposal))
+    );
+    const proposals = [...pending, ...created];
+    const next: DashboardPayload = {
+      ...current,
+      kpis: {
+        ...(current.kpis ?? {}),
+        cdExpired: pending.length,
+        debitNotesPendingApproval: pending.length,
+        needsAttention: pending.length,
+        totalOutstanding: sumRecoverable(pending),
+        createdDebitNotes: created.length,
+        createdDebitNoteAmount: sumRecoverable(created),
+      },
+      tabs: {
+        ...(current.tabs ?? {}),
+        cashDiscountTracker: proposals,
+        debitNoteQueue: proposals,
+      },
+    };
+    dashboardRef.current = next;
+    setDashboard(next);
+    return next;
+  }, [selectedCompany?.companyName,selectedCompany?.financialYear,selectedCompany?.companyGuid,isDedicatedFollowUpsPage,refreshTallyOpenBills]);
 
   const refreshAll = useCallback(
     async (options?: { quiet?: boolean; refreshTally?: boolean }) => {
@@ -1422,20 +1411,30 @@ export function CollectionsDashboardPage({
     })();
   }, [accessReady, liveTallyConnection, refreshTallyOpenBills, selectedCompany, selectedConnectionId]);
 
-  const proposals = dashboard?.tabs?.debitNoteQueue ?? [];
-  const paymentFollowUps = useMemo(() => dashboard?.tabs?.paymentFollowUps ?? [], [dashboard]);
-  const followUpKpis = useMemo(() => ({
-    total: paymentFollowUps.length,
-    needsFollowUp: paymentFollowUps.filter((item) => item.followUpStatus === "needs_follow_up").length,
-    escalated: paymentFollowUps.filter((item) => item.followUpStatus === "escalate").length,
-    needsReview: paymentFollowUps.filter((item) => item.followUpStatus === "needs_review").length,
-    outstanding: paymentFollowUps.reduce((total, item) => total + (Number(item.outstandingAmount) || 0), 0),
-  }), [paymentFollowUps]);
-  const sortedPaymentFollowUps = useMemo(
-    () => sortPaymentFollowUpRows(paymentFollowUps, paymentFollowUpSort),
-    [paymentFollowUpSort, paymentFollowUps]
-  );
-  const narrationAnalysis = dashboard?.narrationAnalysis ?? [];
+  // Lists are read a page at a time (from the connector for a paged dashboard,
+  // from the dashboard itself otherwise); KPIs and counts come from its summary.
+  const summary = useMemo(() => collectionsSummary(dashboard), [dashboard]);
+  const collectionsRemote = useCallback<CollectionsRemote>((operation, payload) => runCashDiscountLiveRequest({
+    connectionId: selectedConnectionId,
+    companyName: selectedCompany?.companyName || '',
+    companyGuid: selectedCompany?.companyGuid,
+    financialYear: selectedCompany?.financialYear,
+    operation,
+    payload,
+  }), [selectedConnectionId, selectedCompany?.companyName, selectedCompany?.companyGuid, selectedCompany?.financialYear]);
+  // A held dashboard was replaced (newer check) or its access expired: re-check quietly.
+  const onCollectionsExpired = useCallback(() => { void refreshAll({ quiet: true }); }, [refreshAll]);
+  const followUpKpis = summary?.followUps ?? { total: 0, needsFollowUp: 0, escalated: 0, needsReview: 0, outstanding: 0 };
+  const followUpsList = useCollectionsList<PaymentFollowUp>(dashboard,
+    activeView === 'followUps' && reminderTab === 'outstanding' && !reminderInvoice
+      ? { view: 'followUps', sort: paymentFollowUpSort, page: followUpsPage, pageSize } : null,
+    collectionsRemote, onCollectionsExpired);
+  const pendingList = useCollectionsList<DebitNoteProposal>(dashboard,
+    activeView === 'needsAction' ? { view: 'pending', filter: pendingFilter, search: pendingQuery, sort: pendingSort, page: pendingPage, pageSize } : null,
+    collectionsRemote, onCollectionsExpired);
+  const createdList = useCollectionsList<DebitNoteProposal>(dashboard,
+    activeView === 'done' ? { view: 'created', filter: createdFilter, search: createdQuery, sort: createdSort, page: createdPage, pageSize } : null,
+    collectionsRemote, onCollectionsExpired);
 
   const activeTallyCompanyName = liveTallyConnection?.lastCompanyName?.trim() ?? "";
   const tallyCompanyVerified =
@@ -1456,64 +1455,32 @@ export function CollectionsDashboardPage({
   const companyContextLocked = liveCompanyCheckPending || companyContextBlocked;
   const scanFailed = Boolean(!loading && !dashboard && message?.tone === "error" && !companyContextLocked);
 
-  const pendingProposals = proposals.filter(isPendingDebitNote);
-  const createdProposals = proposals.filter(isCreatedDebitNote);
-  const visiblePendingProposals = useMemo(() => {
-    const query = pendingQuery.trim().toLowerCase();
-    const rows = pendingProposals.filter((proposal) => {
-      if (pendingFilter === "ready" && !["draft", "pending_approval"].includes(proposal.status)) return false;
-      if (pendingFilter === "in_progress" && !["approved", "queued_in_tally"].includes(proposal.status)) return false;
-      if (pendingFilter === "failed" && proposal.status !== "failed") return false;
-      if (!query) return true;
-      return [
-        proposal.partyLedgerName,
-        proposal.linkedInvoiceNumber,
-        proposal.cashDiscountRuleName,
-        proposal.cashDiscountAnalysis?.sourceNarration,
-        proposal.lastError,
-      ].some((value) => String(value ?? "").toLowerCase().includes(query));
-    });
-    const dateValue = (value?: string | null) => Date.parse(value ?? "") || Number.MAX_SAFE_INTEGER;
-    return [...rows].sort((left, right) => {
-      if (pendingSort === "highest_recovery") return (right.recoverableAmount || 0) - (left.recoverableAmount || 0);
-      if (pendingSort === "invoice_oldest") return dateValue(left.linkedInvoiceDate) - dateValue(right.linkedInvoiceDate);
-      if (pendingSort === "customer") return left.partyLedgerName.localeCompare(right.partyLedgerName);
-      return dateValue(left.discountDeadline) - dateValue(right.discountDeadline);
-    });
-  }, [pendingFilter, pendingProposals, pendingQuery, pendingSort]);
-  const visibleCreatedProposals = useMemo(() => {
-    const query = createdQuery.trim().toLowerCase();
-    const rows = createdProposals.filter((proposal) => {
-      if (createdFilter === "sent" && proposal.communicationStatus !== "sent") return false;
-      if (createdFilter === "not_sent" && proposal.communicationStatus === "sent") return false;
-      if (createdFilter === "failed" && proposal.communicationStatus !== "failed") return false;
-      if (!query) return true;
-      return [
-        proposal.partyLedgerName,
-        proposal.linkedInvoiceNumber,
-        proposal.tallyVoucherNumber,
-        proposal.narration,
-      ].some((value) => String(value ?? "").toLowerCase().includes(query));
-    });
-    const dateValue = (value?: string | null) => Date.parse(value ?? "") || 0;
-    return [...rows].sort((left, right) => {
-      if (createdSort === "highest_amount") return (right.recoverableAmount || 0) - (left.recoverableAmount || 0);
-      if (createdSort === "invoice_newest") return dateValue(right.linkedInvoiceDate) - dateValue(left.linkedInvoiceDate);
-      if (createdSort === "customer") return left.partyLedgerName.localeCompare(right.partyLedgerName);
-      return dateValue(right.createdInTallyAt ?? right.tallyVoucherDate) - dateValue(left.createdInTallyAt ?? left.tallyVoucherDate);
-    });
-  }, [createdFilter, createdProposals, createdQuery, createdSort]);
-  const pendingPageCount = Math.max(1, Math.ceil(visiblePendingProposals.length / pageSize));
-  const createdPageCount = Math.max(1, Math.ceil(visibleCreatedProposals.length / pageSize));
-  const followUpsPageCount = Math.max(1, Math.ceil(sortedPaymentFollowUps.length / pageSize));
-  const safePendingPage = Math.min(pendingPage, pendingPageCount);
-  const safeCreatedPage = Math.min(createdPage, createdPageCount);
-  const safeFollowUpsPage = Math.min(followUpsPage, followUpsPageCount);
-  const pagedPendingProposals = visiblePendingProposals.slice((safePendingPage - 1) * pageSize, safePendingPage * pageSize);
-  const pagedCreatedProposals = visibleCreatedProposals.slice((safeCreatedPage - 1) * pageSize, safeCreatedPage * pageSize);
-  const pagedPaymentFollowUps = sortedPaymentFollowUps.slice((safeFollowUpsPage - 1) * pageSize, safeFollowUpsPage * pageSize);
-  const selectedFollowUps=sortedPaymentFollowUps.filter(row=>selectedFollowUpIds.has(row.id));
-  const openFollowUpBulk=(mode:'enroll'|'send_once')=>{setFollowUpBulkPhones(Object.fromEntries(selectedFollowUps.map(row=>[row.id,row.partyPhone||''])));setFollowUpBulkMode(mode);};
+  // Totals of the whole lists (not just the page) come from the summary.
+  const pendingCount = summary?.pending.all ?? 0;
+  const createdCount = summary?.created.all ?? 0;
+  const pendingTotal = pendingList.page?.total ?? 0;
+  const createdTotal = createdList.page?.total ?? 0;
+  const followUpsTotal = followUpsList.page?.total ?? followUpKpis.total;
+  const safePendingPage = pendingList.page?.page ?? pendingPage;
+  const safeCreatedPage = createdList.page?.page ?? createdPage;
+  const safeFollowUpsPage = followUpsList.page?.page ?? followUpsPage;
+  const pagedPendingProposals = pendingList.page?.rows ?? [];
+  const pagedCreatedProposals = createdList.page?.rows ?? [];
+  const pagedPaymentFollowUps = followUpsList.page?.rows ?? [];
+  // Selected rows can be on any page: they are loaded by id when needed.
+  const loadSelectedFollowUps = async () => {
+    if (!dashboard || !selectedFollowUpIds.size) return [];
+    return fetchCollectionsRows<PaymentFollowUp>(dashboard, 'followUps', [...selectedFollowUpIds], collectionsRemote);
+  };
+  const selectedFollowUps = followUpBulkRows;
+  const openFollowUpBulk=async(mode:'enroll'|'send_once')=>{
+    try{
+      const rows=await loadSelectedFollowUps();
+      setFollowUpBulkRows(rows);
+      setFollowUpBulkPhones(Object.fromEntries(rows.map(row=>[row.id,row.partyPhone||''])));
+      setFollowUpBulkMode(mode);
+    }catch(error){setMessage({tone:'error',text:error instanceof Error?error.message:'Could not load the selected invoices.'});}
+  };
   const submitFollowUpBulk=async()=>{
     if(!followUpBulkMode||!selectedCompany||!selectedFollowUps.length||followUpBulkBusy)return;
     setFollowUpBulkBusy(true);setMessage(null);
@@ -1522,24 +1489,21 @@ export function CollectionsDashboardPage({
       const result=await response.json();if(!response.ok)throw new Error(result.error||'Bulk reminder action failed.');const rows=result.results||[];const completed=rows.filter((item:{status:string})=>!['skipped','rejected','uncertain'].includes(item.status)).length;const attention=rows.length-completed;setMessage({tone:attention?'info':'success',text:`${completed} completed${attention?` · ${attention} need attention`:''}.`});setFollowUpBulkMode(null);setSelectedFollowUpIds(new Set());setReminderTab(followUpBulkMode==='enroll'?'pipelines':'due');
     }catch(error){setMessage({tone:'error',text:error instanceof Error?error.message:'Bulk reminder action failed.'});}finally{setFollowUpBulkBusy(false);}
   };
-  const exportSelectedFollowUps=()=>{if(!selectedFollowUps.length)return;const q=(value:unknown)=>`"${String(value??'').replaceAll('"','""')}"`;const csv=[['Customer','Invoice','Invoice date','Outstanding','Phone','Payment age'],...selectedFollowUps.map(row=>[row.partyLedgerName,row.linkedInvoiceNumber,row.linkedInvoiceDate,row.outstandingAmount,row.partyPhone||'',row.ageLabel])].map(line=>line.map(q).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\ufeff',csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='unpaid-invoices.csv';a.click();window.setTimeout(()=>URL.revokeObjectURL(url),1000);};
+  const exportSelectedFollowUps=async()=>{let rows:PaymentFollowUp[];try{rows=await loadSelectedFollowUps();}catch(error){setMessage({tone:'error',text:error instanceof Error?error.message:'Could not load the selected invoices.'});return;}if(!rows.length)return;const q=(value:unknown)=>`"${String(value??'').replaceAll('"','""')}"`;const csv=[['Customer','Invoice','Invoice date','Outstanding','Phone','Payment age'],...rows.map(row=>[row.partyLedgerName,row.linkedInvoiceNumber,row.linkedInvoiceDate,row.outstandingAmount,row.partyPhone||'',row.ageLabel])].map(line=>line.map(q).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\ufeff',csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='unpaid-invoices.csv';a.click();window.setTimeout(()=>URL.revokeObjectURL(url),1000);};
   const scheduleStatuses=useReminderStatuses({connectionId:selectedConnectionId,companyId:selectedCompany?.accessCompanyId,companyGuid:selectedCompany?.companyGuid,companyName:selectedCompany?.companyName||'',financialYear:selectedCompany?.financialYear||''},pagedPaymentFollowUps,activeView==='followUps'&&reminderTab==='outstanding'&&!reminderInvoice);
-  const selectablePendingProposals = tallyCompanyVerified ? pendingProposals.filter(canCreateInTally) : [];
   const selectablePendingOnPage = tallyCompanyVerified ? pagedPendingProposals.filter(canCreateInTally) : [];
-  const selectedPendingProposals = selectablePendingProposals.filter((proposal) => selectedPendingIds.has(proposal.id));
-  const selectableCreatedProposals = createdProposals.filter(
-    (proposal) => proposal.communicationStatus !== "sent" || needsUpdatedPdfDelivery(proposal)
-  );
-  const selectableCreatedOnPage = pagedCreatedProposals.filter(
-    (proposal) => proposal.communicationStatus !== "sent" || needsUpdatedPdfDelivery(proposal)
-  );
-  const selectedCreatedProposals = selectableCreatedProposals.filter((proposal) => selectedCreatedIds.has(proposal.id));
+  const canMessageProposal = (proposal: DebitNoteProposal) => proposal.communicationStatus !== "sent" || needsUpdatedPdfDelivery(proposal);
+  const selectableCreatedOnPage = pagedCreatedProposals.filter(canMessageProposal);
+  // Only ids of actionable rows are ever selected; the rows are loaded (and
+  // re-checked) when the action runs.
+  const selectedPendingCount = tallyCompanyVerified ? selectedPendingIds.size : 0;
+  const selectedCreatedCount = selectedCreatedIds.size;
   const allPendingSelected =
     selectablePendingOnPage.length > 0 && selectablePendingOnPage.every((proposal) => selectedPendingIds.has(proposal.id));
   const allCreatedSelected =
     selectableCreatedOnPage.length > 0 && selectableCreatedOnPage.every((proposal) => selectedCreatedIds.has(proposal.id));
-  const pendingRecoverableTotal = sumRecoverable(pendingProposals);
-  const createdRecoverableTotal = sumRecoverable(createdProposals);
+  const pendingRecoverableTotal = summary?.pending.recoverable ?? 0;
+  const createdRecoverableTotal = summary?.created.recoverable ?? 0;
   const companyReady = tallyCompanyVerified;
   const whatsappDialogMissingCount = whatsappDialogProposals.filter((proposal) => !proposal.partyPhone).length;
   const allPhonesValid = whatsappDialogProposals.every((proposal) => {
@@ -1588,12 +1552,19 @@ export function CollectionsDashboardPage({
   }
 
   currentBulkScope.current=`${selectedConnectionId}|${selectedCompany?.companyName}|${selectedCompany?.financialYear}|${accessCacheEpoch()}`;
-  function approveSelectedProposals() {
+  async function approveSelectedProposals() {
     if(bulkRunning.current||activeScanRef.current){setMessage({tone:'error',text:'Wait for the current operation to finish.'});return;}
     if(!tallyCompanyVerified||!allowed('discounts.post')){setMessage({tone:'error',text:'Verify the selected Tally company and posting access first.'});return;}
-    if(!selectedPendingProposals.length)return;
+    if(!selectedPendingIds.size||!dashboard)return;
+    let rows:DebitNoteProposal[];
+    try{rows=await fetchCollectionsRows<DebitNoteProposal>(dashboard,'pending',[...selectedPendingIds],collectionsRemote);}
+    catch(error){setMessage({tone:'error',text:error instanceof Error?error.message:'Could not load the selected debit notes.'});return;}
+    // Re-checked against the current results: a row may have changed since it was ticked.
+    const creatable=rows.filter(proposal=>canCreateDebitNoteInTally(proposal as never));
+    if(!creatable.length){setMessage({tone:'info',text:'The selected debit notes can no longer be created. Refresh to see their current status.'});return;}
     bulkScope.current=currentBulkScope.current;
-    setBulkReview([...selectedPendingProposals]);setBulkPhase('review');setBulkAcknowledged(false);setBulkStates({});setBulkProgress({});setBulkResultMessage('');
+    setBulkMessageable([]);
+    setBulkReview(creatable);setBulkPhase('review');setBulkAcknowledged(false);setBulkStates({});setBulkProgress({});setBulkResultMessage('');
   }
   async function postReviewedBulk() {
     if(bulkRunning.current||!bulkAcknowledged||!bulkReview?.length)return;
@@ -1604,6 +1575,7 @@ export function CollectionsDashboardPage({
     bulkRunning.current=true;setBulkCreating(true);setBulkPhase('posting');setBulkProgress({});setBulkResultMessage('');
     setBulkStates(Object.fromEntries(batch.map(p=>[p.id,{status:'waiting' as const}])));
     let confirmed=0,stopped=false;
+    const confirmedIds=new Set<string>();
     try {
       const result=await runDebitNoteBatch(batch,{
         canContinue:()=>bulkScope.current===currentBulkScope.current,
@@ -1613,6 +1585,7 @@ export function CollectionsDashboardPage({
           await createDebitNoteForProposal(proposal);
         },
         confirmed:proposal=>{
+          confirmedIds.add(proposal.id);
           setBulkStates(current=>({...current,[proposal.id]:{status:'created'}}));
           setSelectedPendingIds(current=>{const next=new Set(current);next.delete(proposal.id);return next;});
         },
@@ -1624,7 +1597,15 @@ export function CollectionsDashboardPage({
       confirmed=result.confirmed;stopped=result.stopped;
       if(result.scopeChanged)setBulkResultMessage('Company or access changed. Remaining notes were not attempted.');
       if(bulkScope.current===currentBulkScope.current&&selectedConnectionId){
-        try{await refreshCreatedDebitNotesFromStore(selectedConnectionId);}
+        try{
+          const refreshed=await refreshCreatedDebitNotesFromStore(selectedConnectionId);
+          // The debit notes just created (new ids), found by their invoices.
+          const confirmedKeys=batch.filter(p=>confirmedIds.has(p.id)).map(p=>proposalListInvoiceKey(p as never));
+          if(refreshed&&confirmedKeys.length){
+            const created=await fetchCollectionsRowsByInvoice<DebitNoteProposal>(refreshed,'created',confirmedKeys,collectionsRemote);
+            setBulkMessageable(created.filter(p=>isCreatedDebitNote(p)&&canMessageProposal(p)));
+          }
+        }
         catch{setBulkResultMessage(current=>[current,'Created history could not be refreshed. Do not recreate confirmed notes. Refresh Created before sending WhatsApp.'].filter(Boolean).join(' '));}
       }
       if(!stopped)setBulkResultMessage(current=>current||`All ${confirmed} debit notes were confirmed created in Tally.`);
@@ -1634,13 +1615,16 @@ export function CollectionsDashboardPage({
   }
 
   async function sendSelectedWhatsappMessages() {
-    if (selectedCreatedProposals.length === 0) return;
-    await openWhatsappDialog(selectedCreatedProposals);
+    if (selectedCreatedIds.size === 0 || !dashboard) return;
+    let rows: DebitNoteProposal[];
+    try { rows = await fetchCollectionsRows<DebitNoteProposal>(dashboard, 'created', [...selectedCreatedIds], collectionsRemote); }
+    catch (error) { setMessage({ tone: 'error', text: error instanceof Error ? error.message : 'Could not load the selected debit notes.' }); return; }
+    const messageable = rows.filter(canMessageProposal);
+    if (messageable.length === 0) return;
+    await openWhatsappDialog(messageable);
   }
 
   const bulkConfirmed=(bulkReview||[]).filter(p=>bulkStates[p.id]?.status==='created');
-  const bulkConfirmedKeys=new Set(bulkConfirmed.map(proposalInvoiceKey));
-  const bulkMessageable=createdProposals.filter(p=>bulkConfirmedKeys.has(proposalInvoiceKey(p))&&isCreatedDebitNote(p)&&(p.communicationStatus!=='sent'||needsUpdatedPdfDelivery(p)));
   const bulkAmount=sumRecoverable(bulkReview||[]);
 
   return (
@@ -1881,13 +1865,13 @@ export function CollectionsDashboardPage({
 
       {!companyContextLocked && !scanFailed && showWorkflowSummary ? <>
         <section aria-label="Cash Discount totals" className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
-          <SummaryCard count={pendingProposals.length} label="Pending invoices" />
+          <SummaryCard count={pendingCount} label="Pending invoices" />
           <SummaryCard count={formatMoney(pendingRecoverableTotal)} label="Potential recovery" />
-          <SummaryCard count={createdProposals.length} label="Debit notes created" />
+          <SummaryCard count={createdCount} label="Debit notes created" />
           <SummaryCard count={formatMoney(createdRecoverableTotal)} label="Amount posted" />
         </section>
         <div aria-label="Debit note views" className="mb-4 flex gap-5 border-b border-[#e0d8cc]">
-          {([{value:'needsAction',label:'Pending',count:pendingProposals.length},{value:'done',label:'Created',count:createdProposals.length}] as const).map(tab => (
+          {([{value:'needsAction',label:'Pending',count:pendingCount},{value:'done',label:'Created',count:createdCount}] as const).map(tab => (
             <button key={tab.value} type="button" aria-pressed={activeView===tab.value}
               onClick={() => chooseView(tab.value)}
               className={`inline-flex items-center gap-2 border-b-2 px-1 pb-3 text-sm font-medium focus-visible:outline focus-visible:outline-2 ${activeView===tab.value ? 'border-[#2d2d2d] text-[#1a1a1a]' : 'border-transparent text-[#8a7f72] hover:text-[#3d3530]'}`}>
@@ -1901,7 +1885,7 @@ export function CollectionsDashboardPage({
 
       {!companyContextLocked && !scanFailed && activeView === "needsAction" ? (
         <section className={styles.results} aria-label="Debit notes to create">
-          {pendingProposals.length > 0 ? (
+          {pendingCount > 0 ? (
             <ListControls
               filter={pendingFilter}
               filterLabel="Filter debit notes to create"
@@ -1922,7 +1906,7 @@ export function CollectionsDashboardPage({
                 { value: "invoice_oldest", label: "Oldest invoice" },
                 { value: "customer", label: "Customer name" },
               ]}
-              action={allowed('discounts.post') && selectedPendingProposals.length > 0 ? (
+              action={allowed('discounts.post') && selectedPendingCount > 0 ? (
                 <button
                   className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[#2d2d2d] px-4 text-xs font-medium text-white shadow-sm transition-all hover:bg-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
                   disabled={bulkCreating}
@@ -1930,16 +1914,16 @@ export function CollectionsDashboardPage({
                   type="button"
                 >
                   {bulkCreating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
-                  Create {selectedPendingProposals.length} debit note{selectedPendingProposals.length === 1 ? "" : "s"}
+                  Create {selectedPendingCount} debit note{selectedPendingCount === 1 ? "" : "s"}
                 </button>
               ) : null}
             />
           ) : null}
-          {pendingProposals.length === 0 ? (
+          {pendingCount === 0 ? (
             <EmptyState>
               Nothing needs action right now.
             </EmptyState>
-          ) : visiblePendingProposals.length === 0 ? (
+          ) : pendingList.page?.total === 0 ? (
             <EmptyState>No debit notes match these filters.</EmptyState>
           ) : (
             <div className={styles.flatTable}>
@@ -1986,14 +1970,14 @@ export function CollectionsDashboardPage({
                 onPageSizeChange={changePageSize}
                 page={safePendingPage}
                 pageSize={pageSize}
-                total={visiblePendingProposals.length}
+                total={pendingTotal}
               />
             </div>
           )}
         </section>
       ) : null}
 
-      {!companyContextLocked && activeView==='followUps'?<div className="flex shrink-0 flex-wrap items-center justify-between gap-x-5 border-b border-[#ded8d0]"><nav aria-label="Payment follow-up views" className="flex min-w-0 gap-5 overflow-x-auto text-sm">{([['due','Reminders due'],['outstanding','Unpaid invoices'],['pipelines','Reminder tracking']] as const).map(([key,label])=><button key={key} type="button" aria-current={reminderTab===key?'page':undefined} className={`whitespace-nowrap border-b-2 px-1 py-3 ${reminderTab===key?'border-[#2d2d2d] font-medium text-[#1a1a1a]':'border-transparent text-[#82776a]'}`} onClick={()=>{setReminderTab(key);setReminderInvoice(null);setFocusedReminder('');setSelectedFollowUpIds(new Set());}}>{label}{key==='due'&&remindersDue!==null&&remindersDue>0?<span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900">{remindersDue}</span>:null}</button>)}</nav><div className="ml-auto flex items-center gap-2 py-1.5">          {reminderTab==='outstanding'&&!reminderInvoice&&paymentFollowUps.length > 0 ? (
+      {!companyContextLocked && activeView==='followUps'?<div className="flex shrink-0 flex-wrap items-center justify-between gap-x-5 border-b border-[#ded8d0]"><nav aria-label="Payment follow-up views" className="flex min-w-0 gap-5 overflow-x-auto text-sm">{([['due','Reminders due'],['outstanding','Unpaid invoices'],['pipelines','Reminder tracking']] as const).map(([key,label])=><button key={key} type="button" aria-current={reminderTab===key?'page':undefined} className={`whitespace-nowrap border-b-2 px-1 py-3 ${reminderTab===key?'border-[#2d2d2d] font-medium text-[#1a1a1a]':'border-transparent text-[#82776a]'}`} onClick={()=>{setReminderTab(key);setReminderInvoice(null);setFocusedReminder('');setSelectedFollowUpIds(new Set());}}>{label}{key==='due'&&remindersDue!==null&&remindersDue>0?<span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900">{remindersDue}</span>:null}</button>)}</nav><div className="ml-auto flex items-center gap-2 py-1.5">          {reminderTab==='outstanding'&&!reminderInvoice&&followUpKpis.total > 0 ? (
             <div className="flex flex-wrap justify-end gap-2">{selectedFollowUpIds.size?<><span className="self-center text-xs font-semibold text-[#51483f]">{selectedFollowUpIds.size} selected</span><button className={styles.messageAction} onClick={()=>openFollowUpBulk('enroll')}>Start reminders</button><button className={styles.messageAction} onClick={()=>openFollowUpBulk('send_once')}>Send once</button><button className={styles.messageAction} onClick={exportSelectedFollowUps}>CSV</button><button className={styles.messageAction} onClick={()=>setSelectedFollowUpIds(new Set())}>Clear</button></>:null}
             <label className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
               Sort
@@ -2016,7 +2000,7 @@ export function CollectionsDashboardPage({
       {!companyContextLocked && activeView === 'followUps' && selectedCompany && (reminderTab!=='outstanding'||reminderInvoice) ? <FollowUpPipelines key={`${selectedConnectionId}|${selectedCompany.id}|${reminderTab}`} toolbarTarget={reminderToolbar} focusId={focusedReminder} view={reminderTab==='due'?'due':'pipelines'} connectionId={selectedConnectionId} companyName={selectedCompany.companyName} companyGuid={selectedCompany.companyGuid} financialYear={selectedCompany.financialYear || ''} companyId={selectedCompany.accessCompanyId || undefined} invoice={reminderInvoice} onDueCount={setRemindersDue} onClearInvoice={()=>setReminderInvoice(null)} /> : null}
       {!companyContextLocked && !scanFailed && activeView === "followUps" && reminderTab==='outstanding' && !reminderInvoice ? (
         <section className={styles.results} aria-label="Payment follow-ups">
-          {paymentFollowUps.length === 0 ? (
+          {followUpKpis.total === 0 ? (
             <EmptyState>There are no payments to follow up from the latest Tally scan.</EmptyState>
           ) : (
             <div className={styles.flatTable}>
@@ -2057,7 +2041,7 @@ export function CollectionsDashboardPage({
                 onPageSizeChange={changePageSize}
                 page={safeFollowUpsPage}
                 pageSize={pageSize}
-                total={sortedPaymentFollowUps.length}
+                total={followUpsTotal}
               />
             </div>
           )}
@@ -2066,7 +2050,7 @@ export function CollectionsDashboardPage({
 
       {!companyContextLocked && !scanFailed && activeView === "done" ? (
         <section className={styles.results} aria-label="Created debit notes">
-          {allowed('discounts.export') && selectedCreatedProposals.length > 0 ? (
+          {allowed('discounts.export') && selectedCreatedCount > 0 ? (
             <div className="mb-2 flex justify-end">
               <button
                 className="inline-flex h-9 items-center justify-center gap-1.5 rounded-xl border border-[#e5ddd0] bg-white px-4 text-xs font-medium text-[#5a5046] shadow-sm transition-all hover:bg-[#faf8f4] hover:text-[#1a1a1a] disabled:cursor-not-allowed disabled:opacity-50"
@@ -2075,11 +2059,11 @@ export function CollectionsDashboardPage({
                 type="button"
               >
                 {bulkSendingWhatsapp ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <MessageCircle className="h-3.5 w-3.5" />}
-                Send WhatsApp ({selectedCreatedProposals.length})
+                Send WhatsApp ({selectedCreatedCount})
               </button>
             </div>
           ) : null}
-          {createdProposals.length > 0 ? (
+          {createdCount > 0 ? (
             <ListControls
               filter={createdFilter}
               filterLabel="Filter created debit notes"
@@ -2102,9 +2086,9 @@ export function CollectionsDashboardPage({
               ]}
             />
           ) : null}
-          {createdProposals.length === 0 ? (
+          {createdCount === 0 ? (
             <EmptyState>No debit notes created yet.</EmptyState>
-          ) : visibleCreatedProposals.length === 0 ? (
+          ) : createdList.page?.total === 0 ? (
             <EmptyState>No created debit notes match these filters.</EmptyState>
           ) : (
             <div className={styles.flatTable}>
@@ -2165,7 +2149,7 @@ export function CollectionsDashboardPage({
                 onPageSizeChange={changePageSize}
                 page={safeCreatedPage}
                 pageSize={pageSize}
-                total={visibleCreatedProposals.length}
+                total={createdTotal}
               />
             </div>
           )}

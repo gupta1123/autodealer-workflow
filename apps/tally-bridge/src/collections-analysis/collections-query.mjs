@@ -167,6 +167,19 @@ export function collectionRowsById(dashboard, view, ids) {
     const source = view === "followUps" ? followUps(dashboard) : proposals(dashboard);
     return source.filter((row) => wanted.has(text(row.id)));
 }
+/** Same key as the page's proposalInvoiceKey: customer and invoice number. */
+export function invoiceKey(row) {
+    const normalize = (value) => text(value).trim().toLowerCase().replace(/\s+/g, " ");
+    return `${normalize(row.partyLedgerName)}|${normalize(row.linkedInvoiceNumber)}`;
+}
+/** Full rows for given invoices (e.g. the debit notes just created for them). */
+export function collectionRowsByInvoice(dashboard, view, keys) {
+    const wanted = new Set(keys.slice(0, MAX_ROWS_BY_ID).map(text));
+    const source = view === "followUps" ? followUps(dashboard)
+        : view === "created" ? proposals(dashboard).filter(isCreatedDebitNote)
+            : proposals(dashboard).filter(isPendingDebitNote);
+    return source.filter((row) => wanted.has(invoiceKey(row)));
+}
 /** KPIs and counts for tabs and filters, without any rows. */
 export function summarizeCollections(dashboard) {
     const followUpList = followUps(dashboard);

@@ -17,7 +17,7 @@ import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallySc
 import { createLocalAgentRuntime } from "./agent/runtime.mjs";
 import { openBillAmountIndexFromFields, openBillFromFields, openBillsByLedgerFromFields } from "./agent/receivable-fields.mjs";
 import { buildLiveCashDiscountDashboard } from "./collections-analysis/cash-discount-live-dashboard.mjs";
-import { collectionRowsById, dashboardShell, queryCollections } from "./collections-analysis/collections-query.mjs";
+import { collectionRowsById, collectionRowsByInvoice, dashboardShell, queryCollections } from "./collections-analysis/collections-query.mjs";
 import { powershellProtectedData } from "./agent/key-vault.mjs";
 import { workflowCacheState } from './agent/workflow-cache-policy.mjs';
 import { startDetachedDocument } from "./agent/detached-document.mjs";
@@ -5867,7 +5867,10 @@ function answerCollectionsRequest(config, operation, message) {
   if (operation === "collections_query") return queryCollections(held.dashboard, message.payload?.query || {});
   const view = String(message.payload?.view || "");
   if (!["followUps", "pending", "created"].includes(view)) throw new Error("Unknown collections list.");
-  return { view, rows: collectionRowsById(held.dashboard, view, Array.isArray(message.payload?.ids) ? message.payload.ids : []) };
+  const rows = Array.isArray(message.payload?.invoiceKeys)
+    ? collectionRowsByInvoice(held.dashboard, view, message.payload.invoiceKeys)
+    : collectionRowsById(held.dashboard, view, Array.isArray(message.payload?.ids) ? message.payload.ids : []);
+  return { view, rows };
 }
 
 // The same per-customer result as collectCashDiscountCustomerEvidence, from
