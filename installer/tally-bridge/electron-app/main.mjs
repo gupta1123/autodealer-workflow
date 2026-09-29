@@ -1,13 +1,13 @@
-import { app, BrowserWindow, dialog, ipcMain, safeStorage } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, Tray } from "electron";
 import electronUpdater from "electron-updater";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import { pairBridge, createBridgeRunner, disconnectBridge } from "@autodealer/tally-bridge";
 import { consumeSuccessfulUpdate, isNewerVersion, recordDownloadedUpdate } from "./update-state.mjs";
-import { pruneLegacyRuntimeBackups } from "./backup-retention.mjs";
 
 // electron-updater publishes CommonJS. Importing autoUpdater as an ESM named
 // export works in some development environments but fails in the packaged
@@ -17,6 +17,9 @@ const { autoUpdater } = electronUpdater;
 const CONNECTOR_NAME = "Kalika Local Agent";
 const PROTOCOL_NAME = "kalika-tally";
 const APP_USER_MODEL_ID = "com.kalika.local-agent";
+const HIDDEN_LAUNCH_ARG = "--hidden";
+// The installer starts the agent with --quit to close a running copy cleanly.
+const QUIT_LAUNCH_ARG = "--quit";
 
 // The status window is plain HTML and does not benefit from GPU acceleration.
 // Some Windows graphics drivers leave Electron's renderer alive but entirely
@@ -135,6 +138,23 @@ function relaunchWithWindowsCertificateStore() {
       return false;
     }
 
+    // Child workers (document parsing, vector search) inherit this.
+    process.env.NODE_EXTRA_CA_CERTS = certificatePath;
+    // Newer Node runtimes can extend the trusted roots in-process, which
+    // avoids booting Electron a second time on every launch.
+    if (typeof tls.setDefaultCACertificates === "function") {
+      try {
+        const extra = fs.readFileSync(certificatePath, "utf8")
+          .match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g) || [];
+        tls.setDefaultCACertificates([...new Set([...tls.getCACertificates("default"), ...extra])]);
+        process.env[WINDOWS_CA_READY] = "1";
+        return false;
+      } catch (error) {
+        // Fall back to the relaunch path below.
+        appendLog(errPath, `In-process certificate load failed; relaunching: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+
     const child = spawn(process.execPath, process.argv.slice(1), {
       detached: true,
       windowsHide: false,
@@ -162,8 +182,28 @@ function relaunchWithWindowsCertificateStore() {
   }
 }
 
+// Keep at most two ~5 MB generations per log so a machine that runs the agent
+// for months does not accumulate unbounded log files.
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
+const logSizes = new Map();
+
 function appendLog(filePath, message) {
-  const line = `[${new Date().toISOString()}] ${message}\n`;
+  // An error object must show its message, never "[object Object]".
+  const text = typeof message === "string" ? message
+    : message instanceof Error ? (message.stack || message.message)
+    : message && typeof message === "object" ? (message.message || JSON.stringify(message))
+    : String(message);
+  const line = `[${new Date().toISOString()}] ${text}\n`;
+  if (!logSizes.has(filePath)) {
+    try { logSizes.set(filePath, fs.statSync(filePath).size); } catch { logSizes.set(filePath, 0); }
+  }
+  const size = logSizes.get(filePath) + Buffer.byteLength(line);
+  if (size > MAX_LOG_BYTES) {
+    try { fs.renameSync(filePath, `${filePath}.1`); } catch {}
+    logSizes.set(filePath, Buffer.byteLength(line));
+  } else {
+    logSizes.set(filePath, size);
+  }
   fs.appendFile(filePath, line, () => {});
 }
 
@@ -221,6 +261,61 @@ function configureUpdateFeed() {
   }
 }
 
+const UPDATE_CHECK_DELAY_MS = 2 * 60_000;
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60_000;
+
+async function checkForUpdatesNow() {
+  // Never restart a check while a download is in flight or an update is
+  // already waiting to be installed.
+  if (["checking", "available", "downloading", "ready", "waiting", "installing"].includes(updateState.state)) {
+    return updateState;
+  }
+  configureUpdateFeed();
+  sendUpdateStatus({ state: "checking", message: "Checking for a newer Local Agent…" });
+  try {
+    await autoUpdater.checkForUpdates();
+  } catch (error) {
+    // Never show raw updater/HTTP errors in the window.
+    reportUpdateError(error);
+  }
+  return updateState;
+}
+
+// Turns updater failures into a short message for the user; the technical
+// detail goes to the error log as a single line.
+function reportUpdateError(error) {
+  const detail = String(error instanceof Error ? error.message : error || "");
+  appendLog(errPath, `Updater: ${detail.split("\n")[0].slice(0, 300)}`);
+  const version = app.getVersion();
+  if (/latest\.yml|no published versions|HttpError: 404|\b404\b/i.test(detail)) {
+    sendUpdateStatus({ state: "current", availableVersion: null, percent: 0,
+      message: `No update is available right now. You're on version ${version}.` });
+  } else if (/ENOTFOUND|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ERR_INTERNET_DISCONNECTED|ERR_NAME_NOT_RESOLVED|network|socket hang up/i.test(detail)) {
+    sendUpdateStatus({ state: "failed", message: "Couldn't reach the update server. Check the internet connection and try again." });
+  } else {
+    sendUpdateStatus({ state: "failed", message: "Couldn't check for updates right now. Please try again later." });
+  }
+}
+
+let tray = null;
+
+async function createTray() {
+  if (tray) return;
+  try {
+    const icon = await app.getFileIcon(process.execPath, { size: "small" });
+    tray = new Tray(icon);
+    tray.setToolTip(CONNECTOR_NAME);
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: `Open ${CONNECTOR_NAME}`, click: () => showWindow() },
+      { type: "separator" },
+      { label: "Quit", click: () => app.quit() },
+    ]));
+    tray.on("click", () => showWindow());
+  } catch (error) {
+    appendLog(errPath, `Tray icon unavailable: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
 function installDownloadedUpdateWhenSafe() {
   if (!runner?.busy) {
     if (updateInstallTimer) clearInterval(updateInstallTimer);
@@ -244,7 +339,13 @@ function installDownloadedUpdateWhenSafe() {
 }
 
 function showWindow() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
+  // The status window is created on demand and destroyed when closed, so an
+  // idle agent keeps no renderer process in memory.
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
 }
@@ -300,8 +401,10 @@ async function renderTallyPrintToPdf({ html, fileName }) {
 }
 
 async function startRunner() {
+  // Wait for the previous runner to release its database, vector index and
+  // loopback upload port before a new runner opens them again.
   if (runner && !runner.stopped) {
-    runner.stop("restarting");
+    await runner.stop("restarting");
   }
 
   runner = createBridgeRunner({
@@ -313,7 +416,9 @@ async function startRunner() {
     onLog(entry) {
       appendLog(entry.level === "error" ? errPath : logPath, entry.message);
       if (entry.level === "error") {
-        const expired = /invalid bridge token|401|403/i.test(entry.message);
+        // Revoked sessions are reported through onStop; only an explicit
+        // token rejection is treated as expiry here.
+        const expired = /invalid bridge token/i.test(entry.message);
         sendStatus({
           title: expired ? "Reconnect required" : "Connector warning",
           detail: expired ? "Open Kalika and click Connect again." : entry.message,
@@ -321,7 +426,10 @@ async function startRunner() {
         });
         return;
       }
-      sendStatus({ title: "Connector running", detail: entry.message, state: "running" });
+      // Routine info logs must not replace the "Connected to <company>" status.
+      if (lastStatus.state !== "connected") {
+        sendStatus({ title: "Connector running", detail: entry.message, state: "running" });
+      }
     },
     onStatus(cycle) {
       const result = cycle?.result || {};
@@ -332,32 +440,78 @@ async function startRunner() {
       }
     },
     onStop(event) {
+      if (event.reason === "revoked") {
+        sendStatus({ title: "Reconnect required", detail: "Open Kalika and click Connect again.", state: "expired" });
+        return;
+      }
+      if (event.reason === "update required") {
+        sendStatus({ title: "Update required", detail: "Open Connector updates from the ⋮ menu to install the latest version.", state: "expired" });
+        return;
+      }
+      if (event.reason === "restarting") return;
       sendStatus({ title: "Connector stopped", detail: event.reason || "Stopped", state: "stopped" });
     },
   });
 
   await runner.start();
-  archiveVerifiedLegacyRuntime();
+  await applyStartWithWindowsSetting();
+  removeVerifiedLegacyRuntime();
 }
 
-function archiveVerifiedLegacyRuntime() {
+async function applyStartWithWindowsSetting() {
+  try {
+    const settings = await runner?.getAgentSettings?.();
+    app.setLoginItemSettings({ openAtLogin: settings?.startWithWindows !== false, openAsHidden: true, args: [HIDDEN_LAUNCH_ARG] });
+  } catch (error) {
+    appendLog(errPath, `Start with Windows setting: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+// Once this install has started and is paired, the pre-1.0 connector program
+// in C:\Autodealer\tally-bridge is no longer needed. Delete it rather than
+// archiving a ~260 MB copy on the client's disk. Its data was already migrated
+// into %LOCALAPPDATA%\Kalika\LocalAgent, which is kept.
+function removeVerifiedLegacyRuntime() {
   if (process.platform !== "win32" || !app.isPackaged) return;
   const legacy = path.resolve("C:\\Autodealer\\tally-bridge");
   const current = path.resolve(process.resourcesPath, "..");
-  const migratedConfig = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Kalika", "LocalAgent", "config", "config.json");
+  const migratedConfig = path.join(localAgentRoot, "config", "config.json");
   const legacyMarker = path.join(legacy, "resources", "app", "package.json");
-  if (current.startsWith(legacy) || !fs.existsSync(migratedConfig)) return;
+  if (current.startsWith(legacy) || !fs.existsSync(migratedConfig) || !fs.existsSync(legacyMarker)) return;
   try {
-    const backupRoot = path.join(path.dirname(path.dirname(migratedConfig)), "migration-backups");
-    fs.mkdirSync(backupRoot, { recursive: true });
-    if (fs.existsSync(legacyMarker)) {
-      const target = path.join(backupRoot, `legacy-runtime-${Date.now()}`);
-      fs.renameSync(legacy, target);
+    // Keep documents\: older builds saved purchase PDFs there and Tally
+    // vouchers link to them by absolute path. Remove only the old program.
+    for (const entry of fs.readdirSync(legacy)) {
+      if (entry.toLowerCase() === "documents") continue;
+      fs.rmSync(path.join(legacy, entry), { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
     }
-    pruneLegacyRuntimeBackups(backupRoot, 1);
   } catch (error) {
     appendLog(errPath, `Legacy runtime cleanup deferred: ${error instanceof Error ? error.message : error}`);
   }
+}
+
+// Removes storage left behind by earlier connector versions. Only rebuildable
+// or obsolete items are touched; config, security, data and vectors are the
+// client's live state and are never removed here.
+function cleanUpObsoleteLocalStorage() {
+  const remove = (target) => {
+    try { fs.rmSync(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 }); }
+    catch (error) { appendLog(errPath, `Storage cleanup deferred for ${path.basename(target)}: ${error instanceof Error ? error.message : error}`); }
+  };
+  // Archived old programs, manual backups and plain-text legacy configs.
+  remove(path.join(localAgentRoot, "migration-backups"));
+  // Leftover files from interrupted document parsing.
+  const temporary = path.join(localAgentRoot, "tmp");
+  try {
+    for (const entry of fs.readdirSync(temporary)) remove(path.join(temporary, entry));
+  } catch {}
+  // Rotated logs written before log size limits existed can be hundreds of MB.
+  try {
+    for (const entry of fs.readdirSync(runtimeLogDir)) {
+      const filePath = path.join(runtimeLogDir, entry);
+      if (/\.log\.\d+$/.test(entry) && fs.statSync(filePath).size > MAX_LOG_BYTES) remove(filePath);
+    }
+  } catch {}
 }
 
 async function handleConnectUrl(value) {
@@ -389,14 +543,13 @@ async function handleConnectUrl(value) {
     appendLog(errPath, message);
     sendStatus({ title: "Connection failed", detail: message, state: "error" });
     showWindow();
-    dialog.showErrorBox("Kalika Tally Connector", message);
   }
 }
 
 async function handleDisconnectUrl(value) {
   try {
     const url = new URL(value);
-    if (runner && !runner.stopped) runner.stop("disconnect");
+    if (runner && !runner.stopped) await runner.stop("disconnect");
     await disconnectBridge({ "connection-id": url.searchParams.get("connectionId") || "" });
     sendStatus({ title: "Disconnected", detail: "Connector stopped.", state: "stopped" });
   } catch (error) {
@@ -480,12 +633,12 @@ function createWindow() {
         <div class="windowShell">
           <header id="titleBar" class="titleBar"><div class="titleBrand"><span class="titleMark">K</span><span>Kalika Local Agent</span></div><div class="windowControls"><button id="minimizeBtn" class="windowControl">−</button><button id="maximizeBtn" class="windowControl">□</button><button id="closeBtn" class="windowControl close">×</button></div></header>
           <main id="appContent">
-            <div class="globalbar"><div class="health"><strong id="homeCompany">Tally not connected</strong><span id="homeConnectionBadge" class="connectionBadge warning"></span></div><div class="moreWrap"><button id="menu-button" class="moreButton">⋮</button><div id="menu" class="menu"><button id="menuLocalMatching">Ledger matching</button><button id="menuReconcile">Check deleted ledgers</button><button id="updates">Connector updates</button></div></div></div>
-            <section id="homeView" class="homeView"><div id="homeTask" class="homeTask" hidden><div><b id="homeTaskText">Working…</b><span id="homeTaskPercent">0%</span></div><div class="homeProgress"><i></i></div></div><h1 id="homeTitle">Finish ledger setup</h1><p id="homeCopy">Prepare the company once. The connector keeps both parts up to date after that.</p><div class="homeStatusGrid"><button id="homeLedgerCard" class="homeStatusCard"><div id="homeLedgerIcon" class="homeStatusIcon">▦</div><b>Ledger data</b><span id="homeLedgerState">Not available</span></button><button id="homeVectorCard" class="homeStatusCard"><div id="homeVectorIcon" class="homeStatusIcon">◇</div><b>Match preparation</b><span id="homeVectorState">Not available</span></button></div><button id="connectionCheckBtn" class="homeAction connectionAction" hidden>Recheck connection</button><button id="homeSetupBtn" class="homeAction">Set up ledger matching</button></section>
+            <div class="globalbar"><div class="health"><strong id="homeCompany">Tally not connected</strong><span id="homeConnectionBadge" class="connectionBadge warning"></span></div><div class="moreWrap"><button id="menu-button" class="moreButton">⋮</button><div id="menu" class="menu"><button id="menuLocalMatching">Ledger matching</button><button id="menuCustomerDues">Customer dues</button><button id="updates">Connector updates</button><button id="menuDiagnostics">Send diagnostics to support</button><div class="menuLabel">Advanced</div><button id="menuReset" class="menuDanger">Factory reset…</button></div></div></div>
+            <section id="homeView" class="homeView"><div id="homeTask" class="homeTask" hidden><div><b id="homeTaskText">Working…</b><span id="homeTaskPercent">0%</span></div><div class="homeProgress"><i></i></div></div><h1 id="homeTitle">Finish ledger setup</h1><p id="homeCopy">Prepare the company once. The connector keeps both parts up to date after that.</p><div class="homeStatusGrid"><button id="homeLedgerCard" class="homeStatusCard"><div id="homeLedgerIcon" class="homeStatusIcon">▦</div><b>Ledger data</b><span id="homeLedgerState">Not available</span></button><button id="homeVectorCard" class="homeStatusCard"><div id="homeVectorIcon" class="homeStatusIcon">◇</div><b>Smart matching</b><span id="homeVectorState">Not available</span></button><button id="homeDuesCard" class="homeStatusCard duesCard"><div id="homeDuesIcon" class="homeStatusIcon">₹</div><b>Customer dues</b><span id="homeDuesState">Not checked yet</span></button></div><button id="connectionCheckBtn" class="homeAction connectionAction" hidden>Recheck connection</button><button id="homeSetupBtn" class="homeAction">Set up ledger matching</button></section>
           </main>
-          <section id="localPanel" class="pagePanel"><div class="stickyHeader"><button id="backBtn" class="backButton">←</button><h1>Ledger matching</h1></div><div class="contextLine"><strong id="matchingCompany">Checking Tally…</strong><span>·</span><span><b id="matchingLedgerCount">—</b> ledgers</span></div><section id="ledgerStep" class="step"><div class="stepHeader"><span class="stepNumber">1</span><b>Ledgers</b></div><div class="stepRow"><div><div id="syncState">Ready</div><small id="lastSync">Not updated yet</small></div><button id="refresh-data" class="primary-action">Refresh</button></div></section><section id="vectorStep" class="step"><div class="stepHeader"><span class="stepNumber">2</span><b>Search index</b></div><div class="stepRow"><div><div id="vectorState">Waiting for ledgers</div><small id="lastVector">Not indexed yet</small></div><button id="rebuild-index" class="secondary-action">Update index</button></div></section><div id="matchingReady" class="steadyHero" hidden><div class="steadyIcon">✓</div><div><div><b id="steadyTitle">Ledgers matched</b> <span id="freshnessPill">Up to date</span></div><small id="steadySubtitle">Synced today</small></div></div><div id="data-toast" class="data-toast"></div></section>
-          <section id="updatesPanel" class="pagePanel"><div class="stickyHeader"><button id="updatesBackBtn" class="backButton">←</button><h1>Connector updates</h1></div><p class="updateContext">Keep the connector secure and reliable</p><div class="updateHero"><div class="updateTile">✓</div><div><p id="updateVersion">Current version</p><h2 id="updateTitle">You're up to date</h2><p id="update-message">Last checked a few minutes ago.</p></div></div><button id="checkUpdatesBtn" class="updateAction">Check for updates</button><section id="update-card" class="update"><button id="install-update">Restart &amp; update</button></section></section>
-          <div class="legacyControls" hidden><div id="card"><span id="title"></span><span id="detail"></span></div><span id="version"></span><span id="metrics"></span><span id="company"></span><span id="company-state"></span><span id="ledger-detail"></span><span id="freshness"></span><span id="toast"></span><input id="anydoc" type="checkbox"><input id="zvec" type="checkbox"><input id="startup" type="checkbox"><button id="clear"></button><button id="diagnostics"></button><button id="reset"></button></div>
+          <section id="localPanel" class="pagePanel"><div class="stickyHeader"><button id="backBtn" class="backButton">←</button><h1>Ledger matching</h1></div><div class="contextLine"><strong id="matchingCompany">Checking Tally…</strong><span>·</span><span id="matchingLedgerCount" hidden></span></div><section id="ledgerStep" class="step"><div class="stepHeader"><span class="stepNumber">1</span><b>Ledgers</b></div><div class="stepRow"><div><div id="syncState">Ready</div><small id="lastSync">Not updated yet</small></div><button id="refresh-data" class="primary-action">Refresh</button></div></section><section id="vectorStep" class="step"><div class="stepHeader"><span class="stepNumber">2</span><b>Smart matching</b></div><div class="stepRow"><div><div id="vectorState">Waiting for ledgers</div><small id="lastVector">Not prepared yet</small></div><button id="rebuild-index" class="secondary-action">Prepare</button></div></section><div id="matchingReady" class="steadyHero" hidden><div class="steadyIcon">✓</div><div><div><b id="steadyTitle">Ledgers matched</b> <span id="freshnessPill">Up to date</span></div><small id="steadySubtitle">Synced today</small></div></div><div id="data-toast" class="data-toast"></div></section>
+          <section id="duesPanel" class="pagePanel"><div class="stickyHeader"><button id="duesBackBtn" class="backButton">←</button><h1>Customer dues</h1></div><p class="updateContext">For Payment Follow-ups and Cash Discounts</p><div class="updateHero"><div id="duesTile" class="updateTile">₹</div><div><p id="duesCompany">Checking Tally…</p><h2 id="duesTitle">Get customer dues ready</h2><p id="duesDetail">Makes Payment Follow-ups and Cash Discounts open instantly. The first check takes a few minutes.</p></div></div><div id="duesProgress" class="updateProgress"><i id="duesProgressBar"></i></div><p id="duesStep" class="duesStep"></p><button id="duesCheckBtn" class="updateAction">Check customer dues</button><p class="duesNote">After the first check, Kalika follows changes in Tally automatically. Tally stays usable while this runs.</p><button id="duesFullBtn" class="duesFullLink" hidden>Check everything again</button></section><section id="updatesPanel" class="pagePanel"><div class="stickyHeader"><button id="updatesBackBtn" class="backButton">←</button><h1>Connector updates</h1></div><p class="updateContext">Keep the connector secure and reliable</p><div class="updateHero"><div class="updateTile">✓</div><div><p id="updateVersion">Current version</p><h2 id="updateTitle">You're up to date</h2><p id="update-message">Last checked a few minutes ago.</p></div></div><button id="checkUpdatesBtn" class="updateAction">Check for updates</button><section id="update-card" class="update"><button id="install-update">Restart &amp; update</button></section></section>
+          <div class="legacyControls" hidden><div id="card"><span id="title"></span><span id="detail"></span></div><span id="version"></span><span id="metrics"></span><span id="company"></span><span id="company-state"></span><span id="ledger-detail"></span><span id="freshness"></span><span id="toast"></span></div>
         </div>\`;
       const visualStyles=document.createElement('style'); visualStyles.textContent=\`
         html,body{width:100%;height:100%;margin:0;overflow:hidden;background:transparent;color:#2d2d2d;font-family:"Segoe UI Variable Text","Segoe UI",sans-serif}
@@ -495,13 +648,12 @@ function createWindow() {
         .menu-wrap{position:relative;margin-left:auto}.icon-button{width:30px;height:30px;border:0;border-radius:8px;background:transparent;color:#2d2d2d;font-size:18px;cursor:pointer}.icon-button:hover{background:#e6ddd1}.menu{display:none;position:absolute;right:0;top:34px;z-index:30;width:220px;padding:6px;border:1px solid #ddd2c2;border-radius:12px;background:#fff;box-shadow:0 16px 36px rgba(45,45,45,.16)}.menu.open{display:block}.menu-title{padding:7px 9px 4px;color:#8b8171;font-size:10px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.setting{display:flex;align-items:center;justify-content:space-between;padding:7px 9px;border-radius:8px;font-size:12px}.setting:hover,.menu .action:hover{background:#fbf8f3}.divider{height:1px;margin:5px;background:#eee8df}.menu button.action{display:block;width:100%;padding:8px 9px;border:0;border-radius:8px;background:transparent;color:#2d2d2d;text-align:left;font-size:12px;cursor:pointer}.menu button.danger{color:#c1543b}
         .status{margin-top:8px;padding:12px 13px;border:1px solid #ddd2c2;border-radius:13px;background:#fff}.status-row{display:flex;align-items:flex-start;gap:10px}.state-dot{width:8px;height:8px;margin-top:5px;border-radius:50%;background:#8b8171;box-shadow:0 0 0 3px #e6ddd1}.status.connected{border-color:#b9dfca;background:linear-gradient(135deg,#fff 45%,#f1faf5)}.status.connected .state-dot{background:#4ca154;box-shadow:0 0 0 3px #e3f0e3}.status.error,.status.expired{border-color:#e5b7aa;background:#fff8f5}.status.error .state-dot,.status.expired .state-dot{background:#c1543b;box-shadow:0 0 0 3px #f0d8d2}.status.running .state-dot{background:#397ca8;box-shadow:0 0 0 3px #e2eff6}.status.warning .state-dot{background:#e3a64a;box-shadow:0 0 0 3px #fbeeda}.status-title{font-size:13px;font-weight:700}.status-detail{margin-top:2px;color:#595147;font-size:11.5px;line-height:1.35}.meta{display:flex;justify-content:space-between;gap:10px;margin-top:9px;padding-top:8px;border-top:1px solid #eee8df;color:#8b8171;font-size:10.5px}.meta strong{color:#595147}
         .data-panel{margin-top:8px!important;padding:11px 12px!important;border-color:#ddd2c2!important;border-radius:13px!important}.panel-head h2{font-size:13.5px!important}.eyebrow{color:#8b8171!important}.data-grid{margin-top:9px!important}.data-card{padding:8px!important;background:#fbf8f3!important}.actions{margin-top:9px!important}.actions button{min-height:30px!important}.primary-action{background:#2d2d2d!important}.freshness{background:#e3f0e3!important;color:#2e6b37!important}.data-toast{margin-top:6px!important;min-height:12px!important}
-        .update{display:none;margin-top:9px}.update.show{display:flex}.windowShell{position:absolute;inset:2px;border:1px solid rgba(45,45,45,.1);border-radius:16px;background:#f4f0e9;overflow:hidden}.titleBar{padding:0 8px 0 14px}.titleBrand{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:650}.titleMark{width:22px;height:22px;display:grid;place-items:center;border-radius:7px;background:linear-gradient(150deg,#f1c889,#d99b2b 45%,#4ca154);color:#fff;font-weight:800}.windowControls{display:flex;margin-left:auto;-webkit-app-region:no-drag}.windowControl{width:32px;height:28px;border:0;border-radius:7px;background:transparent;color:#595147}.windowControl:hover{background:#e6ddd1}.windowControl.close:hover{background:#f0d8d2;color:#c1543b}#appContent{height:calc(100% - 40px);overflow:auto;background:#f4f0e9}.globalbar{display:flex;align-items:center;min-height:42px;padding:8px 14px 5px}.health{display:flex;align-items:center;gap:7px;font-size:12.5px}.connectionBadge{width:8px;height:8px;border-radius:50%;background:#4ca154;box-shadow:0 0 0 3px #e3f0e3}.connectionBadge.warning{background:#e3a64a;box-shadow:0 0 0 3px #fbeeda}.connectionBadge.error{background:#c1543b;box-shadow:0 0 0 3px #f0d8d2}.moreWrap{position:relative;margin-left:auto}.moreButton{width:30px;height:30px;border:0;border-radius:8px;background:transparent;font-size:18px}.moreButton:hover{background:#e6ddd1}.menu{top:34px;width:180px}.menu button{display:block;width:100%;padding:8px 9px;border:0;border-radius:8px;background:transparent;text-align:left;font-size:13px}.menu button:hover{background:#fbf8f3}.homeView{padding:3px 14px 16px}.homeView h1{margin:0;font-size:16.5px}.homeView>p{margin:4px 0 13px;color:#8b8171;font-size:12.5px;line-height:1.45}.homeStatusGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}.homeStatusCard{padding:10px;border:1px solid #ddd2c2;border-radius:11px;background:#fff;text-align:left}.homeStatusIcon{width:28px;height:28px;display:grid;place-items:center;margin-bottom:8px;border-radius:8px;background:#e3f0e3;font-size:16px;font-weight:700}.homeStatusIcon.ready{background:linear-gradient(150deg,#f1c889,#d99b2b 45%,#4ca154);color:#fff}.homeStatusCard b,.homeStatusCard span{display:block}.homeStatusCard b{font-size:12.5px}.homeStatusCard span{margin-top:3px;color:#e3a64a;font-size:11px;font-weight:650}.homeStatusCard span.ready{color:#4ca154}.homeAction{width:100%;min-height:36px;padding:8px 14px;border:0;border-radius:10px;background:#2d2d2d;color:#fff;font-size:13px;font-weight:650}.connectionAction{margin-bottom:9px}.homeTask{margin-bottom:12px;padding:11px;border:1px solid #ddd2c2;border-radius:12px;background:#fbf8f3}.homeProgress{height:5px;margin-top:8px;border-radius:99px;background:#e6ddd1}.pagePanel{display:none;position:absolute;inset:42px 2px 2px;z-index:20;padding:0 14px 16px;overflow:auto;border-radius:0 0 16px 16px;background:#f4f0e9}.pagePanel.open{display:block}.stickyHeader{position:sticky;top:0;display:flex;align-items:center;gap:9px;padding:10px 0 6px;background:#f4f0e9}.stickyHeader h1{margin:0;font-size:16.5px}.backButton{width:30px;height:30px;border:0;border-radius:8px;background:transparent;font-size:17px}.backButton:hover{background:#e6ddd1}.contextLine{display:flex;gap:6px;margin:0 0 8px;padding-left:39px;color:#595147;font-size:12px}.step{margin-bottom:8px;padding:11px 13px;border:1px solid #ddd2c2;border-radius:13px;background:#fff}.stepHeader{display:flex;align-items:center;gap:8px;margin-bottom:7px}.stepNumber{width:21px;height:21px;display:grid;place-items:center;border-radius:7px;background:#eee8e3;font-size:11px;font-weight:750}.stepRow{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#595147;font-size:12px}.stepRow small{color:#8b8171}.primary-action,.secondary-action{min-height:30px;padding:6px 10px;border-radius:8px;font-size:12px;font-weight:650}.primary-action{border:1px solid #2d2d2d;background:#2d2d2d;color:#fff}.secondary-action{border:1px solid #ddd2c2;background:#fff;color:#2d2d2d}.steadyHero,.updateHero{display:flex;align-items:center;gap:12px;padding:13px;border:1px solid #ddd2c2;border-radius:12px;background:#fbf8f3}.steadyIcon,.updateTile{width:42px;height:42px;display:grid;place-items:center;flex:0 0 auto;border-radius:11px;background:linear-gradient(150deg,#f1c889,#d99b2b 45%,#4ca154);color:#fff;font-size:19px}.updateTile.checking,.updateTile.downloading{background:#2d2d2d}.updateTile.failed,.updateTile.unavailable{background:#c1543b}.steadyHero small,.updateHero p{color:#8b8171}.steadyHero span{padding:2px 8px;border-radius:999px;background:#e3f0e3;color:#2e6b37;font-size:10.5px}.updateContext{margin:0 0 11px;padding-left:39px;color:#8b8171;font-size:11.5px}.updateHero p,.updateHero h2{margin:2px 0}.updateHero h2{font-size:14.5px}.updateProgress{display:none;height:5px;margin-top:10px;border-radius:999px;background:#e6ddd1;overflow:hidden}.updateProgress.show{display:block}.updateProgress i{display:block;width:0;height:100%;border-radius:inherit;background:#4ca154;transition:width .2s ease}.updateAction{width:100%;min-height:34px;margin-top:11px;border:0;border-radius:9px;background:#2d2d2d;color:#fff;font-weight:650}.updateAction:disabled{opacity:.58;cursor:wait}.installAction{width:100%;min-height:34px;border:1px solid #2d2d2d;border-radius:9px;background:#fff;color:#2d2d2d;font-weight:650}.data-toast{font-size:11px;color:#7b5b2d}
+        .update{display:none;margin-top:9px}.update.show{display:flex}.windowShell{position:absolute;inset:2px;border:1px solid rgba(45,45,45,.1);border-radius:16px;background:#f4f0e9;overflow:hidden}.titleBar{padding:0 8px 0 14px}.titleBrand{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:650}.titleMark{width:22px;height:22px;display:grid;place-items:center;border-radius:7px;background:linear-gradient(150deg,#f1c889,#d99b2b 45%,#4ca154);color:#fff;font-weight:800}.windowControls{display:flex;margin-left:auto;-webkit-app-region:no-drag}.windowControl{width:32px;height:28px;border:0;border-radius:7px;background:transparent;color:#595147}.windowControl:hover{background:#e6ddd1}.windowControl.close:hover{background:#f0d8d2;color:#c1543b}#appContent{height:calc(100% - 40px);overflow:auto;background:#f4f0e9}.globalbar{display:flex;align-items:center;min-height:42px;padding:8px 14px 5px}.health{display:flex;align-items:center;gap:7px;font-size:12.5px}.connectionBadge{width:8px;height:8px;border-radius:50%;background:#4ca154;box-shadow:0 0 0 3px #e3f0e3}.connectionBadge.warning{background:#e3a64a;box-shadow:0 0 0 3px #fbeeda}.connectionBadge.error{background:#c1543b;box-shadow:0 0 0 3px #f0d8d2}.moreWrap{position:relative;margin-left:auto}.moreButton{width:30px;height:30px;border:0;border-radius:8px;background:transparent;font-size:18px}.moreButton:hover{background:#e6ddd1}.menu{top:34px;width:180px}.menu button{display:block;width:100%;padding:8px 9px;border:0;border-radius:8px;background:transparent;text-align:left;font-size:13px}.menu button:hover{background:#fbf8f3}.homeStatusCard b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.duesStep{min-height:16px;margin:8px 0 0;color:#595147;font-size:11.5px}.duesNote{margin:10px 2px 0;color:#8b8171;font-size:11px;line-height:1.45}.duesFullLink{margin:8px 2px 0;padding:0;border:0;background:none;color:#8b8171;font-size:11px;text-decoration:underline;cursor:pointer}.duesFullLink:disabled{opacity:.5;cursor:default}.menuLabel{margin:6px 9px 2px;padding-top:6px;border-top:1px solid #eee8df;color:#8b8171;font-size:10px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.menu button.menuDanger{color:#c1543b}.homeView{padding:3px 14px 16px}.homeView h1{margin:0;font-size:16.5px}.homeView>p{margin:4px 0 13px;color:#8b8171;font-size:12.5px;line-height:1.45}.homeStatusGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:12px}.homeStatusCard{padding:10px;border:1px solid #ddd2c2;border-radius:11px;background:#fff;text-align:left}.homeStatusIcon{width:28px;height:28px;display:grid;place-items:center;margin-bottom:8px;border-radius:8px;background:#e3f0e3;font-size:16px;font-weight:700}.homeStatusIcon.ready{background:linear-gradient(150deg,#f1c889,#d99b2b 45%,#4ca154);color:#fff}.homeStatusCard b,.homeStatusCard span{display:block}.homeStatusCard b{font-size:12.5px}.homeStatusCard span{margin-top:3px;color:#e3a64a;font-size:11px;font-weight:650}.homeStatusCard span.ready{color:#4ca154}.homeAction{width:100%;min-height:36px;padding:8px 14px;border:0;border-radius:10px;background:#2d2d2d;color:#fff;font-size:13px;font-weight:650}.connectionAction{margin-bottom:9px}.homeTask{margin-bottom:12px;padding:11px;border:1px solid #ddd2c2;border-radius:12px;background:#fbf8f3}.homeProgress{height:5px;margin-top:8px;border-radius:99px;background:#e6ddd1}.pagePanel{display:none;position:absolute;inset:42px 2px 2px;z-index:20;padding:0 14px 16px;overflow:auto;border-radius:0 0 16px 16px;background:#f4f0e9}.pagePanel.open{display:block}.stickyHeader{position:sticky;top:0;display:flex;align-items:center;gap:9px;padding:10px 0 6px;background:#f4f0e9}.stickyHeader h1{margin:0;font-size:16.5px}.backButton{width:30px;height:30px;border:0;border-radius:8px;background:transparent;font-size:17px}.backButton:hover{background:#e6ddd1}.contextLine{display:flex;gap:6px;margin:0 0 8px;padding-left:39px;color:#595147;font-size:12px}.step{margin-bottom:8px;padding:11px 13px;border:1px solid #ddd2c2;border-radius:13px;background:#fff}.stepHeader{display:flex;align-items:center;gap:8px;margin-bottom:7px}.stepNumber{width:21px;height:21px;display:grid;place-items:center;border-radius:7px;background:#eee8e3;font-size:11px;font-weight:750}.stepRow{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#595147;font-size:12px}.stepRow small{color:#8b8171}.primary-action,.secondary-action{min-height:30px;padding:6px 10px;border-radius:8px;font-size:12px;font-weight:650}.primary-action{border:1px solid #2d2d2d;background:#2d2d2d;color:#fff}.secondary-action{border:1px solid #ddd2c2;background:#fff;color:#2d2d2d}.steadyHero,.updateHero{display:flex;align-items:center;gap:12px;padding:13px;border:1px solid #ddd2c2;border-radius:12px;background:#fbf8f3}.steadyIcon,.updateTile{width:42px;height:42px;display:grid;place-items:center;flex:0 0 auto;border-radius:11px;background:linear-gradient(150deg,#f1c889,#d99b2b 45%,#4ca154);color:#fff;font-size:19px}.updateTile.checking,.updateTile.downloading{background:#2d2d2d}.updateTile.failed,.updateTile.unavailable{background:#c1543b}.steadyHero small,.updateHero p{color:#8b8171}.steadyHero span{padding:2px 8px;border-radius:999px;background:#e3f0e3;color:#2e6b37;font-size:10.5px}.updateContext{margin:0 0 11px;padding-left:39px;color:#8b8171;font-size:11.5px}.updateHero p,.updateHero h2{margin:2px 0}.updateHero h2{font-size:14.5px}.updateProgress{display:none;height:5px;margin-top:10px;border-radius:999px;background:#e6ddd1;overflow:hidden}.updateProgress.show{display:block}.updateProgress i{display:block;width:0;height:100%;border-radius:inherit;background:#4ca154;transition:width .2s ease}.updateAction{width:100%;min-height:34px;margin-top:11px;border:0;border-radius:9px;background:#2d2d2d;color:#fff;font-weight:650}.updateAction:disabled{opacity:.58;cursor:wait}.installAction{width:100%;min-height:34px;border:1px solid #2d2d2d;border-radius:9px;background:#fff;color:#2d2d2d;font-weight:650}.data-toast{font-size:11px;color:#7b5b2d}
       \`; document.head.appendChild(visualStyles);
       const matchingStyles=document.createElement('style');matchingStyles.textContent='.homeTask{display:none!important}.pagePanel{inset:82px 2px 2px}.pagePanel .contextLine{display:none}.steadyHero{margin-bottom:10px}.steadyCopy{min-width:0}.steadyHeroHead{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.steadyHeroHead b{font-size:14.5px}.steadyActions{display:flex;align-items:center;gap:9px;margin-bottom:8px}.steadyActions .secondary-action,.steadyActions .primary-action{background:transparent;color:#2d2d2d}.steadyMeta{display:flex;justify-content:space-between;padding:9px 1px 0;border-top:1px solid #ddd2c2;color:#595147;font-size:11.5px}.steadyMeta strong{color:#2d2d2d;font-weight:650}.data-toast{min-height:16px;margin-top:8px}';document.head.appendChild(matchingStyles);
       const titleBar=document.getElementById('titleBar');
       document.getElementById('minimizeBtn').onclick=()=>window.kalikaAgent.minimize(); document.getElementById('maximizeBtn').onclick=()=>window.kalikaAgent.maximize(); document.getElementById('closeBtn').onclick=()=>window.kalikaAgent.close();
       const card=document.getElementById('card'), menu=document.getElementById('menu'), menuButton=document.getElementById('menu-button'), toast=document.getElementById('toast');
-      const anydoc=document.getElementById('anydoc'),zvec=document.getElementById('zvec'),startup=document.getElementById('startup');
       function renderConnection(data={}){document.getElementById('title').textContent=data.title||'Local Agent';document.getElementById('detail').textContent=data.detail||'';card.className='status '+(data.state||'idle');const state=data.state||'idle',company=data.companyName||String(data.title||'').replace(/^Connected to\s+/i,'')||'Tally not connected';document.getElementById('homeCompany').textContent=company;const badge=document.getElementById('homeConnectionBadge');badge.className='connectionBadge '+(state==='connected'?'':state==='error'?'error':'warning');document.getElementById('connectionCheckBtn').hidden=state==='connected';document.getElementById('homeSetupBtn').hidden=state!=='connected'}
       function closeMenu(){menu.classList.remove('open');menuButton.setAttribute('aria-expanded','false')}
       menuButton.onclick=(event)=>{event.stopPropagation();const open=menu.classList.toggle('open');menuButton.setAttribute('aria-expanded',String(open))};
@@ -512,31 +664,32 @@ function createWindow() {
       function renderUpdate(data={}){const state=data.state||'idle',percent=Math.max(0,Math.min(100,Number(data.percent||0))),busy=['checking','available','downloading','waiting','installing'].includes(state),canInstall=['ready','waiting','installing'].includes(state),titles={idle:'Updates are automatic',checking:'Checking for updates…',current:"You're up to date",available:'Update found',downloading:'Downloading update…',ready:'Ready to install',waiting:'Finishing Tally work',installing:'Installing update…',failed:'Update check failed',unavailable:'Updates unavailable',installed:'Update installed'};document.getElementById('updateTitle').textContent=titles[state]||'Connector updates';updateMessage.textContent=data.message||'Updates are checked automatically.';document.getElementById('updateVersion').textContent='Current version '+(data.installedVersion||'${app.getVersion()}')+(data.availableVersion?' · Version '+data.availableVersion+' available':'');const tile=document.querySelector('.updateTile');tile.className='updateTile '+state;tile.textContent=state==='checking'||state==='installing'?'↻':state==='downloading'?'↓':state==='failed'||state==='unavailable'?'!':'✓';const progress=document.getElementById('updateProgress');progress.className='updateProgress'+(['downloading','installing'].includes(state)?' show':'');document.getElementById('updateProgressBar').style.width=(state==='installing'?100:percent)+'%';const check=document.getElementById('checkUpdatesBtn');check.disabled=busy;check.style.display=['ready','waiting','installing'].includes(state)?'none':'block';check.textContent=state==='checking'?'Checking…':state==='available'?'Preparing download…':state==='downloading'?'Downloading… '+percent+'%':state==='failed'?'Retry update check':'Check for updates';updateCard.className='update'+(canInstall?' show':'');installUpdate.style.display=canInstall?'block':'none';installUpdate.disabled=state!=='ready';installUpdate.textContent=state==='waiting'?'Waiting for Tally operation…':state==='installing'?'Installing and reopening…':'Restart & update';if(state==='installed')setTimeout(()=>showUpdatesPage(),0)}
       window.kalikaAgent.onUpdateStatus(renderUpdate);installUpdate.onclick=async()=>{installUpdate.disabled=true;renderUpdate({...await window.kalikaAgent.getUpdateStatus(),state:'installing',message:'Preparing the update. Kalika Local Agent will reopen automatically…'});try{const result=await window.kalikaAgent.installUpdate();if(result?.waiting)renderUpdate({...await window.kalikaAgent.getUpdateStatus(),state:'waiting'})}catch(error){renderUpdate({state:'failed',message:error?.message||'The update could not be installed.'})}};window.kalikaAgent.getUpdateStatus().then(renderUpdate).catch(()=>{});
       async function refreshConnection(){renderConnection(await window.kalikaAgent.getConnectionStatus())}
-      async function loadAgent(){await refreshConnection();const [settings,status,connection]=await Promise.all([window.kalikaAgent.getSettings(),window.kalikaAgent.getStatus(),window.kalikaAgent.getConnectionStatus()]);anydoc.checked=settings.localAnydocEnabled!==false;zvec.checked=settings.localZvecEnabled===true;startup.checked=settings.startWithWindows!==false;const storage=status.storage||{};document.getElementById('version').textContent='Agent '+(status.agentVersion||'Loading…');document.getElementById('metrics').textContent=Math.round((storage.sizeBytes||0)/1024)+' KB · '+(storage.queuedJobs||0)+' queued';const datasets=Array.isArray(status.datasets)?status.datasets:[];const ready=datasets.find((d)=>d.status==='ready'||d.state==='ready');const active=connection?.companyName||connection?.title||'Tally company';document.getElementById('company').textContent=active;document.getElementById('company-state').textContent=connection?.state==='connected'?'Connected':'Waiting for Tally';document.getElementById('ledger-detail').textContent=ready?.ledgerCount?Number(ready.ledgerCount).toLocaleString()+' ledgers synced':(datasets.length?'Syncing catalogue…':'Not synced yet');document.getElementById('freshness').textContent=ready?'Ready':'Needs refresh'}
+      async function loadAgent(){await refreshConnection();const [status,connection]=await Promise.all([window.kalikaAgent.getStatus(),window.kalikaAgent.getConnectionStatus()]);const storage=status.storage||{};document.getElementById('version').textContent='Agent '+(status.agentVersion||'Loading…');document.getElementById('metrics').textContent=Math.round((storage.sizeBytes||0)/1024)+' KB · '+(storage.queuedJobs||0)+' queued';const datasets=Array.isArray(status.datasets)?status.datasets:[];const ready=datasets.find((d)=>d.status==='ready'||d.state==='ready');const active=connection?.companyName||connection?.title||'Tally company';document.getElementById('company').textContent=active;document.getElementById('company-state').textContent=connection?.state==='connected'?'Connected':'Waiting for Tally';document.getElementById('ledger-detail').textContent=ready?.ledgerCount?Number(ready.ledgerCount).toLocaleString()+' ledgers synced':(datasets.length?'Syncing catalogue…':'Not synced yet');document.getElementById('freshness').textContent=ready?'Ready':'Needs refresh'}
       async function runAgentAction(button, message){button.disabled=true;button.classList.add('busy');document.getElementById('data-toast').textContent=message;try{await window.kalikaAgent.runOnce();await loadAgent();document.getElementById('data-toast').textContent='Refresh requested. The connector will continue in the background.'}catch(error){document.getElementById('data-toast').textContent=error?.message||'The refresh could not be started.'}finally{button.disabled=false;button.classList.remove('busy')}}
-      document.getElementById('refresh-data').onclick=()=>runAgentAction(document.getElementById('refresh-data'),'Reading the active Tally company…');document.getElementById('rebuild-index').onclick=()=>runAgentAction(document.getElementById('rebuild-index'),'Updating the semantic matching index…');
-      for(const [element,key] of [[anydoc,'localAnydocEnabled'],[zvec,'localZvecEnabled'],[startup,'startWithWindows']])element.addEventListener('change',()=>window.kalikaAgent.updateSettings({[key]:element.checked}).then(loadAgent).catch(showError));
       function showError(error){toast.textContent=error?.message||'The action could not be completed.'}
       async function action(work,success){closeMenu();toast.textContent='Working…';try{await work();toast.textContent=success;await loadAgent()}catch(error){showError(error)}}
-      document.getElementById('clear').onclick=()=>action(()=>window.kalikaAgent.clearCache(),'Rebuildable cache cleared.');document.getElementById('diagnostics').onclick=()=>action(()=>window.kalikaAgent.exportDiagnostics(),'Diagnostics exported.');updates.onclick=()=>action(()=>window.kalikaAgent.checkForUpdates(),'Update check complete.');document.getElementById('reset').onclick=()=>{closeMenu();window.kalikaAgent.factoryReset().catch(showError)};
-      const localPanel=document.getElementById('localPanel'),updatesPanel=document.getElementById('updatesPanel'),matchingReady=document.getElementById('matchingReady');matchingReady.className='';matchingReady.innerHTML='<div class="steadyHero"><div class="steadyIcon">✓</div><div class="steadyCopy"><div class="steadyHeroHead"><b id="steadyTitle">Ledgers matched</b><span id="freshnessPill">Up to date</span></div><small id="steadySubtitle">Synced today</small></div></div><div class="steadyActions"><button id="steadySyncBtn" class="primary-action" hidden>Sync now</button><button id="steadyCheckBtn" class="secondary-action">Check for changes</button></div><div class="steadyMeta"><span>Match preparation</span><strong id="steadyVectorMeta">— vectors ready</strong></div>';function showHome(){localPanel.classList.remove('open');updatesPanel.classList.remove('open')}function showMatching(){closeMenu();updatesPanel.classList.remove('open');localPanel.classList.add('open');refreshVisible().catch(showError)}function showUpdatesPage(){closeMenu();localPanel.classList.remove('open');updatesPanel.classList.add('open')}
-      async function runMatchingAction(button,message,work){button.disabled=true;const original=button.textContent;button.textContent=message;document.getElementById('data-toast').textContent=message;try{const result=await work();await refreshVisible();document.getElementById('data-toast').textContent='Ledger data and match preparation are up to date.';return result}catch(error){document.getElementById('data-toast').textContent=error?.message||'The operation could not be completed.';throw error}finally{button.disabled=false;button.textContent=original}}
+      document.getElementById('menuDiagnostics').onclick=()=>action(()=>window.kalikaAgent.exportDiagnostics(),'Diagnostics saved. Send the file to Kalika support.');document.getElementById('menuReset').onclick=()=>{closeMenu();window.kalikaAgent.factoryReset().catch(showError)};
+      const duesPanel=document.getElementById('duesPanel'),localPanel=document.getElementById('localPanel'),updatesPanel=document.getElementById('updatesPanel'),matchingReady=document.getElementById('matchingReady');matchingReady.className='';matchingReady.innerHTML='<div class="steadyHero"><div class="steadyIcon">✓</div><div class="steadyCopy"><div class="steadyHeroHead"><b id="steadyTitle">Ledgers matched</b><span id="freshnessPill">Up to date</span></div><small id="steadySubtitle">Synced today</small></div></div><div class="steadyActions"><button id="steadySyncBtn" class="primary-action" hidden>Sync now</button><button id="steadyCheckBtn" class="secondary-action">Check for changes</button></div><div class="steadyMeta"><span>Smart matching</span><strong id="steadyVectorMeta">— ledgers indexed</strong></div>';function showHome(){localPanel.classList.remove('open');updatesPanel.classList.remove('open');duesPanel.classList.remove('open')}function showDues(){closeMenu();localPanel.classList.remove('open');updatesPanel.classList.remove('open');duesPanel.classList.add('open');refreshVisible().catch(showError)}function showMatching(){closeMenu();updatesPanel.classList.remove('open');duesPanel.classList.remove('open');localPanel.classList.add('open');refreshVisible().catch(showError)}function showUpdatesPage(){closeMenu();localPanel.classList.remove('open');duesPanel.classList.remove('open');updatesPanel.classList.add('open')}
+      async function runMatchingAction(button,message,work){button.disabled=true;const original=button.textContent;button.textContent=message;document.getElementById('data-toast').textContent=message;try{const result=await work();await refreshVisible();document.getElementById('data-toast').textContent='Ledger data and smart matching are up to date.';return result}catch(error){document.getElementById('data-toast').textContent=error?.message||'The operation could not be completed.';throw error}finally{button.disabled=false;button.textContent=original}}
       document.getElementById('refresh-data').onclick=()=>runMatchingAction(document.getElementById('refresh-data'),'Updating…',()=>window.kalikaAgent.syncLedgers());document.getElementById('rebuild-index').onclick=()=>runMatchingAction(document.getElementById('rebuild-index'),'Indexing…',()=>window.kalikaAgent.rebuildVectorIndex());document.getElementById('steadyCheckBtn').onclick=()=>runMatchingAction(document.getElementById('steadyCheckBtn'),'Checking…',()=>window.kalikaAgent.syncLedgers());document.getElementById('steadySyncBtn').onclick=()=>runMatchingAction(document.getElementById('steadySyncBtn'),'Syncing…',()=>window.kalikaAgent.syncLedgers());
-      document.getElementById('menuLocalMatching').onclick=showMatching;document.getElementById('menuReconcile').onclick=()=>{showMatching();runMatchingAction(document.getElementById('refresh-data'),'Reconciling…',()=>window.kalikaAgent.syncLedgers({forceReconcile:true})).catch(()=>{})};updates.onclick=showUpdatesPage;document.getElementById('backBtn').onclick=showHome;document.getElementById('updatesBackBtn').onclick=showHome;document.getElementById('homeLedgerCard').onclick=showMatching;document.getElementById('homeVectorCard').onclick=showMatching;document.getElementById('homeSetupBtn').onclick=showMatching;document.getElementById('connectionCheckBtn').onclick=()=>refreshVisible().catch(showError);document.getElementById('checkUpdatesBtn').onclick=async()=>{renderUpdate({...await window.kalikaAgent.getUpdateStatus(),state:'checking',message:'Checking for a newer Kalika Local Agent…'});try{renderUpdate(await window.kalikaAgent.checkForUpdates())}catch(error){renderUpdate({state:'failed',message:error?.message||'The update check failed. Please try again.'})}};
+      document.getElementById('menuLocalMatching').onclick=showMatching;document.getElementById('menuCustomerDues').onclick=showDues;document.getElementById('homeDuesCard').onclick=showDues;document.getElementById('duesBackBtn').onclick=showHome;async function runDuesCheck(full){const quick=!full&&lastDues.status==='ready';duesBusy=true;renderDues(lastDues,{phase:quick?'checking_changes':'checking_company'});try{const result=await window.kalikaAgent.prepareCustomerDues({full});duesBusy=false;renderDues(result,null)}catch(error){duesBusy=false;renderDues({...lastDues,status:quick?lastDues.status:'failed',lastError:error?.message||'The check could not finish.'},null);if(quick)document.getElementById('duesStep').textContent=error?.message||'The check could not finish.'}}document.getElementById('duesCheckBtn').onclick=()=>runDuesCheck(false);document.getElementById('duesFullBtn').onclick=()=>runDuesCheck(true);updates.onclick=showUpdatesPage;document.getElementById('backBtn').onclick=showHome;document.getElementById('updatesBackBtn').onclick=showHome;document.getElementById('homeLedgerCard').onclick=showMatching;document.getElementById('homeVectorCard').onclick=showMatching;document.getElementById('homeSetupBtn').onclick=showMatching;document.getElementById('connectionCheckBtn').onclick=()=>refreshVisible().catch(showError);document.getElementById('checkUpdatesBtn').onclick=async()=>{renderUpdate({...await window.kalikaAgent.getUpdateStatus(),state:'checking',message:'Checking for a newer Kalika Local Agent…'});try{renderUpdate(await window.kalikaAgent.checkForUpdates())}catch(error){renderUpdate({state:'failed',message:error?.message||'The update check failed. Please try again.'})}};
       async function refreshVisible(){
         const [status,connection]=await Promise.all([window.kalikaAgent.getStatus(),window.kalikaAgent.getConnectionStatus()]);renderConnection(connection);
         const datasets=Array.isArray(status.datasets)?status.datasets:[],companyName=connection?.companyName||String(connection?.title||'').replace(/^Connected to\s+/i,''),dataset=datasets.find((d)=>String(d?.identity?.companyName||'').toLowerCase()===String(companyName||'').toLowerCase())||datasets.find((d)=>d.status==='ready')||datasets[0];
         const metrics=dataset?.metrics||{},ledgerCount=Number(metrics.ledgerCount||0),vectorCount=Number(metrics.vectorCount||0),hasData=ledgerCount>0,indexReady=hasData&&vectorCount>=ledgerCount,active=status.activeJob,progress=active?.progress||{},isWorking=Boolean(active);
         document.getElementById('matchingCompany').textContent=companyName||dataset?.identity?.companyName||'Open a company in Tally';document.getElementById('matchingLedgerCount').textContent=ledgerCount?ledgerCount.toLocaleString():'—';
-        document.getElementById('homeLedgerState').textContent=hasData?ledgerCount.toLocaleString()+' available':'Not available';document.getElementById('homeVectorState').textContent=indexReady?vectorCount.toLocaleString()+' ready':hasData?(vectorCount?vectorCount.toLocaleString()+' of '+ledgerCount.toLocaleString():'Needs preparation'):'Not available';
+        const vectorPercent=ledgerCount?Math.min(99,Math.round(vectorCount/ledgerCount*100)):0;document.getElementById('homeLedgerState').textContent=hasData?'Ready':'Not loaded';document.getElementById('homeVectorState').textContent=indexReady?'Ready':hasData?(vectorCount?'Preparing… '+vectorPercent+'%':'Needs preparation'):'Not available';
         document.getElementById('homeLedgerState').className=hasData?'ready':'';document.getElementById('homeVectorState').className=indexReady?'ready':'';document.getElementById('homeLedgerIcon').className='homeStatusIcon'+(hasData?' ready':'');document.getElementById('homeLedgerIcon').textContent=hasData?'✓':'▦';document.getElementById('homeVectorIcon').className='homeStatusIcon'+(indexReady?' ready':'');document.getElementById('homeVectorIcon').textContent=indexReady?'✓':'◇';
-        document.getElementById('homeTitle').textContent=indexReady?'Ledger matching is ready':hasData?'Prepare ledger matching':'Finish ledger setup';document.getElementById('homeCopy').textContent=indexReady?'Your ledger list and matching index are ready for suggestions.':hasData?'Ledger data is ready. Complete the matching index once.':'Import ledgers from the company currently open in Tally.';document.getElementById('homeSetupBtn').textContent=hasData?'Open ledger status':'Set up ledger matching';document.getElementById('homeSetupBtn').hidden=indexReady||connection?.state!=='connected';
-        document.getElementById('syncState').textContent=hasData?'Ledger list updated':'Not synced';document.getElementById('lastSync').textContent=dataset?.last_sync_at?'Updated '+new Date(dataset.last_sync_at).toLocaleString():'Not updated yet';document.getElementById('vectorState').textContent=indexReady?vectorCount.toLocaleString()+' of '+ledgerCount.toLocaleString()+' indexed':hasData?'Ready to index':'Waiting for ledgers';document.getElementById('lastVector').textContent=metrics.vectorUpdatedAt?'Updated '+new Date(metrics.vectorUpdatedAt).toLocaleString():'Not indexed yet';
-        document.getElementById('matchingReady').hidden=!indexReady;document.getElementById('ledgerStep').hidden=indexReady;document.getElementById('vectorStep').hidden=indexReady;document.getElementById('steadyTitle').textContent=ledgerCount.toLocaleString()+' ledgers matched';document.getElementById('steadyVectorMeta').textContent=vectorCount.toLocaleString()+' of '+ledgerCount.toLocaleString()+' vectors ready';document.getElementById('steadySyncBtn').hidden=true;document.getElementById('steadyCheckBtn').hidden=false;
-        document.getElementById('homeTask').hidden=!isWorking;if(isWorking){const processed=Number(progress.processed||0),total=Number(progress.total||0),percent=total?Math.round(processed/total*100):0;document.getElementById('homeTaskText').textContent=String(progress.phase||'Working…').replaceAll('_',' ');document.getElementById('homeTaskPercent').textContent=total?percent+'%':'Working';document.querySelector('#homeTask .homeProgress i').style.width=percent+'%'}document.getElementById('updateVersion').textContent='Current version '+(status.agentVersion||'');
+        document.getElementById('homeTitle').textContent=indexReady?'Ledger matching is ready':hasData?'Prepare ledger matching':'Finish ledger setup';document.getElementById('homeCopy').textContent=connection?.state!=='connected'?'Open Tally Prime with a company loaded, then click Recheck connection.':indexReady?'Your ledger list and matching index are ready for suggestions.':hasData?'Ledger data is ready. Complete the matching index once.':'Import ledgers from the company currently open in Tally.';document.getElementById('homeSetupBtn').textContent=hasData?'Open ledger status':'Set up ledger matching';document.getElementById('homeSetupBtn').hidden=indexReady||connection?.state!=='connected';
+        document.getElementById('syncState').textContent=hasData?'Ledger list updated':'Not synced';document.getElementById('lastSync').textContent=dataset?.last_sync_at?'Updated '+new Date(dataset.last_sync_at).toLocaleString():'Not updated yet';document.getElementById('vectorState').textContent=indexReady?'Ready':hasData?(vectorCount?'Preparing… '+vectorPercent+'%':'Ready to prepare'):'Waiting for ledgers';document.getElementById('lastVector').textContent=metrics.vectorUpdatedAt?'Updated '+new Date(metrics.vectorUpdatedAt).toLocaleString():'Not prepared yet';
+        document.getElementById('matchingReady').hidden=!indexReady;document.getElementById('ledgerStep').hidden=indexReady;document.getElementById('vectorStep').hidden=indexReady;document.getElementById('steadyTitle').textContent='Ledger matching is ready';document.getElementById('steadyVectorMeta').textContent='Ready';document.getElementById('steadySyncBtn').hidden=true;document.getElementById('steadyCheckBtn').hidden=false;
+        document.getElementById('homeTask').hidden=!isWorking;if(isWorking){const processed=Number(progress.processed||0),total=Number(progress.total||0),percent=total?Math.round(processed/total*100):0;document.getElementById('homeTaskText').textContent=friendlyPhase(progress.phase);document.getElementById('homeTaskPercent').textContent=total?percent+'%':'Working';document.querySelector('#homeTask .homeProgress i').style.width=percent+'%'}document.getElementById('updateVersion').textContent='Current version '+(status.agentVersion||'');if(!duesBusy)renderDues(status.receivables||{});
       }
-      window.kalikaAgent.onProgress((progress={})=>{const processed=Number(progress.processed||0),total=Number(progress.total||0),label=String(progress.phase||'Working').replaceAll('_',' ');document.getElementById('homeTask').hidden=false;document.getElementById('homeTaskText').textContent=label;document.getElementById('homeTaskPercent').textContent=total?Math.round(processed/total*100)+'%':'Working';document.querySelector('#homeTask .homeProgress i').style.width=(total?Math.round(processed/total*100):8)+'%';document.getElementById('data-toast').textContent=total?label+' · '+processed.toLocaleString()+' of '+total.toLocaleString():label});
-      refreshConnection().catch(showError);setInterval(()=>refreshVisible().catch(()=>{}),2000);loadAgent().then(refreshVisible).catch(showError);
+      function friendlyPhase(phase){const value=String(phase||'').toLowerCase();if(value==='checking_changes')return 'Checking Tally for changes';if(value==='checking_company')return 'Checking the Tally company';if(value==='checking_customer_bills')return 'Checking customer bills';if(value==='checking_invoices_and_receipts')return 'Checking invoices and receipts';if(value==='checking_older_invoices')return 'Checking earlier-year invoices';if(/vector|embed|index/.test(value))return 'Preparing smart matching';if(/ledger|master|catalog/.test(value))return 'Reading ledgers from Tally';if(/voucher|bill/.test(value))return 'Reading vouchers from Tally';if(/document|pars/.test(value))return 'Reading document';return 'Updating Tally data'}
+      let duesBusy=false,lastDues={};function sinceText(value){if(!value)return '';const minutes=Math.round((Date.now()-Date.parse(value))/60000);return minutes<1?'just now':minutes<60?minutes+' min ago':new Date(value).toLocaleString()}function renderDues(data={},progress=null){lastDues=data||{};const st=lastDues.status||'loading',loading=st==='loading',busy=duesBusy||st==='preparing',counts=lastDues.counts||{};document.getElementById('duesCompany').textContent=lastDues.companyName?lastDues.companyName+(lastDues.financialYear?' · FY '+lastDues.financialYear:''):'Company open in Tally';document.getElementById('duesTitle').textContent=loading?'Loading customer dues…':busy?'Checking customer dues…':st==='ready'?'Customer dues are ready':st==='failed'?'The check did not finish':st==='no_company'?'Open a company in Tally':'Get customer dues ready';document.getElementById('duesDetail').textContent=loading?'Kalika Local Agent is starting.':busy?'You can keep working in Tally.':st==='ready'?(Number(counts.customersWithBills||0).toLocaleString()+' parties with open bills · checked '+sinceText(lastDues.checkedAt)):st==='failed'?(lastDues.lastError||'Please try again.'):st==='no_company'?'Open the company in Tally Prime, then come back here.':'Makes Payment Follow-ups and Cash Discounts open instantly. The first check takes a few minutes.';const tile=document.getElementById('duesTile');tile.className='updateTile'+(busy?' downloading':st==='failed'?' failed':'');tile.textContent=busy?'↻':st==='ready'?'✓':st==='failed'?'!':'₹';let percent=0,step='';if(progress){const total=Number(progress.total||0),done=Number(progress.processed||0);percent=Number.isFinite(progress.overall)?progress.overall:total?Math.round(done/total*100):5;step=(progress.waitingForMemory?'Waiting for free memory · ':'')+friendlyPhase(progress.phase)+(progress.phase==='checking_customer_bills'&&total?' · '+done.toLocaleString()+' of '+total.toLocaleString():'')+(progress.month?' · '+progress.month:'')}document.getElementById('duesProgress').className='updateProgress'+(busy?' show':'');document.getElementById('duesProgressBar').style.width=(busy?Math.max(5,percent):0)+'%';document.getElementById('duesStep').textContent=busy?step:'';const button=document.getElementById('duesCheckBtn');button.disabled=loading||busy||st==='no_company';button.textContent=busy?'Checking…':st==='ready'?'Check for changes':'Check customer dues';const fullLink=document.getElementById('duesFullBtn');fullLink.hidden=st!=='ready';fullLink.disabled=busy;const home=document.getElementById('homeDuesState');home.textContent=loading?'Loading…':busy?('Checking… '+(percent?percent+'%':'')):st==='ready'?'Ready':st==='failed'?'Needs another check':'Not checked yet';home.className=st==='ready'&&!busy?'ready':'';document.getElementById('homeDuesIcon').className='homeStatusIcon'+(st==='ready'&&!busy?' ready':'');document.getElementById('homeDuesIcon').textContent=st==='ready'&&!busy?'✓':'₹'}window.kalikaAgent.onProgress((progress={})=>{if(progress.operation==='receivables'){if(progress.phase==='complete'||progress.phase==='failed'){duesBusy=false;refreshVisible().catch(()=>{});return}duesBusy=true;renderDues({...lastDues,status:'preparing'},progress);return}const processed=Number(progress.processed||0),total=Number(progress.total||0),percent=total?Math.round(processed/total*100):0,label=friendlyPhase(progress.phase);document.getElementById('homeTask').hidden=false;document.getElementById('homeTaskText').textContent=label;document.getElementById('homeTaskPercent').textContent=total?percent+'%':'Working';document.querySelector('#homeTask .homeProgress i').style.width=(total?percent:8)+'%';document.getElementById('data-toast').textContent=total?label+' · '+percent+'%':label});
+      // Poll only while the window is actually visible; the page is destroyed
+      // when the window is closed, so a hidden agent does no UI work at all.
+      refreshConnection().catch(showError);setInterval(()=>{if(!document.hidden)refreshVisible().catch(()=>{})},5000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshVisible().catch(()=>{})});loadAgent().then(refreshVisible).catch(showError);
     </script></body></html>
   `)}`;
 
@@ -568,9 +721,8 @@ function createWindow() {
     appendLog(errPath, `Local Agent status page could not be opened: ${formatConnectorError(error)}`);
     showWindow();
   });
-  mainWindow.on("close", (event) => {
-    event.preventDefault();
-    mainWindow.hide();
+  mainWindow.on("closed", () => {
+    mainWindow = null;
   });
 }
 
@@ -579,19 +731,21 @@ function startApplication() {
   app.setAppUserModelId(APP_USER_MODEL_ID);
 
   const gotLock = app.requestSingleInstanceLock();
-  if (!gotLock) {
+  if (!gotLock || process.argv.includes(QUIT_LAUNCH_ARG)) {
+    // --quit with no running copy: nothing to close, and never start the agent.
     app.quit();
     return;
   }
   app.setAsDefaultProtocolClient(PROTOCOL_NAME);
-  app.setLoginItemSettings({ openAtLogin: true, openAsHidden: true });
+  // Login-item registration follows the saved "Start with Windows" preference
+  // once the runner has loaded settings (see applyStartWithWindowsSetting).
   ipcMain.handle("agent:get-connection-status", () => lastStatus);
   ipcMain.handle("window:minimize", () => mainWindow?.minimize());
   ipcMain.handle("window:maximize", () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     if (mainWindow.isMaximized()) mainWindow.unmaximize(); else mainWindow.maximize();
   });
-  ipcMain.handle("window:close", () => mainWindow?.hide());
+  ipcMain.handle("window:close", () => mainWindow?.close());
   ipcMain.handle("agent:get-status", async () => {
     const status = await runner?.getAgentStatus?.() ?? { connected: false };
     return { ...status, agentVersion: status.agentVersion || app.getVersion(), connectionStatus: lastStatus };
@@ -609,6 +763,10 @@ function startApplication() {
     if (!runner?.rebuildAgentVectorIndex) throw new Error("The Local Agent is not ready yet.");
     return runner.rebuildAgentVectorIndex();
   });
+  ipcMain.handle("agent:prepare-customer-dues", async (_event, options = {}) => {
+    if (!runner?.prepareCustomerDues) throw new Error("The Local Agent is not ready yet.");
+    return runner.prepareCustomerDues({ full: options?.full === true });
+  });
   ipcMain.handle("agent:get-settings", () => runner?.getAgentSettings?.() ?? {});
   ipcMain.handle("agent:update-settings", async (_event, settings) => {
     const next = await runner?.updateAgentSettings?.(settings && typeof settings === "object" ? settings : {});
@@ -617,11 +775,11 @@ function startApplication() {
   });
   ipcMain.handle("agent:clear-cache", () => runner?.clearAgentCache?.() ?? { cleared: false });
   ipcMain.handle("agent:check-updates", async () => {
-    if (!app.isPackaged) return { available: false, reason: "development" };
-    configureUpdateFeed();
-    sendUpdateStatus({ state: "checking", message: "Checking for a newer Local Agent…" });
-    await autoUpdater.checkForUpdates();
-    return updateState;
+    if (!app.isPackaged) {
+      sendUpdateStatus({ state: "unavailable", message: "Updates are disabled in development builds." });
+      return updateState;
+    }
+    return checkForUpdatesNow();
   });
   ipcMain.handle("agent:get-update-status", () => updateState);
   ipcMain.handle("agent:install-update", () => {
@@ -652,14 +810,20 @@ function startApplication() {
     const localBase = path.resolve(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"));
     const target = path.resolve(localBase, "Kalika", "LocalAgent");
     if (!target.startsWith(`${localBase}${path.sep}`) || path.basename(target) !== "LocalAgent") throw new Error("Factory reset target validation failed.");
-    runner?.stop("factory reset");
-    fs.rmSync(target, { recursive: true, force: true });
+    // The storage and vector workers hold file locks on Windows; wait for
+    // them to exit before deleting their files.
+    await runner?.stop("factory reset");
+    fs.rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     safeQuitApproved = true;
     app.relaunch();
     app.quit();
     return { reset: true };
   });
   app.on("second-instance", (_event, argv) => {
+    if (argv.includes(QUIT_LAUNCH_ARG)) {
+      app.quit();
+      return;
+    }
     const protocolArg = argv.find((entry) => entry.startsWith("kalika-tally://"));
     if (protocolArg) {
       handleProtocolUrl(protocolArg);
@@ -668,11 +832,15 @@ function startApplication() {
   });
   app.on("open-url", (event, url) => {
     event.preventDefault();
-    if (mainWindow) handleProtocolUrl(url);
+    if (app.isReady()) handleProtocolUrl(url);
     else pendingProtocolUrl = url;
   });
   app.whenReady().then(() => {
-    createWindow();
+    // Windows login starts the agent with --hidden: run in the tray only and
+    // create the status window when the user opens it.
+    if (!process.argv.includes(HIDDEN_LAUNCH_ARG)) createWindow();
+    // Runs before the agent starts so nothing is using tmp\ yet.
+    cleanUpObsoleteLocalStorage();
     const completedUpdate = consumeSuccessfulUpdate(localAgentRoot, app.getVersion());
     if (completedUpdate) {
       updatedOnThisLaunch = true;
@@ -740,29 +908,40 @@ function startApplication() {
         }
         sendUpdateStatus({ state: "ready", availableVersion: info.version, percent: 100, message: `Version ${info.version} is ready to install.` });
       });
-      autoUpdater.on("error", (error) => {
-        appendLog(errPath, `Updater: ${error.message}`);
-        const noPublishedRelease = /no published versions/i.test(error.message);
-        sendUpdateStatus(noPublishedRelease
-          ? { state: "unavailable", message: "No Local Agent update has been published yet." }
-          : { state: "failed", message: "The update check failed. You can retry from the menu." });
-      });
-      // Updates are checked only when the user presses Check for updates.
+      autoUpdater.on("error", (error) => reportUpdateError(error));
+      // Check shortly after launch and then periodically. Downloads start
+      // automatically, but installing still waits for the user (or a safe
+      // boundary) so a Tally write is never interrupted.
+      setTimeout(() => void checkForUpdatesNow().catch(() => {}), UPDATE_CHECK_DELAY_MS).unref();
+      setInterval(() => void checkForUpdatesNow().catch(() => {}), UPDATE_CHECK_INTERVAL_MS).unref();
     }
+    createTray();
   });
   app.on("window-all-closed", (event) => {
     event.preventDefault();
   });
+  let quitPrepared = false;
+  let quitInProgress = false;
   app.on("before-quit", (event) => {
-    if (safeQuitApproved || !runner?.busy) return;
+    if (quitPrepared || !runner || runner.stopped) return;
     event.preventDefault();
-    sendStatus({ title: "Finishing Tally work", detail: "The agent will close after the active financial operation reaches a safe boundary.", state: "running" });
-    const waitForSafeExit = setInterval(() => {
-      if (runner?.busy) return;
+    if (quitInProgress) return;
+    quitInProgress = true;
+    if (runner.busy && !safeQuitApproved) {
+      sendStatus({ title: "Finishing Tally work", detail: "The agent will close after the active financial operation reaches a safe boundary.", state: "running" });
+    }
+    const waitForSafeExit = setInterval(async () => {
+      if (runner?.busy && !safeQuitApproved) return;
       clearInterval(waitForSafeExit);
-      safeQuitApproved = true;
+      // Close the local database cleanly so a quit, restart or installer
+      // upgrade never cuts off a write.
+      await Promise.race([
+        Promise.resolve(runner?.stop("quit")).catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 5000)),
+      ]);
+      quitPrepared = true;
       app.quit();
-    }, 500);
+    }, 250);
   });
 }
 

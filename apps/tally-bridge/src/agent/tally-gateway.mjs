@@ -22,8 +22,11 @@ export class TallyAgentGateway {
     this.execute = execute;
   }
 
-  async invoke(xml, { signal, timeoutMs = this.timeoutMs } = {}) {
+  // onStart runs when the request leaves the shared Tally queue, so callers
+  // can tell queue wait apart from Tally's own time.
+  async invoke(xml, { signal, timeoutMs = this.timeoutMs, onStart } = {}) {
     const request = async () => {
+      onStart?.();
       const timeout = AbortSignal.timeout(timeoutMs);
       const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
       const response = await fetch(this.tallyUrl, { method: "POST", headers: { "Content-Type": "text/xml; charset=utf-8" }, body: xml, signal: combined });

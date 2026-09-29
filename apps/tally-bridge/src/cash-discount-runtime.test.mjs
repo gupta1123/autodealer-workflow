@@ -140,7 +140,7 @@ test("continuation cache is bounded, expires, returns copies, and isolates keys"
 test('low-memory scan does not issue an evidence request', async()=>{
   const result=await collectCashDiscountCustomerEvidence({}, {companyName:'A',ledgers:[{name:'A'}],
     billExport:{xml:''},dateRange:{}}, {freeMemory:()=>100,readCustomer:()=>assert.fail('must not query Tally')});
-  assert.equal(result.complete,false);assert.match(result.failures[0].error,/750 MB/);
+  assert.equal(result.complete,false);assert.match(result.failures[0].error,/256 MB/);
 });
 
 test('posting can take the lane between scan chunks', async()=>{

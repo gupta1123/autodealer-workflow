@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld("kalikaAgent", Object.freeze({
   runOnce: () => ipcRenderer.invoke("agent:run-once"),
   syncLedgers: (options) => ipcRenderer.invoke("agent:sync-ledgers", options),
   rebuildVectorIndex: () => ipcRenderer.invoke("agent:rebuild-vector-index"),
+  prepareCustomerDues: (options) => ipcRenderer.invoke("agent:prepare-customer-dues", options),
   getSettings: () => ipcRenderer.invoke("agent:get-settings"),
   updateSettings: (settings) => ipcRenderer.invoke("agent:update-settings", settings),
   clearCache: () => ipcRenderer.invoke("agent:clear-cache"),

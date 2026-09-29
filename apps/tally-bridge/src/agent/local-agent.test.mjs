@@ -138,9 +138,22 @@ test("schema upgrade preserves existing Local Agent settings", async (t) => {
   assert.equal(await upgraded.call("getSetting", { key: "localZvecEnabled" }), true);
   assert.equal((await upgraded.call("health")).schemaVersion, 3);
   await upgraded.close();
+  // A successful upgrade leaves no full-size database copies on disk.
   const backups = fs.readdirSync(dataDirectory).filter((name) => /^agent\.db\.pre-v\d+-\d+\.bak$/.test(name));
-  assert.equal(backups.length, 1);
-  assert.match(backups[0], /^agent\.db\.pre-v3-/);
+  assert.deepEqual(backups, []);
+});
+
+test("routine launches do not copy an up-to-date database", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "kalika-agent-nocopy-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const keyHex = "04".repeat(32);
+  for (let launch = 0; launch < 2; launch += 1) {
+    const storage = new LocalAgentStorage({ baseDirectory: directory, keyHex, schemaVersion: 3 });
+    await storage.call("health");
+    await storage.close();
+  }
+  const dataDirectory = path.join(directory, "data");
+  assert.deepEqual(fs.readdirSync(dataDirectory).filter((name) => name.endsWith(".bak")), []);
 });
 
 test("maintenance prunes delivered results and completed jobs without removing active work", async (t) => {

@@ -16,6 +16,9 @@ const required = [
 for (const filePath of required) {
   if (!fs.existsSync(filePath)) throw new Error(`Missing Local Agent installer source: ${filePath}`);
 }
+// The connector analyses Cash Discount / Follow-up scans with the API's own
+// code; regenerate it so a connector is never shipped with a stale copy.
+execFileSync(process.execPath, [path.join(repoRoot, "scripts", "build-connector-collections-analysis.mjs")], { cwd: repoRoot, stdio: "inherit" });
 
 const packageJson = JSON.parse(fs.readFileSync(path.join(appDirectory, "package.json"), "utf8"));
 if (!/^\d+\.\d+\.\d+$/.test(packageJson.version || "") || packageJson.productName !== "Kalika Local Agent") {

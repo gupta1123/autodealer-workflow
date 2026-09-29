@@ -45,13 +45,13 @@ export function userRoutePolicy(path: string, method: string, action?: string, c
   if (path.startsWith('/api/collections/')) {
     if(path==='/api/collections/follow-ups/pipelines') return read?simple('followups.view'):action?simple(action==='history'||action==='statuses'?'followups.view':action==='send_once'||action==='send'||action==='preview'?'followups.export':action==='save_template'?'settings.manage':'followups.prepare'):{permissions:['followups.view'],inspectAction:true};
     if (path==='/api/collections/follow-ups') return simple('followups.view');
-    if (path==='/api/collections/follow-ups/analyse') return simple('followups.prepare');
+    if (path==='/api/collections/follow-ups/analyse'||path==='/api/collections/follow-ups/analysis-context') return simple('followups.prepare');
     if (['cash-discount-rules','whatsapp/templates'].some(p=>path===`/api/collections/${p}`)) return simple(read?'discounts.view':'settings.manage');
     if (['live/prepare-debit-note','live/confirm-debit-note','tally-debit-notes/approve'].some(p=>path===`/api/collections/${p}`)) return simple('discounts.post');
     if (path==='/api/collections/live/session') return simple('@connection-status');
     if (path==='/api/collections/debit-note-proposals') return simple(read?'discounts.view':'discounts.prepare');
     if (['dashboard','dashboard/version'].some(p=>path===`/api/collections/${p}`)) return simple('discounts.view');
-    if (['live/analyse','live/analyse-preview','live/queue-scan','live/scan-event'].some(p=>path===`/api/collections/${p}`)) return simple('discounts.prepare');
+    if (['live/analyse','live/analysis-context','live/analyse-preview','live/queue-scan','live/scan-event'].some(p=>path===`/api/collections/${p}`)) return simple('discounts.prepare');
     return null;
   }
   if (path==='/api/tally/agent/jobs') return commandType&&commandPermissions[commandType]?simple(commandPermissions[commandType]):{permissions:[],inspectAction:true};

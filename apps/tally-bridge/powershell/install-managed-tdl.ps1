@@ -6,10 +6,17 @@ $managedFiles = @(
   'kalika-purchase-document-attachment.tdl',
   'kalika-agent-sync-reports.tdl'
 )
-$candidateDirectories = @(
-  (Join-Path $env:ProgramFiles 'TallyPrime'),
-  (Join-Path ${env:ProgramFiles(x86)} 'TallyPrime')
-) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) }
+# The installer is a 32-bit process, so $env:ProgramFiles resolves to
+# "Program Files (x86)" here. ProgramW6432 is the real 64-bit folder where
+# TallyPrime is normally installed; without it this script silently found
+# nothing and never updated the TDLs.
+# Outer @() keeps a single match as an array; otherwise [0] is its first letter.
+$candidateDirectories = @(@(
+  $env:ProgramW6432,
+  $env:ProgramFiles,
+  ${env:ProgramFiles(x86)}
+) | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'TallyPrime' } | Select-Object -Unique |
+  Where-Object { Test-Path -LiteralPath $_ -PathType Container })
 
 if (-not $candidateDirectories.Count) { exit 0 }
 $tallyDirectory = $candidateDirectories[0]

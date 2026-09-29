@@ -12,15 +12,16 @@ KalikaSourceDocumentId     : String : 30004
 KalikaVehicleNumber        : String : 30005
 
 [#Form : VCH Display]
-Add : Button : Kalika Purchase Source PDF Button 30001
+Add : Button : KalikaOpenPurchasePdf
 
 [#Form : Voucher]
-Add : Button : Kalika Purchase Source PDF Button 30001
+Add : Button : KalikaOpenPurchasePdf
 
-;; Keep the definition name unique. Tally treats Button and Key definitions as
-;; the same family, so a generic name can collide with another loaded add-on.
-[Button : Kalika Purchase Source PDF Button 30001]
+;; Keep this identifier short and unique. Button definitions are represented
+;; internally as Key definitions by Tally; long names ending in a numeric UDF
+;; index are parsed as an invalid Button/Key reference on some Tally releases.
+[Button : KalikaOpenPurchasePdf]
 Title    : "Open Source PDF"
 Key      : Ctrl + Alt + D
-Action   : BrowseURL Ex : $KalikaSourceDocumentPath
+Action   : Browse URL : $KalikaSourceDocumentPath
 Inactive : $$IsEmpty:$KalikaSourceDocumentPath

@@ -20,6 +20,7 @@ import { AGENT_CAPABILITIES, AGENT_PROTOCOL_VERSION, AGENT_VERSION, LOCAL_SCHEMA
 import { assertAgentIdentity, identityFromCommand, datasetKey, normalizeFinancialYear } from "./identity.mjs";
 import { resourceSnapshot } from "./resource-policy.mjs";
 import { automaticCatalogueSyncPlan } from "./sync-policy.mjs";
+import { ReceivablesPreparer, financialYearRange } from "./receivables.mjs";
 
 const AGENT_COMMANDS = new Set([
   "agent_sync_dataset",
@@ -35,6 +36,18 @@ const AGENT_COMMANDS = new Set([
   "agent_query_workflow_vouchers",
   "agent_voucher_identity",
 ]);
+
+// Product decisions, not client preferences. Stored values from older builds
+// (or from the old web settings menu) are ignored so every install behaves the
+// same way.
+const MANAGED_SETTINGS = Object.freeze({
+  localAnydocEnabled: true,
+  localZvecEnabled: true,
+  localDataModules: Object.freeze({ purchase: true, bank: true, cashDiscount: true, followups: true }),
+  startWithWindows: true,
+  // Upper bound for rebuildable cached Tally data on client PCs.
+  cacheLimitBytes: 512 * 1024 * 1024,
+});
 
 function financialYearDates(value) {
   const match = String(value || "").match(/(\d{4})\D+(\d{2,4})/);
@@ -138,6 +151,19 @@ export class LocalAgentRuntime {
     this.documents = new LocalDocumentService({ temporaryDirectory: this.storage.paths.temporary, browserUpload: this.browserUpload,
       suggestLedgerBatch: (queries, options) => this.suggestLedgerBatch(queries, options) });
     this.scheduler = new AgentJobScheduler({ storage: this.storage });
+    // Used only by a scan that already holds the Tally queue.
+    this.directGateway = new TallyAgentGateway({ tallyUrl: config.tallyUrl });
+    this.receivables = new ReceivablesPreparer({
+      storage: this.storage,
+      invoke: (xml, options) => this.gateway.invoke(xml, options),
+      onProgress: (progress) => this.onProgress?.(progress),
+      onLog: (level, message) => this.onLog?.(level, message),
+      // The Payment Follow-ups page watches this revision to refresh itself.
+      onChanged: (key, state) => void this.storage.call("setSetting", {
+        key: `followup-last-change:${key}`,
+        value: { changedAt: new Date().toISOString(), cursor: Number(state.watermark || 0) },
+      }).catch(() => {}),
+    });
     this.onProgress = onProgress;
     this.onLog = onLog;
     this.started = false;
@@ -239,8 +265,6 @@ export class LocalAgentRuntime {
       return result;
     });
     this.scheduler.register("agent_parse_document", async (job, progress) => {
-      const enabled = await this.storage.call("getSetting", { key: "localAnydocEnabled", fallback: true });
-      if (enabled === false) throw Object.assign(new Error("Local AnyDoc parsing is disabled in Local Agent settings."), { code: "LOCAL_ANYDOC_DISABLED" });
       await progress({ phase: "downloading_document", processed: 0, total: 1 });
       const result = await this.documents.parse(job.payload);
       await progress({ phase: "document_parsed", processed: 1, total: 1 });
@@ -285,20 +309,6 @@ export class LocalAgentRuntime {
   async start() {
     if (this.started) return;
     await this.storage.call("health");
-    const semanticV3Migrated = await this.storage.call("getSetting", {
-      key: "semanticEmbeddingV3Migrated",
-      fallback: false,
-    });
-    if (semanticV3Migrated !== true) {
-      await this.storage.call("setSetting", { key: "localZvecEnabled", value: true });
-      if (this.config.organizationId) {
-        await this.storage.call("setSetting", {
-          key: `zvec:${this.config.organizationId}`,
-          value: true,
-        });
-      }
-      await this.storage.call("setSetting", { key: "semanticEmbeddingV3Migrated", value: true });
-    }
     await this.runMaintenance();
     const pendingVectorCleanup = await this.storage.call("getSetting", { key: "pendingVectorCleanup", fallback: [] });
     for (const oldDatasetKey of pendingVectorCleanup || []) this.vectors.reset(oldDatasetKey);
@@ -363,6 +373,7 @@ export class LocalAgentRuntime {
       storage,
       datasets: datasetsWithWorkflowRevisions,
       settings,
+      receivables: await this.activeReceivablesStatus().catch(() => null),
       activeJob: activeJob ? { id: activeJob.id, commandId: activeJob.command_id, jobClass: activeJob.job_class, progress: activeJob.progress } : null,
     };
   }
@@ -377,6 +388,60 @@ export class LocalAgentRuntime {
     return { dataset, vector, identity };
   }
 
+  // Once customer dues are ready, a check only applies what changed in Tally
+  // (about a second). The full check runs the first time or when asked for.
+  async prepareActiveReceivables({ full = false } = {}) {
+    const identity = this.activeIdentity;
+    if (!identity) throw new Error("Open a company in Tally Prime first.");
+    const key = datasetKey(identity);
+    const state = await this.storage.call("getReceivableState", { datasetKey: key });
+    if (full || state?.status !== "ready" || financialYearRange(identity.financialYear).label !== state.financialYear) {
+      // "Check everything again" starts over; otherwise an interrupted
+      // preparation continues where it stopped.
+      return this.receivables.prepare(identity, key, { fresh: full });
+    }
+    this.onProgress?.({ operation: "receivables", localUi: true, phase: "checking_changes", processed: 0, total: null });
+    try {
+      await this.receivables.checkForChanges(identity, key, { force: true });
+    } finally {
+      this.onProgress?.({ operation: "receivables", localUi: true, phase: "complete", processed: 1, total: 1 });
+    }
+    return this.receivables.status(key);
+  }
+
+  // Prepared customer dues for a Cash Discount / Follow-up scan, or null when
+  // they are not ready for this company and financial year (the scan then
+  // reads Tally live). Latest Tally changes are applied first.
+  async preparedReceivablesFor({ companyName, financialYear }) {
+    const identity = this.activeIdentity;
+    if (!identity || String(identity.companyName || "").toLowerCase().replace(/[^a-z0-9]/g, "") !==
+      String(companyName || "").toLowerCase().replace(/[^a-z0-9]/g, "")) return null;
+    const key = datasetKey(identity);
+    const state = await this.storage.call("getReceivableState", { datasetKey: key });
+    if (state?.status !== "ready") return null;
+    if (financialYear && financialYearRange(financialYear).label !== state.financialYear) return null;
+    // Quick delta only: a full customer re-check (after a deletion) takes
+    // minutes and runs in the background instead of holding up the scan.
+    await this.receivables.checkForChanges(identity, key, {
+      force: true,
+      allowFullCheck: false,
+      invoke: (xml, options) => this.directGateway.invoke(xml, options),
+    }).catch((error) => this.onLog?.("warn", `Customer dues check before scan: ${error.message}`));
+    // Scans, reminder checks and bank matching all answer from the dues held
+    // in memory (loaded once, reloaded only after the dues change).
+    const snapshot = await this.receivables.loadSnapshot(key);
+    return {
+      datasetKey: key,
+      state: await this.storage.call("getReceivableState", { datasetKey: key }),
+      recordsFor: async (ledgerNames, options) => snapshot.recordsFor(ledgerNames, options),
+      allBills: async () => snapshot.allBills(),
+    };
+  }
+
+  async activeReceivablesStatus() {
+    return this.activeIdentity ? this.receivables.status(datasetKey(this.activeIdentity)) : { status: "no_company" };
+  }
+
   async rebuildActiveVectorIndex() {
     const identity = this.activeIdentity;
     if (!identity) throw new Error("Open a company in Tally Prime before updating the matching index.");
@@ -386,27 +451,23 @@ export class LocalAgentRuntime {
   }
 
   async updateSettings(settings = {}) {
-    const allowed = ["localAnydocEnabled", "localZvecEnabled", "localDataModules", "cacheLimitBytes", "diagnosticRetentionDays", "markdownRetentionDays", "completedJobRetentionDays", "deliveredOutboxRetentionDays", "workflowSnapshotRetentionDays", "syncIntervalSeconds", "startWithWindows", "updateChannel"];
+    // Managed settings are intentionally not writable.
+    const allowed = ["diagnosticRetentionDays", "markdownRetentionDays", "completedJobRetentionDays", "deliveredOutboxRetentionDays", "workflowSnapshotRetentionDays", "syncIntervalSeconds", "updateChannel"];
     for (const key of allowed) {
       if (Object.prototype.hasOwnProperty.call(settings, key)) {
         await this.storage.call("setSetting", { key, value: settings[key] });
       }
-    }
-    if (Object.prototype.hasOwnProperty.call(settings, "localZvecEnabled") && this.config.organizationId) {
-      await this.storage.call("setSetting", { key: `zvec:${this.config.organizationId}`, value: settings.localZvecEnabled === true });
     }
     return this.settings();
   }
 
   async settings() {
     const entries = await Promise.all([
-      ["localAnydocEnabled", true], ["localZvecEnabled", true], ["cacheLimitBytes", 1024 ** 3],
-      ["localDataModules", { purchase: true, bank: true, cashDiscount: true, followups: true }],
       ["diagnosticRetentionDays", 14], ["markdownRetentionDays", 30], ["completedJobRetentionDays", 7],
       ["deliveredOutboxRetentionDays", 7], ["workflowSnapshotRetentionDays", 7],
-      ["syncIntervalSeconds", 60], ["startWithWindows", true], ["updateChannel", "stable"],
+      ["syncIntervalSeconds", 60], ["updateChannel", "stable"],
     ].map(async ([key, fallback]) => [key, await this.storage.call("getSetting", { key, fallback })]));
-    return Object.fromEntries(entries);
+    return { ...Object.fromEntries(entries), ...MANAGED_SETTINGS };
   }
 
   async runMaintenance() {
@@ -447,6 +508,22 @@ export class LocalAgentRuntime {
     this.activeIdentityObservedAt = Date.now();
     void this.ensureVectorIndex(identity)
       .catch((error) => this.onLog?.("warn", `Local ledger index: ${error.message}`));
+    // Keeps prepared customer dues current (at most one counter check a minute).
+    void this.receivables.checkForChanges(identity, datasetKey(identity))
+      .catch((error) => this.onLog?.("warn", `Customer dues check: ${error.message}`));
+    // Once per start-up, load the prepared dues into memory in the background,
+    // so the first Cash Discount or Follow-ups scan does not wait for it.
+    const warmKey = datasetKey(identity);
+    if (this.receivablesWarmedKey !== warmKey) {
+      this.receivablesWarmedKey = warmKey;
+      setTimeout(() => {
+        void this.storage.call("getReceivableState", { datasetKey: warmKey })
+          .then((state) => state?.status === "ready"
+            ? this.receivables.loadSnapshot(warmKey).then(() => undefined)
+            : undefined)
+          .catch(() => { this.receivablesWarmedKey = null; });
+      }, 20_000).unref?.();
+    }
     const intervalSeconds = Number(await this.storage.call("getSetting", { key: "syncIntervalSeconds", fallback: 60 })) || 60;
     if (Date.now() - this.lastWatermarkAt < Math.max(15, intervalSeconds) * 1_000 || this.scheduler.busy) return;
     this.lastWatermarkAt = Date.now();
@@ -480,11 +557,7 @@ export class LocalAgentRuntime {
   }
 
   async moduleEnabled(moduleName) {
-    const modules = await this.storage.call("getSetting", {
-      key: "localDataModules",
-      fallback: { purchase: true, bank: true, cashDiscount: true, followups: true },
-    });
-    return modules?.[moduleName] !== false;
+    return MANAGED_SETTINGS.localDataModules[moduleName] !== false;
   }
 
   async syncDataset(identity, options = {}) {
@@ -554,8 +627,6 @@ export class LocalAgentRuntime {
 
   async buildVectorIndex(identity = this.activeIdentity, progress = async () => {}, { force = false } = {}) {
     if (!identity) return { indexed: 0, skipped: true };
-    const enabled = await this.storage.call("getSetting", { key: `zvec:${identity.organizationId}`, fallback: true });
-    if (enabled !== true) return { indexed: 0, skipped: true };
     const key = datasetKey(identity);
     if (!force && Date.now() - Number(this.vectorIndexCheckedAt.get(key) || 0) < 30_000) return { indexed: 0, skipped: true, fresh: true };
     const dataset = await this.storage.call("getDataset", { datasetKey: key });
@@ -664,8 +735,6 @@ export class LocalAgentRuntime {
     }
     const shortlist = shortlistLedgers(query, lookup, savedMappings);
     const deterministic = deterministicLedgerCandidates(query, shortlist, savedMappings).slice(0, 8);
-    const enabled = await this.storage.call("getSetting", { key: `zvec:${identity.organizationId}`, fallback: true });
-    if (enabled !== true) return { suggestions: deterministic.slice(0, 5), deterministic: deterministic.slice(0, 5), vectorEnabled: false };
     await this.ensureVectorIndex(identity);
     this.vectors.enabled = true;
     const [embedding] = await this.requestSemanticEmbeddings([String(query?.name || query || "").trim()]);
@@ -708,14 +777,6 @@ export class LocalAgentRuntime {
         deterministic: deterministicLedgerCandidates(query, shortlist, savedMappings).slice(0, 8),
       };
     });
-    const enabled = await this.storage.call("getSetting", { key: `zvec:${identity.organizationId}`, fallback: true });
-    if (enabled !== true) {
-      return Object.fromEntries(prepared.map((item) => [item.id, {
-        suggestions: item.deterministic.slice(0, 5),
-        deterministic: item.deterministic.slice(0, 5),
-        vectorEnabled: false,
-      }]));
-    }
     await this.ensureVectorIndex(identity);
     this.vectors.enabled = true;
     const embeddings = await this.requestSemanticEmbeddings(

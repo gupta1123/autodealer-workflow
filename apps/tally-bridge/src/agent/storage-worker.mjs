@@ -4,6 +4,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import Database from "better-sqlite3-multiple-ciphers";
 import { datasetKey as stableDatasetKey } from "./identity.mjs";
 
+
 const { databasePath, keyHex, schemaVersion = 1 } = workerData;
 fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
 if (!/^[a-f0-9]{64}$/i.test(keyHex || "")) throw new Error("The Local Agent database key is invalid.");
@@ -11,14 +12,28 @@ if (!/^[a-f0-9]{64}$/i.test(keyHex || "")) throw new Error("The Local Agent data
 const existed = fs.existsSync(databasePath);
 let migrationBackupPath = null;
 const migrationBackupPattern = new RegExp(`^${path.basename(databasePath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.pre-v\\d+-\\d+\\.bak$`);
-if (existed) {
-  const backupPrefix = `${path.basename(databasePath)}.pre-v${schemaVersion}-`;
-  const alreadyBackedUpForVersion = fs.readdirSync(path.dirname(databasePath))
-    .some((name) => name.startsWith(backupPrefix) && name.endsWith(".bak"));
-  if (!alreadyBackedUpForVersion) {
-    migrationBackupPath = `${databasePath}.pre-v${schemaVersion}-${Date.now()}.bak`;
-    fs.copyFileSync(databasePath, migrationBackupPath);
+// Reads the schema version already applied to the existing database, or 0 if
+// it cannot be determined (which conservatively triggers a backup).
+function storedSchemaVersion() {
+  let probe = null;
+  try {
+    probe = new Database(databasePath, { readonly: true, fileMustExist: true, timeout: 5_000 });
+    probe.pragma("cipher='sqlcipher'");
+    probe.pragma("legacy=4");
+    probe.key(Buffer.from(keyHex, "hex"));
+    return Number(probe.prepare("select max(version) as version from schema_migrations").get()?.version || 0);
+  } catch {
+    return 0;
+  } finally {
+    try { probe?.close(); } catch {}
   }
+}
+
+// Copy the database only when this build is about to upgrade its schema, so
+// the migration can be rolled back. Routine launches make no copy.
+if (existed && storedSchemaVersion() < Number(schemaVersion)) {
+  migrationBackupPath = `${databasePath}.pre-v${schemaVersion}-${Date.now()}.bak`;
+  fs.copyFileSync(databasePath, migrationBackupPath);
 }
 
 const db = new Database(databasePath, { timeout: 5_000 });
@@ -29,6 +44,9 @@ db.pragma("journal_mode=WAL");
 db.pragma("synchronous=NORMAL");
 db.pragma("foreign_keys=ON");
 db.pragma("busy_timeout=5000");
+// 16 MB page cache (SQLite's default is 2 MB): repeated reads come from memory
+// instead of a slow or busy disk.
+db.pragma("cache_size=-16384");
 
 function parseJson(value, fallback = null) {
   if (value == null) return fallback;
@@ -328,29 +346,65 @@ db.exec(`
     created_at integer not null
   );
   create index if not exists diagnostics_created_idx on diagnostics(created_at);
+  -- Customer receivables prepared locally for Payment Follow-ups and Cash
+  -- Discounts. Each bill and voucher is stored as fields (JSON, column
+  -- "fields", added below); the "xml" column is left empty.
+  -- Deliberately separate from workflow_voucher_cache, which expires.
+  create table if not exists receivable_state (
+    dataset_key text primary key,
+    state_json text not null,
+    updated_at text not null
+  );
+  create table if not exists receivable_bills (
+    dataset_key text not null,
+    ledger_key text not null,
+    bill_key text not null,
+    xml text not null,
+    updated_at text not null,
+    primary key (dataset_key, ledger_key, bill_key)
+  );
+  create table if not exists receivable_vouchers (
+    dataset_key text not null,
+    master_id text not null,
+    alter_id integer not null default 0,
+    voucher_date text,
+    xml text not null,
+    updated_at text not null,
+    primary key (dataset_key, master_id)
+  );
+  create table if not exists receivable_voucher_ledgers (
+    dataset_key text not null,
+    master_id text not null,
+    ledger_key text not null,
+    primary key (dataset_key, master_id, ledger_key)
+  );
+  create index if not exists receivable_voucher_ledgers_lookup_idx
+    on receivable_voucher_ledgers(dataset_key, ledger_key);
 `);
 
 const previousSchemaVersion = Number(db.prepare("select max(version) as version from schema_migrations").get()?.version || 0);
 if (previousSchemaVersion < 3 && Number(schemaVersion) >= 3) migrateStableDatasetIdentities();
+// Customer dues are stored as fields (JSON) instead of Tally XML. Rows from
+// earlier versions are converted once, after this migration (see below).
+for (const table of ["receivable_bills", "receivable_vouchers"]) {
+  if (!db.prepare(`pragma table_info(${table})`).all().some((column) => column.name === "fields")) {
+    db.exec(`alter table ${table} add column fields text`);
+  }
+}
 
 db.prepare("insert or ignore into schema_migrations(version, applied_at) values (?, ?)")
   .run(schemaVersion, new Date().toISOString());
 db.exec("commit");
 
-// Once the schema opens successfully, only its newest recovery point is
-// useful. Older pre-migration copies are redundant and may each be as large
-// as the complete encrypted database.
+// The pre-migration copy exists only to roll back a failed migration within
+// this startup (see the catch below). Once the schema has opened and migrated
+// successfully, every copy is redundant, and each can be as large as the
+// complete encrypted database, so none are kept on the client's disk.
 try {
-  const migrationBackups = fs.readdirSync(path.dirname(databasePath), { withFileTypes: true })
-    .filter((entry) => entry.isFile() && migrationBackupPattern.test(entry.name))
-    .map((entry) => ({
-      path: path.join(path.dirname(databasePath), entry.name),
-      modifiedAt: fs.statSync(path.join(path.dirname(databasePath), entry.name)).mtimeMs,
-    }))
-    .sort((left, right) => right.modifiedAt - left.modifiedAt);
-  const requiredMigrationBackup = migrationBackupPath || migrationBackups[0]?.path || null;
-  for (const backup of migrationBackups) {
-    if (backup.path !== requiredMigrationBackup) fs.rmSync(backup.path, { force: true });
+  for (const entry of fs.readdirSync(path.dirname(databasePath), { withFileTypes: true })) {
+    if (entry.isFile() && migrationBackupPattern.test(entry.name)) {
+      fs.rmSync(path.join(path.dirname(databasePath), entry.name), { force: true });
+    }
   }
 } catch {
   // A managed endpoint may temporarily deny cleanup. The verified database
@@ -363,6 +417,22 @@ try {
     fs.copyFileSync(migrationBackupPath, databasePath);
   }
   throw migrationError;
+}
+
+markXmlReceivablesForNewCheck();
+
+// Customer dues stored as Tally XML by 1.2.16-1.2.21 are not converted here:
+// converting at start-up held the whole agent for minutes on a large, busy
+// database. Instead the dues are marked as needing a new check (one small
+// update). They are not used meanwhile (scans read Tally live), and the next
+// "Check customer dues" clears the old rows and stores fields.
+function markXmlReceivablesForNewCheck() {
+  const pending = db.prepare("select distinct dataset_key from receivable_bills where fields is null union select distinct dataset_key from receivable_vouchers where fields is null").all();
+  const mark = db.prepare(`insert into receivable_state(dataset_key,state_json,updated_at) values(?,?,?)
+    on conflict(dataset_key) do update set state_json=excluded.state_json,updated_at=excluded.updated_at`);
+  for (const { dataset_key: key } of pending) {
+    mark.run(key, JSON.stringify({ status: "failed", lastError: "The connector was updated. Click Check customer dues once to prepare them again." }), new Date().toISOString());
+  }
 }
 
 function nowIso() { return new Date().toISOString(); }
@@ -719,13 +789,132 @@ const operations = {
     const rows = db.prepare("select category,payload_json,created_at from diagnostics order by created_at desc limit 5000").all();
     return rows.map((row) => ({ category: row.category, createdAt: row.created_at, payload: fromJson(row.payload_json, {}) }));
   },
+  getReceivableState({ datasetKey }) {
+    const row = db.prepare("select state_json from receivable_state where dataset_key=?").get(datasetKey);
+    return row ? fromJson(row.state_json, null) : null;
+  },
+  putReceivableState({ datasetKey, state }) {
+    db.prepare(`insert into receivable_state(dataset_key,state_json,updated_at) values(?,?,?)
+      on conflict(dataset_key) do update set state_json=excluded.state_json,updated_at=excluded.updated_at`)
+      .run(datasetKey, toJson(state), nowIso());
+    return state;
+  },
+  clearReceivables({ datasetKey }) {
+    const transaction = db.transaction(() => {
+      for (const table of ["receivable_bills", "receivable_vouchers", "receivable_voucher_ledgers"]) {
+        db.prepare(`delete from ${table} where dataset_key=?`).run(datasetKey);
+      }
+    });
+    transaction();
+    return true;
+  },
+  // Replaces the open bills of the given customers. Customers with no open
+  // bills are passed with an empty list so stale rows are removed.
+  replaceReceivableBills({ datasetKey, byLedger = {} }) {
+    const remove = db.prepare("delete from receivable_bills where dataset_key=? and ledger_key=?");
+    const insert = db.prepare(`insert or replace into receivable_bills(dataset_key,ledger_key,bill_key,xml,fields,updated_at) values(?,?,?,'',?,?)`);
+    const at = nowIso();
+    let count = 0;
+    db.transaction(() => {
+      for (const [ledgerKey, bills] of Object.entries(byLedger)) {
+        remove.run(datasetKey, ledgerKey);
+        for (const bill of bills || []) { insert.run(datasetKey, ledgerKey, bill.key, toJson(bill.fields), at); count += 1; }
+      }
+    })();
+    return { count };
+  },
+  upsertReceivableVouchers({ datasetKey, vouchers = [] }) {
+    const upsert = db.prepare(`insert into receivable_vouchers(dataset_key,master_id,alter_id,voucher_date,xml,fields,updated_at) values(?,?,?,?,'',?,?)
+      on conflict(dataset_key,master_id) do update set alter_id=excluded.alter_id,voucher_date=excluded.voucher_date,xml='',fields=excluded.fields,updated_at=excluded.updated_at`);
+    const removeLedgers = db.prepare("delete from receivable_voucher_ledgers where dataset_key=? and master_id=?");
+    const removeVoucher = db.prepare("delete from receivable_vouchers where dataset_key=? and master_id=?");
+    const addLedger = db.prepare("insert or ignore into receivable_voucher_ledgers(dataset_key,master_id,ledger_key) values(?,?,?)");
+    const at = nowIso();
+    db.transaction(() => {
+      for (const voucher of vouchers) {
+        removeLedgers.run(datasetKey, voucher.masterId);
+        // An edited voucher that no longer touches any customer is dropped.
+        if (!voucher.ledgerKeys?.length) { removeVoucher.run(datasetKey, voucher.masterId); continue; }
+        upsert.run(datasetKey, voucher.masterId, Number(voucher.alterId || 0), voucher.date || null, toJson(voucher.fields), at);
+        for (const ledgerKey of voucher.ledgerKeys) addLedger.run(datasetKey, voucher.masterId, ledgerKey);
+      }
+    })();
+    return { count: vouchers.length };
+  },
+  listReceivableBills({ datasetKey, ledgerKeys = [] }) {
+    if (!ledgerKeys.length) return [];
+    const rows = [];
+    // Same order as the full snapshot: by bill key within a customer.
+    const statement = db.prepare("select ledger_key,fields from receivable_bills where dataset_key=? and ledger_key=? order by bill_key");
+    for (const ledgerKey of ledgerKeys) rows.push(...statement.all(datasetKey, ledgerKey));
+    return rows.map((row) => ({ ledgerKey: row.ledger_key, fields: row.fields }));
+  },
+  listReceivableVouchers({ datasetKey, ledgerKeys = [], dateFrom = null, dateTo = null }) {
+    if (!ledgerKeys.length) return [];
+    const seen = new Set();
+    const result = [];
+    const statement = db.prepare(`select v.master_id,v.voucher_date,v.fields from receivable_voucher_ledgers l
+      join receivable_vouchers v on v.dataset_key=l.dataset_key and v.master_id=l.master_id
+      where l.dataset_key=? and l.ledger_key=?`);
+    for (const ledgerKey of ledgerKeys) {
+      for (const row of statement.all(datasetKey, ledgerKey)) {
+        if (seen.has(row.master_id)) continue;
+        if (dateFrom && row.voucher_date && row.voucher_date < dateFrom) continue;
+        if (dateTo && row.voucher_date && row.voucher_date > dateTo) continue;
+        seen.add(row.master_id);
+        result.push(row.fields);
+      }
+    }
+    return result;
+  },
+  // Replaces every voucher linked to the given customers with a fresh set read
+  // from Tally. Vouchers deleted in Tally disappear; vouchers left with no
+  // customer link are removed.
+  replaceReceivableVouchersForLedgers({ datasetKey, ledgerKeys = [], vouchers = [] }) {
+    if (!ledgerKeys.length) return { count: 0 };
+    const unlink = db.prepare("delete from receivable_voucher_ledgers where dataset_key=? and ledger_key=?");
+    db.transaction(() => { for (const ledgerKey of ledgerKeys) unlink.run(datasetKey, ledgerKey); })();
+    operations.upsertReceivableVouchers({ datasetKey, vouchers });
+    db.prepare(`delete from receivable_vouchers where dataset_key=? and not exists (
+      select 1 from receivable_voucher_ledgers l where l.dataset_key=receivable_vouchers.dataset_key and l.master_id=receivable_vouchers.master_id)`).run(datasetKey);
+    return { count: vouchers.length };
+  },
+  listReceivableVoucherLedgerKeys({ datasetKey, masterId }) {
+    return db.prepare("select ledger_key from receivable_voucher_ledgers where dataset_key=? and master_id=?")
+      .all(datasetKey, masterId).map((row) => row.ledger_key);
+  },
+  // Every bill, voucher and customer link of a dataset in three sequential
+  // reads. A scan loads this once instead of thousands of per-customer
+  // lookups, which are slow on busy spinning disks.
+  listAllReceivableRecords({ datasetKey }) {
+    return {
+      // Fields stay JSON text here; the caller parses them once.
+      bills: db.prepare("select ledger_key,bill_key,fields from receivable_bills where dataset_key=? order by rowid").all(datasetKey)
+        .map((row) => ({ ledgerKey: row.ledger_key, billKey: row.bill_key, fields: row.fields })),
+      vouchers: db.prepare("select master_id,voucher_date,fields from receivable_vouchers where dataset_key=?").all(datasetKey)
+        .map((row) => ({ masterId: row.master_id, date: row.voucher_date, fields: row.fields })),
+      links: db.prepare("select ledger_key,master_id from receivable_voucher_ledgers where dataset_key=? order by rowid").all(datasetKey)
+        .map((row) => ({ ledgerKey: row.ledger_key, masterId: row.master_id })),
+    };
+  },
+  listReceivableLedgerKeys({ datasetKey }) {
+    return db.prepare("select distinct ledger_key from receivable_bills where dataset_key=?").all(datasetKey).map((row) => row.ledger_key);
+  },
+  receivableCounts({ datasetKey }) {
+    const count = (sql) => Number(db.prepare(sql).get(datasetKey)?.count || 0);
+    return {
+      customersWithBills: count("select count(distinct ledger_key) as count from receivable_bills where dataset_key=?"),
+      bills: count("select count(*) as count from receivable_bills where dataset_key=?"),
+      vouchers: count("select count(*) as count from receivable_vouchers where dataset_key=?"),
+    };
+  },
   invalidateWorkflowSnapshots({ datasetKey, workflow }) {
     db.prepare('delete from workflow_voucher_cache where dataset_key=? and workflow=?').run(datasetKey, workflow);
     return true;
   },
   clearRebuildableCache() {
     const transaction = db.transaction(() => {
-      db.exec("delete from master_cache; delete from open_bill_cache; delete from workflow_voucher_cache; delete from tombstones; delete from document_cache; delete from vector_index_metadata; delete from vector_document_state;");
+      db.exec("delete from master_cache; delete from open_bill_cache; delete from workflow_voucher_cache; delete from tombstones; delete from document_cache; delete from vector_index_metadata; delete from vector_document_state; delete from receivable_state; delete from receivable_bills; delete from receivable_vouchers; delete from receivable_voucher_ledgers;");
       db.prepare("update company_datasets set status='new',cursor_json='{}',cache_health_json='{}',last_sync_at=null,updated_at=?").run(nowIso());
     });
     transaction();

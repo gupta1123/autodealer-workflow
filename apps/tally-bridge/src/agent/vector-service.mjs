@@ -4,7 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 
-const WORKER_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "vector-worker.mjs");
+const VECTOR_IDLE_STOP_MS = 3 * 60_000;
+const WORKER_PATH =path.join(path.dirname(fileURLToPath(import.meta.url)), "vector-worker.mjs");
 
 function normalized(value) {
   return String(value || "").normalize("NFKC").toLocaleLowerCase("en-IN").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
@@ -107,11 +108,26 @@ export class LocalVectorService {
   call(operation, payload) {
     if (!this.enabled) return Promise.reject(Object.assign(new Error("Local vector suggestions are disabled."), { code: "VECTOR_DISABLED" }));
     this.#ensureChild();
+    clearTimeout(this.#idleTimer);
     const id = randomUUID();
-    return new Promise((resolve, reject) => {
+    const request = new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
       this.#child.send({ id, operation, ...payload });
     });
+    return request.finally(() => this.#scheduleIdleStop());
+  }
+
+  // The worker holds the index in memory (up to its 256 MB heap). Release it
+  // once no suggestions have been requested for a while; the next call
+  // restarts it transparently.
+  #idleTimer = null;
+  #scheduleIdleStop() {
+    clearTimeout(this.#idleTimer);
+    if (this.#pending.size) return;
+    this.#idleTimer = setTimeout(() => {
+      if (!this.#pending.size) void this.stop();
+    }, VECTOR_IDLE_STOP_MS);
+    this.#idleTimer.unref?.();
   }
 
   indexPath(datasetKey) {
@@ -123,6 +139,7 @@ export class LocalVectorService {
   query({ datasetKey, dimensions, embedding, topK = 5 }) { return this.call("query", { indexPath: this.indexPath(datasetKey), dimensions, embedding, topK }); }
   reset(datasetKey) { fs.rmSync(this.indexPath(datasetKey), { recursive: true, force: true }); }
   async stop() {
+    clearTimeout(this.#idleTimer);
     const child = this.#child;
     if (!child) return;
     await new Promise((resolve) => {

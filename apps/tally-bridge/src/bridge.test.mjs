@@ -29,7 +29,87 @@ import {
   getBankVoucherCommandBatchKey,
   resolveBankVoucherLedgerIdentities,
   strictBankTransactionCandidates,
+  createReconnectBackoff,
+  liveReadMemoryPressure,
+  uniqueVoucherBlocks,
+  buildOpenBillAmountIndex,
+  matchOpenBillsByAmount,
+  sharedPurchaseDocumentFileName,
 } from "./bridge.mjs";
+
+test("shared-folder purchase PDFs are named <Supplier> <Invoice No>.pdf and fill the Attach Documents add-on", () => {
+  assert.equal(sharedPurchaseDocumentFileName({ supplierLedgerName: "Surya Steel Trading Co", supplierInvoiceNumber: "SSTC-26/27-182" }),
+    "Surya Steel Trading Co SSTC-26-27-182.pdf");
+  assert.equal(sharedPurchaseDocumentFileName({ supplierLedgerName: 'A: "B" <C>', supplierInvoiceNumber: "X|Y?" }), "A- -B- -C- X-Y-.pdf");
+
+  const payload = {
+    companyName: "Kalika Steel Alloys Pvt Ltd", voucherDate: "2026-09-21", supplierInvoiceDate: "2026-09-20",
+    supplierInvoiceNumber: "SSTC-26/27-182", supplierLedgerName: "Surya Steel Trading Co", finalPayableAmount: "1180",
+    items: [{ stockItemName: "M S Scrap & Sponge Iron", purchaseLedgerName: "M.S. Scrap Purchase", hsn: "72044900", unit: "MTS", quantity: "1", rate: "1000", taxableAmount: "1000" }],
+    charges: [{ name: "Input ITC CGST 9%", amount: "90" }, { name: "Input ITC SGST 9%", amount: "90" }],
+    sourceDocumentFolder: "\\\\ksplserver\\TRANCATION\\PURCHASE",
+    sourceDocumentPath: "\\\\ksplserver\\TRANCATION\\PURCHASE\\Surya Steel Trading Co SSTC-26-27-182.pdf",
+    sourceDocumentName: "Surya Steel Trading Co SSTC-26-27-182.pdf", sourceDocumentSha256: "ABC", sourceDocumentId: "file-1",
+  };
+  const xml = buildPurchaseVoucherXml(payload, payload.companyName);
+  assert.match(xml, /<UDF:UDFFORSAVEDOCATTACHSAVE\.LIST DESC="`UdfForSaveDocAttachSave`" ISLIST="YES" TYPE="Logical" INDEX="2200"><UDF:UDFFORSAVEDOCATTACHSAVE DESC="`UdfForSaveDocAttachSave`">Yes</);
+  assert.match(xml, /<UDF:DOCATTACHDETAIL\.LIST DESC="`DocAttachDetail`" INDEX="21000"><UDF:UDFFORLINKDOCUMENTFILE\.LIST[^>]*INDEX="2697"><UDF:UDFFORLINKDOCUMENTFILE[^>]*>\\\\ksplserver\\TRANCATION\\PURCHASE\\Surya Steel Trading Co SSTC-26-27-182\.pdf</);
+  assert.match(xml, /<UDF:UDFVCHTYPELOCATION[^>]*>\\\\ksplserver\\TRANCATION\\PURCHASE\\<\/UDF:UDFVCHTYPELOCATION>/);
+  // Without a shared folder the add-on fields are not written.
+  assert.doesNotMatch(buildPurchaseVoucherXml({ ...payload, sourceDocumentFolder: "" }, payload.companyName), /DOCATTACHDETAIL/);
+});
+
+test("bank lines match parties by an open bill of the same amount and direction", () => {
+  const bill = (ledger, name, closing) => `<BILL NAME="${name}"><LEDGERNAME>${ledger}</LEDGERNAME><BILLDATE>20260502</BILLDATE><OPENINGBALANCE>${closing}</OPENINGBALANCE><CLOSINGBALANCE>${closing}</CLOSINGBALANCE></BILL>`;
+  const index = buildOpenBillAmountIndex([
+    bill("Apex Rebar Projects", "INV/1", "-1231200.00"),   // receivable
+    bill("Balaji Rebar Projects", "INV/2", "-50000.50"),   // receivable
+    bill("Surya Steel Trading Co", "SSTC/9", "484206.40"), // payable
+    ...["A", "B", "C", "D"].map((party) => bill(`Party ${party}`, `X/${party}`, "-1000.00")),
+  ].join(""));
+
+  const exact = matchOpenBillsByAmount(index, { amount: 1231200, direction: "receipt" });
+  assert.deepEqual(exact.map((entry) => [entry.ledger.name, entry.source, entry.openBill.referenceName]), [["Apex Rebar Projects", "open_bill_amount", "INV/1"]]);
+
+  // A payment of the same amount must not match a receivable, and vice versa.
+  assert.deepEqual(matchOpenBillsByAmount(index, { amount: 1231200, direction: "payment" }), []);
+  assert.equal(matchOpenBillsByAmount(index, { amount: 484206.40, direction: "payment" })[0].ledger.name, "Surya Steel Trading Co");
+
+  // Within Rs 1 is offered only when there is no exact match, and labelled.
+  const near = matchOpenBillsByAmount(index, { amount: 50000, direction: "receipt" });
+  assert.deepEqual(near.map((entry) => [entry.ledger.name, entry.source]), [["Balaji Rebar Projects", "open_bill_amount_near"]]);
+
+  // Four parties with the same amount is not a useful signal.
+  assert.deepEqual(matchOpenBillsByAmount(index, { amount: 1000, direction: "receipt" }), []);
+  assert.deepEqual(matchOpenBillsByAmount(index, { amount: 0, direction: "receipt" }), []);
+});
+
+test("windowed Cash Discount evidence keeps each voucher once", () => {
+  // Tally ignores the date window on Vouchers : Ledger unions, so each window
+  // repeats every voucher; repeats must not double-count receipts.
+  const receipt = '<VOUCHER REMOTEID="r-1"><VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME><AMOUNT>100</AMOUNT></VOUCHER>';
+  const sale = '<VOUCHER REMOTEID="s-1"><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME></VOUCHER>';
+  const deduped = uniqueVoucherBlocks([receipt, sale, receipt, sale, receipt].join("\n"));
+  assert.equal((deduped.match(/REMOTEID="r-1"/g) || []).length, 1);
+  assert.equal((deduped.match(/REMOTEID="s-1"/g) || []).length, 1);
+});
+
+test("live channel reconnects back off to 60 seconds and log once per outage", () => {
+  const backoff = createReconnectBackoff();
+  assert.deepEqual(Array.from({ length: 7 }, () => backoff.nextDelay()), [3000, 6000, 12000, 24000, 48000, 60000, 60000]);
+  assert.equal(backoff.shouldLog(), true);
+  assert.equal(backoff.shouldLog(), false);
+  assert.equal(backoff.connected(), true);
+  assert.equal(backoff.nextDelay(), 3000);
+  assert.equal(backoff.shouldLog(), true);
+});
+
+test("live reads are refused only when memory is nearly exhausted", () => {
+  const MB = 1024 * 1024;
+  assert.equal(liveReadMemoryPressure({ freeBytes: 500 * MB, rssBytes: 250 * MB }), false);
+  assert.equal(liveReadMemoryPressure({ freeBytes: 200 * MB, rssBytes: 250 * MB }), true);
+  assert.equal(liveReadMemoryPressure({ freeBytes: 2048 * MB, rssBytes: 1100 * MB }), true);
+});
 
 test("bank posting resolves stale display names by stable Tally GUID", () => {
   const [resolved] = resolveBankVoucherLedgerIdentities([{
@@ -690,6 +770,7 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
     voucherDate: "2026-07-29",
     supplierInvoiceDate: "2026-07-28",
     supplierInvoiceNumber: "VIS/26-27/0142",
+    useCustomVoucherNumber: true,
     voucherNumber: "VIS/26-27/0142 / 28-Jul-26",
     supplierLedgerName: "Vertex Industrial Supplies",
     sourceDocumentPath: "C:\\Kalika Documents\\VIS-0142.pdf",
@@ -743,6 +824,12 @@ test("Purchase vouchers use Tally's item-invoice envelope and allocation tags", 
   assert.match(xml, /<LEDGERNAME>Transportation Inward @ 18\.00%<\/LEDGERNAME>/);
   assert.match(xml, /<LEDGERNAME>TDS Payable @ 0\.10% \(194Q\)<\/LEDGERNAME>/);
   assert.match(xml, /<LEDGERNAME>CGST TDS PAYABLE 1%<\/LEDGERNAME>/);
+  assert.match(xml, /<STOCKITEMNAME>M S Scrap &amp; Sponge Iron<\/STOCKITEMNAME>[\s\S]*?<ISDEEMEDPOSITIVE>Yes<\/ISDEEMEDPOSITIVE>[\s\S]*?<AMOUNT>-250000\.00<\/AMOUNT>/);
+  assert.match(xml, /<LEDGERNAME>Input ITC CGST 9%<\/LEDGERNAME>[\s\S]*?<ISDEEMEDPOSITIVE>Yes<\/ISDEEMEDPOSITIVE><AMOUNT>-22590\.00<\/AMOUNT>/);
+  // TDS stays a credit (positive AMOUNT) but sits on the item side of the
+  // invoice (ISDEEMEDPOSITIVE Yes), so Tally subtracts it from the bill total.
+  assert.match(xml, /<LEDGERNAME>TDS Payable @ 0\.10% \(194Q\)<\/LEDGERNAME>[\s\S]*?<ISDEEMEDPOSITIVE>Yes<\/ISDEEMEDPOSITIVE><AMOUNT>250\.00<\/AMOUNT>/);
+  assert.match(xml, /<LEDGERNAME>Vertex Industrial Supplies<\/LEDGERNAME>[\s\S]*?<ISDEEMEDPOSITIVE>No<\/ISDEEMEDPOSITIVE><AMOUNT>292500\.00<\/AMOUNT>/);
   assert.match(
     xml,
     /<BASICRATEOFINVOICETAX\.LIST TYPE="Number"><BASICRATEOFINVOICETAX>-0\.10<\/BASICRATEOFINVOICETAX><\/BASICRATEOFINVOICETAX\.LIST><ROUNDTYPE\/><LEDGERNAME>TDS Payable @ 0\.10% \(194Q\)<\/LEDGERNAME>/
@@ -826,6 +913,30 @@ test("Purchase vouchers only include an explicitly selected Tally godown", () =>
     xml,
     /<BATCHALLOCATIONS\.LIST><GODOWNNAME>Warehouse A<\/GODOWNNAME><BATCHNAME>Lot 1<\/BATCHNAME><DESTINATIONGODOWNNAME>Warehouse A<\/DESTINATIONGODOWNNAME>/
   );
+});
+
+test("Purchase vouchers do not invent Main Location when no godown is selected", () => {
+  const xml = buildPurchaseVoucherXml({
+    companyName: "Kalika Steel Alloys Pvt Ltd - (25-26)",
+    voucherDate: "2026-09-21",
+    supplierInvoiceDate: "2026-08-11",
+    supplierInvoiceNumber: "SSTC-26/27-182",
+    supplierLedgerName: "Surya Steel Trading Co",
+    finalPayableAmount: 100,
+    items: [{
+      stockItemName: "M S Scrap & Sponge Iron",
+      purchaseLedgerName: "M.S. Scrap Purchase",
+      hsn: "72044900",
+      quantity: 1,
+      unit: "MTS",
+      rate: 100,
+      taxableAmount: 100,
+      godownName: "",
+      batchName: "",
+    }],
+  });
+
+  assert.doesNotMatch(xml, /Main Location|Primary Batch|BATCHALLOCATIONS\.LIST|GODOWNNAME/);
 });
 
 test("Purchase duplicate checks cover the complete Indian financial year", () => {
@@ -985,6 +1096,41 @@ test("Purchase voucher verification includes the attached source PDF identity", 
   );
 });
 
+test("Purchase PDF verification does not require the Kalika TDL", () => {
+  const payload = {
+    voucherDate: "2026-07-29",
+    supplierInvoiceDate: "2026-07-28",
+    supplierInvoiceNumber: "VIS/26-27/0142",
+    supplierLedgerName: "Vertex Industrial Supplies",
+    finalPayableAmount: 292500,
+    items: [],
+    charges: [],
+    withholdings: [],
+    sourceDocumentPath: "\\\\ksplserver\\TRANCATION\\PURCHASE\\Vertex Industrial Supplies VIS-26-27-0142.pdf",
+    sourceDocumentName: "Vertex Industrial Supplies VIS-26-27-0142.pdf",
+    sourceDocumentSha256: "ABC123",
+    sourceDocumentId: "file-1",
+  };
+  const voucher = {
+    date: "20260729",
+    reference: "VIS/26-27/0142",
+    referenceDate: "20260728",
+    inventoryEntries: [],
+    ledgerEntries: [{ ledgerName: "Vertex Industrial Supplies", amount: 292500 }],
+    billAllocations: [{ referenceName: "VIS/26-27/0142", billType: "New Ref", billDate: "20260729", amount: 292500 }],
+  };
+  const pdfDifferences = (voucherValue, payloadValue) =>
+    purchaseVoucherReadbackComparison(voucherValue, payloadValue).filter((difference) => /pdf|document/i.test(difference));
+
+  // No Kalika TDL and no shared folder: nothing in Tally can hold the PDF.
+  assert.deepEqual(pdfDifferences(voucher, payload), []);
+  // Shared folder configured: the client's Attach Documents path must match.
+  const withFolder = { ...payload, sourceDocumentFolder: "\\\\ksplserver\\TRANCATION\\PURCHASE" };
+  assert.deepEqual(pdfDifferences({ ...voucher, linkDocumentPath: payload.sourceDocumentPath }, withFolder), []);
+  assert.ok(pdfDifferences(voucher, withFolder).some((difference) => /pdf path was not attached/i.test(difference)));
+  assert.ok(pdfDifferences({ ...voucher, linkDocumentPath: "\\\\ksplserver\\other.pdf" }, withFolder).length > 0);
+});
+
 test("canonical Purchase vouchers reject an unbalanced approved representation", () => {
   assert.throws(() => buildPurchaseVoucherXml({
     canonicalVersion: 2,
@@ -1050,6 +1196,7 @@ test("Purchase read-back rejects every substantive canonical mutation regardless
       batchName: "Lot 1",
     }],
     ledgerEntries: [
+      { ledgerName: "Scrap Purchase", amount: -100 },
       { ledgerName: "Input SGST", amount: -9 },
       { ledgerName: "Supplier", amount: 117.5 },
       { ledgerName: "TDS 194Q", amount: 1 },

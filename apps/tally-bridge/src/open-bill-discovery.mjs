@@ -7,7 +7,8 @@ export async function readScopedOpenBills({ names, read, check, freeMemory, batc
   let adaptiveLimit = 50;
   while (offset < unique.length) {
     check();
-    if (freeMemory() < 750 * 1024 * 1024) throw new Error('Open-bill discovery paused: less than 750 MB memory is available.');
+    // Batches already shrink with free memory; stop only when nearly exhausted.
+    if (freeMemory() < 256 * 1024 * 1024) throw new Error('Open-bill discovery paused: less than 256 MB memory is available.');
     const size = Math.max(1, Math.min(50, batchLimit(), adaptiveLimit));
     const batch = unique.slice(offset, offset + size);
     progress?.(`Reading open bills: ${offset} of ${unique.length} ledger scopes checked...`);

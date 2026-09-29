@@ -59,7 +59,7 @@ test('failure stops discovery without retrying or returning partial success', as
 test('memory, cancellation and response limits stop further reads', async () => {
   let calls = 0;
   const read = async () => { calls++; return '12345'; };
-  await assert.rejects(readScopedOpenBills({ ...options, read, freeMemory: () => 100 }), /750 MB/);
+  await assert.rejects(readScopedOpenBills({ ...options, read, freeMemory: () => 100 }), /256 MB/);
   await assert.rejects(readScopedOpenBills({ ...options, read, check: () => { throw new Error('cancelled'); } }), /cancelled/);
   assert.equal(calls, 0);
   await assert.rejects(readScopedOpenBills({ ...options, read, maxBytes: 4 }), /size limit/);

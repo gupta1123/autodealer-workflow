@@ -276,6 +276,27 @@ async function handleBrowserRequest(socket, message, meta) {
   if (item.debitNoteKey) activeDebitNotes.add(item.debitNoteKey);
   const requestedCompanyName = String(message.companyName ?? "").trim();
   const companyKey = requestedCompanyName.toLowerCase().replace(/\s+/g, " ");
+  // Connectors from 1.2.24 analyse a scan themselves when given the context
+  // (debit notes already created, connection status), so only the finished
+  // dashboard crosses the internet. Without it they send every open bill
+  // and the API analyses, as before; any context failure falls back to that.
+  let analysisContext;
+  if (["scan", "followups_scan"].includes(operation) && connectorSupportsAnalysis(connectorMeta.bridgeVersion)) {
+    const contextStartedAt = Date.now();
+    try {
+      const followUps = operation === "followups_scan";
+      const context = await apiRequest(followUps ? "/api/collections/follow-ups/analysis-context" : "/api/collections/live/analysis-context", {
+        organizationId: meta.organizationId, accessToken: meta.accessToken, signal: item.controller.signal,
+        body: { connectionId: meta.connectionId, companyName: requestedCompanyName, financialYear: message.financialYear, companyGuid: message.companyGuid },
+      });
+      analysisContext = { ...context, followUps };
+    } catch (error) {
+      if (!pending.has(requestId)) return;
+      console.warn(`Cash Discount scan ${requestId}: analysis context unavailable (${error.message}); the API will analyse.`);
+    }
+    item.contextMs = Date.now() - contextStartedAt;
+    if (!pending.has(requestId)) return;
+  }
   send(connector, {
     type: "operation",
     requestId,
@@ -306,7 +327,20 @@ async function handleBrowserRequest(socket, message, meta) {
     customerScope: message.customerScope && typeof message.customerScope === "object"
       ? message.customerScope
       : meta.customerScope ?? meta.customerScopes?.[companyKey] ?? meta.defaultCustomerScope,
+    analysisContext,
   });
+}
+
+// Off unless CASH_DISCOUNT_CONNECTOR_ANALYSIS=true: the finished dashboard is
+// about 3.5x larger than the open bills (1.36 MB vs 0.41 MB compressed on a
+// 4,000-customer company), so over the internet the API analysing is faster.
+// Kept for a same-computer path where nothing is uploaded.
+function connectorSupportsAnalysis(bridgeVersion) {
+  if (process.env.CASH_DISCOUNT_CONNECTOR_ANALYSIS !== "true") return false;
+  const version = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(bridgeVersion || ""));
+  if (!version) return false;
+  const [major, minor, patch] = version.slice(1).map(Number);
+  return major > 1 || (major === 1 && (minor > 2 || (minor === 2 && patch >= 24)));
 }
 
 async function handleConnectorResult(socket, message, meta) {
@@ -339,9 +373,14 @@ async function handleConnectorResult(socket, message, meta) {
     try {
       const connectorResultAt = Date.now();
       const connectorDiagnostics = message.data?.benchmarkDiagnostics ?? null;
-      send(item.browser, { type: "progress", requestId, message: item.operation === 'followups_scan' ? 'Customer dues checked. Preparing payment follow-ups…' : "Customer dues checked. Calculating cash discounts and checking debit-note history…" });
       const analysisStartedAt = Date.now();
-      const dashboard = await apiRequest(item.operation === 'followups_scan' ? '/api/collections/follow-ups/analyse' : '/api/collections/live/analyse', {
+      // Connectors from 1.2.24 analyse the scan themselves (with the context
+      // sent with the request) and return the finished dashboard; older ones
+      // send every open bill for the API to analyse.
+      const dashboard = message.data?.analysed === true && message.data.dashboard && typeof message.data.dashboard === "object"
+        ? message.data.dashboard
+        : await (send(item.browser, { type: "progress", requestId, message: item.operation === 'followups_scan' ? 'Customer dues checked. Preparing payment follow-ups…' : "Customer dues checked. Calculating cash discounts and checking debit-note history…" }),
+          apiRequest(item.operation === 'followups_scan' ? '/api/collections/follow-ups/analyse' : '/api/collections/live/analyse', {
         organizationId:item.organizationId,
         accessToken: item.accessToken,
         signal: item.controller.signal,
@@ -351,7 +390,7 @@ async function handleConnectorResult(socket, message, meta) {
           financialYear: item.authorizationMessage.financialYear,
           scan: message.data,
         },
-      });
+      }));
       if (!pending.has(requestId)) return;
       dashboard.cache = message.data?.cache ?? null;
       dashboard.scanSummary = message.data?.scanSummary ?? dashboard.scanSummary;
@@ -370,7 +409,9 @@ async function handleConnectorResult(socket, message, meta) {
         };
         dashboard.benchmarkDiagnostics.gateway.browserResultBytes = Buffer.byteLength(JSON.stringify(dashboard));
       }
-      console.log(`Cash Discount scan ${requestId} completed in ${Date.now() - item.startedAt} ms (gateway total).`);
+      // Where the time went: until the connector's result had fully arrived
+      // (scan plus upload), then analysis (on the connector, or here).
+      console.log(`Cash Discount scan ${requestId} completed in ${Date.now() - item.startedAt} ms (gateway total): connector result after ${connectorResultAt - item.startedAt} ms${item.contextMs !== undefined ? ` (analysis context ${item.contextMs} ms)` : ""}, ${message.data?.analysed === true ? "analysed on the connector" : `API analysis ${Date.now() - analysisStartedAt} ms`}.`);
       recordScanOutcome(item, 'completed', dashboard);
       clearPending(requestId);
       send(item.browser, { type: "result", requestId, success: true, data: dashboard });
@@ -453,13 +494,17 @@ export function startCashDiscountGateway(options = {}) {
   apiBaseUrl = String(options.apiBaseUrl || process.env.CASH_DISCOUNT_API_BASE_URL || "http://localhost:3001")
     .replace(/\/+$/, "");
 
+  // Scan results compress about 13x (4.3 MB -> 0.34 MB). Compression is
+  // negotiated per connection, so clients without it keep working.
+  const perMessageDeflate = { threshold: 16 * 1024, zlibDeflateOptions: { level: 6 } };
   const server = attachedServer
-    ? new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_BYTES })
+    ? new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_BYTES, perMessageDeflate })
     : new WebSocketServer({
         host: options.host || HOST,
         port: Number(options.port ?? PORT),
         path: gatewayPath,
         maxPayload: MAX_MESSAGE_BYTES,
+        perMessageDeflate,
       });
 
   if (attachedServer) {

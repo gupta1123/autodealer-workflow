@@ -12,7 +12,7 @@ function atomicWrite(filePath, bytes) {
   fs.renameSync(temporary, filePath);
 }
 
-function powershellProtectedData(mode, bytes) {
+export function powershellProtectedData(mode, bytes) {
   const powershell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const loadProtectedData = "Add-Type -AssemblyName System.Security;";
   const script = mode === "protect"
