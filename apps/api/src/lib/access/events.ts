@@ -58,11 +58,16 @@ export function accessEventStream(request: Request, userId: string, organization
       channel.on('broadcast', { event: 'access_changed' }, ({ payload }) => {
         if (accessEvent(payload)) void check();
       }).subscribe(status => send('transport', { online: status === 'SUBSCRIBED' }));
-      // Also handles lost notifications. Never trust a notification as authority.
-      const timer = setInterval(() => void check(), 30_000);
+      // Proxies in front of the API (Netlify, Heroku's router) close a request
+      // after about 30 s. The stream therefore ends itself at 25 s: it first
+      // re-checks access (covering any lost notification; never trust a
+      // notification as authority), then tells the page to reconnect at once.
+      const timer = setTimeout(() => {
+        void check().finally(() => { send('reconnect', {}); dispose(); });
+      }, 25_000);
       dispose = () => {
         if (closed) return;
-        closed = true; clearInterval(timer); request.signal.removeEventListener('abort', dispose);
+        closed = true; clearTimeout(timer); request.signal.removeEventListener('abort', dispose);
         void db.removeChannel(channel).catch(() => {}).finally(() => db.realtime.disconnect()).catch(() => {});
         try { controller.close(); } catch { /* The response reader may already have cancelled. */ }
       };

@@ -82,15 +82,25 @@ export function AccessProvider({ children }: { children: ReactNode }) {
     if (!org || !user || passwordRequired) return;
     const controller = new AbortController(); let reconnect: ReturnType<typeof setTimeout> | undefined;
     const connect = async () => {
+      // The server ends each stream after ~25 s (proxies cut long requests)
+      // with a "reconnect" event: reconnect at once. Any other end is a
+      // failure: re-check access and retry after a pause.
+      let rotated = false;
       try {
         const response = await apiFetch('/api/access/events', { signal: controller.signal, headers: { 'X-Kalika-Organization': org } });
         await consumeAccessEvents(response, (type, data) => {
           if (controller.signal.aborted) return;
           if (type === 'transport') live.current = data.online === true;
+          if (type === 'reconnect') rotated = true;
           if (type === 'access_revoked' || (type === 'access_changed' && Number(data.revision) > currentRevision.current)) void refresh();
         });
       } catch { /* durable snapshot fallback remains active */ }
-      finally { live.current = false; if (!controller.signal.aborted) reconnect = setTimeout(() => { void refresh(); void connect(); }, 15000); }
+      finally {
+        if (!controller.signal.aborted) {
+          if (rotated) void connect();
+          else { live.current = false; reconnect = setTimeout(() => { void refresh(); void connect(); }, 15000); }
+        }
+      }
     };
     void connect();
     return () => { controller.abort(); if (reconnect) clearTimeout(reconnect); live.current = false; };
