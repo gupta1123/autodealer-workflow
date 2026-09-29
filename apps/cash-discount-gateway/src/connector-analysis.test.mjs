@@ -45,7 +45,7 @@ async function withGateway(bridgeVersion, run) {
   const connector = await open({ role: "connector", token: "bridge-token", bridgeVersion });
   const browser = await open({ role: "browser", token: "access-token", companyName: "Solution Nyx" });
   try {
-    await run({ connector, browser, requests });
+    await run({ connector, browser, requests, open });
   } finally {
     browser.close(); connector.close();
     for (const socket of gateway.clients) socket.terminate();
@@ -83,6 +83,39 @@ test("with connector analysis switched on, a 1.2.24 connector's dashboard goes s
     assert.equal(result.data.from, "connector");
     assert.deepEqual(result.data.scanSummary, { complete: true });
     assert.equal(requests.filter((request) => request.url === "/api/collections/live/analyse").length, 0, "no server analysis");
+  });
+});
+
+test("a paged scan: 1.2.25 connector keeps the dashboard, and only the browser that scanned can read its pages", async () => {
+  await withGateway("1.2.25", async ({ connector, browser, requests, open }) => {
+    browser.send(JSON.stringify({ type: "request", requestId: "scan-p", operation: "scan", companyName: "Solution Nyx", financialYear: "2026-27", payload: { paged: true } }));
+    const operation = await nextMessage(connector, (message) => message.type === "operation" && message.requestId === "scan-p");
+    assert.ok(operation.analysisContext, "paged scans get the context without the switch");
+    assert.equal(operation.payload.paged, true);
+    connector.send(JSON.stringify({ type: "operation_result", requestId: "scan-p", success: true,
+      data: { analysed: true, dashboard: { paged: true, dashboardId: "connection-1|solutionnyx|2026-27|discounts|r1", summary: { followUps: { total: 9071 } } }, scanSummary: { complete: true } } }));
+    const shell = await nextMessage(browser, (message) => message.type === "result" && message.requestId === "scan-p");
+    assert.equal(shell.data.dashboardId, "connection-1|solutionnyx|2026-27|discounts|r1");
+
+    browser.send(JSON.stringify({ type: "request", requestId: "page-1", operation: "collections_query",
+      payload: { dashboardId: "connection-1|solutionnyx|2026-27|discounts|r1", query: { view: "followUps", page: 2, pageSize: 25 } } }));
+    const forwarded = await nextMessage(connector, (message) => message.requestId === "page-1");
+    assert.equal(forwarded.operation, "collections_query");
+    assert.deepEqual(forwarded.payload.query, { view: "followUps", page: 2, pageSize: 25 });
+    connector.send(JSON.stringify({ type: "operation_result", requestId: "page-1", success: true, data: { total: 9071, page: 2, rows: [{ id: "fu-26" }] } }));
+    const page = await nextMessage(browser, (message) => message.type === "result" && message.requestId === "page-1");
+    assert.deepEqual(page.data.rows, [{ id: "fu-26" }]);
+    assert.equal(requests.filter((request) => request.url === "/api/collections/live/session" && request.body.operation === "collections_query").length, 0, "pages are not re-authorized each time");
+
+    browser.send(JSON.stringify({ type: "request", requestId: "page-x", operation: "collections_query", payload: { dashboardId: "connection-1|other|r9", query: { view: "followUps" } } }));
+    assert.match((await nextMessage(browser, (message) => message.requestId === "page-x")).error, /expired|Refresh/);
+
+    const otherBrowser = await open({ role: "browser", token: "other-token", companyName: "Solution Nyx" });
+    otherBrowser.send(JSON.stringify({ type: "request", requestId: "page-o", operation: "collections_query",
+      payload: { dashboardId: "connection-1|solutionnyx|2026-27|discounts|r1", query: { view: "followUps" } } }));
+    const refused = await nextMessage(otherBrowser, (message) => message.requestId === "page-o");
+    assert.equal(refused.success, false, "another browser connection cannot read this dashboard");
+    otherBrowser.close();
   });
 });
 

@@ -106,7 +106,7 @@ function recordScanOutcome(item, status, data, error) {
 
 function failPending(requestId, error) {
   const active = pending.get(requestId);
-  if (active && ["scanning", "revalidating", "company_check", "ledger_suggestions", "verify_bank_transaction", "fetch_customer_open_bills"].includes(active.phase)) {
+  if (active && ["scanning", "revalidating", "company_check", "ledger_suggestions", "verify_bank_transaction", "fetch_customer_open_bills", "collections"].includes(active.phase)) {
     send(active.connector, { type: "cancel", requestId });
   }
   const item = clearPending(requestId);
@@ -223,9 +223,45 @@ async function authorizeLiveOperation(meta,message,previous) {
   return authority.teamAccess ? authority : null;
 }
 
+// A browser connection may read pages of a dashboard its own authorized scan
+// produced, for this long. Each page is then not re-authorized with the
+// database; the next scan (or reconnect) authorizes again.
+const DASHBOARD_GRANT_MS = 30 * 60_000;
+
+function grantDashboard(browser, dashboardId) {
+  const meta = metadata.get(browser);
+  if (!meta || !dashboardId) return;
+  meta.dashboardGrants ||= new Map();
+  const now = Date.now();
+  for (const [id, expiresAt] of meta.dashboardGrants) if (expiresAt <= now) meta.dashboardGrants.delete(id);
+  meta.dashboardGrants.set(dashboardId, now + DASHBOARD_GRANT_MS);
+}
+
+function handleCollectionsRequest(socket, message, meta, requestId, operation) {
+  const dashboardId = String(message.payload?.dashboardId || "");
+  const fail = (error) => send(socket, { type: "result", requestId, success: false, error });
+  if ((meta.dashboardGrants?.get(dashboardId) || 0) <= Date.now()) return fail("These results have expired. Refresh to continue.");
+  if (pending.has(requestId)) return fail("This live request is already running.");
+  const connector = connectors.get(meta.connectionId);
+  if (!connector || connector.readyState !== WebSocket.OPEN || metadata.get(connector)?.ownerUserId !== meta.ownerUserId) {
+    return fail("The Tally connector is not on the live channel. Restart it and refresh.");
+  }
+  const item = startPending({ requestId, browser: socket, connector, connectionId: meta.connectionId, ownerUserId: meta.ownerUserId,
+    accessToken: meta.accessToken, operation, payload: message.payload });
+  item.phase = "collections";
+  send(connector, {
+    type: "operation", requestId, operation, deadlineAt: Date.now() + 30_000,
+    payload: { dashboardId, query: message.payload?.query, view: message.payload?.view, ids: message.payload?.ids },
+  });
+}
+
 async function handleBrowserRequest(socket, message, meta) {
   const requestId = String(message.requestId || randomUUID());
   const operation = String(message.operation ?? "");
+  if (operation === "collections_query" || operation === "collections_rows") {
+    handleCollectionsRequest(socket, message, meta, requestId, operation);
+    return;
+  }
   if (!['test_purchase_document_folder', 'company_check', 'bank_ledgers', 'ledger_masters', 'ledger_suggestions', 'verify_bank_transaction', 'fetch_customer_open_bills', 'scan', 'followups_scan', 'create_debit_note'].includes(operation)) {
     send(socket, { type: "result", requestId, success: false, error: "Unsupported Cash Discount operation." });
     return;
@@ -311,7 +347,10 @@ async function handleBrowserRequest(socket, message, meta) {
   // dashboard crosses the internet. Without it they send every open bill
   // and the API analyses, as before; any context failure falls back to that.
   let analysisContext;
-  if (["scan", "followups_scan"].includes(operation) && connectorSupportsAnalysis(connectorMeta.bridgeVersion)) {
+  // A page that pages its lists (payload.paged) always gets connector
+  // analysis from connectors that can hold the dashboard (1.2.25 and later).
+  const pagedScan = message.payload?.paged === true && versionAtLeast(connectorMeta.bridgeVersion, [1, 2, 25]);
+  if (["scan", "followups_scan"].includes(operation) && (pagedScan || connectorSupportsAnalysis(connectorMeta.bridgeVersion))) {
     const contextStartedAt = Date.now();
     try {
       const followUps = operation === "followups_scan";
@@ -368,10 +407,17 @@ async function handleBrowserRequest(socket, message, meta) {
 // Kept for a same-computer path where nothing is uploaded.
 function connectorSupportsAnalysis(bridgeVersion) {
   if (process.env.CASH_DISCOUNT_CONNECTOR_ANALYSIS !== "true") return false;
+  return versionAtLeast(bridgeVersion, [1, 2, 24]);
+}
+
+function versionAtLeast(bridgeVersion, minimum) {
   const version = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(bridgeVersion || ""));
   if (!version) return false;
-  const [major, minor, patch] = version.slice(1).map(Number);
-  return major > 1 || (major === 1 && (minor > 2 || (minor === 2 && patch >= 24)));
+  const parts = version.slice(1).map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    if (parts[index] !== minimum[index]) return parts[index] > minimum[index];
+  }
+  return true;
 }
 
 async function handleConnectorResult(socket, message, meta) {
@@ -395,7 +441,7 @@ async function handleConnectorResult(socket, message, meta) {
     return;
   }
 
-  if (["test_purchase_document_folder", "bank_ledgers", "ledger_masters", "ledger_suggestions", "verify_bank_transaction", "fetch_customer_open_bills"].includes(item.phase)) {
+  if (["test_purchase_document_folder", "bank_ledgers", "ledger_masters", "ledger_suggestions", "verify_bank_transaction", "fetch_customer_open_bills", "collections"].includes(item.phase)) {
     clearPending(requestId);
     send(item.browser, { type: "result", requestId, success: true, data: message.data });
     return;
@@ -424,6 +470,8 @@ async function handleConnectorResult(socket, message, meta) {
         },
       }));
       if (!pending.has(requestId)) return;
+      // A paged dashboard stays on the connector; this browser may read its pages.
+      if (dashboard.paged === true && dashboard.dashboardId) grantDashboard(item.browser, String(dashboard.dashboardId));
       dashboard.cache = message.data?.cache ?? null;
       dashboard.scanSummary = message.data?.scanSummary ?? dashboard.scanSummary;
       if (connectorDiagnostics) {
