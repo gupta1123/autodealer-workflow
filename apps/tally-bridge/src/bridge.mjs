@@ -1993,12 +1993,25 @@ function purchaseVoucherReadbackComparison(voucher, payload, options = {}) {
   }
 
   const withholdingEntries = new Set(Array.isArray(payload?.withholdings) ? payload.withholdings : []);
+  // Tally keeps one accounting row per purchase ledger: two items on the same
+  // ledger come back as a single combined amount. Compare the ledger total;
+  // each item line was already checked individually above.
+  const purchaseLedgerTotals = new Map();
+  for (const item of expectedItems) {
+    const name = String(item?.purchaseLedgerName || "").trim();
+    if (!name) continue;
+    const key = normalizeLooseName(name);
+    const current = purchaseLedgerTotals.get(key) || { name, amount: 0 };
+    current.amount += Math.abs(Number(item?.taxableAmount) || 0);
+    purchaseLedgerTotals.set(key, current);
+  }
   const expectedSignedLedgerRows = [
     { name: payload?.supplierLedgerName, signedAmount: Number(payload?.finalPayableAmount), role: "supplier" },
-    ...expectedItems.map((item) => ({
-      name: item?.purchaseLedgerName,
-      signedAmount: -Math.abs(Number(item?.taxableAmount)),
+    ...Array.from(purchaseLedgerTotals.values()).map((entry) => ({
+      name: entry.name,
+      signedAmount: -Math.round(entry.amount * 100) / 100,
       role: "purchase ledger",
+      combinable: true,
     })),
     ...expectedAllocations.map((entry) => ({
       name: entry.name,
@@ -2013,8 +2026,23 @@ function purchaseVoucherReadbackComparison(voucher, payload, options = {}) {
     const actual = actualLedgerRows.find((entry) =>
       !entry.used && normalizeLooseName(entry.ledgerName) === normalizeLooseName(expected.name) && closeMoney(Number(entry.amount), expected.signedAmount)
     );
-    if (actual) actual.used = true;
-    else differences.push(`${expected.name} ${expected.role} amount or accounting direction differs.`);
+    if (actual) {
+      actual.used = true;
+      continue;
+    }
+    // A purchase ledger may also come back split per item: accept rows on the
+    // same ledger and side whose sum is the expected total.
+    const sameLedgerRows = expected.combinable
+      ? actualLedgerRows.filter((entry) =>
+          !entry.used && normalizeLooseName(entry.ledgerName) === normalizeLooseName(expected.name) &&
+          Math.sign(Number(entry.amount)) === Math.sign(expected.signedAmount))
+      : [];
+    const splitTotal = sameLedgerRows.reduce((total, entry) => total + Number(entry.amount), 0);
+    if (sameLedgerRows.length > 1 && closeMoney(splitTotal, expected.signedAmount)) {
+      sameLedgerRows.forEach((entry) => { entry.used = true; });
+    } else {
+      differences.push(`${expected.name} ${expected.role} amount or accounting direction differs.`);
+    }
   }
 
   for (const unexpected of actualLedgerRows.filter((entry) => !entry.used)) {

@@ -1254,3 +1254,29 @@ test("purchase vouchers record the supplier e-way bill as reference, like the cl
   assert.doesNotMatch(buildPurchaseVoucherXml({ ...payload, ewayBill: undefined }, payload.companyName), /EWAYBILL/);
   assert.doesNotMatch(buildPurchaseVoucherXml({ ...payload, ewayBill: { ...payload.ewayBill, number: "12345" } }, payload.companyName), /EWAYBILL/);
 });
+
+test("two items on one purchase ledger verify against Tally's single combined ledger row", () => {
+  const item = (quantity, amount) => ({ stockItemName: "M S Scrap & Sponge Iron", purchaseLedgerName: "M.S. Scrap Purchase",
+    hsn: "72044900", unit: "MTS", quantity, rate: "34300", taxableAmount: amount, godownName: "Main Location" });
+  const payload = {
+    voucherDate: "2026-09-30", supplierInvoiceDate: "2026-08-12", supplierInvoiceNumber: "BST/26-27/635",
+    supplierLedgerName: "Tawari Vasundhara Steel Enterprises, Kolhapur", finalPayableAmount: "1051638",
+    items: [item("18.690", "641067"), item("11.970", "410571")], charges: [], withholdings: [],
+  };
+  const inventory = (quantity, amount) => ({ stockItemName: "M S Scrap & Sponge Iron", purchaseLedgerName: "M.S. Scrap Purchase",
+    hsn: "72044900", quantity: `${quantity} MTS`, rate: "34300.00/MTS", amount, signedAmount: -amount, godownName: "Main Location" });
+  const voucher = {
+    date: "20260930", reference: "BST/26-27/635", referenceDate: "20260812",
+    inventoryEntries: [inventory("18.690", 641067), inventory("11.970", 410571)],
+    billAllocations: [{ referenceName: "BST/26-27/635", billType: "New Ref", billDate: "20260930", amount: 1051638 }],
+  };
+  const withLedgers = (rows) => purchaseVoucherReadbackComparison({ ...voucher, ledgerEntries: [
+    { ledgerName: payload.supplierLedgerName, amount: 1051638 }, ...rows] }, payload);
+
+  // Tally combines both items into one row on the purchase ledger.
+  assert.deepEqual(withLedgers([{ ledgerName: "M.S. Scrap Purchase", amount: -1051638 }]), []);
+  // Split per item is accepted as well.
+  assert.deepEqual(withLedgers([{ ledgerName: "M.S. Scrap Purchase", amount: -641067 }, { ledgerName: "M.S. Scrap Purchase", amount: -410571 }]), []);
+  // A wrong total is still a mismatch.
+  assert.ok(withLedgers([{ ledgerName: "M.S. Scrap Purchase", amount: -1000000 }]).some((text) => /M\.S\. Scrap Purchase purchase ledger/.test(text)));
+});
