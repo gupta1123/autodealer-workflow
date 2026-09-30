@@ -700,6 +700,43 @@ export function prepareLiveTallyApprovalContext(
   return approvalContext;
 }
 
+/**
+ * The compact validation subset is built when the catalogue loads. Anything the
+ * reviewer picks later must be added before each save, or the server cannot
+ * find it and falls back to its own default for that field.
+ */
+export function withSelectedLiveMasters(
+  compactValue: unknown,
+  review: TallyPostingReview,
+  masterOptions: TallyPostingResponse["masterOptions"] | null
+) {
+  const compact = liveRecord(compactValue);
+  const masters = liveRecord(compact?.masters);
+  if (!compact || !masters || !masterOptions) return compactValue;
+  const selected = liveRecord(liveRecord(prepareLiveTallyApprovalContext(compact, review, masterOptions))?.masters) ?? {};
+  const merge = (key: "ledgers" | "stockItems" | "units" | "godowns") => {
+    const rows = new Map<string, unknown>();
+    for (const value of [
+      ...(Array.isArray(masters[key]) ? masters[key] as unknown[] : []),
+      ...(Array.isArray(selected[key]) ? selected[key] as unknown[] : []),
+    ]) {
+      const name = liveKey(liveRecord(value)?.name);
+      if (name) rows.set(name, value);
+    }
+    return Array.from(rows.values());
+  };
+  return {
+    ...compact,
+    masters: {
+      ...masters,
+      ledgers: merge("ledgers"),
+      stockItems: merge("stockItems"),
+      units: merge("units"),
+      godowns: merge("godowns"),
+    },
+  };
+}
+
 async function readResponse(response: Response, fallback: string) {
   const raw = await response.text();
   let payload: Record<string, unknown> = {};

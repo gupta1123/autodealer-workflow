@@ -50,6 +50,7 @@ import {
   matchTallyPurchaseLineMasters,
   matchTallyPurchaseSupplierLedger,
   prepareLiveTallyApprovalContext,
+  withSelectedLiveMasters,
   prepareLiveTallyCatalogue,
   prepareTallyPurchasePostingFromLive,
   saveTallyPurchasePosting,
@@ -1579,12 +1580,14 @@ export function TallyPurchasePostingPanel({
     try {
       setSaving(true);
       setError(null);
+      // Include whatever is picked now; otherwise the server cannot find a
+      // later pick in the load-time subset and silently drops it.
       const next = await saveTallyPurchasePosting(
         caseId,
         nextReview,
         selectedConnectionId,
         selectedCompanyName,
-        liveMasterResultRef.current
+        withSelectedLiveMasters(liveMasterResultRef.current, nextReview, liveMasterOptionsRef.current)
       );
       const hydrated = withLiveMasterOptions(next);
       setPayload(hydrated);
