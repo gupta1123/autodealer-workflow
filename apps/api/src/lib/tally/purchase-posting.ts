@@ -721,6 +721,15 @@ function invoiceRoundOffAmount(
   return Math.abs(derived) <= MAX_ROUND_OFF_PAISE ? formatPaise(derived) : "";
 }
 
+// Section 194C: 1% for an individual or HUF payee, 2% for anyone else. The
+// payee type is the 4th character of the PAN inside the GSTIN (P or H). An
+// unreadable GSTIN keeps 1%, the rate the client books for its suppliers.
+export function transportTdsRateForPayee(gstin: unknown) {
+  const pan = normalizeGstin(gstin).slice(2, 12);
+  if (!/^[A-Z]{5}\d{4}[A-Z]$/.test(pan)) return "1";
+  return pan[3] === "P" || pan[3] === "H" ? "1" : "2";
+}
+
 const FREIGHT_ROW_PATTERN = /\b(?:freight|cartage|carriage|lorry\s+hire|transport(?:ation)?)\b/i;
 
 // A charge row, not goods: named as freight/transport and either without a
@@ -1159,7 +1168,7 @@ function buildDefaultReview(
       mappedRoleName(masters, mappings, "tds_ledger", ["transport", "goods_transport"], ["ledger", "tax_ledger"]) ||
       exactMasterName(masters, "Tds on Goods Transport", ["ledger", "tax_ledger"]) ||
       namedRoleLedger(masters, [/tds|withholding|tax\s+deducted/i, /transport|freight/i]),
-    transportTdsRate: source.invoiceTransportTdsRate || "1",
+    transportTdsRate: source.invoiceTransportTdsRate || transportTdsRateForPayee(source.supplierGstin),
     cgstTdsLedgerName:
       mappedRoleName(masters, mappings, "tds_ledger", ["cgst_tds", "gst_tds_cgst"], ["ledger", "tax_ledger"]) ||
       exactMasterName(masters, "CGST TDS PAYABLE 1%", ["ledger", "tax_ledger"]) ||

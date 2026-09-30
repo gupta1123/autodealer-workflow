@@ -48,6 +48,7 @@ const {
   getCanonicalInvoiceDocuments,
   getPurchaseInvoiceCandidates,
   purchaseVoucherNumber,
+  transportTdsRateForPayee,
 } = await loadPurchasePostingModule();
 
 test("purchase voucher number matches the frontend invoice/date reference", () => {
@@ -1351,7 +1352,9 @@ test("a transportation row is booked once as freight with transport TDS on it", 
   assert.equal(result.review.freightAmount, "200.00");
   assert.equal(result.review.applyTransportTds, true);
   assert.equal(result.calculation.gstAmount, "216.00");
-  assert.equal(result.calculation.transportTdsAmount, "2.00");
+  // Test supplier PAN AAAAA0000A is not an individual or HUF, so 2%.
+  assert.equal(result.review.transportTdsRate, "2");
+  assert.equal(result.calculation.transportTdsAmount, "4.00");
   assert.equal(result.calculation.transportTdsDifference, "0.00");
   for (const code of ["STOCK_ITEM_REQUIRED", "LINE_ACCOUNTING_FIELDS_REQUIRED", "GST_MISMATCH", "TOTAL_MISMATCH"]) {
     assert.equal(result.blockers.some((blocker) => blocker.code === code), false, code);
@@ -1378,4 +1381,12 @@ test("a wrong transport TDS ledger is named and the right one is suggested", () 
   assert.ok(blocker);
   assert.match(blocker.message, /Transportation Inward @ 18\.00% is not a goods-transport TDS ledger/);
   assert.equal(blocker.suggestion, "Tds on Goods Transport");
+});
+
+test("transport TDS rate follows the payee type in the GSTIN's PAN", () => {
+  assert.equal(transportTdsRateForPayee("27ABMPS1459G1ZA"), "1"); // P: individual (Bhawana)
+  assert.equal(transportTdsRateForPayee("27AAAHK1234A1Z5"), "1"); // H: HUF
+  assert.equal(transportTdsRateForPayee("27AACCK1502A1ZD"), "2"); // C: company
+  assert.equal(transportTdsRateForPayee("27AAAFA1234A1Z5"), "2"); // F: firm
+  assert.equal(transportTdsRateForPayee(""), "1");
 });
