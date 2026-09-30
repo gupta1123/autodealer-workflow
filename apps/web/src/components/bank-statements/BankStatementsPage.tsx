@@ -3495,6 +3495,23 @@ export function BankStatementsPage() {
     );
     return exactNames.length === 1 ? exactNames[0] : null;
   }, [account.accountNumber, bankLedgerOptions]);
+  // Ledger names in the selected Tally company. Empty until ledgers load, in
+  // which case nothing can be judged missing yet.
+  const companyLedgerNameKeys = useMemo(
+    () => new Set([...ledgerMasters, ...bankLedgerOptions].map((ledger) => normalizeName(ledger.name)).filter(Boolean)),
+    [bankLedgerOptions, ledgerMasters]
+  );
+  const bankLedgerMissingInTally = Boolean(
+    bankLedgerName.trim() && companyLedgerNameKeys.size > 0 && !companyLedgerNameKeys.has(normalizeName(bankLedgerName))
+  );
+  // Saved accounts are matched across every past connection and company. Only
+  // offer those whose bank ledger exists in the selected Tally company.
+  const scopedAccountCandidates = useMemo(
+    () => (preview?.candidates ?? []).filter((candidate) =>
+      companyLedgerNameKeys.size === 0 ||
+      Boolean(candidate.tallyLedgerName && companyLedgerNameKeys.has(normalizeName(candidate.tallyLedgerName)))),
+    [companyLedgerNameKeys, preview?.candidates]
+  );
 
   useEffect(() => {
     if (!preview || bankLedgerName || bankLedgerChangeMode || !exactBankLedgerMatch) return;
@@ -5031,9 +5048,58 @@ export function BankStatementsPage() {
     clearStatementReview();
   }
 
+  // Tally check results belong to one bank ledger. After the ledger or account
+  // changes they must be discarded, so posting requires a fresh check.
+  function clearTallyCheckResults() {
+    setBillAllocationsByTransactionId({});
+    setOutgoingVerificationsByTransactionId({});
+    setTallyPresenceByTransactionId({});
+    setTallyBalanceProof(null);
+    setTallyCheckAttempted(false);
+  }
+
+  function chooseStatementAccount(value: string) {
+    if (!preview) return;
+    const candidate = value === "new" ? null : scopedAccountCandidates.find((item) => item.id === value);
+    setSelectedAccountId(candidate?.id || "");
+    clearTallyCheckResults();
+    if (!candidate) {
+      // Back to the statement's own account and the ledger analysis resolved.
+      const extractedLedgerName = preview.account.tallyLedgerName?.trim() || "";
+      setAccount({
+        bankName: preview.account.bankName ?? "",
+        accountNumber: preview.account.accountNumber ?? "",
+        accountHolderName: preview.account.accountHolderName ?? "",
+        ifscCode: preview.account.ifscCode ?? "",
+        tallyLedgerName: extractedLedgerName,
+      });
+      setBankLedgerName(extractedLedgerName);
+      setBankLedgerVerified(Boolean(extractedLedgerName && preview.bankLedgerResolution?.verified));
+      setBankLedgerManuallyConfirmed(false);
+      return;
+    }
+    // The statement's account details stay as read from the file; only the
+    // saved account's Tally bank ledger is taken, for review before posting.
+    const ledgerName = candidate.tallyLedgerName?.trim() || "";
+    setAccount((current) => ({ ...current, tallyLedgerName: ledgerName || current.tallyLedgerName }));
+    if (ledgerName) setBankLedgerName(ledgerName);
+    setBankLedgerVerified(false);
+    setBankLedgerManuallyConfirmed(false);
+  }
+
+  function accountCandidateLabel(candidate: BankAccount) {
+    const number = String(candidate.accountNumber || candidate.accountNumberMasked || "");
+    return [
+      candidate.bankName || "Saved account",
+      number ? `****${number.replace(/\W/g, "").slice(-4)}` : null,
+      candidate.accountHolderName,
+    ].filter(Boolean).join(" · ");
+  }
+
   function applyTallyBankLedgerSelection(ledgerName: string) {
     // The statement account remains evidence from the uploaded file. A manual
     // Tally choice must never overwrite it with the ledger's account details.
+    if (normalizeName(ledgerName) !== normalizeName(bankLedgerName)) clearTallyCheckResults();
     setAccount((current) => ({ ...current, tallyLedgerName: ledgerName }));
     setBankLedgerName(ledgerName);
     setBankLedgerVerified(
@@ -6120,7 +6186,15 @@ export function BankStatementsPage() {
       showToast("info", "No valid bank statement rows were found to check.");
       return;
     }
+    if (bankLedgerMissingInTally) {
+      // A ledger that is not in this company has no vouchers, so every row
+      // would wrongly look new.
+      showToast("error", `Bank ledger "${bankLedgerName}" is not in the selected Tally company. Choose this company's bank ledger.`);
+      return;
+    }
 
+    // Every check starts clean; results are only valid for this bank ledger.
+    clearTallyCheckResults();
     setTallyCheckAttempted(true);
     try {
       setMatchingBills(true);
@@ -6289,6 +6363,10 @@ export function BankStatementsPage() {
     }
     if (!bankLedgerName.trim()) {
       showToast("error", "Select the Tally bank ledger.");
+      return;
+    }
+    if (bankLedgerMissingInTally) {
+      showToast("error", `Bank ledger "${bankLedgerName}" is not in the selected Tally company.`);
       return;
     }
     if (!bankLedgerVerified && !bankLedgerManuallyConfirmed) {
@@ -6616,7 +6694,7 @@ export function BankStatementsPage() {
 
   return (
     <AppShell defaultSidebarCollapsed>
-      <div className="fixed bottom-6 right-6 z-50 flex w-[min(420px,calc(100vw-2rem))] flex-col gap-3">
+      <div className="fixed bottom-6 right-6 z-[1100] flex w-[min(420px,calc(100vw-2rem))] flex-col gap-3">
         {toasts.map((toast) => (
           <div
             key={toast.id}
@@ -7479,8 +7557,8 @@ export function BankStatementsPage() {
                               <div className="truncate text-[11px] font-extrabold leading-[13px] text-[#1a1a1a]" title={bankLedgerName}>
                                 {bankLedgerName}
                               </div>
-                              <div className={`text-[9px] font-bold leading-3 ${bankLedgerVerified ? "text-emerald-700" : "text-amber-700"}`} title={bankLedgerVerified ? "Exact statement account match" : "Manual selection - review account numbers"}>
-                                {bankLedgerVerified ? "Matched" : "Review account match"}
+                              <div className={`text-[9px] font-bold leading-3 ${bankLedgerMissingInTally ? "text-red-700" : bankLedgerVerified ? "text-emerald-700" : "text-amber-700"}`} title={bankLedgerMissingInTally ? "This ledger does not exist in the selected Tally company" : bankLedgerVerified ? "Exact statement account match" : "Manual selection - review account numbers"}>
+                                {bankLedgerMissingInTally ? "Not in this Tally company" : bankLedgerVerified ? "Matched" : "Review account match"}
                               </div>
                             </div>
                           </div>
@@ -7488,34 +7566,17 @@ export function BankStatementsPage() {
                       </div>
 
                       <div className="flex shrink-0 flex-col items-stretch gap-1.5">
-                        {preview.candidates.length > 1 ? (
+                        {scopedAccountCandidates.length > 1 ? (
                           <select
                             value={selectedAccountId || "new"}
-                            onChange={(event) => {
-                              const value = event.target.value;
-                              setSelectedAccountId(value === "new" ? "" : value);
-                              const candidate = preview.candidates.find((item) => item.id === value);
-                              if (candidate) {
-                                setAccount({
-                                  bankName: candidate.bankName || account.bankName,
-                                  accountNumber: candidate.accountNumber || account.accountNumber,
-                                  accountHolderName: candidate.accountHolderName || account.accountHolderName,
-                                  ifscCode: candidate.ifscCode || account.ifscCode,
-                                  tallyLedgerName: candidate.tallyLedgerName || account.tallyLedgerName,
-                                });
-                                if (candidate.tallyLedgerName) {
-                                  setBankLedgerName(candidate.tallyLedgerName);
-                                  setBankLedgerVerified(false);
-                                  setBankLedgerManuallyConfirmed(false);
-                                }
-                              }
-                            }}
-                            className="h-8 w-28 rounded-lg border border-[#e5ddd0] bg-white px-2 text-[10px] font-bold text-[#5a5046] outline-none focus:border-amber-500"
+                            onChange={(event) => chooseStatementAccount(event.target.value)}
+                            title="Saved account for this statement"
+                            className="h-8 w-48 rounded-lg border border-[#e5ddd0] bg-white px-2 text-[10px] font-bold text-[#5a5046] outline-none focus:border-amber-500"
                           >
                             <option value="new">Extracted account</option>
-                            {preview.candidates.map((candidate) => (
+                            {scopedAccountCandidates.map((candidate) => (
                               <option key={candidate.id} value={candidate.id}>
-                                {candidate.accountHolderName || "Saved account"} - {candidate.accountNumber || candidate.accountNumberMasked}
+                                {accountCandidateLabel(candidate)}
                               </option>
                             ))}
                           </select>
@@ -7701,34 +7762,16 @@ export function BankStatementsPage() {
                         </div>
                       </div>
                     </div>
-                    {preview.candidates.length > 1 ? (
+                    {scopedAccountCandidates.length > 1 ? (
                       <select
                         value={selectedAccountId || "new"}
-                        onChange={(event) => {
-                          const value = event.target.value;
-                          setSelectedAccountId(value === "new" ? "" : value);
-                          const candidate = preview.candidates.find((item) => item.id === value);
-                          if (candidate) {
-                            setAccount({
-                              bankName: candidate.bankName || account.bankName,
-                              accountNumber: candidate.accountNumber || account.accountNumber,
-                              accountHolderName: candidate.accountHolderName || account.accountHolderName,
-                              ifscCode: candidate.ifscCode || account.ifscCode,
-                              tallyLedgerName: candidate.tallyLedgerName || account.tallyLedgerName,
-                            });
-                            if (candidate.tallyLedgerName) {
-                              setBankLedgerName(candidate.tallyLedgerName);
-                              setBankLedgerVerified(false);
-                              setBankLedgerManuallyConfirmed(false);
-                            }
-                          }
-                        }}
+                        onChange={(event) => chooseStatementAccount(event.target.value)}
                         className="mt-3 h-9 w-full rounded-md border border-[#d8cbbb] bg-white px-3 text-sm font-medium outline-none focus:border-[#7c5f3f]"
                       >
                         <option value="new">Use extracted account</option>
-                        {preview.candidates.map((candidate) => (
+                        {scopedAccountCandidates.map((candidate) => (
                           <option key={candidate.id} value={candidate.id}>
-                            {candidate.accountHolderName || "Saved account"} - {candidate.accountNumber || candidate.accountNumberMasked}
+                            {accountCandidateLabel(candidate)}
                           </option>
                         ))}
                       </select>
@@ -8139,6 +8182,9 @@ export function BankStatementsPage() {
                                     ? "cursor-pointer outline-none transition hover:bg-[#fbf7f1] focus-visible:bg-[#fbf7f1] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-amber-300"
                                     : ""
                                 }`}
+                                // Clicks inside this cell must not close the open
+                                // picker and then reopen it on the same click.
+                                data-ledger-editor-toggle
                                 onClick={() => {
                                   if (showLedgerSelect || statementReviewLocked) return;
                                   setEditingLedgerIds(new Set([transaction.id]));
@@ -8346,7 +8392,7 @@ export function BankStatementsPage() {
                   <button
                     aria-label="Close bill allocation review"
                     className="absolute inset-0 cursor-default"
-                    onClick={() => closeBillAllocationReview(false, true)}
+                    onClick={() => closeBillAllocationReview(true)}
                     type="button"
                   />
                   <aside className="relative z-10 flex h-full w-full max-w-[720px] flex-col border-l border-[#aebfca] bg-white shadow-2xl">
@@ -8374,7 +8420,7 @@ export function BankStatementsPage() {
                           </Button>
                           <button
                             className="inline-flex h-6 w-6 items-center justify-center transition hover:bg-white/60"
-                            onClick={() => closeBillAllocationReview()}
+                            onClick={() => closeBillAllocationReview(true)}
                             title="Close"
                             type="button"
                           >
