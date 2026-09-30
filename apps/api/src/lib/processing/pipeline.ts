@@ -5322,6 +5322,144 @@ export function verifyProcessedDocuments(
   return buildProcessedVerificationResult(verificationResult);
 }
 
+// Extracts every document from one file (image or PDF). Shared by stored-case processing and the
+// extraction test endpoint so both run the same classification and extraction path.
+export async function extractFileDocuments(params: {
+  bytes: Uint8Array;
+  fileName: string;
+  mimeType?: string | null;
+  analysisMode: CaseAnalysisMode;
+  position?: string;
+  onProgress?: (phase: number, stage: string) => Promise<void> | void;
+}): Promise<CaseDoc[]> {
+  const { bytes, fileName, analysisMode } = params;
+  const position = params.position ?? "1 of 1";
+  const mimeType = getFileMimeType(fileName, params.mimeType ?? null);
+
+  let fileDocuments: CaseDoc[] = [];
+  if (mimeType.startsWith("image/")) {
+    await params.onProgress?.(0.35, `Extracting file ${position}: ${fileName}`);
+    const image = await imageBytesToProviderDataUrl(bytes, mimeType, fileName);
+    const documentType = await classifyDocumentFromImage(image, fileName);
+    let document = await extractDataFromImagePages({
+      fileName,
+      pageImages: [image],
+      documentType,
+    });
+    document = await retryWeakImageExtraction({
+      document,
+      fileName,
+      pageImages: [image],
+      documentType,
+    });
+    fileDocuments = [document];
+  } else if (mimeType === "application/pdf") {
+    const textPages = await extractPdfTextPages(bytes.slice());
+    if (analysisMode === "smart_split") {
+      await params.onProgress?.(0.18, `Organizing PDF ${position}: ${fileName}`);
+
+      let pageImages: string[] = [];
+      try {
+        pageImages = await renderPdfToImagePages(bytes, {
+          maxPages: PDF_SMART_SPLIT_MAX_PAGES,
+          sourceName: fileName,
+        });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error ?? "Unknown error");
+        if (!hasMeaningfulTextPages(textPages)) {
+          throw new Error(
+            `Unable to render scanned PDF "${fileName}". Install poppler-utils/pdftoppm in the API runtime. ${reason}`
+          );
+        }
+        console.warn(`Unable to render PDF "${fileName}" for smart split image fallback. Continuing with text only. ${reason}`);
+      }
+
+      const groups = await splitPdfIntoDocumentGroups({
+        fileName,
+        textPages,
+        pageImages,
+      });
+
+      fileDocuments = await extractPdfDocumentGroups({
+        fileName,
+        textPages,
+        pageImages,
+        groups,
+        onGroupProgress: async ({ current, total, group }) => {
+          await params.onProgress?.(
+            0.2 + (current / Math.max(1, total)) * 0.72,
+            `Extracting document ${current} of ${total} from PDF ${position}: ${formatDocType(group.documentType)}`
+          );
+        },
+      });
+    } else if (hasMeaningfulTextPages(textPages)) {
+      const documentType = await classifyDocumentFromText(textPages, fileName);
+      let document = await extractDataFromTextPages({
+        fileName,
+        textPages,
+        documentType,
+      });
+      if (needsImageFallbackForTextExtraction(document)) {
+        await params.onProgress?.(0.45, `Rereading PDF images for handwritten content ${position}: ${fileName}`);
+
+        try {
+          document = await retryWeakPdfTextExtractionFromImages({
+            document,
+            fileName,
+            bytes,
+            documentType,
+          });
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error ?? "Unknown error");
+          console.warn(`Unable to render PDF "${fileName}" for handwritten image fallback. Continuing with text extraction. ${reason}`);
+        }
+      }
+      fileDocuments = [document];
+    } else {
+      await params.onProgress?.(0.25, `Rendering scanned PDF ${position}: ${fileName}`);
+
+      let pageImages: string[] = [];
+      try {
+        pageImages = await renderPdfToImagePages(bytes, { sourceName: fileName });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error ?? "Unknown error");
+        throw new Error(
+          `Unable to render scanned PDF "${fileName}". Install poppler-utils/pdftoppm in the API runtime. ${reason}`
+        );
+      }
+
+      if (pageImages.length === 0) {
+        const document = fallbackDoc(fileName, inferDocTypeFromFilename(fileName), {
+          pages: Math.max(1, textPages.length),
+        });
+        fileDocuments = [document];
+      } else {
+        const documentType = await classifyDocumentFromImage(pageImages[0], fileName);
+        let document = await extractDataFromImagePages({
+          fileName,
+          pageImages,
+          documentType,
+        });
+        document = await retryWeakImageExtraction({
+          document,
+          fileName,
+          pageImages,
+          documentType,
+        });
+        fileDocuments = [document];
+      }
+    }
+  } else {
+    fileDocuments = [fallbackDoc(fileName, inferDocTypeFromFilename(fileName))];
+  }
+
+  for (const document of fileDocuments) {
+    document.sourceHint = document.sourceHint ?? fileName;
+    document.sourceFileName = document.sourceFileName ?? fileName;
+  }
+  return fileDocuments;
+}
+
 export async function processStoredCaseFiles(params: {
   caseId: string;
   fieldConfiguration?: Awaited<ReturnType<typeof getPersistedPacketFieldConfiguration>>;
@@ -5369,146 +5507,36 @@ export async function processStoredCaseFiles(params: {
       throw download.error;
     }
 
-    const bytes = new Uint8Array(await download.data.arrayBuffer());
-    const mimeType = getFileMimeType(file.original_name, file.mime_type);
-
-    let fileDocuments: CaseDoc[] = [];
-    if (mimeType.startsWith("image/")) {
-      await params.onProgress?.({
-        progress: fileProgress(0.35),
-        stage: `Extracting file ${index + 1} of ${files.length}: ${file.original_name}`,
-      });
-      const image = await imageBytesToProviderDataUrl(bytes, mimeType, file.original_name);
-      const documentType = await classifyDocumentFromImage(image, file.original_name);
-      let document = await extractDataFromImagePages({
-        fileName: file.original_name,
-        pageImages: [image],
-        documentType,
-      });
-      document = await retryWeakImageExtraction({
-        document,
-        fileName: file.original_name,
-        pageImages: [image],
-        documentType,
-      });
-      fileDocuments = [document];
-    } else if (mimeType === "application/pdf") {
-      const textPages = await extractPdfTextPages(bytes.slice());
-      if (analysisMode === "smart_split") {
-        await params.onProgress?.({
-          progress: fileProgress(0.18),
-          stage: `Organizing PDF ${index + 1} of ${files.length}: ${file.original_name}`,
-        });
-
-        let pageImages: string[] = [];
-        try {
-          pageImages = await renderPdfToImagePages(bytes, {
-            maxPages: PDF_SMART_SPLIT_MAX_PAGES,
-            sourceName: file.original_name,
-          });
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : String(error ?? "Unknown error");
-          if (!hasMeaningfulTextPages(textPages)) {
-            throw new Error(
-              `Unable to render scanned PDF "${file.original_name}". Install poppler-utils/pdftoppm in the API runtime. ${reason}`
-            );
-          }
-          console.warn(`Unable to render PDF "${file.original_name}" for smart split image fallback. Continuing with text only. ${reason}`);
-        }
-
-        const groups = await splitPdfIntoDocumentGroups({
-          fileName: file.original_name,
-          textPages,
-          pageImages,
-        });
-
-        fileDocuments = await extractPdfDocumentGroups({
-          fileName: file.original_name,
-          textPages,
-          pageImages,
-          groups,
-          onGroupProgress: async ({ current, total, group }) => {
-            await params.onProgress?.({
-              progress: fileProgress(0.2 + (current / Math.max(1, total)) * 0.72),
-              stage: `Extracting document ${current} of ${total} from PDF ${index + 1} of ${files.length}: ${formatDocType(group.documentType)}`,
-            });
-          },
-        });
-      } else if (hasMeaningfulTextPages(textPages)) {
-        const documentType = await classifyDocumentFromText(textPages, file.original_name);
-        let document = await extractDataFromTextPages({
-          fileName: file.original_name,
-          textPages,
-          documentType,
-        });
-        if (needsImageFallbackForTextExtraction(document)) {
-          await params.onProgress?.({
-            progress: fileProgress(0.45),
-            stage: `Rereading PDF images for handwritten content ${index + 1} of ${files.length}: ${file.original_name}`,
-          });
-
-          try {
-            document = await retryWeakPdfTextExtractionFromImages({
-              document,
-              fileName: file.original_name,
-              bytes,
-              documentType,
-            });
-          } catch (error) {
-            const reason = error instanceof Error ? error.message : String(error ?? "Unknown error");
-            console.warn(`Unable to render PDF "${file.original_name}" for handwritten image fallback. Continuing with text extraction. ${reason}`);
-          }
-        }
-        fileDocuments = [document];
-      } else {
-        await params.onProgress?.({
-          progress: fileProgress(0.25),
-          stage: `Rendering scanned PDF ${index + 1} of ${files.length}: ${file.original_name}`,
-        });
-
-        let pageImages: string[] = [];
-        try {
-          pageImages = await renderPdfToImagePages(bytes, { sourceName: file.original_name });
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : String(error ?? "Unknown error");
-          throw new Error(
-            `Unable to render scanned PDF "${file.original_name}". Install poppler-utils/pdftoppm in the API runtime. ${reason}`
-          );
-        }
-
-        if (pageImages.length === 0) {
-          const document = fallbackDoc(file.original_name, inferDocTypeFromFilename(file.original_name), {
-            pages: Math.max(1, textPages.length),
-          });
-          fileDocuments = [document];
-        } else {
-          const documentType = await classifyDocumentFromImage(pageImages[0], file.original_name);
-          let document = await extractDataFromImagePages({
-            fileName: file.original_name,
-            pageImages,
-            documentType,
-          });
-          document = await retryWeakImageExtraction({
-            document,
-            fileName: file.original_name,
-            pageImages,
-            documentType,
-          });
-          fileDocuments = [document];
-        }
-      }
-    } else {
-      fileDocuments = [fallbackDoc(file.original_name, inferDocTypeFromFilename(file.original_name))];
-    }
-
-    for (const document of fileDocuments) {
-      document.sourceHint = document.sourceHint ?? file.original_name;
-      document.sourceFileName = document.sourceFileName ?? file.original_name;
-      documents.push(document);
-    }
+    const fileDocuments = await extractFileDocuments({
+      bytes: new Uint8Array(await download.data.arrayBuffer()),
+      fileName: file.original_name,
+      mimeType: file.mime_type,
+      analysisMode,
+      position: `${index + 1} of ${files.length}`,
+      onProgress: (phase, stage) => params.onProgress?.({ progress: fileProgress(phase), stage }),
+    });
+    documents.push(...fileDocuments);
   }
 
-  const canonicalDocuments = collapseDuplicateInvoiceCopies(documents);
+  return finalizeExtractedDocuments({
+    documents,
+    comparisonOptions,
+    analysisMode,
+    fieldConfiguration,
+    onProgress: params.onProgress,
+  });
+}
+
+// Collapses duplicate invoice copies, enriches, compares and summarizes extracted documents.
+export async function finalizeExtractedDocuments(params: {
+  documents: CaseDoc[];
+  comparisonOptions: ReturnType<typeof readComparisonOptions>;
+  analysisMode: CaseAnalysisMode;
+  fieldConfiguration: Awaited<ReturnType<typeof getPersistedPacketFieldConfiguration>>;
+  onProgress?: (details: { progress: number; stage: string }) => Promise<void> | void;
+}) {
+  const { comparisonOptions, analysisMode, fieldConfiguration } = params;
+  const canonicalDocuments = collapseDuplicateInvoiceCopies(params.documents);
   const enrichedDocuments = enrichProcessedDocuments(canonicalDocuments);
   const verificationResult = buildProcessedVerificationResult(
     verifyGroupedCaseDocuments(enrichedDocuments, comparisonOptions)

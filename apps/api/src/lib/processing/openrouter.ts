@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENROUTER_MODEL =
@@ -94,13 +96,80 @@ function timeoutMessage(model: string, timeoutMs: number) {
   return `OpenRouter request timed out after ${Math.round(timeoutMs / 1000)}s for model ${model}.`;
 }
 
+// Test-only overrides for the extraction test endpoint. Production requests never run inside this
+// context, so callOpenRouter behaves exactly as before for them.
+export type AiCallTrace = {
+  label: string;
+  model: string;
+  durationMs: number;
+  usage: unknown;
+  systemPrompt: string;
+  userText: string;
+  imageCount: number;
+  response: string;
+  error?: string;
+};
+
+export type AiTestOverrides = {
+  model?: string;
+  systemAppend?: string;
+  systemReplace?: Array<{ find: string; replace: string }>;
+  trace: AiCallTrace[];
+};
+
+const aiTestContext = new AsyncLocalStorage<AiTestOverrides>();
+
+export function runWithAiTestOverrides<T>(overrides: AiTestOverrides, run: () => Promise<T>) {
+  return aiTestContext.run(overrides, run);
+}
+
+function messageText(message: OpenRouterMessage) {
+  return typeof message.content === "string"
+    ? message.content
+    : message.content.map((part) => ("text" in part ? part.text : "")).filter(Boolean).join("\n");
+}
+
+function applyTestPromptOverrides(messages: OpenRouterMessage[], overrides: AiTestOverrides) {
+  if (!overrides.systemAppend && !overrides.systemReplace?.length) return messages;
+  return messages.map((message) => {
+    if (message.role !== "system" || typeof message.content !== "string") return message;
+    let content = message.content;
+    for (const { find, replace } of overrides.systemReplace ?? []) {
+      if (find) content = content.split(find).join(replace);
+    }
+    if (overrides.systemAppend) content = `${content} ${overrides.systemAppend}`;
+    return { ...message, content };
+  });
+}
+
+function recordTestTrace(
+  overrides: AiTestOverrides | undefined,
+  messages: OpenRouterMessage[],
+  entry: Pick<AiCallTrace, "model" | "durationMs" | "usage" | "response" | "error">
+) {
+  if (!overrides) return;
+  const system = messages.find((message) => message.role === "system");
+  const users = messages.filter((message) => message.role === "user");
+  overrides.trace.push({
+    label: `call-${overrides.trace.length + 1}`,
+    systemPrompt: system ? messageText(system) : "",
+    userText: users.map(messageText).join("\n"),
+    imageCount: users.reduce(
+      (count, message) =>
+        count + (Array.isArray(message.content) ? message.content.filter((part) => part.type === "image_url").length : 0),
+      0
+    ),
+    ...entry,
+  });
+}
+
 function logOpenRouterDiagnostic(event: Record<string, unknown>) {
   if (process.env.OPENROUTER_DEBUG_LOG !== "true") return;
   console.log(JSON.stringify({ scope: "openrouter", ...event }));
 }
 
 export async function callOpenRouter(
-  messages: OpenRouterMessage[],
+  requestMessages: OpenRouterMessage[],
   options?: {
     expectJson?: boolean;
     jsonMode?: boolean;
@@ -115,8 +184,11 @@ export async function callOpenRouter(
     throw new Error("OPENROUTER_API_KEY is not configured.");
   }
 
+  const testOverrides = aiTestContext.getStore();
+  const messages = testOverrides ? applyTestPromptOverrides(requestMessages, testOverrides) : requestMessages;
+  const callStartedAt = Date.now();
   const maxTokens = normalizeMaxTokens(options?.maxTokens ?? OPENROUTER_MAX_OUTPUT_TOKENS);
-  const model = options?.model || OPENROUTER_MODEL;
+  const model = testOverrides?.model || options?.model || OPENROUTER_MODEL;
   const timeoutMs = Number.isFinite(options?.timeoutMs) && Number(options?.timeoutMs) > 0
     ? Number(options?.timeoutMs)
     : OPENROUTER_TIMEOUT_MS;
@@ -192,6 +264,12 @@ export async function callOpenRouter(
         contentLength: content.length,
         content,
       });
+      recordTestTrace(testOverrides, messages, {
+        model,
+        durationMs: Date.now() - callStartedAt,
+        usage: payload?.usage ?? null,
+        response: content,
+      });
       return content;
     } catch (error) {
       clearTimeout(timeoutId);
@@ -209,6 +287,13 @@ export async function callOpenRouter(
         error: lastError,
       });
       if (attempt === maxRetries) {
+        recordTestTrace(testOverrides, messages, {
+          model,
+          durationMs: Date.now() - callStartedAt,
+          usage: null,
+          response: "",
+          error: lastError,
+        });
         throw new Error(lastError);
       }
       const delayMs = RETRY_BASE_MS * Math.pow(2, attempt);
