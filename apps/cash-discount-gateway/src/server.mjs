@@ -35,7 +35,13 @@ function send(socket, payload) {
   const text = JSON.stringify(payload);
   socket.send(text);
   if (metadata.get(socket)?.role === "browser" && payload?.requestId && requestTimeline.has(payload.requestId)) {
-    trace(payload.requestId, `sent ${payload.type}${payload.success === false ? " (failed)" : ""} to the browser, ${text.length} bytes, ${socket.bufferedAmount} bytes still queued`);
+    // For results, the shape (top-level keys and list sizes, never values),
+    // so a page that finds a list empty can be explained from the log.
+    const shape = payload.type === "result" && payload.data && typeof payload.data === "object"
+      ? ` [${Object.entries(payload.data).slice(0, 20).map(([key, value]) => Array.isArray(value) ? `${key}:${value.length}`
+        : value && typeof value === "object" ? `${key}:{${Object.entries(value).slice(0, 8).map(([inner, innerValue]) => Array.isArray(innerValue) ? `${inner}:${innerValue.length}` : inner).join(",")}}` : key).join(" ")}]`
+      : "";
+    trace(payload.requestId, `sent ${payload.type}${payload.success === false ? " (failed)" : ""} to the browser, ${text.length} bytes, ${socket.bufferedAmount} bytes still queued${shape}`);
     if (payload.type === "result") {
       // When the result has fully left the server (a slow download shows here).
       const requestId = payload.requestId;
