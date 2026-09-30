@@ -131,3 +131,26 @@ test("reports a conflicting source transport deduction", () => {
   assert.equal(result.transportTdsCalculatedAmount, "7.00");
   assert.equal(result.transportTdsDifference, "-0.50");
 });
+
+test("transport TDS not printed on the invoice is the rate on freight, to the rupee", () => {
+  const result = calculator.calculatePurchaseVoucher(input({
+    freightAmount: "36792.00",
+    freightGstRate: "18",
+    transportTdsEnabled: true,
+    sourceTransportTdsAmount: "",
+    transportTdsRate: "1",
+  }));
+  assert.equal(result.transportTdsAmount, "368.00");
+  assert.equal(result.transportTdsDifference, "0.00");
+});
+
+test("a printed transport TDS amount is used as printed", () => {
+  const result = calculator.calculatePurchaseVoucher(input({
+    freightAmount: "36792.00",
+    transportTdsEnabled: true,
+    sourceTransportTdsAmount: "367.00",
+    transportTdsRate: "1",
+  }));
+  assert.equal(result.transportTdsAmount, "367.00");
+  assert.equal(result.transportTdsDifference, "-0.92");
+});

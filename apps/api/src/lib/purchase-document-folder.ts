@@ -13,18 +13,29 @@ export function validatePurchaseDocumentFolder(value: unknown): string {
   return path.win32.normalize(folder);
 }
 
-export function purchaseDocumentCompanyKey(companyId: string | undefined, connectionId: string, companyName: string) {
-  return companyId || `legacy:${connectionId}:${companyName.trim().toLowerCase()}`;
+// Keys to look a company's folder up by, preferred first. The Tally company
+// GUID survives a connector re-pair (new connection id); the older
+// connection-and-name key is kept as a fallback for folders saved before.
+export function purchaseDocumentCompanyKeys(companyId: string | undefined, connectionId: string, companyName: string, companyGuid?: string | null) {
+  if (companyId) return [companyId];
+  const guid = String(companyGuid || '').trim().toLowerCase();
+  return [
+    ...(guid ? [`guid:${guid}`] : []),
+    `legacy:${connectionId}:${companyName.trim().toLowerCase()}`,
+  ];
 }
 
-export async function readPurchaseDocumentFolder(organizationId: string, companyKey: string) {
+export async function readPurchaseDocumentFolder(organizationId: string, companyKeys: string | string[]) {
+  const keys = Array.isArray(companyKeys) ? companyKeys : [companyKeys];
   const { data, error } = await createSupabaseAdminClient().from('purchase_document_folders')
-    .select('folder_path').eq('organization_id', organizationId).eq('company_key', companyKey).maybeSingle();
+    .select('company_key,folder_path').eq('organization_id', organizationId).in('company_key', keys);
   if (error) {
     // Without the migration no folder can have been saved, so posting keeps
     // using connector-local storage instead of blocking every purchase.
     if (['42P01', 'PGRST205'].includes(String(error.code || ''))) return '';
     throw new Error('Purchase document folder settings are unavailable. Try again.');
   }
-  return validatePurchaseDocumentFolder(data?.folder_path || '');
+  const byKey = new Map((data ?? []).map((row) => [row.company_key, row.folder_path]));
+  const saved = keys.map((key) => byKey.get(key)).find((value) => value !== undefined);
+  return validatePurchaseDocumentFolder(saved || '');
 }

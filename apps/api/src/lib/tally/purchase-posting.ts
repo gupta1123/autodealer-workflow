@@ -719,6 +719,17 @@ function invoiceRoundOffAmount(
   return Math.abs(derived) <= MAX_ROUND_OFF_PAISE ? formatPaise(derived) : "";
 }
 
+const FREIGHT_ROW_PATTERN = /\b(?:freight|cartage|carriage|lorry\s+hire|transport(?:ation)?)\b/i;
+
+// A charge row, not goods: named as freight/transport and either without a
+// stock quantity or carrying a transport service code (SAC 9965 / 9967).
+function isFreightChargeRow(item: CommercialLineItem, line: PurchasePostingSourceLine) {
+  if (!FREIGHT_ROW_PATTERN.test(`${text(item.description)} ${text(item.rawText)}`)) return false;
+  if (!((moneyPaise(line.taxableAmount) ?? 0) > 0)) return false;
+  const quantity = Number(String(line.quantity).replace(/,/g, ""));
+  return !(quantity > 0) || /^996[57]/.test(line.hsn);
+}
+
 function buildSource(
   document: PurchasePostingDocumentInput,
   lineSource: PurchasePostingDocumentInput = document,
@@ -726,9 +737,17 @@ function buildSource(
 ): PurchasePostingSource {
   const fields = fieldsOf(document);
   const commercialFields = extractInvoiceCommercialFieldsFromText(document.markdown);
-  const lines = readStoredLineItems(lineSource.extracted_fields).map((item, index) =>
-    sourceLine(lineSource.id, item, index)
-  );
+  // Freight printed as an invoice row ("Transportation Charges") is booked on
+  // the freight ledger, never as a stock line. Keeping it in both places
+  // counted it twice and inflated GST, 194Q and the total.
+  const itemRows = readStoredLineItems(lineSource.extracted_fields).map((item, index) => ({
+    item,
+    line: sourceLine(lineSource.id, item, index),
+  }));
+  const freightRows = itemRows.filter(({ item, line }) => isFreightChargeRow(item, line));
+  const lines = itemRows.filter((row) => !freightRows.includes(row)).map(({ line }) => line);
+  const freightFromRows = sum(freightRows.map(({ line }) => moneyPaise(line.taxableAmount)));
+  const printedFreight = text(fields.freightAmount) || commercialFields.freightAmount;
   return {
     documentId: document.id,
     documentType: document.document_type,
@@ -753,9 +772,10 @@ function buildSource(
     invoiceTdsAmount: text(fields.tdsAmount) || commercialFields.tdsAmount,
     invoiceTdsRate: text(fields.tdsRate) || commercialFields.tdsRate,
     invoiceFreightAmount:
-      text(fields.freightAmount) || commercialFields.freightAmount,
+      printedFreight || (freightFromRows > 0 ? formatPaise(freightFromRows) : ""),
     invoiceFreightGstRate:
-      text(fields.freightGstRate) || commercialFields.freightGstRate,
+      text(fields.freightGstRate) || commercialFields.freightGstRate ||
+      (printedFreight ? "" : freightRows.map(({ line }) => line.taxRate).find(Boolean) || ""),
     invoiceTds194qAmount:
       text(fields.tds194qAmount) || commercialFields.tds194qAmount,
     invoiceTds194qRate:
@@ -1130,7 +1150,8 @@ function buildDefaultReview(
     applyTds194q: invoiceHasTds194q,
     tds194qBasisAmount: "",
     tds194qRounding: "nearest_rupee",
-    applyTransportTds: invoiceHasTransportTds,
+    // Pre-ticked when the invoice has freight; the reviewer can untick it.
+    applyTransportTds: invoiceHasTransportTds || hasPositiveInvoiceAmount(source.invoiceFreightAmount),
     applyGstTds: invoiceHasGstTds || qualifiesForAutomaticScrapGstTds,
     transportTdsLedgerName:
       mappedRoleName(masters, mappings, "tds_ledger", ["transport", "goods_transport"], ["ledger", "tax_ledger"]) ||
@@ -1483,7 +1504,7 @@ function calculate(
     taxBuckets: finalCalculation.taxBuckets,
     invoiceGstAmount: finalCalculation.invoiceGstAmount,
     gstDifference: finalCalculation.gstDifference,
-    tdsAmount: formatPaise(tds194q + transportTds),
+    tdsAmount: formatPaise(sum([moneyPaise(finalCalculation.tds194qAmount), moneyPaise(finalCalculation.transportTdsAmount)])),
     tds194qAmount: finalCalculation.tds194qAmount,
     tds194qBasisAmount: finalCalculation.tds194qBasisAmount,
     tds194qRounding: review.tds194qRounding,

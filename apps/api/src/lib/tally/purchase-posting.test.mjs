@@ -1331,3 +1331,29 @@ test("output GST ledgers cannot be used for a purchase voucher", () => {
   assert.ok(result.blockers.some((blocker) => blocker.code === "CGST_LEDGER_REQUIRED"));
   assert.ok(result.blockers.some((blocker) => blocker.code === "SGST_LEDGER_REQUIRED"));
 });
+
+test("a transportation row is booked once as freight with transport TDS on it", () => {
+  const document = invoiceDocument({
+    totalAmount: "1416.00",
+    taxAmount: "216.00",
+    tdsAmount: "",
+    lines: [
+      { description: "MS Scrap", hsnSac: "72044900", quantity: "1", unit: "MT", rate: "1000.00", taxableAmount: "1000.00" },
+      { description: "TRANSPORTATION CHARGES", taxableAmount: "200.00" },
+    ],
+  });
+  document.extracted_fields.cgstTdsAmount = "";
+  document.extracted_fields.sgstTdsAmount = "";
+
+  const result = prepare(document, { savedReview: { sourceReferenceApproved: true, applyGstTds: false } });
+
+  assert.equal(result.review.lines.length, 1);
+  assert.equal(result.review.freightAmount, "200.00");
+  assert.equal(result.review.applyTransportTds, true);
+  assert.equal(result.calculation.gstAmount, "216.00");
+  assert.equal(result.calculation.transportTdsAmount, "2.00");
+  assert.equal(result.calculation.transportTdsDifference, "0.00");
+  for (const code of ["STOCK_ITEM_REQUIRED", "LINE_ACCOUNTING_FIELDS_REQUIRED", "GST_MISMATCH", "TOTAL_MISMATCH"]) {
+    assert.equal(result.blockers.some((blocker) => blocker.code === code), false, code);
+  }
+});

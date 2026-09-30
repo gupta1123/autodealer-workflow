@@ -5,7 +5,7 @@ import {accessFailureResponse} from '@/lib/access/failures';
 import { listAccessPredicate } from '@/lib/access/list-scope';
 import { purchaseFinancialDigest } from '@/lib/access/purchase-digest';
 import { createHash } from "node:crypto";
-import { readPurchaseDocumentFolder, purchaseDocumentCompanyKey } from '@/lib/purchase-document-folder';
+import { readPurchaseDocumentFolder, purchaseDocumentCompanyKeys } from '@/lib/purchase-document-folder';
 
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
@@ -1562,7 +1562,8 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
     }
     const sourceDocumentFolder = await readPurchaseDocumentFolder(
       team?.access.organizationId ?? user.id,
-      purchaseDocumentCompanyKey(team?.scope.company_id ?? undefined, context.connection.id, context.selectedCompanyName || '')
+      purchaseDocumentCompanyKeys(team?.scope.company_id ?? undefined, context.connection.id, context.selectedCompanyName || '',
+        context.liveCompanyProfile?.guid)
     );
     if (sourceDocumentFolder && !context.connectionStatus?.agentCapabilities?.includes('purchase-shared-folder-v1')) {
       return jsonWithCors(request, { error: 'Update and reconnect the connector to use the configured shared invoice folder.' }, { status: 409 });
