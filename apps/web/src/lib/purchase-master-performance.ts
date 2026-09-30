@@ -27,6 +27,21 @@ function optionIdentity(option: TallyMasterOption) {
     .join(" ");
 }
 
+export type PurchaseWithholdingRole = "194q" | "transport" | "cgst_tds" | "sgst_tds" | "igst_tds" | "tcs";
+
+// Mirrors the server's check (isWithholdingLedger in purchase-posting.ts): a
+// ledger only passes for a withholding role when its name/group says so.
+export function isPurchaseWithholdingOption(option: TallyMasterOption, role: PurchaseWithholdingRole) {
+  const identity = optionIdentity(option);
+  if (!/\b(tds|tcs)\b|withholding|tax\s+(?:deducted|collected)/i.test(identity)) return false;
+  if (role === "194q") return /194q|0[.]?10/i.test(identity);
+  if (role === "transport") return /transport|freight|goods\s+carriage/i.test(identity);
+  if (role === "cgst_tds") return /cgst|central\s+tax/i.test(identity);
+  if (role === "sgst_tds") return /sgst|state\s+tax/i.test(identity);
+  if (role === "igst_tds") return /igst|integrated\s+tax/i.test(identity);
+  return /\btcs\b|tax\s+collected/i.test(identity);
+}
+
 function normalizeUnitFamily(value: string | null | undefined) {
   const normalized = String(value ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
   if (["mt", "mts", "metricton", "metrictons", "tonne", "tonnes"].includes(normalized)) {

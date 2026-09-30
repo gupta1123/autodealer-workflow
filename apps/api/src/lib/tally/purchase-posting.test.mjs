@@ -1357,3 +1357,25 @@ test("a transportation row is booked once as freight with transport TDS on it", 
     assert.equal(result.blockers.some((blocker) => blocker.code === code), false, code);
   }
 });
+
+test("a wrong transport TDS ledger is named and the right one is suggested", () => {
+  const document = invoiceDocument({
+    totalAmount: "1416.00",
+    taxAmount: "216.00",
+    tdsAmount: "",
+    lines: [
+      { description: "MS Scrap", hsnSac: "72044900", quantity: "1", unit: "MT", rate: "1000.00", taxableAmount: "1000.00" },
+      { description: "TRANSPORTATION CHARGES", taxableAmount: "200.00" },
+    ],
+  });
+  document.extracted_fields.cgstTdsAmount = "";
+  document.extracted_fields.sgstTdsAmount = "";
+
+  const result = prepare(document, {
+    savedReview: { sourceReferenceApproved: true, applyGstTds: false, transportTdsLedgerName: "Transportation Inward @ 18.00%" },
+  });
+  const blocker = result.blockers.find((item) => item.code === "TRANSPORT_TDS_LEDGER_REQUIRED");
+  assert.ok(blocker);
+  assert.match(blocker.message, /Transportation Inward @ 18\.00% is not a goods-transport TDS ledger/);
+  assert.equal(blocker.suggestion, "Tds on Goods Transport");
+});

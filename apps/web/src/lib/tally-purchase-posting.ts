@@ -10,6 +10,7 @@ export type TallyPostingIssue = {
   lineId?: string;
   requiresAcknowledgement?: boolean;
   policyRule?: string;
+  suggestion?: string;
 };
 
 export type TallyPostingLine = {

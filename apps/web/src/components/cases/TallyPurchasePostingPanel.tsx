@@ -38,6 +38,8 @@ import { fetchCaseFileSignedUrl } from "@/lib/case-persistence";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import {
   rankPurchaseLedgerRole as rankLedgerRole,
+  isPurchaseWithholdingOption,
+  type PurchaseWithholdingRole,
   rankPurchaseStockItems as rankStockItems,
   searchPurchaseMasterOptions,
   selectedMasterOption,
@@ -56,6 +58,7 @@ import {
   waitForTallyCommand,
   type TallyMasterOption,
   type TallyPostingIssue,
+  type TallyPostingLine,
   type TallyPostingResponse,
   type TallyPostingReview,
   type SupplierLedgerMatch,
@@ -276,13 +279,71 @@ function purchasePostingFailureMessage(
   return "The Purchase voucher could not be created. Check Tally and retry.";
 }
 
-function FieldIssues({ issues }: { issues?: TallyPostingIssue[] }) {
+// The review field each ledger error is about.
+const ISSUE_REVIEW_FIELD: Partial<Record<string, keyof TallyPostingReview>> = {
+  SUPPLIER_LEDGER_REQUIRED: "supplierLedgerName",
+  SUPPLIER_LEDGER_GSTIN_MISMATCH: "supplierLedgerName",
+  SUPPLIER_LEDGER_ROLE_COLLISION: "supplierLedgerName",
+  CGST_LEDGER_REQUIRED: "cgstLedgerName",
+  SGST_LEDGER_REQUIRED: "sgstLedgerName",
+  IGST_LEDGER_REQUIRED: "igstLedgerName",
+  FREIGHT_LEDGER_REQUIRED: "freightLedgerName",
+  TDS_194Q_LEDGER_REQUIRED: "tds194qLedgerName",
+  TRANSPORT_TDS_LEDGER_REQUIRED: "transportTdsLedgerName",
+  CGST_TDS_LEDGER_REQUIRED: "cgstTdsLedgerName",
+  SGST_TDS_LEDGER_REQUIRED: "sgstTdsLedgerName",
+  IGST_TDS_LEDGER_REQUIRED: "igstTdsLedgerName",
+  TCS_LEDGER_REQUIRED: "tcsLedgerName",
+  ROUND_OFF_LEDGER_REQUIRED: "roundOffLedgerName",
+};
+// Item-line errors and the line values that can resolve them.
+const ISSUE_LINE_FIELDS: Partial<Record<string, Array<keyof TallyPostingLine>>> = {
+  STOCK_ITEM_REQUIRED: ["stockItemName"],
+  PURCHASE_LEDGER_REQUIRED: ["purchaseLedgerName"],
+  PURCHASE_LEDGER_MATCHES_SUPPLIER: ["purchaseLedgerName"],
+  LINE_ACCOUNTING_FIELDS_REQUIRED: ["description", "quantity", "unit", "rate", "taxableAmount"],
+  LINE_TAXABLE_MISMATCH: ["quantity", "rate", "taxableAmount"],
+};
+
+// True when the user has changed (to a non-empty value) the field an error from
+// the last check refers to. The error is hidden until the re-check confirms it.
+function issueFieldChanged(
+  issue: TallyPostingIssue,
+  checked: TallyPostingReview | null,
+  current: TallyPostingReview | null
+) {
+  if (!checked || !current) return false;
+  const field = ISSUE_REVIEW_FIELD[issue.code];
+  if (field) {
+    const value = current[field];
+    return typeof value === "string" && Boolean(value.trim()) && value !== checked[field];
+  }
+  const lineFields = ISSUE_LINE_FIELDS[issue.code];
+  if (!lineFields || !issue.lineId) return false;
+  const before = checked.lines.find((line) => line.lineId === issue.lineId);
+  const after = current.lines.find((line) => line.lineId === issue.lineId);
+  if (!before || !after) return false;
+  const changed = lineFields.some((key) => after[key] !== before[key]);
+  const filled = lineFields.every((key) => String(after[key] ?? "").trim());
+  return changed && filled;
+}
+
+function FieldIssues({ issues, onUse }: { issues?: TallyPostingIssue[]; onUse?: (value: string) => void }) {
   if (!issues?.length) return null;
   return (
     <div className="space-y-1">
       {issues.map((issue) => (
         <p className="text-[11px] leading-4 text-rose-600" key={issue.code}>
           {issue.message}
+          {issue.suggestion && onUse ? (
+            <button
+              className="ml-1.5 rounded border border-emerald-300 bg-emerald-50 px-1.5 py-0.5 font-semibold text-emerald-800 hover:bg-emerald-100"
+              onClick={() => onUse(issue.suggestion!)}
+              type="button"
+            >
+              Use {issue.suggestion}
+            </button>
+          ) : null}
         </p>
       ))}
     </div>
@@ -624,7 +685,7 @@ function MasterCombobox({
           This selection is not available in the latest data from {companyName || "Tally"}.
         </p>
       ) : null}
-      <FieldIssues issues={issues} />
+      <FieldIssues issues={issues} onUse={disabled ? undefined : onChange} />
     </div>
   );
 }
@@ -738,6 +799,10 @@ export function TallyPurchasePostingPanel({
   const automaticLiveRefreshRef = useRef<string | null>(null);
   const liveMasterResultRef = useRef<unknown>(null);
   const liveMasterOptionsRef = useRef<TallyPostingResponse["masterOptions"] | null>(null);
+  // The review on screen right now. A save that finishes after newer edits
+  // must not replace them; a failed automatic save waits for the next edit.
+  const currentReviewRef = useRef<TallyPostingReview | null>(null);
+  const autoSaveFailedReviewRef = useRef<TallyPostingReview | null>(null);
 
   const withLiveMasterOptions = useCallback((next: TallyPostingResponse) =>
     liveMasterOptionsRef.current
@@ -1377,12 +1442,18 @@ export function TallyPurchasePostingPanel({
   const sgstOptions = sgstRanked.options;
   const igstOptions = igstRanked.options;
   const freightOptions = freightRanked.options;
-  const tds194qOptions = tds194qRanked.options;
-  const transportTdsOptions = transportTdsRanked.options;
-  const cgstTdsOptions = cgstTdsRanked.options;
-  const sgstTdsOptions = sgstTdsRanked.options;
-  const igstTdsOptions = igstTdsRanked.options;
-  const tcsOptions = tcsRanked.options;
+  // Withholding pickers list only ledgers that the posting check accepts for
+  // that deduction (plus the current choice, which may come from a mapping).
+  const withholdingOptions = (options: TallyMasterOption[], role: PurchaseWithholdingRole, current: string | undefined) => {
+    const valid = options.filter((option) => isPurchaseWithholdingOption(option, role) || option.name === current);
+    return valid.length ? valid : options;
+  };
+  const tds194qOptions = withholdingOptions(tds194qRanked.options, "194q", review?.tds194qLedgerName);
+  const transportTdsOptions = withholdingOptions(transportTdsRanked.options, "transport", review?.transportTdsLedgerName);
+  const cgstTdsOptions = withholdingOptions(cgstTdsRanked.options, "cgst_tds", review?.cgstTdsLedgerName);
+  const sgstTdsOptions = withholdingOptions(sgstTdsRanked.options, "sgst_tds", review?.sgstTdsLedgerName);
+  const igstTdsOptions = withholdingOptions(igstTdsRanked.options, "igst_tds", review?.igstTdsLedgerName);
+  const tcsOptions = withholdingOptions(tcsRanked.options, "tcs", review?.tcsLedgerName);
   const roundOffOptions = roundOffRanked.options;
   // Keep expensive 50k-master line rankings across ordinary amount and text
   // edits. Each cache is discarded when its authoritative option array changes.
@@ -1418,9 +1489,12 @@ export function TallyPurchasePostingPanel({
         issue.code === "ROUND_OFF_LEDGER_REQUIRED" &&
         roundOffOptions.some((option) => option.name === review?.roundOffLedgerName)
       ) return false;
+      // The user already changed the field this error is about; the automatic
+      // re-check (under a second later) decides whether it still applies.
+      if (issueFieldChanged(issue, payload?.review ?? null, review)) return false;
       return true;
     }),
-    [masterValidationPending, payload?.blockers, payload?.posting?.status, review?.invoiceDate, review?.voucherDate, review?.roundOffLedgerName, roundOffOptions]
+    [masterValidationPending, payload?.blockers, payload?.posting?.status, payload?.review, review, roundOffOptions]
   );
   const remainingCorrectionBlockers = useMemo(
     () => correctionBlockers.filter((item) =>
@@ -1514,17 +1588,20 @@ export function TallyPurchasePostingPanel({
       );
       const hydrated = withLiveMasterOptions(next);
       setPayload(hydrated);
-      setReview(hydrated.review);
       setSelectedConnectionId(hydrated.selectedConnectionId ?? selectedConnectionId);
       setSelectedCompanyName(hydrated.selectedCompanyName ?? selectedCompanyName);
-      setDirty(false);
       setConnectionDirty(false);
+      // Edits made while this save ran stay on screen and are saved next.
+      if (currentReviewRef.current !== nextReview) return;
+      setReview(hydrated.review);
+      setDirty(false);
       setNotice(hydrated.readyForApproval
-        ? "Changes saved. This voucher is ready to send to Tally."
-        : "Changes saved. Complete the highlighted items before approval.");
+        ? "All changes saved. This voucher is ready to send to Tally."
+        : "All changes saved. Complete the highlighted items before approval.");
       if (approval.enabled) await approval.refresh();
     } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : "Could not save your changes.");
+      autoSaveFailedReviewRef.current = nextReview;
+      setError(saveError instanceof Error ? `${saveError.message} Your changes are kept; use Retry.` : "Could not save your changes. Use Retry.");
     } finally {
       setSaving(false);
     }
@@ -1791,6 +1868,17 @@ export function TallyPurchasePostingPanel({
     !refreshingMasters &&
     (hasUnsavedChanges || !payload?.posting)
   );
+  currentReviewRef.current = review;
+  // Every change saves and re-checks by itself shortly after the user stops,
+  // so the error list always describes what is on screen.
+  useEffect(() => {
+    if (!(hasUnsavedChanges || !payload?.posting) || !canSave || saving || !review) return;
+    if (autoSaveFailedReviewRef.current === review) return;
+    const timer = window.setTimeout(() => { void persistReview(review); }, 800);
+    return () => window.clearTimeout(timer);
+    // persistReview reads current state; re-run only when the edit state changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [review, hasUnsavedChanges, canSave, saving, payload?.posting]);
   const connection = payload?.connection;
   const connectionReadable = Boolean(
     connection?.bridgeConnected &&
@@ -2228,6 +2316,24 @@ export function TallyPurchasePostingPanel({
               syncing={!liveMastersReady || supplierLedgerLoading}
               value={review.supplierLedgerName}
             />
+            {(() => {
+              // Said as soon as the party is picked, not after a check.
+              const chosen = supplierLedgerOptions.find((option) => option.name === review.supplierLedgerName);
+              const chosenGstin = chosen?.gstin?.trim().toUpperCase();
+              const invoiceGstin = review.supplierGstin?.trim().toUpperCase();
+              if (!chosenGstin || !invoiceGstin || chosenGstin === invoiceGstin) return null;
+              const sameGstin = supplierLedgerOptions.find((option) => option.gstin?.trim().toUpperCase() === invoiceGstin);
+              return (
+                <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[10px] leading-4 text-rose-700 lg:col-span-2">
+                  {review.supplierLedgerName} has GSTIN {chosenGstin}, but this invoice is from {invoiceGstin}.
+                  {sameGstin ? (
+                    <button type="button" className="ml-1 font-semibold underline" disabled={locked} onClick={() => updateReview("supplierLedgerName", sameGstin.name)}>
+                      Use {sameGstin.name}
+                    </button>
+                  ) : " Pick the party ledger with the invoice's GSTIN."}
+                </div>
+              );
+            })()}
             {supplierLedgerMatch?.matchType === "suspense" ? (
               <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-[10px] leading-4 text-slate-500 lg:col-span-2">
                 No ledger was safe to select automatically. Search the complete ledger list above.
@@ -3018,7 +3124,15 @@ export function TallyPurchasePostingPanel({
                 )}</strong></span>
               </>
             ) : null}
-            {hasUnsavedChanges ? <Badge variant="outline" className="border-amber-200 bg-amber-50 text-amber-700">Unsaved</Badge> : null}
+            {saving ? (
+              <Badge variant="outline" className="border-slate-200 bg-slate-50 text-slate-600"><Loader2 className="mr-1 h-3 w-3 animate-spin" />Saving…</Badge>
+            ) : hasUnsavedChanges && error ? (
+              <Badge variant="outline" className="border-red-200 bg-red-50 text-red-700">Not saved</Badge>
+            ) : hasUnsavedChanges ? (
+              <Badge variant="outline" className="border-slate-200 bg-slate-50 text-slate-600">Saving…</Badge>
+            ) : payload.posting ? (
+              <Badge variant="outline" className="border-emerald-200 bg-emerald-50 text-emerald-700">All changes saved</Badge>
+            ) : null}
           </div>
           {payload.posting?.status === "created" ? (
             <div className="flex items-center justify-end gap-2 text-xs font-medium text-emerald-700">
@@ -3030,10 +3144,13 @@ export function TallyPurchasePostingPanel({
             </div>
           ) : (
             <div className="flex justify-end gap-2">
-              <Button disabled={!canSave || saving} onClick={() => void handleSave()} variant="outline">
-                {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileCheck2 className="h-4 w-4" />}
-                Save and check
-              </Button>
+              {/* Changes save and re-check by themselves; this only appears to retry a failed save. */}
+              {canSave && error && !saving ? (
+                <Button disabled={!canSave} onClick={() => void handleSave()} variant="outline">
+                  <FileCheck2 className="h-4 w-4" />
+                  Retry save
+                </Button>
+              ) : null}
               {onApprovePacket && !approval.enabled ? (
                 <Button
                   className="bg-emerald-700 text-white hover:bg-emerald-800"

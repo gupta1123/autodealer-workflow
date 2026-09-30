@@ -30,6 +30,8 @@ export type PurchasePostingIssue = {
   lineId?: string;
   requiresAcknowledgement?: boolean;
   policyRule?: PurchaseValidationRuleKey;
+  // A live Tally master that would resolve this issue (offered as one click).
+  suggestion?: string;
 };
 
 export type PurchasePostingDocumentInput = {
@@ -1321,6 +1323,24 @@ function issue(
   return { code, label, message, scope, ...(lineId ? { lineId } : {}) };
 }
 
+// A withholding ledger that is missing or of the wrong kind: name the chosen
+// ledger and offer a live one that the check accepts.
+function withholdingLedgerIssue(
+  code: string,
+  label: string,
+  kind: string,
+  role: "194q" | "transport" | "cgst_tds" | "sgst_tds" | "igst_tds",
+  selectedName: string,
+  masters: PurchasePostingMasterInput[]
+) {
+  const suggestion = activeMasters(masters).find((master) =>
+    ["ledger", "tax_ledger"].includes(master.master_type) && isWithholdingLedger(master, role)
+  )?.tally_name;
+  const chosen = text(selectedName);
+  const message = `${chosen ? `${chosen} is not a ${kind} ledger.` : `Choose the ${kind} ledger.`}${suggestion ? ` Use ${suggestion}.` : " Create it in Tally, then refresh."}`;
+  return { ...issue(code, label, message, "tax"), ...(suggestion ? { suggestion } : {}) };
+}
+
 const PURCHASE_VALIDATION_RULE_BY_CODE: Partial<
   Record<string, PurchaseValidationRuleKey>
 > = {
@@ -1702,18 +1722,32 @@ export function preparePurchasePosting(params: {
     blockers.push(issue("SUPPLIER_GSTIN_REQUIRED", "Supplier GSTIN required", "Confirm the supplier GSTIN before posting.", "invoice"));
   }
   const supplierLedger = selectedMaster(params.masters, review.supplierLedgerName, ["ledger"]);
+  // The party ledger carrying the invoice's GSTIN, offered as a one-click fix.
+  const supplierByGstin = validGstin(review.supplierGstin)
+    ? activeMasters(params.masters).find((master) =>
+        master.master_type === "ledger" && normalizeGstin(master.gstin) === normalizeGstin(review.supplierGstin)
+      )?.tally_name
+    : undefined;
   if (!supplierLedger) {
-    blockers.push(issue("SUPPLIER_LEDGER_REQUIRED", "Supplier ledger missing", "Select an existing supplier ledger from the active Tally company.", "invoice"));
+    blockers.push({
+      ...issue("SUPPLIER_LEDGER_REQUIRED", "Supplier ledger missing",
+        `${text(review.supplierLedgerName) ? `${review.supplierLedgerName} is not a ledger in the selected Tally company.` : "Choose the party ledger."}${supplierByGstin ? ` Use ${supplierByGstin} (GSTIN ${review.supplierGstin}).` : ""}`,
+        "invoice"),
+      ...(supplierByGstin ? { suggestion: supplierByGstin } : {}),
+    });
   } else if (
     supplierLedger.gstin &&
     normalizeGstin(supplierLedger.gstin) !== normalizeGstin(review.supplierGstin)
   ) {
-    blockers.push(issue(
-      "SUPPLIER_LEDGER_GSTIN_MISMATCH",
-      "Supplier ledger GSTIN does not match",
-      `The selected ledger belongs to GSTIN ${supplierLedger.gstin}, not ${review.supplierGstin}.`,
-      "invoice"
-    ));
+    blockers.push({
+      ...issue(
+        "SUPPLIER_LEDGER_GSTIN_MISMATCH",
+        "Supplier ledger GSTIN does not match",
+        `${supplierLedger.tally_name} has GSTIN ${supplierLedger.gstin}, but the invoice is from ${review.supplierGstin}.${supplierByGstin ? ` Use ${supplierByGstin}.` : ""}`,
+        "invoice"
+      ),
+      ...(supplierByGstin ? { suggestion: supplierByGstin } : {}),
+    });
   } else if (!supplierLedger.gstin) {
     warnings.push(issue(
       "SUPPLIER_LEDGER_GSTIN_UNAVAILABLE",
@@ -1985,7 +2019,7 @@ export function preparePurchasePosting(params: {
       }
       const tds194qMaster = selectedMaster(params.masters, review.tds194qLedgerName, ["ledger", "tax_ledger"]);
       if (!tds194qMaster || (!isWithholdingLedger(tds194qMaster, "194q") && !mappingSelects(params.masters, params.mappings ?? [], "tds_ledger", ["194q", "purchase_goods"], review.tds194qLedgerName))) {
-        blockers.push(issue("TDS_194Q_LEDGER_REQUIRED", "Purchase TDS ledger missing", "Select the configured purchase TDS ledger from live Tally.", "tax"));
+        blockers.push(withholdingLedgerIssue("TDS_194Q_LEDGER_REQUIRED", "Purchase TDS ledger missing", "Section 194Q TDS", "194q", review.tds194qLedgerName, params.masters));
       }
       warnings.push(issue(
         "TDS_194Q_USER_CONFIRMED",
@@ -2016,11 +2050,11 @@ export function preparePurchasePosting(params: {
       );
       const cgstTdsMaster = selectedMaster(params.masters, review.cgstTdsLedgerName, ["ledger", "tax_ledger"]);
       if (!cgstTdsMaster || (!isWithholdingLedger(cgstTdsMaster, "cgst_tds") && !mappingSelects(params.masters, params.mappings ?? [], "tds_ledger", ["cgst_tds", "gst_tds_cgst"], review.cgstTdsLedgerName))) {
-        blockers.push(issue("CGST_TDS_LEDGER_REQUIRED", "CGST TDS ledger missing", "Select CGST TDS PAYABLE 1% from live Tally.", "tax"));
+        blockers.push(withholdingLedgerIssue("CGST_TDS_LEDGER_REQUIRED", "CGST TDS ledger missing", "CGST TDS", "cgst_tds", review.cgstTdsLedgerName, params.masters));
       }
       const sgstTdsMaster = selectedMaster(params.masters, review.sgstTdsLedgerName, ["ledger", "tax_ledger"]);
       if (!sgstTdsMaster || (!isWithholdingLedger(sgstTdsMaster, "sgst_tds") && !mappingSelects(params.masters, params.mappings ?? [], "tds_ledger", ["sgst_tds", "gst_tds_sgst"], review.sgstTdsLedgerName))) {
-        blockers.push(issue("SGST_TDS_LEDGER_REQUIRED", "SGST TDS ledger missing", "Select SGST TDS PAYABLE 1% from live Tally.", "tax"));
+        blockers.push(withholdingLedgerIssue("SGST_TDS_LEDGER_REQUIRED", "SGST TDS ledger missing", "SGST TDS", "sgst_tds", review.sgstTdsLedgerName, params.masters));
       }
       } else if (calculation.taxMode === "igst") {
       requireMatchingInvoiceDeduction(
@@ -2032,7 +2066,7 @@ export function preparePurchasePosting(params: {
       );
       const igstTdsMaster = selectedMaster(params.masters, review.igstTdsLedgerName, ["ledger", "tax_ledger"]);
       if (!igstTdsMaster || (!isWithholdingLedger(igstTdsMaster, "igst_tds") && !mappingSelects(params.masters, params.mappings ?? [], "tds_ledger", ["igst_tds", "gst_tds_igst"], review.igstTdsLedgerName))) {
-        blockers.push(issue("IGST_TDS_LEDGER_REQUIRED", "IGST TDS ledger missing", "Select IGST TDS PAYABLE 2% from live Tally.", "tax"));
+        blockers.push(withholdingLedgerIssue("IGST_TDS_LEDGER_REQUIRED", "IGST TDS ledger missing", "IGST TDS", "igst_tds", review.igstTdsLedgerName, params.masters));
       }
       }
     }
@@ -2057,7 +2091,7 @@ export function preparePurchasePosting(params: {
     }
     const transportTdsMaster = selectedMaster(params.masters, review.transportTdsLedgerName, ["ledger", "tax_ledger"]);
     if (!transportTdsMaster || (!isWithholdingLedger(transportTdsMaster, "transport") && !mappingSelects(params.masters, params.mappings ?? [], "tds_ledger", ["transport", "goods_transport"], review.transportTdsLedgerName))) {
-      blockers.push(issue("TRANSPORT_TDS_LEDGER_REQUIRED", "Transport TDS ledger missing", "Select Tds on Goods Transport from live Tally.", "tax"));
+      blockers.push(withholdingLedgerIssue("TRANSPORT_TDS_LEDGER_REQUIRED", "Transport TDS ledger missing", "goods-transport TDS", "transport", review.transportTdsLedgerName, params.masters));
     }
   }
   if (tcsReceivableActive) {
