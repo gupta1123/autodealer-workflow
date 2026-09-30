@@ -45,8 +45,17 @@ async function GETHandler(request:Request) {
     const rows=await query.order('next_due_at',{ascending:true,nullsFirst:false}).order('id').range((page-1)*limit,page*limit-1);
     checked(rows);
     const templates=checked(await db.from('followup_pipeline_templates').select('*').eq('organization_id',access.organizationId).order('name').limit(100));
-    const visibleRows=(rows.data||[]).map(row=>row.connection_id===connection.id&&row.session_generation===connection.session_generation
-      ?row:{...row,verification_expires_at:null,note:row.note||'Tally was reconnected. Check outstanding before sending again.'});
+    // The latest message of each schedule on this page, so the list can show
+    // whether (and when) the last reminder was submitted.
+    const pageIds=(rows.data||[]).map(row=>row.id);
+    const latest=new Map<string,{status:string;created_at:string;error:string|null}>();
+    if(pageIds.length){
+      const attempts=checked(await db.from('invoice_followup_attempts').select('pipeline_id,status,created_at,error')
+        .in('pipeline_id',pageIds).order('created_at',{ascending:false}).limit(500));
+      for(const attempt of attempts||[])if(!latest.has(attempt.pipeline_id))latest.set(attempt.pipeline_id,{status:attempt.status,created_at:attempt.created_at,error:attempt.error});
+    }
+    const visibleRows=(rows.data||[]).map(row=>({...(row.connection_id===connection.id&&row.session_generation===connection.session_generation
+      ?row:{...row,verification_expires_at:null,note:row.note||'Tally was reconnected. Check outstanding before sending again.'}),last_attempt:latest.get(row.id)??null}));
     return jsonWithCors(request,{rows:visibleRows,total:rows.count,page,pageSize:limit,templates,messages:reminderMessages().map(m=>({key:m.key,text:m.text})),checkValidityMinutes:5},{headers:{'Cache-Control':'private, no-store'}});
   }catch(error){return failure(request,error);}
 }
@@ -201,7 +210,10 @@ async function POSTHandler(request:Request) {
       checked(await db.rpc('followup_finish_send',{p_id:row.id,p_attempt:claim.attempt_id,p_status:status,p_provider:provider,p_error:error,p_next:next}));
       let phoneNotice=null;
       if(status==='accepted'&&body.savePhoneToTally===true){const queued=await db.rpc('followup_queue_phone',{p_actor:access.member.user_id,p_org:access.organizationId,p_id:row.id});phoneNotice=queued.error?'Message submitted, but the number could not be queued for Tally.':'Number queued for Tally; not yet confirmed saved.';if(!queued.error)await wakeTallyConnector(connection.id).catch(()=>{});}
-      return jsonWithCors(request,{status,error,phoneNotice});
+      // Where the schedule stands now, so the page can say what happens next.
+      const after=await db.from('invoice_followup_pipelines').select('status,next_due_at').eq('id',row.id).maybeSingle();
+      return jsonWithCors(request,{status,error,phoneNotice,submittedAt:new Date().toISOString(),
+        scheduleStatus:after.data?.status??null,nextDueAt:after.data?.next_due_at??null});
     }
     throw new AccessError('Unknown pipeline action.',400);
   }catch(error){return failure(request,error);}
