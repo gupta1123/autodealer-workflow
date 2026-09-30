@@ -162,21 +162,31 @@ export async function POST(request: Request) {
       const ctx = statement.processing_meta?.selectedContext || {};
       await supabase.from("bank_statement_extraction_jobs").update({ progress: 50, stage: "Analyzing transactions" }).eq("id", bankJob.id).eq("status", "running");
       mark("ai_analysis");
-      const extraction = await matchBankMarkdown({ markdown, ledgerNames: ctx.liveTallyLedgerNames || [], bankAccountCandidates: ctx.liveTallyBankAccountCandidates || [], traceId });
-      const localExtraction = {
-        commandId: command.id, data: extraction.data,
-        diagnostics: { source: "local_agent", machineName: current.machineName, installationId: identity.installationId, auditHash,
-          sourceRetention: jobPayload.browserUpload ? "local_only" : "cloud", markdownChars: markdown.length, aiMs: extraction.aiMs,
-          coverage: extraction.coverage },
-      };
-      mark("saving_result", { aiMs: extraction.aiMs, transactionCount: extraction.data.transactions.length });
-      const { data: updated, error: saveError } = await supabase.from("bank_statement_extraction_jobs")
-        .update({ result: { ...bankJob.result, localExtraction } }).eq("id", bankJob.id).eq("status", "running").select("id").maybeSingle();
-      if (saveError) throw saveError;
-      if (!updated) return jsonWithCors(request, { error: "Bank analysis was cancelled." }, { status: 409 });
-      await supabase.from("tally_bridge_commands").update({ external_result_reference: `bank-document:${auditHash}` }).eq("id", command.id);
-      mark("completed");
-      return jsonWithCors(request, { accepted: true, auditHash, transactionCount: extraction.data.transactions.length });
+      // Heroku ends any request after 30 seconds, and AI on a larger statement
+      // takes longer. Accept the upload now and finish in the background; the
+      // bank worker waits for the saved localExtraction or a failed job.
+      const analysisFailureContext = failureContext;
+      void (async () => {
+        try {
+          const extraction = await matchBankMarkdown({ markdown, ledgerNames: ctx.liveTallyLedgerNames || [], bankAccountCandidates: ctx.liveTallyBankAccountCandidates || [], traceId });
+          const localExtraction = {
+            commandId: command.id, data: extraction.data,
+            diagnostics: { source: "local_agent", machineName: current.machineName, installationId: identity.installationId, auditHash,
+              sourceRetention: jobPayload.browserUpload ? "local_only" : "cloud", markdownChars: markdown.length, aiMs: extraction.aiMs,
+              coverage: extraction.coverage },
+          };
+          mark("saving_result", { aiMs: extraction.aiMs, transactionCount: extraction.data.transactions.length });
+          const { data: updated, error: saveError } = await supabase.from("bank_statement_extraction_jobs")
+            .update({ result: { ...bankJob.result, localExtraction } }).eq("id", bankJob.id).eq("status", "running").select("id").maybeSingle();
+          if (saveError) throw saveError;
+          if (!updated) { mark("cancelled_before_save"); return; }
+          await supabase.from("tally_bridge_commands").update({ external_result_reference: `bank-document:${auditHash}` }).eq("id", command.id);
+          mark("completed");
+        } catch (error) {
+          await recordFailure(error, analysisFailureContext);
+        }
+      })();
+      return jsonWithCors(request, { accepted: true, auditHash, processing: true });
     }
     // Markdown is intentionally processed in-memory and is never stored in a
     // Supabase table. The workflow receives only compact extraction metadata;
@@ -191,6 +201,14 @@ export async function POST(request: Request) {
       },
     });
   } catch (error) {
+    const { message, diagnostic } = await recordFailure(error, failureContext);
+    return jsonWithCors(request, { error: message, code: diagnostic.diagnosticCode || "DOCUMENT_RESULT_FAILED" },
+      { status: diagnostic.diagnosticCode === "AI_TIMEOUT" ? 504 : /incorrect header|invalid/i.test(message) ? 400 : 500 });
+  }
+
+  // Logs the failure and marks the bank job and import failed (only while they
+  // are still running), so the waiting worker and page stop promptly.
+  async function recordFailure(error: unknown, context: typeof failureContext) {
     const detail = error as { name?: string; code?: string; cause?: { code?: string } };
     console.error("[bank-document-result]", JSON.stringify({ traceId, event: "failed", phase,
       elapsedMs: Date.now() - started,
@@ -199,8 +217,8 @@ export async function POST(request: Request) {
     }));
     const diagnostic = error as { diagnosticCode?: string; publicMessage?: string };
     const message = diagnostic.publicMessage || (error instanceof Error ? error.message : "Document result processing failed.");
-    if (failureContext) {
-      const { db, jobId, importId, ownerId, meta } = failureContext;
+    if (context) {
+      const { db, jobId, importId, ownerId, meta } = context;
       try {
         const finishedAt = new Date().toISOString();
         const { data: failed, error: jobError } = await db.from("bank_statement_extraction_jobs")
@@ -222,8 +240,7 @@ export async function POST(request: Request) {
         console.error("[bank-document-result]", JSON.stringify({ traceId, event: "failure_status_save_failed" }));
       }
     }
-    return jsonWithCors(request, { error: message, code: diagnostic.diagnosticCode || "DOCUMENT_RESULT_FAILED" },
-      { status: diagnostic.diagnosticCode === "AI_TIMEOUT" ? 504 : /incorrect header|invalid/i.test(message) ? 400 : 500 });
+    return { message, diagnostic };
   }
 }
 
