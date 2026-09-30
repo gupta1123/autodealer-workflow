@@ -135,13 +135,14 @@ export function calculatePurchaseVoucher(input: PurchaseCalculationInput) {
     ? taxAmount(freight, purchaseRateBasisPoints(input.transportTdsRate) ?? 0)
     : 0;
   // A deduction printed on the invoice is used as printed. Invoices rarely
-  // print it, so otherwise the rate on freight is deducted, to the rupee.
+  // print it, so otherwise the rate on freight is deducted, rounded down to
+  // the whole rupee as the client books it.
   const printedTransportTds = purchaseMoneyPaise(input.sourceTransportTdsAmount);
   const transportTds = !input.transportTdsEnabled
     ? 0
     : printedTransportTds !== null
       ? Math.abs(printedTransportTds)
-      : Math.round(transportTdsCalculated / 100) * 100;
+      : Math.floor(transportTdsCalculated / 100) * 100;
   const cgstTds = Math.abs(purchaseMoneyPaise(input.cgstTdsAmount) ?? 0);
   const sgstTds = Math.abs(purchaseMoneyPaise(input.sgstTdsAmount) ?? 0);
   const igstTds = Math.abs(purchaseMoneyPaise(input.igstTdsAmount) ?? 0);
