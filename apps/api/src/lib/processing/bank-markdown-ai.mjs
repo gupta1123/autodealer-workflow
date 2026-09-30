@@ -1,15 +1,21 @@
 // Only Markdown and candidate labels reach the AI provider; PDF bytes stay out.
 import { inventoryBankMarkdown, verifyBankChunk } from "./bank-markdown-coverage.mjs";
+import { createLedgerShortlister, ledgerShortlistEnabled, shortlistLedgerNames } from "./bank-ledger-shortlist.mjs";
 
 export async function matchBankMarkdown(options) {
   const started = Date.now();
   const inventory = inventoryBankMarkdown(options.markdown);
   const logger = options.logger || console;
   const traceId = options.traceId || "unassigned";
+  const shortlister = ledgerShortlistEnabled() && Array.isArray(options.ledgerNames)
+    ? createLedgerShortlister(options.ledgerNames) : null;
+  // Only the ledgers these rows can plausibly refer to; null keeps the full list.
+  const ledgerNamesFor = (texts) => shortlistLedgerNames(shortlister, texts) ?? options.ledgerNames;
   if (!inventory.verifiable) {
     // Unsupported layouts may still be extracted, but never claim verified
     // completeness from the model's response alone.
-    const result = await requestBankMarkdown(options);
+    const result = await requestBankMarkdown({ ...options,
+      ledgerNames: ledgerNamesFor(options.markdown.split(/\r?\n/).filter(line => line.trim())) });
     return { ...result, coverage: { complete: false, method: "unverified_layout",
       sourceRows: inventory.rows.length, returnedRows: result.data.transactions.length } };
   }
@@ -18,7 +24,8 @@ export async function matchBankMarkdown(options) {
   const chunks = [];
   for (let i = 0; i < inventory.rows.length; i += 50) chunks.push(inventory.rows.slice(i, i + 50));
   logger.info("[bank-document-ai]", JSON.stringify({ traceId, event: "coverage_inventory",
-    sourceRows: inventory.rows.length, chunks: chunks.length, concurrency: Math.min(2, chunks.length) }));
+    sourceRows: inventory.rows.length, chunks: chunks.length, concurrency: Math.min(2, chunks.length),
+    ledgerCatalogue: options.ledgerNames?.length ?? 0, ledgerShortlist: Boolean(shortlister && shortlister.size > 600) }));
   const results = new Array(chunks.length);
   let next = 0;
   let completedRows = 0;
@@ -27,7 +34,7 @@ export async function matchBankMarkdown(options) {
     let result;
     try {
       result = await requestBankMarkdown({ ...options, markdown: inventory.context,
-        sourceRows: rows, signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]), timeoutMs: 60_000,
+        ledgerNames: ledgerNamesFor(rows.map(row => row.markdown)), sourceRows: rows, signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]), timeoutMs: 60_000,
         traceId: `${traceId}:rows-${rows[0].id}-${rows.at(-1).id}` });
       signal.throwIfAborted();
       if (verifyBankChunk(rows, result.data.transactions)) {
