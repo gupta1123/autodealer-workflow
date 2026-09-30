@@ -2374,7 +2374,7 @@ export function TallyPurchasePostingPanel({
                 <div>
                   <div className="text-xs font-semibold text-slate-900">E-way bill</div>
                   <div className="text-[10px] leading-4 text-slate-500">
-                    Recorded in Tally as reference. Tally's "Provide e-Way Bill details" stays No; To is your company address from Tally.
+                    {"Recorded in Tally as reference. Tally's \"Provide e-Way Bill details\" stays No; To is your company address from Tally."}
                   </div>
                 </div>
                 <label className="flex items-center gap-2 text-[11px] font-medium text-slate-700">
