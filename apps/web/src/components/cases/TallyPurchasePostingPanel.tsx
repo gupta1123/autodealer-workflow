@@ -2369,18 +2369,18 @@ export function TallyPurchasePostingPanel({
             </div>
           </details>
           {review.ewayBill ? (
-            <div className="border-t border-slate-100 px-4 py-3 sm:px-5" id="tally-eway-bill">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <div className="text-xs font-semibold text-slate-900">E-way bill</div>
-                  <div className="text-[10px] leading-4 text-slate-500">
-                    {"Recorded in Tally as reference. Tally's \"Provide e-Way Bill details\" stays No; To is your company address from Tally."}
-                  </div>
-                </div>
-                <label className="flex items-center gap-2 text-[11px] font-medium text-slate-700">
+            <div className="border-t border-slate-100" id="tally-eway-bill">
+              {/* Same pattern as the invoice header: fixed labels and values;
+                  inputs only appear under "Edit e-way bill details". */}
+              <div className="flex items-center justify-between gap-2 px-4 pt-2.5 sm:px-5">
+                <div className="text-[8px] font-semibold uppercase tracking-[0.12em] text-slate-400">E-way bill</div>
+                <label
+                  className="flex items-center gap-1.5 text-[10px] font-medium text-slate-600"
+                  title={"Recorded as reference; Tally's e-way bill applicability stays No. To is your company address from Tally."}
+                >
                   <input
                     checked={review.ewayBill.record}
-                    className="h-3.5 w-3.5 accent-emerald-700"
+                    className="h-3 w-3 accent-emerald-700"
                     disabled={locked}
                     onChange={(event) => updateReview("ewayBill", { ...review.ewayBill!, record: event.target.checked })}
                     type="checkbox"
@@ -2388,17 +2388,34 @@ export function TallyPurchasePostingPanel({
                   Record in Tally
                 </label>
               </div>
-              {review.ewayBill.record ? (
-                <div className="mt-2 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <div className={`grid grid-cols-2 gap-x-4 gap-y-2 px-4 py-2 sm:grid-cols-5 sm:px-5 ${review.ewayBill.record ? "" : "opacity-50"}`}>
+                {([
+                  ["E-way bill no.", review.ewayBill.number || "Missing", true],
+                  ["E-way bill date", formatShortDate(review.ewayBill.date), false],
+                  ["From", [review.ewayBill.fromPlace, review.ewayBill.fromPincode].filter(Boolean).join(" ") || "—", false],
+                  ["Vehicle", review.ewayBill.vehicleNumber || review.vehicleNumber || "—", false],
+                  ["Distance", review.ewayBill.distanceKm ? `${review.ewayBill.distanceKm} km · ${review.ewayBill.transportMode.replace(/^\d+\s*-\s*/, "")}` : "—", false],
+                ] as const).map(([label, value, strong]) => (
+                  <div key={label}>
+                    <div className="text-[8px] font-semibold uppercase tracking-[0.12em] text-slate-400">{label}</div>
+                    <div className={`mt-0.5 text-[11px] ${strong ? "font-semibold text-slate-950" : "text-slate-700"}`}>{value}</div>
+                  </div>
+                ))}
+              </div>
+              <details className="group border-t border-slate-100">
+                <summary className="flex cursor-pointer list-none items-center gap-1.5 px-4 py-2 text-[10px] font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-800 sm:px-5">
+                  Edit e-way bill details <ChevronDown className="h-3 w-3 transition group-open:rotate-180" />
+                </summary>
+                <div className="grid gap-3 border-t border-slate-100 bg-white p-4 sm:grid-cols-2 sm:px-5 lg:grid-cols-4">
                   {([
                     ["number", "E-way bill number", "text"],
                     ["date", "E-way bill date", "date"],
-                    ["fromPlace", "From (dispatch place)", "text"],
+                    ["fromPlace", "From place", "text"],
                     ["fromPincode", "From PIN", "text"],
+                    ["fromState", "From state", "text"],
                     ["vehicleNumber", "Vehicle", "text"],
                     ["distanceKm", "Distance (km)", "text"],
                     ["transportMode", "Mode", "text"],
-                    ["fromState", "From state", "text"],
                   ] as const).map(([key, label, type]) => (
                     <Field
                       compact
@@ -2411,7 +2428,7 @@ export function TallyPurchasePostingPanel({
                     />
                   ))}
                 </div>
-              ) : null}
+              </details>
             </div>
           ) : null}
         </div>
