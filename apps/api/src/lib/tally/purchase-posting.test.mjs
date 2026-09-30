@@ -1390,3 +1390,39 @@ test("transport TDS rate follows the payee type in the GSTIN's PAN", () => {
   assert.equal(transportTdsRateForPayee("27AAAFA1234A1Z5"), "2"); // F: firm
   assert.equal(transportTdsRateForPayee(""), "1");
 });
+
+test("the case's e-way bill page is read for the voucher and only sent when valid", () => {
+  const invoice = invoiceDocument();
+  const eway = {
+    id: "eway-1", document_type: "E-Way Bill", source_file_name: "invoice.pdf", source_hint: "invoice.pdf", title: "E-Way Bill",
+    extracted_fields: {
+      eWayBillNumber: "2622 6409 7358", referenceInvoiceNumber: "INV-100", documentDate: "12/08/2026 07:13 PM",
+      vehicleNumber: "MH21X7266",
+      dispatchFrom: "PLOT NO 22, MIDC AREA HINGNA ROAD, NAGPUR, NAGPUR,MAHARASHTRA-440016",
+      shipTo: "C-7&8 ADDITIONAL MIDC AREA, JALNA, JALNA,MAHARASHTRA-431203",
+    },
+    markdown: "eWay Bill No: 2622 6409 7358\nMode: Road\nApprox Distance: 437km",
+  };
+  const run = (savedReview) => preparePurchasePosting({
+    documents: [invoice, eway], masters: completeMasters, mappings: [], savedReview,
+    caseStatus: "accepted", connectionReady: true, companyName: "Test Company",
+    companyGstin: invoice.extracted_fields.buyerGstin, sourceDocumentReference: "https://app.example/x",
+    duplicateExists: false, accountingSettings: { purchaseGoodsTdsEnabled: true, transporterTdsEnabled: true, gstTdsEnabled: true },
+  });
+
+  const result = run({ sourceReferenceApproved: true });
+  assert.deepEqual(
+    { ...result.review.ewayBill, fromAddress: undefined },
+    { record: true, number: "262264097358", date: "2026-08-12", fromAddress: undefined, fromPlace: "NAGPUR", fromPincode: "440016",
+      fromState: "Maharashtra", toPlace: "JALNA", toPincode: "431203", toState: "Maharashtra", transportMode: "1 - Road",
+      vehicleNumber: "MH21X7266", distanceKm: "437" }
+  );
+  assert.equal(result.tallyPayload.ewayBill.number, "262264097358");
+
+  const invalid = run({ sourceReferenceApproved: true, ewayBill: { number: "12345" } });
+  assert.equal(invalid.tallyPayload.ewayBill, undefined);
+  assert.ok(invalid.warnings.some((warning) => warning.code === "EWAY_BILL_NUMBER_INVALID"));
+
+  const off = run({ sourceReferenceApproved: true, ewayBill: { record: false } });
+  assert.equal(off.tallyPayload.ewayBill, undefined);
+});

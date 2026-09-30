@@ -286,6 +286,18 @@ function asSavedReview(value: unknown): Partial<PurchasePostingReview> | null {
   for (const key of ["applyTds194q", "applyTransportTds", "applyGstTds", "tcsReceivable", "sourceReferenceApproved"] as const) {
     if (typeof input[key] === "boolean") output[key] = input[key];
   }
+  if (input.ewayBill && typeof input.ewayBill === "object" && !Array.isArray(input.ewayBill)) {
+    const eway = input.ewayBill as Record<string, unknown>;
+    const clean: Record<string, unknown> = {};
+    if (typeof eway.record === "boolean") clean.record = eway.record;
+    for (const key of ["number", "date", "fromAddress", "fromPlace", "fromPincode", "fromState", "toPlace", "toPincode", "toState", "transportMode", "vehicleNumber", "distanceKm"] as const) {
+      if (typeof eway[key] === "string") {
+        const value = eway[key].trim().slice(0, key === "fromAddress" ? 300 : 80);
+        clean[key] = key === "date" ? normalizePurchasePostingDate(value) : value;
+      }
+    }
+    output.ewayBill = clean;
+  }
   if (Array.isArray(input.lines)) {
     const lineKeys = [
       "lineId",

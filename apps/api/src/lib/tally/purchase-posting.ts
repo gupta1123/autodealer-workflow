@@ -125,7 +125,28 @@ export type PurchasePostingReview = {
   roundOffAmount: string;
   sourceReferenceApproved: boolean;
   narration: string;
+  // Supplier's e-way bill, recorded on the voucher as reference only
+  // (Tally's e-way bill applicability stays No). Null when the case has none.
+  ewayBill: PurchaseEwayBill | null;
   lines: PurchasePostingReviewLine[];
+};
+
+export type PurchaseEwayBill = {
+  record: boolean;
+  number: string;
+  date: string;
+  fromAddress: string;
+  fromPlace: string;
+  fromPincode: string;
+  fromState: string;
+  // Fallbacks from the e-way bill's Ship To; the connector prefers the
+  // company's own address and PIN from Tally.
+  toPlace: string;
+  toPincode: string;
+  toState: string;
+  transportMode: string;
+  vehicleNumber: string;
+  distanceKm: string;
 };
 
 type PurchasePostingSourceLine = PurchasePostingReviewLine & {
@@ -139,6 +160,7 @@ type PurchasePostingSourceLine = PurchasePostingReviewLine & {
 };
 
 export type PurchasePostingSource = {
+  ewayBill: PurchaseEwayBill | null;
   documentId: string;
   documentType: string;
   lineSourceDocumentId: string;
@@ -807,7 +829,73 @@ function buildSource(
     invoiceRoundOffAmount: invoiceRoundOffAmount(fields, commercialFields, lines),
     godownName: packetInventoryText(document, documents, "godown"),
     batchName: packetInventoryText(document, documents, "batch"),
+    ewayBill: packetEwayBill(fields, documents),
     lines,
+  };
+}
+
+const STATE_NAMES = [
+  "Andaman and Nicobar Islands", "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chandigarh",
+  "Chhattisgarh", "Dadra and Nagar Haveli and Daman and Diu", "Delhi", "Goa", "Gujarat", "Haryana",
+  "Himachal Pradesh", "Jammu and Kashmir", "Jharkhand", "Karnataka", "Kerala", "Ladakh", "Lakshadweep",
+  "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya", "Mizoram", "Nagaland", "Odisha", "Puducherry",
+  "Punjab", "Rajasthan", "Sikkim", "Tamil Nadu", "Telangana", "Tripura", "Uttar Pradesh", "Uttarakhand",
+  "West Bengal",
+];
+
+function stateInText(value: string) {
+  const compact = value.toLowerCase().replace(/[^a-z]/g, "");
+  return STATE_NAMES.find((state) => compact.includes(state.toLowerCase().replace(/[^a-z]/g, ""))) ?? "";
+}
+
+// "PLOT NO 22, MIDC AREA HINGNA ROAD, NAGPUR, NAGPUR,MAHARASHTRA-440016"
+// -> place NAGPUR, PIN 440016, state Maharashtra.
+function splitEwayAddress(address: string) {
+  const pincode = address.match(/\b(\d{6})\b(?!.*\b\d{6}\b)/)?.[1] ?? "";
+  const state = stateInText(address);
+  const parts = address.split(",").map((part) => part.replace(/-?\s*\d{6}\s*$/, "").trim()).filter(Boolean);
+  const place = [...parts].reverse().find((part) => !stateInText(part) && /^[A-Za-z .]{3,40}$/.test(part)) ?? "";
+  return { pincode, state, place: place.replace(/\s+/g, " ") };
+}
+
+function emptyEwayBill(): PurchaseEwayBill {
+  return { record: false, number: "", date: "", fromAddress: "", fromPlace: "", fromPincode: "", fromState: "",
+    toPlace: "", toPincode: "", toState: "", transportMode: "1 - Road", vehicleNumber: "", distanceKm: "" };
+}
+
+// The supplier's e-way bill page for this invoice: its number, date, dispatch
+// place and transport details, recorded on the purchase voucher as reference.
+function packetEwayBill(invoiceFields: Record<string, unknown>, documents: PurchasePostingDocumentInput[]): PurchaseEwayBill | null {
+  const invoiceNumber = normalizeKey(invoiceFields.invoiceNumber || invoiceFields.referenceInvoiceNumber);
+  const candidates = documents.filter((document) => /e-?way\s*bill/i.test(document.document_type));
+  const document = candidates.find((candidate) =>
+    invoiceNumber && normalizeKey(fieldsOf(candidate).referenceInvoiceNumber) === invoiceNumber
+  ) ?? (candidates.length === 1 ? candidates[0] : null);
+  if (!document) return null;
+  const fields = fieldsOf(document);
+  const pageText = text(document.markdown);
+  const number = text(fields.eWayBillNumber || fields.ewayBillNumber).replace(/\D/g, "") ||
+    (pageText.match(/e-?way\s*bill\s*no\.?\s*:?\s*([\d ]{12,16})/i)?.[1] ?? "").replace(/\D/g, "");
+  if (!number) return null;
+  const from = splitEwayAddress(text(fields.dispatchFrom));
+  const to = splitEwayAddress(text(fields.shipTo));
+  const distance = pageText.match(/approx\.?\s*distance\s*:?\s*(\d{1,4})\s*km/i)?.[1] ?? "";
+  const mode = pageText.match(/\bmode\s*:?\s*(road|rail|air|ship)\b/i)?.[1]?.toLowerCase() ?? "road";
+  const modeCode = { road: "1 - Road", rail: "2 - Rail", air: "3 - Air", ship: "4 - Ship" }[mode] ?? "1 - Road";
+  return {
+    record: true,
+    number,
+    date: parseDate(text(fields.documentDate).split(/\s+/)[0]) || "",
+    fromAddress: text(fields.dispatchFrom),
+    fromPlace: from.place,
+    fromPincode: from.pincode,
+    fromState: from.state || stateInText(text(fields.dispatchFrom)),
+    toPlace: to.place,
+    toPincode: to.pincode,
+    toState: to.state || stateInText(text(fields.shipTo)),
+    transportMode: modeCode,
+    vehicleNumber: text(fields.vehicleNumber).replace(/\s+/g, "").toUpperCase(),
+    distanceKm: distance,
   };
 }
 
@@ -1189,12 +1277,17 @@ function buildDefaultReview(
     roundOffAmount: source.invoiceRoundOffAmount,
     sourceReferenceApproved: true,
     narration: defaultNarration,
+    ewayBill: source.ewayBill,
     lines,
   };
 
   return {
     ...baseReview,
     ...(saved ?? {}),
+    // Reviewer edits override the extracted e-way bill field by field.
+    ewayBill: baseReview.ewayBill || saved?.ewayBill
+      ? { ...(baseReview.ewayBill ?? emptyEwayBill()), ...(saved?.ewayBill ?? {}) }
+      : null,
     lines,
     invoiceDate: parseDate(saved?.invoiceDate) || baseReview.invoiceDate,
     voucherDate: parseDate(saved?.voucherDate) || baseReview.voucherDate,
@@ -1765,6 +1858,19 @@ export function preparePurchasePosting(params: {
       "invoice"
     ));
   }
+  // E-way bill details are reference data: problems only warn and the voucher
+  // is posted without them rather than blocked.
+  if (review.ewayBill?.record) {
+    if (!/^\d{12}$/.test(review.ewayBill.number)) {
+      warnings.push(issue("EWAY_BILL_NUMBER_INVALID", "E-way bill number not recorded", "An e-way bill number has 12 digits. It will not be recorded in Tally until corrected.", "invoice"));
+    }
+    if (!isValidIsoDate(review.ewayBill.date)) {
+      warnings.push(issue("EWAY_BILL_DATE_INVALID", "E-way bill date missing", "Enter the e-way bill date to record it in Tally.", "invoice"));
+    }
+    if (review.ewayBill.distanceKm && !/^\d{1,4}$/.test(review.ewayBill.distanceKm)) {
+      warnings.push(issue("EWAY_BILL_DISTANCE_INVALID", "E-way bill distance is not a number", "Enter the distance in whole kilometres.", "invoice"));
+    }
+  }
   if (review.lines.length === 0) {
     blockers.push(issue("LINE_ITEMS_REQUIRED", "Invoice items required", "No invoice items were found. Add the item details before approval.", "invoice"));
   }
@@ -2186,6 +2292,11 @@ export function preparePurchasePosting(params: {
     supplierGstin: review.supplierGstin,
     buyerGstin: review.buyerGstin,
     vehicleNumber: review.vehicleNumber,
+    // Reference only: the connector records these with e-way bill
+    // applicability left at No, as the client books purchases.
+    ...(review.ewayBill?.record && /^\d{12}$/.test(review.ewayBill.number) && isValidIsoDate(review.ewayBill.date)
+      ? { ewayBill: { ...review.ewayBill, vehicleNumber: review.ewayBill.vehicleNumber || review.vehicleNumber } }
+      : {}),
     taxMode: calculation.taxMode,
     items: review.lines.map((line) => {
       const stockItem = selectedMaster(params.masters, line.stockItemName, ["stock_item"]);

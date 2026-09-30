@@ -1320,6 +1320,75 @@ function buildAttachDocumentsAddOnXml(payload) {
     udf(ATTACH_DOCUMENTS_ADDON.attach, "Logical", "Yes");
 }
 
+// The supplier's e-way bill, recorded on the purchase as reference exactly as
+// the client books it (their exported voucher): details filled in, but Tally's
+// e-way bill applicability left at No, since the supplier generated it.
+// The consignee (To) is the company's own address, read from Tally.
+function buildPurchaseEwayBillXml(ewayBill) {
+  const number = String(ewayBill?.number || "").replace(/\D/g, "");
+  const date = /^\d{4}-\d{2}-\d{2}/.test(String(ewayBill?.date || "")) ? toIsoLikeDate(ewayBill.date) : "";
+  if (!/^\d{12}$/.test(number) || !date) return "";
+  const value = (input) => escapeXml(String(input ?? "").trim());
+  const consignee = ewayBill.consignee || {};
+  const toAddress = consignee.address || "";
+  const toPlace = consignee.place || ewayBill.toPlace || "";
+  const toPincode = consignee.pincode || ewayBill.toPincode || "";
+  const toState = consignee.state || ewayBill.toState || "";
+  const distance = /^\d{1,4}$/.test(String(ewayBill.distanceKm || "")) ? ` ${ewayBill.distanceKm}` : "";
+  return [
+    "<ISEWAYBILLAPPLICABLE>No</ISEWAYBILLAPPLICABLE>",
+    "<OVRDNEWAYBILLAPPLICABILITY>No</OVRDNEWAYBILLAPPLICABILITY>",
+    "<EWAYBILLDETAILS.LIST>",
+    ewayBill.fromAddress ? `<CONSIGNORADDRESS.LIST TYPE="String"><CONSIGNORADDRESS>${value(ewayBill.fromAddress)}</CONSIGNORADDRESS></CONSIGNORADDRESS.LIST>` : "",
+    toAddress ? `<CONSIGNEEADDRESS.LIST TYPE="String"><CONSIGNEEADDRESS>${value(toAddress)}</CONSIGNEEADDRESS></CONSIGNEEADDRESS.LIST>` : "",
+    `<BILLDATE>${date}</BILLDATE>`,
+    "<DOCUMENTTYPE>Tax Invoice</DOCUMENTTYPE>",
+    toPincode ? `<CONSIGNEEPINCODE>${value(toPincode)}</CONSIGNEEPINCODE>` : "",
+    `<BILLNUMBER>${number}</BILLNUMBER>`,
+    "<SUBTYPE>Supply</SUBTYPE>",
+    ewayBill.fromPlace ? `<CONSIGNORPLACE>${value(ewayBill.fromPlace)}</CONSIGNORPLACE>` : "",
+    ewayBill.fromPincode ? `<CONSIGNORPINCODE>${value(ewayBill.fromPincode)}</CONSIGNORPINCODE>` : "",
+    toPlace ? `<CONSIGNEEPLACE>${value(toPlace)}</CONSIGNEEPLACE>` : "",
+    ewayBill.fromState ? `<SHIPPEDFROMSTATE>${value(ewayBill.fromState)}</SHIPPEDFROMSTATE>` : "",
+    toState ? `<SHIPPEDTOSTATE>${value(toState)}</SHIPPEDTOSTATE>` : "",
+    "<TRANSPORTDETAILS.LIST>",
+    `<TRANSPORTMODE>${value(ewayBill.transportMode || "1 - Road")}</TRANSPORTMODE>`,
+    ewayBill.vehicleNumber ? `<VEHICLENUMBER>${value(ewayBill.vehicleNumber)}</VEHICLENUMBER>` : "",
+    distance ? `<DISTANCE>${distance}</DISTANCE>` : "",
+    "</TRANSPORTDETAILS.LIST>",
+    "</EWAYBILLDETAILS.LIST>",
+  ].join("");
+}
+
+// The company's own mailing address from Tally, for the e-way bill consignee.
+const companyAddressCache = new Map();
+async function readCompanyAddress(tallyUrl, companyName) {
+  const key = String(companyName || "").trim().toLowerCase();
+  if (companyAddressCache.has(key)) return companyAddressCache.get(key);
+  const xml = await exportTallyCollection(tallyUrl, {
+    collectionName: "Kalika Company Address",
+    tallyType: "Company",
+    fetchFields: "Name,Address,PinCode,StateName",
+    companyName: null,
+    timeoutMs: 8_000,
+  });
+  const block = extractBlocks(xml, "COMPANY").find((candidate) =>
+    String(getTagText(candidate, "NAME") || getAttribute(candidate, "NAME") || "").trim().toLowerCase() === key
+  );
+  // Exact <ADDRESS> lines only (not the enclosing <ADDRESS.LIST>).
+  const address = block
+    ? [...block.matchAll(/<ADDRESS(?:\s[^>]*)?>([\s\S]*?)<\/ADDRESS>/gi)]
+        .map((match) => cleanXmlText(match[1]).trim()).filter(Boolean).join(", ")
+    : "";
+  const result = block ? {
+    address,
+    pincode: getTagText(block, "PINCODE") || "",
+    state: getTagText(block, "STATENAME") || "",
+  } : null;
+  companyAddressCache.set(key, result);
+  return result;
+}
+
 function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
   const companyName = String(payload?.companyName || fallbackCompanyName || "").trim();
   const voucherDate = toIsoLikeDate(payload?.voucherDate || payload?.supplierInvoiceDate);
@@ -1481,6 +1550,7 @@ function buildPurchaseVoucherXml(payload, fallbackCompanyName) {
     "<ISOPTIONAL>No</ISOPTIONAL>",
     "<DIFFACTUALQTY>No</DIFFACTUALQTY>",
     `<NARRATION>${escapeXml(narration)}</NARRATION>`,
+    buildPurchaseEwayBillXml(payload?.ewayBill),
     // Tally's canonical Invoice Voucher XML puts the party allocation before
     // inventory and charge rows. PARTYLEDGERNAME alone is not enough because
     // bill allocations belong to this entry. Keeping it first lets Tally bind
@@ -2480,9 +2550,18 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName, options = {})
   // Only send the number displayed in Kalika when the live Voucher Type permits
   // manual input/override; otherwise omit it and read Tally's assigned number
   // back after creation.
-  const postingPayload = numbering.acceptsProvidedNumber && proposedVoucherNumber
+  const numberedPayload = numbering.acceptsProvidedNumber && proposedVoucherNumber
     ? { ...payload, useCustomVoucherNumber: true, voucherNumber: proposedVoucherNumber }
     : { ...payload, useCustomVoucherNumber: false, voucherNumber: undefined };
+  // E-way bill consignee is the company's own address from Tally. If it cannot
+  // be read, the e-way bill's Ship To place/PIN are used instead.
+  let postingPayload = numberedPayload;
+  if (payload?.ewayBill) {
+    const companyAddress = await readCompanyAddress(tallyUrl, companyName).catch(() => null);
+    if (companyAddress) {
+      postingPayload = { ...numberedPayload, ewayBill: { ...payload.ewayBill, consignee: companyAddress } };
+    }
+  }
   let xml = buildPurchaseVoucherXml(postingPayload, companyName);
   let importOutcome;
   try {

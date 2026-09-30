@@ -1227,3 +1227,30 @@ test("Purchase read-back rejects every substantive canonical mutation regardless
     );
   }
 });
+
+test("purchase vouchers record the supplier e-way bill as reference, like the client's own export", () => {
+  const payload = {
+    companyName: "Kalika Steel Alloys Pvt Ltd", voucherDate: "2026-08-12", supplierInvoiceDate: "2026-08-12",
+    supplierInvoiceNumber: "BST/26-27/635", supplierLedgerName: "BHAWANA STEEL TRADERS Nagpur (SCRAP)", finalPayableAmount: "1180",
+    items: [{ stockItemName: "M S Scrap & Sponge Iron", purchaseLedgerName: "M.S. Scrap Purchase", hsn: "72044900", unit: "MTS", quantity: "1", rate: "1000", taxableAmount: "1000" }],
+    charges: [{ name: "Input ITC CGST 9%", amount: "90" }, { name: "Input ITC SGST 9%", amount: "90" }],
+    ewayBill: {
+      record: true, number: "262264097358", date: "2026-08-12",
+      fromAddress: "PLOT NO 22, MIDC AREA HINGNA ROAD, NAGPUR, NAGPUR,MAHARASHTRA-440016",
+      fromPlace: "NAGPUR", fromPincode: "440016", fromState: "Maharashtra",
+      toPlace: "JALNA", toPincode: "431203", toState: "Maharashtra",
+      transportMode: "1 - Road", vehicleNumber: "MH21X7266", distanceKm: "437",
+      consignee: { address: "C-7 & 8, Addl. M.I.D.C. Area, Jalna", pincode: "431203", state: "Maharashtra" },
+    },
+  };
+  const xml = buildPurchaseVoucherXml(payload, payload.companyName);
+  assert.match(xml, /<ISEWAYBILLAPPLICABLE>No<\/ISEWAYBILLAPPLICABLE><OVRDNEWAYBILLAPPLICABILITY>No<\/OVRDNEWAYBILLAPPLICABILITY><EWAYBILLDETAILS\.LIST>/);
+  assert.match(xml, /<BILLNUMBER>262264097358<\/BILLNUMBER>/);
+  assert.match(xml, /<BILLDATE>20260812<\/BILLDATE><DOCUMENTTYPE>Tax Invoice<\/DOCUMENTTYPE>/);
+  assert.match(xml, /<CONSIGNEEADDRESS>C-7 &amp; 8, Addl\. M\.I\.D\.C\. Area, Jalna<\/CONSIGNEEADDRESS>/);
+  assert.match(xml, /<CONSIGNORPLACE>NAGPUR<\/CONSIGNORPLACE><CONSIGNORPINCODE>440016<\/CONSIGNORPINCODE><CONSIGNEEPLACE>JALNA<\/CONSIGNEEPLACE>/);
+  assert.match(xml, /<TRANSPORTDETAILS\.LIST><TRANSPORTMODE>1 - Road<\/TRANSPORTMODE><VEHICLENUMBER>MH21X7266<\/VEHICLENUMBER><DISTANCE> 437<\/DISTANCE><\/TRANSPORTDETAILS\.LIST>/);
+  // No e-way bill, or an invalid number: the voucher is exactly as before.
+  assert.doesNotMatch(buildPurchaseVoucherXml({ ...payload, ewayBill: undefined }, payload.companyName), /EWAYBILL/);
+  assert.doesNotMatch(buildPurchaseVoucherXml({ ...payload, ewayBill: { ...payload.ewayBill, number: "12345" } }, payload.companyName), /EWAYBILL/);
+});

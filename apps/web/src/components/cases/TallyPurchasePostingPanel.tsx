@@ -2368,6 +2368,52 @@ export function TallyPurchasePostingPanel({
               <Field compact id="field-buyer-gstin" disabled={locked} issues={scopeIssues("invoice", ["BUYER_GSTIN_REQUIRED"])} label="Buyer GSTIN" onChange={(value) => updateReview("buyerGstin", value.toUpperCase())} sourceValue={payload.source?.buyerGstin} value={review.buyerGstin} />
             </div>
           </details>
+          {review.ewayBill ? (
+            <div className="border-t border-slate-100 px-4 py-3 sm:px-5" id="tally-eway-bill">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className="text-xs font-semibold text-slate-900">E-way bill</div>
+                  <div className="text-[10px] leading-4 text-slate-500">
+                    Recorded in Tally as reference. Tally's "Provide e-Way Bill details" stays No; To is your company address from Tally.
+                  </div>
+                </div>
+                <label className="flex items-center gap-2 text-[11px] font-medium text-slate-700">
+                  <input
+                    checked={review.ewayBill.record}
+                    className="h-3.5 w-3.5 accent-emerald-700"
+                    disabled={locked}
+                    onChange={(event) => updateReview("ewayBill", { ...review.ewayBill!, record: event.target.checked })}
+                    type="checkbox"
+                  />
+                  Record in Tally
+                </label>
+              </div>
+              {review.ewayBill.record ? (
+                <div className="mt-2 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                  {([
+                    ["number", "E-way bill number", "text"],
+                    ["date", "E-way bill date", "date"],
+                    ["fromPlace", "From (dispatch place)", "text"],
+                    ["fromPincode", "From PIN", "text"],
+                    ["vehicleNumber", "Vehicle", "text"],
+                    ["distanceKm", "Distance (km)", "text"],
+                    ["transportMode", "Mode", "text"],
+                    ["fromState", "From state", "text"],
+                  ] as const).map(([key, label, type]) => (
+                    <Field
+                      compact
+                      disabled={locked}
+                      key={key}
+                      label={label}
+                      onChange={(value) => updateReview("ewayBill", { ...review.ewayBill!, [key]: value })}
+                      type={type}
+                      value={review.ewayBill![key]}
+                    />
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       </section>
 

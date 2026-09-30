@@ -28,6 +28,22 @@ export type TallyPostingLine = {
   batchName: string;
 };
 
+export type TallyPostingEwayBill = {
+  record: boolean;
+  number: string;
+  date: string;
+  fromAddress: string;
+  fromPlace: string;
+  fromPincode: string;
+  fromState: string;
+  toPlace: string;
+  toPincode: string;
+  toState: string;
+  transportMode: string;
+  vehicleNumber: string;
+  distanceKm: string;
+};
+
 export type TallyPostingReview = {
   selectedInvoiceDocumentId: string;
   invoiceNumber: string;
@@ -69,6 +85,8 @@ export type TallyPostingReview = {
   roundOffAmount: string;
   sourceReferenceApproved: boolean;
   narration: string;
+  // Supplier's e-way bill, recorded in Tally as reference (applicability No).
+  ewayBill?: TallyPostingEwayBill | null;
   lines: TallyPostingLine[];
 };
 
