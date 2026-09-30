@@ -2019,6 +2019,23 @@ export function preparePurchasePosting(params: {
         "line",
         line.lineId
       ));
+    } else if (!line.godownName && liveGodowns.length > 1) {
+      // With more than one godown Tally rejects the whole voucher ("Godown
+      // name in Item Allocations is missing/invalid"); catch it here instead.
+      const suggestion =
+        review.lines.map((other) => selectedMaster(params.masters, other.godownName, ["godown"])?.tally_name).find(Boolean) ||
+        liveGodowns.find((master) => /main\s+location/i.test(master.tally_name))?.tally_name ||
+        liveGodowns[0].tally_name;
+      blockers.push({
+        ...issue(
+          "GODOWN_REQUIRED",
+          "Godown missing",
+          `Choose a godown for ${line.description || "this item"} — Tally rejects items without one in this company. Use ${suggestion}.`,
+          "line",
+          line.lineId
+        ),
+        suggestion,
+      });
     }
   }
 

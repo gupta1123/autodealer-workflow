@@ -304,6 +304,7 @@ const ISSUE_LINE_FIELDS: Partial<Record<string, Array<keyof TallyPostingLine>>> 
   PURCHASE_LEDGER_MATCHES_SUPPLIER: ["purchaseLedgerName"],
   LINE_ACCOUNTING_FIELDS_REQUIRED: ["description", "quantity", "unit", "rate", "taxableAmount"],
   LINE_TAXABLE_MISMATCH: ["quantity", "rate", "taxableAmount"],
+  GODOWN_REQUIRED: ["godownName"],
 };
 
 // True when the user has changed (to a non-empty value) the field an error from
@@ -1635,6 +1636,22 @@ export function TallyPurchasePostingPanel({
     setNotice(null);
   }
 
+  // A godown picked on one line also fills every line that has none: Tally
+  // rejects the whole voucher when any item line lacks a godown.
+  function updateGodown(index: number, value: string) {
+    setReview((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        lines: current.lines.map((line, lineIndex) =>
+          lineIndex === index || (value && !line.godownName.trim()) ? { ...line, godownName: value } : line
+        ),
+      };
+    });
+    setDirty(true);
+    setNotice(null);
+  }
+
   async function handleSave() {
     if (!review || !selectedConnectionId || !selectedCompanyName || locked) return;
     await persistReview(review);
@@ -2564,7 +2581,7 @@ export function TallyPurchasePostingPanel({
                     hideSourceBadge
                     issues={lineIssues(line.lineId, ["GODOWN_REQUIRED"])}
                     label="Godown"
-                    onChange={(value) => updateLine(index, "godownName", value)}
+                    onChange={(value) => updateGodown(index, value)}
                     options={godownOptions}
                     placeholder="No godown allocation"
                     sourceHint={sourceLine?.godownName}

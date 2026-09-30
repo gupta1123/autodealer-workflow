@@ -1426,3 +1426,28 @@ test("the case's e-way bill page is read for the voucher and only sent when vali
   const off = run({ sourceReferenceApproved: true, ewayBill: { record: false } });
   assert.equal(off.tallyPayload.ewayBill, undefined);
 });
+
+test("a missing godown blocks with a suggestion only when the company has several godowns", () => {
+  const document = invoiceDocument({
+    totalAmount: "2360.00",
+    taxAmount: "360.00",
+    tdsAmount: "",
+    lines: [
+      { description: "MS Scrap", hsnSac: "72044900", quantity: "1", unit: "MT", rate: "1000.00", taxableAmount: "1000.00" },
+      { description: "Waste and Scrap", hsnSac: "72045000", quantity: "1", unit: "MT", rate: "1000.00", taxableAmount: "1000.00" },
+    ],
+  });
+  document.extracted_fields.cgstTdsAmount = "";
+  document.extracted_fields.sgstTdsAmount = "";
+  const firstLineId = `${document.id}:1`;
+  const saved = { sourceReferenceApproved: true, applyGstTds: false, lines: [{ lineId: firstLineId, godownName: "Main Location" }] };
+
+  const several = prepare(document, { savedReview: saved, masters: [...completeMasters, master("godown", "Main Location"), master("godown", "Factory")] });
+  const blockers = several.blockers.filter((blocker) => blocker.code === "GODOWN_REQUIRED");
+  assert.equal(blockers.length, 1);
+  assert.equal(blockers[0].lineId, `${document.id}:2`);
+  assert.equal(blockers[0].suggestion, "Main Location");
+
+  const single = prepare(document, { savedReview: saved, masters: [...completeMasters, master("godown", "Main Location")] });
+  assert.equal(single.blockers.some((blocker) => blocker.code === "GODOWN_REQUIRED"), false);
+});
