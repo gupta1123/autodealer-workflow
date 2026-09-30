@@ -4195,6 +4195,7 @@ export function BankStatementsPage() {
     const payload = await runCashDiscountLiveRequest<{
       ledgers?: TallyMaster[];
       groups?: TallyMaster[];
+      masters?: { ledgers?: TallyMaster[]; groups?: TallyMaster[] };
       bankDocumentIdentity?: Record<string, unknown>;
     }>({
       connectionId,
@@ -4205,7 +4206,7 @@ export function BankStatementsPage() {
       payload: { persist: false, ...(exactScope ? { bankDocumentIdentity: exactScope.identity } : {}) },
     });
     if (exactScope) assertLocalBankContextIdentity(exactScope.identity, payload.bankDocumentIdentity);
-    const masters = payload.ledgers ?? [];
+    const masters = payload.ledgers ?? payload.masters?.ledgers ?? [];
     if (loadSeq === ledgerLoadSeqRef.current) {
       setLedgerMasters(masters);
     }
