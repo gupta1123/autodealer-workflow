@@ -227,7 +227,10 @@ export function summarizeCollections(dashboard: Dashboard | null | undefined) {
 // The fields whose change must make an open page reload: identity, status,
 // amounts and ages. (Other fields only change together with one of these.)
 const FOLLOW_UP_REVISION_FIELDS = ["id", "followUpStatus", "outstandingAmount", "amountReceived", "ageDays", "ageBasis", "dueDate", "partyPhone"];
-const PROPOSAL_REVISION_FIELDS = ["id", "status", "communicationStatus", "recoverableAmount", "lastError", "tallyVoucherNumber", "canCreateDebitNote"];
+// Includes what drives the Download PDF and "Send updated PDF" actions (PDF
+// verified, when it was sent, when the PDF was exported) and a saved phone.
+const PROPOSAL_REVISION_FIELDS = ["id", "status", "communicationStatus", "communicationSentAt", "nativeTallyPdfVerified", "partyPhone",
+  "recoverableAmount", "lastError", "tallyVoucherNumber", "canCreateDebitNote"];
 
 /** Changes whenever anything the lists show changes (FNV-1a over key fields). */
 export function dashboardRevision(dashboard: Dashboard | null | undefined) {
@@ -245,7 +248,10 @@ export function dashboardRevision(dashboard: Dashboard | null | undefined) {
   add(JSON.stringify(dashboard?.kpis ?? null));
   for (const row of followUps(dashboard)) for (const field of FOLLOW_UP_REVISION_FIELDS) add(row[field]);
   add("|");
-  for (const row of proposals(dashboard)) for (const field of PROPOSAL_REVISION_FIELDS) add(row[field]);
+  for (const row of proposals(dashboard)) {
+    for (const field of PROPOSAL_REVISION_FIELDS) add(row[field]);
+    add(((row.nativeTallyPdf ?? null) as Row | null)?.exportedAt);
+  }
   return `${length.toString(36)}-${hash.toString(36)}`;
 }
 

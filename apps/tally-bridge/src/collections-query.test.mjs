@@ -191,6 +191,24 @@ test("the connector keeps each dashboard for its own connection and the one befo
   assert.throws(() => answerCollectionsRequest(config, "collections_query", { payload: { dashboardId: first.dashboardId, query: { view: "pending" } } }), /replaced by a newer check/);
 });
 
+test("the revision changes when a WhatsApp or PDF state changes, so the page reloads that row", () => {
+  const base = dashboard(8);
+  const revision = (change) => {
+    const copy = structuredClone(base);
+    change(copy.tabs.debitNoteQueue[0]);
+    return summarizeCollections(copy).revision;
+  };
+  const original = summarizeCollections(base).revision;
+  assert.equal(revision(() => {}), original, "no change, same revision");
+  for (const [label, change] of [
+    ["message status", (row) => { row.communicationStatus = "sent"; }],
+    ["sent time", (row) => { row.communicationSentAt = "2026-09-30T10:00:00Z"; }],
+    ["PDF verified", (row) => { row.nativeTallyPdfVerified = true; }],
+    ["PDF exported", (row) => { row.nativeTallyPdf = { exportedAt: "2026-09-30T10:05:00Z" }; }],
+    ["phone saved", (row) => { row.partyPhone = "9876500000"; }],
+  ]) assert.notEqual(revision(change), original, label);
+});
+
 test("rows by id are capped", () => {
   assert.equal(collectionRowsById(dashboard(), "followUps", Array.from({ length: 5000 }, (_, index) => `fu-${index % 700}`)).length, 700);
 });

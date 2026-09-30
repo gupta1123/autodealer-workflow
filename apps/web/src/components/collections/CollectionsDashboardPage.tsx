@@ -684,6 +684,10 @@ export function CollectionsDashboardPage({
   const [sendingWhatsappId, setSendingWhatsappId] = useState("");
   const [preparingNativePdfId, setPreparingNativePdfId] = useState("");
   const [bulkSendingWhatsapp, setBulkSendingWhatsapp] = useState(false);
+  // Debit notes just submitted to WhatsApp stay locked (spinner, no resend)
+  // until the refreshed list shows their new status, or for at most a minute.
+  const [sentLocks, setSentLocks] = useState<Map<string, number>>(() => new Map());
+  const lockSentProposal = (id: string) => setSentLocks((current) => new Map(current).set(id, Date.now()));
   const [selectedPendingIds, setSelectedPendingIds] = useState<Set<string>>(() => new Set());
   const [selectedCreatedIds, setSelectedCreatedIds] = useState<Set<string>>(() => new Set());
   const [reviewingProposal, setReviewingProposal] = useState<DebitNoteProposal | null>(null);
@@ -1121,7 +1125,9 @@ export function CollectionsDashboardPage({
     } else if (!payload.ready) {
       throw new Error("The native Tally PDF export could not be started.");
     }
-    if (selectedConnectionId) await refreshCreatedDebitNotesFromStore(selectedConnectionId);
+    // A whole dashboard is patched from the store after each PDF, as before.
+    // A paged one is re-analysed once, after all messages are sent.
+    if (selectedConnectionId && !dashboardRef.current?.paged) await refreshCreatedDebitNotesFromStore(selectedConnectionId);
     return { ...(payload.proposal ?? proposal), nativeTallyPdfVerified: true };
   }
 
@@ -1212,6 +1218,7 @@ export function CollectionsDashboardPage({
           }
         );
         acceptedCount += 1;
+        lockSentProposal(proposal.id);
         if (sendResult.verificationRequired) throw new Error(sendResult.error || 'Submission accepted; verify its saved status before resending.');
         if (requestedPhone.saveToTally && sendResult.phoneSaveCommandId && sendResult.phoneSaveConnectionId) {
           requestedTallyPhoneSaves += 1;
@@ -1465,7 +1472,8 @@ export function CollectionsDashboardPage({
   const safeCreatedPage = createdList.page?.page ?? createdPage;
   const safeFollowUpsPage = followUpsList.page?.page ?? followUpsPage;
   const pagedPendingProposals = pendingList.page?.rows ?? [];
-  const pagedCreatedProposals = createdList.page?.rows ?? [];
+  const createdPageRows = createdList.page?.rows;
+  const pagedCreatedProposals = useMemo(() => createdPageRows ?? [], [createdPageRows]);
   const pagedPaymentFollowUps = followUpsList.page?.rows ?? [];
   // Selected rows can be on any page: they are loaded by id when needed.
   const loadSelectedFollowUps = async () => {
@@ -1492,8 +1500,21 @@ export function CollectionsDashboardPage({
   const exportSelectedFollowUps=async()=>{let rows:PaymentFollowUp[];try{rows=await loadSelectedFollowUps();}catch(error){setMessage({tone:'error',text:error instanceof Error?error.message:'Could not load the selected invoices.'});return;}if(!rows.length)return;const q=(value:unknown)=>`"${String(value??'').replaceAll('"','""')}"`;const csv=[['Customer','Invoice','Invoice date','Outstanding','Phone','Payment age'],...rows.map(row=>[row.partyLedgerName,row.linkedInvoiceNumber,row.linkedInvoiceDate,row.outstandingAmount,row.partyPhone||'',row.ageLabel])].map(line=>line.map(q).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\ufeff',csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='unpaid-invoices.csv';a.click();window.setTimeout(()=>URL.revokeObjectURL(url),1000);};
   const scheduleStatuses=useReminderStatuses({connectionId:selectedConnectionId,companyId:selectedCompany?.accessCompanyId,companyGuid:selectedCompany?.companyGuid,companyName:selectedCompany?.companyName||'',financialYear:selectedCompany?.financialYear||''},pagedPaymentFollowUps,activeView==='followUps'&&reminderTab==='outstanding'&&!reminderInvoice);
   const selectablePendingOnPage = tallyCompanyVerified ? pagedPendingProposals.filter(canCreateInTally) : [];
-  const canMessageProposal = (proposal: DebitNoteProposal) => proposal.communicationStatus !== "sent" || needsUpdatedPdfDelivery(proposal);
+  const canMessageProposal = (proposal: DebitNoteProposal) =>
+    !sentLocks.has(proposal.id) && (proposal.communicationStatus !== "sent" || needsUpdatedPdfDelivery(proposal));
   const selectableCreatedOnPage = pagedCreatedProposals.filter(canMessageProposal);
+  // Release a sent lock once the list shows the note as submitted (or after a minute).
+  useEffect(() => {
+    if (!sentLocks.size) return;
+    const shown = new Map(pagedCreatedProposals.map((proposal) => [proposal.id, proposal]));
+    const release = [...sentLocks].filter(([id, lockedAt]) => {
+      const row = shown.get(id);
+      return Date.now() - lockedAt > 60_000 || Boolean(row && row.communicationStatus === 'sent' && !needsUpdatedPdfDelivery(row));
+    }).map(([id]) => id);
+    if (release.length) setSentLocks((current) => { const next = new Map(current); for (const id of release) next.delete(id); return next; });
+    const timer = window.setTimeout(() => setSentLocks((current) => new Map([...current].filter(([, lockedAt]) => Date.now() - lockedAt <= 60_000))), 61_000);
+    return () => window.clearTimeout(timer);
+  }, [pagedCreatedProposals, sentLocks]);
   // Only ids of actionable rows are ever selected; the rows are loaded (and
   // re-checked) when the action runs.
   const selectedPendingCount = tallyCompanyVerified ? selectedPendingIds.size : 0;
@@ -2108,11 +2129,11 @@ export function CollectionsDashboardPage({
                   </tr></thead>
                   <tbody>{pagedCreatedProposals.map(proposal => {
                     const canMessage = allowed('discounts.export') && (proposal.communicationStatus !== 'sent' || needsUpdatedPdfDelivery(proposal));
-                    const sending = sendingWhatsappId===proposal.id;
+                    const sending = sendingWhatsappId===proposal.id || sentLocks.has(proposal.id);
                     const preparing = preparingNativePdfId===proposal.id;
                     return <tr key={proposal.id}>
                       <td><input aria-label={`Select WhatsApp for ${proposal.partyLedgerName}`} type="checkbox"
-                        checked={selectedCreatedIds.has(proposal.id)} disabled={!canMessage || bulkSendingWhatsapp}
+                        checked={selectedCreatedIds.has(proposal.id)} disabled={!canMessage || sending || bulkSendingWhatsapp}
                         onChange={event=>toggleCreatedSelection(proposal.id,event.target.checked)} className="h-4 w-4 accent-[#2d2d2d]" /></td>
                       <td><span className={styles.customerName} title={proposal.partyLedgerName}>{proposal.partyLedgerName}</span>
                         <span className={styles.secondary}>{proposal.partyPhone || 'No phone number'}</span></td>
