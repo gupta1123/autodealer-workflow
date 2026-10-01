@@ -36,6 +36,7 @@ import {
   suggestSupplierLedger,
 } from "@/lib/tally/purchase-master-matching";
 import { wakeTallyConnector } from "@/lib/tally/command-wake";
+import { readCompanyMappings } from "@/lib/tally/company-mappings";
 
 type PostingRow = {
   id: string;
@@ -621,12 +622,8 @@ async function loadContext(
   }
   const loadMappings = options.loadMappings !== false;
   const earlyMappingsResultPromise = loadMappings && requestedConnectionId && requestedCompanyName
-    ? supabase
-        .from("tally_mapping_settings")
-        .select("mapping_type, source_key, target_master_type, target_master_key, target_master_name, status")
-        .eq("connection_id", requestedConnectionId)
-        .ilike("company_name", requestedCompanyName)
-        .eq("status", "active")
+    ? readCompanyMappings(supabase, { connectionId: requestedConnectionId, companyName: requestedCompanyName })
+        .then((data) => ({ data, error: null }), (error: unknown) => ({ data: null, error }))
     : Promise.resolve({ data: [], error: null });
   const [caseResult, purchaseAccountingSettings, documentsResult, filesResult, connectionsResult, postingResult, earlyMappingsResult] = await Promise.all([
     supabase
@@ -792,14 +789,7 @@ async function loadContext(
       if (canUseEarlyMappings) {
         mappings = (earlyMappingsResult.data ?? []) as PurchasePostingMappingInput[];
       } else {
-        const mappingsResult = await supabase
-          .from("tally_mapping_settings")
-          .select("mapping_type, source_key, target_master_type, target_master_key, target_master_name, status")
-          .eq("connection_id", connection.id)
-          .ilike("company_name", companyName)
-          .eq("status", "active");
-        if (mappingsResult.error) throw mappingsResult.error;
-        mappings = (mappingsResult.data ?? []) as PurchasePostingMappingInput[];
+        mappings = (await readCompanyMappings(supabase, { connectionId: connection.id, companyName })) as PurchasePostingMappingInput[];
       }
     }
   }

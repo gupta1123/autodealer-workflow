@@ -1451,3 +1451,41 @@ test("a missing godown blocks with a suggestion only when the company has severa
   const single = prepare(document, { savedReview: saved, masters: [...completeMasters, master("godown", "Main Location")] });
   assert.equal(single.blockers.some((blocker) => blocker.code === "GODOWN_REQUIRED"), false);
 });
+
+test("a godown saved in Settings fills lines the documents leave empty", () => {
+  const document = invoiceDocument({ totalAmount: "1180.00", taxAmount: "180.00", tdsAmount: "" });
+  document.extracted_fields.cgstTdsAmount = "";
+  document.extracted_fields.sgstTdsAmount = "";
+  const masters = [...completeMasters, master("godown", "Main Location"), master("godown", "Factory")];
+  const result = prepare(document, {
+    savedReview: { sourceReferenceApproved: true, applyGstTds: false },
+    masters,
+    mappings: [{
+      mapping_type: "godown",
+      source_key: "purchase",
+      target_master_type: "godown",
+      target_master_key: "factory",
+      target_master_name: "Factory",
+      status: "active",
+    }],
+  });
+  assert.deepEqual(result.review.lines.map((line) => line.godownName), ["Factory"]);
+  assert.equal(result.blockers.some((blocker) => blocker.code === "GODOWN_REQUIRED"), false);
+});
+
+test("194Q is never applied while Purchase TDS on goods is switched off in Settings", () => {
+  const document = invoiceDocument({ totalAmount: "1157.00" });
+  const settings = { purchaseGoodsTdsEnabled: false, transporterTdsEnabled: true, gstTdsEnabled: true };
+  const off = prepare(document, {
+    savedReview: { sourceReferenceApproved: true, applyTds194q: true, tds194qRounding: "paise" },
+    accountingSettings: settings,
+  });
+  assert.equal(off.calculation.tds194qAmount, "0.00");
+  assert.equal(off.tallyPayload.withholdings.some((entry) => entry.kind === "tds_194q"), false);
+
+  const on = prepare(document, {
+    savedReview: { sourceReferenceApproved: true, applyTds194q: true, tds194qRounding: "paise" },
+    accountingSettings: { ...settings, purchaseGoodsTdsEnabled: true },
+  });
+  assert.equal(on.tallyPayload.withholdings.some((entry) => entry.kind === "tds_194q"), true);
+});

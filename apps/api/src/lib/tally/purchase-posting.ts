@@ -1174,7 +1174,8 @@ function buildDefaultReview(
       godownName:
         exactMasterName(masters, prior?.godownName || "", ["godown"]) ||
         exactMasterName(masters, source.godownName, ["godown"]) ||
-        source.godownName,
+        source.godownName ||
+        mappedName(masters, mappings, "godown", "purchase", ["godown"]),
       batchName: prior?.batchName ?? source.batchName,
     };
   });
@@ -1542,7 +1543,8 @@ function calculate(
     ? reviewed194qBasis
     : basic;
   const tds194qRate = rateBasisPoints(review.tds194qRate) ?? 10;
-  const rawTds194q = review.applyTds194q
+  const tds194qActive = accountingSettings.purchaseGoodsTdsEnabled && review.applyTds194q;
+  const rawTds194q = tds194qActive
     ? Math.round((tds194qBasis * tds194qRate) / 10000)
     : 0;
   const tds194q = review.tds194qRounding === "nearest_rupee"
@@ -1598,7 +1600,7 @@ function calculate(
     sourceRoundOffAmount: source.invoiceRoundOffAmount,
     confirmedRoundOffAmount: review.roundOffAmount,
     tcsAmount: review.tcsReceivable ? review.tcsAmount : "0",
-    tds194qEnabled: review.applyTds194q,
+    tds194qEnabled: tds194qActive,
     tds194qBasisAmount: formatPaise(tds194qBasis),
     tds194qRate: review.tds194qRate,
     tds194qRounding: review.tds194qRounding,

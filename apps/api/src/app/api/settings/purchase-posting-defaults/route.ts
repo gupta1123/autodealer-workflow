@@ -2,6 +2,7 @@ import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { readCompanyMappings } from "@/lib/tally/company-mappings";
 
 const ALLOWED_DEFAULTS = new Map([
   ["ms-scrap-item", { mappingType: "item_hsn", sourceKey: "7204", targetTypes: ["stock_item"] }],
@@ -14,73 +15,39 @@ const ALLOWED_DEFAULTS = new Map([
   ["sgst", { mappingType: "gst_rate", sourceKey: "sgst:9", targetTypes: ["ledger", "gst_ledger", "tax_ledger"] }],
   ["igst", { mappingType: "gst_rate", sourceKey: "igst:18", targetTypes: ["ledger", "gst_ledger", "tax_ledger"] }],
   ["tds-194q", { mappingType: "tds_ledger", sourceKey: "194q", targetTypes: ["ledger", "tax_ledger"] }],
+  ["transport-tds", { mappingType: "tds_ledger", sourceKey: "transport", targetTypes: ["ledger", "tax_ledger"] }],
   ["cgst-tds", { mappingType: "tds_ledger", sourceKey: "cgst_tds", targetTypes: ["ledger", "tax_ledger"] }],
   ["sgst-tds", { mappingType: "tds_ledger", sourceKey: "sgst_tds", targetTypes: ["ledger", "tax_ledger"] }],
   ["igst-tds", { mappingType: "tds_ledger", sourceKey: "igst_tds", targetTypes: ["ledger", "tax_ledger"] }],
+  ["tcs", { mappingType: "tcs_ledger", sourceKey: "receivable", targetTypes: ["ledger", "tax_ledger"] }],
   ["freight", { mappingType: "freight_ledger", sourceKey: "purchase", targetTypes: ["ledger"] }],
   ["round-off", { mappingType: "round_off_ledger", sourceKey: "purchase", targetTypes: ["ledger"] }],
+  ["godown", { mappingType: "godown", sourceKey: "purchase", targetTypes: ["godown"] }],
 ] as const);
 
 function clean(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function normalize(value: unknown) {
-  return clean(value).replace(/\s+/g, " ").toLocaleLowerCase();
+// Same shape as the posting review's master key, so a name-only default still matches live Tally.
+function masterKeyFromName(value: unknown) {
+  return clean(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
-function commandMaster(
-  resultValue: unknown,
-  companyName: string,
-  targetName: string,
-  targetTypes: readonly string[]
-) {
-  if (!resultValue || typeof resultValue !== "object" || Array.isArray(resultValue)) return null;
-  const result = resultValue as Record<string, unknown>;
-  if (result.source !== "live_tally" || normalize(result.companyName) !== normalize(companyName)) return null;
-  if (!result.masters || typeof result.masters !== "object" || Array.isArray(result.masters)) return null;
-  const masters = result.masters as Record<string, unknown>;
-  const acceptsStock = targetTypes.includes("stock_item");
-  const values = acceptsStock ? masters.stockItems : masters.ledgers;
-  const masterType = acceptsStock ? "stock_item" : "ledger";
-  for (const value of Array.isArray(values) ? values : []) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-    const row = value as Record<string, unknown>;
-    const name = clean(row.name);
-    if (normalize(name) !== normalize(targetName)) continue;
-    const guid = clean(row.guid);
-    return {
-      master_type: masterType,
-      master_key: guid || normalize(name),
-      tally_name: name,
-    };
-  }
-  return null;
+function escapeLikePattern(value: string) {
+  return value.replace(/[\\%_]/g, (character) => `\\${character}`);
 }
 
-async function findLiveCommandMaster(
-  supabase: ReturnType<typeof createSupabaseAdminClient>,
-  ownerUserId: string,
-  connectionId: string,
-  companyName: string,
-  targetName: string,
-  targetTypes: readonly string[]
-) {
-  const { data, error } = await supabase
-    .from("tally_bridge_commands")
-    .select("result")
-    .eq("connection_id", connectionId)
-    .eq("owner_user_id", ownerUserId)
-    .eq("command_type", "fetch_purchase_masters")
-    .eq("status", "succeeded")
-    .order("completed_at", { ascending: false })
-    .limit(10);
-  if (error) throw error;
-  for (const row of data ?? []) {
-    const target = commandMaster(row.result, companyName, targetName, targetTypes);
-    if (target) return target;
+// A default arrives either as a plain name (clears when empty) or as the master the user picked
+// from the live Tally list: { name, guid }. The posting review re-checks every saved default
+// against live Tally before it is used, so a renamed or deleted master is never posted.
+function readTarget(value: unknown) {
+  if (typeof value === "string") return { name: clean(value), guid: "" };
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    return { name: clean(record.name), guid: clean(record.guid) };
   }
-  return null;
+  return { name: "", guid: "" };
 }
 
 async function verifyConnection(ownerUserId: string, connectionId: string) {
@@ -111,20 +78,11 @@ async function GETHandler(request: Request) {
     }
     const { supabase, exists } = await verifyConnection(user.id, connectionId);
     if (!exists) return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
-    const { data, error } = await supabase
-      .from("tally_mapping_settings")
-      .select("mapping_type, source_key, target_master_type, target_master_key, target_master_name, status")
-      .eq("connection_id", connectionId)
-      .eq("owner_user_id", user.id)
-      .ilike("company_name", companyName)
-      .eq("status", "active");
-    if (error) throw error;
-    const rows = data ?? [];
+    const rows = await readCompanyMappings(supabase, { connectionId, companyName, ownerUserId: user.id });
     const defaults = Object.fromEntries([...ALLOWED_DEFAULTS].map(([id, definition]) => [
       id,
-      rows.find((row) =>
-        row.mapping_type === definition.mappingType && row.source_key === definition.sourceKey
-      )?.target_master_name ?? "",
+      rows.find((row) => row.mapping_type === definition.mappingType && row.source_key === definition.sourceKey)
+        ?.target_master_name ?? "",
     ]));
     return jsonWithCors(request, { defaults });
   } catch (error) {
@@ -149,57 +107,36 @@ async function PUTHandler(request: Request) {
     const { supabase, exists } = await verifyConnection(user.id, connectionId);
     if (!exists) return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
 
+    // Only the defaults present in the request change, so each field can be saved on its own.
     for (const [id, definition] of ALLOWED_DEFAULTS) {
-      const targetName = clean(defaults[id]);
-      const baseDelete = supabase
+      if (!(id in defaults)) continue;
+      const target = readTarget(defaults[id]);
+
+      // Replace the company's default on every connection, so an older connection's value can
+      // never reappear after this one is cleared or changed.
+      const { error: deleteError } = await supabase
         .from("tally_mapping_settings")
         .delete()
-        .eq("connection_id", connectionId)
         .eq("owner_user_id", user.id)
-        .ilike("company_name", companyName)
+        .ilike("company_name", escapeLikePattern(companyName))
         .eq("mapping_type", definition.mappingType)
         .eq("source_key", definition.sourceKey);
-      if (!targetName) {
-        const { error } = await baseDelete;
-        if (error) throw error;
-        continue;
-      }
-      const { data: syncedTarget, error: targetError } = await supabase
-        .from("tally_masters")
-        .select("master_type, master_key, tally_name")
-        .eq("connection_id", connectionId)
-        .eq("owner_user_id", user.id)
-        .eq("company_name", companyName)
-        .eq("is_active", true)
-        .in("master_type", [...definition.targetTypes])
-        .eq("tally_name", targetName)
-        .limit(1)
-        .maybeSingle();
-      if (targetError) throw targetError;
-      const target = syncedTarget ?? await findLiveCommandMaster(
-        supabase,
-        user.id,
-        connectionId,
-        companyName,
-        targetName,
-        definition.targetTypes
-      );
-      if (!target) {
-        return jsonWithCors(request, { error: `${targetName} was not found in the latest live Tally masters for ${companyName}. Refresh from Tally and try again.` }, { status: 409 });
-      }
-      const { error } = await supabase.from("tally_mapping_settings").upsert({
+      if (deleteError) throw deleteError;
+      if (!target.name) continue;
+
+      const { error } = await supabase.from("tally_mapping_settings").insert({
         connection_id: connectionId,
         owner_user_id: user.id,
         company_name: companyName,
         mapping_type: definition.mappingType,
         source_key: definition.sourceKey,
         source_label: id,
-        target_master_type: target.master_type,
-        target_master_key: target.master_key,
-        target_master_name: target.tally_name,
+        target_master_type: definition.targetTypes[0],
+        target_master_key: target.guid || masterKeyFromName(target.name),
+        target_master_name: target.name,
         status: "active",
         notes: "Configured in Purchase accounting settings.",
-      }, { onConflict: "connection_id,company_name,mapping_type,source_key" });
+      });
       if (error) throw error;
     }
     return jsonWithCors(request, { saved: true });

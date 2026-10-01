@@ -2026,6 +2026,8 @@ export function TallyPurchasePostingPanel({
     );
   }
 
+  // Deductions switched off in Settings → Purchase accounting are hidden and never applied.
+  const deductionSettings = payload.accountingSettings;
   const localTaxMode = (() => {
     const supplier = review.supplierGstin.match(/^\d{2}/)?.[0];
     const buyer = (review.buyerGstin || payload.connection?.companyGstin || "").match(/^\d{2}/)?.[0];
@@ -2050,11 +2052,11 @@ export function TallyPurchasePostingPanel({
     sourceRoundOffAmount: payload.source?.invoiceRoundOffAmount ?? "",
     confirmedRoundOffAmount: review.roundOffAmount,
     tcsAmount: review.tcsReceivable ? review.tcsAmount : "0",
-    tds194qEnabled: review.applyTds194q,
+    tds194qEnabled: deductionSettings.purchaseGoodsTdsEnabled && review.applyTds194q,
     tds194qBasisAmount: review.tds194qBasisAmount,
     tds194qRate: review.tds194qRate,
     tds194qRounding: review.tds194qRounding,
-    transportTdsEnabled: review.applyTransportTds,
+    transportTdsEnabled: deductionSettings.transporterTdsEnabled && review.applyTransportTds,
     sourceTransportTdsAmount: payload.source?.invoiceTransportTdsAmount ?? "",
     transportTdsRate: review.transportTdsRate,
     cgstTdsAmount: review.applyGstTds ? payload.calculation?.cgstTdsAmount ?? "0" : "0",
@@ -2092,7 +2094,7 @@ export function TallyPurchasePostingPanel({
       Number(review.gstRate) > 0 &&
       Number(calculation.basicAmount) > 0
   );
-  const purchaseGoodsTdsActive = review.applyTds194q;
+  const purchaseGoodsTdsActive = deductionSettings.purchaseGoodsTdsEnabled && review.applyTds194q;
   const tds194qBasisPreview = Number(review.tds194qBasisAmount || calculation?.basicAmount || 0);
   const tds194qRawPreview = Number.isFinite(tds194qBasisPreview)
     ? tds194qBasisPreview * Number(review.tds194qRate || 0) / 100
@@ -2664,7 +2666,7 @@ export function TallyPurchasePostingPanel({
 
           <div className="border-b border-slate-100">
             <div className="flex flex-wrap items-center gap-x-5 gap-y-2 py-2.5">
-              <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
+              {deductionSettings.purchaseGoodsTdsEnabled ? <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
                 <button
                   aria-checked={review.applyTds194q}
                   className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.applyTds194q ? "bg-emerald-700" : "bg-slate-300"}`}
@@ -2676,8 +2678,8 @@ export function TallyPurchasePostingPanel({
                   <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.applyTds194q ? "left-[18px]" : "left-0.5"}`} />
                 </button>
                 194Q TDS
-              </label>
-              <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
+              </label> : null}
+              {deductionSettings.transporterTdsEnabled ? <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
                 <button
                   aria-checked={review.applyTransportTds}
                   className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.applyTransportTds ? "bg-emerald-700" : "bg-slate-300"}`}
@@ -2689,8 +2691,8 @@ export function TallyPurchasePostingPanel({
                   <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.applyTransportTds ? "left-[18px]" : "left-0.5"}`} />
                 </button>
                 Transport TDS
-              </label>
-              <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
+              </label> : null}
+              {deductionSettings.gstTdsEnabled ? <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
                 <button
                   aria-checked={review.applyGstTds}
                   className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.applyGstTds ? "bg-emerald-700" : "bg-slate-300"}`}
@@ -2706,7 +2708,7 @@ export function TallyPurchasePostingPanel({
                   : calculation?.taxMode === "igst"
                     ? "GST TDS (IGST)"
                     : "GST TDS"}
-              </label>
+              </label> : null}
               <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
                 <button
                   aria-checked={review.tcsReceivable}
@@ -2720,7 +2722,7 @@ export function TallyPurchasePostingPanel({
                 </button>
                 TCS Receivable
               </label>
-              {review.applyTds194q ? (
+              {purchaseGoodsTdsActive ? (
                 <details className="group basis-full border-t border-slate-100 pt-2">
                   <summary className="cursor-pointer list-none text-[10px] font-semibold text-slate-500 hover:text-slate-800">
                     194Q basis and rounding <ChevronDown className="ml-1 inline h-3 w-3 transition group-open:rotate-180" />
