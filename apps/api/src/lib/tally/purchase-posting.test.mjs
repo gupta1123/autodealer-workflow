@@ -1489,3 +1489,30 @@ test("194Q is never applied while Purchase TDS on goods is switched off in Setti
   });
   assert.equal(on.tallyPayload.withholdings.some((entry) => entry.kind === "tds_194q"), true);
 });
+
+test("a Materials row maps any HSN to its purchase ledger, and longer HSNs inherit shorter rows", () => {
+  const ledgerMapping = (source_key, name) => ({
+    mapping_type: "purchase_ledger",
+    source_key,
+    target_master_type: "ledger",
+    target_master_key: name.toLowerCase(),
+    target_master_name: name,
+    status: "active",
+  });
+  const masters = [...completeMasters, master("ledger", "Structural Steel Purchase"), master("ledger", "Scrap Trim Purchase")];
+  const mappings = [
+    ledgerMapping("hsn:7308:local", "Structural Steel Purchase"),
+    ledgerMapping("hsn:7204:local", "Scrap Trim Purchase"),
+    ledgerMapping("ms_scrap:local", "M.S. Scrap Purchase"),
+  ];
+  const ledgerFor = (hsn) => {
+    const document = invoiceDocument({ totalAmount: "1180.00", taxAmount: "180.00", tdsAmount: "", hsn });
+    document.extracted_fields.cgstTdsAmount = "";
+    document.extracted_fields.sgstTdsAmount = "";
+    return prepare(document, { masters, mappings, savedReview: { sourceReferenceApproved: true, applyGstTds: false } })
+      .review.lines[0].purchaseLedgerName;
+  };
+  assert.equal(ledgerFor("73089090"), "Structural Steel Purchase");
+  // 72044900 has no row of its own, so it uses the 7204 row before the older material key.
+  assert.equal(ledgerFor("72044900"), "Scrap Trim Purchase");
+});

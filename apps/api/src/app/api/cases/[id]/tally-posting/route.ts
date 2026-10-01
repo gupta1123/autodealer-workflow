@@ -545,7 +545,6 @@ function purchaseMappingProposals(
   };
   for (const line of review.lines ?? []) {
     const hsn = String(line.hsn ?? "").replace(/\D/g, "").slice(0, 8);
-    const material = hsn.startsWith("7204") ? "ms_scrap" : hsn === "72031000" ? "sponge_iron" : "unknown";
     if (line.stockItemName) {
       add(
         hsn ? "item_hsn" : "item_description",
@@ -554,11 +553,12 @@ function purchaseMappingProposals(
         line.stockItemName
       );
     }
-    if (line.purchaseLedgerName && material !== "unknown" && geography) {
+    // Remembered per HSN, the same key as a Materials row in Settings.
+    if (line.purchaseLedgerName && hsn.length >= 2 && geography) {
       add(
         "purchase_ledger",
-        `${material}:${geography}`,
-        `${line.description || material} · ${geography} purchase`,
+        `hsn:${hsn}:${geography}`,
+        `${line.description || hsn} · ${geography} purchase`,
         line.purchaseLedgerName
       );
     }

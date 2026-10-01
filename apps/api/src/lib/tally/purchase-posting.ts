@@ -1074,13 +1074,38 @@ function namedRoleLedger(
   });
 }
 
+// Material rows from Settings store the purchase ledger as `hsn:<prefix>:<local|interstate>`.
+// The longest prefix matching the line's HSN wins, so an empty longer row inherits a shorter one.
+function mappedHsnPurchaseLedger(
+  masters: PurchasePostingMasterInput[],
+  mappings: PurchasePostingMappingInput[],
+  hsnValue: string,
+  geography: "local" | "interstate"
+) {
+  const hsn = normalizeHsn(hsnValue);
+  if (!hsn) return "";
+  return mappings
+    .flatMap((mapping) => {
+      const match = /^hsn:(\d{2,8}):(local|interstate)$/.exec(mapping.source_key.trim().toLowerCase());
+      return mapping.status === "active" && mapping.mapping_type === "purchase_ledger" && match && match[2] === geography && hsn.startsWith(match[1])
+        ? [{ mapping, prefix: match[1] }]
+        : [];
+    })
+    .sort((left, right) => right.prefix.length - left.prefix.length)
+    .find(({ mapping }) => mappingTargetIsLive(mapping, masters, ["ledger"]))
+    ?.mapping.target_master_name ?? "";
+}
+
 function purchaseLedgerForLine(
   masters: PurchasePostingMasterInput[],
   mappings: PurchasePostingMappingInput[],
   material: ReturnType<typeof materialFromHsn>["material"],
-  localPurchase: boolean
+  localPurchase: boolean,
+  hsn = ""
 ) {
   const geography = localPurchase ? "local" : "interstate";
+  const byHsn = mappedHsnPurchaseLedger(masters, mappings, hsn, geography);
+  if (byHsn) return exactMasterName(masters, byHsn, ["ledger"]);
   const mapped = mappedRoleName(masters, mappings, "purchase_ledger", [
     `${material}:${geography}`,
     `any:${geography}`,
@@ -1170,7 +1195,7 @@ function buildDefaultReview(
       stockItemName: stockItem,
       purchaseLedgerName:
         exactMasterName(masters, prior?.purchaseLedgerName || "", ["ledger"]) ||
-        purchaseLedgerForLine(masters, mappings, material.material, localPurchase),
+        purchaseLedgerForLine(masters, mappings, material.material, localPurchase, prior?.hsn || line.hsn),
       godownName:
         exactMasterName(masters, prior?.godownName || "", ["godown"]) ||
         exactMasterName(masters, source.godownName, ["godown"]) ||

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Check, Database, Loader2, RefreshCw } from "lucide-react";
+import { AlertTriangle, Check, Database, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
 
 import { PurchaseDocumentFolderSettings } from './PurchaseDocumentFolderSettings';
 import { SearchableSelect } from "@/components/ui/searchable-select";
@@ -37,22 +37,27 @@ type LivePurchaseMasterResult = {
 
 type FieldDefinition = { id: string; label: string; hint: string; kind: MasterKind; requires?: DeductionKey };
 
+type Material = {
+  hsn: string;
+  name: string;
+  starter: boolean;
+  stockItem: string;
+  localLedger: string;
+  interstateLedger: string;
+};
+type MaterialField = "stockItem" | "localLedger" | "interstateLedger";
+
+const MATERIAL_COLUMNS: ReadonlyArray<{ field: MaterialField; label: string; kind: MasterKind }> = [
+  { field: "stockItem", label: "Stock item", kind: "stock" },
+  { field: "localLedger", label: "Purchase ledger · within Maharashtra", kind: "ledger" },
+  { field: "interstateLedger", label: "Purchase ledger · outside Maharashtra", kind: "ledger" },
+];
+
 const SECTIONS: ReadonlyArray<{ title: string; fields: ReadonlyArray<FieldDefinition> }> = [
   {
-    title: "Items and godown",
+    title: "Godown",
     fields: [
-      { id: "ms-scrap-item", label: "MS Scrap", hint: "Stock item for HSN 7204… (includes 72044900)", kind: "stock" },
-      { id: "sponge-iron-item", label: "Sponge Iron", hint: "Stock item for HSN 72031000", kind: "stock" },
       { id: "godown", label: "Default godown", hint: "Used when the documents name no godown", kind: "godown" },
-    ],
-  },
-  {
-    title: "Purchase ledgers",
-    fields: [
-      { id: "ms-scrap-local", label: "MS Scrap · within Maharashtra", hint: "Supplier and buyer in the same state", kind: "ledger" },
-      { id: "ms-scrap-interstate", label: "MS Scrap · outside Maharashtra", hint: "Supplier in another state", kind: "ledger" },
-      { id: "sponge-local", label: "Sponge Iron · within Maharashtra", hint: "Supplier and buyer in the same state", kind: "ledger" },
-      { id: "sponge-interstate", label: "Sponge Iron · outside Maharashtra", hint: "Supplier in another state", kind: "ledger" },
     ],
   },
   {
@@ -130,6 +135,9 @@ export function PurchasePostingDefaultsSettings({ deductions }: { deductions?: D
   const [companyName, setCompanyName] = useState("");
   const [masters, setMasters] = useState<Master[]>([]);
   const [defaults, setDefaults] = useState<Defaults>({});
+  const [materials, setMaterials] = useState<Material[]>([]);
+  const [newHsn, setNewHsn] = useState("");
+  const [newName, setNewName] = useState("");
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [masterSource, setMasterSource] = useState("");
@@ -230,8 +238,10 @@ export function PurchasePostingDefaultsSettings({ deductions }: { deductions?: D
     void apiFetch(`/api/settings/purchase-posting-defaults?${query}`, { cache: "no-store" })
       .then(async (response) => {
         if (!response.ok) throw new Error(await errorText(response));
-        const payload = await response.json() as { defaults?: Defaults };
-        if (!cancelled) setDefaults(payload.defaults ?? {});
+        const payload = await response.json() as { defaults?: Defaults; materials?: Material[] };
+        if (cancelled) return;
+        setDefaults(payload.defaults ?? {});
+        setMaterials(payload.materials ?? []);
       })
       .catch((error) => {
         if (!cancelled) setNotice(error instanceof Error ? error.message : "Could not load saved choices.");
@@ -273,6 +283,75 @@ export function PurchasePostingDefaultsSettings({ deductions }: { deductions?: D
     } finally {
       setSavingField("");
     }
+  }
+
+  async function putChange(body: Record<string, unknown>) {
+    const response = await apiFetch("/api/settings/purchase-posting-defaults", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connectionId, companyName, ...body }),
+    });
+    if (!response.ok) throw new Error(await errorText(response));
+  }
+
+  async function saveMaterialCell(material: Material, field: MaterialField, kind: MasterKind, name: string) {
+    if (name === material[field]) return;
+    const key = `${material.hsn}:${field}`;
+    const picked = mastersByKind[kind].find((option) => option.name === name);
+    const apply = (value: string) =>
+      setMaterials((current) => current.map((row) => (row.hsn === material.hsn ? { ...row, [field]: value } : row)));
+    apply(name);
+    setSavingField(key);
+    setSavedField("");
+    setNotice("");
+    try {
+      await putChange({ material: { hsn: material.hsn, name: material.name, field, value: name ? { name, guid: picked?.guid ?? "" } : "" } });
+      setSavedField(key);
+    } catch (error) {
+      apply(material[field]);
+      setNotice(error instanceof Error ? error.message : "Could not save this choice.");
+    } finally {
+      setSavingField("");
+    }
+  }
+
+  async function removeMaterial(material: Material) {
+    const hasValues = Boolean(material.stockItem || material.localLedger || material.interstateLedger);
+    setMaterials((current) => current.filter((row) => row.hsn !== material.hsn));
+    if (!hasValues) return;
+    setNotice("");
+    try {
+      await putChange({ removeMaterial: material.hsn });
+    } catch (error) {
+      setMaterials((current) => [...current, material].sort((left, right) => left.hsn.localeCompare(right.hsn)));
+      setNotice(error instanceof Error ? error.message : "Could not remove this material.");
+    }
+  }
+
+  function addMaterial() {
+    const hsn = newHsn.replace(/\D/g, "");
+    if (hsn.length < 2 || hsn.length > 8) {
+      setNotice("Enter an HSN code of 2 to 8 digits, for example 7308 or 72142000.");
+      return;
+    }
+    if (materials.some((row) => row.hsn === hsn)) {
+      setNotice(`HSN ${hsn} is already in the list.`);
+      return;
+    }
+    setNotice("");
+    setMaterials((current) =>
+      [...current, { hsn, name: newName.trim(), starter: false, stockItem: "", localLedger: "", interstateLedger: "" }]
+        .sort((left, right) => left.hsn.localeCompare(right.hsn))
+    );
+    setNewHsn("");
+    setNewName("");
+  }
+
+  // An empty cell falls back to the longest shorter HSN row that has a value, as posting does.
+  function inheritedValue(material: Material, field: MaterialField) {
+    return materials
+      .filter((row) => row.hsn !== material.hsn && material.hsn.startsWith(row.hsn) && row[field])
+      .sort((left, right) => right.hsn.length - left.hsn.length)[0];
   }
 
   const disabled = loading || !connectionId || !companyName;
@@ -346,6 +425,103 @@ export function PurchasePostingDefaultsSettings({ deductions }: { deductions?: D
           </div>
         ) : (
           <div className="px-5 pb-2">
+            <div className="flex flex-wrap items-end justify-between gap-2 pb-2 pt-5">
+              <div>
+                <h3 className="text-[11px] font-bold uppercase tracking-[0.14em] text-[#8a7f72]">Materials by HSN</h3>
+                <p className="mt-1 text-[11px] text-[#8a7f72]">The longest matching HSN wins. An empty cell uses the shorter row above it, e.g. 72044900 uses 7204.</p>
+              </div>
+            </div>
+            <div className="overflow-hidden rounded-lg border border-[#e8e2db]">
+              <div className="hidden grid-cols-[minmax(0,180px)_repeat(3,minmax(0,1fr))_28px] gap-3 border-b border-[#e8e2db] bg-[#faf8f5] px-3 py-2 text-[11px] font-semibold text-[#675d54] lg:grid">
+                <span>HSN</span>
+                {MATERIAL_COLUMNS.map((column) => <span key={column.field}>{column.label}</span>)}
+                <span />
+              </div>
+              <div className="divide-y divide-[#f3efe9]">
+                {materials.map((material) => (
+                  <div className="grid gap-3 px-3 py-2.5 lg:grid-cols-[minmax(0,180px)_repeat(3,minmax(0,1fr))_28px] lg:items-center" key={material.hsn}>
+                    <div className="min-w-0">
+                      <span className="inline-flex rounded-md border border-[#ded8d0] bg-[#faf8f5] px-1.5 py-0.5 font-mono text-[11px] font-semibold text-[#2b1a10]">{material.hsn}</span>
+                      <p className="mt-1 truncate text-xs font-semibold text-[#111827]" title={material.name}>{material.name || "Custom material"}</p>
+                    </div>
+                    {MATERIAL_COLUMNS.map((column) => {
+                      const value = material[column.field];
+                      const key = `${material.hsn}:${column.field}`;
+                      const options = mastersByKind[column.kind];
+                      const missing = Boolean(value && masters.length && !options.some((option) => option.name === value));
+                      const inherited = value ? null : inheritedValue(material, column.field);
+                      return (
+                        <div className="min-w-0" key={column.field}>
+                          <p className="mb-1 text-[11px] font-medium text-[#8a7f72] lg:hidden">{column.label}</p>
+                          <div className="flex items-center gap-1.5">
+                            <SearchableSelect
+                              aria-label={`${column.label} for HSN ${material.hsn}`}
+                              disabled={disabled || savingField === key}
+                              emptyMessage={options.length ? "No matching master." : "Tally masters are not loaded. Use Refresh from Tally."}
+                              invalid={missing}
+                              onChange={(next) => void saveMaterialCell(material, column.field, column.kind, next)}
+                              options={options.map((option) => ({ value: option.name, label: option.name, hint: option.parent }))}
+                              placeholder={inherited ? `Uses ${inherited.hsn}: ${inherited[column.field]}` : "Not set"}
+                              searchPlaceholder={SEARCH_PLACEHOLDER[column.kind]}
+                              value={value}
+                            />
+                            <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                              {savingField === key ? <Loader2 className="h-3.5 w-3.5 animate-spin text-[#8a7f72]" />
+                                : savedField === key ? <Check className="h-3.5 w-3.5 text-emerald-600" />
+                                  : missing ? <AlertTriangle className="h-3.5 w-3.5 text-amber-600" /> : null}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <div className="flex justify-end">
+                      {material.starter ? null : (
+                        <button
+                          aria-label={`Remove HSN ${material.hsn}`}
+                          className="rounded-md p-1.5 text-[#776b61] transition hover:bg-[#f3eee8] hover:text-red-700 disabled:opacity-35"
+                          disabled={disabled}
+                          onClick={() => void removeMaterial(material)}
+                          title="Remove material"
+                          type="button"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <form
+                className="flex flex-col gap-2 border-t border-[#e8e2db] bg-[#fdfcfa] px-3 py-2.5 sm:flex-row sm:items-center"
+                onSubmit={(event) => { event.preventDefault(); addMaterial(); }}
+              >
+                <input
+                  aria-label="New material HSN"
+                  className="h-8 w-full rounded-lg border border-[#ded8d0] bg-white px-2.5 font-mono text-xs outline-none placeholder:font-sans placeholder:text-[#a89e92] focus:border-[#b9aa99] sm:w-36"
+                  inputMode="numeric"
+                  maxLength={10}
+                  onChange={(event) => setNewHsn(event.target.value)}
+                  placeholder="HSN, e.g. 7308"
+                  value={newHsn}
+                />
+                <input
+                  aria-label="New material name"
+                  className="h-8 w-full rounded-lg border border-[#ded8d0] bg-white px-2.5 text-xs outline-none placeholder:text-[#a89e92] focus:border-[#b9aa99] sm:w-56"
+                  maxLength={60}
+                  onChange={(event) => setNewName(event.target.value)}
+                  placeholder="Name (optional), e.g. Structurals"
+                  value={newName}
+                />
+                <button
+                  className="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border border-[#ded8d0] bg-[#faf8f5] px-3 text-xs font-semibold text-[#332c26] transition hover:bg-[#f3eee8] disabled:opacity-45"
+                  disabled={disabled || !newHsn.trim()}
+                  type="submit"
+                >
+                  <Plus className="h-3.5 w-3.5" />Add material
+                </button>
+              </form>
+            </div>
+
             {SECTIONS.map((section) => (
               <div key={section.title}>
                 <h3 className="pb-1 pt-5 text-[11px] font-bold uppercase tracking-[0.14em] text-[#8a7f72]">{section.title}</h3>
