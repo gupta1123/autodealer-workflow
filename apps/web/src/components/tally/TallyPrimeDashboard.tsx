@@ -28,6 +28,8 @@ const DEFAULT_LAN_TALLY_URL = "http://192.168.1.10:9000";
 const SELECTED_CONNECTION_STORAGE_KEY = "kalika:selected-tally-connection";
 const EXPECTED_MACHINE_STORAGE_PREFIX = "kalika:tally-connector-machine:";
 const CONNECTION_CONTROL_STORAGE_PREFIX = "kalika:tally-connection-control:";
+// Another PC is offered for disconnecting only after it has not checked in for a week.
+const STALE_PC_MS = 7 * 24 * 60 * 60 * 1000;
 
 type TallySetupMode = "same_machine" | "lan_server";
 
@@ -41,6 +43,8 @@ type TallyConnection = {
   bridgeName: string | null;
   bridgeVersion: string | null;
   bridgeMachineId: string | null;
+  bridgeMachineName?: string | null;
+  revoked?: boolean;
   lastHeartbeatAt: string | null;
   lastTestedAt: string | null;
   lastTallyReachable: boolean | null;
@@ -308,10 +312,9 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   const [creating, setCreating] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [disconnectingOthers, setDisconnectingOthers] = useState(false);
-  const [confirmAction, setConfirmAction] = useState<"disconnect" | "disconnect_others" | null>(null);
+  const [confirmAction, setConfirmAction] = useState<"disconnect" | "disconnect_others" | "repair" | null>(null);
   // localStorage is only read after mount so the first client render matches
   // the server render.
-  const [mounted, setMounted] = useState(false);
   const [setupMode, setSetupMode] = useState<TallySetupMode>("same_machine");
   const [tallyUrlInput, setTallyUrlInput] = useState("");
   const [message, setMessage] = useState<{
@@ -325,61 +328,41 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     connections[0] ??
     null;
   const selectedConnectionId = selectedConnection?.id ?? "";
-  const expectedMachineId =
-    mounted && selectedConnectionId
-      ? window.localStorage.getItem(
-          `${EXPECTED_MACHINE_STORAGE_PREFIX}${selectedConnectionId}`,
-        )
-      : null;
-  const selectedControlToken =
-    mounted && selectedConnectionId
-      ? window.localStorage.getItem(
-          `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnectionId}`,
-        )
-      : null;
-  const connectionBelongsToThisBrowser =
-    !selectedConnection?.bridgeConnected ||
-    (Boolean(selectedControlToken) &&
-      (!expectedMachineId ||
-        !selectedConnection?.bridgeMachineId ||
-        expectedMachineId === selectedConnection.bridgeMachineId));
-  const selectedCompany = connectionBelongsToThisBrowser
-    ? (companies.find(
-        (company) =>
-          company.connectionId === selectedConnection?.id &&
-          (company.isActive ||
-            company.companyName.trim().toLowerCase() ===
-              String(selectedConnection?.lastCompanyName ?? "")
-                .trim()
-                .toLowerCase()),
-      ) ?? null)
-    : null;
-  const statusTone = connectionBelongsToThisBrowser
-    ? getStatusTone(selectedConnection)
-    : "error";
-  const connectorActive =
-    connectionBelongsToThisBrowser &&
-    Boolean(selectedConnection?.bridgeConnected);
-  const selectedActiveConnectionId = selectedConnection?.bridgeConnected
-    ? (selectedConnection?.id ?? "")
-    : "";
-  const otherActiveConnectionCount = connections.filter(
+  // The connection belongs to the PC running the connector, not to the browser that created it,
+  // so every signed-in user sees the same status and controls.
+  const selectedCompany =
+    companies.find(
+      (company) =>
+        company.connectionId === selectedConnection?.id &&
+        (company.isActive ||
+          company.companyName.trim().toLowerCase() ===
+            String(selectedConnection?.lastCompanyName ?? "")
+              .trim()
+              .toLowerCase()),
+    ) ?? null;
+  const statusTone = getStatusTone(selectedConnection);
+  const connectorActive = Boolean(selectedConnection?.bridgeConnected);
+  // Paired but not checking in (PC asleep, connector or Tally closed): nothing to re-pair, the
+  // connector resumes on its own once it runs again.
+  const connectorOffline = Boolean(
+    selectedConnection && !connectorActive && !selectedConnection.revoked && selectedConnection.pairedAt,
+  );
+  const selectedActiveConnectionId = connectorActive ? (selectedConnection?.id ?? "") : "";
+  const staleOtherConnections = connections.filter(
     (connection) =>
-      connection.bridgeConnected && connection.id !== selectedActiveConnectionId,
-  ).length;
-  const tallyReachable =
-    connectionBelongsToThisBrowser &&
-    selectedConnection?.tallyReachable === true;
-  const companyLoaded =
-    connectionBelongsToThisBrowser &&
-    selectedConnection?.companyLoaded === true;
-  const companyDetail = !connectionBelongsToThisBrowser
-    ? "This connection is managed from another browser or computer. Click Reconnect to use this computer instead."
-    : selectedConnection?.lastCompanyName ||
-      selectedCompany?.companyName ||
-      (selectedConnection?.companyLoaded
-        ? "Company loaded"
-        : "Company not detected yet");
+      connection.id !== selectedActiveConnectionId &&
+      !connection.bridgeConnected &&
+      Boolean(connection.pairedAt) &&
+      (!connection.lastHeartbeatAt ||
+        Date.now() - Date.parse(connection.lastHeartbeatAt) > STALE_PC_MS),
+  );
+  const tallyReachable = selectedConnection?.tallyReachable === true;
+  const companyLoaded = selectedConnection?.companyLoaded === true;
+  const pcName = selectedConnection?.bridgeMachineName || "the Tally PC";
+  const companyDetail =
+    selectedConnection?.lastCompanyName ||
+    selectedCompany?.companyName ||
+    (selectedConnection?.companyLoaded ? "Company loaded" : "Company not detected yet");
   async function loadConnections(options?: { quiet?: boolean }) {
     try {
       if (!options?.quiet) {
@@ -597,22 +580,9 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     try {
       setDisconnecting(true);
       setMessage(null);
-      const controlToken = window.localStorage.getItem(
-        `${CONNECTION_CONTROL_STORAGE_PREFIX}${selectedConnection.id}`,
-      );
-      if (!controlToken) {
-        throw new Error(
-          "This connection was created in another browser. Reconnect from this browser to manage it.",
-        );
-      }
       const response = await apiFetch(
         `/api/tally/connections/${selectedConnection.id}/disconnect`,
-        {
-          method: "POST",
-          headers: {
-            "x-tally-control-token": controlToken,
-          },
-        },
+        { method: "POST" },
       );
       if (!response.ok) {
         throw new Error(await readError(response));
@@ -636,7 +606,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       );
       setMessage({
         tone: "success",
-        text: "Connector disconnected.",
+        text: `Disconnected ${selectedConnection.bridgeMachineName || "this PC"}. Reconnect on that PC resumes the same connection with its settings.`,
       });
     } catch (error) {
       setMessage({
@@ -719,7 +689,6 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   }
 
   useEffect(() => {
-    setMounted(true);
     void loadConnections();
   }, []);
 
@@ -985,9 +954,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                       }
                       variant="outline"
                     >
-                      {connectionBelongsToThisBrowser
-                        ? getStatusLabel(selectedConnection)
-                        : "Reconnect required"}
+                      {connectorOffline ? "Connector offline" : getStatusLabel(selectedConnection)}
                     </Badge>
                   </div>
                   <div className="mt-1 max-w-3xl text-xs font-medium text-[#8a7f72]">
@@ -999,7 +966,9 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               </div>
 
               <div className="flex w-full flex-wrap gap-2.5 lg:w-auto lg:shrink-0 lg:flex-nowrap lg:items-center lg:justify-end">
-                  {!connectorActive ? (
+                  {!connectorActive && !connectorOffline ? (
+                    // Only a PC whose connector login is gone needs pairing; this resumes the
+                    // same connection rather than creating a new one.
                     <Button
                       className="w-fit whitespace-nowrap rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] text-xs font-medium text-white shadow-md transition-all"
                       disabled={creating}
@@ -1018,10 +987,13 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                       <PopoverTrigger asChild>
                         <Button aria-label="Open connection menu" className="rounded-xl" size="icon" type="button" variant="outline"><MoreHorizontal className="h-4 w-4" /></Button>
                       </PopoverTrigger>
-                      <PopoverContent align="end" className="w-64 rounded-xl border-[#e5ddd0] p-2 shadow-xl">
-                        <p className="px-2 pb-1 pt-1 text-[11px] font-semibold text-[#8a7f72]">Connection</p>
+                      <PopoverContent align="end" className="w-72 rounded-xl border-[#e5ddd0] p-2 shadow-xl">
+                        <p className="px-2 pb-1 pt-1 text-[11px] font-semibold text-[#8a7f72]">{pcName}</p>
+                        {connectorOffline ? (
+                          <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-[#2b1a10] hover:bg-[#f5efe6] disabled:opacity-50" disabled={creating} onClick={() => setConfirmAction("repair")} type="button"><PlugZap className="h-3.5 w-3.5" />Pair this PC again…</button>
+                        ) : null}
                         <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-amber-800 hover:bg-amber-50 disabled:opacity-50" disabled={disconnecting} onClick={() => setConfirmAction("disconnect")} type="button"><PlugZap className="h-3.5 w-3.5" />Disconnect…</button>
-                        {otherActiveConnectionCount > 0 ? <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50" disabled={disconnectingOthers} onClick={() => setConfirmAction("disconnect_others")} type="button"><PlugZap className="h-3.5 w-3.5" />Disconnect other sessions…</button> : null}
+                        {staleOtherConnections.length > 0 ? <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50" disabled={disconnectingOthers} onClick={() => setConfirmAction("disconnect_others")} type="button"><PlugZap className="h-3.5 w-3.5" />Disconnect PCs not seen for 7 days…</button> : null}
                         <div className="mt-1 border-t border-slate-100 px-2 pt-2 text-[11px] leading-4 text-[#8a7f72]">Last heartbeat {formatTime(selectedConnection.lastHeartbeatAt)}</div>
                       </PopoverContent>
                     </Popover>
@@ -1049,11 +1021,9 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
             />
             <StatusCard
               detail={
-                connectionBelongsToThisBrowser
-                  ? selectedConnection.lastCompanyName ||
-                    selectedConnection.lastError ||
-                    companyDetail
-                  : companyDetail
+                selectedConnection.lastCompanyName ||
+                selectedConnection.lastError ||
+                companyDetail
               }
               ok={companyLoaded}
               title="Company"
@@ -1097,23 +1067,26 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         </div>
       )}
       <CaseConfirmDialog
-        confirmLabel={confirmAction === "disconnect_others" ? "Disconnect others" : "Disconnect"}
+        confirmLabel={confirmAction === "disconnect_others" ? "Disconnect them" : confirmAction === "repair" ? "Pair again" : "Disconnect"}
         description={
           confirmAction === "disconnect_others"
-            ? `${otherActiveConnectionCount} other active connector session${otherActiveConnectionCount === 1 ? "" : "s"} will stop and must reconnect from their own computer.`
-            : "Kalika workflows that use Tally will stop. You will need to click Reconnect and approve the Local Agent again."
+            ? `${staleOtherConnections.map((connection) => connection.bridgeMachineName || "Unnamed PC").join(", ")} ${staleOtherConnections.length === 1 ? "has" : "have"} not checked in for over a week. Reconnect on ${staleOtherConnections.length === 1 ? "that PC" : "those PCs"} resumes the same connection later.`
+            : confirmAction === "repair"
+              ? `Only needed if the connector on ${pcName} lost its pairing. If ${pcName} is just switched off, or the connector or Tally is closed, open them instead; it reconnects on its own. Pairing again keeps this same connection and its settings.`
+              : `Kalika workflows that use Tally on ${pcName} stop until you click Reconnect on that PC and approve the Local Agent. This connection, its settings and history stay.`
         }
         footnote={null}
-        loading={disconnecting || disconnectingOthers}
+        loading={disconnecting || disconnectingOthers || creating}
         onConfirm={() => {
           const action = confirmAction;
           setConfirmAction(null);
           if (action === "disconnect") void disconnectConnector();
           if (action === "disconnect_others") void disconnectOtherConnectors();
+          if (action === "repair") void connectConnector();
         }}
         onOpenChange={(open) => { if (!open) setConfirmAction(null); }}
         open={confirmAction !== null}
-        title={confirmAction === "disconnect_others" ? "Disconnect other sessions?" : "Disconnect Tally?"}
+        title={confirmAction === "disconnect_others" ? "Disconnect PCs not seen for a week?" : confirmAction === "repair" ? `Pair ${pcName} again?` : `Disconnect ${pcName}?`}
       />
     </div>
   );

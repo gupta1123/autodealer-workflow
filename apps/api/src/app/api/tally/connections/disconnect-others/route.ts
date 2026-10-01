@@ -31,6 +31,8 @@ function disconnectedUpdatePayload(disconnectedAt: string) {
   };
 }
 
+const STALE_SESSION_MS = 7 * 24 * 60 * 60 * 1000;
+
 function readKeepConnectionId(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
@@ -64,6 +66,10 @@ async function POSTHandler(request: Request) {
       });
     }
 
+    // Only PCs whose connector has not checked in for a week are disconnected, so a working PC
+    // (for example the client's Tally PC) can never be cut off from another browser. They can
+    // be resumed later with Reconnect on that PC.
+    const staleBefore = new Date(Date.now() - STALE_SESSION_MS).toISOString();
     const supabase = createSupabaseAdminClient();
     let query = supabase
       .from("tally_connections")
@@ -71,7 +77,8 @@ async function POSTHandler(request: Request) {
       .eq("owner_user_id", user.id)
       .is("revoked_at", null)
       .not("bridge_token_hash", "is", null)
-      .not("paired_at", "is", null);
+      .not("paired_at", "is", null)
+      .or(`last_heartbeat_at.is.null,last_heartbeat_at.lt.${staleBefore}`);
 
     if (keepConnectionId) {
       query = query.neq("id", keepConnectionId);
