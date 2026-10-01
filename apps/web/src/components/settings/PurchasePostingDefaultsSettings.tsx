@@ -23,6 +23,8 @@ type LiveMaster = {
 
 type LivePurchaseMasterResult = {
   source?: unknown;
+  validatedAt?: unknown;
+  fetchedAt?: unknown;
   masters?: {
     ledgers?: unknown;
     stockItems?: unknown;
@@ -88,6 +90,13 @@ function cleanText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function describeSyncedCopy(value: LivePurchaseMasterResult) {
+  const checkedAt = new Date(cleanText(value.validatedAt) || cleanText(value.fetchedAt));
+  if (Number.isNaN(checkedAt.getTime())) return "Read through the connector";
+  const when = checkedAt.toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  return `Read through the connector, last checked with Tally ${when}. Use Refresh from Tally for new masters`;
+}
+
 function mastersFromLiveResult(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const result = value as LivePurchaseMasterResult;
@@ -116,6 +125,7 @@ export function PurchasePostingDefaultsSettings() {
   const [defaults, setDefaults] = useState<Defaults>({});
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [masterSource, setMasterSource] = useState("");
   const [savingField, setSavingField] = useState("");
   const [notice, setNotice] = useState<{ tone: "success" | "error"; text: string } | null>(null);
   const company = companies.find((entry) => entry.companyName === companyName);
@@ -170,8 +180,10 @@ export function PurchasePostingDefaultsSettings() {
     return () => { cancelled = true; };
   }, [connectionId]);
 
-  // Masters always come live from the open Tally company, the same source the posting review uses.
-  const refreshLiveMasters = useCallback(async () => {
+  // Masters come through the connector. Opening the tab uses the connector's synced copy (fast);
+  // the Refresh button asks the connector to check Tally for changed masters first, the same as
+  // the posting review does. Godowns are always read directly from Tally.
+  const refreshLiveMasters = useCallback(async (checkTally = false) => {
     if (!connectionId || !companyName) return;
     setRefreshing(true);
     try {
@@ -181,11 +193,16 @@ export function PurchasePostingDefaultsSettings() {
         companyGuid: company?.companyGuid,
         financialYear: company?.financialYear,
         operation: "ledger_masters",
-        payload: { requestedMasterTypes: ["ledger", "group", "stock_item"], includeInventoryLocations: true },
+        payload: {
+          requestedMasterTypes: ["ledger", "group", "stock_item"],
+          includeInventoryLocations: true,
+          ...(checkTally ? { requireFresh: true } : {}),
+        },
       });
       const live = mastersFromLiveResult(livePayload);
       if (!live) throw new Error("Tally returned no usable ledgers for this company.");
       setMasters(live);
+      setMasterSource(checkTally ? "Checked with Tally just now" : describeSyncedCopy(livePayload));
     } catch (error) {
       setNotice({
         tone: "error",
@@ -202,6 +219,7 @@ export function PurchasePostingDefaultsSettings() {
     setLoading(true);
     setNotice(null);
     setMasters([]);
+    setMasterSource("");
     const query = new URLSearchParams({ connectionId, companyName });
     void apiFetch(`/api/settings/purchase-posting-defaults?${query}`, { cache: "no-store" })
       .then(async (response) => {
@@ -255,7 +273,7 @@ export function PurchasePostingDefaultsSettings() {
             Pre-filled on every Purchase voucher for this company and kept when the connector is re-paired. Supplier ledgers are remembered by GSTIN once confirmed on a voucher. Each choice saves as soon as it is picked.
           </p>
         </div>
-        <Button disabled={disabled || refreshing} onClick={() => void refreshLiveMasters()} size="sm" variant="outline">
+        <Button disabled={disabled || refreshing} onClick={() => void refreshLiveMasters(true)} size="sm" variant="outline">
           {refreshing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
           Refresh from Tally
         </Button>
@@ -305,7 +323,7 @@ export function PurchasePostingDefaultsSettings() {
           ))}
         </div>
       )}
-      {masters.length ? <p className="mt-1 text-xs font-medium text-emerald-700"><Check className="mr-1 inline h-4 w-4" />{optionsByKind.ledger.length} ledgers, {optionsByKind.stock.length} items and {optionsByKind.godown.length} godowns read live from Tally.</p> : null}
+      {masters.length ? <p className="mt-1 text-xs font-medium text-emerald-700"><Check className="mr-1 inline h-4 w-4" />{optionsByKind.ledger.length} ledgers, {optionsByKind.stock.length} items and {optionsByKind.godown.length} godowns. {masterSource}.</p> : null}
 
       <div className="mt-4 border-t border-[#f0ece4] pt-4">
         <PurchaseDocumentFolderSettings connectionId={connectionId} companyName={companyName}
