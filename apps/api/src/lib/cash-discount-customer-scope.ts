@@ -12,6 +12,8 @@ export type CashDiscountCustomerScope = {
 };
 
 type ScopeRow = {
+  connection_id?: string;
+  updated_at?: string | null;
   company_name_key?: string;
   mode: CashDiscountCustomerScopeMode;
   selected_group_names: string[] | null;
@@ -91,6 +93,25 @@ export function isCashDiscountCustomerScopeSchemaMissing(error: unknown) {
   );
 }
 
+const SCOPE_COLUMNS =
+  "connection_id, company_name_key, updated_at, mode, selected_group_names, include_nested_groups, detect_sales_linked_exceptions, excluded_group_names, excluded_ledger_names";
+
+function companyNameKey(companyName: string) {
+  return companyName.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+// A scope is saved against the connector connection that saved it, but a re-pair creates a new
+// connection. Scopes are therefore read per company across the owner's connections: the current
+// connection's row wins, otherwise the most recently saved one.
+function preferredRow(rows: ScopeRow[], connectionId: string) {
+  return [...rows].sort((left, right) => {
+    const leftCurrent = left.connection_id === connectionId ? 1 : 0;
+    const rightCurrent = right.connection_id === connectionId ? 1 : 0;
+    if (leftCurrent !== rightCurrent) return rightCurrent - leftCurrent;
+    return String(right.updated_at ?? "").localeCompare(String(left.updated_at ?? ""));
+  })[0] ?? null;
+}
+
 export async function getCashDiscountCustomerScope(params: {
   ownerUserId: string;
   connectionId: string;
@@ -99,13 +120,11 @@ export async function getCashDiscountCustomerScope(params: {
   const supabase = createSupabaseAdminClient();
   const { data, error } = await supabase
     .from("cash_discount_customer_scope_settings")
-    .select("mode, selected_group_names, include_nested_groups, detect_sales_linked_exceptions, excluded_group_names, excluded_ledger_names")
+    .select(SCOPE_COLUMNS)
     .eq("owner_user_id", params.ownerUserId)
-    .eq("connection_id", params.connectionId)
-    .eq("company_name_key", params.companyName.trim().toLowerCase().replace(/\s+/g, " "))
-    .maybeSingle();
+    .eq("company_name_key", companyNameKey(params.companyName));
   if (error) throw error;
-  return fromRow(data as ScopeRow | null);
+  return fromRow(preferredRow((data ?? []) as ScopeRow[], params.connectionId));
 }
 
 export async function getCashDiscountCustomerScopeOrDefault(params: {
@@ -130,18 +149,19 @@ export async function getCashDiscountCustomerScopesByCompany(params: {
   const supabase = createSupabaseAdminClient();
   const { data, error } = await supabase
     .from("cash_discount_customer_scope_settings")
-    .select("company_name_key, mode, selected_group_names, include_nested_groups, detect_sales_linked_exceptions, excluded_group_names, excluded_ledger_names")
-    .eq("owner_user_id", params.ownerUserId)
-    .eq("connection_id", params.connectionId);
+    .select(SCOPE_COLUMNS)
+    .eq("owner_user_id", params.ownerUserId);
   if (error) {
     if (isCashDiscountCustomerScopeSchemaMissing(error)) return {};
     throw error;
   }
+  const rowsByCompany = new Map<string, ScopeRow[]>();
+  for (const row of (data ?? []) as ScopeRow[]) {
+    const key = String(row.company_name_key ?? "").trim();
+    if (key) rowsByCompany.set(key, [...(rowsByCompany.get(key) ?? []), row]);
+  }
   return Object.fromEntries(
-    ((data ?? []) as ScopeRow[]).flatMap((row) => {
-      const key = String(row.company_name_key ?? "").trim();
-      return key ? [[key, fromRow(row)] as const] : [];
-    })
+    [...rowsByCompany].map(([key, rows]) => [key, fromRow(preferredRow(rows, params.connectionId))] as const)
   );
 }
 
@@ -171,5 +191,14 @@ export async function saveCashDiscountCustomerScope(params: {
     .select("mode, selected_group_names, include_nested_groups, detect_sales_linked_exceptions, excluded_group_names, excluded_ledger_names")
     .single();
   if (error) throw error;
+
+  // Older connections' copies would otherwise be stale fallbacks for this company.
+  const { error: cleanupError } = await supabase
+    .from("cash_discount_customer_scope_settings")
+    .delete()
+    .eq("owner_user_id", params.ownerUserId)
+    .eq("company_name_key", companyNameKey(params.companyName))
+    .neq("connection_id", params.connectionId);
+  if (cleanupError) throw cleanupError;
   return fromRow(data as ScopeRow);
 }
