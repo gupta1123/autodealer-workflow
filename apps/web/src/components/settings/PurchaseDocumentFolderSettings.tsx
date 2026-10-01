@@ -1,8 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from 'react';
-import { Loader2 } from 'lucide-react';
-import { Button } from '@/components/ui/button';
+import { FolderCheck, Loader2 } from 'lucide-react';
 import { apiFetch } from '@/lib/api-client';
 import { runCashDiscountLiveRequest } from '@/lib/cash-discount-live';
 
@@ -68,22 +67,24 @@ export function PurchaseDocumentFolderSettings({ connectionId, companyName, comp
   }
 
   return <div>
-    <h3 className="text-sm font-bold text-[#111827]">Purchase invoice folder</h3>
-    <p className="mt-0.5 text-xs text-[#8a7f72]">Invoice PDFs are copied here before posting so every Tally user can open them. Leave empty to keep them on the connector PC.</p>
-    <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">
-      <label className="block flex-1 text-xs font-medium text-[#5b4b3d]">Shared folder path
-        <input className="mt-1 h-10 w-full rounded-lg border border-[#ddd7cc] px-3" value={folderPath}
-          placeholder={'\\\\AccountsServer\\Invoices\\Kalika'} disabled={busy === 'loading' || busy === 'save' || !loaded}
-          onBlur={() => void save()}
-          onKeyDown={event => { if (event.key === 'Enter') void save(); }}
-          onChange={event => { setFolderPath(event.target.value); setNotice(null); }} />
-      </label>
-      <Button variant="outline" disabled={Boolean(busy) || !loaded || !folderPath.trim()} onClick={() => void test()}>
-        {busy === 'test' && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}Test folder access
-      </Button>
+    <h2 className="text-base font-bold tracking-tight text-[#111827]">Purchase invoice folder</h2>
+    <p className="mt-1 text-xs text-[#5b4b3d]">Invoice PDFs are copied here before posting so every Tally user can open them. Leave empty to keep them on the connector PC. Saves when you leave the field.</p>
+    <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center">
+      <input aria-label="Shared folder path"
+        className="h-9 w-full flex-1 rounded-lg border border-[#ded8d0] bg-[#fbfaf8] px-3 font-mono text-xs text-[#111827] shadow-sm outline-none transition placeholder:font-sans placeholder:text-[#a89e92] hover:border-[#b9aa99] focus:border-[#b9aa99] focus:bg-white disabled:opacity-50"
+        value={folderPath}
+        placeholder={'\\\\AccountsServer\\Invoices\\Kalika'} disabled={busy === 'loading' || busy === 'save' || !loaded}
+        onBlur={() => void save()}
+        onKeyDown={event => { if (event.key === 'Enter') void save(); }}
+        onChange={event => { setFolderPath(event.target.value); setNotice(null); }} />
+      <button type="button"
+        className="inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-lg border border-[#ded8d0] bg-[#faf8f5] px-3 text-xs font-semibold text-[#332c26] transition hover:bg-[#f3eee8] disabled:cursor-not-allowed disabled:opacity-45"
+        disabled={Boolean(busy) || !loaded || !folderPath.trim()} onClick={() => void test()}>
+        {busy === 'test' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FolderCheck className="h-3.5 w-3.5" />}Test folder access
+      </button>
     </div>
-    {busy === 'loading' && <p className="mt-2 text-xs">Loading folder settings…</p>}
-    {busy === 'save' && <p className="mt-2 text-xs">Saving…</p>}
+    {busy === 'loading' && <p className="mt-2 text-xs text-[#8a7f72]">Loading folder settings…</p>}
+    {busy === 'save' && <p className="mt-2 inline-flex items-center gap-1.5 text-xs text-[#8a7f72]"><Loader2 className="h-3 w-3 animate-spin" />Saving…</p>}
     {notice && <p role="status" className={`mt-2 text-xs ${notice.error ? 'text-rose-700' : 'text-emerald-700'}`}>{notice.text}</p>}
   </div>;
 }

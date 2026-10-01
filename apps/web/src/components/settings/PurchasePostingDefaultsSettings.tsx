@@ -1,10 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Check, Loader2, RefreshCw } from "lucide-react";
+import { AlertTriangle, Check, Database, Loader2, RefreshCw } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
 import { PurchaseDocumentFolderSettings } from './PurchaseDocumentFolderSettings';
+import { SearchableSelect } from "@/components/ui/searchable-select";
+import { SelectDropdown } from "@/components/ui/select-dropdown";
 import { apiFetch } from "@/lib/api-client";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
@@ -14,6 +15,8 @@ type Company = { id: string; companyName: string; companyGuid?: string | null; f
 type MasterKind = "ledger" | "stock" | "godown";
 type Master = { guid: string; kind: MasterKind; name: string; parent: string | null };
 type Defaults = Record<string, string>;
+type DeductionKey = "purchaseGoodsTdsEnabled" | "transporterTdsEnabled" | "gstTdsEnabled";
+export type DeductionSwitches = Record<DeductionKey, boolean>;
 
 type LiveMaster = {
   guid?: unknown;
@@ -32,54 +35,54 @@ type LivePurchaseMasterResult = {
   };
 };
 
-const SECTIONS: ReadonlyArray<{
-  title: string;
-  description: string;
-  fields: ReadonlyArray<readonly [string, string, MasterKind]>;
-}> = [
+type FieldDefinition = { id: string; label: string; hint: string; kind: MasterKind; requires?: DeductionKey };
+
+const SECTIONS: ReadonlyArray<{ title: string; fields: ReadonlyArray<FieldDefinition> }> = [
   {
     title: "Items and godown",
-    description: "HSN 7204 includes longer scrap codes such as 72044900. The godown is used when the documents name none.",
     fields: [
-      ["ms-scrap-item", "MS Scrap · HSN 7204…", "stock"],
-      ["sponge-iron-item", "Sponge Iron · HSN 72031000", "stock"],
-      ["godown", "Default godown", "godown"],
+      { id: "ms-scrap-item", label: "MS Scrap", hint: "Stock item for HSN 7204… (includes 72044900)", kind: "stock" },
+      { id: "sponge-iron-item", label: "Sponge Iron", hint: "Stock item for HSN 72031000", kind: "stock" },
+      { id: "godown", label: "Default godown", hint: "Used when the documents name no godown", kind: "godown" },
     ],
   },
   {
     title: "Purchase ledgers",
-    description: "Local means supplier and buyer states match; otherwise interstate is used.",
     fields: [
-      ["ms-scrap-local", "MS Scrap · Maharashtra", "ledger"],
-      ["ms-scrap-interstate", "MS Scrap · outside Maharashtra", "ledger"],
-      ["sponge-local", "Sponge Iron · Maharashtra", "ledger"],
-      ["sponge-interstate", "Sponge Iron · outside Maharashtra", "ledger"],
+      { id: "ms-scrap-local", label: "MS Scrap · within Maharashtra", hint: "Supplier and buyer in the same state", kind: "ledger" },
+      { id: "ms-scrap-interstate", label: "MS Scrap · outside Maharashtra", hint: "Supplier in another state", kind: "ledger" },
+      { id: "sponge-local", label: "Sponge Iron · within Maharashtra", hint: "Supplier and buyer in the same state", kind: "ledger" },
+      { id: "sponge-interstate", label: "Sponge Iron · outside Maharashtra", hint: "Supplier in another state", kind: "ledger" },
     ],
   },
   {
     title: "GST, freight and round off",
-    description: "Freight on the invoice is booked once to the freight ledger, with GST at the invoice rate.",
     fields: [
-      ["cgst", "Input CGST 9%", "ledger"],
-      ["sgst", "Input SGST 9%", "ledger"],
-      ["igst", "Input IGST 18%", "ledger"],
-      ["freight", "Freight inward", "ledger"],
-      ["round-off", "Round off", "ledger"],
+      { id: "cgst", label: "Input CGST 9%", hint: "Same-state purchases", kind: "ledger" },
+      { id: "sgst", label: "Input SGST 9%", hint: "Same-state purchases", kind: "ledger" },
+      { id: "igst", label: "Input IGST 18%", hint: "Purchases from another state", kind: "ledger" },
+      { id: "freight", label: "Freight inward", hint: "Transport charges billed on the invoice, booked once", kind: "ledger" },
+      { id: "round-off", label: "Round off", hint: "Paise difference to the invoice total", kind: "ledger" },
     ],
   },
   {
     title: "TDS and TCS",
-    description: "Used only for the deductions switched on above.",
     fields: [
-      ["tds-194q", "Section 194Q TDS", "ledger"],
-      ["transport-tds", "TDS on goods transport", "ledger"],
-      ["cgst-tds", "CGST TDS 1%", "ledger"],
-      ["sgst-tds", "SGST TDS 1%", "ledger"],
-      ["igst-tds", "IGST TDS 2%", "ledger"],
-      ["tcs", "TCS receivable", "ledger"],
+      { id: "tds-194q", label: "Section 194Q TDS", hint: "0.1% on goods", kind: "ledger", requires: "purchaseGoodsTdsEnabled" },
+      { id: "transport-tds", label: "TDS on goods transport", hint: "1% or 2% on freight", kind: "ledger", requires: "transporterTdsEnabled" },
+      { id: "cgst-tds", label: "CGST TDS 1%", hint: "GST TDS on scrap, same state", kind: "ledger", requires: "gstTdsEnabled" },
+      { id: "sgst-tds", label: "SGST TDS 1%", hint: "GST TDS on scrap, same state", kind: "ledger", requires: "gstTdsEnabled" },
+      { id: "igst-tds", label: "IGST TDS 2%", hint: "GST TDS on scrap, another state", kind: "ledger", requires: "gstTdsEnabled" },
+      { id: "tcs", label: "TCS receivable", hint: "When the supplier collects TCS", kind: "ledger" },
     ],
   },
 ];
+
+const SEARCH_PLACEHOLDER: Record<MasterKind, string> = {
+  ledger: "Search ledgers…",
+  stock: "Search stock items…",
+  godown: "Search godowns…",
+};
 
 async function errorText(response: Response) {
   const payload = await response.json().catch(() => ({})) as { error?: string };
@@ -94,7 +97,7 @@ function describeSyncedCopy(value: LivePurchaseMasterResult) {
   const checkedAt = new Date(cleanText(value.validatedAt) || cleanText(value.fetchedAt));
   if (Number.isNaN(checkedAt.getTime())) return "Read through the connector";
   const when = checkedAt.toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-  return `Read through the connector, last checked with Tally ${when}. Use Refresh from Tally for new masters`;
+  return `Last checked with Tally ${when}`;
 }
 
 function mastersFromLiveResult(value: unknown) {
@@ -116,7 +119,11 @@ function mastersFromLiveResult(value: unknown) {
   return [...ledgers, ...convert(result.masters.stockItems, "stock"), ...convert(result.masters.godowns, "godown")];
 }
 
-export function PurchasePostingDefaultsSettings() {
+function cardClass() {
+  return "rounded-xl border border-[#ded8d0] bg-white shadow-[0_1px_2px_rgba(52,42,32,0.04)]";
+}
+
+export function PurchasePostingDefaultsSettings({ deductions }: { deductions?: DeductionSwitches | null }) {
   const [connections, setConnections] = useState<Connection[]>([]);
   const [companies, setCompanies] = useState<Company[]>([]);
   const [connectionId, setConnectionId] = useState("");
@@ -127,7 +134,8 @@ export function PurchasePostingDefaultsSettings() {
   const [refreshing, setRefreshing] = useState(false);
   const [masterSource, setMasterSource] = useState("");
   const [savingField, setSavingField] = useState("");
-  const [notice, setNotice] = useState<{ tone: "success" | "error"; text: string } | null>(null);
+  const [savedField, setSavedField] = useState("");
+  const [notice, setNotice] = useState("");
   const company = companies.find((entry) => entry.companyName === companyName);
 
   useEffect(() => {
@@ -147,7 +155,7 @@ export function PurchasePostingDefaultsSettings() {
       })
       .catch((error) => {
         if (cancelled) return;
-        setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not load Tally connections." });
+        setNotice(error instanceof Error ? error.message : "Could not load Tally connections.");
         setLoading(false);
       });
     return () => { cancelled = true; };
@@ -174,18 +182,19 @@ export function PurchasePostingDefaultsSettings() {
       })
       .catch((error) => {
         if (cancelled) return;
-        setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not load Tally companies." });
+        setNotice(error instanceof Error ? error.message : "Could not load Tally companies.");
         setLoading(false);
       });
     return () => { cancelled = true; };
   }, [connectionId]);
 
   // Masters come through the connector. Opening the tab uses the connector's synced copy (fast);
-  // the Refresh button asks the connector to check Tally for changed masters first, the same as
-  // the posting review does. Godowns are always read directly from Tally.
+  // Refresh asks the connector to check Tally for changed masters first, the same as the posting
+  // review does. Godowns are always read directly from Tally.
   const refreshLiveMasters = useCallback(async (checkTally = false) => {
     if (!connectionId || !companyName) return;
     setRefreshing(true);
+    setNotice("");
     try {
       const livePayload = await runCashDiscountLiveRequest<LivePurchaseMasterResult>({
         connectionId,
@@ -204,10 +213,7 @@ export function PurchasePostingDefaultsSettings() {
       setMasters(live);
       setMasterSource(checkTally ? "Checked with Tally just now" : describeSyncedCopy(livePayload));
     } catch (error) {
-      setNotice({
-        tone: "error",
-        text: `${error instanceof Error ? error.message : "Could not read ledgers from Tally."} Saved choices are still shown; open the company in Tally and refresh to change them.`,
-      });
+      setNotice(`${error instanceof Error ? error.message : "Could not read ledgers from Tally."} Saved choices are still shown — open the company in Tally and refresh to change them.`);
     } finally {
       setRefreshing(false);
     }
@@ -217,7 +223,7 @@ export function PurchasePostingDefaultsSettings() {
     if (!connectionId || !companyName) return;
     let cancelled = false;
     setLoading(true);
-    setNotice(null);
+    setNotice("");
     setMasters([]);
     setMasterSource("");
     const query = new URLSearchParams({ connectionId, companyName });
@@ -228,25 +234,31 @@ export function PurchasePostingDefaultsSettings() {
         if (!cancelled) setDefaults(payload.defaults ?? {});
       })
       .catch((error) => {
-        if (!cancelled) setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not load Purchase defaults." });
+        if (!cancelled) setNotice(error instanceof Error ? error.message : "Could not load saved choices.");
       })
       .finally(() => !cancelled && setLoading(false));
     void refreshLiveMasters();
     return () => { cancelled = true; };
   }, [companyName, connectionId, refreshLiveMasters]);
 
-  const optionsByKind = useMemo(() => ({
-    ledger: masters.filter((master) => master.kind === "ledger"),
-    stock: masters.filter((master) => master.kind === "stock"),
-    godown: masters.filter((master) => master.kind === "godown"),
-  }), [masters]);
+  const mastersByKind = useMemo(() => {
+    const group = (kind: MasterKind) => {
+      const seen = new Set<string>();
+      return masters
+        .filter((master) => master.kind === kind && !seen.has(master.name) && Boolean(seen.add(master.name)))
+        .sort((left, right) => left.name.localeCompare(right.name));
+    };
+    return { ledger: group("ledger"), stock: group("stock"), godown: group("godown") };
+  }, [masters]);
 
   async function saveField(id: string, kind: MasterKind, name: string) {
     const previous = defaults[id] ?? "";
-    const picked = optionsByKind[kind].find((option) => option.name === name);
+    if (name === previous) return;
+    const picked = mastersByKind[kind].find((option) => option.name === name);
     setDefaults((current) => ({ ...current, [id]: name }));
     setSavingField(id);
-    setNotice(null);
+    setSavedField("");
+    setNotice("");
     try {
       const response = await apiFetch("/api/settings/purchase-posting-defaults", {
         method: "PUT",
@@ -254,81 +266,137 @@ export function PurchasePostingDefaultsSettings() {
         body: JSON.stringify({ connectionId, companyName, defaults: { [id]: name ? { name, guid: picked?.guid ?? "" } : "" } }),
       });
       if (!response.ok) throw new Error(await errorText(response));
+      setSavedField(id);
     } catch (error) {
       setDefaults((current) => ({ ...current, [id]: previous }));
-      setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not save this default." });
+      setNotice(error instanceof Error ? error.message : "Could not save this choice.");
     } finally {
       setSavingField("");
     }
   }
 
   const disabled = loading || !connectionId || !companyName;
+  const counts = `${mastersByKind.ledger.length.toLocaleString("en-IN")} ledgers · ${mastersByKind.stock.length} items · ${mastersByKind.godown.length} godowns`;
 
   return (
-    <section className="rounded-xl border border-[#ded8d0] bg-white px-5 py-4 shadow-2xs">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="text-base font-bold tracking-tight text-[#111827]">Ledgers and items</h2>
-          <p className="mt-1 text-xs text-[#5b4b3d]">
-            Pre-filled on every Purchase voucher for this company and kept when the connector is re-paired. Supplier ledgers are remembered by GSTIN once confirmed on a voucher. Each choice saves as soon as it is picked.
+    <>
+      <section className={cardClass()}>
+        <header className="flex flex-col gap-4 border-b border-[#e8e2db] px-5 py-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="min-w-0">
+            <h2 className="text-base font-bold tracking-tight text-[#111827]">Tally ledgers and items</h2>
+            <p className="mt-1 max-w-2xl text-xs text-[#5b4b3d]">
+              Filled in on every Purchase voucher for this company. Supplier ledgers are learned by GSTIN from confirmed vouchers. Choices save as soon as you pick them.
+            </p>
+          </div>
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            {connections.length > 1 ? (
+              <SelectDropdown
+                className="w-44"
+                onChange={(value) => { setCompanyName(""); setCompanies([]); setConnectionId(value); }}
+                options={connections.map((connection) => ({ value: connection.id, label: connection.displayName || "Tally workstation" }))}
+                value={connectionId}
+              />
+            ) : null}
+            {companies.length > 1 ? (
+              <SelectDropdown
+                className="w-64"
+                onChange={setCompanyName}
+                options={companies.map((entry) => ({ value: entry.companyName, label: entry.companyName }))}
+                value={companyName}
+              />
+            ) : null}
+            <button
+              className="inline-flex h-9 items-center gap-2 rounded-lg border border-[#ded8d0] bg-[#faf8f5] px-3 text-xs font-semibold text-[#332c26] transition hover:bg-[#f3eee8] disabled:cursor-not-allowed disabled:opacity-45"
+              disabled={disabled || refreshing}
+              onClick={() => void refreshLiveMasters(true)}
+              type="button"
+            >
+              {refreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              Refresh from Tally
+            </button>
+          </div>
+        </header>
+
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-[#f0ece4] bg-[#faf8f5] px-5 py-2.5 text-xs text-[#675d54]">
+          <span className="inline-flex items-center gap-1.5 font-semibold text-[#2b1a10]">
+            <Database className="h-3.5 w-3.5 text-[#8a7f72]" />
+            {companyName || "No Tally company"}
+          </span>
+          {refreshing ? (
+            <span className="inline-flex items-center gap-1.5"><Loader2 className="h-3 w-3 animate-spin" />Reading Tally masters…</span>
+          ) : masters.length ? (
+            <>
+              <span className="text-[#c8bfb0]">•</span>
+              <span>{counts}</span>
+              <span className="text-[#c8bfb0]">•</span>
+              <span>{masterSource}</span>
+            </>
+          ) : null}
+        </div>
+
+        {notice ? (
+          <p className="mx-5 mt-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />{notice}
           </p>
-        </div>
-        <Button disabled={disabled || refreshing} onClick={() => void refreshLiveMasters(true)} size="sm" variant="outline">
-          {refreshing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
-          Refresh from Tally
-        </Button>
-      </div>
-
-      <div className="mt-4 grid gap-3 sm:grid-cols-2">
-        {connections.length > 1 ? (
-          <label className="text-xs font-medium text-[#5b4b3d]">Tally workstation
-            <select className="mt-1 h-10 w-full rounded-lg border border-[#ddd7cc] bg-white px-3" onChange={(event) => { setCompanyName(''); setCompanies([]); setConnectionId(event.target.value); }} value={connectionId}>
-              {connections.map((connection) => <option key={connection.id} value={connection.id}>{connection.displayName || "Tally workstation"}</option>)}
-            </select>
-          </label>
         ) : null}
-        <label className="text-xs font-medium text-[#5b4b3d]">Tally company
-          <select className="mt-1 h-10 w-full rounded-lg border border-[#ddd7cc] bg-white px-3" onChange={(event) => setCompanyName(event.target.value)} value={companyName}>
-            {companies.map((entry) => <option key={entry.id} value={entry.companyName}>{entry.companyName}</option>)}
-          </select>
-        </label>
-      </div>
 
-      {notice ? <div className={`mt-3 rounded-lg border px-3 py-2 text-xs ${notice.tone === "success" ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-rose-200 bg-rose-50 text-rose-700"}`}>{notice.text}</div> : null}
-
-      {loading ? (
-        <div className="mt-4 flex items-center text-xs text-[#5b4b3d]"><Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading saved choices…</div>
-      ) : (
-        <div className="mt-2 divide-y divide-[#f0ece4]">
-          {SECTIONS.map((section) => (
-            <div className="py-4" key={section.title}>
-              <h3 className="text-sm font-bold text-[#111827]">{section.title}</h3>
-              <p className="mt-0.5 text-xs text-[#8a7f72]">{section.description}</p>
-              <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                {section.fields.map(([id, label, kind]) => {
-                  const saved = defaults[id] || "";
-                  const options = optionsByKind[kind];
-                  const savedMissing = saved && !options.some((option) => option.name === saved);
-                  return <label className="text-xs font-medium text-[#5b4b3d]" key={id}>
-                    <span className="flex items-center gap-1.5">{label}{savingField === id ? <Loader2 className="h-3 w-3 animate-spin" /> : null}</span>
-                    <select className="mt-1 h-10 w-full rounded-lg border border-[#ddd7cc] bg-white px-3 text-xs" disabled={disabled || refreshing || savingField === id} onChange={(event) => void saveField(id, kind, event.target.value)} value={saved}>
-                      <option value="">{options.length ? "Choose from Tally…" : refreshing ? "Reading Tally…" : "Not set"}</option>
-                      {savedMissing ? <option value={saved}>{saved}{masters.length ? " (not in this Tally company)" : ""}</option> : null}
-                      {options.map((option) => <option key={`${option.kind}:${option.guid || option.name}`} value={option.name}>{option.name}{option.parent ? ` — ${option.parent}` : ""}</option>)}
-                    </select>
-                  </label>;
-                })}
+        {loading ? (
+          <div className="space-y-2 px-5 py-5">
+            {Array.from({ length: 6 }).map((_, index) => <div className="h-9 animate-pulse rounded-lg bg-[#ede6d9]/50" key={index} />)}
+          </div>
+        ) : (
+          <div className="px-5 pb-2">
+            {SECTIONS.map((section) => (
+              <div key={section.title}>
+                <h3 className="pb-1 pt-5 text-[11px] font-bold uppercase tracking-[0.14em] text-[#8a7f72]">{section.title}</h3>
+                <div className="divide-y divide-[#f3efe9]">
+                  {section.fields.map((field) => {
+                    const saved = defaults[field.id] || "";
+                    const options = mastersByKind[field.kind];
+                    const missing = Boolean(saved && masters.length && !options.some((option) => option.name === saved));
+                    const switchedOff = Boolean(field.requires && deductions && !deductions[field.requires]);
+                    return (
+                      <div className={`grid items-center gap-x-4 gap-y-1.5 py-2.5 sm:grid-cols-[minmax(0,1fr)_minmax(0,340px)_16px] ${switchedOff ? "opacity-55" : ""}`} key={field.id}>
+                        <div className="min-w-0">
+                          <p className="text-xs font-semibold text-[#111827]">{field.label}</p>
+                          <p className="mt-0.5 text-[11px] text-[#8a7f72]">
+                            {switchedOff ? "Not used while this deduction is switched off above" : missing ? <span className="text-amber-700">Not found in this Tally company — choose another</span> : field.hint}
+                          </p>
+                        </div>
+                        <SearchableSelect
+                          aria-label={field.label}
+                          disabled={disabled || savingField === field.id}
+                          emptyMessage={options.length ? "No matching master." : "Tally masters are not loaded. Use Refresh from Tally."}
+                          invalid={missing}
+                          onChange={(value) => void saveField(field.id, field.kind, value)}
+                          options={options.map((option) => ({ value: option.name, label: option.name, hint: option.parent }))}
+                          placeholder={refreshing && !options.length ? "Reading Tally…" : "Not set"}
+                          searchPlaceholder={SEARCH_PLACEHOLDER[field.kind]}
+                          value={saved}
+                        />
+                        <span className="hidden h-4 w-4 items-center justify-center sm:flex">
+                          {savingField === field.id ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin text-[#8a7f72]" />
+                          ) : savedField === field.id ? (
+                            <Check className="h-3.5 w-3.5 text-emerald-600" />
+                          ) : missing ? (
+                            <AlertTriangle className="h-3.5 w-3.5 text-amber-600" />
+                          ) : null}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          ))}
-        </div>
-      )}
-      {masters.length ? <p className="mt-1 text-xs font-medium text-emerald-700"><Check className="mr-1 inline h-4 w-4" />{optionsByKind.ledger.length} ledgers, {optionsByKind.stock.length} items and {optionsByKind.godown.length} godowns. {masterSource}.</p> : null}
+            ))}
+          </div>
+        )}
+      </section>
 
-      <div className="mt-4 border-t border-[#f0ece4] pt-4">
+      <section className={`${cardClass()} px-5 py-4`}>
         <PurchaseDocumentFolderSettings connectionId={connectionId} companyName={companyName}
           companyGuid={company?.companyGuid} financialYear={company?.financialYear} />
-      </div>
-    </section>
+      </section>
+    </>
   );
 }

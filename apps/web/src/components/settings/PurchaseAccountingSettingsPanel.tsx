@@ -1,13 +1,15 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, Loader2 } from "lucide-react";
+import { Check, ChevronDown, Loader2 } from "lucide-react";
 
 import { PurchasePostingDefaultsSettings } from "@/components/settings/PurchasePostingDefaultsSettings";
 import { SettingsSwitch } from "@/components/settings/SettingsSwitch";
 import { apiFetch } from "@/lib/api-client";
 
 type Severity = "block" | "warn" | "off";
+
+const CARD = "rounded-xl border border-[#ded8d0] bg-white shadow-[0_1px_2px_rgba(52,42,32,0.04)]";
 
 const RULE_GROUPS = [
   {
@@ -115,47 +117,52 @@ export function PurchaseAccountingSettingsPanel() {
 
   return (
     <main className="w-full space-y-4">
-      <section className="rounded-xl border border-[#ded8d0] bg-white px-5 py-4 shadow-2xs">
-        <div className="flex items-start justify-between gap-3">
+      <section className={CARD}>
+        <header className="flex items-start justify-between gap-3 border-b border-[#e8e2db] px-5 py-4">
           <div>
             <h2 className="text-base font-bold tracking-tight text-[#111827]">Deductions</h2>
-            <p className="mt-1 text-xs text-[#5b4b3d]">Switched-off deductions are hidden on Purchase vouchers and never posted.</p>
+            <p className="mt-1 text-xs text-[#5b4b3d]">Which deductions Kalika handles. Switched-off deductions are hidden on Purchase vouchers and never posted.</p>
           </div>
-          <span className="flex h-5 items-center text-xs text-[#8a7f72]">
-            {status === "saving" ? <><Loader2 className="mr-1 h-3 w-3 animate-spin" />Saving…</> : status === "saved" ? "Saved" : null}
+          <span className="flex h-6 shrink-0 items-center gap-1.5 rounded-full border border-[#ded8d0] bg-[#faf8f5] px-2.5 text-[11px] font-medium text-[#675d54]">
+            {status === "saving" ? <><Loader2 className="h-3 w-3 animate-spin" />Saving…</> : <><Check className="h-3 w-3 text-emerald-600" />Saved automatically</>}
           </span>
-        </div>
-        {error ? <p className="mt-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{error}</p> : null}
+        </header>
+        {error ? <p className="mx-5 mt-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{error}</p> : null}
         {settings ? (
-          <div className="mt-3 divide-y divide-[#f0ece4] rounded-lg border border-[#ded8d0]">
+          <div className="divide-y divide-[#f3efe9] px-5">
             {DEDUCTIONS.map((rule) => {
               const enabled = settings[rule.key];
               return (
                 <button
                   aria-pressed={enabled}
-                  className="flex w-full items-center justify-between gap-4 px-4 py-3 text-left transition hover:bg-[#fbfaf8]"
+                  className="flex w-full items-center justify-between gap-6 py-3.5 text-left"
                   key={rule.key}
                   onClick={() => void update({ ...settings, [rule.key]: !enabled })}
                   type="button"
                 >
                   <span className="min-w-0">
                     <span className="block text-xs font-semibold text-[#111827]">{rule.label}</span>
-                    <span className="mt-0.5 block text-xs leading-5 text-[#6b5d50]">{rule.description}</span>
+                    <span className="mt-0.5 block max-w-3xl text-[11px] leading-5 text-[#8a7f72]">{rule.description}</span>
                   </span>
-                  <SettingsSwitch checked={enabled} />
+                  <span className="flex shrink-0 items-center gap-2.5">
+                    <span className={`w-6 text-right text-[11px] font-semibold ${enabled ? "text-[#047857]" : "text-[#a89e92]"}`}>{enabled ? "On" : "Off"}</span>
+                    <SettingsSwitch checked={enabled} />
+                  </span>
                 </button>
               );
             })}
           </div>
         ) : !error ? (
-          <div className="mt-3 flex items-center text-xs text-[#5b4b3d]"><Loader2 className="mr-2 h-4 w-4 animate-spin" />Loading…</div>
+          <div className="space-y-2 px-5 py-4">
+            {Array.from({ length: 3 }).map((_, index) => <div className="h-10 animate-pulse rounded-lg bg-[#ede6d9]/50" key={index} />)}
+          </div>
         ) : null}
       </section>
 
-      <PurchasePostingDefaultsSettings />
+      <PurchasePostingDefaultsSettings deductions={settings} />
 
       {settings ? (
-        <details className="group rounded-xl border border-[#ded8d0] bg-white shadow-2xs">
+        <details className={`group ${CARD}`}>
           <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-5 py-4">
             <span>
               <span className="block text-base font-bold tracking-tight text-[#111827]">Checks before posting</span>
