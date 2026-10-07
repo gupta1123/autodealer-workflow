@@ -7,6 +7,8 @@ function normalizeApiTarget(value?: string | null) {
 }
 
 export function GET() {
+  const configured = process.env.NEXT_PUBLIC_CASH_DISCOUNT_GATEWAY_URL?.trim();
+  if (configured) return Response.json({ url: configured });
   const target =
     normalizeApiTarget(process.env.API_PROXY_TARGET) ||
     normalizeApiTarget(process.env.NEXT_PUBLIC_API_BASE_URL) ||
@@ -18,7 +20,12 @@ export function GET() {
 
   const url = new URL(target);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.pathname = "/agent-live";
+  if (["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+    url.port = "3002";
+    url.pathname = "/";
+  } else {
+    url.pathname = "/agent-live";
+  }
   url.search = "";
   url.hash = "";
 

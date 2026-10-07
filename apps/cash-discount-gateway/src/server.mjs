@@ -7,7 +7,9 @@ import {createScopedBankSubscriptions} from './bank-job-subscriptions.mjs';
 import {waitForDurableDiscount} from './durable-discount.mjs';
 
 const PORT = Number(process.env.CASH_DISCOUNT_GATEWAY_PORT || 3002);
-const HOST = process.env.CASH_DISCOUNT_GATEWAY_HOST || "0.0.0.0";
+// Dual-stack localhost: browsers may resolve localhost to ::1 while the
+// desktop connector uses 127.0.0.1. Both must reach the same gateway.
+const HOST = process.env.CASH_DISCOUNT_GATEWAY_HOST || "::";
 let apiBaseUrl = (process.env.CASH_DISCOUNT_API_BASE_URL || "http://localhost:3001").replace(/\/+$/, "");
 const AUTH_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 4 * 60_000;
@@ -215,16 +217,20 @@ async function authenticate(socket, message) {
 }
 
 async function authorizeLiveOperation(meta,message,previous) {
+  const connector = connectors.get(meta.connectionId);
+  const paired = connector ? metadata.get(connector) : null;
+  if (!connector || connector.readyState !== WebSocket.OPEN || paired?.ownerUserId !== meta.ownerUserId) {
+    throw new Error('The Tally connector is not on the live Cash Discount channel. Update or restart the connector and try again.');
+  }
   // The backend flag is authoritative, not a separately configured gateway flag.
   const authority=await apiRequest('/api/collections/live/session',{
     accessToken:meta.accessToken,organizationId:meta.organizationId,
-    bridgeToken:metadata.get(connectors.get(meta.connectionId))?.bridgeToken,
+    bridgeToken:paired.bridgeToken,
     body:{role:'browser',connectionId:meta.connectionId,operation:message.operation,
       companyName:message.companyName,companyGuid:message.companyGuid,companyNames:message.companyNames,
       financialYear:message.financialYear,...previous},
   });
   if(authority.ownerUserId!==meta.ownerUserId)throw new Error('The paired connection changed. Reconnect before continuing.');
-  const paired=metadata.get(connectors.get(meta.connectionId));
   if(authority.teamAccess&&(!paired||paired.installationId!==authority.installationId||paired.sessionGeneration!==authority.sessionGeneration))throw new Error('The live connector belongs to an older pairing session. Reconnect before continuing.');
   return authority.teamAccess ? authority : null;
 }
@@ -678,7 +684,7 @@ export function startCashDiscountGateway(options = {}) {
   server.on("close", () => clearInterval(heartbeat));
   const location = attachedServer
     ? gatewayPath
-    : `ws://${options.host || HOST}:${Number(options.port ?? PORT)}${gatewayPath}`;
+    : `ws://${(options.host || HOST).includes(':') ? `[${options.host || HOST}]` : options.host || HOST}:${Number(options.port ?? PORT)}${gatewayPath}`;
   console.log(`Cash Discount live gateway listening on ${location}`);
   return server;
 }
