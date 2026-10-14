@@ -7834,6 +7834,7 @@ async function runOnce(config, options = {}) {
   // it before a slow/unreachable Tally heartbeat can hold the customer send
   // flow hostage for a minute.
   let deferredCommand = null;
+  let earlyCommandProcessed = 0;
   try {
     const [command = null] = await receiveNextCommands(config, 1);
     const isVerifiedDebitNotePdf =
@@ -7841,6 +7842,7 @@ async function runOnce(config, options = {}) {
       (command.commandType === "export_debit_note_pdf" ||
         (command.commandType === "create_debit_note" && command.payload?.operation === "export_native_pdf"));
     if (isVerifiedDebitNotePdf) {
+      earlyCommandProcessed = 1;
       await runCommand(config, command, options);
     } else {
       deferredCommand = command;
@@ -7896,9 +7898,15 @@ async function runOnce(config, options = {}) {
   );
 
   try {
-    if (deferredCommand) {
-      await runCommand(config, deferredCommand, options);
-    }
+    // The heartbeat is also the notification-outage recovery path. Include
+    // its already claimed command in the batch instead of processing one
+    // voucher and leaving the remaining queue until the next 15-second tick.
+    await drainPendingCommands(
+      config,
+      options,
+      deferredCommand ? [deferredCommand] : [],
+      MAX_COMMANDS_PER_CYCLE - earlyCommandProcessed
+    );
   } catch (commandError) {
     console.error(commandError instanceof Error ? commandError.message : commandError);
   }
@@ -8531,16 +8539,28 @@ async function processClaimedCommands(config, commands, options = {}) {
   }
 }
 
-async function drainPendingCommands(config, options = {}) {
+async function drainPendingCommands(config, options = {}, initialCommands = [], maxCommands = MAX_COMMANDS_PER_CYCLE) {
   let processed = 0;
-  while (processed < MAX_COMMANDS_PER_CYCLE) {
-    const commands = await receiveNextCommands(
-      config,
-      Math.min(MAX_COMMANDS_PER_CYCLE - processed, MAX_COMMANDS_PER_CYCLE)
-    );
+  let initial = initialCommands;
+  while (processed < maxCommands) {
+    let commands = initial;
+    initial = [];
+    let claimError = null;
+    const remaining = maxCommands - processed - commands.length;
+    if (remaining > 0) {
+      try {
+        commands = [...commands, ...await receiveNextCommands(config, remaining)];
+      } catch (error) {
+        if (commands.length === 0) throw error;
+        // Do not strand the heartbeat's first claimed command when a later
+        // claim fails. Finish that command through the same guarded executor.
+        claimError = error;
+      }
+    }
     if (commands.length === 0) break;
     await processClaimedCommands(config, commands, options);
     processed += commands.length;
+    if (claimError) throw claimError;
   }
   return processed;
 }

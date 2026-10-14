@@ -1224,6 +1224,11 @@ async function POSTHandler(request: Request) {
       },
     });
 
+    // Legacy queues need the same immediate wake as team queues. Notify only
+    // after posting logs and transaction state are durable; polling remains
+    // the recovery path if the notification cannot be delivered.
+    await wakeTallyConnector(connectionId).catch(() => undefined);
+
     return jsonWithCors(request, {
       queuedCount: voucherCommands.length,
       verificationCount: verificationCommands.length,

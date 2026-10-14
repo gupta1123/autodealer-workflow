@@ -45,16 +45,16 @@ try {
   assert.equal(sha(fs.readFileSync(pdf)), sourceHash, 'Original PDF changed');
   assert.equal(fs.existsSync(copiedPdf), false, 'Temporary source retained');
   const vectorModulePath = path.join(archive, 'node_modules', '@autodealer', 'tally-bridge', 'src', 'agent', 'vector-service.mjs');
-  const { LocalVectorService, localLedgerEmbedding } = await import(pathToFileURL(vectorModulePath).href);
+  const { LocalVectorService, localLedgerEmbedding, LOCAL_LEDGER_VECTOR_DIMENSIONS: dimensions } = await import(pathToFileURL(vectorModulePath).href);
   vectors = new LocalVectorService({ vectorsDirectory: path.join(folder, 'vectors'), enabled: true });
-  await vectors.upsert({ datasetKey: 'packaged-smoke', dimensions: 256, documents: [
+  await vectors.upsert({ datasetKey: 'packaged-smoke', dimensions, documents: [
     { id: 'surya', embedding: localLedgerEmbedding('Surya Steel Trading Company') },
     { id: 'charges', embedding: localLedgerEmbedding('Bank Charges and Commission') },
   ] });
-  const vectorHits = await vectors.query({ datasetKey: 'packaged-smoke', dimensions: 256,
+  const vectorHits = await vectors.query({ datasetKey: 'packaged-smoke', dimensions,
     embedding: localLedgerEmbedding('Surya Steel Trading Co'), topK: 2 });
   assert.equal(vectorHits[0]?.id, 'surya', 'Packaged local vector search returned the wrong ledger');
-  await vectors.delete({ datasetKey: 'packaged-smoke', dimensions: 256, ids: ['charges'] });
+  await vectors.delete({ datasetKey: 'packaged-smoke', dimensions, ids: ['charges'] });
   await vectors.stop(); vectors = null;
   console.log(JSON.stringify({ electron: process.versions.electron, encryptedSQLite: true,
     packagedParser: true, packagedVectorSearch: true, packagedSourceFiles: packagedSourceFiles.length,
