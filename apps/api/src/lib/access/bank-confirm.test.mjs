@@ -3,7 +3,7 @@ import {readFile} from 'node:fs/promises';import ts from 'typescript';import {cr
 const source=await readFile(new URL('../../app/api/bank-statements/imports/[id]/confirm/route.ts',import.meta.url),'utf8');
 const code=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
 class AccessError extends Error{constructor(message,status=403){super(message);this.status=status;}}
-function fixture({team=true,otherCompany=false}={}) {
+function fixture({team=true,otherCompany=false,olderImports=[]}={}) {
  const writes=[],reads=[],checks=[],exports={};
  const records={bank_statement_imports:[{id:'import',owner_user_id:'creator',bank_account_id:'account',status:'ready_to_review',processing_meta:{},created_at:'2026-09-01'}],
  bank_accounts:[{id:'account',owner_user_id:team?'account-owner':'actor',account_number_normalized:'123'}],bank_transactions:[],bank_transaction_posting_log:[]};
@@ -13,7 +13,10 @@ function fixture({team=true,otherCompany=false}={}) {
  function execute(single){
   if(action!=='read')writes.push({table,action,data,filters});else reads.push({table,filters});
   let rows=records[table]||[];
-  if(table==='bank_statement_imports'&&filters.some(([k])=>k==='bank_account_id'))rows=[];
+  if(table==='bank_statement_imports'&&filters.some(([k])=>k==='bank_account_id'))rows=olderImports;
+  if(table==='storage_cleanup_queue'&&action==='upsert'&&new Set(data.map(r=>r.storage_bucket+'|'+r.storage_path)).size<data.length){
+   return {data:null,error:{code:'21000',message:'ON CONFLICT DO UPDATE command cannot affect row a second time'}};
+  }
   return {data:single?{...rows[0],...(action==='update'?data:{})}:rows,error:null};
  }return q;}};
  const imports={
@@ -43,4 +46,15 @@ test('cross-company account selection is rejected before any persistence',async(
 test('legacy confirmation retains actor ownership and does not query team authority',async()=>{
  const f=fixture({team:false});const response=await f.run();assert.equal(response.status,200,await response.text());assert.equal(f.checks.length,0);
  assert.equal(f.writes.find(w=>w.table==='bank_transactions').data[0].owner_user_id,'actor');
+});
+test('legacy confirmation succeeds with repeated historical storage paths and preserves every old import',async()=>{
+ const f=fixture({team:false,olderImports:[
+  {id:'old-import-1',storage_path:'actor/sha256/shared-file'},
+  {id:'old-import-2',storage_path:'actor/sha256/shared-file'},
+  {id:'old-import-3',storage_path:'actor/sha256/other-file'},
+ ]});
+ const response=await f.run();assert.equal(response.status,200,await response.text());
+ assert.ok(!f.writes.some(w=>w.action==='delete'||w.table==='storage_cleanup_queue'));
+ assert.equal(f.writes.find(w=>w.table==='bank_transactions'&&w.action==='insert').data.length,1);
+ assert.equal(f.writes.find(w=>w.table==='bank_statement_imports'&&w.action==='update').data.status,'imported');
 });

@@ -6,7 +6,6 @@ import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { createHash } from "node:crypto";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
-  BANK_STATEMENT_BUCKET,
   buildTransactionFingerprint,
   extractCounterpartyName,
   maskAccountNumber,
@@ -809,47 +808,10 @@ async function POSTHandler(
     if (accountUpdateError) throw accountUpdateError;
     if (importUpdateError) throw importUpdateError;
 
-    // Shared history must not be removed as a side effect of confirming a new
-    // statement. Explicit retention/deletion policy handles it separately.
-    const { data: olderImports, error: olderImportsError } = authorized ? {data:[],error:null} : await supabase
-      .from("bank_statement_imports")
-      .select("id, storage_path")
-      .eq("owner_user_id", user.id)
-      .eq("bank_account_id", accountId)
-      .neq("id", id);
-
-    if (olderImportsError) throw olderImportsError;
-
-    const olderStoragePaths = (olderImports ?? [])
-      .map((row) => (typeof row.storage_path === "string" ? row.storage_path : ""))
-      .filter(Boolean);
-
-    if (olderStoragePaths.length > 0) {
-      const { error: cleanupQueueError } = await supabase
-        .from("storage_cleanup_queue")
-        .upsert(
-          olderStoragePaths.map((storagePath) => ({
-            owner_user_id: user.id,
-            storage_bucket: BANK_STATEMENT_BUCKET,
-            storage_path: storagePath,
-            requested_at: new Date().toISOString(),
-            last_error: null,
-          })),
-          { onConflict: "storage_bucket,storage_path" }
-        );
-      if (cleanupQueueError) throw cleanupQueueError;
-    }
-
-    if ((olderImports ?? []).length > 0) {
-      const { error: deleteOlderImportsError } = await supabase
-        .from("bank_statement_imports")
-        .delete()
-        .eq("owner_user_id", user.id)
-        .eq("bank_account_id", accountId)
-        .neq("id", id);
-
-      if (deleteOlderImportsError) throw deleteOlderImportsError;
-    }
+    // Keep statement history in both legacy and team access modes. Older
+    // imports may share a content-addressed file; confirmation must not queue
+    // its deletion or let duplicate cleanup keys fail after transactions save.
+    // Explicit retention/deletion policy handles cleanup separately.
 
     return jsonWithCors(request, {
       account: serializeAccount(updatedAccount),
