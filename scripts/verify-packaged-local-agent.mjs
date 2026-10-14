@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
+import { createServer } from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -30,6 +31,7 @@ for (const relative of packagedSourceFiles) {
 const sourceHash = sha(fs.readFileSync(pdf));
 let db;
 let vectors;
+let masterServer;
 try {
   db = new Database(databasePath);
   db.pragma("cipher='sqlcipher'"); db.pragma('legacy=4'); db.key(Buffer.from('01'.repeat(32), 'hex'));
@@ -44,6 +46,19 @@ try {
   assert.ok(result.markdown?.length > 100); assert.equal(result.uploaded, false);
   assert.equal(sha(fs.readFileSync(pdf)), sourceHash, 'Original PDF changed');
   assert.equal(fs.existsSync(copiedPdf), false, 'Temporary source retained');
+  // Exercise the packaged bank master's HTTP/XML path without contacting Tally.
+  const { resolveBankVoucherLedgerPayloads } = await import(pathToFileURL(path.join(archive, 'node_modules', '@autodealer', 'tally-bridge', 'src', 'bridge.mjs')).href);
+  masterServer = createServer(async (request, response) => {
+    let requestXml = ''; for await (const chunk of request) requestXml += chunk;
+    assert.match(requestXml, /KalikaBankVoucherLedgerIdentity/);
+    assert.doesNotMatch(requestXml, /<IMPORTDATA>/);
+    response.end('<ENVELOPE><HEADER><STATUS>1</STATUS></HEADER><BODY><COLLECTION><LEDGER NAME="Bank"><GUID>bank-guid</GUID></LEDGER><LEDGER NAME="Customer"><GUID>party-guid</GUID></LEDGER></COLLECTION></BODY></ENVELOPE>');
+  });
+  await new Promise(resolve => masterServer.listen(0, '127.0.0.1', resolve));
+  const resolvedMasters = await resolveBankVoucherLedgerPayloads(`http://127.0.0.1:${masterServer.address().port}`,
+    [{ bankLedgerName: 'Bank', counterpartyLedgerName: 'Customer', voucherType: 'Receipt', amount: 100 }], 'Smoke company');
+  assert.equal(resolvedMasters[0].counterpartyLedgerGuid, 'party-guid');
+  await new Promise(resolve => masterServer.close(resolve)); masterServer = null;
   const vectorModulePath = path.join(archive, 'node_modules', '@autodealer', 'tally-bridge', 'src', 'agent', 'vector-service.mjs');
   const { LocalVectorService, localLedgerEmbedding, LOCAL_LEDGER_VECTOR_DIMENSIONS: dimensions } = await import(pathToFileURL(vectorModulePath).href);
   vectors = new LocalVectorService({ vectorsDirectory: path.join(folder, 'vectors'), enabled: true });
@@ -57,9 +72,10 @@ try {
   await vectors.delete({ datasetKey: 'packaged-smoke', dimensions, ids: ['charges'] });
   await vectors.stop(); vectors = null;
   console.log(JSON.stringify({ electron: process.versions.electron, encryptedSQLite: true,
-    packagedParser: true, packagedVectorSearch: true, packagedSourceFiles: packagedSourceFiles.length,
+    packagedParser: true, packagedBankMasterValidation: true, packagedVectorSearch: true, packagedSourceFiles: packagedSourceFiles.length,
     bridgeSourceMatches: true, parseMs: result.parseMs, markdownBytes: result.markdownBytes, originalUnchanged: true }));
 } finally {
+  if (masterServer) await new Promise(resolve => masterServer.close(resolve));
   await vectors?.stop().catch(() => {});
   if (db?.open) db.close();
   // The only recursive removal is the fresh mkdtemp test directory above.

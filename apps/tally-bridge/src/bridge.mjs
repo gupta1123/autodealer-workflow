@@ -2901,7 +2901,7 @@ export function resolveBankVoucherLedgerIdentities(payloads, liveMasters) {
   });
 }
 
-async function resolveBankVoucherLedgerPayloads(tallyUrl, payloads, companyName) {
+export async function resolveBankVoucherLedgerPayloads(tallyUrl, payloads, companyName) {
   const identities = (payloads || []).flatMap((payload) => [
     { name: payload?.bankLedgerName, guid: payload?.bankLedgerGuid },
     { name: payload?.counterpartyLedgerName, guid: payload?.counterpartyLedgerGuid },
@@ -2924,7 +2924,7 @@ async function resolveBankVoucherLedgerPayloads(tallyUrl, payloads, companyName)
     timeoutMs: 20_000,
     maxResponseBytes: 1024 * 1024,
   });
-  return resolveBankVoucherLedgerIdentities(payloads, parseBankStatementMasterCollection(xml, "LEDGER"));
+  return resolveBankVoucherLedgerIdentities(payloads, parseMasterCollection(xml, "LEDGER"));
 }
 
 async function validateBankVoucherBillAllocationsLive(config, payloads, companyName) {

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createServer } from "node:http";
 
 import {
   buildCollectionExportXml,
@@ -28,6 +29,7 @@ import {
   purchaseVoucherReadbackComparison,
   getBankVoucherCommandBatchKey,
   resolveBankVoucherLedgerIdentities,
+  resolveBankVoucherLedgerPayloads,
   strictBankTransactionCandidates,
   createReconnectBackoff,
   liveReadMemoryPressure,
@@ -126,6 +128,33 @@ test("bank posting resolves stale display names by stable Tally GUID", () => {
     bankLedgerName: "HDFC Bank", bankLedgerGuid: "bank-guid",
     counterpartyLedgerName: "Missing", counterpartyLedgerGuid: "missing-guid",
   }], [{ name: "HDFC Bank", guid: "bank-guid" }]), /not present in the active Tally company/);
+});
+
+test("bank posting reads and parses live Tally master XML before resolving each voucher", async (t) => {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    let xml = "";
+    for await (const chunk of request) xml += chunk;
+    requests.push(xml);
+    response.writeHead(200, { "Content-Type": "text/xml" });
+    response.end('<ENVELOPE><HEADER><STATUS>1</STATUS></HEADER><BODY><DATA><COLLECTION><LEDGER NAME="Bank &amp; Co"><GUID>BANK-GUID</GUID><PARENT>Bank Accounts</PARENT></LEDGER><LEDGER NAME="Renamed Customer"><GUID>PARTY-GUID</GUID><PARENT>Sundry Debtors</PARENT></LEDGER></COLLECTION></DATA></BODY></ENVELOPE>');
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const payloads = [
+    { transactionId: "receipt", bankLedgerName: "Bank & Co", counterpartyLedgerName: "Old Customer", counterpartyLedgerGuid: "party-guid", voucherType: "Receipt", amount: 100 },
+    { transactionId: "payment", bankLedgerName: "Bank & Co", counterpartyLedgerName: "Renamed Customer", voucherType: "Payment", amount: 200 },
+  ];
+  const resolved = await resolveBankVoucherLedgerPayloads(url, payloads, "Company");
+  assert.equal(requests.length, 1, "One scoped master read serves the mixed batch");
+  assert.match(requests[0], /KalikaBankVoucherLedgerIdentity/);
+  assert.doesNotMatch(requests[0], /<IMPORTDATA>/);
+  assert.deepEqual(resolved.map((payload) => [payload.transactionId, payload.counterpartyLedgerName, payload.amount]), [
+    ["receipt", "Renamed Customer", 100], ["payment", "Renamed Customer", 200],
+  ]);
+  assert.ok(resolved.every((payload) => payload.bankLedgerGuid === "BANK-GUID" && payload.liveMasterValidation.checkedAt));
+  await assert.rejects(resolveBankVoucherLedgerPayloads(url, [{ ...payloads[0], counterpartyLedgerGuid: "missing-guid" }], "Company"), /not present in the active Tally company/);
 });
 
 test("bank voucher batch puts fifty mixed statement vouchers in one Tally request", () => {
