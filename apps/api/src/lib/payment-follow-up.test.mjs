@@ -5,7 +5,7 @@ import {
   derivePaymentFollowUpTiming,
   isCollectionOnlyPaymentFollowUp,
   sortPaymentFollowUpsByPriority,
-} from "./payment-follow-up.ts";
+} from "../../../tally-bridge/src/collections-analysis/payment-follow-up.mjs";
 
 test("requires seven days past the Tally due date", () => {
   assert.equal(
@@ -16,6 +16,20 @@ test("requires seven days past the Tally due date", () => {
     derivePaymentFollowUpTiming({ dueDate: "2026-08-04", invoiceDate: "2026-07-01" }, "2026-08-10").eligible,
     false
   );
+});
+
+test('advance reminders start on invoice date, overriding Tally credit terms', () => {
+  const bill={narration:'ADVANCE RTGS',invoiceDate:'2026-10-12',dueDate:'2026-11-12'};
+  assert.equal(derivePaymentFollowUpTiming(bill,'2026-10-11').eligible,false);
+  assert.equal(derivePaymentFollowUpTiming(bill,'2026-10-12').eligible,true);
+});
+test('same-day reminders wait until the following IST day with no grace week', () => {
+  const bill={narration:'SAME DAY RTGS',invoiceDate:'2026-10-12',dueDate:'2026-11-12'};
+  assert.equal(derivePaymentFollowUpTiming(bill,'2026-10-12').eligible,false);
+  assert.equal(derivePaymentFollowUpTiming(bill,'2026-10-13').eligible,true);
+});
+test('RTGS CD recovery does not hide unpaid invoices from payment follow-ups', () => {
+  assert.equal(isCollectionOnlyPaymentFollowUp({followUpStatus:'debit_note_required',paymentCategory:'advance_rtgs'}),true);
 });
 
 test("uses invoice age only when the due date is missing or invalid", () => {

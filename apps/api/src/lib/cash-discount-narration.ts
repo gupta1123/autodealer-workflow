@@ -1,7 +1,10 @@
+import { classifyPaymentNarration, paymentRequirement, validPaymentDate, type PaymentCategory } from '@/lib/payment-terms';
+
 export type CashDiscountTerm = {
   ratePercent: 1 | 1.5;
   eligibilityDays: number;
   periodSource: "explicit" | "default";
+  paymentCategory?: PaymentCategory;
 };
 
 export type CurrentCashDiscountEligibility = {
@@ -37,6 +40,7 @@ export type CashDiscountReversalPlan = {
 };
 
 export type CashDiscountNarrationAnalysis = {
+  paymentCategory: PaymentCategory | null;
   sourceNarration: string;
   matchedCashDiscountContext: string | null;
   terms: CashDiscountTerm[];
@@ -52,17 +56,7 @@ export type CashDiscountNarrationAnalysis = {
   deterministicReason: string;
 };
 
-export const DEFAULT_CASH_DISCOUNT_DAYS = {
-  1.5: 7,
-  1: 15,
-} as const;
-
 const SUPPORTED_CASH_DISCOUNT_RATES = [1.5, 1] as const;
-const EXPLICIT_CASH_DISCOUNT_CONTEXT = /(?:\bcash\s*disc(?:ount)?\b|\bc\.?\s*d\.?(?=\W|$))/i;
-const GENERIC_DISCOUNT_CONTEXT = /\bdiscount\b/i;
-const PAYMENT_CONTEXT = /\b(?:pay(?:ment|able|ing|s|ed)?|within|before|upto|up\s*to|days?|business|working)\b/i;
-const PAIRED_RATES = /(\d{1,2}(?:\.\d{1,2})?)\s*%?\s*\/\s*(\d{1,2}(?:\.\d{1,2})?)\s*%/gi;
-const PERCENTAGE_TOKEN = /(?:^|[^\d.])(\d{1,2}(?:\.\d{1,2})?)\s*%/gi;
 
 type ParsedCashDiscountNarration = {
   matchedCashDiscountContext: string | null;
@@ -78,15 +72,6 @@ function asMoney(value: number) {
 
 function moneyClose(left: number, right: number) {
   return Math.abs(left - right) <= 1;
-}
-
-function normalizeNarrationText(value: string) {
-  return value
-    .replace(/\b1\s*(?:1\s*\/\s*2|½)\s*%/gi, "1.5%")
-    .replace(/\bone[\s-]+(?:and[\s-]+)?a?[\s-]*half\s+(?:per\s*cent|percent)\b/gi, "1.5%")
-    .replace(/\bone[\s-]+point[\s-]+five\s+(?:per\s*cent|percent)\b/gi, "1.5%")
-    .replace(/\bone\s+(?:per\s*cent|percent)\b/gi, "1%")
-    .replace(/\b(\d{1,2}(?:\.\d{1,2})?)\s*(?:per\s*cent|percent|pct\.?)\b/gi, "$1%");
 }
 
 function addDays(dateText: string, days: number) {
@@ -106,13 +91,14 @@ function normalizeTerms(terms: CashDiscountTerm[]) {
     const ratePercent = Number(term.ratePercent);
     const eligibilityDays = Math.trunc(Number(term.eligibilityDays));
     if (!Number.isFinite(ratePercent) || !Number.isFinite(eligibilityDays)) continue;
-    if (!isSupportedCashDiscountRate(ratePercent) || eligibilityDays < 0 || eligibilityDays > 365) continue;
+    if (!isSupportedCashDiscountRate(ratePercent) || eligibilityDays < (term.paymentCategory === 'advance_rtgs' ? -1 : 0) || eligibilityDays > 365) continue;
     const existing = byRate.get(ratePercent);
     if (!existing || (existing.periodSource === "default" && term.periodSource === "explicit")) {
       byRate.set(ratePercent, {
         ratePercent,
         eligibilityDays,
         periodSource: term.periodSource,
+        paymentCategory: term.paymentCategory,
       });
     }
   }
@@ -125,21 +111,9 @@ function isSupportedCashDiscountRate(value: number): value is 1 | 1.5 {
   return SUPPORTED_CASH_DISCOUNT_RATES.some((rate) => Math.abs(rate - value) < 0.0001);
 }
 
-function uniqueNumbers(values: number[]) {
-  return Array.from(new Set(values.map((value) => Number(value.toFixed(4)))));
-}
-
-function matchedContextLabel(narration: string) {
-  const explicitMatch = narration.match(EXPLICIT_CASH_DISCOUNT_CONTEXT)?.[0] ?? null;
-  if (explicitMatch) return explicitMatch;
-  if (GENERIC_DISCOUNT_CONTEXT.test(narration) && PAYMENT_CONTEXT.test(narration)) return "discount payment terms";
-  if (narration.includes("%") && PAYMENT_CONTEXT.test(narration)) return "payment terms";
-  return null;
-}
-
 export function formatCashDiscountTerms(terms: CashDiscountTerm[]) {
   return terms
-    .map((term) => `${Number(term.ratePercent).toLocaleString("en-IN", { maximumFractionDigits: 2 })}% within ${term.eligibilityDays} days`)
+    .map((term) => term.paymentCategory === 'advance_rtgs' ? '1.5% — payment before invoice date' : term.paymentCategory === 'same_day_rtgs' ? '1% — payment on invoice date' : `${Number(term.ratePercent).toLocaleString("en-IN", { maximumFractionDigits: 2 })}% within ${term.eligibilityDays} days`)
     .join("; ");
 }
 
@@ -153,7 +127,7 @@ export function currentCashDiscountEligibility(input: {
   originalAmount: number;
   today: string;
 }): CurrentCashDiscountEligibility | null {
-  const invoiceDate = String(input.invoiceDate ?? "").slice(0, 10);
+  const invoiceDate = validPaymentDate(input.invoiceDate);
   if (!invoiceDate || !Number.isFinite(input.originalAmount) || input.originalAmount <= 0) return null;
 
   const eligible = normalizeTerms(input.terms)
@@ -240,45 +214,18 @@ function createUnpaidReversalPlan(input: {
   };
 }
 
-/**
- * Detect only the supported 1% and 1.5% rates from the narration. Written day
- * counts are intentionally ignored: this client's fixed windows are always
- * 7 calendar days for 1.5% and 15 calendar days for 1%.
- */
+/** Classify only the two client-approved RTGS narration patterns. */
 export function parseCashDiscountNarration(sourceNarration: string | null | undefined): ParsedCashDiscountNarration {
-  const narration = normalizeNarrationText(String(sourceNarration ?? "")).replace(/\s+/g, " ").trim();
-  const matchedCashDiscountContext = matchedContextLabel(narration);
-  const hasCashDiscountContext = Boolean(matchedCashDiscountContext);
-  if (!narration || !hasCashDiscountContext) {
-    return {
-      matchedCashDiscountContext,
-      hasCashDiscountContext,
-      supportedRates: [],
-      unsupportedRates: [],
-      terms: [],
-    };
-  }
-
-  const pairedMatches = Array.from(narration.matchAll(PAIRED_RATES));
-  const percentages = uniqueNumbers([
-    ...Array.from(narration.matchAll(PERCENTAGE_TOKEN), (match) => Number(match[1])),
-    ...pairedMatches.flatMap((match) => [Number(match[1]), Number(match[2])]),
-  ]);
-  const supportedRates = percentages.filter(isSupportedCashDiscountRate);
-  const unsupportedRates = percentages.filter((rate) => !isSupportedCashDiscountRate(rate));
-  const defaultedTerms = supportedRates
-    .map((ratePercent) => ({
-      ratePercent,
-      eligibilityDays: DEFAULT_CASH_DISCOUNT_DAYS[ratePercent],
-      periodSource: "default" as const,
-    }));
-
+  const parsed = classifyPaymentNarration(sourceNarration);
+  const category = parsed.category;
+  const ratePercent = category === 'advance_rtgs' ? 1.5 : 1;
+  const terms: CashDiscountTerm[] = category ? [{ ratePercent, eligibilityDays: category === 'advance_rtgs' ? -1 : 0, periodSource: 'explicit', paymentCategory: category }] : [];
   return {
-    matchedCashDiscountContext,
-    hasCashDiscountContext,
-    supportedRates,
-    unsupportedRates,
-    terms: normalizeTerms(defaultedTerms),
+    matchedCashDiscountContext: category === 'advance_rtgs' ? 'ADVANCE RTGS' : category === 'same_day_rtgs' ? 'SAME DAY RTGS' : parsed.ambiguous ? 'Conflicting RTGS terms' : null,
+    hasCashDiscountContext: Boolean(category) || parsed.ambiguous,
+    supportedRates: category ? [ratePercent] : [],
+    unsupportedRates: [],
+    terms,
   };
 }
 
@@ -295,149 +242,44 @@ export function analyseCashDiscountNarration(input: {
   matchedReceiptAmount?: number | null | undefined;
   today: string;
 }): CashDiscountNarrationAnalysis {
-  const sourceNarration = String(input.narration ?? "").trim();
-  const parsedNarration = parseCashDiscountNarration(sourceNarration);
-  const terms = parsedNarration.terms;
-  const termsLabel = terms.length > 0 ? formatCashDiscountTerms(terms) : null;
-  const finalEligibilityDays = terms.length > 0 ? Math.max(...terms.map((term) => term.eligibilityDays)) : null;
-  const invoiceDate = String(input.invoiceDate ?? "").slice(0, 10);
-  const receiptDate = String(input.receiptDate ?? "").slice(0, 10) || null;
-  const matchedReceiptAmount = Number.isFinite(Number(input.matchedReceiptAmount))
-    ? asMoney(Number(input.matchedReceiptAmount))
-    : null;
-  const discountDeadlines = invoiceDate
-    ? terms
-        .map((term) => addDays(invoiceDate, term.eligibilityDays))
-        .filter((value): value is string => Boolean(value))
-    : [];
-  const discountDeadline = discountDeadlines.length > 0
-    ? discountDeadlines.sort((left, right) => left.localeCompare(right)).at(-1) ?? null
-    : null;
-  const expectedDiscounts = terms.map((term) => ({
-    ratePercent: term.ratePercent,
-    amount: asMoney((input.originalAmount * term.ratePercent) / 100),
-  }));
-  const matchedDiscount = expectedDiscounts.find((term) => moneyClose(input.pendingAmount, term.amount)) ?? null;
-  const reversalPlan = createUnpaidReversalPlan({
-    terms,
-    invoiceDate,
-    invoiceNetAmount: input.originalAmount,
-    today: input.today,
-  });
-  const amountReceived = asMoney(Math.max(input.originalAmount - input.pendingAmount, 0));
-  const discountAtReceipt = receiptDate
-    ? currentCashDiscountEligibility({
-        terms,
-        invoiceDate,
-        originalAmount: input.originalAmount,
-        today: receiptDate,
-      })
-    : null;
-  const receiptSettlesValidNarratedDiscount = Boolean(
-    receiptDate &&
-      discountAtReceipt &&
-      matchedReceiptAmount !== null &&
-      moneyClose(matchedReceiptAmount, amountReceived) &&
-      moneyClose(input.pendingAmount, discountAtReceipt.discountAmount)
-  );
+  const sourceNarration = String(input.narration ?? '').trim();
+  const parsed = classifyPaymentNarration(sourceNarration);
+  const terms = parseCashDiscountTerms(sourceNarration);
+  const requirement = parsed.category ? paymentRequirement(parsed.category, input.invoiceDate) : null;
+  const receiptDate = validPaymentDate(input.receiptDate);
+  const matchedReceiptAmount = input.matchedReceiptAmount != null && Number.isFinite(Number(input.matchedReceiptAmount))
+    ? asMoney(Number(input.matchedReceiptAmount)) : null;
+  const reversalPlan = requirement ? createUnpaidReversalPlan({ terms, invoiceDate: input.invoiceDate, invoiceNetAmount: input.originalAmount, today: input.today }) : null;
+  const expectedDiscounts = terms.map(term => ({ ratePercent: term.ratePercent, amount: asMoney(input.originalAmount * term.ratePercent / 100) }));
   const base = {
+    paymentCategory: parsed.category,
     sourceNarration,
-    matchedCashDiscountContext: parsedNarration.matchedCashDiscountContext,
+    matchedCashDiscountContext: parseCashDiscountNarration(sourceNarration).matchedCashDiscountContext,
     terms,
-    termsLabel,
-    finalEligibilityDays,
-    discountDeadline,
+    termsLabel: terms.length ? formatCashDiscountTerms(terms) : null,
+    finalEligibilityDays: requirement?.eligibilityDays ?? null,
+    discountDeadline: requirement?.deadline ?? null,
     receiptDate,
     matchedReceiptAmount,
     expectedDiscounts,
-    matchedDiscount,
+    matchedDiscount: expectedDiscounts.find(term => moneyClose(input.pendingAmount, term.amount)) ?? null,
     reversalPlan,
   };
-
-  if (!parsedNarration.hasCashDiscountContext) {
-    return {
-      ...base,
-      deterministicStatus: "no_cash_discount_context",
-      deterministicReason: "No cash-discount or discount-payment context was found in the invoice narration.",
-    };
+  const result = (deterministicStatus: CashDiscountDeterministicStatus, deterministicReason: string): CashDiscountNarrationAnalysis => ({ ...base, deterministicStatus, deterministicReason });
+  if (parsed.ambiguous) return result('cash_discount_rate_missing', 'Both ADVANCE RTGS and SAME DAY RTGS are present. Review the agreed payment category.');
+  if (!parsed.category) return result('no_cash_discount_context', 'Neither ADVANCE RTGS nor SAME DAY RTGS was found in the invoice narration.');
+  if (!requirement || !validPaymentDate(input.today)) return result('missing_invoice_date', 'A valid invoice date and business date are required to check RTGS payment terms.');
+  if (!Number.isFinite(input.originalAmount) || input.originalAmount <= 0 || !Number.isFinite(input.pendingAmount) || input.pendingAmount < 0 || input.pendingAmount > input.originalAmount + 1) {
+    return result('receipt_amount_unverified', 'The invoice balance cannot be verified. Review it in Tally before recovering CD.');
   }
-  if (parsedNarration.supportedRates.length === 0 && parsedNarration.unsupportedRates.length > 0) {
-    return {
-      ...base,
-      deterministicStatus: "unsupported_cash_discount_rate",
-      deterministicReason: `The narration contains unsupported cash-discount rate${parsedNarration.unsupportedRates.length === 1 ? "" : "s"}: ${parsedNarration.unsupportedRates.map((rate) => `${rate}%`).join(", ")}. Only 1% and 1.5% are evaluated automatically.`,
-    };
+  // Outstanding money means full payment has not met the requirement. A small
+  // balance equal to a CD percentage is not proof that another discount is due.
+  if (input.pendingAmount <= 0.005) {
+    if (!receiptDate) return result('receipt_date_not_found', 'No linked receipt date proves payment against this invoice.');
+    if (matchedReceiptAmount === null || !moneyClose(matchedReceiptAmount, input.originalAmount)) return result('receipt_amount_unverified', 'Linked receipts do not prove full payment of this invoice.');
+    if (receiptDate <= requirement.deadline) return {...result('discount_taken_within_window', 'Full payment met the agreed RTGS requirement.'), reversalPlan: reversalPlan ? {...reversalPlan,activeDiscount:reversalPlan.initialDiscount,currentPayableAmount:input.originalAmount,totalReversalRequired:0} : null};
+    return result('existing_balance_due', 'Payment arrived after the RTGS deadline. Review the full category CD recovery.');
   }
-  if (terms.length === 0) {
-    return {
-      ...base,
-      deterministicStatus: "cash_discount_rate_missing",
-      deterministicReason: "Cash discount is mentioned, but neither 1% nor 1.5% was found in the narration.",
-    };
-  }
-  if (!discountDeadline) {
-    return {
-      ...base,
-      deterministicStatus: "missing_invoice_date",
-      deterministicReason: "The invoice date is required to determine whether the narrated cash-discount window has expired.",
-    };
-  }
-  if (moneyClose(input.pendingAmount, input.originalAmount) && reversalPlan && reversalPlan.totalReversalRequired > 0.01) {
-    const activeDiscount = reversalPlan.activeDiscount;
-    return {
-      ...base,
-      deterministicStatus: "unpaid_discount_tier_expired",
-      deterministicReason: activeDiscount
-        ? `The ${reversalPlan.initialDiscount.ratePercent}% tier ended on ${reversalPlan.initialDiscount.discountDeadline}. The invoice is fully unpaid; ${activeDiscount.ratePercent}% remains available until ${activeDiscount.discountDeadline}, so the payable amount must be raised to ₹${reversalPlan.currentPayableAmount.toLocaleString("en-IN")}.`
-        : `All narrated discount tiers have expired and the invoice is fully unpaid. The payable amount must be raised to ₹${reversalPlan.currentPayableAmount.toLocaleString("en-IN")}.`,
-    };
-  }
-  if (receiptSettlesValidNarratedDiscount && receiptDate && discountAtReceipt) {
-    return {
-      ...base,
-      deterministicStatus: "discount_taken_within_window",
-      deterministicReason: `The matched receipt is dated ${receiptDate}, within the ${discountAtReceipt.ratePercent}% narrated discount window ending ${discountAtReceipt.discountDeadline}.`,
-    };
-  }
-  if (!isAfterDate(input.today, discountDeadline)) {
-    return {
-      ...base,
-      deterministicStatus: "within_eligibility_window",
-      deterministicReason: `The final narrated discount window ends on ${discountDeadline}.`,
-    };
-  }
-  if (moneyClose(input.pendingAmount, input.originalAmount)) {
-    return {
-      ...base,
-      deterministicStatus: "invoice_unpaid",
-      deterministicReason: "The invoice is still fully unpaid, so it is a collection follow-up rather than a debit note.",
-    };
-  }
-  if (!receiptDate) {
-    return {
-      ...base,
-      deterministicStatus: "receipt_date_not_found",
-      deterministicReason: "No receipt dated against this invoice could be evidenced from Tally, so a debit note is blocked for review.",
-    };
-  }
-  if (matchedReceiptAmount === null || !moneyClose(matchedReceiptAmount, amountReceived)) {
-    return {
-      ...base,
-      deterministicStatus: "receipt_amount_unverified",
-      deterministicReason: "The matched receipt total does not prove the amount settled against this invoice, so a debit note is blocked for review.",
-    };
-  }
-  if (!matchedDiscount) {
-    return {
-      ...base,
-      deterministicStatus: "balance_does_not_match_narrated_discount",
-      deterministicReason: "The outstanding balance does not equal any discount amount explicitly stated in the narration.",
-    };
-  }
-
-  return {
-    ...base,
-    deterministicStatus: "existing_balance_due",
-    deterministicReason: `The final narrated discount window expired on ${discountDeadline}. The ${matchedDiscount.ratePercent}% amount is already outstanding on the original invoice, so it should be collected without creating another debit note.`,
-  };
+  if (input.today <= requirement.deadline) return result('within_eligibility_window', `Payment is required by ${requirement.deadline} (IST).`);
+  return result('unpaid_discount_tier_expired', `The ${requirement.category === 'advance_rtgs' ? 'advance' : 'same-day'} payment requirement was missed. Recover the full ${requirement.ratePercent}% category discount and follow up for the remaining Tally balance.`);
 }

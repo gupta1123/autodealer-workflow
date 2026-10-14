@@ -5,6 +5,8 @@ import { subscribeBankJobEvents } from '../../api/src/lib/processing/bank-job-ev
 import {scopedCompanyCheck} from './company-scope.mjs';
 import {createScopedBankSubscriptions} from './bank-job-subscriptions.mjs';
 import {waitForDurableDiscount} from './durable-discount.mjs';
+import {startFollowupAutomation} from './followup-automation.mjs';
+import {businessDateText} from '../../tally-bridge/src/collections-analysis/business-date.mjs';
 
 const PORT = Number(process.env.CASH_DISCOUNT_GATEWAY_PORT || 3002);
 const HOST = process.env.CASH_DISCOUNT_GATEWAY_HOST || "0.0.0.0";
@@ -348,14 +350,16 @@ async function handleBrowserRequest(socket, message, meta) {
   if (item.debitNoteKey) activeDebitNotes.add(item.debitNoteKey);
   const requestedCompanyName = String(message.companyName ?? "").trim();
   const companyKey = requestedCompanyName.toLowerCase().replace(/\s+/g, " ");
-  // Connectors from 1.2.24 analyse a scan themselves when given the context
+  // Connectors from 1.2.29 analyse RTGS terms themselves when given the context
   // (debit notes already created, connection status), so only the finished
   // dashboard crosses the internet. Without it they send every open bill
   // and the API analyses, as before; any context failure falls back to that.
   let analysisContext;
   // A page that pages its lists (payload.paged) always gets connector
-  // analysis from connectors that can hold the dashboard (1.2.25 and later).
-  const pagedScan = message.payload?.paged === true && versionAtLeast(connectorMeta.bridgeVersion, [1, 2, 25]);
+  // analysis from connectors that support the current rules (1.2.29 and later).
+  // Earlier local analysers still use 7/15-day CD tiers. Return their raw
+  // evidence for backend RTGS analysis instead of displaying obsolete rules.
+  const pagedScan = message.payload?.paged === true && versionAtLeast(connectorMeta.bridgeVersion, [1, 2, 29]);
   if (["scan", "followups_scan"].includes(operation) && (pagedScan || connectorSupportsAnalysis(connectorMeta.bridgeVersion))) {
     const contextStartedAt = Date.now();
     try {
@@ -413,7 +417,7 @@ async function handleBrowserRequest(socket, message, meta) {
 // Kept for a same-computer path where nothing is uploaded.
 function connectorSupportsAnalysis(bridgeVersion) {
   if (process.env.CASH_DISCOUNT_CONNECTOR_ANALYSIS !== "true") return false;
-  return versionAtLeast(bridgeVersion, [1, 2, 24]);
+  return versionAtLeast(bridgeVersion, [1, 2, 29]);
 }
 
 function versionAtLeast(bridgeVersion, minimum) {
@@ -424,6 +428,26 @@ function versionAtLeast(bridgeVersion, minimum) {
     if (parts[index] !== minimum[index]) return parts[index] > minimum[index];
   }
   return true;
+}
+
+function automaticConnectorRead(context, operation, payload) {
+  const connector = connectors.get(context.connectionId);
+  const meta = connector && metadata.get(connector);
+  if (!meta || connector.readyState !== WebSocket.OPEN || meta.installationId !== context.installationId || meta.sessionGeneration !== context.sessionGeneration || meta.ownerUserId !== context.initiatingUserId) return Promise.reject(new Error('The automatic reminder connector pairing changed.'));
+  if ([...pending.values()].some(item => item.connectionId === context.connectionId)) return Promise.reject(new Error('Tally is busy with another request.'));
+  return new Promise((resolve, reject) => {
+    const requestId = randomUUID();
+    const browser = { readyState: WebSocket.OPEN, send: text => {
+      const result = JSON.parse(text);
+      if (result.type !== 'result') return;
+      if (result.success) resolve(result.data); else reject(new Error(result.error || 'Automatic Tally check failed.'));
+    } };
+    const item = startPending({requestId,browser,connector,connectionId:context.connectionId,ownerUserId:meta.ownerUserId,operation,payload});
+    // Service authorization was established by the bridge-authenticated API,
+    // and is rechecked again there immediately before sending a message.
+    item.phase = 'fetch_customer_open_bills';
+    send(connector,{type:'operation',requestId,operation,deadlineAt:Date.now()+90_000,companyName:context.companyName,financialYear:context.financialYear,customerScope:context.customerScope,agentIdentity:context,payload});
+  });
 }
 
 async function handleConnectorResult(socket, message, meta) {
@@ -592,6 +616,31 @@ export function startCashDiscountGateway(options = {}) {
         maxPayload: MAX_MESSAGE_BYTES,
         perMessageDeflate,
       });
+
+  const automationApi = (context, body) => {
+    const connector = connectors.get(context.connectionId);
+    const meta = connector && metadata.get(connector);
+    if (!meta?.bridgeToken) throw new Error('Connector disconnected.');
+    return apiRequest('/api/collections/follow-ups/automatic',{bridgeToken:meta.bridgeToken,body:{...context,...body}});
+  };
+  const automation = options.followupAutomation === false ? null : startFollowupAutomation({
+    intervalMs: options.followupAutomationIntervalMs || 60_000,
+    contexts: async () => {
+      const contexts = [];
+      for (const [connectionId,connector] of connectors) {
+        const meta = metadata.get(connector);
+        if (!meta || connector.readyState !== WebSocket.OPEN || !versionAtLeast(meta.bridgeVersion,[1,2,29]) || [...pending.values()].some(item => item.connectionId === connectionId)) continue;
+        try { const result = await automationApi({connectionId},{action:'context'}); contexts.push(...(result.contexts || [])); }
+        catch (error) { console.warn(`Automatic follow-up context unavailable: ${error.message}`); }
+      }
+      return contexts;
+    },
+    scan: context => automaticConnectorRead(context,'cash_discount_scan',{forceRefresh:true,requireFresh:true,automaticDiscovery:true,moduleName:'followups'}),
+    reconcile: async (context,scan) => (await automationApi(context,{action:'reconcile',scan})).tasks || [],
+    read: (context,task) => automaticConnectorRead(context,'fetch_customer_open_bills',{companyName:context.companyName,financialYear:context.financialYear,asOfDate:businessDateText(),ledgerNames:[task.customer],queryPurpose:'payment_followup',forceLive:true,verificationInvoice:{invoice:task.invoice,invoiceDate:task.invoiceDate}}),
+    deliver: (context,task,evidence) => automationApi(context,{action:'deliver',id:task.id,evidence}),
+  });
+  server.once('close',() => automation?.stop());
 
   if (attachedServer) {
     attachedServer.on("upgrade", (request, socket, head) => {

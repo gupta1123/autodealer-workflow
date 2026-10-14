@@ -1,3 +1,4 @@
+import { classifyPaymentNarration, paymentRequirement, type PaymentCategory } from '@/lib/payment-terms';
 export const PAYMENT_FOLLOW_UP_GRACE_DAYS = 7;
 
 export type PaymentFollowUpAgeBasis = "due_date" | "invoice_date" | "missing_dates";
@@ -18,6 +19,7 @@ export type PaymentFollowUpStatus =
   | "needs_review";
 
 type BillDates = {
+  narration?: string | null;
   dueDate?: string | null;
   invoiceDate?: string | null;
 };
@@ -30,8 +32,8 @@ type PriorityFollowUp = {
   partyLedgerName: string;
 };
 
-export function isCollectionOnlyPaymentFollowUp(row: { followUpStatus: PaymentFollowUpStatus }) {
-  return row.followUpStatus !== "debit_note_required";
+export function isCollectionOnlyPaymentFollowUp(row: { followUpStatus: PaymentFollowUpStatus; paymentCategory?: PaymentCategory | null }) {
+  return Boolean(row.paymentCategory) || row.followUpStatus !== "debit_note_required";
 }
 
 function validDateText(value: string | null | undefined) {
@@ -57,6 +59,13 @@ export function derivePaymentFollowUpTiming(
   const currentDate = validDateText(today);
   const dueDate = validDateText(bill.dueDate);
   const invoiceDate = validDateText(bill.invoiceDate);
+  const category = classifyPaymentNarration(bill.narration).category;
+  if (category && currentDate) {
+    const requirement = paymentRequirement(category, invoiceDate);
+    if (!requirement) return { eligible: true, ageBasis: 'missing_dates', ageDays: null, ageLabel: 'Invoice date missing for RTGS terms', dueDate: null, invoiceDate };
+    const ageDays = elapsedDays(requirement.deadline, currentDate);
+    return { eligible: ageDays > 0, ageBasis: 'due_date', ageDays, ageLabel: `${Math.max(ageDays, 0)} days past ${category === 'advance_rtgs' ? 'advance' : 'same-day'} payment deadline`, dueDate: requirement.deadline, invoiceDate };
+  }
 
   if (!currentDate) {
     return {

@@ -412,7 +412,7 @@ export class LocalAgentRuntime {
   // Prepared customer dues for a Cash Discount / Follow-up scan, or null when
   // they are not ready for this company and financial year (the scan then
   // reads Tally live). Latest Tally changes are applied first.
-  async preparedReceivablesFor({ companyName, financialYear }) {
+  async preparedReceivablesFor({ companyName, financialYear, requireFresh = false }) {
     const identity = this.activeIdentity;
     if (!identity || String(identity.companyName || "").toLowerCase().replace(/[^a-z0-9]/g, "") !==
       String(companyName || "").toLowerCase().replace(/[^a-z0-9]/g, "")) return null;
@@ -422,11 +422,13 @@ export class LocalAgentRuntime {
     if (financialYear && financialYearRange(financialYear).label !== state.financialYear) return null;
     // Quick delta only: a full customer re-check (after a deletion) takes
     // minutes and runs in the background instead of holding up the scan.
-    await this.receivables.checkForChanges(identity, key, {
+    const check = await this.receivables.checkForChanges(identity, key, {
       force: true,
       allowFullCheck: false,
       invoke: (xml, options) => this.directGateway.invoke(xml, options),
-    }).catch((error) => this.onLog?.("warn", `Customer dues check before scan: ${error.message}`));
+    }).catch((error) => { if (requireFresh) throw error; this.onLog?.("warn", `Customer dues check before scan: ${error.message}`); });
+    const checkedState = await this.storage.call('getReceivableState', { datasetKey: key });
+    if (requireFresh && (!check || checkedState?.status !== 'ready' || checkedState.pendingFullBillCheck || checkedState.deepCheckFromAlterId != null)) throw new Error('Customer dues are still being verified. Automatic reminders will wait for fresh Tally evidence.');
     // Scans, reminder checks and bank matching all answer from the dues held
     // in memory (loaded once, reloaded only after the dues change).
     const snapshot = await this.receivables.loadSnapshot(key);

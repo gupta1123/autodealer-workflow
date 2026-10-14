@@ -1,5 +1,7 @@
 # Invoice follow-up pipelines
 
+For the October 2026 ADVANCE RTGS / SAME DAY RTGS changes and automatic schedules, see [RTGS cash discount and automatic follow-ups](rtgs-cd-payment-followups.md). The manual pipeline flow below continues to apply to manually enrolled schedules.
+
 ## Updated defaults and one-time flow
 
 Also manually apply `20260907083147_followup_defaults_and_one_time.sql` in Kalika. It has been validated only in a disposable local database. Settings → Payment reminders now stores the organization-wide stage templates, intervals, limits and default Send once template. Existing schedules retain their copied stages.

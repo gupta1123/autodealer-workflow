@@ -15,6 +15,7 @@ const sourceDirectory = path.join(root, "apps/api/src/lib");
 const outputDirectory = path.join(root, "apps/tally-bridge/src/collections-analysis");
 const modules = [
   "business-date",
+  "payment-terms",
   "collections",
   "payment-follow-up",
   "cash-discount-narration",

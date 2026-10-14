@@ -17,6 +17,8 @@ import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallySc
 import { createLocalAgentRuntime } from "./agent/runtime.mjs";
 import { openBillAmountIndexFromFields, openBillFromFields, openBillsByLedgerFromFields } from "./agent/receivable-fields.mjs";
 import { buildLiveCashDiscountDashboard } from "./collections-analysis/cash-discount-live-dashboard.mjs";
+import { classifyPaymentNarration } from "./collections-analysis/payment-terms.mjs";
+import { businessDateText } from "./collections-analysis/business-date.mjs";
 import { collectionRowsById, collectionRowsByInvoice, dashboardShell, queryCollections } from "./collections-analysis/collections-query.mjs";
 import { powershellProtectedData } from "./agent/key-vault.mjs";
 import { workflowCacheState } from './agent/workflow-cache-policy.mjs';
@@ -5737,7 +5739,7 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
     throw new Error(`Tally is currently open to ${readiness.companyName || "another company"}. Switch to ${requestedCompany} and refresh.`);
   }
   const resolvedCompany = requestedCompany || readiness.companyName || null;
-  const asOfDate = new Date().toISOString().slice(0, 10);
+  const asOfDate = businessDateText();
   const dateRange = cashDiscountFinancialYearRange(financialYear || proposal?.financialYear, asOfDate);
   if (!readOptions.resume || operation !== "cash_discount_scan") cashDiscountResultCache.clear();
   // Never share financial scan caches across similarly named companies/PCs.
@@ -5748,8 +5750,8 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
   // Customer dues prepared in the Local Agent (kept current from Tally's change
   // counters) replace the heavy live reads. Without them, read Tally live.
   const prepared = operation === "cash_discount_scan"
-    ? await config.__agentRuntime?.preparedReceivablesFor?.({ companyName: resolvedCompany, financialYear: dateRange.financialYear })
-      .catch((error) => { console.error(`Prepared customer dues unavailable: ${error.message}`); return null; })
+    ? await config.__agentRuntime?.preparedReceivablesFor?.({ companyName: resolvedCompany, financialYear: dateRange.financialYear, requireFresh: readOptions.requireFresh === true })
+      .catch((error) => { if (readOptions.requireFresh) throw error; console.error(`Prepared customer dues unavailable: ${error.message}`); return null; })
     : null;
   lap("duesUpdate");
   if (!prepared && companyGuid && operation === 'cash_discount_scan' && !readOptions.forceRefresh && !readOptions.resume) {
@@ -5811,6 +5813,9 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
 
   if (candidateLedgerNames.length === 0) {
     return {
+      companyGuid,
+      cache: { source: 'live_tally', updatedAt: new Date().toISOString(), stale: false },
+      scanSummary: { complete: true, completed: 0, total: 0 },
       companyName: resolvedCompany,
       financialYear: dateRange.financialYear,
       dateFrom: dateRange.dateFrom,
@@ -5861,6 +5866,9 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
 
   if (ledgersToScan.length === 0) {
     return {
+      companyGuid,
+      cache: { source: 'live_tally', updatedAt: new Date().toISOString(), stale: false },
+      scanSummary: { complete: true, completed: 0, total: 0 },
       companyName: resolvedCompany,
       financialYear: dateRange.financialYear,
       dateFrom: dateRange.dateFrom,
@@ -5925,6 +5933,7 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
     throw new Error("Tally company changed or could not be verified during the scan. Refresh and select the company again.");
   }
   const snapshot = {
+    companyGuid,
     cache: prepared
       ? { source: 'prepared_customer_dues', updatedAt: prepared.state?.checkedAt || new Date().toISOString(), stale: false }
       : { source: 'live_tally', updatedAt: new Date().toISOString(), stale: false },
@@ -8217,11 +8226,11 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
           // Payment reminder checks and bank bill allocation use the customer
           // dues kept current from Tally's change counters (latest changes
           // applied first): always current, and instant for any number of parties.
-          const prepared = isReminderCheck || isBankBillCheck
+          const prepared = (isReminderCheck || isBankBillCheck) && message.payload?.forceLive !== true
             ? await config.__agentRuntime?.preparedReceivablesFor?.({ companyName: message.companyName, financialYear: message.financialYear }).catch(() => null)
             : null;
           if (prepared) {
-            const asOfDate = new Date().toISOString().slice(0, 10);
+            const asOfDate = businessDateText();
             const names = uniquePayloadLedgerNames(message.payload || {});
             const records = await prepared.recordsFor(names, { dateTo: asOfDate });
             const outcome = await cashDiscountReadContext.run({ signal: controller.signal, deadlineAt, benchmark, schedule: executeExclusive },
@@ -8287,6 +8296,16 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
           // status) the connector builds the finished dashboard itself, with
           // the server's own code, and sends only that instead of every open bill.
           const context = message.analysisContext;
+          if (message.payload?.automaticDiscovery && snapshot?.openBillsResult) {
+            // Only the two agreed categories cross the service channel. The
+            // backend still evaluates deadlines and verifies each send afresh.
+            const source = snapshot.openBillsResult.result || snapshot.openBillsResult;
+            const byLedger = Object.fromEntries(Object.entries(source.byLedger || {}).flatMap(([name,bucket]) => {
+              const openBills = (bucket.openBills || []).filter(bill => classifyPaymentNarration(bill.narration).category);
+              return openBills.length ? [[name,{...bucket,openBills,existingAdvances:[]}]] : [];
+            }));
+            return {...snapshot,ledgers:(snapshot.ledgers || []).filter(ledger => byLedger[ledger.name]),openBillsResult:{result:{byLedger}}};
+          }
           if (operation !== "cash_discount_scan" || !context || !Array.isArray(context.proposalRows) || !snapshot?.openBillsResult) return snapshot;
           const analysisStarted = performance.now();
           const dashboard = buildLiveCashDiscountDashboard({

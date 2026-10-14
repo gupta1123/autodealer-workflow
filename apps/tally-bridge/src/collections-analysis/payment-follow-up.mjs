@@ -1,8 +1,9 @@
 // GENERATED from apps/api/src/lib/payment-follow-up.ts by scripts/build-connector-collections-analysis.mjs.
 // Do not edit: change the source and run the script.
+import { classifyPaymentNarration, paymentRequirement } from './payment-terms.mjs';
 export const PAYMENT_FOLLOW_UP_GRACE_DAYS = 7;
 export function isCollectionOnlyPaymentFollowUp(row) {
-    return row.followUpStatus !== "debit_note_required";
+    return Boolean(row.paymentCategory) || row.followUpStatus !== "debit_note_required";
 }
 function validDateText(value) {
     const dateText = String(value ?? "").trim().slice(0, 10);
@@ -21,6 +22,14 @@ export function derivePaymentFollowUpTiming(bill, today, graceDays = PAYMENT_FOL
     const currentDate = validDateText(today);
     const dueDate = validDateText(bill.dueDate);
     const invoiceDate = validDateText(bill.invoiceDate);
+    const category = classifyPaymentNarration(bill.narration).category;
+    if (category && currentDate) {
+        const requirement = paymentRequirement(category, invoiceDate);
+        if (!requirement)
+            return { eligible: true, ageBasis: 'missing_dates', ageDays: null, ageLabel: 'Invoice date missing for RTGS terms', dueDate: null, invoiceDate };
+        const ageDays = elapsedDays(requirement.deadline, currentDate);
+        return { eligible: ageDays > 0, ageBasis: 'due_date', ageDays, ageLabel: `${Math.max(ageDays, 0)} days past ${category === 'advance_rtgs' ? 'advance' : 'same-day'} payment deadline`, dueDate: requirement.deadline, invoiceDate };
+    }
     if (!currentDate) {
         return {
             eligible: false,

@@ -1,172 +1,62 @@
-import assert from "node:assert/strict";
-import test from "node:test";
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { analyseCashDiscountNarration, parseCashDiscountTerms } from '../../../tally-bridge/src/collections-analysis/cash-discount-narration.mjs';
+import { classifyPaymentNarration, paymentRequirement } from '../../../tally-bridge/src/collections-analysis/payment-terms.mjs';
+const analyse = (values = {}) => analyseCashDiscountNarration({ narration:'MH14-KY-5700 ADVANCE RTGS', invoiceDate:'2026-10-12', originalAmount:98500, pendingAmount:98500, today:'2026-10-12', ...values });
 
-import {
-  analyseCashDiscountNarration,
-  parseCashDiscountNarration,
-  parseCashDiscountTerms,
-} from "./cash-discount-narration.ts";
-
-test("defaults 1.5% to 7 days and 1% to 15 days", () => {
-  assert.deepEqual(parseCashDiscountTerms("Cash discount 1.5% and 1%"), [
-    { ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" },
-    { ratePercent: 1, eligibilityDays: 15, periodSource: "default" },
-  ]);
+test('client narration patterns establish the two rates without percentages', () => {
+  assert.equal(parseCashDiscountTerms('MH14-KY-5700 ADVANCE RTGS')[0].ratePercent,1.5);
+  assert.equal(parseCashDiscountTerms('MH43-U-3463 SAME DAY RTGS')[0].ratePercent,1);
+  assert.equal(classifyPaymentNarration('same-day r.t.g.s.').category,'same_day_rtgs');
+  assert.equal(classifyPaymentNarration('same day rtgs').category,'same_day_rtgs');
 });
-
-test("recognizes CD and C.D. markers without explicit periods", () => {
-  assert.deepEqual(parseCashDiscountTerms("CD 1%"), [
-    { ratePercent: 1, eligibilityDays: 15, periodSource: "default" },
-  ]);
-  assert.deepEqual(parseCashDiscountTerms("C.D. 1.5%"), [
-    { ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" },
-  ]);
+test('regular credit and percentage-only legacy terms cannot invent a CD category', () => {
+  for(const narration of ['PAYMENT WITHIN 25 DAYS','Cash discount 1.5% and 1%','GST 1%','ADVANCE PAYMENT','NOTADVANCE RTGS']) assert.deepEqual(parseCashDiscountTerms(narration),[]);
 });
-
-test("written periods never override the fixed client windows", () => {
-  assert.deepEqual(
-    parseCashDiscountTerms("Cash discount 1.5% within 10 days and 1% within 20 days"),
-    [
-      { ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" },
-      { ratePercent: 1, eligibilityDays: 15, periodSource: "default" },
-    ]
-  );
+test('conflicting category phrases require review', () => {
+  assert.equal(classifyPaymentNarration('ADVANCE RTGS / SAME DAY RTGS').ambiguous,true);
+  assert.equal(analyse({narration:'ADVANCE RTGS SAME DAY RTGS'}).reversalPlan,null);
 });
-
-test("ignores working-day wording and applies the fixed window for the detected rate", () => {
-  assert.deepEqual(
-    parseCashDiscountTerms("Cash Discount 1% within 4 working days"),
-    [{ ratePercent: 1, eligibilityDays: 15, periodSource: "default" }]
-  );
+test('advance expires at the beginning of invoice date in IST', () => {
+  const rule=paymentRequirement('advance_rtgs','2026-10-12');
+  assert.equal(rule.deadline,'2026-10-11');
+  assert.equal(rule.followUpStartsAt,'2026-10-11T18:30:00.000Z');
+  assert.equal(analyse({today:'2026-10-11'}).reversalPlan.totalReversalRequired,0);
+  assert.equal(analyse().reversalPlan.totalReversalRequired,1500);
 });
-
-test("normalizes supported rate and period wording variants", () => {
-  assert.deepEqual(
-    parseCashDiscountTerms("C.D. @ 1.00 % if paid in four business days"),
-    [{ ratePercent: 1, eligibilityDays: 15, periodSource: "default" }]
-  );
-  assert.deepEqual(
-    parseCashDiscountTerms("One and a half percent cash discount within seven calendar days"),
-    [{ ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" }]
-  );
-  assert.deepEqual(
-    parseCashDiscountTerms("Cash disc: 1.50 percent"),
-    [{ ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" }]
-  );
-  assert.deepEqual(
-    parseCashDiscountTerms("CD 1½%"),
-    [{ ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" }]
-  );
+test('same-day remains available all invoice day and expires next IST day', () => {
+  const same = {narration:'SAME DAY RTGS',originalAmount:99000,pendingAmount:99000};
+  assert.equal(paymentRequirement('same_day_rtgs','2026-10-12').followUpStartsAt,'2026-10-12T18:30:00.000Z');
+  assert.equal(analyse(same).reversalPlan.totalReversalRequired,0);
+  assert.equal(analyse({...same,today:'2026-10-13'}).reversalPlan.totalReversalRequired,1000);
 });
-
-test("recognizes compact paired cash-discount tiers", () => {
-  assert.deepEqual(
-    parseCashDiscountTerms("Cash discount 1.5/1% for 7/15 days"),
-    [
-      { ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" },
-      { ratePercent: 1, eligibilityDays: 15, periodSource: "default" },
-    ]
-  );
+test('missing and invalid invoice dates do not authorize CD', () => {
+  for(const invoiceDate of [null,'','2026-02-30','not-a-date']) assert.equal(analyse({invoiceDate}).deterministicStatus,'missing_invoice_date');
 });
-
-test("uses the fixed 15-day window even when narration says four working days", () => {
-  const analysis = analyseCashDiscountNarration({
-    narration: "Cash Discount 1% within 4 working days",
-    invoiceDate: "2026-08-07",
-    originalAmount: 80_000,
-    pendingAmount: 80_000,
-    today: "2026-08-16",
-  });
-  assert.equal(analysis.discountDeadline, "2026-08-22");
-  assert.equal(analysis.deterministicStatus, "within_eligibility_window");
-  assert.equal(analysis.reversalPlan?.totalReversalRequired, 0);
+test('partial payment misses the full-payment condition and reverses the full category CD', () => {
+  const result=analyse({pendingAmount:48500,receiptDate:'2026-10-10',matchedReceiptAmount:50000});
+  assert.equal(result.deterministicStatus,'unpaid_discount_tier_expired');
+  assert.equal(result.reversalPlan.totalReversalRequired,1500);
 });
-
-test("does not treat unrelated percentages as cash discounts", () => {
-  assert.deepEqual(parseCashDiscountTerms("GST 1% and interest 1.5%"), []);
-  const analysis = analyseCashDiscountNarration({
-    narration: "GST 1% and interest 1.5%",
-    invoiceDate: "2026-06-01",
-    originalAmount: 100_000,
-    pendingAmount: 1_500,
-    receiptDate: "2026-06-25",
-    matchedReceiptAmount: 98_500,
-    today: "2026-07-01",
-  });
-  assert.equal(analysis.deterministicStatus, "no_cash_discount_context");
+test('advance paid on invoice day never downgrades to 1% eligibility', () => {
+  const result=analyse({pendingAmount:1000,receiptDate:'2026-10-12',matchedReceiptAmount:97500});
+  assert.equal(result.reversalPlan.activeDiscount,null);
+  assert.equal(result.reversalPlan.totalReversalRequired,1500);
 });
-
-test("does not match 1% inside 1.5% or 11%", () => {
-  const parsed = parseCashDiscountNarration("CD 11% and 1.5%");
-  assert.deepEqual(parsed.supportedRates, [1.5]);
-  assert.deepEqual(parsed.unsupportedRates, [11]);
-  assert.deepEqual(parsed.terms, [
-    { ratePercent: 1.5, eligibilityDays: 7, periodSource: "default" },
-  ]);
+test('a remaining balance resembling another discount does not prove timely full payment', () => {
+  assert.equal(analyse({pendingAmount:1477.5,receiptDate:'2026-10-10',matchedReceiptAmount:97022.5}).deterministicStatus,'unpaid_discount_tier_expired');
 });
-
-test("marks a cash-discount narration with only an unsupported rate for review", () => {
-  const analysis = analyseCashDiscountNarration({
-    narration: "Cash discount 2%",
-    invoiceDate: "2026-06-01",
-    originalAmount: 100_000,
-    pendingAmount: 2_000,
-    today: "2026-07-01",
-  });
-  assert.equal(analysis.deterministicStatus, "unsupported_cash_discount_rate");
+test('verified full advance before invoice qualifies', () => {
+  assert.equal(analyse({pendingAmount:0,receiptDate:'2026-10-11',matchedReceiptAmount:98500}).deterministicStatus,'discount_taken_within_window');
+  assert.equal(analyse({pendingAmount:0,receiptDate:'2026-10-11',matchedReceiptAmount:98500}).reversalPlan.totalReversalRequired,0);
 });
-
-test("routes a late short payment to collection when the balance is already open", () => {
-  const analysis = analyseCashDiscountNarration({
-    narration: "Cash discount 1.5%",
-    invoiceDate: "2026-06-01",
-    originalAmount: 100_000,
-    pendingAmount: 1_500,
-    receiptDate: "2026-06-25",
-    matchedReceiptAmount: 98_500,
-    today: "2026-07-01",
-  });
-  assert.equal(analysis.discountDeadline, "2026-06-08");
-  assert.equal(analysis.deterministicStatus, "existing_balance_due");
-  assert.equal(analysis.matchedDiscount?.amount, 1_500);
-  assert.match(analysis.deterministicReason, /without creating another debit note/);
+test('generated recovery narration cannot recursively qualify for another CD recovery',()=>{
+  assert.deepEqual(parseCashDiscountTerms('Cash discount recovery against invoice INV. Source narration: ADVANCE RTGS'),[]);
 });
-
-test("keeps the deadline date eligible", () => {
-  const analysis = analyseCashDiscountNarration({
-    narration: "CD 1.5%",
-    invoiceDate: "2026-06-01",
-    originalAmount: 100_000,
-    pendingAmount: 1_500,
-    receiptDate: "2026-06-08",
-    matchedReceiptAmount: 98_500,
-    today: "2026-07-01",
-  });
-  assert.equal(analysis.deterministicStatus, "discount_taken_within_window");
+test('full advance on invoice day fails and unverified receipts require review', () => {
+  assert.equal(analyse({pendingAmount:0,receiptDate:'2026-10-12',matchedReceiptAmount:98500}).deterministicStatus,'existing_balance_due');
+  assert.equal(analyse({pendingAmount:0,receiptDate:'2026-10-11',matchedReceiptAmount:100}).deterministicStatus,'receipt_amount_unverified');
 });
-
-test("blocks a late short payment when receipt evidence does not reconcile", () => {
-  const analysis = analyseCashDiscountNarration({
-    narration: "CD 1%",
-    invoiceDate: "2026-06-01",
-    originalAmount: 80_000,
-    pendingAmount: 800,
-    receiptDate: "2026-06-25",
-    matchedReceiptAmount: 70_000,
-    today: "2026-07-01",
-  });
-  assert.equal(analysis.deterministicStatus, "receipt_amount_unverified");
-});
-
-test("grosses up a fully unpaid net invoice after all default tiers expire", () => {
-  const analysis = analyseCashDiscountNarration({
-    narration: "Cash discount 1.5% and 1%",
-    invoiceDate: "2026-06-01",
-    originalAmount: 50_000,
-    pendingAmount: 50_000,
-    today: "2026-06-25",
-  });
-  assert.equal(analysis.deterministicStatus, "unpaid_discount_tier_expired");
-  assert.equal(analysis.reversalPlan?.grossInvoiceAmount, 50_761.42);
-  assert.equal(analysis.reversalPlan?.totalReversalRequired, 761.42);
+test('invalid balances never authorize recovery', () => {
+  for(const pendingAmount of [-1,NaN,100000]) assert.equal(analyse({pendingAmount}).deterministicStatus,'receipt_amount_unverified');
 });

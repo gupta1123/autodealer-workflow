@@ -8,6 +8,7 @@ import { requireRequestUser } from "@/lib/api/request-auth";
 import { readTallyOpenBills } from "@/lib/collections-dashboard";
 import { businessDateText } from "@/lib/business-date";
 import { analyseCashDiscountNarration } from "@/lib/cash-discount-narration";
+import { isNonSalesVoucher } from '@/lib/payment-terms';
 import { toNumber, toText } from "@/lib/collections";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { wakeTallyConnector } from "@/lib/tally/command-wake";
@@ -104,7 +105,7 @@ async function POSTHandler(request: Request) {
     const pendingAmount = toNumber(bill.pendingAmount);
     const invoiceDate = nullableText(bill.invoiceDate, 20);
     const today = businessDateText();
-    if (bill.kind === "advance" || originalAmount <= 0 || pendingAmount <= 0) {
+    if (bill.kind === "advance" || isNonSalesVoucher(bill.sourceVoucherType) || originalAmount <= 0 || pendingAmount <= 0) {
       return jsonWithCors(request, { error: "The invoice is no longer eligible for a Debit Note." }, { status: 409 });
     }
 

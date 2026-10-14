@@ -17,6 +17,7 @@ function templateLabel(key:string){
 export function PaymentReminderSettings(){
  const [plan,setPlan]=useState<ReminderPlan>(()=>standardReminderPlan());
  const [once,setOnce]=useState(DEFAULT_TEMPLATE);
+ const [automatic,setAutomatic]=useState(true);
  const [revision,setRevision]=useState(0);
  const [messages,setMessages]=useState<ReminderMessage[]>([]);
  const [status,setStatus]=useState('');
@@ -32,7 +33,7 @@ export function PaymentReminderSettings(){
    setRevision(data.revision);
    setMessages(data.messages);
    const defaultKey=data.messages.some((message:ReminderMessage)=>message.key===DEFAULT_TEMPLATE)?DEFAULT_TEMPLATE:data.messages[0]?.key||'';
-   if(data.value){setPlan(data.value.plan);setOnce(data.value.onceTemplate);}
+   if(data.value){setPlan(data.value.plan);setOnce(data.value.onceTemplate);setAutomatic(data.value.automatic!==false);}
    else if(defaultKey){setPlan(standardReminderPlan(defaultKey));setOnce(defaultKey);}
   }).catch(reason=>{
    if(live){setError(true);setStatus(reason instanceof Error?reason.message:'Reminder settings could not be loaded.');}
@@ -48,7 +49,7 @@ export function PaymentReminderSettings(){
 
  const save=()=>{
   setBusy(true);setStatus('');setError(false);
-  void apiFetch('/api/settings/payment-reminders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan,onceTemplate:once,revision})})
+  void apiFetch('/api/settings/payment-reminders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan,onceTemplate:once,automatic,revision})})
    .then(async response=>{const data=await response.json();if(!response.ok)throw Error(data.error);setRevision(data.revision);setStatus('Reminder settings saved.');})
    .catch(reason=>{setError(true);setStatus(reason instanceof Error?reason.message:'Reminder settings could not be saved.');})
    .finally(()=>setBusy(false));
@@ -58,7 +59,7 @@ export function PaymentReminderSettings(){
 
  return <section className="w-full rounded-xl border border-[#ded8d0] bg-white p-5 text-sm shadow-[0_1px_2px_rgba(52,42,32,0.04)] sm:p-6">
   <div className="flex flex-col gap-4 border-b border-[#e8e2db] pb-5 lg:flex-row lg:items-start lg:justify-between">
-   <div><h2 className="text-base font-bold tracking-tight text-[#111827]">Reminder sequence</h2><p className="mt-1 text-xs text-[#5b4b3d]">Choose when reminders become due. Your team checks the balance and sends them.</p></div>
+   <div><h2 className="text-base font-bold tracking-tight text-[#111827]">Reminder sequence</h2><p className="mt-1 text-xs text-[#5b4b3d]">Automatic RTGS reminders use this sequence and check Tally before every message. Manually started schedules remain available for your team to send.</p></div>
    <div className="flex shrink-0 items-center gap-2 self-start rounded-full border border-[#ded8d0] bg-[#faf8f5] px-3 py-2 text-xs text-[#675d54]"><Info aria-hidden="true" className="size-3.5"/><span>{plan.stages.length} {plan.stages.length===1?'stage':'stages'} · Up to {totalReminders} reminders</span></div>
   </div>
 
@@ -66,6 +67,10 @@ export function PaymentReminderSettings(){
   {!messages.length&&!busy?<p className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">No approved payment-reminder template is available.</p>:null}
 
   <fieldset disabled={busy} className="mt-5 space-y-5 disabled:opacity-60">
+   <label className="flex items-start gap-3 rounded-lg border border-[#e5dfd8] bg-[#faf8f5] px-4 py-3">
+    <input type="checkbox" className="mt-0.5" checked={automatic} onChange={event=>setAutomatic(event.target.checked)}/>
+    <span><span className="block text-xs font-semibold">Automatic RTGS payment follow-ups</span><span className="mt-1 block text-xs text-[#675d54]">ADVANCE RTGS requires payment before the invoice date; SAME DAY RTGS requires payment by the end of that date in IST. Unpaid invoices start reminders once the deadline is missed. A customer WhatsApp number and an online connector are required.</span></span>
+   </label>
    <div className="flex flex-col gap-2 rounded-lg border border-[#e5dfd8] bg-[#faf8f5] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
     <div><p className="text-xs font-semibold text-[#111827]">“Send once” template</p><p className="mt-0.5 text-xs text-[#8a7f72]">A single message, without adding the invoice to this sequence.</p></div>
     <select aria-label="One-time reminder template" className={`${input} w-full sm:w-64`} value={once} onChange={event=>setOnce(event.target.value)}>{templateOptions}</select>

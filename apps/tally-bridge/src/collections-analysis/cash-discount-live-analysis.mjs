@@ -4,6 +4,7 @@ import { invoiceIdentityKey, normalizeLedgerName, serializePaymentFollowUp, seri
 import { derivePaymentFollowUpTiming, isCollectionOnlyPaymentFollowUp, sortPaymentFollowUpsByPriority, } from "./payment-follow-up.mjs";
 import { analyseCashDiscountNarration, } from "./cash-discount-narration.mjs";
 import { serializeDebitNoteProposal, toNumber, toText } from "./collections.mjs";
+import { isNonSalesVoucher } from './payment-terms.mjs';
 export function liveCashDiscountLedgerRow(value) {
     const name = toText(value.name, 500);
     if (!name)
@@ -46,7 +47,7 @@ export function analyseLiveCashDiscountSnapshot(params) {
             const originalAmount = toNumber(bill.originalAmount);
             const pendingAmount = toNumber(bill.pendingAmount);
             const invoiceDate = String(bill.invoiceDate ?? "").slice(0, 10);
-            if (!ledgerName || bill.kind === "advance" || originalAmount <= 0 || pendingAmount <= 0)
+            if (!ledgerName || bill.kind === "advance" || isNonSalesVoucher(bill.sourceVoucherType) || originalAmount <= 0 || pendingAmount <= 0)
                 continue;
             narrationReviewRows.push({
                 ledgerName,
@@ -71,6 +72,7 @@ export function analyseLiveCashDiscountSnapshot(params) {
         originalInvoiceAmount: toNumber(row.bill.originalAmount),
         pendingAmount: toNumber(row.bill.pendingAmount),
         analysis: {
+            paymentCategory: row.analysis.paymentCategory,
             sourceNarration: row.analysis.sourceNarration,
             matchedCashDiscountContext: row.analysis.matchedCashDiscountContext,
             terms: row.analysis.terms,
@@ -83,7 +85,7 @@ export function analyseLiveCashDiscountSnapshot(params) {
             reversalPlan: row.analysis.reversalPlan,
             deterministicStatus: row.analysis.deterministicStatus,
             deterministicReason: row.analysis.deterministicReason,
-            calculationVersion: "cash_discount_v2",
+            calculationVersion: "cash_discount_rtgs_v3",
         },
     }));
     const paymentFollowUps = sortPaymentFollowUpsByPriority(narrationReviewRows

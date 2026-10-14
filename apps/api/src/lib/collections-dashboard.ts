@@ -231,7 +231,7 @@ export function serializeTallyCandidate(params: {
       matchedReceiptAmount: params.analysis.matchedReceiptAmount,
       deterministicStatus: params.analysis.deterministicStatus,
       deterministicReason: params.analysis.deterministicReason,
-      calculationVersion: "cash_discount_v2",
+      calculationVersion: "cash_discount_rtgs_v3",
     },
     createdInTallyAt: null,
     lastSyncedFromTallyAt: null,
@@ -322,8 +322,10 @@ export function serializePaymentFollowUp(params: {
     nextAction = "Confirm the invoice or due date before scheduling collection follow-up.";
   } else if (pendingTierReversalAmount > 0.01) {
     kind = "full_payment_due";
-    title = "Debit Note required first";
-    nextAction = `Create the pending Debit Note of ₹${pendingTierReversalAmount.toLocaleString("en-IN")}, then follow up for payment.`;
+    title = params.analysis.paymentCategory ? "Payment overdue · CD recovery pending" : "Debit Note required first";
+    nextAction = params.analysis.paymentCategory
+      ? `Follow up for ₹${outstandingAmount.toLocaleString("en-IN")}. CD recovery of ₹${pendingTierReversalAmount.toLocaleString("en-IN")} is pending separately.`
+      : `Create the pending Debit Note of ₹${pendingTierReversalAmount.toLocaleString("en-IN")}, then follow up for payment.`;
   } else if (params.analysis.deterministicStatus === "within_eligibility_window" && currentDiscount) {
     kind = "discount_window_open";
     title = "Payment pending";
@@ -363,6 +365,7 @@ export function serializePaymentFollowUp(params: {
     id: `follow-up:${Buffer.from(`${params.ledgerName}|${invoiceNumber ?? "-"}|${outstandingAmount.toFixed(2)}`).toString("base64url")}`,
     kind,
     followUpStatus,
+    paymentCategory: params.analysis.paymentCategory,
     ageBasis: timing.ageBasis,
     ageDays: timing.ageDays,
     ageLabel: timing.ageLabel,
@@ -392,7 +395,7 @@ export function serializePaymentFollowUp(params: {
     reversalPlan: params.analysis.reversalPlan,
     deterministicStatus: params.analysis.deterministicStatus,
     deterministicReason: params.analysis.deterministicReason,
-    calculationVersion: "cash_discount_v2",
+    calculationVersion: "cash_discount_rtgs_v3",
   };
 }
 
