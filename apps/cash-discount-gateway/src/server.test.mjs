@@ -19,7 +19,7 @@ function nextMessage(socket, predicate = () => true, timeoutMs = 5_000) {
   });
 }
 
-test("live scan relays browser to connector and returns analysed dashboard", async (t) => {
+test("live scan relays browser to connector and returns analysed dashboard", async t => {
   const requests = [];
   const httpServer = createServer(async (request, response) => {
     const chunks = [];
@@ -59,10 +59,10 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
     path: "/cash-discount-live",
     apiBaseUrl: baseUrl,
   });
-  t.after(async()=>{
-    for(const socket of gateway.clients)socket.terminate();
-    await new Promise(resolve=>gateway.close(resolve));
-    await new Promise(resolve=>httpServer.close(resolve));
+  t.after(async () => {
+    for (const socket of gateway.clients) socket.terminate();
+    await new Promise(resolve => gateway.close(resolve));
+    await new Promise(resolve => httpServer.close(resolve));
   });
 
   const connector = new WebSocket(`${baseUrl.replace("http", "ws")}/cash-discount-live`);
@@ -207,24 +207,31 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
   );
   assert.equal(secondResult.success, true);
 
-  // Authenticate each socket once, then recheck current dataset access for
-  // every operation. Revoked permissions must not survive an open socket.
-  const sessions=requests.filter(request=>request.url==='/api/collections/live/session');
-  assert.equal(sessions.filter(request=>!request.body.operation).length,2);
-  assert.deepEqual(sessions.filter(request=>request.body.operation).map(request=>request.body.operation),['company_check','verify_bank_transaction','scan','scan']);
+  // The socket is authenticated once per role, and every live operation is
+  // authorized again so revoked permissions or pairings cannot keep reading.
+  const sessions = requests.filter((request) => request.url === "/api/collections/live/session");
+  assert.equal(sessions.filter(request => !request.body.operation).length, 2);
+  assert.deepEqual(sessions.filter(request => request.body.operation).map(request => request.body.operation),
+    ['company_check', 'verify_bank_transaction', 'scan', 'scan']);
   assert.equal(requests.filter((request) => request.url === "/api/collections/live/analyse").length, 2);
   assert.equal(requests.filter((request) => request.url === "/api/collections/live/analyse-preview").length, 0);
 
   browser.send(JSON.stringify({ type: "request", requestId: "cancel-1", operation: "scan", companyName: "Solution Nyx" }));
   await nextMessage(connector, (message) => message.requestId === "cancel-1");
   browser.send(JSON.stringify({ type: "request", requestId: "duplicate", operation: "scan", companyName: "Solution Nyx" }));
-  const duplicate = await nextMessage(browser, (message) => message.type === 'result' && message.requestId === "duplicate",25_000);
-  assert.match(duplicate.error, /already running|still running/);
+  const duplicate = await nextMessage(browser, (message) => message.requestId === "duplicate");
+  assert.equal(duplicate.type, 'progress');
+  assert.match(duplicate.message, /Waiting for the current check/);
   const cancelledOnConnector = nextMessage(connector, (message) => message.type === "cancel" && message.requestId === "cancel-1");
   const cancelledOnBrowser = nextMessage(browser, (message) => message.type === "result" && message.requestId === "cancel-1");
   browser.send(JSON.stringify({ type: "cancel", requestId: "cancel-1" }));
   await cancelledOnConnector;
   assert.match((await cancelledOnBrowser).error, /cancelled/);
+
+  await nextMessage(connector, message => message.type === 'operation' && message.requestId === 'duplicate');
+  const duplicateCancelled = nextMessage(browser, message => message.type === 'result' && message.requestId === 'duplicate');
+  browser.send(JSON.stringify({ type: 'cancel', requestId: 'duplicate' }));
+  assert.match((await duplicateCancelled).error, /cancelled/);
 
   browser.close();
   connector.close();
