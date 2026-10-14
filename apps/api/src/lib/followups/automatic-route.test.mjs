@@ -10,9 +10,9 @@ const root=fileURLToPath(new URL('../../../../../',import.meta.url));
 const hash=value=>createHash('sha256').update(value).digest('hex');
 const compile=(path,imports={})=>{
   const code=ts.transpileModule(fs.readFileSync(root+path,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
-  const module={exports:{}};
-  new Function('require','module','exports',code)(name=>imports[name]??(name.startsWith('node:')?require(name):(()=>{throw Error(`Unexpected dependency: ${name}`);})()),module,module.exports);
-  return module.exports;
+  const compiledModule={exports:{}};
+  new Function('require','module','exports',code)(name=>imports[name]??(name.startsWith('node:')?require(name):(()=>{throw Error(`Unexpected dependency: ${name}`);})()),compiledModule,compiledModule.exports);
+  return compiledModule.exports;
 };
 const terms=compile('apps/api/src/lib/payment-terms.ts');
 const dates={'businessDateText':()=> '2026-10-12'};
