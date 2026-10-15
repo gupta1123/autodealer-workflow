@@ -9,6 +9,7 @@ import { SelectDropdown } from "@/components/ui/select-dropdown";
 import { apiFetch } from "@/lib/api-client";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
+import { readCustomerScopeMasters, type CustomerScopeMastersResult, type CustomerScopeMaster } from "@/lib/tally-customer-scope-masters";
 
 type Mode = "automatic" | "custom" | "strict";
 type Scope = {
@@ -21,8 +22,8 @@ type Scope = {
 };
 type Connection = { id: string; displayName?: string | null };
 type Company = { id: string; companyName: string; companyGuid?: string | null; financialYear?: string | null };
-type Master = { name: string; parent: string | null };
-type LiveMastersResult = { groups?: unknown; ledgers?: unknown; validatedAt?: unknown; fetchedAt?: unknown };
+type Master = CustomerScopeMaster;
+type LiveMastersResult = CustomerScopeMastersResult;
 
 const CARD = "rounded-xl border border-[#ded8d0] bg-white shadow-[0_1px_2px_rgba(52,42,32,0.04)]";
 const DEFAULT_SCOPE: Scope = {
@@ -40,16 +41,6 @@ function key(value: string | null | undefined) {
 
 function looksLikeCustomerGroup(group: Master) {
   return /debtor|receivable|customer|dealer|distributor/i.test(`${group.name} ${group.parent || ""}`);
-}
-
-function readMasters(value: unknown): Master[] {
-  return (Array.isArray(value) ? value : []).flatMap((item) => {
-    if (!item || typeof item !== "object") return [];
-    const record = item as Record<string, unknown>;
-    const name = typeof record.name === "string" ? record.name.trim() : "";
-    const parent = typeof record.parent === "string" && record.parent.trim() ? record.parent.trim() : null;
-    return name ? [{ name, parent }] : [];
-  });
 }
 
 function checkedLabel(value: LiveMastersResult) {
@@ -151,8 +142,10 @@ export function CashDiscountCustomerScopeSettings() {
         operation: "ledger_masters",
         payload: { requestedMasterTypes: ["ledger", "group"], ...(checkTally ? { requireFresh: true } : {}) },
       });
-      setGroups(readMasters(live.groups));
-      setLedgers(readMasters(live.ledgers));
+      const masters = readCustomerScopeMasters(live);
+      setGroups(masters.groups);
+      setLedgers(masters.ledgers);
+      setNotice("");
       setSource(checkTally ? "Checked with Tally just now" : checkedLabel(live));
     } catch (error) {
       setNotice(`${error instanceof Error ? error.message : "Could not read Tally."} Saved choices still apply; open the company in Tally and refresh to change groups.`);
