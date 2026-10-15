@@ -271,7 +271,7 @@ function isLiveTallyCompanyMatch(
 
 type DashboardPayload = {
   cache?: { source: string; updatedAt: string; stale: boolean; refreshError?: string };
-  scanSummary?: { complete: boolean; completed: number; total: number; elapsedMs: number; resumable?: boolean; reused?: number; failures: Array<{ ledgerName: string; error: string }> };
+  scanSummary?: { complete: boolean; completed: number; total: number; elapsedMs: number; resumable?: boolean; reused?: number; reconciliationPending?: boolean; failures: Array<{ ledgerName: string; error: string }> };
   setupRequired?: boolean;
   preview?: boolean;
   error?: string;
@@ -480,11 +480,12 @@ function Section({
   );
 }
 
-function SummaryCard({ count, label }: { count: number | string; label: string }) {
+function SummaryCard({ count, label, note }: { count: number | string; label: string; note?: string }) {
   return (
     <div className="rounded-xl border border-[#e0d8cc] bg-white px-4 py-3">
       <div className="text-xs font-medium text-[#5a5046]">{label}</div>
       <div className="mt-2 text-xl font-semibold tabular-nums tracking-tight text-[#1a1a1a] sm:text-2xl">{count}</div>
+      {note ? <div className="mt-1 text-[11px] text-[#8a7f72]">{note}</div> : null}
     </div>
   );
 }
@@ -1723,7 +1724,7 @@ export function CollectionsDashboardPage({
                 {liveCompanyCheckPending
                 ? "Checking Tally…"
                 : companyReady
-                  ? 'Verified'
+                  ? 'Tally connected'
                   : tallyCompanyMismatch
                     ? "Switch company in Tally"
                     : "Tally not ready"}
@@ -1765,7 +1766,7 @@ export function CollectionsDashboardPage({
           </div>
         </details> : null}
       </div>
-      {dashboard?.cache?.stale && dashboard?.scanSummary?.complete !== false ? <div role="status" className="mb-2 text-xs text-amber-800">Showing saved results. {dashboard.cache.refreshError ? `Could not refresh: ${dashboard.cache.refreshError}` : 'Updating from Tally…'}</div> : null}
+      {dashboard?.cache?.stale && dashboard?.scanSummary?.complete !== false ? <div role="status" className="mb-2 text-xs text-amber-800">Showing saved results. {dashboard.cache.refreshError ? `Could not refresh: ${dashboard.cache.refreshError}` : dashboard.scanSummary?.reconciliationPending ? 'Checking all customer bills in the connector. Totals may change; refresh after the check finishes.' : 'Updating from Tally…'}</div> : null}
       {dashboard?.scanSummary?.complete === false ? (
         <div role="alert" className="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">
           <p>{dashboard.scanSummary.completed}/{dashboard.scanSummary.total} customers checked. Remaining customers need review; no missing evidence has been treated as zero.</p>
@@ -1879,10 +1880,10 @@ export function CollectionsDashboardPage({
 
       {!companyContextLocked && !scanFailed && isDedicatedFollowUpsPage ? (
         <section aria-label="Payment follow-up summary" className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
-          <SummaryCard count={followUpKpis.needsFollowUp} label="To contact" />
-          <SummaryCard count={formatMoney(followUpKpis.outstanding)} label="Outstanding" />
-          <SummaryCard count={followUpKpis.escalated} label="Escalated" />
-          <SummaryCard count={followUpKpis.needsReview} label="Needs review" />
+          <SummaryCard count={followUpKpis.needsFollowUp} label="Overdue 1–30 days" note="Invoices" />
+          <SummaryCard count={formatMoney('confirmedOutstanding' in followUpKpis ? followUpKpis.confirmedOutstanding : followUpKpis.outstanding)} label={'confirmedOutstanding' in followUpKpis ? 'Outstanding (excluding review)' : 'Total outstanding'} note={'confirmedOutstanding' in followUpKpis ? `${followUpKpis.total-followUpKpis.needsReview} invoices` : 'Includes invoices needing review'} />
+          <SummaryCard count={followUpKpis.escalated} label="Overdue 31+ days" note="Invoices" />
+          <SummaryCard count={followUpKpis.needsReview} label="Needs review" note={'reviewOutstanding' in followUpKpis ? `${formatMoney(followUpKpis.reviewOutstanding)} outstanding` : 'Invoice details need checking'} />
         </section>
       ) : null}
 

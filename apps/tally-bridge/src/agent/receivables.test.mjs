@@ -107,6 +107,47 @@ test("nothing changed in Tally costs one counter read", async (t) => {
   assert.deepEqual(tally.requests, ["KalikaReceivableCounters"]);
 });
 
+test('enabling a customer loads existing invoices even when no voucher counter changes', async t => {
+  const {tally,preparer}=await setup(t);
+  tally.addVoucher({masterId:'91',type:'Sales',party:'New billwise customer',bill:'OLD-SALE',amount:'-475000.00',date:'20260410'});
+  await preparer.prepare(identity,'demo');
+  tally.parties.push('New billwise customer');
+  tally.bills['New billwise customer']=[{name:'OLD-SALE',closing:'-475000.00',date:'20260410'}];
+  tally.altMstId++;
+  const result=await preparer.checkForChanges(identity,'demo',{force:true,allowFullCheck:false});
+  assert.equal(result.customersChecked,1);
+  assert.match(await billsOf(preparer,'New billwise customer'),/OLD-SALE/);
+  assert.match(await vouchersOf(preparer,'New billwise customer'),/<MASTERID>91<\/MASTERID>/);
+});
+
+test('upgrading an old cache repairs omitted invoices without a Tally change', async t => {
+  const {storage,tally,preparer}=await setup(t);
+  tally.addVoucher({masterId:'92',type:'Sales',party:'Apex Traders',bill:'INV-1',amount:'-1000.00',date:'20260410'});
+  await preparer.prepare(identity,'demo');
+  await storage.call('replaceReceivableBills',{datasetKey:'demo',byLedger:{[receivableLedgerKey('Apex Traders')]:[]}});
+  const state=await storage.call('getReceivableState',{datasetKey:'demo'});
+  await storage.call('putReceivableState',{datasetKey:'demo',state:{...state,reconciliationVersion:0}});
+  tally.requests=[];
+  await preparer.checkForChanges(identity,'demo',{force:true,allowFullCheck:false});
+  assert.equal(tally.requests.includes('KalikaReceivableBills'),false);
+  assert.equal((await preparer.status('demo')).pendingFullBillCheck,true);
+  const repaired=await preparer.checkForChanges(identity,'demo',{force:true});
+  assert.equal(repaired.fullCheck,true);
+  assert.match(await billsOf(preparer,'Apex Traders'),/INV-1/);
+  assert.equal((await preparer.status('demo')).reconciliationVersion,1);
+  assert.equal((await preparer.status('demo')).pendingFullBillCheck,false);
+});
+
+test('periodic reconciliation catches missed bills even with unchanged Tally counters',async t=>{
+  const {storage,preparer,advance}=await setup(t);
+  await preparer.prepare(identity,'demo');
+  await storage.call('replaceReceivableBills',{datasetKey:'demo',byLedger:{[receivableLedgerKey('Apex Traders')]:[]}});
+  advance(3*60*60_000+1);
+  const result=await preparer.checkForChanges(identity,'demo',{force:true});
+  assert.equal(result.fullCheck,true);
+  assert.match(await billsOf(preparer,'Apex Traders'),/INV-1/);
+});
+
 test("created and edited vouchers update only the affected customer", async (t) => {
   const { tally, preparer } = await setup(t);
   await preparer.prepare(identity, "demo");

@@ -152,7 +152,9 @@ test("KPIs and counts equal what the page calculated from the full lists", () =>
     needsFollowUp: followUps.filter((item) => item.followUpStatus === "needs_follow_up").length,
     escalated: followUps.filter((item) => item.followUpStatus === "escalate").length,
     needsReview: followUps.filter((item) => item.followUpStatus === "needs_review").length,
-    outstanding: followUps.reduce((total, item) => total + (Number(item.outstandingAmount) || 0), 0),
+    outstanding: followUps.reduce((total, item) => total + Math.round((Number(item.outstandingAmount) || 0)*100), 0)/100,
+    confirmedOutstanding: followUps.filter(item=>item.followUpStatus!=='needs_review').reduce((total,item)=>total+Math.round((Number(item.outstandingAmount)||0)*100),0)/100,
+    reviewOutstanding: followUps.filter(item=>item.followUpStatus==='needs_review').reduce((total,item)=>total+Math.round((Number(item.outstandingAmount)||0)*100),0)/100,
   });
   const pending = source.tabs.debitNoteQueue.filter(isPendingDebitNote);
   assert.equal(summary.pending.all, pending.length);

@@ -15,6 +15,7 @@ import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallySc
   recordConnectorTallyRead, CASH_DISCOUNT_READ_MS, CASH_DISCOUNT_SCAN_MS,
   CASH_DISCOUNT_RESULT_BYTES } from "./cash-discount-runtime.mjs";
 import { createLocalAgentRuntime } from "./agent/runtime.mjs";
+import { RECEIVABLE_RECONCILIATION_VERSION } from "./agent/receivables.mjs";
 import { billFields, voucherFields, openBillAmountIndexFromFields, openBillFromFields, openBillsByLedgerFromFields } from "./agent/receivable-fields.mjs";
 import { buildLiveCashDiscountDashboard } from "./collections-analysis/cash-discount-live-dashboard.mjs";
 import { collectionPaymentRequirement } from "./collections-analysis/payment-terms.mjs";
@@ -5741,16 +5742,28 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
       billExport = await exportCashDiscountOpenBillsFirst(config, resolvedCompany, dateRange, onProgress);
       // Pending Bills omit fully settled customers. Read only the small
       // voucher header fields to discover RTGS invoices for CD review.
-      const headers = await exportTallyCollection(config.tallyUrl, {
-        collectionName: 'Kalika CD Invoice Headers', tallyType: 'Voucher',
-        fetchFields: 'PartyLedgerName,Narration,VoucherTypeName,IsCancelled,IsOptional',
-        companyName: resolvedCompany, dateFrom: dateRange.dateFrom, dateTo: dateRange.dateTo,
-      });
-      const closedCandidateNames = extractBlocks(headers, 'VOUCHER').filter(block =>
-        !/^yes$/i.test(getTagText(block, 'ISCANCELLED') || '') && !/^yes$/i.test(getTagText(block, 'ISOPTIONAL') || '') &&
-        /sales|invoice/i.test(getTagText(block, 'VOUCHERTYPENAME') || '') &&
-        /\b(?:ADVANCE|SAME[ -]DAY)\s+RTGS\b/i.test(getTagText(block, 'NARRATION') || '')
-      ).map(block => getTagText(block, 'PARTYLEDGERNAME')).filter(Boolean);
+      const closedCandidateNames = [];
+      const headerChunks = cashDiscountVoucherDateChunks(dateRange.dateFrom, dateRange.dateTo);
+      while (headerChunks.length) {
+        checkReadBudget();
+        const chunk = headerChunks.shift();
+        try {
+          const headers = await exportTallyCollection(config.tallyUrl, {
+            collectionName: 'Kalika CD Invoice Headers', tallyType: 'Voucher',
+            fetchFields: 'PartyLedgerName,Narration,VoucherTypeName,IsCancelled,IsOptional',
+            companyName: resolvedCompany, ...chunk,
+          });
+          closedCandidateNames.push(...extractBlocks(headers, 'VOUCHER').filter(block =>
+            !/^yes$/i.test(getTagText(block, 'ISCANCELLED') || '') && !/^yes$/i.test(getTagText(block, 'ISOPTIONAL') || '') &&
+            /sales|invoice/i.test(getTagText(block, 'VOUCHERTYPENAME') || '') &&
+            /\b(?:ADVANCE|SAME[ -]DAY)\s+RTGS\b/i.test(getTagText(block, 'NARRATION') || '')
+          ).map(block => getTagText(block, 'PARTYLEDGERNAME')).filter(Boolean));
+        } catch (error) {
+          const smaller = splitDateChunk(chunk);
+          if (!smaller || (!isTallyExportTimeout(error) && !/exceeded the safe Cash Discount size limit/i.test(error.message || ''))) throw error;
+          headerChunks.unshift(...smaller);
+        }
+      }
       candidateLedgerNames = Array.from(new Set(
         [...closedCandidateNames, ...extractBlocks(billExport.xml, "BILL")
           .filter((block) => {
@@ -5891,7 +5904,7 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
   const snapshot = {
     companyGuid,
     cache: prepared
-      ? { source: 'prepared_customer_dues', updatedAt: prepared.state?.checkedAt || new Date().toISOString(), stale: false }
+      ? { source: 'prepared_customer_dues', updatedAt: prepared.state?.checkedAt || new Date().toISOString(), stale: Boolean(prepared.state?.pendingFullBillCheck || prepared.state?.reconciliationVersion !== RECEIVABLE_RECONCILIATION_VERSION) }
       : { source: 'live_tally', updatedAt: new Date().toISOString(), stale: false },
     companyName: resolvedCompany,
     financialYear: dateRange.financialYear,
@@ -5899,7 +5912,7 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
     dateTo: dateRange.dateTo,
     ledgers: verifiedLedgers.map(cashDiscountLiveLedger),
     openBillsResult,
-    scanSummary: { complete: ledgerResults.complete, completed: ledgerResults.completedCount,
+    scanSummary: { reconciliationPending: Boolean(prepared && (prepared.state?.pendingFullBillCheck || prepared.state?.reconciliationVersion !== RECEIVABLE_RECONCILIATION_VERSION)), complete: ledgerResults.complete, completed: ledgerResults.completedCount,
       total: ledgersToScan.length, failures: ledgerResults.failures, reused: ledgerResults.reusedCount,
       resumable: Boolean(cacheScope && !ledgerResults.complete), elapsedMs: Math.round(performance.now() - scanStarted),
       stepMs,

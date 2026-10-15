@@ -20,7 +20,7 @@ import { AGENT_CAPABILITIES, AGENT_PROTOCOL_VERSION, AGENT_VERSION, LOCAL_SCHEMA
 import { assertAgentIdentity, identityFromCommand, datasetKey, normalizeFinancialYear } from "./identity.mjs";
 import { resourceSnapshot } from "./resource-policy.mjs";
 import { automaticCatalogueSyncPlan } from "./sync-policy.mjs";
-import { ReceivablesPreparer, financialYearRange } from "./receivables.mjs";
+import { ReceivablesPreparer, financialYearRange, RECEIVABLE_RECONCILIATION_VERSION } from "./receivables.mjs";
 
 const AGENT_COMMANDS = new Set([
   "agent_sync_dataset",
@@ -428,7 +428,7 @@ export class LocalAgentRuntime {
       invoke: (xml, options) => this.directGateway.invoke(xml, options),
     }).catch((error) => { if (requireFresh) throw error; this.onLog?.("warn", `Customer dues check before scan: ${error.message}`); });
     const checkedState = await this.storage.call('getReceivableState', { datasetKey: key });
-    if (requireFresh && (!check || checkedState?.status !== 'ready' || checkedState.pendingFullBillCheck || checkedState.deepCheckFromAlterId != null)) throw new Error('Customer dues are still being verified. Automatic reminders will wait for fresh Tally evidence.');
+    if (requireFresh && (!check || checkedState?.status !== 'ready' || checkedState.pendingFullBillCheck || checkedState.deepCheckFromAlterId != null || checkedState.reconciliationVersion !== RECEIVABLE_RECONCILIATION_VERSION)) throw new Error('Customer dues are still being verified. Automatic reminders will wait for fresh Tally evidence.');
     // Scans, reminder checks and bank matching all answer from the dues held
     // in memory (loaded once, reloaded only after the dues change).
     const snapshot = await this.receivables.loadSnapshot(key);

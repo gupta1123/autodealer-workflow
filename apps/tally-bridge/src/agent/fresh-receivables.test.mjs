@@ -5,7 +5,7 @@ import {financialYearRange} from './receivables.mjs';
 function runtime(check,statePatch={}) {
   const agent=Object.create(LocalAgentRuntime.prototype);
   agent.activeIdentity={organizationId:'org',installationId:'install',companyGuid:'guid',companyName:'Company',financialYear:'2026-27'};
-  agent.storage={call:async()=>({status:'ready',financialYear:financialYearRange('2026-27').label,...statePatch})};
+  agent.storage={call:async()=>({status:'ready',financialYear:financialYearRange('2026-27').label,reconciliationVersion:1,...statePatch})};
   agent.receivables={checkForChanges:check,loadSnapshot:async()=>({allBills:()=>[],recordsFor:()=>({}),cashDiscountLedgerNames:()=>['Settled customer']})};
   agent.directGateway={invoke:async()=>{}};
   return agent;
@@ -21,4 +21,8 @@ test('automatic discovery returns dues only after a successful current check',as
   const result=await runtime(async()=>({changed:0})).preparedReceivablesFor({companyName:'Company',financialYear:'2026-27',requireFresh:true});
   assert.deepEqual(await result.allBills(),[]);
   assert.deepEqual(result.cashDiscountLedgerNames(),['Settled customer']);
+});
+
+test('automatic discovery waits for reconciliation after a connector upgrade', async () => {
+  await assert.rejects(runtime(async()=>({changed:0}),{reconciliationVersion:0}).preparedReceivablesFor({companyName:'Company',requireFresh:true}), /still being verified/);
 });

@@ -198,13 +198,16 @@ export function summarizeCollections(dashboard: Dashboard | null | undefined) {
   const pending = proposalList.filter(isPendingDebitNote);
   const created = proposalList.filter(isCreatedDebitNote);
   const count = (rows: Row[], test: (row: Row) => boolean) => rows.reduce((total, row) => total + (test(row) ? 1 : 0), 0);
+  const money = (rows: Row[]) => rows.reduce((total, row) => total + Math.round(number(row.outstandingAmount) * 100), 0) / 100;
   return {
     followUps: {
       total: followUpList.length,
       needsFollowUp: count(followUpList, (row) => row.followUpStatus === "needs_follow_up"),
       escalated: count(followUpList, (row) => row.followUpStatus === "escalate"),
       needsReview: count(followUpList, (row) => row.followUpStatus === "needs_review"),
-      outstanding: followUpList.reduce((total, row) => total + number(row.outstandingAmount), 0),
+      outstanding: money(followUpList),
+      confirmedOutstanding: money(followUpList.filter(row => row.followUpStatus !== 'needs_review')),
+      reviewOutstanding: money(followUpList.filter(row => row.followUpStatus === 'needs_review')),
     },
     pending: {
       all: pending.length,

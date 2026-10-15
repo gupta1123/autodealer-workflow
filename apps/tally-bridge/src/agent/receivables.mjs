@@ -13,6 +13,7 @@
 
 import { RESOURCE_LIMITS, resourceSnapshot, shouldPauseBackgroundWork } from "./resource-policy.mjs";
 import { billFields, voucherFields } from "./receivable-fields.mjs";
+export const RECEIVABLE_RECONCILIATION_VERSION = 1;
 
 const XML_ESCAPE = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" };
 function escapeXml(value) { return String(value ?? "").replace(/[&<>"']/g, (character) => XML_ESCAPE[character]); }
@@ -556,6 +557,7 @@ export class ReceivablesPreparer {
         status: "ready", companyName, financialYear: range.label, dateFrom: range.dateFrom, dateTo: range.dateTo, evidenceFrom,
         watermark: resume.counters.altVchId, masterWatermark: resume.counters.altMstId,
         debtors, preparedAt: now, checkedAt: now, lastFullBillCheckAt: now, counts,
+        reconciliationVersion: RECEIVABLE_RECONCILIATION_VERSION,
         // Bills read before an interruption may be out of date; the next
         // background check re-reads every customer's bills.
         ...(resuming ? { pendingFullBillCheck: true, deepCheckFromAlterId: resume.counters.altVchId, lastFullBillCheckAt: resume.startedAt } : {}),
@@ -639,14 +641,17 @@ export class ReceivablesPreparer {
     const today = new Date(this.now()).toISOString().slice(0, 10);
     const counters = await this.readCounters(companyName);
     let debtors = state.debtors || [];
+    const repairRequired = state.reconciliationVersion !== RECEIVABLE_RECONCILIATION_VERSION;
+    const previousDebtors = new Set(debtors.map(receivableLedgerKey));
     if (counters.altVchId < Number(state.watermark || 0)) {
       // Counters went backwards: the company was restored from a backup.
       this.onLog?.("info", "Tally company data was restored; checking customer dues again.");
       return this.#prepare(identity, datasetKey);
     }
-    if (counters.altMstId !== Number(state.masterWatermark || 0)) {
+    if (repairRequired || counters.altMstId !== Number(state.masterWatermark || 0)) {
       debtors = await this.readDebtors(companyName);
     }
+    const addedDebtors = debtors.filter(name => !previousDebtors.has(receivableLedgerKey(name)));
     const debtorKeys = new Set(debtors.map(receivableLedgerKey));
     const nameByKey = new Map(debtors.map((name) => [receivableLedgerKey(name), name]));
     const moved = counters.altVchId - Number(state.watermark || 0);
@@ -656,8 +661,10 @@ export class ReceivablesPreparer {
     const deepFrom = state.deepCheckFromAlterId ?? null;
     // The deep sweep and full bill re-check run together, in the background
     // only, when something could not be found in the recent days.
-    const deepPending = allowFullCheck && fullCheckIntervalElapsed && (deepFrom !== null || state.pendingFullBillCheck === true);
-    if (moved <= 0 && !deepPending) {
+    const reconciliationDue = repairRequired || fullCheckIntervalElapsed;
+    const deepPending = allowFullCheck && reconciliationDue;
+    if (reconciliationDue && !allowFullCheck) next.pendingFullBillCheck = true;
+    if (moved <= 0 && !deepPending && !addedDebtors.length) {
       await this.storage.call("putReceivableState", { datasetKey, state: next });
       return { changed: 0 };
     }
@@ -675,7 +682,7 @@ export class ReceivablesPreparer {
       : { blocks: [], requests: 0 };
     const blocksChanged = [...recent.blocks, ...deep.blocks];
     const vouchers = blocksChanged.map((block) => this.customerVoucher(block, debtorKeys));
-    const affected = new Set(vouchers.flatMap((voucher) => voucher.ledgerKeys));
+    const affected = new Set([...vouchers.flatMap((voucher) => voucher.ledgerKeys), ...addedDebtors.map(receivableLedgerKey)]);
     // An edit can move a voucher away from a customer; re-check that one too.
     for (const voucher of vouchers) {
       for (const key of await this.storage.call("listReceivableVoucherLedgerKeys", { datasetKey, masterId: voucher.masterId })) affected.add(key);
@@ -711,7 +718,7 @@ export class ReceivablesPreparer {
     // every customer whose bills changed and replace their set; the deleted
     // ones drop out. (A deleted receipt that was never allocated to a bill
     // does not change bills; the weekly full check covers that case.)
-    const voucherRecheck = [...new Set(billsChanged)].map((key) => nameByKey.get(key)).filter(Boolean);
+    const voucherRecheck = [...new Set([...billsChanged, ...addedDebtors.map(receivableLedgerKey)])].map((key) => nameByKey.get(key)).filter(Boolean);
     for (let offset = 0; offset < voucherRecheck.length; offset += 10) {
       const batch = voucherRecheck.slice(offset, offset + 10);
       // From the earliest open bill, so earlier-year evidence is kept.
@@ -725,6 +732,7 @@ export class ReceivablesPreparer {
       next.lastFullBillCheckAt = new Date(this.now()).toISOString();
       next.pendingFullBillCheck = false;
       next.deepCheckFromAlterId = null;
+      next.reconciliationVersion = RECEIVABLE_RECONCILIATION_VERSION;
     }
     if (suspectedDeletion && !fullCheckDue) {
       next.pendingFullBillCheck = true;
