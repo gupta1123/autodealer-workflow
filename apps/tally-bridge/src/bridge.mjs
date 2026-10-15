@@ -15,9 +15,9 @@ import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallySc
   recordConnectorTallyRead, CASH_DISCOUNT_READ_MS, CASH_DISCOUNT_SCAN_MS,
   CASH_DISCOUNT_RESULT_BYTES } from "./cash-discount-runtime.mjs";
 import { createLocalAgentRuntime } from "./agent/runtime.mjs";
-import { openBillAmountIndexFromFields, openBillFromFields, openBillsByLedgerFromFields } from "./agent/receivable-fields.mjs";
+import { billFields, voucherFields, openBillAmountIndexFromFields, openBillFromFields, openBillsByLedgerFromFields } from "./agent/receivable-fields.mjs";
 import { buildLiveCashDiscountDashboard } from "./collections-analysis/cash-discount-live-dashboard.mjs";
-import { classifyPaymentNarration } from "./collections-analysis/payment-terms.mjs";
+import { collectionPaymentRequirement } from "./collections-analysis/payment-terms.mjs";
 import { businessDateText } from "./collections-analysis/business-date.mjs";
 import { collectionRowsById, collectionRowsByInvoice, dashboardShell, queryCollections } from "./collections-analysis/collections-query.mjs";
 import { powershellProtectedData } from "./agent/key-vault.mjs";
@@ -48,7 +48,7 @@ const CASH_DISCOUNT_LOW_MEMORY_UNION_BATCH_SIZE = 25;
 const CASH_DISCOUNT_MAX_VOUCHER_CHUNKS = 60;
 const CASH_DISCOUNT_READINESS_REUSE_MS = 5_000;
 const CASH_DISCOUNT_VOUCHER_FIELDS =
-  "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount";
+  "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,GUID,IsCancelled,IsOptional,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount";
 const LEGACY_CONFIG_DIR = path.join(os.homedir(), ".autodealer-tally-bridge");
 const CONFIG_DIR = path.join(
   process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"),
@@ -5081,7 +5081,7 @@ async function exportTargetedOpenBillXml(
       collectionName: "Autodealer Customer Open Bills",
       tallyType: "Bill",
       fetchFields:
-        "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
+        "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,BillCreditPeriod,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
       companyName,
       dateFrom,
       dateTo: asOfDate,
@@ -5100,7 +5100,7 @@ async function exportTargetedOpenBillXml(
       collectionName: `Autodealer Customer Open Bills ${index + 1}`,
       tallyType: "Bill",
       fetchFields:
-        "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
+        "Name,Parent,LedgerName,PartyLedgerName,BillType,TypeOfRef,Date,BillDate,DueDate,BillCreditPeriod,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount",
       companyName,
       dateFrom,
       dateTo: asOfDate,
@@ -5192,8 +5192,9 @@ async function exportTargetedBillEvidenceXml(
   };
 }
 
-// Missing open bills are not proof of payment. Require one exact Sales New Ref
-// and a balanced set of signed Receipt/Payment Agst Ref allocations.
+// Missing open bills are not proof of payment. Require one exact Sales source
+// and balanced signed allocations. With pre-invoice receipts Tally puts New
+// Ref on the receipt and Agst Ref on the later Sales voucher.
 export function verifyReminderAllocationXml(xml, ledgerName, invoice, invoiceDate) {
   let original = 0, credited = 0, sources = 0, allocations = 0, invalid = false;
   for (const voucher of extractBlocks(xml, "VOUCHER")) {
@@ -5207,9 +5208,9 @@ export function verifyReminderAllocationXml(xml, ledgerName, invoice, invoiceDat
         const kind = getTagText(allocation, "BILLTYPE");
         if (amount === null || !Number.isFinite(amount)) { invalid = true; continue; }
         const cents = Math.round(amount * 100);
-        if (/^new ref$/i.test(kind) && /^sales$/i.test(type) && cents < 0 && parseTallyDate(getTagText(voucher, "DATE")) === invoiceDate) {
+        if (/^(new ref|agst ref)$/i.test(kind) && /^sales$/i.test(type) && cents < 0 && parseTallyDate(getTagText(voucher, "DATE")) === invoiceDate) {
           sources++; original -= cents;
-        } else if (/^agst ref$/i.test(kind) && /^(receipt|payment)$/i.test(type)) {
+        } else if (/^(agst ref|new ref|advance)$/i.test(kind) && /^(receipt|payment)$/i.test(type)) {
           credited += cents; allocations++;
         } else invalid = true;
       }
@@ -5306,8 +5307,8 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
   // Cash Discount calculation always needs invoice narration and receipt
   // allocation evidence. For other consumers, retain the narrower structural
   // fallback behaviour.
-  const evidenceLedgerNames = dependencies.forceVoucherEvidence && billBlocks.length > 0
-    ? Array.from(new Set(billBlocks.map(billLedgerName)))
+  const evidenceLedgerNames = dependencies.forceVoucherEvidence
+    ? ledgerNames
     : fallbackLedgerNames;
   const earliestDate = earliestBillDate(dependencies.forceVoucherEvidence ? billBlocks : fallbackBlocks);
   const evidenceDateFrom = dependencies.forceVoucherEvidence
@@ -5337,65 +5338,7 @@ async function fetchCustomerOpenBillsFromTally(config, commandPayload = {}, depe
           exportCollection
         )
     : { xml: "", batchCount: 0 });
-  const {
-    narrationByBill,
-    receiptEvidenceByBill,
-    salesLedgerByBill,
-    invoiceReferenceKeys,
-    advanceReferenceKeys,
-  } = indexInvoiceNarrations(voucherExport.xml, requestedLedgerByKey);
-  const byLedger = Object.fromEntries(ledgerNames.map((ledgerName) => [ledgerName, emptyOpenBillBucket(ledgerName)]));
-
-  for (const block of billBlocks) {
-    const rowLedgerName = billLedgerName(block);
-    const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(rowLedgerName));
-    if (!requestedLedgerName) continue;
-
-    const referenceName = getAttribute(block, "NAME") || getTagText(block, "NAME") || getTagText(block, "BILLREF");
-    const referenceKey = openBillNarrationKey(requestedLedgerName, referenceName);
-    const entry = toOpenBill(block, requestedLedgerName, {
-      knownInvoice: invoiceReferenceKeys.has(referenceKey),
-      knownAdvance: advanceReferenceKeys.has(referenceKey),
-    });
-    if (!entry) continue;
-
-    if (entry.kind === "bill") {
-      entry.narration =
-        narrationByBill.get(openBillNarrationKey(requestedLedgerName, entry.referenceName)) ||
-        narrationByBill.get(openBillNarrationKey(requestedLedgerName, entry.voucherNumber)) ||
-        null;
-      entry.sourceSalesLedgerName =
-        salesLedgerByBill.get(openBillNarrationKey(requestedLedgerName, entry.referenceName)) ||
-        salesLedgerByBill.get(openBillNarrationKey(requestedLedgerName, entry.voucherNumber)) ||
-        null;
-      const receiptEvidence =
-        receiptEvidenceByBill.get(openBillNarrationKey(requestedLedgerName, entry.referenceName)) ||
-        receiptEvidenceByBill.get(openBillNarrationKey(requestedLedgerName, entry.voucherNumber)) ||
-        null;
-      entry.receiptDate = receiptEvidence?.lastReceiptDate || null;
-      entry.matchedReceiptAmount = receiptEvidence?.matchedReceiptAmount || null;
-      if (receiptEvidence && entry.originalAmount > 0) {
-        const settledAmount = Math.min(entry.originalAmount, Math.max(0, receiptEvidence.matchedReceiptAmount));
-        entry.settledAmount = settledAmount;
-        // Some Tally releases expose a Bill collection's original balance even
-        // after a receipt has been allocated. The allocation in the Receipt
-        // voucher is definitive, so derive the remaining balance from it.
-        entry.pendingAmount = Math.max(0, Number((entry.originalAmount - settledAmount).toFixed(2)));
-      }
-    }
-
-    if (entry.kind === "bill" && entry.pendingAmount <= 0.01) continue;
-
-    const { kind, ...openBillEntry } = entry;
-    const bucket = byLedger[requestedLedgerName] || emptyOpenBillBucket(requestedLedgerName);
-    bucket.rawCount += 1;
-    if (kind === "advance") {
-      bucket.existingAdvances.push(openBillEntry);
-    } else {
-      bucket.openBills.push(openBillEntry);
-    }
-    byLedger[requestedLedgerName] = bucket;
-  }
+  const { byLedger } = openBillsByLedgerFromFields(ledgerNames, billBlocks.map(billFields), extractBlocks(voucherExport.xml, 'VOUCHER').map(voucherFields));
 
   const firstLedgerName = ledgerNames[0];
   const firstLedgerBucket = byLedger[firstLedgerName] || emptyOpenBillBucket(firstLedgerName);
@@ -5682,7 +5625,7 @@ async function exportCashDiscountOpenBillsFirst(config, companyName, dateRange, 
   });
   const names = extractNamedCollectionNames(directory, 'LEDGER');
   const pendingFilterName = "KalikaCashDiscountPendingBill";
-  const fields = 'Name,Parent,LedgerName,PartyLedgerName,IsAdvance,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount';
+  const fields = 'Name,Parent,LedgerName,PartyLedgerName,IsAdvance,BillType,TypeOfRef,Date,BillDate,DueDate,BillCreditPeriod,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount';
   return readScopedOpenBills({
     names, check: dependencies.check || checkReadBudget, freeMemory: dependencies.freeMemory || (() => os.freemem()),
     batchLimit: dependencies.batchLimit || cashDiscountNativeUnionBatchSize, progress: onProgress,
@@ -5712,6 +5655,7 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
   }
   checkReadBudget();
   const workflowCacheScope = {
+    calculationVersion: 'collections_rtgs_v4',
     companyName: String(companyName || "").trim(),
     financialYear: String(financialYear || proposal?.financialYear || "").trim(),
     customerScope: customerScope || null,
@@ -5776,7 +5720,7 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
       collectionName: "Kalika Cash Discount Customer Bills",
       tallyType: "Bills",
       childOf: tallyFormulaString(requestedLedgerName),
-      fetchFields: "Name,Parent,LedgerName,IsAdvance,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance",
+      fetchFields: "Name,Parent,LedgerName,IsAdvance,BillType,TypeOfRef,Date,BillDate,DueDate,BillCreditPeriod,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance",
       companyName: resolvedCompany,
       dateTo: dateRange.dateTo,
     });
@@ -5789,20 +5733,32 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
     if (prepared) {
       // Customer dues are held as fields in memory: no XML to read.
       preparedBills = await prepared.allBills();
-      candidateLedgerNames = Array.from(new Set(preparedBills
+      candidateLedgerNames = Array.from(new Set([...prepared.cashDiscountLedgerNames(), ...preparedBills
         .filter((bill) => Boolean(bill.ledger && openBillFromFields(bill, bill.ledger)))
         .map((bill) => bill.ledger)
-        .filter(Boolean)));
+        .filter(Boolean)]));
     } else {
       billExport = await exportCashDiscountOpenBillsFirst(config, resolvedCompany, dateRange, onProgress);
+      // Pending Bills omit fully settled customers. Read only the small
+      // voucher header fields to discover RTGS invoices for CD review.
+      const headers = await exportTallyCollection(config.tallyUrl, {
+        collectionName: 'Kalika CD Invoice Headers', tallyType: 'Voucher',
+        fetchFields: 'PartyLedgerName,Narration,VoucherTypeName,IsCancelled,IsOptional',
+        companyName: resolvedCompany, dateFrom: dateRange.dateFrom, dateTo: dateRange.dateTo,
+      });
+      const closedCandidateNames = extractBlocks(headers, 'VOUCHER').filter(block =>
+        !/^yes$/i.test(getTagText(block, 'ISCANCELLED') || '') && !/^yes$/i.test(getTagText(block, 'ISOPTIONAL') || '') &&
+        /sales|invoice/i.test(getTagText(block, 'VOUCHERTYPENAME') || '') &&
+        /\b(?:ADVANCE|SAME[ -]DAY)\s+RTGS\b/i.test(getTagText(block, 'NARRATION') || '')
+      ).map(block => getTagText(block, 'PARTYLEDGERNAME')).filter(Boolean);
       candidateLedgerNames = Array.from(new Set(
-        extractBlocks(billExport.xml, "BILL")
+        [...closedCandidateNames, ...extractBlocks(billExport.xml, "BILL")
           .filter((block) => {
             const ledgerName = billLedgerName(block);
             return Boolean(ledgerName && toOpenBill(block, ledgerName));
           })
           .map(billLedgerName)
-          .filter(Boolean)
+          .filter(Boolean)]
       ));
     }
     const benchmarkLedgerLimit = Number(process.env.KALIKA_CASH_DISCOUNT_BENCHMARK_LEDGER_LIMIT);
@@ -5894,8 +5850,8 @@ async function collectCashDiscountLiveSnapshot(config, operation, companyName, p
       return [normalizeLooseName(ledger.name)];
     }
     const bucket = openBillsResult.result?.byLedger?.[ledger.name];
-    const hasSalesEvidence = Array.isArray(bucket?.openBills) &&
-      bucket.openBills.some((bill) => Boolean(String(bill?.sourceSalesLedgerName || "").trim()));
+    const hasSalesEvidence = [...(bucket?.openBills || []), ...(bucket?.settledBills || [])]
+      .some((bill) => Boolean(String(bill?.sourceSalesLedgerName || "").trim()));
     return hasSalesEvidence ? [normalizeLooseName(ledger.name)] : [];
   }));
   const verifiedLedgers = ledgersToScan.filter((ledger) => verifiedLedgerKeys.has(normalizeLooseName(ledger.name)));
@@ -8220,6 +8176,7 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
         }
         if (operation === "fetch_customer_open_bills") {
           const openBillScope = {
+            calculationVersion: 'collections_rtgs_v4',
             companyName: message.companyName,
             companyGuid: config.__agentRuntime?.activeIdentity?.companyGuid || null,
             financialYear: message.financialYear || config.__agentRuntime?.activeIdentity?.financialYear || null,
@@ -8305,12 +8262,12 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
           // the server's own code, and sends only that instead of every open bill.
           const context = message.analysisContext;
           if (message.payload?.automaticDiscovery && snapshot?.openBillsResult) {
-            // Only the two agreed categories cross the service channel. The
+            // Only overdue invoices with unambiguous terms cross this channel. The
             // backend still evaluates deadlines and verifies each send afresh.
             const source = snapshot.openBillsResult.result || snapshot.openBillsResult;
             const byLedger = Object.fromEntries(Object.entries(source.byLedger || {}).flatMap(([name,bucket]) => {
-              const openBills = (bucket.openBills || []).filter(bill => classifyPaymentNarration(bill.narration).category);
-              return openBills.length ? [[name,{...bucket,openBills,existingAdvances:[]}]] : [];
+              const openBills = (bucket.openBills || []).filter(bill => { const rule = collectionPaymentRequirement(bill.narration, bill.invoiceDate); return rule && businessDateText() > rule.deadline && !bill.invoiceEvidenceAmbiguous; });
+              return openBills.length ? [[name,{...bucket,openBills,settledBills:[],existingAdvances:[]}]] : [];
             }));
             return {...snapshot,ledgers:(snapshot.ledgers || []).filter(ledger => byLedger[ledger.name]),openBillsResult:{result:{byLedger}}};
           }

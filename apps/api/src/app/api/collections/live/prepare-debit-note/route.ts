@@ -7,7 +7,7 @@ import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { readTallyOpenBills } from "@/lib/collections-dashboard";
 import { businessDateText } from "@/lib/business-date";
-import { analyseCashDiscountNarration } from "@/lib/cash-discount-narration";
+import { analyseCashDiscountNarration, isCashDiscountRecoveryStatus } from "@/lib/cash-discount-narration";
 import { isNonSalesVoucher } from '@/lib/payment-terms';
 import { toNumber, toText } from "@/lib/collections";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -88,14 +88,14 @@ async function POSTHandler(request: Request) {
       return jsonWithCors(request, { error: "The selected Tally company is no longer live." }, { status: 409 });
     }
 
-    const matchingBill = readTallyOpenBills(openBillsResult).find(
+    const matchingBill = readTallyOpenBills(openBillsResult, true).find(
       (row) => normalized(row.ledgerName) === normalized(partyLedgerName) &&
         [row.bill.referenceName, row.bill.voucherNumber].some((value) => normalized(value) === normalized(linkedInvoiceNumber))
     );
     if (!matchingBill) {
       return jsonWithCors(
         request,
-        { error: "The invoice is no longer open in Tally. Refresh Cash Discounts and review it again." },
+        { error: "The invoice could not be verified in the latest Tally evidence. Refresh Cash Discounts and review it again." },
         { status: 409 }
       );
     }
@@ -105,7 +105,7 @@ async function POSTHandler(request: Request) {
     const pendingAmount = toNumber(bill.pendingAmount);
     const invoiceDate = nullableText(bill.invoiceDate, 20);
     const today = businessDateText();
-    if (bill.kind === "advance" || isNonSalesVoucher(bill.sourceVoucherType) || originalAmount <= 0 || pendingAmount <= 0) {
+    if (bill.kind === "advance" || isNonSalesVoucher(bill.sourceVoucherType) || originalAmount <= 0 || pendingAmount < 0) {
       return jsonWithCors(request, { error: "The invoice is no longer eligible for a Debit Note." }, { status: 409 });
     }
 
@@ -116,9 +116,10 @@ async function POSTHandler(request: Request) {
       pendingAmount,
       receiptDate: bill.receiptDate,
       matchedReceiptAmount: toNumber(bill.matchedReceiptAmount, Number.NaN),
+      invoiceEvidenceAmbiguous: bill.invoiceEvidenceAmbiguous,
       today,
     });
-    if (analysis.deterministicStatus !== "unpaid_discount_tier_expired") {
+    if (!isCashDiscountRecoveryStatus(analysis.deterministicStatus)) {
       return jsonWithCors(
         request,
         { error: `The latest Tally data is not eligible for a Debit Note: ${analysis.deterministicReason}` },
@@ -156,7 +157,7 @@ async function POSTHandler(request: Request) {
 
     const ledger = ledgers.find((entry) => normalized(entry.name) === normalized(matchingBill.ledgerName));
     const raw = ledger?.raw && typeof ledger.raw === "object" ? ledger.raw : {};
-    const isTierReversal = analysis.deterministicStatus === "unpaid_discount_tier_expired";
+    const isTierReversal = isCashDiscountRecoveryStatus(analysis.deterministicStatus);
     const referenceSuffix = isTierReversal
       ? `T${analysis.reversalPlan?.activeDiscount?.eligibilityDays ?? "FINAL"}`
       : "SHORT";

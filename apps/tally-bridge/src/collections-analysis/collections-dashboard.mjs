@@ -1,7 +1,7 @@
 // GENERATED from apps/api/src/lib/collections-dashboard.ts by scripts/build-connector-collections-analysis.mjs.
 // Do not edit: change the source and run the script.
 import { businessDateText } from "./business-date.mjs";
-import { currentCashDiscountEligibility, } from "./cash-discount-narration.mjs";
+import { isCashDiscountRecoveryStatus, } from "./cash-discount-narration.mjs";
 import { toNumber, toText, } from "./collections.mjs";
 import { derivePaymentFollowUpTiming, } from "./payment-follow-up.mjs";
 export function normalizeLedgerName(value) {
@@ -84,20 +84,18 @@ export function serializeTallyCandidate(params) {
     const partyContactPerson = readRawText(raw, "contactPerson", 240);
     const partyAddress = readRawText(raw, "address", 1000);
     const amountReceived = originalAmount > 0 ? Math.max(originalAmount - pendingAmount, 0) : null;
-    const isUnpaidTierReversal = params.analysis.deterministicStatus === "unpaid_discount_tier_expired";
+    const isUnpaidTierReversal = isCashDiscountRecoveryStatus(params.analysis.deterministicStatus);
     const stagedReversalAmount = Math.max(0, toNumber(params.stagedReversalAmount ??
         params.analysis.reversalPlan?.totalReversalRequired));
     const sourceSalesLedgerName = toText(params.bill.sourceSalesLedgerName, 500) || null;
     // The source invoice is recorded net of the best narrated discount. A
     // debit note therefore raises only the calculated reversal, never the
     // original invoice's currently-unpaid balance.
-    // A partial receipt is reconciled against the invoice amount recorded in
-    // Tally, so the recoverable debit note is the actual remaining shortfall.
-    // Gross-up is only used for a fully unpaid invoice that was recorded net of
-    // its best narrated discount.
+    // The full category CD is reversed when its full-payment condition fails,
+    // regardless of partial receipts. Collection remains the Tally balance.
     const expectedDiscount = params.analysis.reversalPlan?.totalReversalRequired ?? stagedReversalAmount;
     const recoverableAmount = stagedReversalAmount;
-    const canCreateDebitNote = params.analysis.deterministicStatus === "unpaid_discount_tier_expired" &&
+    const canCreateDebitNote = isCashDiscountRecoveryStatus(params.analysis.deterministicStatus) &&
         recoverableAmount > 0 &&
         Boolean(sourceSalesLedgerName);
     const termsLabel = params.analysis.termsLabel ?? "Narrated cash discount";
@@ -209,119 +207,33 @@ export function serializePaymentFollowUp(params) {
     const originalInvoiceAmount = toNumber(params.bill.originalAmount);
     const outstandingAmount = toNumber(params.bill.pendingAmount);
     const amountReceived = Math.max(originalInvoiceAmount - outstandingAmount, 0);
-    const invoiceDate = String(params.bill.invoiceDate ?? "").slice(0, 10) || null;
+    const invoiceDate = String(params.bill.invoiceDate ?? '').slice(0, 10) || null;
     const invoiceNumber = toText(params.bill.referenceName ?? params.bill.voucherNumber, 240) || null;
     const timing = derivePaymentFollowUpTiming(params.bill, params.today);
-    const raw = params.ledger?.raw_payload && typeof params.ledger.raw_payload === "object" ? params.ledger.raw_payload : {};
-    const currentDiscount = params.analysis.reversalPlan?.activeDiscount ?? currentCashDiscountEligibility({
-        terms: params.analysis.terms,
-        invoiceDate,
-        originalAmount: originalInvoiceAmount,
-        today: params.today,
-    });
-    const invoiceIsUnpaid = Math.abs(outstandingAmount - originalInvoiceAmount) <= 1;
-    const createdTierReversalAmount = Math.max(0, toNumber(params.createdTierReversalAmount));
-    const totalReversalRequired = params.analysis.deterministicStatus === "unpaid_discount_tier_expired"
-        ? params.analysis.reversalPlan?.totalReversalRequired ?? 0
-        : 0;
-    const pendingTierReversalAmount = Math.max(0, Math.round((totalReversalRequired - createdTierReversalAmount) * 100) / 100);
-    let followUpStatus = "needs_follow_up";
-    if (timing.ageBasis === "missing_dates")
-        followUpStatus = "needs_review";
-    else if (pendingTierReversalAmount > 0.01)
-        followUpStatus = "debit_note_required";
-    else if (timing.ageBasis === "due_date" && (timing.ageDays ?? 0) > 30)
-        followUpStatus = "escalate";
-    let kind = "payment_review";
-    let title = "Payment pending";
-    let nextAction = `Follow up for ₹${outstandingAmount.toLocaleString("en-IN")}. ${timing.ageLabel}.`;
-    if (timing.ageBasis === "missing_dates") {
-        kind = "payment_review";
-        title = "Payment dates need review";
-        nextAction = "Confirm the invoice or due date before scheduling collection follow-up.";
-    }
-    else if (pendingTierReversalAmount > 0.01) {
-        kind = "full_payment_due";
-        title = params.analysis.paymentCategory ? "Payment overdue · CD recovery pending" : "Debit Note required first";
-        nextAction = params.analysis.paymentCategory
-            ? `Follow up for ₹${outstandingAmount.toLocaleString("en-IN")}. CD recovery of ₹${pendingTierReversalAmount.toLocaleString("en-IN")} is pending separately.`
-            : `Create the pending Debit Note of ₹${pendingTierReversalAmount.toLocaleString("en-IN")}, then follow up for payment.`;
-    }
-    else if (params.analysis.deterministicStatus === "within_eligibility_window" && currentDiscount) {
-        kind = "discount_window_open";
-        title = "Payment pending";
-        nextAction = `Follow up for payment. ${timing.ageLabel}; ${currentDiscount.ratePercent}% cash discount remains available until ${currentDiscount.discountDeadline}.`;
-    }
-    else if (["existing_balance_due", "late_short_payment"].includes(params.analysis.deterministicStatus)) {
-        kind = "payment_due";
-        title = "Collect existing balance";
-        nextAction = `Collect the existing Tally outstanding of â‚¹${outstandingAmount.toLocaleString("en-IN")}. Do not create another debit note for the same amount.`;
-    }
-    else if (params.analysis.deterministicStatus === "invoice_unpaid") {
-        kind = "full_payment_due";
-        title = "Payment pending";
-        nextAction = `Follow up for the full outstanding amount. ${timing.ageLabel}.`;
-    }
-    else if (params.analysis.deterministicStatus === "no_cash_discount_context") {
-        kind = "payment_due";
-        title = "Payment pending";
-        nextAction = `Follow up for ₹${outstandingAmount.toLocaleString("en-IN")}. ${timing.ageLabel}.`;
-    }
-    else if (params.analysis.deterministicStatus === "cash_discount_rate_missing" ||
-        params.analysis.deterministicStatus === "unsupported_cash_discount_rate") {
-        kind = "payment_review";
-        title = "Payment pending";
-        nextAction = `Follow up for payment and review the cash-discount terms. ${params.analysis.deterministicReason}`;
-    }
-    else if (params.analysis.deterministicStatus === "unpaid_discount_tier_expired" && params.analysis.reversalPlan) {
-        kind = "full_payment_due";
-        title = pendingTierReversalAmount > 0 ? "Debit note required, then collect" : "Payment pending after debit note";
-        nextAction = pendingTierReversalAmount > 0
-            ? `Create the incremental debit note of ₹${pendingTierReversalAmount.toLocaleString("en-IN")}, then collect ₹${params.analysis.reversalPlan.currentPayableAmount.toLocaleString("en-IN")}.`
-            : `Collect ₹${params.analysis.reversalPlan.currentPayableAmount.toLocaleString("en-IN")}; the required tier reversal has already been created in Tally.`;
-    }
-    else if (params.analysis.deterministicStatus === "missing_invoice_date") {
-        kind = "payment_review";
-        title = "Payment pending";
-        nextAction = "Follow up for payment and confirm the invoice date before evaluating the narrated discount terms.";
-    }
+    const raw = params.ledger?.raw_payload ?? {};
+    const needsReview = timing.ageBasis === 'missing_dates' || params.bill.invoiceEvidenceAmbiguous === true || outstandingAmount > originalInvoiceAmount + 1;
+    const followUpStatus = needsReview ? 'needs_review' : (timing.ageDays ?? 0) > 30 ? 'escalate' : 'needs_follow_up';
     return {
-        id: `follow-up:${Buffer.from(`${params.ledgerName}|${invoiceNumber ?? "-"}|${outstandingAmount.toFixed(2)}`).toString("base64url")}`,
-        kind,
+        id: 'follow-up:' + Buffer.from(params.ledgerName + '|' + (invoiceNumber ?? '-') + '|' + outstandingAmount.toFixed(2)).toString('base64url'),
+        kind: needsReview ? 'payment_review' : 'payment_due',
         followUpStatus,
         paymentCategory: params.analysis.paymentCategory,
-        ageBasis: timing.ageBasis,
-        ageDays: timing.ageDays,
-        ageLabel: timing.ageLabel,
-        dueDate: timing.dueDate,
-        title,
-        nextAction,
-        partyLedgerName: params.ledgerName,
-        partyGstin: params.ledger?.gstin ?? null,
-        partyPhone: readRawText(raw, "phone", 80),
-        partyEmail: readRawText(raw, "email", 320),
-        linkedInvoiceNumber: invoiceNumber,
-        linkedInvoiceDate: invoiceDate,
-        originalInvoiceAmount,
-        outstandingAmount,
-        amountReceived,
+        ageBasis: timing.ageBasis, ageDays: timing.ageDays, ageLabel: timing.ageLabel, dueDate: timing.dueDate,
+        title: needsReview ? 'Invoice evidence needs review' : 'Payment pending',
+        nextAction: needsReview ? 'Confirm invoice dates, terms and allocations in Tally before scheduling reminders.' : 'Follow up for ₹' + outstandingAmount.toLocaleString('en-IN') + '. ' + timing.ageLabel + '.',
+        partyLedgerName: params.ledgerName, partyGstin: params.ledger?.gstin ?? null,
+        partyPhone: readRawText(raw, 'phone', 80), partyEmail: readRawText(raw, 'email', 320),
+        linkedInvoiceNumber: invoiceNumber, linkedInvoiceDate: invoiceDate,
+        originalInvoiceAmount, outstandingAmount, amountReceived,
         narration: params.analysis.sourceNarration,
-        matchedCashDiscountContext: params.analysis.matchedCashDiscountContext,
-        terms: params.analysis.terms,
-        termsLabel: params.analysis.termsLabel,
-        discountDeadline: params.analysis.discountDeadline,
-        currentDiscount,
-        paymentAmountIfPaidToday: params.analysis.reversalPlan?.currentPayableAmount ?? (invoiceIsUnpaid && currentDiscount ? Math.max(originalInvoiceAmount - currentDiscount.discountAmount, 0) : null),
-        totalPayableAmount: params.analysis.reversalPlan?.currentPayableAmount ?? outstandingAmount,
-        createdTierReversalAmount,
-        pendingTierReversalAmount,
-        reversalPlan: params.analysis.reversalPlan,
-        deterministicStatus: params.analysis.deterministicStatus,
-        deterministicReason: params.analysis.deterministicReason,
-        calculationVersion: "cash_discount_rtgs_v3",
+        // Collection amounts always describe the remaining Tally balance.
+        paymentAmountIfPaidToday: outstandingAmount,
+        totalPayableAmount: outstandingAmount,
+        currentDiscount: null,
+        calculationVersion: 'collections_rtgs_v4',
     };
 }
-export function readTallyOpenBills(commandResult) {
+export function readTallyOpenBills(commandResult, includeSettled = false) {
     const result = commandResult?.result && typeof commandResult.result === "object"
         ? commandResult.result
         : commandResult;
@@ -330,7 +242,7 @@ export function readTallyOpenBills(commandResult) {
         : {};
     return Object.entries(byLedger).flatMap(([ledgerName, bucket]) => {
         const openBills = Array.isArray(bucket?.openBills) ? bucket.openBills : [];
-        return openBills.map((bill) => ({
+        return [...openBills, ...(includeSettled && Array.isArray(bucket?.settledBills) ? bucket.settledBills : [])].map((bill) => ({
             ledgerName: toText(bill.ledgerName ?? bucket?.ledgerName ?? ledgerName, 500),
             bill,
         }));

@@ -1,10 +1,11 @@
+import { readTallyOpenBills, type OpenBillRow } from '@/lib/collections-dashboard';
 import { withTeamAccess } from '@/lib/access/route-boundary';
 import {requireMasterDataset} from '@/lib/access/master-store';
 import {enqueueTeamDiscount} from '@/lib/access/discount-writes';
 import {accessFailureResponse} from '@/lib/access/failures';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
-import { analyseCashDiscountNarration } from "@/lib/cash-discount-narration";
+import { analyseCashDiscountNarration, isCashDiscountRecoveryStatus } from "@/lib/cash-discount-narration";
 import { toNullableText, toNumber, toText } from "@/lib/collections";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { serializeTallyBridgeCommand, type TallyBridgeCommandRow } from "@/lib/tally/commands";
@@ -17,20 +18,6 @@ function isLiveConnection(row: { status?: string | null; last_tally_reachable?: 
 function normalizeCompanyName(value: string | null | undefined) {
   return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
-
-type OpenBillRow = {
-  kind?: string | null;
-  ledgerName?: string | null;
-  referenceName?: string | null;
-  voucherNumber?: string | null;
-  invoiceDate?: string | null;
-  originalAmount?: number | string | null;
-  pendingAmount?: number | string | null;
-  narration?: string | null;
-  receiptDate?: string | null;
-  matchedReceiptAmount?: number | string | null;
-  sourceSalesLedgerName?: string | null;
-};
 
 type TallyCommandSnapshot = {
   id: string;
@@ -47,22 +34,6 @@ function commandCompanyName(command: TallyCommandSnapshot) {
 
 function commandScanId(command: TallyCommandSnapshot) {
   return toNullableText(command.payload?.scanId, 120);
-}
-
-function readTallyOpenBills(commandResult: Record<string, unknown> | null | undefined) {
-  const result = commandResult?.result && typeof commandResult.result === "object"
-    ? (commandResult.result as Record<string, unknown>)
-    : commandResult;
-  const byLedger = result?.byLedger && typeof result.byLedger === "object"
-    ? (result.byLedger as Record<string, { ledgerName?: string | null; openBills?: OpenBillRow[] }>)
-    : {};
-
-  return Object.entries(byLedger).flatMap(([ledgerName, bucket]) =>
-    (Array.isArray(bucket?.openBills) ? bucket.openBills : []).map((bill) => ({
-      ledgerName: toText(bill.ledgerName ?? bucket?.ledgerName ?? ledgerName, 500),
-      bill,
-    }))
-  );
 }
 
 function sameInvoice(
@@ -191,13 +162,13 @@ async function POSTHandler(request: Request) {
         : [newestOpenBillCommand]
       : [];
     const matchingBill = latestOpenBillCommands
-      .flatMap((command) => readTallyOpenBills(command.result))
+      .flatMap((command) => readTallyOpenBills(command.result, true))
       .find((row) => sameInvoice(row, partyLedgerName, linkedInvoiceNumber));
 
     if (!matchingBill) {
       return jsonWithCors(
         request,
-        { error: "The invoice is not present in the latest Tally open-bill scan. Refresh Cash Discounts and review it again." },
+        { error: "The invoice is not present in the latest Tally evidence. Refresh Cash Discounts and review it again." },
         { status: 409 }
       );
     }
@@ -207,7 +178,7 @@ async function POSTHandler(request: Request) {
     const pendingAmount = toNumber(bill.pendingAmount);
     const invoiceDate = toNullableText(bill.invoiceDate, 20);
     const today = businessDateText();
-    if (bill.kind === "advance" || originalAmount <= 0 || pendingAmount <= 0) {
+    if (bill.kind === "advance" || originalAmount <= 0 || pendingAmount < 0) {
       return jsonWithCors(request, { error: "The latest Tally bill is no longer eligible for a debit note." }, { status: 409 });
     }
 
@@ -218,9 +189,10 @@ async function POSTHandler(request: Request) {
       pendingAmount,
       receiptDate: bill.receiptDate,
       matchedReceiptAmount: toNumber(bill.matchedReceiptAmount, Number.NaN),
+      invoiceEvidenceAmbiguous: bill.invoiceEvidenceAmbiguous,
       today,
     });
-    if (analysis.deterministicStatus !== "unpaid_discount_tier_expired") {
+    if (!isCashDiscountRecoveryStatus(analysis.deterministicStatus)) {
       return jsonWithCors(
         request,
         { error: `The latest Tally data is not eligible for a debit note: ${analysis.deterministicReason}` },
@@ -281,7 +253,7 @@ async function POSTHandler(request: Request) {
     const ledgerRaw = ledgerData?.raw_payload && typeof ledgerData.raw_payload === "object"
       ? (ledgerData.raw_payload as Record<string, unknown>)
       : {};
-    const isTierReversal = analysis.deterministicStatus === "unpaid_discount_tier_expired";
+    const isTierReversal = isCashDiscountRecoveryStatus(analysis.deterministicStatus);
     const referenceSuffix = isTierReversal
       ? `T${analysis.reversalPlan?.activeDiscount?.eligibilityDays ?? "FINAL"}`
       : "SHORT";

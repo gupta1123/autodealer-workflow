@@ -51,7 +51,7 @@ for (const name of modules) {
   const target = path.join(outputDirectory, `${path.basename(name)}.mjs`);
   const content = generate(name);
   if (check) {
-    if (!fs.existsSync(target) || fs.readFileSync(target, "utf8") !== content) stale.push(path.relative(root, target));
+    if (!fs.existsSync(target) || fs.readFileSync(target, "utf8").replace(/\r\n/g, "\n") !== content) stale.push(path.relative(root, target));
   } else {
     fs.writeFileSync(target, content);
   }

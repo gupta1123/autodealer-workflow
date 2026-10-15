@@ -1,9 +1,10 @@
 // GENERATED from apps/api/src/lib/payment-follow-up.ts by scripts/build-connector-collections-analysis.mjs.
 // Do not edit: change the source and run the script.
-import { classifyPaymentNarration, paymentRequirement } from './payment-terms.mjs';
-export const PAYMENT_FOLLOW_UP_GRACE_DAYS = 7;
+import { collectionPaymentRequirement } from './payment-terms.mjs';
+export const PAYMENT_FOLLOW_UP_GRACE_DAYS = 0;
 export function isCollectionOnlyPaymentFollowUp(row) {
-    return Boolean(row.paymentCategory) || row.followUpStatus !== "debit_note_required";
+    // CD review never prevents collection of an outstanding invoice.
+    return Boolean(row);
 }
 function validDateText(value) {
     const dateText = String(value ?? "").trim().slice(0, 10);
@@ -18,18 +19,10 @@ function elapsedDays(fromDate, toDate) {
     return Math.floor((Date.parse(`${toDate}T00:00:00.000Z`) - Date.parse(`${fromDate}T00:00:00.000Z`)) /
         86_400_000);
 }
-export function derivePaymentFollowUpTiming(bill, today, graceDays = PAYMENT_FOLLOW_UP_GRACE_DAYS) {
+export function derivePaymentFollowUpTiming(bill, today) {
     const currentDate = validDateText(today);
     const dueDate = validDateText(bill.dueDate);
     const invoiceDate = validDateText(bill.invoiceDate);
-    const category = classifyPaymentNarration(bill.narration).category;
-    if (category && currentDate) {
-        const requirement = paymentRequirement(category, invoiceDate);
-        if (!requirement)
-            return { eligible: true, ageBasis: 'missing_dates', ageDays: null, ageLabel: 'Invoice date missing for RTGS terms', dueDate: null, invoiceDate };
-        const ageDays = elapsedDays(requirement.deadline, currentDate);
-        return { eligible: ageDays > 0, ageBasis: 'due_date', ageDays, ageLabel: `${Math.max(ageDays, 0)} days past ${category === 'advance_rtgs' ? 'advance' : 'same-day'} payment deadline`, dueDate: requirement.deadline, invoiceDate };
-    }
     if (!currentDate) {
         return {
             eligible: false,
@@ -40,27 +33,16 @@ export function derivePaymentFollowUpTiming(bill, today, graceDays = PAYMENT_FOL
             invoiceDate,
         };
     }
-    if (dueDate) {
-        const ageDays = elapsedDays(dueDate, currentDate);
+    const requirement = collectionPaymentRequirement(bill.narration, invoiceDate);
+    if (requirement) {
+        const ageDays = elapsedDays(requirement.deadline, currentDate);
         const shownDays = Math.max(ageDays, 0);
         return {
-            eligible: ageDays >= graceDays,
+            eligible: ageDays > 0,
             ageBasis: "due_date",
             ageDays,
             ageLabel: `${shownDays} day${shownDays === 1 ? "" : "s"} overdue`,
-            dueDate,
-            invoiceDate,
-        };
-    }
-    if (invoiceDate) {
-        const ageDays = elapsedDays(invoiceDate, currentDate);
-        const shownDays = Math.max(ageDays, 0);
-        return {
-            eligible: ageDays >= graceDays,
-            ageBasis: "invoice_date",
-            ageDays,
-            ageLabel: `${shownDays} day${shownDays === 1 ? "" : "s"} since invoice`,
-            dueDate: null,
+            dueDate: requirement.deadline,
             invoiceDate,
         };
     }
@@ -68,9 +50,9 @@ export function derivePaymentFollowUpTiming(bill, today, graceDays = PAYMENT_FOL
         eligible: true,
         ageBasis: "missing_dates",
         ageDays: null,
-        ageLabel: "Invoice and due dates missing",
+        ageLabel: "Invoice date or payment terms need review",
         dueDate: null,
-        invoiceDate: null,
+        invoiceDate,
     };
 }
 export function sortPaymentFollowUpsByPriority(rows) {

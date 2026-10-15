@@ -31,6 +31,55 @@ const voucher = ({ type, date, effective, number, reference, narration, party, e
   `<VOUCHERNUMBER>${number}</VOUCHERNUMBER>${reference ? `<REFERENCE>${reference}</REFERENCE>` : ""}${narration ? `<NARRATION>${narration}</NARRATION>` : ""}` +
   `<PARTYLEDGERNAME>${party}</PARTYLEDGERNAME><MASTERID>${id}</MASTERID>${entries.join("")}</VOUCHER>`;
 
+const sales = (amount=98500, date='20261012', ref='INV-ADV') => voucher({id:11,type:'Sales',date,number:'100',reference:ref,narration:'ADVANCE RTGS',party:'Customer',entries:[entry('Customer',-amount,true,[[ref,-amount,'Agst Ref']]),entry('Domestic Sales',amount,false)]});
+const receipt = (amount=50000,date='20261010',ref='INV-ADV',id=12) => voucher({id,type:'Receipt',date,number:'R-'+id,party:'Customer',entries:[entry('Customer',amount,false,[[ref,amount,'New Ref']]),entry('Bank',-amount,true)]});
+
+test('advance New Ref opening and date never replace the Sales invoice', async () => {
+  const bills=[bill({name:'INV-ADV',ledger:'Customer',closing:-48500,opening:50000,date:'20261010',voucherType:'Receipt'})];
+  const vouchers=[receipt(),sales()];
+  const bucket=fieldResult(['Customer'],bills,vouchers).Customer;
+  assert.equal(bucket.openBills.length,1);
+  assert.equal(bucket.openBills[0].originalAmount,98500);
+  assert.equal(bucket.openBills[0].pendingAmount,48500);
+  assert.equal(bucket.openBills[0].invoiceDate,'2026-10-12');
+  assert.equal(bucket.openBills[0].invoiceEvidenceAmbiguous,false);
+  assert.deepEqual({Customer:bucket},await xmlResult(['Customer'],bills,vouchers));
+});
+
+test('closed late-paid invoices remain available separately for CD review', async () => {
+  const vouchers=[sales(),receipt(98500,'20261014')];
+  const result=fieldResult(['Customer'],[],vouchers);
+  assert.equal(result.Customer.openBills.length,0);
+  assert.equal(result.Customer.settledBills.length,1);
+  assert.equal(result.Customer.settledBills[0].receiptDate,'2026-10-14');
+  assert.deepEqual(result,await xmlResult(['Customer'],[],vouchers));
+});
+
+test('refunds reopen a balance; cancelled receipts and free-text references cannot prove settlement', () => {
+  const ref='INV-ADV';
+  const refund=voucher({id:13,type:'Payment',date:'20261015',number:'P1',party:'Customer',entries:[entry('Customer',-5000,true,[[ref,-5000,'Agst Ref']]),entry('Bank',5000,false)]});
+  const bills=[bill({name:ref,ledger:'Customer',closing:-5000,opening:-98500})];
+  assert.equal(fieldResult(['Customer'],bills,[sales(),receipt(98500),refund]).Customer.openBills[0].pendingAmount,5000);
+  const cancelled=receipt(98500).replace('<DATE>','<ISCANCELLED>Yes</ISCANCELLED><DATE>');
+  assert.equal(fieldResult(['Customer'],[bill({name:ref,ledger:'Customer',closing:-98500})],[sales(),cancelled]).Customer.openBills[0].pendingAmount,98500);
+  const unallocated=voucher({id:14,type:'Receipt',date:'20261010',number:'R14',narration:'INV-ADV paid in full',party:'Customer',entries:[entry('Customer',98500,false),entry('Bank',-98500,true)]});
+  assert.equal(fieldResult(['Customer'],bills,[sales(),unallocated]).Customer.openBills[0].matchedReceiptAmount,null);
+});
+
+test('conflicting invoice references and balance disagreements require review', () => {
+  const bills=[bill({name:'INV-ADV',ledger:'Customer',closing:-20000,opening:-98500})];
+  const row=fieldResult(['Customer'],bills,[sales(),receipt()]).Customer.openBills[0];
+  assert.equal(row.pendingAmount,20000);
+  assert.equal(row.invoiceEvidenceAmbiguous,true);
+  const duplicate=sales().replace('<MASTERID>11</MASTERID>','<MASTERID>99</MASTERID>');
+  assert.equal(fieldResult(['Customer'],bills,[sales(),duplicate]).Customer.openBills[0].invoiceEvidenceAmbiguous,true);
+});
+
+test('native credit periods and Tally display dates are read consistently', () => {
+  const row=billFields('<BILL><DATE>30-Sep-26</DATE><BILLCREDITPERIOD>15 Days</BILLCREDITPERIOD></BILL>');
+  assert.equal(row.date,'2026-09-30'); assert.equal(row.dueDate,'2026-10-15');
+});
+
 test("fields give the same open bills as the XML calculation on awkward records", async () => {
   const A = "Apex Traders &amp; Sons, Pune", B = "Balaji Stores";
   const ledgers = ["Apex Traders & Sons, Pune", B, "Nobody Ltd"];

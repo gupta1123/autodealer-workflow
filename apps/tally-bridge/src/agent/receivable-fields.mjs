@@ -76,7 +76,13 @@ function parseTallyDate(value) {
   const raw = String(value ?? "").trim();
   if (/^\d{8}$/.test(raw)) return `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
-  return raw || null;
+  const match = raw.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2}|\d{4})$/);
+  const months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+  if (match && months.includes(match[2].toLowerCase())) {
+    const year = match[3].length === 2 ? "20" + match[3] : match[3];
+    return year + "-" + String(months.indexOf(match[2].toLowerCase()) + 1).padStart(2,"0") + "-" + match[1].padStart(2,"0");
+  }
+  return null;
 }
 
 function billReferenceType(block) {
@@ -86,6 +92,18 @@ function billReferenceType(block) {
     getTagText(block, "REFERENCE_TYPE") ||
     ""
   ).trim();
+}
+
+function billDueDate(xml) {
+  const explicit = parseTallyDate(getTagText(xml, 'DUEDATE'));
+  if (explicit) return explicit;
+  const period = getTagText(xml, 'BILLCREDITPERIOD');
+  const date = parseTallyDate(period);
+  if (date) return date;
+  const days = String(period || '').match(/^(\d+)\s*Days?$/i);
+  const invoiceDate = parseTallyDate(getTagText(xml, 'DATE') || getTagText(xml, 'BILLDATE'));
+  if (!days || !invoiceDate) return null;
+  return new Date(Date.parse(invoiceDate + 'T00:00:00Z') + Number(days[1]) * 86400000).toISOString().slice(0,10);
 }
 
 function billLedgerName(block) {
@@ -109,6 +127,7 @@ function emptyOpenBillBucket(ledgerName) {
     ledgerName,
     openBills: [],
     existingAdvances: [],
+    settledBills: [],
     rawCount: 0,
   };
 }
@@ -195,7 +214,8 @@ export function billFields(xml) {
     voucherNumber: text("VOUCHERNUMBER"),
     date: parseTallyDate(text("DATE") || text("BILLDATE")),
     billDate: parseTallyDate(text("BILLDATE")),
-    dueDate: parseTallyDate(text("DUEDATE")),
+    dueDate: billDueDate(xml),
+    creditPeriod: text("BILLCREDITPERIOD"),
   };
 }
 
@@ -266,121 +286,132 @@ function isPartySettlementType(type) {
 }
 
 // indexInvoiceNarrations on fields.
+// Resolve every bill to its Sales voucher before interpreting opening balances.
+// A pre-invoice receipt may own the New Ref and Bill date in Tally.
 function indexInvoiceEvidence(vouchers, requestedLedgerByKey) {
-  const narrationByBill = new Map();
-  const invoiceReferencesByLedger = new Map();
-  const invoiceReferenceKeys = new Set();
+  const invoices = new Map();
+  const canonicalInvoices = new Map();
+  const settlements = new Map();
   const advanceReferenceKeys = new Set();
-  const salesLedgerByBill = new Map();
-
-  for (const voucher of vouchers) {
-    if (!isPartyInvoiceType(voucher.type)) continue;
-    const ledgerNames = [voucher.party, ...voucher.entryLedgers].filter(Boolean);
-    const billReferences = [voucher.number, voucher.reference, ...voucher.allocationNames].filter(Boolean);
-    for (const ledgerName of ledgerNames) {
-      const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(ledgerName));
-      if (!requestedLedgerName) continue;
-      // salesLedgerFromInvoiceVoucher: first non-tax credit line of another ledger.
-      const salesLedgerName = voucher.entries
-        .filter((entry) => normalizeLooseName(entry.ledgerName) !== normalizeLooseName(requestedLedgerName))
-        .find((entry) => !entry.isDebit && !isLikelyTaxLedgerName(entry.ledgerName))?.ledgerName || null;
-      for (const billReference of billReferences) {
-        const key = openBillNarrationKey(requestedLedgerName, billReference);
-        invoiceReferenceKeys.add(key);
-        if (voucher.narration) narrationByBill.set(key, voucher.narration);
-        if (salesLedgerName) salesLedgerByBill.set(key, salesLedgerName);
-        const references = invoiceReferencesByLedger.get(requestedLedgerName) || new Set();
-        references.add(billReference);
-        invoiceReferencesByLedger.set(requestedLedgerName, references);
-      }
-    }
-  }
-
-  // A receipt's bill allocation is the strongest evidence that a payment was
-  // applied to a particular invoice.
-  const receiptEvidenceByBill = new Map();
-  for (const voucher of vouchers) {
-    if (!isPartySettlementType(voucher.type)) continue;
-    const receiptDate = parseTallyDate(voucher.effectiveDate || voucher.date);
-    if (!receiptDate) continue;
-    const normalizedVoucherText = normalizeLooseName([voucher.number, voucher.reference, voucher.narration].join(" "));
+  const active = vouchers.filter(v => !v.cancelled && !v.optional);
+  for (const voucher of active) {
+    if (!isPartyInvoiceType(voucher.type) || /purchase/i.test(voucher.type)) continue;
     for (const entry of voucher.entries) {
-      const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(entry.ledgerName));
-      if (!requestedLedgerName) continue;
-      const references = invoiceReferencesByLedger.get(requestedLedgerName) || new Set();
-      const referenceByKey = new Map([...references].map((reference) => [normalizeLooseName(reference), reference]));
-      let matchedAllocation = false;
-      for (const allocation of entry.billAllocations) {
-        const allocationKey = openBillNarrationKey(requestedLedgerName, allocation.referenceName);
-        const allocationLooksLikeAdvance =
-          /advance/i.test(String(allocation.billType || "")) ||
-          (/^(?:adv|advance)(?:[-/\s]|\d)/i.test(allocation.referenceName) && !invoiceReferenceKeys.has(allocationKey));
-        if (allocationLooksLikeAdvance) advanceReferenceKeys.add(allocationKey);
-        const invoiceReference = referenceByKey.get(normalizeLooseName(allocation.referenceName));
-        if (!invoiceReference) continue;
-        const key = openBillNarrationKey(requestedLedgerName, invoiceReference);
-        const existing = receiptEvidenceByBill.get(key);
-        receiptEvidenceByBill.set(key, {
-          lastReceiptDate: !existing || receiptDate > existing.lastReceiptDate ? receiptDate : existing.lastReceiptDate,
-          matchedReceiptAmount: (existing?.matchedReceiptAmount || 0) + allocation.amount,
-        });
-        matchedAllocation = true;
+      const ledgerName = requestedLedgerByKey.get(normalizeLooseName(entry.ledgerName));
+      if (!ledgerName || !entry.isDebit) continue;
+      const references = [...new Set(entry.billAllocations.map(a => a.referenceName).filter(Boolean))];
+      const reference = references[0] || voucher.reference || voucher.number;
+      if (!reference) continue;
+      const key = openBillNarrationKey(ledgerName, reference);
+      const invoice = {
+        key, ledgerName, referenceName: reference, voucherNumber: voucher.number || reference,
+        invoiceDate: parseTallyDate(voucher.date), originalAmount: entry.amount,
+        sourceVoucherType: voucher.type, narration: voucher.narration || null,
+        sourceSalesLedgerName: voucher.entries.find(e => !e.isDebit && normalizeLooseName(e.ledgerName) !== normalizeLooseName(ledgerName) && !isLikelyTaxLedgerName(e.ledgerName))?.ledgerName || null,
+        identity: voucher.guid || voucher.masterId || [voucher.date, voucher.number, ledgerName].join('|'),
+        invoiceEvidenceAmbiguous: references.length > 1,
+      };
+      const existing = canonicalInvoices.get(key);
+      if (existing && existing.identity !== invoice.identity) {
+        existing.invoiceEvidenceAmbiguous = true;
+        continue;
       }
-      // Older Tally versions can omit allocation blocks; explicit reference
-      // text is the fallback for that case only.
-      if (matchedAllocation) continue;
-      for (const invoiceReference of references) {
-        const normalizedReference = normalizeLooseName(invoiceReference);
-        if (normalizedReference.length < 8 || !normalizedVoucherText.includes(normalizedReference)) continue;
-        const key = openBillNarrationKey(requestedLedgerName, invoiceReference);
-        const existing = receiptEvidenceByBill.get(key);
-        receiptEvidenceByBill.set(key, {
-          lastReceiptDate: !existing || receiptDate > existing.lastReceiptDate ? receiptDate : existing.lastReceiptDate,
-          matchedReceiptAmount: (existing?.matchedReceiptAmount || 0) + entry.amount,
-        });
+      canonicalInvoices.set(key, invoice);
+      for (const alias of [...references, voucher.number, voucher.reference].filter(Boolean)) {
+        const aliasKey = openBillNarrationKey(ledgerName, alias);
+        const previous = invoices.get(aliasKey);
+        if (previous && previous.identity !== invoice.identity) {
+          previous.invoiceEvidenceAmbiguous = true;
+          invoice.invoiceEvidenceAmbiguous = true;
+        } else invoices.set(aliasKey, invoice);
       }
     }
   }
-  return { narrationByBill, receiptEvidenceByBill, salesLedgerByBill, invoiceReferenceKeys, advanceReferenceKeys };
+  for (const voucher of active) {
+    if (isPartyInvoiceType(voucher.type)) continue;
+    for (const entry of voucher.entries) {
+      const ledgerName = requestedLedgerByKey.get(normalizeLooseName(entry.ledgerName));
+      if (!ledgerName) continue;
+      for (const allocation of entry.billAllocations) {
+        const aliasKey = openBillNarrationKey(ledgerName, allocation.referenceName);
+        const invoice = invoices.get(aliasKey);
+        if (!invoice) { if (/advance|new ref/i.test(allocation.billType || '')) advanceReferenceKeys.add(aliasKey); continue; }
+        const proof = settlements.get(invoice.key) || { adjustments: 0, receipts: 0, lastReceiptDate: null, ambiguous: false };
+        const signedAmount = entry.isDebit ? -allocation.amount : allocation.amount;
+        proof.adjustments += signedAmount;
+        if (isPartySettlementType(voucher.type)) {
+          proof.receipts += signedAmount;
+          const date = parseTallyDate(voucher.effectiveDate || voucher.date);
+          if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) proof.ambiguous = true;
+          else if (!proof.lastReceiptDate || date > proof.lastReceiptDate) proof.lastReceiptDate = date;
+        }
+        settlements.set(invoice.key, proof);
+      }
+    }
+  }
+  return { invoices, canonicalInvoices, settlements, advanceReferenceKeys };
 }
 
-// Open bills and advances per customer: the same byLedger result the XML
-// calculation (fetchCustomerOpenBillsFromTally) builds, from fields.
 export function openBillsByLedgerFromFields(ledgerNames, bills, vouchers) {
-  const requestedLedgerByKey = new Map(ledgerNames.map((ledgerName) => [normalizeLooseName(ledgerName), ledgerName]));
+  const requestedLedgerByKey = new Map(ledgerNames.map(name => [normalizeLooseName(name), name]));
   const evidence = indexInvoiceEvidence(vouchers, requestedLedgerByKey);
-  const byLedger = Object.fromEntries(ledgerNames.map((ledgerName) => [ledgerName, emptyOpenBillBucket(ledgerName)]));
+  const byLedger = Object.fromEntries(ledgerNames.map(name => [name, emptyOpenBillBucket(name)]));
+  const seen = new Set();
   let billCount = 0;
+  function invoiceRow(invoice, bill = null) {
+    const proof = evidence.settlements.get(invoice.key);
+    const computed = Math.round((invoice.originalAmount - (proof?.adjustments || 0)) * 100) / 100;
+    const native = bill ? Math.abs(bill.closing ?? bill.balance ?? bill.pending ?? bill.amount ?? computed) : null;
+    // Some Tally versions return the opening balance as ClosingBalance. Other
+    // disagreements need review; never replace a differing live balance blindly.
+    const disagreement = native !== null && Math.abs(native - computed) > 0.01 && Math.abs(native - invoice.originalAmount) > 0.01;
+    const pendingAmount = Math.max(0, disagreement ? native : computed);
+    return {
+      referenceName: invoice.referenceName, voucherNumber: invoice.voucherNumber,
+      invoiceDate: invoice.invoiceDate, dueDate: bill?.dueDate || null,
+      originalAmount: invoice.originalAmount, pendingAmount,
+      settledAmount: Math.max(0, invoice.originalAmount - pendingAmount),
+      sourceVoucherType: invoice.sourceVoucherType, sourceSalesLedgerName: invoice.sourceSalesLedgerName,
+      narration: invoice.narration,
+      receiptDate: proof?.lastReceiptDate || null,
+      matchedReceiptAmount: proof ? Math.round(proof.receipts * 100) / 100 : null,
+      invoiceEvidenceAmbiguous: invoice.invoiceEvidenceAmbiguous || Boolean(proof?.ambiguous) || disagreement || computed < -0.01,
+      status: pendingAmount <= 0.005 ? 'settled' : 'open',
+    };
+  }
+  function add(ledgerName, row) {
+    const bucket = byLedger[ledgerName];
+    (row.pendingAmount <= 0.005 ? bucket.settledBills : bucket.openBills).push(row);
+    bucket.rawCount++;
+  }
   for (const bill of bills) {
-    const requestedLedgerName = requestedLedgerByKey.get(normalizeLooseName(bill.ledger));
-    if (!requestedLedgerName) continue;
-    billCount += 1;
-    const referenceKey = openBillNarrationKey(requestedLedgerName, bill.ref);
-    const entry = openBillFromFields(bill, requestedLedgerName, {
-      knownInvoice: evidence.invoiceReferenceKeys.has(referenceKey),
-      knownAdvance: evidence.advanceReferenceKeys.has(referenceKey),
-    });
-    if (!entry) continue;
-    if (entry.kind === "bill") {
-      const byReference = openBillNarrationKey(requestedLedgerName, entry.referenceName);
-      const byVoucher = openBillNarrationKey(requestedLedgerName, entry.voucherNumber);
-      entry.narration = evidence.narrationByBill.get(byReference) || evidence.narrationByBill.get(byVoucher) || null;
-      entry.sourceSalesLedgerName = evidence.salesLedgerByBill.get(byReference) || evidence.salesLedgerByBill.get(byVoucher) || null;
-      const receiptEvidence = evidence.receiptEvidenceByBill.get(byReference) || evidence.receiptEvidenceByBill.get(byVoucher) || null;
-      entry.receiptDate = receiptEvidence?.lastReceiptDate || null;
-      entry.matchedReceiptAmount = receiptEvidence?.matchedReceiptAmount || null;
-      if (receiptEvidence && entry.originalAmount > 0) {
-        const settledAmount = Math.min(entry.originalAmount, Math.max(0, receiptEvidence.matchedReceiptAmount));
-        entry.settledAmount = settledAmount;
-        entry.pendingAmount = Math.max(0, Number((entry.originalAmount - settledAmount).toFixed(2)));
-      }
+    const ledgerName = requestedLedgerByKey.get(normalizeLooseName(bill.ledger));
+    if (!ledgerName) continue;
+    billCount++;
+    const key = openBillNarrationKey(ledgerName, bill.ref);
+    const invoice = evidence.invoices.get(key);
+    if (invoice) {
+      if (seen.has(invoice.key)) continue;
+      seen.add(invoice.key);
+      add(ledgerName, invoiceRow(invoice, bill));
+      continue;
     }
-    if (entry.kind === "bill" && entry.pendingAmount <= 0.01) continue;
-    const { kind, ...openBillEntry } = entry;
-    const bucket = byLedger[requestedLedgerName] || emptyOpenBillBucket(requestedLedgerName);
-    bucket.rawCount += 1;
-    (kind === "advance" ? bucket.existingAdvances : bucket.openBills).push(openBillEntry);
-    byLedger[requestedLedgerName] = bucket;
+    const entry = openBillFromFields(bill, ledgerName, {knownAdvance: evidence.advanceReferenceKeys.has(key)});
+    if (!entry) continue;
+    const {kind, ...row} = entry;
+    if (kind === 'advance') { byLedger[ledgerName].existingAdvances.push(row); byLedger[ledgerName].rawCount++; }
+    else add(ledgerName, {...row, narration: null, sourceSalesLedgerName: null, receiptDate: null, matchedReceiptAmount: null});
+  }
+  // Settled invoices are absent from Tally's pending Bill collection. Retain
+  // them separately for CD review, never in the collection/reminder list.
+  for (const invoice of evidence.canonicalInvoices.values()) {
+    if (seen.has(invoice.key)) continue;
+    const proof = evidence.settlements.get(invoice.key);
+    if (!proof) continue;
+    const row = invoiceRow(invoice);
+    // A missing bill alone is not settlement proof.
+    if (row.pendingAmount > 0.005) continue;
+    add(invoice.ledgerName, row);
   }
   return { byLedger, billCount };
 }

@@ -437,6 +437,7 @@ export class LocalAgentRuntime {
       state: await this.storage.call("getReceivableState", { datasetKey: key }),
       recordsFor: async (ledgerNames, options) => snapshot.recordsFor(ledgerNames, options),
       allBills: async () => snapshot.allBills(),
+        cashDiscountLedgerNames: () => snapshot.cashDiscountLedgerNames(),
     };
   }
 

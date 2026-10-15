@@ -7,13 +7,13 @@ import {
   sortPaymentFollowUpsByPriority,
 } from "../../../tally-bridge/src/collections-analysis/payment-follow-up.mjs";
 
-test("requires seven days past the Tally due date", () => {
+test("regular invoices use 30 days from invoice date regardless of supplied credit terms", () => {
   assert.equal(
     derivePaymentFollowUpTiming({ dueDate: "2026-08-03", invoiceDate: "2026-07-01" }, "2026-08-10").eligible,
     true
   );
   assert.equal(
-    derivePaymentFollowUpTiming({ dueDate: "2026-08-04", invoiceDate: "2026-07-01" }, "2026-08-10").eligible,
+    derivePaymentFollowUpTiming({ dueDate: "2026-07-04", invoiceDate: "2026-07-11" }, "2026-08-10").eligible,
     false
   );
 });
@@ -32,14 +32,17 @@ test('RTGS CD recovery does not hide unpaid invoices from payment follow-ups', (
   assert.equal(isCollectionOnlyPaymentFollowUp({followUpStatus:'debit_note_required',paymentCategory:'advance_rtgs'}),true);
 });
 
-test("uses invoice age only when the due date is missing or invalid", () => {
-  const timing = derivePaymentFollowUpTiming({ dueDate: null, invoiceDate: "2026-08-03" }, "2026-08-10");
+test("regular credit becomes overdue the day after the full 30-day window", () => {
+  const bill = { narration: 'PAYMENT WITHIN 25 DAYS', invoiceDate: '2026-08-03' };
+  assert.equal(derivePaymentFollowUpTiming(bill, '2026-08-10').eligible, false);
+  assert.equal(derivePaymentFollowUpTiming(bill, '2026-09-02').eligible, false);
+  const timing = derivePaymentFollowUpTiming(bill, "2026-09-03");
   assert.deepEqual(timing, {
     eligible: true,
-    ageBasis: "invoice_date",
-    ageDays: 7,
-    ageLabel: "7 days since invoice",
-    dueDate: null,
+    ageBasis: "due_date",
+    ageDays: 1,
+    ageLabel: "1 day overdue",
+    dueDate: '2026-09-02',
     invoiceDate: "2026-08-03",
   });
 });
@@ -51,13 +54,13 @@ test("keeps bills with no usable dates in review", () => {
   assert.equal(timing.ageDays, null);
 });
 
-test("collection-only filtering removes bills that still require a Debit Note", () => {
+test("CD status never removes a bill from collections", () => {
   const rows = [
     { partyLedgerName: "Debit note", followUpStatus: "debit_note_required", ageBasis: "invoice_date", ageDays: 10, outstandingAmount: 500 },
     { partyLedgerName: "Payment", followUpStatus: "needs_follow_up", ageBasis: "due_date", ageDays: 10, outstandingAmount: 500 },
   ].filter(isCollectionOnlyPaymentFollowUp);
 
-  assert.deepEqual(rows.map((row) => row.partyLedgerName), ["Payment"]);
+  assert.deepEqual(rows.map((row) => row.partyLedgerName), ["Debit note", "Payment"]);
 });
 
 test("priority sorting orders overdue, invoice fallback, then missing-date review", () => {

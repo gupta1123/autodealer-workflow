@@ -642,7 +642,11 @@ export function startCashDiscountGateway(options = {}) {
       return contexts;
     },
     scan: context => automaticConnectorRead(context,'cash_discount_scan',{forceRefresh:true,requireFresh:true,automaticDiscovery:true,moduleName:'followups'}),
-    reconcile: async (context,scan) => (await automationApi(context,{action:'reconcile',scan})).tasks || [],
+    reconcile: async (context,scan) => {
+      const result = await automationApi(context,{action:'reconcile',scan});
+      if (result.regularCreditMigrationRequired) console.warn('Regular payment reminders require the regular_credit_followups database migration; RTGS schedules continue.');
+      return result.tasks || [];
+    },
     read: (context,task) => automaticConnectorRead(context,'fetch_customer_open_bills',{companyName:context.companyName,financialYear:context.financialYear,asOfDate:businessDateText(),ledgerNames:[task.customer],queryPurpose:'payment_followup',forceLive:true,verificationInvoice:{invoice:task.invoice,invoiceDate:task.invoiceDate}}),
     deliver: (context,task,evidence) => automationApi(context,{action:'deliver',id:task.id,evidence}),
   });

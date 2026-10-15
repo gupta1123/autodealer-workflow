@@ -15,3 +15,11 @@ test('duplicates, cancelled receipts, wrong invoice date, refunds and adjustment
  for(const xml of [source+source+paid,source+paid+paid,source+voucher('Receipt','Agst Ref',100,'20260907','<ISCANCELLED>Yes</ISCANCELLED>'),voucher('Sales','New Ref',-100,'20260906')+paid,source+paid+voucher('Payment','Agst Ref',-10),source+voucher('Journal','Agst Ref',100)])assert.equal(check(xml),false);
  assert.equal(verifyReminderAllocationXml(source+paid,'Other','INV-1','2026-09-07').verified,false);
 });
+
+test('pre-invoice New Ref receipts settle the later Sales Agst Ref',()=>{
+ const advanceSource=voucher('Sales','Agst Ref',-100);
+ const advance=voucher('Receipt','New Ref',100,'20260906');
+ assert.equal(check(advance+advanceSource),true);
+ assert.equal(check(voucher('Receipt','New Ref',40,'20260906')+advanceSource),false);
+ assert.equal(check(advance+advanceSource+voucher('Payment','Agst Ref',-10)),false);
+});

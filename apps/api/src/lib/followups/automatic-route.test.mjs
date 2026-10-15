@@ -21,7 +21,7 @@ const shared=compile('packages/shared/src/lib/followup-pipeline.ts');
 const history=compile('apps/api/src/lib/collections-history.ts');
 class Rejected extends Error {}
 
-function fixture() {
+function fixture({legacyCategories=false}={}) {
   const scope={connectionId:'connection',companyName:'Company',companyGuid:'guid',financialYear:'2026-27',installationId:'install',sessionGeneration:1};
   const tables={tally_connections:[{id:'connection',owner_user_id:'owner',organization_id:'org',installation_id:'install',session_generation:1,bridge_token_hash:hash('bridge'),last_company_name:'Company',last_company_loaded:true,last_tally_reachable:true,last_heartbeat_at:new Date().toISOString(),revoked_at:null}],access_company_links:[{organization_id:'org',connection_id:'connection',installation_id:'install',company_id:'company',company_guid:'guid',financial_year:'2026-27'}],invoice_followup_pipelines:[]};
   let canSend=true,automatic=true,provider='accepted'; const submissions=[];
@@ -30,6 +30,7 @@ function fixture() {
     const query={select:()=>query,eq:(key,value)=>{filters.push(row=>row[key]===value);return query;},is:(key,value)=>{filters.push(row=>(row[key]??null)===value);return query;},lte:(key,value)=>{filters.push(row=>row[key]!=null&&row[key]<=value);return query;},limit:n=>{end=n;return query;},order:()=>query,range:(a,b)=>{start=a;end=b+1;return query;},maybeSingle:()=>{single=true;return query;},insert:value=>{kind='insert';patch=value;return query;},update:value=>{kind='update';patch=value;return query;},then:(resolve,reject)=>{
       try {
         let rows=tables[table].filter(row=>filters.every(filter=>filter(row)));
+        if(kind==='insert' && legacyCategories && patch.payment_category==='regular_credit') return Promise.resolve({data:null,error:{code:'23514'}}).then(resolve,reject);
         if(kind==='insert') {const row={id:`row-${tables[table].length}`,status:'active',revision:1,stage_index:0,stage_sent:0,...patch};tables[table].push(row);rows=[row];}
         if(kind==='update')rows.forEach(row=>Object.assign(row,patch));
         rows=rows.slice(start,end);return Promise.resolve({data:structuredClone(single?rows[0]??null:rows),error:null}).then(resolve,reject);
@@ -89,6 +90,25 @@ test('wrong pairing, company or revoked permission prevents submission',async()=
 test('disabling automation stops existing automatic schedules from sending',async()=>{
   const f=fixture();await f.enroll();f.setAutomatic(false);await f.deliver();assert.equal(f.submissions.length,0);
 });
-test('regular, future and ambiguous terms never enroll automatically',async()=>{
-  for(const values of [{narration:'PAYMENT WITHIN 25 DAYS'},{invoiceDate:'2099-10-12'},{narration:'ADVANCE RTGS SAME DAY RTGS'},{sourceVoucherType:'Debit Note'},{narration:'Cash discount recovery against invoice INV. Source narration: ADVANCE RTGS'}]){const f=fixture();await f.enroll(values);assert.equal(f.tables.invoice_followup_pipelines.length,0);}
+test('regular invoices enroll only after 30 days, with no extra grace week',async()=>{
+  const f=fixture(); await f.enroll({narration:'PAYMENT WITHIN 25 DAYS',invoiceDate:'2026-09-11'});
+  assert.equal(f.tables.invoice_followup_pipelines.length,1);
+  assert.equal(f.tables.invoice_followup_pipelines[0].payment_category,'regular_credit');
+  const g=fixture(); await g.enroll({narration:'PAYMENT WITHIN 25 DAYS',invoiceDate:'2026-09-12'});
+  assert.equal(g.tables.invoice_followup_pipelines.length,0);
+});
+
+test('a pending category migration does not interrupt existing RTGS reminders',async()=>{
+  const f=fixture({legacyCategories:true});
+  await f.enroll();
+  const response=await f.enroll({narration:'Regular credit',invoiceDate:'2026-09-01'});
+  assert.equal(response.status,200);
+  assert.equal((await response.json()).regularCreditMigrationRequired,true);
+  assert.equal(f.tables.invoice_followup_pipelines.length,1);
+  await f.deliver();
+  assert.equal(f.submissions.length,1);
+});
+
+test('future, ambiguous and non-sales invoices never enroll automatically',async()=>{
+  for(const values of [{invoiceDate:'2099-10-12'},{narration:'ADVANCE RTGS SAME DAY RTGS'},{invoiceEvidenceAmbiguous:true},{sourceVoucherType:'Debit Note'},{narration:'Cash discount recovery against invoice INV. Source narration: ADVANCE RTGS'}]){const f=fixture();await f.enroll(values);assert.equal(f.tables.invoice_followup_pipelines.length,0);}
 });

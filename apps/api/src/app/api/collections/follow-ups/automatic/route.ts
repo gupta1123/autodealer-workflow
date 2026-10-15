@@ -51,25 +51,29 @@ export async function POST(request: Request) {
       const byLedger = scan.openBillsResult?.result?.byLedger || scan.openBillsResult?.byLedger || {};
       const existing = new Set((await readCompleteHistory((from,to)=>scoped('invoice_followup_pipelines').eq('mode','pipeline').order('id').range(from,to))).map(row => row.invoice_key));
       let enrolled = 0;
+      let regularCreditMigrationRequired = false;
       for (const [customer,bucket] of Object.entries(byLedger) as Array<[string,{complete?:boolean;openBills?:OpenBillRow[]}]>) {
         if (bucket.complete === false) continue;
         const recipient = normalizeWhatsappPhone(ledgers.get(customer)?.raw?.phone);
         if (!/^91\d{10}$/.test(recipient)) continue;
         for (const bill of bucket.openBills || []) {
           const candidate = automaticReminderBill(bill);
-          if (!candidate) continue;
+          if (!candidate || (regularCreditMigrationRequired && candidate.category === 'regular_credit')) continue;
           const invoiceKey = createHash('sha256').update(JSON.stringify([customer,candidate.invoice,candidate.invoiceDate])).digest('hex');
           // Any existing recurring schedule, including paused/stopped/finished,
           // remains an operator decision. Do not restart it through discovery.
           if (existing.has(invoiceKey) || enrolled >= 25) continue;
           const firstDue = new Date(Date.parse(candidate.startsAt)+stageMs(plan.stages[0],'delay')).toISOString();
           const inserted = await db.from('invoice_followup_pipelines').insert({...scope,connection_id:connection.id,session_generation:connection.session_generation,company_name:context.companyName,customer,invoice:candidate.invoice,invoice_date:candidate.invoiceDate,invoice_key:invoiceKey,recipient,mode:'pipeline',automatic:true,payment_category:candidate.category,plan_name:plan.name,stages:plan.stages,outstanding:candidate.outstanding,next_due_at:firstDue,created_by:connection.owner_user_id});
+          // Older installations allow only RTGS categories. Keep their existing
+          // schedules working while the regular-credit migration is applied.
+          if (inserted.error?.code === '23514' && candidate.category === 'regular_credit') { regularCreditMigrationRequired = true; continue; }
           if (inserted.error && inserted.error.code !== '23505') throw new Error('Automatic reminder enrollment failed.');
           existing.add(invoiceKey); enrolled++;
         }
       }
       const tasks = checked(await scoped('invoice_followup_pipelines').eq('automatic',true).eq('status','active').lte('next_due_at',new Date().toISOString()).order('next_due_at').order('id').limit(25));
-      return jsonWithCors(request,{tasks:(tasks || []).map(row => ({id:row.id,customer:row.customer,invoice:row.invoice,invoiceDate:row.invoice_date}))});
+      return jsonWithCors(request,{regularCreditMigrationRequired,tasks:(tasks || []).map(row => ({id:row.id,customer:row.customer,invoice:row.invoice,invoiceDate:row.invoice_date}))});
     }
     if (body.action !== 'deliver') throw new Error('Unknown automatic reminder action.');
     const row = checked(await scoped('invoice_followup_pipelines').eq('id',body.id).eq('automatic',true).eq('mode','pipeline').maybeSingle());

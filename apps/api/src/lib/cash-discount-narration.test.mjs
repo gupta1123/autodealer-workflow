@@ -54,8 +54,18 @@ test('generated recovery narration cannot recursively qualify for another CD rec
   assert.deepEqual(parseCashDiscountTerms('Cash discount recovery against invoice INV. Source narration: ADVANCE RTGS'),[]);
 });
 test('full advance on invoice day fails and unverified receipts require review', () => {
-  assert.equal(analyse({pendingAmount:0,receiptDate:'2026-10-12',matchedReceiptAmount:98500}).deterministicStatus,'existing_balance_due');
+  assert.equal(analyse({pendingAmount:0,receiptDate:'2026-10-12',matchedReceiptAmount:98500}).deterministicStatus,'late_payment_discount_expired');
   assert.equal(analyse({pendingAmount:0,receiptDate:'2026-10-11',matchedReceiptAmount:100}).deterministicStatus,'receipt_amount_unverified');
+});
+
+test('display and recovery preserve the agreed net-of-CD gross-up basis', () => {
+  const result = analyse({originalAmount:100000,pendingAmount:100000});
+  assert.equal(result.expectedDiscounts[0].amount, 1522.84);
+  assert.equal(result.reversalPlan.totalReversalRequired, 1522.84);
+});
+
+test('ambiguous invoice evidence cannot authorize a recovery', () => {
+  assert.equal(analyse({invoiceEvidenceAmbiguous:true}).deterministicStatus,'receipt_amount_unverified');
 });
 test('invalid balances never authorize recovery', () => {
   for(const pendingAmount of [-1,NaN,100000]) assert.equal(analyse({pendingAmount}).deterministicStatus,'receipt_amount_unverified');

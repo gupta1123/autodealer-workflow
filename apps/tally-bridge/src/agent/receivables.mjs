@@ -22,7 +22,7 @@ export const RECEIVABLE_VOUCHER_FIELDS =
   "AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive," +
   "AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount";
 // Same fields and pending-bill rule as the live Cash Discount open-bills read.
-const BILL_FIELDS = "Name,Parent,LedgerName,PartyLedgerName,IsAdvance,BillType,TypeOfRef,Date,BillDate,DueDate,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount";
+const BILL_FIELDS = "Name,Parent,LedgerName,PartyLedgerName,IsAdvance,BillType,TypeOfRef,Date,BillDate,DueDate,BillCreditPeriod,VoucherNumber,VoucherTypeName,OpeningBalance,ClosingBalance,Balance,PendingAmount,Amount";
 const PENDING_BILL_FORMULA = [
   "(NOT $$IsEmpty:$ClosingBalance AND NOT $$IsEqual:$ClosingBalance:0)",
   "($$IsEmpty:$ClosingBalance AND NOT $$IsEmpty:$PendingAmount AND NOT $$IsEqual:$PendingAmount:0)",
@@ -803,6 +803,14 @@ export class ReceivablesPreparer {
     }
     const allBills = [...billsByLedger.values()].flat().map((bill) => bill.fields);
     return {
+      cashDiscountLedgerNames() {
+        const names = new Set();
+        for (const voucher of voucherById.values()) {
+          if (!/sales|invoice/i.test(voucher.fields.type || '') || !/\b(?:ADVANCE|SAME[ -]DAY)\s+RTGS\b/i.test(voucher.fields.narration || '')) continue;
+          if (voucher.fields.party) names.add(voucher.fields.party);
+        }
+        return [...names];
+      },
       recordsFor(ledgerNames, { dateFrom = null, dateTo = null } = {}) {
         const ledgerKeys = [...new Set(ledgerNames.map(receivableLedgerKey).filter(Boolean))];
         const bills = ledgerKeys.flatMap((key) => (billsByLedger.get(key) || []).map((bill) => bill.fields));

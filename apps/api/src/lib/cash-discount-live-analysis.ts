@@ -14,6 +14,7 @@ import {
 } from "@/lib/payment-follow-up";
 import {
   analyseCashDiscountNarration,
+  isCashDiscountRecoveryStatus,
   type CashDiscountNarrationAnalysis,
 } from "@/lib/cash-discount-narration";
 import { serializeDebitNoteProposal, toNumber, toText, type DebitNoteProposalRow } from "@/lib/collections";
@@ -68,12 +69,12 @@ export function analyseLiveCashDiscountSnapshot(params: {
     ? params.openBillsResult.result as Record<string, unknown>
     : params.openBillsResult;
   const byLedger = result?.byLedger && typeof result.byLedger === "object"
-    ? result.byLedger as Record<string, { ledgerName?: string | null; openBills?: OpenBillRow[]; complete?: boolean }>
+    ? result.byLedger as Record<string, { ledgerName?: string | null; openBills?: OpenBillRow[]; settledBills?: OpenBillRow[]; complete?: boolean }>
     : {};
 
   for (const [bucketLedgerName, bucket] of Object.entries(byLedger)) {
     if (bucket.complete === false) continue;
-    for (const bill of Array.isArray(bucket?.openBills) ? bucket.openBills : []) {
+    for (const bill of [...(bucket.openBills ?? []), ...(bucket.settledBills ?? [])]) {
       const ledgerName = toText(bill.ledgerName ?? bucket?.ledgerName ?? bucketLedgerName, 500);
       const billKey = `${normalizeLedgerName(ledgerName)}|${normalizeLedgerName(bill.referenceName)}|${normalizeLedgerName(bill.voucherNumber)}`;
       if (seenBillKeys.has(billKey)) continue;
@@ -81,7 +82,7 @@ export function analyseLiveCashDiscountSnapshot(params: {
       const originalAmount = toNumber(bill.originalAmount);
       const pendingAmount = toNumber(bill.pendingAmount);
       const invoiceDate = String(bill.invoiceDate ?? "").slice(0, 10);
-      if (!ledgerName || bill.kind === "advance" || isNonSalesVoucher(bill.sourceVoucherType) || originalAmount <= 0 || pendingAmount <= 0) continue;
+      if (!ledgerName || bill.kind === "advance" || isNonSalesVoucher(bill.sourceVoucherType) || originalAmount <= 0 || pendingAmount < 0) continue;
       narrationReviewRows.push({
         ledgerName,
         bill,
@@ -92,6 +93,7 @@ export function analyseLiveCashDiscountSnapshot(params: {
           pendingAmount,
           receiptDate: bill.receiptDate,
           matchedReceiptAmount: toNumber(bill.matchedReceiptAmount, Number.NaN),
+          invoiceEvidenceAmbiguous: bill.invoiceEvidenceAmbiguous,
           today,
         }),
       });
@@ -119,12 +121,12 @@ export function analyseLiveCashDiscountSnapshot(params: {
       reversalPlan: row.analysis.reversalPlan,
       deterministicStatus: row.analysis.deterministicStatus,
       deterministicReason: row.analysis.deterministicReason,
-      calculationVersion: "cash_discount_rtgs_v3",
+      calculationVersion: "collections_rtgs_v4",
     },
   }));
 
   const paymentFollowUps = sortPaymentFollowUpsByPriority(narrationReviewRows
-    .filter((row) => row.analysis.deterministicStatus !== "discount_taken_within_window")
+    .filter((row) => toNumber(row.bill.pendingAmount) > 0.005)
     .filter((row) => derivePaymentFollowUpTiming(row.bill, today).eligible)
     .map((row) => serializePaymentFollowUp({
       bill: row.bill,
@@ -139,7 +141,7 @@ export function analyseLiveCashDiscountSnapshot(params: {
     .filter(isCollectionOnlyPaymentFollowUp));
 
   const tallyCandidates = narratedDiscountRows
-    .filter((row) => row.analysis.deterministicStatus === "unpaid_discount_tier_expired")
+    .filter((row) => isCashDiscountRecoveryStatus(row.analysis.deterministicStatus))
     .map((row) => {
       const invoiceNumber = toText(row.bill.referenceName ?? row.bill.voucherNumber, 240) || null;
       const alreadyCreatedReversalAmount = createdReversalByInvoice.get(invoiceIdentityKey(row.ledgerName, invoiceNumber)) ?? 0;

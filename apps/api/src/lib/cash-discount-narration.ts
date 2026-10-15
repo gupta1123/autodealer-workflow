@@ -22,6 +22,7 @@ export type CashDiscountDeterministicStatus =
   | "missing_invoice_date"
   | "within_eligibility_window"
   | "unpaid_discount_tier_expired"
+  | "late_payment_discount_expired"
   | "invoice_unpaid"
   | "receipt_date_not_found"
   | "discount_taken_within_window"
@@ -72,6 +73,10 @@ function asMoney(value: number) {
 
 function moneyClose(left: number, right: number) {
   return Math.abs(left - right) <= 1;
+}
+
+export function isCashDiscountRecoveryStatus(status: string) {
+  return status === 'unpaid_discount_tier_expired' || status === 'late_payment_discount_expired';
 }
 
 function addDays(dateText: string, days: number) {
@@ -240,6 +245,7 @@ export function analyseCashDiscountNarration(input: {
   pendingAmount: number;
   receiptDate?: string | null | undefined;
   matchedReceiptAmount?: number | null | undefined;
+  invoiceEvidenceAmbiguous?: boolean;
   today: string;
 }): CashDiscountNarrationAnalysis {
   const sourceNarration = String(input.narration ?? '').trim();
@@ -250,7 +256,7 @@ export function analyseCashDiscountNarration(input: {
   const matchedReceiptAmount = input.matchedReceiptAmount != null && Number.isFinite(Number(input.matchedReceiptAmount))
     ? asMoney(Number(input.matchedReceiptAmount)) : null;
   const reversalPlan = requirement ? createUnpaidReversalPlan({ terms, invoiceDate: input.invoiceDate, invoiceNetAmount: input.originalAmount, today: input.today }) : null;
-  const expectedDiscounts = terms.map(term => ({ ratePercent: term.ratePercent, amount: asMoney(input.originalAmount * term.ratePercent / 100) }));
+  const expectedDiscounts = terms.map(term => ({ ratePercent: term.ratePercent, amount: asMoney((reversalPlan?.grossInvoiceAmount ?? input.originalAmount) * term.ratePercent / 100) }));
   const base = {
     paymentCategory: parsed.category,
     sourceNarration,
@@ -269,6 +275,7 @@ export function analyseCashDiscountNarration(input: {
   if (parsed.ambiguous) return result('cash_discount_rate_missing', 'Both ADVANCE RTGS and SAME DAY RTGS are present. Review the agreed payment category.');
   if (!parsed.category) return result('no_cash_discount_context', 'Neither ADVANCE RTGS nor SAME DAY RTGS was found in the invoice narration.');
   if (!requirement || !validPaymentDate(input.today)) return result('missing_invoice_date', 'A valid invoice date and business date are required to check RTGS payment terms.');
+  if (input.invoiceEvidenceAmbiguous) return result('receipt_amount_unverified', 'Invoice or allocation evidence is ambiguous. Review it in Tally before recovering CD.');
   if (!Number.isFinite(input.originalAmount) || input.originalAmount <= 0 || !Number.isFinite(input.pendingAmount) || input.pendingAmount < 0 || input.pendingAmount > input.originalAmount + 1) {
     return result('receipt_amount_unverified', 'The invoice balance cannot be verified. Review it in Tally before recovering CD.');
   }
@@ -278,7 +285,7 @@ export function analyseCashDiscountNarration(input: {
     if (!receiptDate) return result('receipt_date_not_found', 'No linked receipt date proves payment against this invoice.');
     if (matchedReceiptAmount === null || !moneyClose(matchedReceiptAmount, input.originalAmount)) return result('receipt_amount_unverified', 'Linked receipts do not prove full payment of this invoice.');
     if (receiptDate <= requirement.deadline) return {...result('discount_taken_within_window', 'Full payment met the agreed RTGS requirement.'), reversalPlan: reversalPlan ? {...reversalPlan,activeDiscount:reversalPlan.initialDiscount,currentPayableAmount:input.originalAmount,totalReversalRequired:0} : null};
-    return result('existing_balance_due', 'Payment arrived after the RTGS deadline. Review the full category CD recovery.');
+    return result('late_payment_discount_expired', 'Full payment arrived after the RTGS deadline. Recover the category CD separately from the settled invoice.');
   }
   if (input.today <= requirement.deadline) return result('within_eligibility_window', `Payment is required by ${requirement.deadline} (IST).`);
   return result('unpaid_discount_tier_expired', `The ${requirement.category === 'advance_rtgs' ? 'advance' : 'same-day'} payment requirement was missed. Recover the full ${requirement.ratePercent}% category discount and follow up for the remaining Tally balance.`);

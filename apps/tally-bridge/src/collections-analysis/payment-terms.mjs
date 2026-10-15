@@ -23,18 +23,22 @@ export function validPaymentDate(value) {
     const time = Date.parse(`${text}T00:00:00Z`);
     return Number.isFinite(time) && new Date(time).toISOString().slice(0, 10) === text ? text : null;
 }
+export function collectionPaymentRequirement(narration, invoiceDate) {
+    const parsed = classifyPaymentNarration(narration);
+    return parsed.ambiguous ? null : paymentRequirement(parsed.category ?? 'regular_credit', invoiceDate);
+}
 export function paymentRequirement(category, invoiceDate) {
     const date = validPaymentDate(invoiceDate);
     if (!date)
         return null;
-    const eligibilityDays = category === 'advance_rtgs' ? -1 : 0;
+    const eligibilityDays = category === 'regular_credit' ? 30 : category === 'advance_rtgs' ? -1 : 0;
     const deadline = new Date(Date.parse(`${date}T00:00:00Z`) + eligibilityDays * 86_400_000).toISOString().slice(0, 10);
     return {
         category,
-        ratePercent: category === 'advance_rtgs' ? 1.5 : 1,
+        ratePercent: category === 'regular_credit' ? 0 : category === 'advance_rtgs' ? 1.5 : 1,
         eligibilityDays,
         deadline,
-        label: category === 'advance_rtgs' ? '1.5% — payment before invoice date' : '1% — payment on invoice date',
+        label: category === 'regular_credit' ? 'Payment within 30 days' : category === 'advance_rtgs' ? '1.5% — payment before invoice date' : '1% — payment on invoice date',
         // Midnight in IST after the last qualifying payment date.
         followUpStartsAt: new Date(Date.parse(`${deadline}T00:00:00+05:30`) + 86_400_000).toISOString(),
     };
