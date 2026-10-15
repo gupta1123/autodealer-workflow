@@ -13,7 +13,7 @@ import { WebSocket } from "ws";
 import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallyScheduler, createCashDiscountResultCache,
   createConnectorBenchmarkTrace, finishConnectorBenchmarkTrace, markConnectorBenchmarkStage,
   recordConnectorTallyRead, CASH_DISCOUNT_READ_MS, CASH_DISCOUNT_SCAN_MS,
-  CASH_DISCOUNT_RESULT_BYTES } from "./cash-discount-runtime.mjs";
+  CASH_DISCOUNT_RESULT_BYTES, cancelCashDiscountRead, shouldPauseAfterReadFailure } from "./cash-discount-runtime.mjs";
 import { createLocalAgentRuntime } from "./agent/runtime.mjs";
 import { RECEIVABLE_RECONCILIATION_VERSION } from "./agent/receivables.mjs";
 import { billFields, voucherFields, openBillAmountIndexFromFields, openBillFromFields, openBillsByLedgerFromFields } from "./agent/receivable-fields.mjs";
@@ -8381,7 +8381,9 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
       sendOperationResult({ type: "operation_result", success: true, companyName: message.companyName, data: responseData });
     } catch (error) {
       if (!benchmarkFinished) {
-        if (isRead) readRecoveryUntil = Date.now() + 30_000;
+        if (isRead && shouldPauseAfterReadFailure(controller.signal)) readRecoveryUntil = Date.now() + 30_000;
+        if (isRead) log(shouldPauseAfterReadFailure(controller.signal) ? "warn" : "info",
+          `Cash Discount ${operation} ${requestId}: ${error instanceof Error ? error.message : String(error)}${shouldPauseAfterReadFailure(controller.signal) ? " Reads paused for 30 seconds." : " Cancelled by the browser; subsequent reads remain available."}`);
         finishConnectorBenchmarkTrace(benchmark, { success: false, error });
         benchmarkFinished = true;
       }
@@ -8441,7 +8443,8 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
           } else if (message.type === "command_queued") {
             wakeCommands();
           } else if (message.type === "cancel") {
-            activeReads.get(String(message.requestId || ""))?.abort(new Error("Cash Discount read cancelled."));
+            const controller = activeReads.get(String(message.requestId || ""));
+            if (controller) cancelCashDiscountRead(controller);
           } else if (message.type === "error") {
             log("error", `Cash Discount live channel: ${message.error || "unknown error"}`);
           }

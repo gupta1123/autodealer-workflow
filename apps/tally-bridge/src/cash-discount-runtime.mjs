@@ -9,6 +9,18 @@ export const CASH_DISCOUNT_READ_MS = 20_000;
 export const CASH_DISCOUNT_SCAN_MS = 90_000;
 export const CASH_DISCOUNT_XML_BYTES = 8 * 1024 * 1024;
 export const CASH_DISCOUNT_RESULT_BYTES = 4 * 1024 * 1024;
+
+// A browser leaving a page cancels its read deliberately. AbortError alone
+// cannot distinguish that from a real HTTP timeout, which still needs backoff.
+export function cancelCashDiscountRead(controller) {
+  const reason = new Error("Cash Discount read cancelled.");
+  reason.code = "KALIKA_READ_CANCELLED";
+  controller.abort(reason);
+}
+
+export function shouldPauseAfterReadFailure(signal) {
+  return !(signal?.aborted && signal.reason?.code === "KALIKA_READ_CANCELLED");
+}
 const BENCHMARK_DIRECTORY = process.env.KALIKA_BENCHMARK_DIRECTORY ||
   path.join(os.homedir(), ".autodealer-tally-bridge", "diagnostics");
 export const BENCHMARK_DIAGNOSTICS_ENABLED = process.env.KALIKA_BENCHMARK_DIAGNOSTICS === "1" ||

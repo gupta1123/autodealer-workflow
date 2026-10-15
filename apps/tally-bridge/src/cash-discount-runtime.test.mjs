@@ -3,8 +3,32 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallyScheduler, createCashDiscountResultCache } from "./cash-discount-runtime.mjs";
+import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallyScheduler, createCashDiscountResultCache, cancelCashDiscountRead, shouldPauseAfterReadFailure } from "./cash-discount-runtime.mjs";
 import { collectCashDiscountCustomerEvidence, fetchCustomerOpenBillsFromTally } from "./bridge.mjs";
+
+test("switching pages cancels the old read without starting the failure cooldown", async () => {
+  const controller = new AbortController();
+  cancelCashDiscountRead(controller);
+  await assert.rejects(cashDiscountReadContext.run({ signal: controller.signal }, async () => checkReadBudget()), /read cancelled/);
+  assert.equal(shouldPauseAfterReadFailure(controller.signal), false);
+  // A new request uses its own signal and can immediately acquire the Tally lane.
+  const queue = createTallyScheduler();
+  assert.equal(await queue.run(async () => {
+    checkReadBudget({ signal: new AbortController().signal });
+    return 'next page available';
+  }), 'next page available');
+});
+
+test("deadline and network aborts still pause reads, even if cancellation arrives later", () => {
+  for (const reason of [new Error('Cash Discount read deadline exceeded.'), new DOMException('HTTP timed out', 'AbortError')]) {
+    const controller = new AbortController();
+    controller.abort(reason);
+    cancelCashDiscountRead(controller);
+    assert.equal(shouldPauseAfterReadFailure(controller.signal), true);
+    assert.equal(controller.signal.reason, reason);
+  }
+  assert.equal(shouldPauseAfterReadFailure(new AbortController().signal), true, 'ordinary read errors retain backoff');
+});
 
 test("benchmark diagnostics remain opt-in and write a bounded local trace", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "kalika-benchmark-"));
