@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { waitForPacketRun } from "./wait-for-packet-run.mjs";
 
 import { createClient } from "@supabase/supabase-js";
 import {
@@ -2392,6 +2393,16 @@ async function recoverStaleRunningJobs() {
 async function claimNextJob() {
   await recoverStaleRunningJobs();
 
+  // Also respect analyses already running when this worker restarted or lost
+  // its router connection; never start another packet just because dispatch ended.
+  const { data: active, error: activeError } = await supabase
+    .from("packet_processing_jobs").select("id").eq("status", "running").limit(1).maybeSingle();
+  if (activeError) throw activeError;
+  if (active?.id) {
+    await waitForInFlightRun(active.id);
+    return null;
+  }
+
   const { data, error } = await supabase.rpc("claim_packet_processing_job", {
     worker_name: WORKER_NAME,
     stale_after: WORKER_STALE_RUNNING_JOB_INTERVAL,
@@ -2505,17 +2516,13 @@ async function requeueTallyQueueJob(job, error) {
 }
 
 async function waitForInFlightRun(jobId) {
-  const deadline = Date.now() + WORKER_IN_FLIGHT_WAIT_MS;
-
-  while (Date.now() < deadline) {
-    const job = await getJob(jobId);
-    if (!job || isTerminalJobStatus(job.status) || job.status === "queued") {
-      return job;
-    }
-    await sleep(WORKER_IN_FLIGHT_POLL_MS);
-  }
-
-  return getJob(jobId);
+  return waitForPacketRun(jobId, {
+    getJob, sleep,
+    pollMs: WORKER_IN_FLIGHT_POLL_MS,
+    staleMs: WORKER_STALE_RUNNING_JOB_MS,
+    reportMs: WORKER_IN_FLIGHT_WAIT_MS,
+    report: (id) => console.log(`[worker] packet job ${id} is still running; waiting before claiming another packet`),
+  });
 }
 
 async function main() {

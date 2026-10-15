@@ -78,6 +78,25 @@ function formatRelativeDate(value: string) {
 
 function getApprovalPill(status: string) {
   switch (status.toLowerCase()) {
+    case "processing":
+    case "queued":
+      return {
+        label: "Processing",
+        className: "bg-[#eff6ff] text-[#1e40af] border-[#bfdbfe]",
+        dotColor: "bg-[#2563eb] animate-pulse",
+      };
+    case "failed":
+      return {
+        label: "Analysis failed",
+        className: "bg-[#fbf0ef] text-[#8c1d18] border-[#f2c7c4]",
+        dotColor: "bg-[#b91c1c]",
+      };
+    case "draft":
+      return {
+        label: "Not analysed",
+        className: "bg-[#f5f5f4] text-[#57534e] border-[#e7e5e4]",
+        dotColor: "bg-[#78716c]",
+      };
     case "accepted":
       return {
         label: "Approved",
@@ -192,18 +211,21 @@ export function CasesPage() {
       setTotalPages(cached.totalPages);
       setStatus("ready");
       setError(null);
-      return;
     }
 
     const controller = new AbortController();
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+    let hasResults = Boolean(cached);
 
-    setCases([]);
-    setTotalCount(0);
-    setTotalPages(1);
-    setStatus("loading");
+    if (!cached) {
+      setCases([]);
+      setTotalCount(0);
+      setTotalPages(1);
+      setStatus("loading");
+    }
     setError(null);
 
-    fetchCasePage({
+    const refresh = () => fetchCasePage({
       scope: "active",
       limit: pageSize,
       page: currentPage,
@@ -214,6 +236,7 @@ export function CasesPage() {
     })
       .then((payload) => {
         if(controller.signal.aborted)return;
+        hasResults = true;
         const nextTotalCount = payload.totalCount ?? payload.cases.length;
         const nextTotalPages = Math.max(1, Math.ceil(nextTotalCount / pageSize));
         setCases(payload.cases);
@@ -225,14 +248,22 @@ export function CasesPage() {
           totalCount: nextTotalCount,
           totalPages: nextTotalPages,
         });
+        if (payload.cases.some((item) => item.status === "processing" || item.status === "queued")) {
+          refreshTimer = setTimeout(refresh, 5000);
+        }
       })
       .catch((loadError) => {
         if (controller.signal.aborted) return;
+        if (hasResults) {
+          refreshTimer = setTimeout(refresh, 5000);
+          return;
+        }
         setError(loadError instanceof Error ? loadError.message : "Failed to load cases.");
         setStatus("error");
       });
+    void refresh();
 
-    return () => controller.abort();
+    return () => { controller.abort(); clearTimeout(refreshTimer); };
   }, [cacheKey, currentPage, debouncedSearchQuery, pageSize]);
 
   async function handleConfirmDelete() {
