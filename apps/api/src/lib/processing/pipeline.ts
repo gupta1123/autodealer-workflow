@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import sharp from "sharp";
+import { planImageBatches, mergeOverlappingPageGroups, runWithImageSizeFallback } from "./image-request-budget";
 
 import { summarizeCase } from "@/lib/case-summary";
 import { DEFAULT_COMPARISON_OPTIONS, normalizeComparableValue, readComparisonOptions } from "@/lib/comparison";
@@ -51,8 +52,8 @@ const execFileAsync = promisify(execFile);
 const PDF_RENDER_DPI = Number(process.env.PACKET_PDF_RENDER_DPI ?? 160);
 const PDF_RENDER_MAX_PAGES = Number(process.env.PACKET_PDF_RENDER_MAX_PAGES ?? 8);
 const PDF_SMART_SPLIT_MAX_PAGES = Number(process.env.PACKET_PDF_SMART_SPLIT_MAX_PAGES ?? 20);
-const PROVIDER_IMAGE_HARD_LIMIT_BYTES = Number(process.env.PACKET_PROVIDER_IMAGE_HARD_LIMIT_BYTES ?? 20 * 1024 * 1024);
-const PROVIDER_IMAGE_TARGET_BYTES = Number(process.env.PACKET_PROVIDER_IMAGE_TARGET_BYTES ?? 8 * 1024 * 1024);
+const PROVIDER_IMAGE_HARD_LIMIT_BYTES = Math.min(8 * 1024 * 1024, Math.max(1, Number(process.env.PACKET_PROVIDER_IMAGE_HARD_LIMIT_BYTES) || 8 * 1024 * 1024));
+const PROVIDER_IMAGE_TARGET_BYTES = Math.min(PROVIDER_IMAGE_HARD_LIMIT_BYTES, Math.max(1, Number(process.env.PACKET_PROVIDER_IMAGE_TARGET_BYTES) || 1.5 * 1024 * 1024));
 const PROVIDER_IMAGE_MAX_DIMENSION = Number(process.env.PACKET_PROVIDER_IMAGE_MAX_DIMENSION ?? 3200);
 const PACKET_AI_CONCURRENCY = Math.max(
   1,
@@ -4744,6 +4745,32 @@ async function splitPdfPagesIndividually(params: {
 }
 
 async function splitPdfIntoDocumentGroups(params: {
+  fileName: string;
+  textPages: string[];
+  pageImages: string[];
+}): Promise<PdfDocumentGroup[]> {
+  const pageCount = Math.max(params.textPages.length, params.pageImages.length);
+  if (pageCount <= 1 || !params.pageImages.length) {
+    return splitPdfBatchIntoDocumentGroups(params);
+  }
+  const batches = planImageBatches(params.pageImages, pageCount);
+  const groups: PdfDocumentGroup[] = [];
+  for (const batch of batches) {
+    console.info(`[packet-processing] grouping pages ${batch.start + 1}-${batch.end} of ${pageCount}; imageBytes=${batch.bytes}`);
+    const batchGroups = await runWithImageSizeFallback(batch.start, batch.end, async (start, end) => {
+      const localGroups = await splitPdfBatchIntoDocumentGroups({
+        fileName: params.fileName,
+        textPages: params.textPages.slice(start, end),
+        pageImages: params.pageImages.slice(start, end),
+      });
+      return localGroups.map((group) => ({ ...group, pageStart: group.pageStart + start, pageEnd: group.pageEnd + start }));
+    });
+    groups.push(...batchGroups);
+  }
+  return mergeOverlappingPageGroups(groups);
+}
+
+async function splitPdfBatchIntoDocumentGroups(params: {
   fileName: string;
   textPages: string[];
   pageImages: string[];
