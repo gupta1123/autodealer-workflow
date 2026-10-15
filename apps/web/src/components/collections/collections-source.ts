@@ -113,7 +113,10 @@ export function useCollectionsList<T>(
 ) {
   const [state, setState] = useState<{ page: ListPage<T> | null; loading: boolean; error: string | null }>({ page: null, loading: false, error: null });
   const latest = useRef(0);
-  const source = dashboard ? (isHeld(dashboard) ? dashboard.dashboardId : dashboard) : null;
+  // A refreshed scan can renew its connection grant while keeping the same
+  // revision/id. The new response must retry a failed page request anyway.
+  const source = dashboard;
+  const recoveryAttempted = useRef<string | null>(null);
   const queryKey = query ? JSON.stringify(query) : '';
   const searchKey = query?.search ?? '';
   const previousSearch = useRef(searchKey);
@@ -123,22 +126,32 @@ export function useCollectionsList<T>(
   expiredRef.current = onExpired;
 
   useEffect(() => {
-    if (!dashboard || !query) { setState({ page: null, loading: false, error: null }); return; }
     const request = ++latest.current;
+    if (!dashboard || !query) { setState({ page: null, loading: false, error: null }); return; }
     const typing = previousSearch.current !== searchKey;
     previousSearch.current = searchKey;
     setState((current) => ({ ...current, loading: true, error: null }));
     const timer = window.setTimeout(() => {
       fetchCollectionsPage<T>(dashboard, query, remoteRef.current).then(
-        (page) => { if (request === latest.current) setState({ page, loading: false, error: null }); },
+        (page) => { if (request === latest.current) {
+          recoveryAttempted.current = null;
+          setState({ page, loading: false, error: null });
+        } },
         (error) => {
           if (request !== latest.current) return;
-          if (isExpiredCollectionsError(error)) expiredRef.current();
-          setState((current) => ({ ...current, loading: false, error: error instanceof Error ? error.message : 'Could not load this list.' }));
+          const recoveryKey = JSON.stringify([dashboard.dashboardId, queryKey]);
+          if (isExpiredCollectionsError(error) && recoveryAttempted.current !== recoveryKey) {
+            recoveryAttempted.current = recoveryKey;
+            expiredRef.current();
+          }
+          setState({ page: null, loading: false, error: error instanceof Error ? error.message : 'Could not load this list.' });
         },
       );
     }, typing && isHeld(dashboard) ? 250 : 0);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      if (latest.current === request) latest.current++;
+    };
     // The source identity and the query (as a key) decide when to reload.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [source, queryKey]);

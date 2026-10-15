@@ -1022,7 +1022,7 @@ export function CollectionsDashboardPage({
           setDashboard(current => current?.scanSummary?.complete === true ? current : nextDashboard);
           return;
         }
-        setDashboard((current) => options?.quiet && isDedicatedFollowUpsPage && paymentFollowUpDataKey(current) === paymentFollowUpDataKey(nextDashboard)
+        setDashboard((current) => options?.quiet && !nextDashboard.paged && isDedicatedFollowUpsPage && paymentFollowUpDataKey(current) === paymentFollowUpDataKey(nextDashboard)
           ? current
           : nextDashboard);
         if (!options?.quiet) setMessage(null);
@@ -1359,7 +1359,7 @@ export function CollectionsDashboardPage({
         // Tally change (or a manual Refresh) tries again.
         followupRevisionRef.current = { scope, revision };
         if (nextDashboard.scanSummary?.complete === false) return;
-        setDashboard((current) => paymentFollowUpDataKey(current) === paymentFollowUpDataKey(nextDashboard)
+        setDashboard((current) => !nextDashboard.paged && paymentFollowUpDataKey(current) === paymentFollowUpDataKey(nextDashboard)
           ? current
           : nextDashboard);
         setLastScan({
