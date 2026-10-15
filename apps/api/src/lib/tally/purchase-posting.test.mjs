@@ -1390,6 +1390,25 @@ test("transport wording on actual goods with quantity does not remove the stock 
   assert.equal(result.source.invoiceFreightAmount, '');
 });
 
+test("a partial catalogue never replaces the saved or configured freight ledger with a fallback", () => {
+  const name = 'Transportation Inward @ 18.00%';
+  const document = invoiceDocument({ totalAmount: '1416', taxAmount: '216', tdsAmount: '' });
+  Object.assign(document.extracted_fields, { freightAmount: '200', freightGstRate: '18', totalTaxableAmount: '1200' });
+  const partial = completeMasters.filter(row => row.tally_name !== name);
+  partial.push(master('ledger', 'Freight Inward', { parent_name: 'Direct Expenses' }));
+  const mappings = [{ mapping_type: 'freight_ledger', source_key: 'purchase', target_master_type: 'ledger', target_master_key: 'transport-ledger-id', target_master_name: name, status: 'active' }];
+  const savedReview = { sourceReferenceApproved: true, applyGstTds: false, applyTransportTds: false };
+  const configured = prepare(document, { masters: partial, mappings, savedReview });
+  assert.equal(configured.review.freightLedgerName, name);
+  assert.ok(configured.blockers.some(row => row.code === 'FREIGHT_LEDGER_REQUIRED'), 'an unverified name is not permission to post');
+  const selected = prepare(document, { masters: partial, savedReview: { ...savedReview, freightLedgerName: name } });
+  assert.equal(selected.review.freightLedgerName, name, 'manual case selection is preserved too');
+  assert.ok(selected.blockers.some(row => row.code === 'FREIGHT_LEDGER_REQUIRED'));
+  const fresh = prepare(document, { masters: [...partial, master('ledger', name, { master_key: 'transport-ledger-id' })], mappings, savedReview: configured.review });
+  assert.equal(fresh.review.freightLedgerName, name);
+  assert.equal(fresh.blockers.some(row => row.code === 'FREIGHT_LEDGER_REQUIRED'), false);
+});
+
 test("a wrong transport TDS ledger is named and the right one is suggested", () => {
   const document = invoiceDocument({
     totalAmount: "1416.00",

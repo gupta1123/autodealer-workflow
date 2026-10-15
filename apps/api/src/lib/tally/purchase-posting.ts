@@ -1160,6 +1160,12 @@ function buildDefaultReview(
   const supplierState = stateCodeFromGstin(source.supplierGstin);
   const buyerState = stateCodeFromGstin(buyerGstin || source.buyerGstin);
   const localPurchase = Boolean(supplierState && buyerState && supplierState === buyerState);
+  const configuredFreight = mappings.find(mapping => mapping.status === 'active' &&
+    mapping.mapping_type === 'freight_ledger' && normalizeKey(mapping.source_key) === normalizeKey('purchase'));
+  // The first page load can have only a partial catalogue. Keep the chosen
+  // ledger visible so the browser includes it in the next live validation;
+  // FREIGHT_LEDGER_REQUIRED still blocks posting until Tally supplies it.
+  const configuredFreightName = configuredFreight?.target_master_name?.trim() || '';
   const savedLineValues = Array.isArray(saved?.lines) ? saved.lines : [];
   const savedLines = new Map(savedLineValues.map((line) => [line.lineId, line]));
   const lines = source.lines.map((line) => {
@@ -1268,6 +1274,7 @@ function buildDefaultReview(
     freightGstRate: source.invoiceFreightGstRate || (moneyPaise(source.invoiceFreightAmount) ? "18" : ""),
     freightLedgerName:
       mappedName(masters, mappings, "freight_ledger", "purchase", ["ledger"]) ||
+      configuredFreightName ||
       exactMasterName(masters, "Transportation Inward @ 18.00%", ["ledger"]) ||
       namedRoleLedger(masters, [/freight|transportation\s+inward/i], [/direct\s+expenses?|purchase/i]),
     tds194qLedgerName:
@@ -1330,7 +1337,7 @@ function buildDefaultReview(
     freightGstRate: moneyPaise(source.invoiceFreightAmount)
       ? saved?.freightGstRate ?? baseReview.freightGstRate
       : "",
-    freightLedgerName: exactMasterName(masters, saved?.freightLedgerName || "", ["ledger"]) || baseReview.freightLedgerName,
+    freightLedgerName: exactMasterName(masters, saved?.freightLedgerName || "", ["ledger"]) || saved?.freightLedgerName?.trim() || baseReview.freightLedgerName,
     tds194qLedgerName:
       exactMasterName(masters, saved?.tds194qLedgerName || saved?.tdsLedgerName || "", ["ledger", "tax_ledger"]) || baseReview.tds194qLedgerName,
     transportTdsLedgerName:

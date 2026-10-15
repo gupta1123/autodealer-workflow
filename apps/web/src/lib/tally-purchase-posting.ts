@@ -579,11 +579,11 @@ export function prepareLiveTallyCatalogue(
   addCandidates(matching(/\b(cgst|central\s+tax)\b.*\btds\b|\btds\b.*\b(cgst|central\s+tax)\b/i), 12);
   addCandidates(matching(/\b(sgst|state\s+tax)\b.*\btds\b|\btds\b.*\b(sgst|state\s+tax)\b/i), 12);
   addCandidates(matching(/\b(igst|integrated\s+tax)\b.*\btds\b|\btds\b.*\b(igst|integrated\s+tax)\b/i), 12);
-  addCandidates(matching(/\b(freight|transport|goods\s+carriage)\b/i), 16);
+  addCandidates(matching(/\b(freight|transport(?:ation)?|goods\s+carriage)\b/i), 16);
   addCandidates(matching(/\b(tcs|tax\s+collected)\b/i), 12);
   addCandidates(matching(/\bround[ -]?off\b|\broundoff\b/i), 12);
   addCandidates(
-    matching(/\b(input|purchase|gst|tds|tcs|tax|dut(?:y|ies)|freight|transport|round[ -]?off|roundoff)\b/i),
+    matching(/\b(input|purchase|gst|tds|tcs|tax|dut(?:y|ies)|freight|transport(?:ation)?|round[ -]?off|roundoff)\b/i),
     20
   );
   const ledgerOptionByName = new Map(ledgerOptions.map((option) => [liveKey(option.name), option]));
