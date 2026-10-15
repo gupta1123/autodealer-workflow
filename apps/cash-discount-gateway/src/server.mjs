@@ -16,6 +16,7 @@ let apiBaseUrl = (process.env.CASH_DISCOUNT_API_BASE_URL || "http://localhost:30
 const AUTH_TIMEOUT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 4 * 60_000;
 const SERIAL_OPERATION_WAIT_MS = 20_000;
+const SERIAL_TALLY_OPERATIONS = new Set(['ledger_masters', 'verify_bank_transaction', 'fetch_customer_open_bills', 'scan', 'followups_scan', 'cash_discount_scan', 'create_debit_note']);
 const MAX_MESSAGE_BYTES = 30 * 1024 * 1024;
 
 const metadata = new WeakMap();
@@ -116,7 +117,7 @@ function recordScanOutcome(item, status, data, error) {
 
 function failPending(requestId, error) {
   const active = pending.get(requestId);
-  if (active && ["scanning", "revalidating", "company_check", "ledger_suggestions", "verify_bank_transaction", "fetch_customer_open_bills", "collections"].includes(active.phase)) {
+  if (active && ["scanning", "revalidating", "company_check", "ledger_masters", "ledger_suggestions", "verify_bank_transaction", "fetch_customer_open_bills", "collections"].includes(active.phase)) {
     send(active.connector, { type: "cancel", requestId });
   }
   const item = clearPending(requestId);
@@ -159,6 +160,32 @@ function startPending({ requestId, browser, connector, connectionId, ownerUserId
   };
   pending.set(requestId, item);
   return item;
+}
+
+async function waitForTallyTurn(item) {
+  if (!SERIAL_TALLY_OPERATIONS.has(item.operation)) return true;
+  const phase = item.phase;
+  item.phase = 'waiting_for_tally';
+  // Map insertion order gives each authenticated request a place in the queue.
+  // Register it before waiting so cancellation/disconnection removes it too.
+  const first = () => [...pending.values()].find(other => other.connectionId === item.connectionId && SERIAL_TALLY_OPERATIONS.has(other.operation));
+  if (first() !== item) {
+    trace(item.requestId, 'waiting: another Tally read is running on this connector');
+    send(item.browser, { type: 'progress', requestId: item.requestId, message: 'Waiting for the current check to finish…' });
+    const until = Date.now() + SERIAL_OPERATION_WAIT_MS;
+    while (pending.get(item.requestId) === item && first() !== item && Date.now() < until && item.browser.readyState === WebSocket.OPEN) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    if (pending.get(item.requestId) !== item) return false;
+    if (item.browser.readyState !== WebSocket.OPEN) { clearPending(item.requestId); return false; }
+    if (first() !== item) { failPending(item.requestId, new Error('The current Tally check is still running. Try again in a moment.')); return false; }
+  }
+  if (connectors.get(item.connectionId) !== item.connector || item.connector.readyState !== WebSocket.OPEN) {
+    failPending(item.requestId, new Error('The Tally connector changed while this request was waiting. Refresh to continue.'));
+    return false;
+  }
+  item.phase = phase;
+  return true;
 }
 
 async function authenticate(socket, message) {
@@ -309,22 +336,6 @@ async function handleBrowserRequest(socket, message, meta) {
       send(socket, { type: "result", requestId, success: false, error: "Update Kalika Local Agent on the Tally computer before checking Cash Discounts or Payment Follow-ups." });
       return;
     }
-    // Only one scan or debit note runs per connector at a time. Scans now take
-    // seconds, so wait briefly for the running one instead of failing.
-    const busy = () => [...pending.values()].some((item) => item.connectionId === meta.connectionId && ["scan", "followups_scan", "create_debit_note"].includes(item.operation));
-    if (busy()) {
-      trace(requestId, "waiting: another check is running on this connector");
-      send(socket, { type: "progress", requestId, message: "Waiting for the current check to finish…" });
-      const waitUntil = Date.now() + SERIAL_OPERATION_WAIT_MS;
-      while (busy() && Date.now() < waitUntil && socket.readyState === WebSocket.OPEN) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
-      }
-      if (socket.readyState !== WebSocket.OPEN) return;
-      if (busy()) {
-        send(socket, { type: "result", requestId, success: false, error: "Another Cash Discount or Payment Follow-up check is still running on this computer. Try again in a moment." });
-        return;
-      }
-    }
   }
   const debitNoteKey = operation === "create_debit_note"
     ? `${meta.connectionId}|${String(proposal?.partyLedgerName ?? "").trim().toLowerCase()}|${String(proposal?.linkedInvoiceNumber ?? "").trim().toLowerCase()}`
@@ -354,6 +365,7 @@ async function handleBrowserRequest(socket, message, meta) {
   item.authority=authority;
   item.authorizationMessage={operation,companyName:message.companyName,companyGuid:message.companyGuid,companyNames:message.companyNames,financialYear:message.financialYear};
   if (item.debitNoteKey) activeDebitNotes.add(item.debitNoteKey);
+  if (!await waitForTallyTurn(item)) return;
   const requestedCompanyName = String(message.companyName ?? "").trim();
   const companyKey = requestedCompanyName.toLowerCase().replace(/\s+/g, " ");
   // Connectors from 1.2.29 analyse RTGS terms themselves when given the context
@@ -691,7 +703,7 @@ export function startCashDiscountGateway(options = {}) {
       } else if (message.type === "cancel" && meta.role === "browser") {
         const item = pending.get(String(message.requestId || ""));
         // Never automatically cancel a financial write with an unknown outcome.
-        if (item?.browser === socket && ["scan", "followups_scan", "verify_bank_transaction", "fetch_customer_open_bills"].includes(item.operation)) failPending(item.requestId, new Error("Scan cancelled."));
+        if (item?.browser === socket && ["ledger_masters", "scan", "followups_scan", "verify_bank_transaction", "fetch_customer_open_bills"].includes(item.operation)) failPending(item.requestId, new Error("Scan cancelled."));
       } else if (["operation_result", "result"].includes(message.type) && meta.role === "connector") {
         await handleConnectorResult(socket, message, meta);
       } else if (message.type === "progress" && meta.role === "connector") {
@@ -715,7 +727,7 @@ export function startCashDiscountGateway(options = {}) {
     meta?.bankJobs?.close();
     if (meta?.role === "connector" && connectors.get(meta.connectionId) === socket) connectors.delete(meta.connectionId);
     for (const [requestId, item] of pending) {
-      if (item.browser === socket && ["scan", "followups_scan", "verify_bank_transaction", "fetch_customer_open_bills"].includes(item.operation)) failPending(requestId, new Error("Browser disconnected; scan cancelled."));
+      if (item.browser === socket && ["ledger_masters", "scan", "followups_scan", "verify_bank_transaction", "fetch_customer_open_bills"].includes(item.operation)) failPending(requestId, new Error("Browser disconnected; scan cancelled."));
       else if (item.browser === socket && item.operation !== "create_debit_note") clearPending(requestId);
       else if (item.connector === socket) failPending(requestId, new Error("The Tally connector disconnected during the live request."));
     }

@@ -1361,6 +1361,35 @@ test("a transportation row is booked once as freight with transport TDS on it", 
   }
 });
 
+test("misspelled transportation is freight once, including when an old saved review retained it as stock", () => {
+  const document = invoiceDocument({
+    totalAmount: "1003389.00", taxAmount: "153059.40", tdsAmount: "",
+    lines: [
+      { description: "M S SCRAP", hsnSac: "72044900", quantity: "25010", unit: "KG", rate: "33", taxableAmount: "825330" },
+      { description: "Transpotation Charge on Sales", taxableAmount: "25000", taxRate: "18" },
+    ],
+  });
+  Object.assign(document.extracted_fields, { subtotal: "850330", totalTaxableAmount: "850330", freightAmount: "25000", freightGstRate: "18", roundOffAmount: "-0.40", cgstTdsAmount: "", sgstTdsAmount: "" });
+  const saved = { sourceReferenceApproved: true, applyGstTds: false, applyTransportTds: false };
+  const result = prepare(document, { savedReview: saved });
+  const oldReview = { ...result.review, lines: [...result.review.lines, { ...result.review.lines[0], lineId: 'invoice-1:2', description: 'Transpotation Charge on Sales', hsn: '', quantity: '', rate: '', taxableAmount: '25000' }] };
+  const refreshed = prepare(document, { savedReview: oldReview });
+  assert.equal(refreshed.source.lines.length, 1);
+  assert.equal(refreshed.review.lines.length, 1);
+  assert.equal(refreshed.review.freightAmount, '25000');
+  assert.equal(refreshed.calculation.gstTaxableAmount, '850330.00');
+  assert.equal(refreshed.calculation.gstAmount, '153059.40');
+  assert.equal(refreshed.blockers.some(row => /HSN/.test(row.code) && row.lineId === 'invoice-1:2'), false);
+  assert.equal(refreshed.blockers.some(row => row.code === 'TOTAL_MISMATCH'), false);
+});
+
+test("transport wording on actual goods with quantity does not remove the stock line", () => {
+  const document = invoiceDocument({ lines: [{ description: 'Transport steel frame', hsnSac: '72044900', quantity: '1', unit: 'MT', rate: '1000', taxableAmount: '1000' }] });
+  const result = prepare(document);
+  assert.equal(result.source.lines.length, 1);
+  assert.equal(result.source.invoiceFreightAmount, '');
+});
+
 test("a wrong transport TDS ledger is named and the right one is suggested", () => {
   const document = invoiceDocument({
     totalAmount: "1416.00",

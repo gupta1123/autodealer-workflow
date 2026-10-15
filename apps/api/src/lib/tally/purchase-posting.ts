@@ -752,7 +752,10 @@ export function transportTdsRateForPayee(gstin: unknown) {
   return pan[3] === "P" || pan[3] === "H" ? "1" : "2";
 }
 
-const FREIGHT_ROW_PATTERN = /\b(?:freight|cartage|carriage|lorry\s+hire|transport(?:ation)?)\b/i;
+// "Transpotation" occurs on supplier invoices as well as in OCR output.
+// Keep the no-stock-quantity/SAC checks below so goods are never dropped
+// merely because their description mentions transport.
+const FREIGHT_ROW_PATTERN = /\b(?:freight|cartage|carriage|lorry\s+hire|transport(?:ation)?|transpotation)\b/i;
 
 // A charge row, not goods: named as freight/transport and either without a
 // stock quantity or carrying a transport service code (SAC 9965 / 9967).

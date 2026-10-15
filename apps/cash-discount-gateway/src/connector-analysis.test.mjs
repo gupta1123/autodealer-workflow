@@ -69,10 +69,10 @@ test("scans are compressed, and the API analyses unless connector analysis is sw
   });
 });
 
-test("with connector analysis switched on, a 1.2.24 connector's dashboard goes straight to the browser", async (t) => {
+test("with connector analysis switched on, a current connector's dashboard goes straight to the browser", async (t) => {
   process.env.CASH_DISCOUNT_CONNECTOR_ANALYSIS = "true";
   t.after(() => { delete process.env.CASH_DISCOUNT_CONNECTOR_ANALYSIS; });
-  await withGateway("1.2.24", async ({ connector, browser, requests }) => {
+  await withGateway("1.2.36", async ({ connector, browser, requests }) => {
     assert.ok(connector.extensions.includes("permessage-deflate"), "the connector connection is compressed");
     browser.send(JSON.stringify({ type: "request", requestId: "scan-1", operation: "scan", companyName: "Solution Nyx", financialYear: "2026-27" }));
     const operation = await nextMessage(connector, (message) => message.type === "operation" && message.requestId === "scan-1");
@@ -86,8 +86,8 @@ test("with connector analysis switched on, a 1.2.24 connector's dashboard goes s
   });
 });
 
-test("a paged scan: 1.2.25 connector keeps the dashboard, and only the browser that scanned can read its pages", async () => {
-  await withGateway("1.2.25", async ({ connector, browser, requests, open }) => {
+test("a paged scan: a current connector keeps the dashboard, and only the browser that scanned can read its pages", async () => {
+  await withGateway("1.2.36", async ({ connector, browser, requests, open }) => {
     browser.send(JSON.stringify({ type: "request", requestId: "scan-p", operation: "scan", companyName: "Solution Nyx", financialYear: "2026-27", payload: { paged: true } }));
     const operation = await nextMessage(connector, (message) => message.type === "operation" && message.requestId === "scan-p");
     assert.ok(operation.analysisContext, "paged scans get the context without the switch");
