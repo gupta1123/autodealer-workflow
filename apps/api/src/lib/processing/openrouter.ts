@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { imageDataBytes, isImageSizeError } from "./image-request-budget";
+import { imageDataBytes, isImageSizeError } from "./image-request-budget.ts";
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";

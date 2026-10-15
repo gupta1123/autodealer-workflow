@@ -5,18 +5,24 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
+import { execFileSync } from 'node:child_process';
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'packet-image-budget-'));
 for (const file of ['image-request-budget', 'openrouter']) {
   const source = fs.readFileSync(new URL(`./${file}.ts`, import.meta.url), 'utf8');
   const output = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
-  fs.writeFileSync(path.join(directory, `${file}.mjs`), output.replaceAll('"./image-request-budget"', '"./image-request-budget.mjs"'));
+  fs.writeFileSync(path.join(directory, `${file}.mjs`), output.replaceAll('"./image-request-budget.ts"', '"./image-request-budget.mjs"'));
 }
 const oldKey = process.env.OPENROUTER_API_KEY;
 process.env.OPENROUTER_API_KEY = 'test-key-never-sent';
 const { callOpenRouter } = await import(pathToFileURL(path.join(directory, 'openrouter.mjs')).href);
 if (oldKey === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = oldKey;
 after(() => fs.rmSync(directory, { recursive: true, force: true }));
+
+test('OpenRouter imports directly in the unbundled Node worker runtime', () => {
+  const url = new URL('./openrouter.ts', import.meta.url).href;
+  execFileSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', `await import(${JSON.stringify(url)});`], { stdio: 'pipe' });
+});
 
 test('aggregate oversize is caught before fetch even when individual images fit', async (t) => {
   const previous = globalThis.fetch;
