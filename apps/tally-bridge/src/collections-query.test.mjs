@@ -216,3 +216,35 @@ test("the revision changes when a WhatsApp or PDF state changes, so the page rel
 test("rows by id are capped", () => {
   assert.equal(collectionRowsById(dashboard(), "followUps", Array.from({ length: 5000 }, (_, index) => `fu-${index % 700}`)).length, 700);
 });
+
+
+test('payment type filters the complete follow-up list before paging and keeps sorting', () => {
+  const source = {tabs:{paymentFollowUps:Array.from({length:205},(_,index)=>({
+    id:String(index), partyLedgerName:'Customer '+index, outstandingAmount:index,
+    paymentCategory:index%2?'same_day_rtgs':'advance_rtgs', narration:'',
+  }))}};
+  const page=queryCollections(source,{view:'followUps',paymentType:'same_day_rtgs',sort:'highest_outstanding',page:2,pageSize:25});
+  assert.equal(page.total,102);assert.equal(page.pageCount,5);assert.equal(page.rows.length,25);
+  assert.equal(page.rows[0].id,'153');assert.ok(page.rows.every(row=>Number(row.id)%2===1));
+  assert.equal(queryCollections(source,{view:'followUps',paymentType:'advance_rtgs'}).total,103,'type is part of the query cache key');
+  assert.equal(queryCollections(source,{view:'followUps',paymentType:'regular_credit'}).total,0);
+  assert.equal(queryCollections(source,{view:'followUps',paymentType:'regular_credit',page:9}).page,1);
+});
+
+test('CD type uses original invoice terms and combines with status, search and select-all', () => {
+  const proposal=(id,type,status='pending_approval')=>({id,status,partyLedgerName:'Apex',linkedInvoiceNumber:id,recoverableAmount:100,
+    narration:'Cash discount recovery against invoice; quoted ADVANCE RTGS',cashDiscountAnalysis:{sourceNarration:type}});
+  const source={tabs:{debitNoteQueue:[proposal('same','same-day r.t.g.s.'),proposal('advance','ADVANCE RTGS'),proposal('created','SAME DAY RTGS','created_in_tally'),proposal('failed','SAME DAY RTGS','failed')]}};
+  const page=queryCollections(source,{view:'pending',paymentType:'same_day_rtgs',filter:'ready',search:'apex'});
+  assert.deepEqual(page.rows.map(row=>row.id),['same']);assert.deepEqual(page.selectableIds,['same']);
+  assert.equal(queryCollections(source,{view:'created',paymentType:'same_day_rtgs'}).total,1);
+  assert.equal(queryCollections(source,{view:'created',paymentType:'advance_rtgs'}).total,0);
+  assert.equal(queryCollections(source,{view:'pending',paymentType:'advance_rtgs',search:'missing'}).total,0);
+});
+
+test('type filter keeps contradictory terms separate from regular credit', () => {
+  const source={tabs:{paymentFollowUps:[{id:'conflict',narration:'ADVANCE RTGS SAME DAY RTGS'},{id:'regular',narration:'PAYMENT WITHIN 25 DAYS'},{id:'invalid',paymentCategory:'unknown'}]}};
+  assert.deepEqual(queryCollections(source,{view:'followUps',paymentType:'regular_credit'}).rows.map(row=>row.id),['regular']);
+  assert.equal(queryCollections(source,{view:'followUps',paymentType:'unclear'}).total,2);
+  assert.throws(()=>queryCollections(source,{view:'followUps',paymentType:'typo'}),/Unknown payment type/);
+});

@@ -547,6 +547,19 @@ function PaginationControls({
   );
 }
 
+function PaymentTypeFilter({ value, onChange, cashDiscount = false }: { value: string; onChange: (value: string) => void; cashDiscount?: boolean }) {
+  return <label className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+    Type
+    <select aria-label="Filter by payment type" value={value} onChange={event => onChange(event.target.value)} className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium normal-case tracking-normal text-[#1a1a1a] outline-none focus:border-amber-400 focus:ring-2 focus:ring-amber-100">
+      <option value="all">All types</option>
+      {!cashDiscount ? <option value="regular_credit">Regular credit</option> : null}
+      <option value="same_day_rtgs">Same-day RTGS</option>
+      <option value="advance_rtgs">Advance RTGS</option>
+      <option value="unclear">Unclear terms</option>
+    </select>
+  </label>;
+}
+
 function ListControls({
   query,
   onQueryChange,
@@ -554,6 +567,8 @@ function ListControls({
   onFilterChange,
   filterLabel,
   filterOptions,
+  paymentType,
+  onPaymentTypeChange,
   sort,
   onSortChange,
   sortOptions,
@@ -565,6 +580,8 @@ function ListControls({
   onFilterChange: (value: string) => void;
   filterLabel: string;
   filterOptions: Array<{ value: string; label: string }>;
+  paymentType: string;
+  onPaymentTypeChange: (value: string) => void;
   sort: string;
   onSortChange: (value: string) => void;
   sortOptions: Array<{ value: string; label: string }>;
@@ -586,6 +603,7 @@ function ListControls({
         />
       </label>
       <div className="flex min-w-0 flex-wrap justify-end gap-2">
+        <PaymentTypeFilter value={paymentType} onChange={onPaymentTypeChange} cashDiscount />
         <select
           aria-label={filterLabel}
           className={`${controlClass} min-w-0 flex-1 sm:w-[150px] sm:flex-none`}
@@ -647,6 +665,8 @@ export function CollectionsDashboardPage({
   const [checkingLiveTallyCompany, setCheckingLiveTallyCompany] = useState(true);
   const [activeView, setActiveView] = useState<ActiveView>(initialView);
   const [paymentFollowUpSort, setPaymentFollowUpSort] = useState<PaymentFollowUpSort>("priority");
+  const [followUpPaymentType, setFollowUpPaymentType] = useState('all');
+  const [cdPaymentType, setCdPaymentType] = useState('all');
   const [pendingQuery, setPendingQuery] = useState("");
   const [pendingFilter, setPendingFilter] = useState<PendingProposalFilter>("all");
   const [pendingSort, setPendingSort] = useState<PendingProposalSort>("deadline_oldest");
@@ -1376,15 +1396,18 @@ export function CollectionsDashboardPage({
 
   useEffect(() => {
     setFollowUpsPage(1);
-  }, [paymentFollowUpSort]);
+    setSelectedFollowUpIds(new Set());
+  }, [paymentFollowUpSort, followUpPaymentType]);
 
   useEffect(() => {
     setPendingPage(1);
-  }, [pendingFilter, pendingQuery, pendingSort]);
+    setSelectedPendingIds(new Set());
+  }, [pendingFilter, pendingQuery, pendingSort, cdPaymentType]);
 
   useEffect(() => {
     setCreatedPage(1);
-  }, [createdFilter, createdQuery, createdSort]);
+    setSelectedCreatedIds(new Set());
+  }, [createdFilter, createdQuery, createdSort, cdPaymentType]);
 
   useEffect(() => {
     if (!accessReady) return;
@@ -1437,13 +1460,13 @@ export function CollectionsDashboardPage({
   const followUpKpis = summary?.followUps ?? { total: 0, needsFollowUp: 0, escalated: 0, needsReview: 0, outstanding: 0 };
   const followUpsList = useCollectionsList<PaymentFollowUp>(dashboard,
     activeView === 'followUps' && reminderTab === 'outstanding' && !reminderInvoice
-      ? { view: 'followUps', sort: paymentFollowUpSort, page: followUpsPage, pageSize } : null,
+      ? { view: 'followUps', paymentType: followUpPaymentType, sort: paymentFollowUpSort, page: followUpsPage, pageSize } : null,
     collectionsRemote, onCollectionsExpired);
   const pendingList = useCollectionsList<DebitNoteProposal>(dashboard,
-    activeView === 'needsAction' ? { view: 'pending', filter: pendingFilter, search: pendingQuery, sort: pendingSort, page: pendingPage, pageSize } : null,
+    activeView === 'needsAction' ? { view: 'pending', paymentType: cdPaymentType, filter: pendingFilter, search: pendingQuery, sort: pendingSort, page: pendingPage, pageSize } : null,
     collectionsRemote, onCollectionsExpired);
   const createdList = useCollectionsList<DebitNoteProposal>(dashboard,
-    activeView === 'done' ? { view: 'created', filter: createdFilter, search: createdQuery, sort: createdSort, page: createdPage, pageSize } : null,
+    activeView === 'done' ? { view: 'created', paymentType: cdPaymentType, filter: createdFilter, search: createdQuery, sort: createdSort, page: createdPage, pageSize } : null,
     collectionsRemote, onCollectionsExpired);
 
   const activeTallyCompanyName = liveTallyConnection?.lastCompanyName?.trim() ?? "";
@@ -1911,6 +1934,8 @@ export function CollectionsDashboardPage({
         <section className={styles.results} aria-label="Debit notes to create">
           {pendingCount > 0 ? (
             <ListControls
+              paymentType={cdPaymentType}
+              onPaymentTypeChange={setCdPaymentType}
               filter={pendingFilter}
               filterLabel="Filter debit notes to create"
               filterOptions={[
@@ -1943,7 +1968,7 @@ export function CollectionsDashboardPage({
               ) : null}
             />
           ) : null}
-          {pendingCount === 0 ? (
+          {pendingList.error ? <div role="alert" className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">{pendingList.error}</div> : pendingCount === 0 ? (
             <EmptyState>
               Nothing needs action right now.
             </EmptyState>
@@ -2003,6 +2028,7 @@ export function CollectionsDashboardPage({
 
       {!companyContextLocked && activeView==='followUps'?<div className="flex shrink-0 flex-wrap items-center justify-between gap-x-5 border-b border-[#ded8d0]"><nav aria-label="Payment follow-up views" className="flex min-w-0 gap-5 overflow-x-auto text-sm">{([['due','Reminders due'],['outstanding','Unpaid invoices'],['pipelines','Reminder tracking'],['history','Sent messages']] as const).map(([key,label])=><button key={key} type="button" aria-current={reminderTab===key?'page':undefined} className={`whitespace-nowrap border-b-2 px-1 py-3 ${reminderTab===key?'border-[#2d2d2d] font-medium text-[#1a1a1a]':'border-transparent text-[#82776a]'}`} onClick={()=>{setReminderTab(key);setReminderInvoice(null);setFocusedReminder('');setSelectedFollowUpIds(new Set());}}>{label}{key==='due'&&remindersDue!==null&&remindersDue>0?<span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900">{remindersDue}</span>:null}</button>)}</nav><div className="ml-auto flex items-center gap-2 py-1.5">          {reminderTab==='outstanding'&&!reminderInvoice&&followUpKpis.total > 0 ? (
             <div className="flex flex-wrap justify-end gap-2">{selectedFollowUpIds.size?<><span className="self-center text-xs font-semibold text-[#51483f]">{selectedFollowUpIds.size} selected</span><button className={styles.messageAction} onClick={()=>openFollowUpBulk('enroll')}>Start reminders</button><button className={styles.messageAction} onClick={()=>openFollowUpBulk('send_once')}>Send once</button><button className={styles.messageAction} onClick={exportSelectedFollowUps}>CSV</button><button className={styles.messageAction} onClick={()=>setSelectedFollowUpIds(new Set())}>Clear</button></>:null}
+            <PaymentTypeFilter value={followUpPaymentType} onChange={setFollowUpPaymentType} />
             <label className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
               Sort
               <select
@@ -2024,9 +2050,9 @@ export function CollectionsDashboardPage({
       {!companyContextLocked && activeView === 'followUps' && selectedCompany && (reminderTab!=='outstanding'||reminderInvoice) ? <FollowUpPipelines key={`${selectedConnectionId}|${selectedCompany.id}|${reminderTab}`} toolbarTarget={reminderToolbar} focusId={focusedReminder} view={reminderTab==='due'?'due':reminderTab==='history'?'history':'pipelines'} onShowSent={()=>{setReminderTab('history');setReminderInvoice(null);setFocusedReminder('');}} connectionId={selectedConnectionId} companyName={selectedCompany.companyName} companyGuid={selectedCompany.companyGuid} financialYear={selectedCompany.financialYear || ''} companyId={selectedCompany.accessCompanyId || undefined} invoice={reminderInvoice} onDueCount={setRemindersDue} onClearInvoice={()=>setReminderInvoice(null)} /> : null}
       {!companyContextLocked && !scanFailed && activeView === "followUps" && reminderTab==='outstanding' && !reminderInvoice ? (
         <section className={styles.results} aria-label="Payment follow-ups">
-          {followUpKpis.total === 0 ? (
+          {followUpsList.error ? <div role="alert" className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">{followUpsList.error}</div> : followUpKpis.total === 0 ? (
             <EmptyState>There are no payments to follow up from the latest Tally scan.</EmptyState>
-          ) : (
+          ) : followUpsList.page?.total === 0 ? <EmptyState>No unpaid invoices match this payment type.</EmptyState> : (
             <div className={styles.flatTable}>
               <div tabIndex={0} role="region" aria-label="Payment follow-ups table">
                 <table className={`${styles.createdTable} ${styles.followUpsTable}`}>
@@ -2092,6 +2118,8 @@ export function CollectionsDashboardPage({
           ) : null}
           {createdCount > 0 ? (
             <ListControls
+              paymentType={cdPaymentType}
+              onPaymentTypeChange={setCdPaymentType}
               filter={createdFilter}
               filterLabel="Filter created debit notes"
               filterOptions={[
@@ -2113,7 +2141,7 @@ export function CollectionsDashboardPage({
               ]}
             />
           ) : null}
-          {createdCount === 0 ? (
+          {createdList.error ? <div role="alert" className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">{createdList.error}</div> : createdCount === 0 ? (
             <EmptyState>No debit notes created yet.</EmptyState>
           ) : createdList.page?.total === 0 ? (
             <EmptyState>No created debit notes match these filters.</EmptyState>

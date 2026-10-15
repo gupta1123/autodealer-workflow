@@ -57,3 +57,17 @@ test('missing connector details cannot silently label an RTGS invoice as regular
     ? { total: 1, rows: [{ id: 'missing' }] }
     : { rows: [] }), /Payment terms could not be loaded/);
 });
+
+
+test('older connectors cannot silently ignore a selected payment type', async () => {
+  await assert.rejects(fetchCollectionsPage({paged:true,dashboardId:'old'}, {view:'followUps',paymentType:'same_day_rtgs'}, async()=>({total:200,rows:[]})),/1.2.35 or later/);
+});
+
+test('current connectors return filtered totals and do not need extra detail reads', async () => {
+  let calls=0;
+  const result=await fetchCollectionsPage({paged:true,dashboardId:'new'}, {view:'followUps',paymentType:'advance_rtgs'}, async(operation,payload)=>{
+    calls++;assert.equal(payload.query.paymentType,'advance_rtgs');
+    return {total:1,paymentType:'advance_rtgs',rows:[{id:'a',paymentCategory:'advance_rtgs',narration:'ADVANCE RTGS'}]};
+  });
+  assert.equal(calls,1);assert.equal(result.total,1);assert.equal(result.rows[0].id,'a');
+});

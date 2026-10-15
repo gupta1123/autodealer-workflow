@@ -33,6 +33,7 @@ export type ListPage<T> = {
   pageCount: number;
   rows: T[];
   selectableIds?: string[];
+  paymentType?: string;
 };
 
 /** Asks the connector (through the live channel) for part of a held dashboard. */
@@ -61,6 +62,9 @@ export function collectionsRevision(dashboard: PageableDashboard | null | undefi
 export async function fetchCollectionsPage<T>(dashboard: PageableDashboard, query: CollectionsQuery, remote: CollectionsRemote): Promise<ListPage<T>> {
   if (isHeld(dashboard)) {
     const page = await remote('collections_query', { dashboardId: dashboard.dashboardId, query }) as ListPage<T>;
+    if (query.paymentType && query.paymentType !== 'all' && page.paymentType !== query.paymentType) {
+      throw new Error('Update the Kalika connector to 1.2.35 or later, then refresh to filter by payment type.');
+    }
     if (query.view !== 'followUps') return page;
     // Existing installed connectors omit terms from their compact page rows.
     // Read only this page's missing details from the already-held dashboard.

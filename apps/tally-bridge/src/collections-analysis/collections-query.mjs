@@ -125,18 +125,40 @@ function listRow(view, row) {
 // so moving through pages does not sort a large list again each time.
 const matchingCache = new WeakMap();
 const MATCHING_CACHE_ENTRIES = 8;
+/** Invoice terms, using the original Sales narration for CD recovery rows. */
+export function collectionPaymentType(row) {
+    const analysis = (row.cashDiscountAnalysis ?? {});
+    const narration = text(analysis.sourceNarration ?? row.narration).toUpperCase()
+        .replace(/\bR[.\s]*T[.\s]*G[.\s]*S\b/g, 'RTGS').replace(/[.\s_-]+/g, ' ').trim();
+    const advance = /\bADVANCE RTGS\b/.test(narration);
+    const sameDay = /\bSAME DAY RTGS\b/.test(narration);
+    if (advance && sameDay)
+        return 'unclear';
+    const terms = Array.isArray(analysis.terms) ? analysis.terms : [];
+    const categories = new Set([row.paymentCategory, analysis.paymentCategory, ...terms.map(term => term.paymentCategory)].filter(Boolean).map(text));
+    if (categories.size > 1)
+        return 'unclear';
+    const category = [...categories][0];
+    if (category)
+        return ['regular_credit', 'same_day_rtgs', 'advance_rtgs'].includes(category) ? category : 'unclear';
+    return advance ? 'advance_rtgs' : sameDay ? 'same_day_rtgs' : 'regular_credit';
+}
 function matching(dashboard, query) {
     const filter = text(query.filter || "all"), search = text(query.search), sort = text(query.sort);
     if (!["followUps", "pending", "created"].includes(query.view))
         throw new Error(`Unknown collections list ${String(query.view)}.`);
-    const key = JSON.stringify([query.view, filter, search.trim().toLowerCase(), sort]);
+    const paymentType = text(query.paymentType || 'all');
+    if (!['all', 'regular_credit', 'same_day_rtgs', 'advance_rtgs', 'unclear'].includes(paymentType))
+        throw new Error('Unknown payment type filter.');
+    const key = JSON.stringify([query.view, filter, search.trim().toLowerCase(), sort, paymentType]);
     const cache = dashboard ? matchingCache.get(dashboard) ?? new Map() : null;
     const cached = cache?.get(key);
     if (cached)
         return cached;
-    const rows = query.view === "followUps" ? followUpRows(dashboard, filter, search, sort)
+    const sorted = query.view === "followUps" ? followUpRows(dashboard, filter, search, sort)
         : query.view === "pending" ? pendingRows(dashboard, filter, search, sort)
             : createdRows(dashboard, filter, search, sort);
+    const rows = paymentType === 'all' ? sorted : sorted.filter(row => collectionPaymentType(row) === paymentType);
     if (dashboard && cache) {
         if (cache.size >= MATCHING_CACHE_ENTRIES)
             cache.delete(cache.keys().next().value);
@@ -153,6 +175,7 @@ export function queryCollections(dashboard, query) {
     const page = Math.min(pageCount, Math.max(1, Math.floor(number(query.page) || 1)));
     return {
         view: query.view,
+        paymentType: query.paymentType || 'all',
         total: rows.length,
         page,
         pageSize,
