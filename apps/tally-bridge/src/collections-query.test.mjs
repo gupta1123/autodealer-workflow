@@ -119,7 +119,9 @@ test("follow-up pages, in every sort, equal the page's own sorted list", () => {
 test("follow-up rows carry only their list fields", () => {
   const { rows } = queryCollections(dashboard(), { view: "followUps", page: 1, pageSize: 5 });
   assert.deepEqual(Object.keys(rows[0]).sort(), [...FOLLOW_UP_LIST_FIELDS].sort());
-  assert.equal("narration" in rows[0], false);
+  assert.equal("paymentCategory" in rows[0], true);
+  assert.equal("narration" in rows[0], true);
+  assert.equal("reversalPlan" in rows[0], false);
 });
 
 test("pending and created debit-note pages equal the page's filters, search and sorts", () => {

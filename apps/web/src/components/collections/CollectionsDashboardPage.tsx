@@ -23,6 +23,7 @@ import {
 import { apiFetch } from "@/lib/api-client";
 import { accessCacheEpoch, registerAccessCache } from '@/lib/access-cache';
 import { collectionsAccessReady } from '@/lib/collections-access-ready';
+import { paymentTermsLabel } from '@/lib/payment-terms-label';
 import styles from './CollectionsDashboardPage.module.css';
 import {companyOptionIdentity} from '@/lib/company-option-identity';
 import {useActionAccess} from '@/components/access/useActionAccess';
@@ -114,6 +115,7 @@ type NarrationAnalysisRow = {
 };
 
 type PaymentFollowUp = {
+  paymentCategory?: string | null;
   id: string;
   kind: "discount_window_open" | "full_payment_due" | "payment_due" | "payment_review";
   followUpStatus: "needs_follow_up" | "escalate" | "needs_review";
@@ -1497,7 +1499,7 @@ export function CollectionsDashboardPage({
       const result=await response.json();if(!response.ok)throw new Error(result.error||'Bulk reminder action failed.');const rows=result.results||[];const completed=rows.filter((item:{status:string})=>!['skipped','rejected','uncertain'].includes(item.status)).length;const attention=rows.length-completed;setMessage({tone:attention?'info':'success',text:`${completed} completed${attention?` · ${attention} need attention`:''}.`});setFollowUpBulkMode(null);setSelectedFollowUpIds(new Set());setReminderTab(followUpBulkMode==='enroll'?'pipelines':'due');
     }catch(error){setMessage({tone:'error',text:error instanceof Error?error.message:'Bulk reminder action failed.'});}finally{setFollowUpBulkBusy(false);}
   };
-  const exportSelectedFollowUps=async()=>{let rows:PaymentFollowUp[];try{rows=await loadSelectedFollowUps();}catch(error){setMessage({tone:'error',text:error instanceof Error?error.message:'Could not load the selected invoices.'});return;}if(!rows.length)return;const q=(value:unknown)=>`"${String(value??'').replaceAll('"','""')}"`;const csv=[['Customer','Invoice','Invoice date','Outstanding','Phone','Payment age'],...rows.map(row=>[row.partyLedgerName,row.linkedInvoiceNumber,row.linkedInvoiceDate,row.outstandingAmount,row.partyPhone||'',row.ageLabel])].map(line=>line.map(q).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\ufeff',csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='unpaid-invoices.csv';a.click();window.setTimeout(()=>URL.revokeObjectURL(url),1000);};
+  const exportSelectedFollowUps=async()=>{let rows:PaymentFollowUp[];try{rows=await loadSelectedFollowUps();}catch(error){setMessage({tone:'error',text:error instanceof Error?error.message:'Could not load the selected invoices.'});return;}if(!rows.length)return;const q=(value:unknown)=>`"${String(value??'').replaceAll('"','""')}"`;const csv=[['Customer','Invoice','Invoice date','Outstanding','Phone','Payment terms','Payment age'],...rows.map(row=>[row.partyLedgerName,row.linkedInvoiceNumber,row.linkedInvoiceDate,row.outstandingAmount,row.partyPhone||'',paymentTermsLabel(row).label,row.ageLabel])].map(line=>line.map(q).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\ufeff',csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='unpaid-invoices.csv';a.click();window.setTimeout(()=>URL.revokeObjectURL(url),1000);};
   const scheduleStatuses=useReminderStatuses({connectionId:selectedConnectionId,companyId:selectedCompany?.accessCompanyId,companyGuid:selectedCompany?.companyGuid,companyName:selectedCompany?.companyName||'',financialYear:selectedCompany?.financialYear||''},pagedPaymentFollowUps,activeView==='followUps'&&reminderTab==='outstanding'&&!reminderInvoice);
   const selectablePendingOnPage = tallyCompanyVerified ? pagedPendingProposals.filter(canCreateInTally) : [];
   const canMessageProposal = (proposal: DebitNoteProposal) =>
@@ -2026,13 +2028,14 @@ export function CollectionsDashboardPage({
           ) : (
             <div className={styles.flatTable}>
               <div tabIndex={0} role="region" aria-label="Payment follow-ups table">
-                <table className={styles.createdTable}>
+                <table className={`${styles.createdTable} ${styles.followUpsTable}`}>
                   <thead><tr>
                     <th scope="col" className="w-9"><input type="checkbox" aria-label="Select unpaid invoices on this page" checked={pagedPaymentFollowUps.length>0&&pagedPaymentFollowUps.every(row=>selectedFollowUpIds.has(row.id))} onChange={event=>setSelectedFollowUpIds(current=>{const next=new Set(current);for(const row of pagedPaymentFollowUps)event.target.checked?next.add(row.id):next.delete(row.id);return next;})}/></th>
                     <th scope="col">Customer</th>
-                    <th scope="col" style={{width:'23%'}}>Invoice</th>
+                    <th scope="col" style={{width:'20%'}}>Invoice</th>
                     <th scope="col" style={{width:140}} className="text-right">Outstanding</th>
-                    <th scope="col" style={{width:'23%'}}>Payment age</th>
+                    <th scope="col" style={{width:195}}>Payment terms</th>
+                    <th scope="col" style={{width:'17%'}}>Payment age</th>
                     <th scope="col" style={{width:150}}>Reminders</th>
                   </tr></thead>
                   <tbody>{pagedPaymentFollowUps.map(followUp => (
@@ -2048,6 +2051,8 @@ export function CollectionsDashboardPage({
                         </div>
                       </details><span className={styles.secondary}>{formatDate(followUp.linkedInvoiceDate)}</span></td>
                       <td className="whitespace-nowrap text-right font-medium tabular-nums">{formatMoney(followUp.outstandingAmount)}</td>
+                      <td><span className={styles.primary}>{paymentTermsLabel(followUp).name}</span>
+                        <span className={styles.secondary}>{paymentTermsLabel(followUp).timing}</span></td>
                       <td><span className={styles.primary}>{followUp.ageLabel}</span>
                         <span className={styles.secondary}>{followUp.ageBasis === 'due_date'
                           ? `Due ${formatDate(followUp.dueDate)}`

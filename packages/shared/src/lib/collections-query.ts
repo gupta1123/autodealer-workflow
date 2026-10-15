@@ -32,6 +32,7 @@ export const MAX_ROWS_BY_ID = 1000;
 export const FOLLOW_UP_LIST_FIELDS = [
   "id", "followUpStatus", "ageBasis", "ageDays", "ageLabel", "dueDate", "partyLedgerName", "partyPhone", "partyEmail",
   "linkedInvoiceNumber", "linkedInvoiceDate", "originalInvoiceAmount", "outstandingAmount", "amountReceived", "currentDiscount",
+  "paymentCategory", "narration",
 ] as const;
 
 const text = (value: unknown) => String(value ?? "");

@@ -59,7 +59,23 @@ export function collectionsRevision(dashboard: PageableDashboard | null | undefi
 }
 
 export async function fetchCollectionsPage<T>(dashboard: PageableDashboard, query: CollectionsQuery, remote: CollectionsRemote): Promise<ListPage<T>> {
-  if (isHeld(dashboard)) return await remote('collections_query', { dashboardId: dashboard.dashboardId, query }) as ListPage<T>;
+  if (isHeld(dashboard)) {
+    const page = await remote('collections_query', { dashboardId: dashboard.dashboardId, query }) as ListPage<T>;
+    if (query.view !== 'followUps') return page;
+    // Existing installed connectors omit terms from their compact page rows.
+    // Read only this page's missing details from the already-held dashboard.
+    const rows = page.rows as Array<T & { id: string; paymentCategory?: string | null; narration?: string | null }>;
+    const missing = rows.filter(row => !('paymentCategory' in row) || !('narration' in row));
+    if (!missing.length) return page;
+    const details = await fetchCollectionsRows<{ id: string; paymentCategory?: string | null; narration?: string | null }>(dashboard, 'followUps', missing.map(row => row.id), remote);
+    const byId = new Map(details.map(row => [row.id, row]));
+    return { ...page, rows: rows.map(row => {
+      if (!missing.includes(row)) return row;
+      const detail = byId.get(row.id);
+      if (!detail) throw new Error('Payment terms could not be loaded. Refresh to continue.');
+      return { ...row, paymentCategory: detail.paymentCategory ?? null, narration: detail.narration ?? null };
+    }) };
+  }
   return queryCollections(dashboard as never, query) as unknown as ListPage<T>;
 }
 

@@ -37,6 +37,7 @@
   text-align: left;
 }
 .createdTable td, .createdTable th { padding-left: 10px; padding-right: 10px; }
+.followUpsTable { min-width: 1120px; }
 .customerName {
   display: -webkit-box;
   -webkit-line-clamp: 2;
