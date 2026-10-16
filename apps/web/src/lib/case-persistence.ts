@@ -257,9 +257,9 @@ async function performApiFetch(input: RequestInfo | URL, init?: RequestInit) {
 }
 
 function isAuthErrorPayload(payload: unknown, status?: number) {
-  if (status === 401 || status === 403) {
-    return true;
-  }
+  // HTTP 403 is a valid session without permission, including module/company
+  // restrictions. It must never send an already signed-in user back to login.
+  if (status !== undefined) return status === 401;
 
   if (!payload || typeof payload !== "object") {
     return false;
@@ -268,7 +268,7 @@ function isAuthErrorPayload(payload: unknown, status?: number) {
   const errorValue = (payload as { error?: unknown }).error;
 
   if (typeof errorValue === "string") {
-    return /unauthorized|forbidden|session|auth/i.test(errorValue);
+    return /unauthorized|(?:session|token) (?:expired|invalid|missing|not (?:active|found))/i.test(errorValue);
   }
 
   if (errorValue && typeof errorValue === "object") {
@@ -277,7 +277,7 @@ function isAuthErrorPayload(payload: unknown, status?: number) {
       .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
       .join(" ");
 
-    return /unauthorized|forbidden|session|auth/i.test(combined);
+    return /unauthorized|(?:session|token) (?:expired|invalid|missing|not (?:active|found))/i.test(combined);
   }
 
   return false;

@@ -78,8 +78,8 @@ export interface DashboardSidebarProps {
 
 export function DashboardSidebar({ user, defaultCollapsed = false }: DashboardSidebarProps) {
   const pathname = usePathname();
-  const {snapshot}=useAccess();
-  const visible=(href:string)=>!snapshot?.sharingEnabled||pagePermissions(href).length===0||pagePermissions(href).some(p=>canAccess(snapshot,p));
+  const {snapshot,enforcementRequired}=useAccess();
+  const visible=(href:string)=>!enforcementRequired||Boolean(snapshot&&(pagePermissions(href).length===0||pagePermissions(href).some(p=>canAccess(snapshot,p))));
   const sections=SIDEBAR_SECTIONS.map(section=>({...section,items:section.items.filter(item=>visible(item.href))})).filter(section=>section.items.length>0);
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(defaultCollapsed);

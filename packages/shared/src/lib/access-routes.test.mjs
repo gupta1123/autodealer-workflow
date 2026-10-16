@@ -1,10 +1,21 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {pagePermissions} from './access-routes.ts';
+import {firstAccessiblePage,pagePermissions} from './access-routes.ts';
 import {DEFAULT_ROLES,canAccess} from './access.ts';
 test('direct financial navigation has explicit module permissions',()=>{
  for(const [path,permission] of [['/cases/x/mismatches','purchases.view'],['/workspace','purchases.prepare'],['/bank-statements','bank.view'],['/collections','discounts.view'],['/collections/follow-ups','followups.view'],['/tally-prime?view=connection','connections.manage']])assert.deepEqual(pagePermissions(path),[permission]);
  assert.deepEqual(pagePermissions('/settings/team'),['team.manage','roles.manage']);
+});
+
+test('Bank-only users cannot open Dashboard and land on Bank Statements',()=>{
+ const allowed=key=>key.startsWith('bank.');
+ assert.deepEqual(pagePermissions('/'),['purchases.view']);
+ assert.equal(pagePermissions('/').some(allowed),false);
+ assert.equal(firstAccessiblePage(allowed),'/bank-statements');
+ assert.equal(firstAccessiblePage(key=>key==='purchases.view'),'/');
+ assert.equal(firstAccessiblePage(key=>key==='followups.view'),'/collections/follow-ups');
+ assert.equal(firstAccessiblePage(key=>key==='team.manage'),'/settings/team');
+ assert.equal(firstAccessiblePage(()=>false),null);
 });
 test('default-role financial permission matrix, suspension and unclassified records',()=>{
  for(const role of DEFAULT_ROLES){
