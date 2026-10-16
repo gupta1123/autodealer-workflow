@@ -848,7 +848,7 @@ export function TallyPurchasePostingPanel({
   // on mount: it made the dropdowns disappear and doubled the failure surface
   // when a live channel reconnected during the request.
   useEffect(() => {
-    if(approval.enabled&&approval.loading)return;
+    if(approval.required&&approval.loading)return;
     if (automaticLiveRefreshRef.current === caseId) return;
     automaticLiveRefreshRef.current = caseId;
     setLiveMastersReady(false);
@@ -858,7 +858,7 @@ export function TallyPurchasePostingPanel({
       const next = await load(false, null, true);
       if (cancelled) return;
       // New cases have no approval row until submission; they are still drafts.
-      if(approval.enabled&&(approval.error||!canAccess(approval.snapshot,'purchases.prepare')||(approval.workflow?.state??'draft')!=='draft'))return;
+      if((approval.enabled&&!canAccess(approval.snapshot,'purchases.prepare'))||(approval.required&&(approval.error||(approval.workflow?.state??'draft')!=='draft')))return;
       const connection = next?.connection;
       if (
         !next ||
@@ -989,7 +989,7 @@ export function TallyPurchasePostingPanel({
         automaticLiveRefreshRef.current = null;
       }
     };
-  }, [caseId,approval.enabled,approval.loading]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [caseId,approval.enabled,approval.required,approval.loading]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!liveMastersReady || !selectedConnectionId || !selectedCompanyName || !review?.supplierName) {
@@ -1208,7 +1208,7 @@ export function TallyPurchasePostingPanel({
   }, [onHeaderStateChange, payload]);
 
   const postingLocked = ["approved", "queued", "creating", "created", "verification_required"].includes(payload?.posting?.status ?? "");
-  const locked = postingLocked || (approval.enabled && (approval.loading || Boolean(approval.error) || !canAccess(approval.snapshot,'purchases.prepare') || Boolean(approval.workflow && approval.workflow.state !== 'draft')));
+  const locked = postingLocked || (approval.enabled && !canAccess(approval.snapshot,'purchases.prepare')) || (approval.required && (approval.loading || Boolean(approval.error) || Boolean(approval.workflow && approval.workflow.state !== 'draft')));
   const ledgerOptions = useMemo(
     () => dedupeMasterOptions(payload?.masterOptions.ledgers ?? []),
     [payload?.masterOptions.ledgers]
@@ -1603,7 +1603,7 @@ export function TallyPurchasePostingPanel({
       setNotice(hydrated.readyForApproval
         ? "All changes saved. This voucher is ready to send to Tally."
         : "All changes saved. Complete the highlighted items before approval.");
-      if (approval.enabled) await approval.refresh();
+      if (approval.required) await approval.refresh();
     } catch (saveError) {
       autoSaveFailedReviewRef.current = nextReview;
       setError(saveError instanceof Error ? `${saveError.message} Your changes are kept; use Retry.` : "Could not save your changes. Use Retry.");
@@ -1734,7 +1734,8 @@ export function TallyPurchasePostingPanel({
       dirty ||
       connectionDirty ||
       postingLocked ||
-      (approval.enabled && (approval.workflow?.state !== 'approved' || !canAccess(approval.snapshot,'purchases.post'))) ||
+      (approval.enabled && !canAccess(approval.snapshot,'purchases.post')) ||
+      (approval.required && approval.workflow?.state !== 'approved') ||
       refreshingMasters ||
       (acknowledgementWarnings.length > 0 && !warningsAcknowledged)
     ) {
@@ -1765,7 +1766,7 @@ export function TallyPurchasePostingPanel({
         selectedConnectionId,
         selectedCompanyName,
         approvalContext,
-        approval.enabled ? approval.workflow?.revision : undefined
+        approval.required ? approval.workflow?.revision : undefined
       );
       const hydrated = withLiveMasterOptions(next);
       setPayload(hydrated);
@@ -1943,7 +1944,8 @@ export function TallyPurchasePostingPanel({
     payload?.posting &&
     !hasUnsavedChanges &&
     !postingLocked &&
-    (!approval.enabled || (!approval.loading && !approval.error && approval.workflow?.state === 'approved' && canAccess(approval.snapshot,'purchases.post'))) &&
+    (!approval.enabled || canAccess(approval.snapshot,'purchases.post')) &&
+    (!approval.required || (!approval.loading && !approval.error && approval.workflow?.state === 'approved')) &&
     !tallyReviewRefreshing &&
     connectionReadable &&
     selectedMatchesActive
@@ -3237,7 +3239,7 @@ export function TallyPurchasePostingPanel({
                   Retry save
                 </Button>
               ) : null}
-              {onApprovePacket && !approval.enabled ? (
+              {onApprovePacket && !approval.required ? (
                 <Button
                   className="bg-emerald-700 text-white hover:bg-emerald-800"
                   disabled={approvingPacket || locked}
@@ -3266,7 +3268,7 @@ export function TallyPurchasePostingPanel({
                     ? "Checking Tally data"
                     : staleMastersBlocking
                       ? "Refresh Tally data first"
-                      : approval.enabled ? "Post approved purchase" : "Approve and send"}
+                      : approval.required ? "Post approved purchase" : "Approve and send"}
                 </Button>
               )}
             </div>

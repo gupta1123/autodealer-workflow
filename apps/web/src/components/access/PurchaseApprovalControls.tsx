@@ -10,18 +10,20 @@ type Workflow={state:'draft'|'awaiting_approval'|'approved'|'posting'|'posted';r
 export function usePurchaseApproval(caseId:string){
  const {snapshot,enforcementRequired}=useAccess();
  const enabled=enforcementRequired;
+ const required=enabled&&snapshot?.purchaseApprovalRequired!==false;
  const [workflow,setWorkflow]=useState<Workflow|null>(null),[loading,setLoading]=useState(false),[error,setError]=useState<string|null>(null);
  const generation=useRef(0);
  const refresh=useCallback(async()=>{
-  if(!enabled)return;
+  if(!required)return;
   const version=++generation.current;
   setLoading(true);
   try{const response=await apiFetch(`/api/cases/${caseId}/approval`,{cache:'no-store',signal:AbortSignal.timeout(10000)});const data=await response.json();if(version!==generation.current)return;if(!response.ok)throw Error(data.error||'Could not read purchase approval.');setWorkflow(data.workflow);setError(null);}
   catch(e){if(version===generation.current)setError(e instanceof Error?e.message:'Approval unavailable.');throw e;}
   finally{if(version===generation.current)setLoading(false);}
- },[caseId,enabled]);
- useEffect(()=>{setWorkflow(null);if(!enabled)return;const read=()=>{void refresh().catch(()=>{});};read();window.addEventListener('focus',read);return()=>{generation.current++;window.removeEventListener('focus',read);};},[refresh,enabled,snapshot?.revision]);
+ },[caseId,required]);
+ useEffect(()=>{setWorkflow(null);setError(null);if(!required){setLoading(false);return;}const read=()=>{void refresh().catch(()=>{});};read();window.addEventListener('focus',read);return()=>{generation.current++;window.removeEventListener('focus',read);};},[refresh,required,snapshot?.revision]);
  const transition=useCallback(async(action:'submit'|'approve'|'return',reason?:string)=>{
+  if(!required)throw Error('Separate purchase approval is disabled for this organization.');
   let revision=workflow?.revision??0;
   generation.current++;
   const send=async(nextAction:string)=>{const response=await apiFetch(`/api/cases/${caseId}/approval`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:nextAction,revision,reason})});const data=await response.json();if(!response.ok)throw Error(data.error||'Purchase changed. Refresh and try again.');setWorkflow(data.workflow);revision=data.workflow.revision;};
@@ -29,12 +31,12 @@ export function usePurchaseApproval(caseId:string){
   try{if(action==='submit')await send('prepare');await send(action);}
   catch(e){setError(e instanceof Error?e.message:'Approval failed.');throw e;}
   finally{setLoading(false);}
- },[caseId,workflow?.revision]);
- return {enabled,snapshot,workflow,loading,error,refresh,transition};
+ },[caseId,workflow?.revision,required]);
+ return {enabled,required,snapshot,workflow,loading,error,refresh,transition};
 }
 export function PurchaseApprovalControls({approval,hasUnsavedChanges,ready}:{approval:ReturnType<typeof usePurchaseApproval>;hasUnsavedChanges:boolean;ready:boolean}){
  const [action,setAction]=useState<'submit'|'approve'|'return'|null>(null),[reason,setReason]=useState('');
- if(!approval.enabled)return null;
+ if(!approval.required)return null;
  const {workflow,snapshot,loading,error}=approval;const state=workflow?.state??'draft';
  const selfBlocked=Boolean(snapshot&&!snapshot.allowSelfApproval&&(workflow?.submitted_by===snapshot.member.user_id||workflow?.prepared_by===snapshot.member.user_id));
  return <section className="rounded-xl border border-slate-200 bg-white p-4" aria-label="Purchase approval">

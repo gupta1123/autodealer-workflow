@@ -29,6 +29,7 @@ export async function POST(request: Request, ctx: { params: Promise<{ id: string
     if (!body || Array.isArray(body) || !['prepare', 'submit', 'approve', 'return'].includes(body.action) || !Number.isSafeInteger(body.revision) || body.revision < 0) throw new AccessError('An action and current revision are required.', 400);
     const permission = body.action === 'prepare' ? 'purchases.prepare' : body.action === 'submit' ? 'purchases.submit' : 'purchases.approve';
     const { db, access, scope } = await requireResourceAccess(request, 'case', id, permission);
+    if (access.purchaseApprovalRequired === false) throw new AccessError('Separate purchase approval is disabled for this organization.', 409);
     // Preparation is read from saved business records. Never approve a client-supplied digest.
     const [docs, posting] = await Promise.all([
       db.from('packet_documents').select('id,document_type,extracted_fields').eq('case_id', id),
