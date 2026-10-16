@@ -57,6 +57,61 @@ test("groups mixed item and freight GST by kind and rate", () => {
   ]);
 });
 
+test("accepts percentage notation for rates without changing money parsing", () => {
+  for (const rate of ["18", "18%", " 18.00 % ", "18％"]) {
+    assert.equal(calculator.purchaseRateBasisPoints(rate), 1800, rate);
+  }
+  assert.equal(calculator.purchaseRateBasisPoints("0.1%"), 10);
+  assert.equal(calculator.purchaseRateBasisPoints("0%"), 0);
+  for (const rate of ["", "GST 18%", "18%%", "18% + 5%", "abc18", "NaN"]) {
+    assert.equal(calculator.purchaseRateBasisPoints(rate), null, rate);
+  }
+  assert.equal(calculator.purchaseMoneyPaise("18%"), null);
+});
+
+test("Perfect Steel 122 includes freight GST for extracted percentage rates", () => {
+  for (const taxMode of ["cgst_sgst", "igst"]) {
+    const result = calculator.calculatePurchaseVoucher(input({
+      taxMode,
+      defaultGstRate: "18%",
+      lines: [{ lineId: "scrap", taxableAmount: "338940.00", taxRate: "18%" }],
+      freightAmount: "15000.00",
+      freightGstRate: "18%",
+      invoiceGstAmount: "63709.20",
+      invoiceTotal: "417649.00",
+      sourceRoundOffAmount: "-0.20",
+      confirmedRoundOffAmount: "-0.20",
+    }));
+    assert.equal(result.gstTaxableAmount, "353940.00");
+    assert.equal(result.gstAmount, "63709.20");
+    assert.equal(result.gstDifference, "0.00");
+    assert.equal(result.totalDifference, "0.00");
+    if (taxMode === "cgst_sgst") {
+      assert.equal(result.cgstAmount, "31854.60");
+      assert.equal(result.sgstAmount, "31854.60");
+    } else {
+      assert.equal(result.igstAmount, "63709.20");
+    }
+  }
+});
+
+test("earlier freight-bearing invoices retain their reconciled GST", () => {
+  for (const invoice of [
+    { number: "121/26-27", basic: "825330", freight: "25000", halfGst: "76529.70" },
+    { number: "127/26-27", basic: "425940", freight: "15000", halfGst: "39684.60" },
+    { number: "BST/26-27/635", basic: "1051638", freight: "36792", halfGst: "97958.70" },
+  ]) {
+    const result = calculator.calculatePurchaseVoucher(input({
+      taxMode: "cgst_sgst",
+      lines: [{ lineId: invoice.number, taxableAmount: invoice.basic, taxRate: "18" }],
+      freightAmount: invoice.freight,
+      freightGstRate: "18",
+    }));
+    assert.equal(result.cgstAmount, invoice.halfGst, invoice.number);
+    assert.equal(result.sgstAmount, invoice.halfGst, invoice.number);
+  }
+});
+
 test("splits an odd paise of intrastate GST without losing it", () => {
   const result = calculator.calculatePurchaseVoucher(input({
     taxMode: "cgst_sgst",

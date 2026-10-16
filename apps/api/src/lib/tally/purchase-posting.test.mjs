@@ -170,6 +170,64 @@ function prepare(document, options = {}) {
   return base;
 }
 
+function freightInvoiceDocument() {
+  const document = invoiceDocument({ totalAmount: "417649.00", taxAmount: "63709.20", tdsAmount: "", lines: [{
+    description: "MS Scrap", hsnSac: "72044900", quantity: "9415", unit: "KG",
+    rate: "36.00", taxableAmount: "338940.00", taxRate: "18%",
+  }] });
+  Object.assign(document.extracted_fields, {
+    invoiceNumber: "122/26-27", taxRate: "18%", totalTaxableAmount: "353940.00",
+    freightAmount: "15000.00", freightGstRate: "18%", roundOffAmount: "-0.20",
+    cgstTdsAmount: "", sgstTdsAmount: "",
+  });
+  return document;
+}
+
+test("Perfect Steel 122 reconciles percentage GST rates through review and Tally payload", () => {
+  const document = freightInvoiceDocument();
+  for (const savedReview of [null, { gstRate: "18 %", freightGstRate: "18%", transportTdsRate: "1%" }]) {
+    const result = prepare(document, { savedReview });
+    assert.equal(result.review.gstRate, "18");
+    assert.equal(result.review.freightGstRate, "18");
+    assert.equal(result.review.lines[0].taxRate, "18");
+    assert.equal(result.review.transportTdsRate, savedReview ? "1" : "2");
+    assert.equal(result.calculation.cgstAmount, "31854.60");
+    assert.equal(result.calculation.sgstAmount, "31854.60");
+    assert.equal(result.calculation.gstDifference, "0.00");
+    assert.equal(result.calculation.totalDifference, "0.00");
+    assert.deepEqual(result.tallyPayload.charges.filter((charge) => charge.kind !== "freight")
+      .map(({ kind, rate, taxableBasis, amount }) => ({ kind, rate, taxableBasis, amount })), [
+      { kind: "cgst", rate: "9", taxableBasis: "353940.00", amount: "31854.60" },
+      { kind: "sgst", rate: "9", taxableBasis: "353940.00", amount: "31854.60" },
+    ]);
+    assert.equal(result.tallyPayload.charges.find((charge) => charge.kind === "freight").rate, "18");
+    assert.ok(!result.blockers.some(({ code }) => /GST_RATE|GST_MISMATCH|TOTAL_MISMATCH/.test(code)));
+  }
+});
+
+test("malformed or missing freight GST rates block posting even when totals match zero freight GST", () => {
+  for (const freightGstRate of ["", "GST 18%", "18%%", "18% + 5%", "-1", "99"] ) {
+    const document = freightInvoiceDocument();
+    Object.assign(document.extracted_fields, { totalAmount: "414949.00", taxAmount: "61009.20" });
+    const result = prepare(document, { savedReview: { freightGstRate } });
+    assert.ok(result.blockers.some(({ code }) => code === "FREIGHT_GST_RATE_REQUIRED"), freightGstRate);
+    assert.equal(result.suggestedStatus, "correction_required");
+  }
+  const zero = prepare(freightInvoiceDocument(), { savedReview: { freightGstRate: "0%" } });
+  assert.equal(zero.review.freightGstRate, "0");
+  assert.ok(!zero.blockers.some(({ code }) => code === "FREIGHT_GST_RATE_REQUIRED"));
+});
+
+test("malformed explicit item GST cannot fall back silently to the invoice rate", () => {
+  const document = freightInvoiceDocument();
+  const initial = prepare(document);
+  for (const taxRate of ["GST 18%", "18%%", "-1", "99"]) {
+    const result = prepare(document, { savedReview: { lines: [{ lineId: initial.review.lines[0].lineId, taxRate }] } });
+    assert.ok(result.blockers.some(({ code }) => code === "LINE_GST_RATE_REQUIRED"), taxRate);
+    assert.equal(result.suggestedStatus, "correction_required");
+  }
+});
+
 test("invoice total after round-off is not mistaken for the round-off amount", () => {
   const document = invoiceDocument({
     totalAmount: "1179.60",

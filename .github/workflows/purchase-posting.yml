@@ -1,0 +1,31 @@
+name: Purchase GST regression checks
+
+on:
+  pull_request:
+    paths:
+      - "packages/shared/**"
+      - "apps/api/src/lib/**"
+      - "package*.json"
+      - ".github/workflows/purchase-posting.yml"
+  push:
+    paths:
+      - "packages/shared/**"
+      - "apps/api/src/lib/**"
+      - "package*.json"
+      - ".github/workflows/purchase-posting.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  purchase-gst:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run test:purchase-posting
+      - run: npm run test:purchase-master-matching

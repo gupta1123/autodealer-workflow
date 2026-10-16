@@ -8,6 +8,7 @@ import type {
 import type { CommercialLineItem } from "@/types/pipeline";
 import {
   calculatePurchaseVoucher,
+  purchaseRateBasisPoints,
   PURCHASE_CALCULATION_VERSION,
 } from "@autodealer/shared/lib/purchase-voucher";
 
@@ -378,7 +379,12 @@ function quantityMillis(value: unknown) {
 }
 
 function rateBasisPoints(value: unknown) {
-  return parseScaled(value, 100);
+  return purchaseRateBasisPoints(value);
+}
+
+function normalizedRate(value: unknown) {
+  const rate = rateBasisPoints(value);
+  return rate === null ? text(value) : String(rate / 100);
 }
 
 function formatPaise(value: number | null | undefined) {
@@ -1200,7 +1206,7 @@ function buildDefaultReview(
       unit: reviewedUnit,
       rate: prior?.rate ?? line.rate,
       taxableAmount: prior?.taxableAmount ?? line.taxableAmount,
-      taxRate: prior?.taxRate ?? line.taxRate ?? source.invoiceTaxRate,
+      taxRate: normalizedRate(prior?.taxRate ?? line.taxRate ?? source.invoiceTaxRate),
       stockItemName: stockItem,
       purchaseLedgerName:
         exactMasterName(masters, prior?.purchaseLedgerName || "", ["ledger"]) ||
@@ -1245,6 +1251,7 @@ function buildDefaultReview(
     Boolean(supplierState && buyerState) &&
     scrapGstTdsBasis > GST_TDS_CONTRACT_THRESHOLD_PAISE;
 
+  const invoiceTaxRate = normalizedRate(source.invoiceTaxRate);
   const baseReview: PurchasePostingReview = {
     selectedInvoiceDocumentId: source.documentId,
     invoiceNumber: source.invoiceNumber,
@@ -1256,20 +1263,20 @@ function buildDefaultReview(
     buyerGstin: buyerGstin || source.buyerGstin,
     vehicleNumber: source.vehicleNumber,
     invoiceTotal: source.invoiceTotal,
-    gstRate: source.invoiceTaxRate,
+    gstRate: invoiceTaxRate,
     supplierLedgerName: supplierLedgerSuggestion(source, masters, mappings),
     cgstLedgerName:
-      mappedRoleName(masters, mappings, "gst_rate", [`cgst:${Number(source.invoiceTaxRate || 0) / 2}`, "cgst"], ["ledger", "gst_ledger", "tax_ledger"]) ||
+      mappedRoleName(masters, mappings, "gst_rate", [`cgst:${Number(invoiceTaxRate || 0) / 2}`, "cgst"], ["ledger", "gst_ledger", "tax_ledger"]) ||
       exactMasterName(masters, "Input ITC CGST 9%", ["ledger", "gst_ledger", "tax_ledger"]) ||
-      taxRoleLedger(masters, "cgst", Number(source.invoiceTaxRate || 0) / 2),
+      taxRoleLedger(masters, "cgst", Number(invoiceTaxRate || 0) / 2),
     sgstLedgerName:
-      mappedRoleName(masters, mappings, "gst_rate", [`sgst:${Number(source.invoiceTaxRate || 0) / 2}`, "sgst"], ["ledger", "gst_ledger", "tax_ledger"]) ||
+      mappedRoleName(masters, mappings, "gst_rate", [`sgst:${Number(invoiceTaxRate || 0) / 2}`, "sgst"], ["ledger", "gst_ledger", "tax_ledger"]) ||
       exactMasterName(masters, "Input ITC SGST 9%", ["ledger", "gst_ledger", "tax_ledger"]) ||
-      taxRoleLedger(masters, "sgst", Number(source.invoiceTaxRate || 0) / 2),
+      taxRoleLedger(masters, "sgst", Number(invoiceTaxRate || 0) / 2),
     igstLedgerName:
-      mappedRoleName(masters, mappings, "gst_rate", [`igst:${Number(source.invoiceTaxRate || 0)}`, "igst"], ["ledger", "gst_ledger", "tax_ledger"]) ||
+      mappedRoleName(masters, mappings, "gst_rate", [`igst:${Number(invoiceTaxRate || 0)}`, "igst"], ["ledger", "gst_ledger", "tax_ledger"]) ||
       exactMasterName(masters, "Input ITC IGST 18%", ["ledger", "gst_ledger", "tax_ledger"]) ||
-      taxRoleLedger(masters, "igst", Number(source.invoiceTaxRate || 0)),
+      taxRoleLedger(masters, "igst", Number(invoiceTaxRate || 0)),
     freightAmount: source.invoiceFreightAmount,
     freightGstRate: source.invoiceFreightGstRate || (moneyPaise(source.invoiceFreightAmount) ? "18" : ""),
     freightLedgerName:
@@ -1320,6 +1327,9 @@ function buildDefaultReview(
   return {
     ...baseReview,
     ...(saved ?? {}),
+    gstRate: normalizedRate(saved?.gstRate ?? baseReview.gstRate),
+    transportTdsRate: normalizedRate(saved?.transportTdsRate ?? baseReview.transportTdsRate),
+    gstTdsRate: normalizedRate(saved?.gstTdsRate ?? baseReview.gstTdsRate),
     // Reviewer edits override the extracted e-way bill field by field.
     ewayBill: baseReview.ewayBill || saved?.ewayBill
       ? { ...(baseReview.ewayBill ?? emptyEwayBill()), ...(saved?.ewayBill ?? {}) }
@@ -1335,7 +1345,7 @@ function buildDefaultReview(
       ? saved?.freightAmount ?? baseReview.freightAmount
       : "",
     freightGstRate: moneyPaise(source.invoiceFreightAmount)
-      ? saved?.freightGstRate ?? baseReview.freightGstRate
+      ? normalizedRate(saved?.freightGstRate ?? baseReview.freightGstRate)
       : "",
     freightLedgerName: exactMasterName(masters, saved?.freightLedgerName || "", ["ledger"]) || saved?.freightLedgerName?.trim() || baseReview.freightLedgerName,
     tds194qLedgerName:
@@ -1345,7 +1355,7 @@ function buildDefaultReview(
     cgstTdsLedgerName: exactMasterName(masters, saved?.cgstTdsLedgerName || "", ["ledger", "tax_ledger"]) || baseReview.cgstTdsLedgerName,
     sgstTdsLedgerName: exactMasterName(masters, saved?.sgstTdsLedgerName || "", ["ledger", "tax_ledger"]) || baseReview.sgstTdsLedgerName,
     igstTdsLedgerName: exactMasterName(masters, saved?.igstTdsLedgerName || "", ["ledger", "tax_ledger"]) || baseReview.igstTdsLedgerName,
-    tds194qRate: saved?.tds194qRate || saved?.tdsRate || baseReview.tds194qRate,
+    tds194qRate: normalizedRate(saved?.tds194qRate || saved?.tdsRate || baseReview.tds194qRate),
     applyTds194q:
       typeof saved?.applyTds194q === "boolean"
         ? saved.applyTds194q
@@ -1913,6 +1923,16 @@ export function preparePurchasePosting(params: {
   }
 
   for (const line of review.lines) {
+    const lineGstRate = rateBasisPoints(line.taxRate || review.gstRate);
+    if (lineGstRate === null || lineGstRate < 0 || lineGstRate > 2800) {
+      blockers.push(issue(
+        "LINE_GST_RATE_REQUIRED",
+        "Item GST rate is invalid",
+        "Confirm a valid item GST rate; enter zero explicitly for exempt goods.",
+        "line",
+        line.lineId
+      ));
+    }
     const material = materialFromHsn(line.hsn);
     if (!line.hsn || material.material === "unknown") {
       blockers.push(issue("HSN_MAPPING_REQUIRED", "HSN mapping required", `Map ${line.hsn || "the missing HSN"} manually before posting.`, "line", line.lineId));
@@ -2080,9 +2100,10 @@ export function preparePurchasePosting(params: {
   const invoiceGstPaise = moneyPaise(calculation.invoiceGstAmount) ?? 0;
   const gstApplicable = invoiceGstPaise > TAX_TOLERANCE_PAISE ||
     (gstRateBasisPoints !== null && gstRateBasisPoints > 0);
-  if (gstApplicable && (
+  if ((gstApplicable || Boolean(text(review.gstRate))) && (
     gstRateBasisPoints === null ||
-    gstRateBasisPoints <= 0 ||
+    gstRateBasisPoints < 0 ||
+    (gstApplicable && gstRateBasisPoints === 0) ||
     gstRateBasisPoints > 2800
   )) {
     blockers.push(issue(
@@ -2247,7 +2268,7 @@ export function preparePurchasePosting(params: {
       blockers.push(issue("FREIGHT_LEDGER_REQUIRED", "Freight ledger missing", "Select the Purchase freight or inward-transport ledger from live Tally.", "tax"));
     }
     const freightRate = rateBasisPoints(review.freightGstRate);
-    if (freightRate !== null && freightRate < 0) {
+    if (freightRate === null || freightRate < 0 || freightRate > 2800) {
       blockers.push(issue("FREIGHT_GST_RATE_REQUIRED", "Freight GST rate is invalid", "Enter zero for exempt freight or a positive GST rate.", "tax"));
     }
   }

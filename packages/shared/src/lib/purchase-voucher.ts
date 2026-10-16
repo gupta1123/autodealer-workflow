@@ -1,4 +1,4 @@
-export const PURCHASE_CALCULATION_VERSION = 2;
+export const PURCHASE_CALCULATION_VERSION = 3;
 
 export type PurchaseTaxMode = "cgst_sgst" | "igst" | "unknown";
 
@@ -58,7 +58,9 @@ export function purchaseMoneyPaise(value: unknown) {
 }
 
 export function purchaseRateBasisPoints(value: unknown) {
-  return scaled(value, 100);
+  // OCR and saved reviews can contain a trailing percent sign. Accept that
+  // notation without stripping arbitrary text (which could hide a bad rate).
+  return scaled(String(value ?? "").trim().replace(/[%％]$/, "").trim(), 100);
 }
 
 export function purchaseFormatPaise(value: number) {
