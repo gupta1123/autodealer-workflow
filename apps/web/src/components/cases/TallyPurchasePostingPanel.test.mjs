@@ -16,7 +16,7 @@ function visit(node){
 visit(ast);assert(effect,'Catalogue effect must exist.');
 const code=ts.transpileModule(`exports.run = ${effect}`,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS}}).outputText;
 
-async function run({workflow=null,prepare=true,loading=false,error=null,enabled=true}={}){
+async function run({workflow=null,prepare=true,loading=false,error=null,enabled=true,approvalRefresh=false}={}){
  const calls=[];
  const snapshot={member:{status:'active',must_change_password:false,modules:['purchases']},role:{archived:false,permissions:prepare?['purchases.view','purchases.prepare']:['purchases.view']}};
  const next={selectedConnectionId:'kalika-connector',selectedCompanyName:'Kalika Steel',connection:{bridgeConnected:true,tallyReachable:true,companyLoaded:true},review:{supplierName:'Supplier',supplierLedgerName:''}};
@@ -31,8 +31,13 @@ async function run({workflow=null,prepare=true,loading=false,error=null,enabled=
   setLiveMastersReady:noop,setPayload:noop,setReview:noop,setSupplierLedgerMatch:noop,setLineMasterMatches:noop,
   setSupplierLedgerMatchError:noop,setLineMasterMatchError:noop,setNotice:noop,setRefreshingMasters:noop,setError:noop,
  };
- vm.runInNewContext(code,context);context.exports.run();
+ vm.runInNewContext(code,context);const cleanup=context.exports.run();
  for(let i=0;i<4;i++)await new Promise(resolve=>setImmediate(resolve));
+ if(approvalRefresh){
+  cleanup?.();context.approval.loading=true;context.exports.run();
+  context.approval.loading=false;context.exports.run();
+  for(let i=0;i<4;i++)await new Promise(resolve=>setImmediate(resolve));
+ }
  return calls;
 }
 
@@ -49,4 +54,22 @@ test('read-only access and failed approval checks do not start catalogue prepara
  assert.deepEqual(await run({prepare:false}),['load-review']);
  assert.deepEqual(await run({error:'Approval unavailable.'}),['load-review']);
  assert.deepEqual(await run({loading:true}),[]);
+});
+
+test('approval rechecks after Save or autosave do not reload the review or Tally catalogue',async()=>{
+ assert.deepEqual(await run({approvalRefresh:true}),['load-review','ledger_masters','prepare-catalogue']);
+});
+
+test('an interrupted initial load releases its guard so a replacement can finish',async()=>{
+ const calls=[];let release;
+ const deferred=new Promise(resolve=>{release=resolve;});
+ const snapshot={member:{status:'active',must_change_password:false,modules:['purchases']},role:{archived:false,permissions:['purchases.prepare']}};
+ const context={exports:{},caseId:'new-case',approval:{enabled:true,loading:false,error:null,workflow:null,snapshot},canAccess,
+  automaticLiveRefreshRef:{current:null},setLiveMastersReady:()=>{},load:async()=>{calls.push('load-review');return deferred;},
+ };
+ vm.runInNewContext(code,context);
+ const cleanup=context.exports.run();assert.equal(context.automaticLiveRefreshRef.current,'new-case');
+ cleanup();assert.equal(context.automaticLiveRefreshRef.current,null);
+ context.exports.run();assert.deepEqual(calls,['load-review','load-review']);
+ release(null);for(let i=0;i<4;i++)await new Promise(resolve=>setImmediate(resolve));
 });

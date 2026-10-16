@@ -853,6 +853,7 @@ export function TallyPurchasePostingPanel({
     automaticLiveRefreshRef.current = caseId;
     setLiveMastersReady(false);
     let cancelled = false;
+    let loadCompleted = false;
     void (async () => {
       const next = await load(false, null, true);
       if (cancelled) return;
@@ -978,14 +979,13 @@ export function TallyPurchasePostingPanel({
       } finally {
         if (!cancelled) setRefreshingMasters(false);
       }
-    })();
+    })().finally(() => { loadCompleted = true; });
     return () => {
       cancelled = true;
-      // This effect can be restarted before its asynchronous catalogue load
-      // completes (notably by React Strict Mode and approval-state changes).
-      // Release this run's guard so the replacement effect is allowed to load
-      // the cached catalogue and perform its incremental live verification.
-      if (automaticLiveRefreshRef.current === caseId) {
+      // Only interrupted initial loads need a replacement run. Once loaded,
+      // approval rechecks after saving or focus must keep the catalogue and
+      // current selections instead of mounting a fresh review.
+      if (!loadCompleted && automaticLiveRefreshRef.current === caseId) {
         automaticLiveRefreshRef.current = null;
       }
     };
