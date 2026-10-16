@@ -22,6 +22,8 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { LocalAgentPanel } from "@/components/tally/LocalAgentPanel";
 import { TallyCompanyLinkingPanel } from "@/components/tally/TallyCompanyLinkingPanel";
 import { CaseConfirmDialog } from "@/components/cases/CaseConfirmDialog";
+import { useAccess } from '@/components/access/AccessProvider';
+import { canAccess } from '@autodealer/shared/lib/access';
 
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_LAN_TALLY_URL = "http://192.168.1.10:9000";
@@ -304,6 +306,10 @@ interface TallyPrimeDashboardProps {
 
 export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboardProps) {
   const router = useRouter();
+  const { snapshot, enforcementRequired } = useAccess();
+  const canManage = !enforcementRequired || canAccess(snapshot, 'connections.manage');
+  const canLinkCompanies = canManage && (!enforcementRequired || Boolean(snapshot?.member.all_companies));
+  const canViewBank = !enforcementRequired || canAccess(snapshot, 'bank.view');
   const [view, setView] = useState<"home" | "connection">(initialView);
   const [connections, setConnections] = useState<TallyConnection[]>([]);
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
@@ -328,8 +334,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     connections[0] ??
     null;
   const selectedConnectionId = selectedConnection?.id ?? "";
-  // The connection belongs to the PC running the connector, not to the browser that created it,
-  // so every signed-in user sees the same status and controls.
+  // Status is shared within the user's company scope; management needs a separate permission.
   const selectedCompany =
     companies.find(
       (company) =>
@@ -482,6 +487,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   }, []);
 
   async function connectConnector() {
+    if (!canManage) return;
     try {
       setCreating(true);
       setMessage(null);
@@ -575,7 +581,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   }
 
   async function disconnectConnector() {
-    if (!selectedConnection) return;
+    if (!canManage || !selectedConnection) return;
 
     try {
       setDisconnecting(true);
@@ -622,6 +628,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   }
 
   async function disconnectOtherConnectors() {
+    if (!canManage) return;
     try {
       setDisconnectingOthers(true);
       setMessage(null);
@@ -789,13 +796,13 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
             }
             title="Tally Connection"
           />
-          <HubCard
+          {canViewBank ? <HubCard
             description="Import, review, and post digitized bank statement entries."
             icon={<FileText className="h-5.5 w-5.5" />}
             onClick={() => router.push("/bank-statements")}
             status="Open statements"
             title="Bank Statements"
-          />
+          /> : null}
         </div>
       </div>
     );
@@ -841,7 +848,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         </div>
       ) : null}
 
-      {!connectorActive ? (
+      {canManage && !connectorActive ? (
         <section className="mb-5 rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-shadow duration-300 hover:shadow-[0_6px_18px_rgba(64,51,35,0.05)]">
           <div className="mb-4">
             <div className="text-xs font-medium text-[#8a7f72]">
@@ -965,7 +972,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                 </div>
               </div>
 
-              <div className="flex w-full flex-wrap gap-2.5 lg:w-auto lg:shrink-0 lg:flex-nowrap lg:items-center lg:justify-end">
+              {canManage ? <div className="flex w-full flex-wrap gap-2.5 lg:w-auto lg:shrink-0 lg:flex-nowrap lg:items-center lg:justify-end">
                   {!connectorActive && !connectorOffline ? (
                     // Only a PC whose connector login is gone needs pairing; this resumes the
                     // same connection rather than creating a new one.
@@ -998,7 +1005,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                       </PopoverContent>
                     </Popover>
                   )}
-              </div>
+              </div> : null}
             </div>
           </div>
 
@@ -1032,7 +1039,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           </div>
           {connectorActive ? (
             <>
-              <TallyCompanyLinkingPanel connectionId={selectedConnection.id} onLinked={() => loadConnections({ quiet: true })} />
+              {canLinkCompanies ? <TallyCompanyLinkingPanel connectionId={selectedConnection.id} onLinked={() => loadConnections({ quiet: true })} /> : null}
               <LocalAgentPanel connectionId={selectedConnection.id} companyName={selectedConnection.lastCompanyName} />
             </>
           ) : null}
@@ -1047,10 +1054,9 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               No Tally connection found
             </h3>
             <p className="mt-1.5 text-xs font-normal text-[#8a7f72] max-w-sm">
-              Install and open Kalika Local Agent on this computer, then connect
-              it to Tally Prime to sync ledgers.
+              {canManage ? 'Install and open Kalika Local Agent on this computer, then connect it to Tally Prime to sync ledgers.' : 'Ask your administrator to connect Tally Prime for your assigned company.'}
             </p>
-            <Button
+            {canManage ? <Button
               className="mt-6 rounded-xl bg-[#2d2d2d] hover:bg-[#1a1a1a] px-6 py-5 text-xs font-medium text-white shadow-md transition-all"
               disabled={creating}
               onClick={() => void connectConnector()}
@@ -1062,7 +1068,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                 <PlugZap className="h-3.5 w-3.5 mr-1.5" />
               )}
               Connect Tally Prime
-            </Button>
+            </Button> : null}
           </div>
         </div>
       )}
@@ -1085,7 +1091,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           if (action === "repair") void connectConnector();
         }}
         onOpenChange={(open) => { if (!open) setConfirmAction(null); }}
-        open={confirmAction !== null}
+        open={canManage && confirmAction !== null}
         title={confirmAction === "disconnect_others" ? "Disconnect PCs not seen for a week?" : confirmAction === "repair" ? `Pair ${pcName} again?` : `Disconnect ${pcName}?`}
       />
     </div>

@@ -3,8 +3,18 @@ import assert from 'node:assert/strict';
 import {firstAccessiblePage,pagePermissions} from './access-routes.ts';
 import {DEFAULT_ROLES,canAccess} from './access.ts';
 test('direct financial navigation has explicit module permissions',()=>{
- for(const [path,permission] of [['/cases/x/mismatches','purchases.view'],['/workspace','purchases.prepare'],['/bank-statements','bank.view'],['/collections','discounts.view'],['/collections/follow-ups','followups.view'],['/tally-prime?view=connection','connections.manage']])assert.deepEqual(pagePermissions(path),[permission]);
+ for(const [path,permission] of [['/cases/x/mismatches','purchases.view'],['/workspace','purchases.prepare'],['/bank-statements','bank.view'],['/collections','discounts.view'],['/collections/follow-ups','followups.view']])assert.deepEqual(pagePermissions(path),[permission]);
  assert.deepEqual(pagePermissions('/settings/team'),['team.manage','roles.manage']);
+});
+
+test('every workflow can view Tally connections without receiving management access',()=>{
+ const required=pagePermissions('/tally-prime?view=connection');
+ for(const module of ['purchases','bank','discounts','followups']) {
+  const snapshot={member:{status:'active',modules:[module],must_change_password:false,is_owner:false},role:{archived:false,permissions:[`${module}.view`]}};
+  assert.equal(required.some(permission=>canAccess(snapshot,permission)),true);
+  assert.equal(canAccess(snapshot,'connections.manage'),false);
+ }
+ assert.equal(required.some(permission=>permission==='connections.manage'),true);
 });
 
 test('Bank-only users cannot open Dashboard and land on Bank Statements',()=>{

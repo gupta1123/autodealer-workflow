@@ -4,7 +4,8 @@ export function pagePermissions(path: string): string[] {
   if (pathname === '/') return ['purchases.view'];
   if (pathname === '/settings/team') return ['team.manage', 'roles.manage'];
   if (/^\/settings(?:\/|$)/.test(pathname)) return ['settings.manage'];
-  if (/^\/tally-prime(?:\/|$)/.test(pathname)) return ['connections.manage'];
+  // Every workflow can inspect its scoped connection; changes still need management access.
+  if (/^\/tally-prime(?:\/|$)/.test(pathname)) return ['connections.manage', 'purchases.view', 'bank.view', 'discounts.view', 'followups.view'];
   if (/^\/workspace(?:\/|$)/.test(pathname)) return ['purchases.prepare'];
   if (/^\/cases(?:\/|$)/.test(pathname)) return ['purchases.view'];
   if (/^\/recycle-bin(?:\/|$)/.test(pathname)) return ['purchases.recycle'];

@@ -33,3 +33,10 @@ test('Bank Statements and a permitted Cases dashboard remain usable',()=>{
 test('direct navigation to a forbidden page shows denial without redirecting to login',()=>{
  const f=fixture({path:'/cases'});assert.equal(f.mounted,0);assert.deepEqual(f.redirects,[]);assert.match(f.html,/don’t have access/);
 });
+
+test('all financial workflows can open the Tally connection page',()=>{
+ for(const module of ['purchases','bank','discounts','followups']) {
+  const f=fixture({path:'/tally-prime',module});
+  assert.equal(f.mounted,1);assert.deepEqual(f.redirects,[]);
+ }
+});
