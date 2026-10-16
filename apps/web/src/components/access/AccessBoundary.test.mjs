@@ -35,8 +35,8 @@ test('direct navigation to a forbidden page shows denial without redirecting to 
 });
 
 test('all financial workflows can open the Tally connection page',()=>{
- for(const module of ['purchases','bank','discounts','followups']) {
-  const f=fixture({path:'/tally-prime',module});
+ for(const workflow of ['purchases','bank','discounts','followups']) {
+  const f=fixture({path:'/tally-prime',module:workflow});
   assert.equal(f.mounted,1);assert.deepEqual(f.redirects,[]);
  }
 });

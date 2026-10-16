@@ -42,8 +42,8 @@ function fixture({module='bank',manager=false,allCompanies=false,connected=true,
 }
 
 test('Cases and Bank users see connection and agent status without management controls',()=>{
- for(const module of ['purchases','bank','discounts','followups']) {
-  const html=fixture({module});
+ for(const workflow of ['purchases','bank','discounts','followups']) {
+  const html=fixture({module:workflow});
   assert.match(html,/Tally Connection/);assert.match(html,/Office Tally/);
   assert.match(html,/Agent data status/);
   assert.doesNotMatch(html,/Company mapping controls|Open connection menu|Disconnect…|Reconnect|Connection location/);
