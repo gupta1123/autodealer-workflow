@@ -856,7 +856,8 @@ export function TallyPurchasePostingPanel({
     void (async () => {
       const next = await load(false, null, true);
       if (cancelled) return;
-      if(approval.enabled&&(!canAccess(approval.snapshot,'purchases.prepare')||approval.workflow?.state!=='draft'))return;
+      // New cases have no approval row until submission; they are still drafts.
+      if(approval.enabled&&(approval.error||!canAccess(approval.snapshot,'purchases.prepare')||(approval.workflow?.state??'draft')!=='draft'))return;
       const connection = next?.connection;
       if (
         !next ||
