@@ -6,6 +6,9 @@ publish = "apps/web/.next-build"
 NODE_VERSION = "24"
 NPM_VERSION = "11"
 
+[context.production.environment]
+NEXT_PUBLIC_TEAM_ACCESS_ENFORCEMENT = "true"
+
 [[plugins]]
 package = "./netlify/plugins/api-proxy"
 

@@ -4,12 +4,10 @@ import { createSupabaseAdminClient } from '@/lib/supabase/admin';
 
 /** Apply the same predicate BEFORE pagination, counts, search and cursors. */
 export async function listAccessPredicate(request: Request, legacyOwner: string, permission: string) {
-  // Cases and the recycle bin are organization-wide client workspaces. They
-  // predate the company-scoped access columns, so keep their visibility
-  // independent from Tally/bank company mapping. Restrict the owner set to
-  // active members of the selected organization; this also makes legacy rows
-  // owned by the original user visible to newly provisioned teammates.
-  if (permission.startsWith('purchases.')) {
+  // Preserve the legacy shared Cases workspace only before enforcement.
+  // Once enabled, lists and detail routes must use the same reviewed company
+  // mapping; organization membership alone must not expose other companies.
+  if (process.env.TEAM_ACCESS_ENFORCEMENT !== 'true' && permission.startsWith('purchases.')) {
     const context = await requireAccessContext(request);
     if (!canAccess(context, permission)) throw new AccessError('You do not have access to this module.');
     const { data: members, error } = await createSupabaseAdminClient()
@@ -31,7 +29,9 @@ export async function listAccessPredicate(request: Request, legacyOwner: string,
 
   if (!context.sharingEnabled) throw new AccessError('Organization access mapping is not activated.', 503);
   const org = JSON.stringify(context.organizationId);
-  if (context.member.all_companies) return `and(access_organization_id.eq.${org},access_company_id.not.is.null)`;
+  // Existing unrestricted users may still read their own unclassified legacy
+  // work while its company is reviewed. Restricted teammates never receive it.
+  if (context.member.all_companies) return `or(and(access_organization_id.eq.${org},access_company_id.not.is.null),and(owner_user_id.eq.${JSON.stringify(legacyOwner)},access_organization_id.is.null,access_company_id.is.null))`;
   // Empty company scope is an empty result, never an omitted predicate.
   if (!context.member.company_ids.length) return 'id.is.null';
   const companies = context.member.company_ids.map(id => JSON.stringify(id)).join(',');

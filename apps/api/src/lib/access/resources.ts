@@ -38,6 +38,17 @@ export async function requireResourceAccess(request: Request, type: AccessResour
     return result.data as ResourceScope|null;
   })();requestScopes.set(key,pending);}
   const scope=await pending;
+  // Preserve the original user's read access to their unclassified legacy
+  // records. Writes still require a reviewed company mapping. Explicit company
+  // restrictions never fall back to ownership, including for administrators.
+  if (!scope && access.member.all_companies && permission.endsWith('.view')) {
+    const table = {case:'packet_cases',bank_import:'bank_statement_imports',bank_account:'bank_accounts',proposal:'debit_note_proposals'}[type];
+    const legacy = await db.from(table).select('id')
+      .eq('id',id).eq('owner_user_id',access.member.user_id)
+      .is('access_organization_id',null).is('access_company_id',null).maybeSingle();
+    if (legacy.error) throw new AccessError('Resource authorization is unavailable.',503);
+    if (legacy.data) return {access,db,scope:{organization_id:access.organizationId,company_id:null,creator_user_id:access.member.user_id,source_revision:0} as ResourceScope};
+  }
   if (!scope || !scope.company_id || !(access.member.all_companies||access.member.company_ids.includes(scope.company_id)) || !canAccess(access, permission, scope.company_id)) throw new AccessError('Resource not found or outside your company access.', 404);
   return { access, scope, db };
 }
