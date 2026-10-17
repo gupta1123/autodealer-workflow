@@ -1785,7 +1785,7 @@ export function CollectionsDashboardPage({
             <p>{dashboard.cache?.source === 'prepared_customer_dues'
               ? 'Figures come from customer dues in Kalika Local Agent, which follows changes in Tally about every minute.'
               : 'Figures were read from Tally at the time shown. Refresh to check again.'}</p>
-            <p className="mt-2">Configured policy: 1.5% for 7 calendar days; 1% for 15 calendar days. Narration supplies the rates, not the day counts. Posting always rechecks the invoice.</p>
+            <p className="mt-2">ADVANCE RTGS: 1.5% with full payment before the invoice date. SAME DAY RTGS: 1% with full payment by the end of the invoice date in IST. Posting always rechecks the invoice.</p>
           </div>
         </details> : null}
       </div>

@@ -5,8 +5,6 @@ import { subscribeBankJobEvents } from '../../api/src/lib/processing/bank-job-ev
 import {scopedCompanyCheck} from './company-scope.mjs';
 import {createScopedBankSubscriptions} from './bank-job-subscriptions.mjs';
 import {waitForDurableDiscount} from './durable-discount.mjs';
-import {startFollowupAutomation} from './followup-automation.mjs';
-import {businessDateText} from '../../tally-bridge/src/collections-analysis/business-date.mjs';
 
 const PORT = Number(process.env.CASH_DISCOUNT_GATEWAY_PORT || 3002);
 // Dual-stack localhost: browsers may resolve localhost to ::1 while the
@@ -448,26 +446,6 @@ function versionAtLeast(bridgeVersion, minimum) {
   return true;
 }
 
-function automaticConnectorRead(context, operation, payload) {
-  const connector = connectors.get(context.connectionId);
-  const meta = connector && metadata.get(connector);
-  if (!meta || connector.readyState !== WebSocket.OPEN || meta.installationId !== context.installationId || meta.sessionGeneration !== context.sessionGeneration || meta.ownerUserId !== context.initiatingUserId) return Promise.reject(new Error('The automatic reminder connector pairing changed.'));
-  if ([...pending.values()].some(item => item.connectionId === context.connectionId)) return Promise.reject(new Error('Tally is busy with another request.'));
-  return new Promise((resolve, reject) => {
-    const requestId = randomUUID();
-    const browser = { readyState: WebSocket.OPEN, send: text => {
-      const result = JSON.parse(text);
-      if (result.type !== 'result') return;
-      if (result.success) resolve(result.data); else reject(new Error(result.error || 'Automatic Tally check failed.'));
-    } };
-    const item = startPending({requestId,browser,connector,connectionId:context.connectionId,ownerUserId:meta.ownerUserId,operation,payload});
-    // Service authorization was established by the bridge-authenticated API,
-    // and is rechecked again there immediately before sending a message.
-    item.phase = 'fetch_customer_open_bills';
-    send(connector,{type:'operation',requestId,operation,deadlineAt:Date.now()+90_000,companyName:context.companyName,financialYear:context.financialYear,customerScope:context.customerScope,agentIdentity:context,payload});
-  });
-}
-
 async function handleConnectorResult(socket, message, meta) {
   const requestId = String(message.requestId ?? "");
   const item = pending.get(requestId);
@@ -635,34 +613,7 @@ export function startCashDiscountGateway(options = {}) {
         perMessageDeflate,
       });
 
-  const automationApi = (context, body) => {
-    const connector = connectors.get(context.connectionId);
-    const meta = connector && metadata.get(connector);
-    if (!meta?.bridgeToken) throw new Error('Connector disconnected.');
-    return apiRequest('/api/collections/follow-ups/automatic',{bridgeToken:meta.bridgeToken,body:{...context,...body}});
-  };
-  const automation = options.followupAutomation === false ? null : startFollowupAutomation({
-    intervalMs: options.followupAutomationIntervalMs || 60_000,
-    contexts: async () => {
-      const contexts = [];
-      for (const [connectionId,connector] of connectors) {
-        const meta = metadata.get(connector);
-        if (!meta || connector.readyState !== WebSocket.OPEN || !versionAtLeast(meta.bridgeVersion,[1,2,29]) || [...pending.values()].some(item => item.connectionId === connectionId)) continue;
-        try { const result = await automationApi({connectionId},{action:'context'}); contexts.push(...(result.contexts || [])); }
-        catch (error) { console.warn(`Automatic follow-up context unavailable: ${error.message}`); }
-      }
-      return contexts;
-    },
-    scan: context => automaticConnectorRead(context,'cash_discount_scan',{forceRefresh:true,requireFresh:true,automaticDiscovery:true,moduleName:'followups'}),
-    reconcile: async (context,scan) => {
-      const result = await automationApi(context,{action:'reconcile',scan});
-      if (result.regularCreditMigrationRequired) console.warn('Regular payment reminders require the regular_credit_followups database migration; RTGS schedules continue.');
-      return result.tasks || [];
-    },
-    read: (context,task) => automaticConnectorRead(context,'fetch_customer_open_bills',{companyName:context.companyName,financialYear:context.financialYear,asOfDate:businessDateText(),ledgerNames:[task.customer],queryPurpose:'payment_followup',forceLive:true,verificationInvoice:{invoice:task.invoice,invoiceDate:task.invoiceDate}}),
-    deliver: (context,task,evidence) => automationApi(context,{action:'deliver',id:task.id,evidence}),
-  });
-  server.once('close',() => automation?.stop());
+
 
   if (attachedServer) {
     attachedServer.on("upgrade", (request, socket, head) => {

@@ -1,8 +1,8 @@
 /* Cases table density and typography, scoped away from Payment Follow-ups. */
 .cashDiscounts {
-  height: 100dvh;
-  min-height: 0;
-  overflow: hidden;
+  min-height: 100dvh;
+  height: auto;
+  overflow: visible;
   padding-top: 16px;
   padding-bottom: 12px;
 }
@@ -10,7 +10,7 @@
 .cashDiscounts > .results {
   display: flex;
   flex-direction: column;
-  flex: 1 1 0;
+  flex: none;
   min-height: 0;
 }
 .results > * { flex-shrink: 0; }
@@ -19,12 +19,12 @@
   background: transparent;
   display: flex;
   flex-direction: column;
-  flex: 1 1 0;
+  flex: none;
   min-height: 0;
 }
 .flatTable > [role="region"] {
   overflow: auto;
-  flex: 1 1 0;
+  flex: none;
   min-height: 0;
   scrollbar-gutter: stable;
 }

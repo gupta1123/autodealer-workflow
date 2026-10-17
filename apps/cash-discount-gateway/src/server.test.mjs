@@ -237,34 +237,23 @@ test("live scan relays browser to connector and returns analysed dashboard", asy
   connector.close();
 });
 
-test('background RTGS reminder checks Tally without a browser connection',async t=>{
-  const requests=[]; let complete=false;
-  const context={connectionId:'auto-connection',companyName:'Company',companyGuid:'guid',financialYear:'2026-27',installationId:'install',sessionGeneration:1,initiatingUserId:'owner',organizationId:'org'};
+test('connecting a connector never starts background scans or messages, including legacy enable options',async t=>{
+  const requests=[],operations=[];
   const httpServer=createServer(async(request,response)=>{
-    const chunks=[];for await(const chunk of request)chunks.push(chunk);
-    const body=JSON.parse(Buffer.concat(chunks).toString()||'{}');requests.push({body,bridgeToken:request.headers['x-bridge-token']});response.setHeader('content-type','application/json');
-    if(request.url==='/api/collections/live/session'){response.end(JSON.stringify({authenticated:true,ownerUserId:'owner',installationId:'install',sessionGeneration:1}));return;}
-    if(body.action==='context'){response.end(JSON.stringify({contexts:complete?[]:[context]}));return;}
-    if(body.action==='reconcile'){response.end(JSON.stringify({tasks:[{id:'auto-row',customer:'Customer',invoice:'INV',invoiceDate:'2026-10-10'}]}));return;}
-    if(body.action==='deliver'){complete=true;response.end(JSON.stringify({status:'accepted'}));return;}
-    response.statusCode=404;response.end('{}');
+    requests.push(request.url);response.setHeader('content-type','application/json');
+    response.end(JSON.stringify({authenticated:true,ownerUserId:'owner',installationId:'install',sessionGeneration:1}));
   });
   await new Promise(resolve=>httpServer.listen(0,'127.0.0.1',resolve));
-  const url=`http://127.0.0.1:${httpServer.address().port}`;
-  const gateway=startCashDiscountGateway({server:httpServer,path:'/agent-live',apiBaseUrl:url,followupAutomationIntervalMs:100});
+  const url='http://127.0.0.1:'+httpServer.address().port;
+  const gateway=startCashDiscountGateway({server:httpServer,path:'/agent-live',apiBaseUrl:url,followupAutomation:true,followupAutomationIntervalMs:10});
   t.after(async()=>{for(const client of gateway.clients)client.terminate();await new Promise(resolve=>gateway.close(resolve));await new Promise(resolve=>httpServer.close(resolve));});
   const connector=new WebSocket(url.replace('http','ws')+'/agent-live');
   await new Promise((resolve,reject)=>{connector.once('open',resolve);connector.once('error',reject);});
-  connector.send(JSON.stringify({type:'authenticate',role:'connector',connectionId:context.connectionId,token:'auto-bridge',bridgeVersion:'1.2.29'}));
+  connector.on('message',data=>{const value=JSON.parse(data);if(value.type==='operation')operations.push(value);});
+  connector.send(JSON.stringify({type:'authenticate',role:'connector',connectionId:'connection',token:'bridge',bridgeVersion:'1.2.36'}));
   await nextMessage(connector,message=>message.type==='authenticated');
-  const scan=await nextMessage(connector,message=>message.type==='operation'&&message.operation==='cash_discount_scan');
-  assert.equal(scan.payload.requireFresh,true);assert.equal(scan.payload.automaticDiscovery,true);assert.equal(scan.agentIdentity.companyGuid,'guid');
-  const freshRequest=nextMessage(connector,message=>message.type==='operation'&&message.operation==='fetch_customer_open_bills');
-  connector.send(JSON.stringify({type:'operation_result',requestId:scan.requestId,success:true,data:{companyName:'Company',companyGuid:'guid',financialYear:'2026-27',scanSummary:{complete:true}}}));
-  const check=await freshRequest;assert.equal(check.payload.forceLive,true);assert.equal(check.payload.verificationInvoice.invoice,'INV');
-  const evidence={complete:true,byLedger:{Customer:{openBills:[{referenceName:'INV',invoiceDate:'2026-10-10',pendingAmount:123}]}}};
-  connector.send(JSON.stringify({type:'operation_result',requestId:check.requestId,success:true,data:evidence}));
-  for(let attempts=0;!complete&&attempts<50;attempts++)await new Promise(resolve=>setTimeout(resolve,20));
-  assert.equal(complete,true);
-  const delivery=requests.find(request=>request.body.action==='deliver');assert.equal(delivery.bridgeToken,'auto-bridge');assert.deepEqual(delivery.body.evidence,evidence);
+  await new Promise(resolve=>setTimeout(resolve,150));
+  assert.deepEqual(operations,[]);
+  assert.equal(requests.filter(url=>url.includes('/follow-ups/')).length,0);
+  connector.close();
 });
