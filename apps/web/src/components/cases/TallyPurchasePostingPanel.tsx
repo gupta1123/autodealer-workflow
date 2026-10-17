@@ -800,6 +800,7 @@ export function TallyPurchasePostingPanel({
   const lastPostingStatusRef = useRef<string | null>(null);
   const automaticLiveRefreshRef = useRef<string | null>(null);
   const liveMasterResultRef = useRef<unknown>(null);
+  const fullLiveMasterResultRef = useRef<unknown>(null);
   const liveMasterOptionsRef = useRef<TallyPostingResponse["masterOptions"] | null>(null);
   // The review on screen right now. A save that finishes after newer edits
   // must not replace them; a failed automatic save waits for the next edit.
@@ -882,6 +883,7 @@ export function TallyPurchasePostingPanel({
       const connectionId = next.selectedConnectionId;
       const companyName = next.selectedCompanyName;
       const applyCatalogue = async (liveMasters: unknown, noticeText: string) => {
+        fullLiveMasterResultRef.current = liveMasters;
         const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, next.review);
         liveMasterResultRef.current = liveCatalogue.compactResult;
         liveMasterOptionsRef.current = liveCatalogue.masterOptions;
@@ -907,6 +909,7 @@ export function TallyPurchasePostingPanel({
       // preview is non-authoritative; the live incremental pass below remains
       // responsible for approval freshness and final validation.
       const applyCachedOptions = async (liveMasters: unknown) => {
+        fullLiveMasterResultRef.current = liveMasters;
         const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, next.review);
         liveMasterResultRef.current = liveCatalogue.compactResult;
         liveMasterOptionsRef.current = liveCatalogue.masterOptions;
@@ -1682,6 +1685,22 @@ export function TallyPurchasePostingPanel({
       setReview(hydrated.review);
       setDirty(false);
       setNotice("Purchase invoice selected. Review the accounting before posting.");
+      // A multi-invoice packet has no review when its catalogue first loads,
+      // so its compact envelope contains no line-specific stock candidates.
+      // Rebuild it for the chosen invoice from the catalogue already on this
+      // PC; no second Tally read or connector update is needed.
+      if (hydrated.review && fullLiveMasterResultRef.current) {
+        const catalogue = prepareLiveTallyCatalogue(fullLiveMasterResultRef.current, hydrated.review);
+        liveMasterResultRef.current = catalogue.compactResult;
+        liveMasterOptionsRef.current = catalogue.masterOptions;
+        const matched = await prepareTallyPurchasePostingFromLive(
+          caseId, selectedConnectionId, selectedCompanyName, catalogue.compactResult, true
+        );
+        const matchedReview = withLiveMasterOptions(matched);
+        setPayload(matchedReview);
+        setReview(matchedReview.review);
+        setDirty(true);
+      }
     } catch (selectionError) {
       setError(selectionError instanceof Error ? selectionError.message : "Failed to select the invoice.");
     } finally {
