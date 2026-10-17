@@ -19,6 +19,7 @@ import {
   resolveCompanySuspenseLedgerName,
 } from "@/lib/bank-statement-ledger-safety";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { createBankQueueFetch } from "@/lib/bank-queue-fetch";
 
 export const runtime = "nodejs";
 
@@ -323,6 +324,7 @@ async function resolveQueueUser(request: Request) {
 }
 
 async function POSTHandler(request: Request) {
+  let admissionStarted = false;
   try {
     const user = await resolveQueueUser(request);
     if (!user) {
@@ -380,7 +382,7 @@ async function POSTHandler(request: Request) {
       );
     }
 
-    const supabase = createSupabaseAdminClient();
+    const supabase = createSupabaseAdminClient({fetch: createBankQueueFetch()});
     const expectedCompanyName = toText(body.companyName, 240);
     if (!expectedCompanyName) {
       return jsonWithCors(request, { error: "Select the Tally company before sending entries." }, { status: 400 });
@@ -933,7 +935,9 @@ async function POSTHandler(request: Request) {
             postingFallbackReason: isSuspenseLedger(counterpartyLedgerName) ? "unresolved_counterparty" : null,
             bankLedgerEntryIsDebit: bankEntryIsDebit(transaction),
             amount,
-            narration: buildVoucherNarration(transaction.description, referenceNumber),
+            // Shared admission verifies the narration against the source row.
+            // Keep the bank reference in its dedicated voucher fields.
+            narration: teamScope ? transaction.description : buildVoucherNarration(transaction.description, referenceNumber),
             referenceNumber,
             bankReferenceNumber,
             referenceSource,
@@ -1069,6 +1073,7 @@ async function POSTHandler(request: Request) {
     );
 
     if(teamScope) {
+      admissionStarted = true;
       const {data:createdCommands,error}=await supabase.rpc('access_enqueue_bank_batch',{
         p_actor:user.id,p_org:teamScope.access.organizationId,p_company:teamScope.link.company_id,
         p_dataset:teamScope.dataset!.id,p_generation:teamScope.connection.session_generation,
@@ -1091,6 +1096,7 @@ async function POSTHandler(request: Request) {
       if (mappingError) throw mappingError;
     }
 
+    admissionStarted = true;
     const { data: createdCommands, error: commandError } = await supabase
       .from("tally_bridge_commands")
       .insert(commands)
@@ -1253,6 +1259,14 @@ async function POSTHandler(request: Request) {
   } catch (error) {
     const denied=accessFailureResponse(request,error);if(denied)return denied;
     console.error("Error in POST /api/bank-statements/tally/queue:", error);
+    if (/timeout|timed out|abort|fetch failed|upstream request/i.test(serializeError(error))) {
+      return jsonWithCors(request, {
+        error: admissionStarted
+          ? "The posting request did not return in time. Its result must be checked before trying again."
+          : "Posting preparation timed out before any entries were queued. Please click Post to Tally again.",
+        code: admissionStarted ? "BANK_ADMISSION_UNCONFIRMED" : "BANK_PREPARATION_TIMEOUT",
+      }, {status: 503});
+    }
     return jsonWithCors(
       request,
       { error: serializeError(error) },

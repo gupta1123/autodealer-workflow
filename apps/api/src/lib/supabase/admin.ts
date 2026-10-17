@@ -7,7 +7,7 @@ function requireEnv(name: string, value?: string) {
   return value;
 }
 
-export function createSupabaseAdminClient() {
+export function createSupabaseAdminClient(options?: {fetch?: typeof fetch}) {
   const supabaseUrl = requireEnv(
     "NEXT_PUBLIC_SUPABASE_URL",
     process.env.NEXT_PUBLIC_SUPABASE_URL ?? process.env.SUPABASE_URL
@@ -18,6 +18,7 @@ export function createSupabaseAdminClient() {
   );
 
   return createClient(supabaseUrl, serviceRoleKey, {
+    ...(options?.fetch ? {global: {fetch: options.fetch}} : {}),
     auth: {
       autoRefreshToken: false,
       persistSession: false,
