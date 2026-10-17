@@ -347,6 +347,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     ) ?? null;
   const statusTone = getStatusTone(selectedConnection);
   const connectorActive = Boolean(selectedConnection?.bridgeConnected);
+  const connectorPaused=Boolean(selectedConnection?.revoked&&/disconnected|paused/i.test(selectedConnection.lastError||''));
   // Paired but not checking in (PC asleep, connector or Tally closed): nothing to re-pair, the
   // connector resumes on its own once it runs again.
   const connectorOffline = Boolean(
@@ -612,7 +613,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       );
       setMessage({
         tone: "success",
-        text: `Disconnected ${selectedConnection.bridgeMachineName || "this PC"}. Reconnect on that PC resumes the same connection with its settings.`,
+        text: `Paused ${selectedConnection.bridgeMachineName || "this PC"}. Click Resume on that PC and approve the Local Agent to continue. Settings and history are preserved.`,
       });
     } catch (error) {
       setMessage({
@@ -712,7 +713,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   }, [selectedConnection?.id, selectedConnection?.tallyUrl]);
 
   useEffect(() => {
-    if (!selectedConnectionId) return;
+    if (!selectedConnectionId || selectedConnection?.revoked) return;
     void refreshStatus(selectedConnectionId);
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refreshStatus(selectedConnectionId);
@@ -726,7 +727,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [refreshStatus, selectedConnectionId]);
+  }, [refreshStatus, selectedConnectionId,selectedConnection?.revoked]);
 
   useEffect(() => {
     if (!selectedConnection?.id) return;
@@ -961,7 +962,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                       }
                       variant="outline"
                     >
-                      {connectorOffline ? "Connector offline" : getStatusLabel(selectedConnection)}
+                      {connectorPaused ? "Paused" : connectorOffline ? "Connector offline" : getStatusLabel(selectedConnection)}
                     </Badge>
                   </div>
                   <div className="mt-1 max-w-3xl text-xs font-medium text-[#8a7f72]">
@@ -987,7 +988,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                       ) : (
                         <PlugZap className="h-3.5 w-3.5 mr-1.5" />
                       )}
-                      Reconnect
+                      {connectorPaused ? "Resume connection" : "Reconnect"}
                     </Button>
                   ) : (
                     <Popover>
@@ -999,7 +1000,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                         {connectorOffline ? (
                           <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-[#2b1a10] hover:bg-[#f5efe6] disabled:opacity-50" disabled={creating} onClick={() => setConfirmAction("repair")} type="button"><PlugZap className="h-3.5 w-3.5" />Pair this PC again…</button>
                         ) : null}
-                        <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-amber-800 hover:bg-amber-50 disabled:opacity-50" disabled={disconnecting} onClick={() => setConfirmAction("disconnect")} type="button"><PlugZap className="h-3.5 w-3.5" />Disconnect…</button>
+                        <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-amber-800 hover:bg-amber-50 disabled:opacity-50" disabled={disconnecting} onClick={() => setConfirmAction("disconnect")} type="button"><PlugZap className="h-3.5 w-3.5" />Pause connection…</button>
                         {staleOtherConnections.length > 0 ? <button className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50" disabled={disconnectingOthers} onClick={() => setConfirmAction("disconnect_others")} type="button"><PlugZap className="h-3.5 w-3.5" />Disconnect PCs not seen for 7 days…</button> : null}
                         <div className="mt-1 border-t border-slate-100 px-2 pt-2 text-[11px] leading-4 text-[#8a7f72]">Last heartbeat {formatTime(selectedConnection.lastHeartbeatAt)}</div>
                       </PopoverContent>
@@ -1073,13 +1074,13 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         </div>
       )}
       <CaseConfirmDialog
-        confirmLabel={confirmAction === "disconnect_others" ? "Disconnect them" : confirmAction === "repair" ? "Pair again" : "Disconnect"}
+        confirmLabel={confirmAction === "disconnect_others" ? "Disconnect them" : confirmAction === "repair" ? "Pair again" : "Pause connection"}
         description={
           confirmAction === "disconnect_others"
             ? `${staleOtherConnections.map((connection) => connection.bridgeMachineName || "Unnamed PC").join(", ")} ${staleOtherConnections.length === 1 ? "has" : "have"} not checked in for over a week. Reconnect on ${staleOtherConnections.length === 1 ? "that PC" : "those PCs"} resumes the same connection later.`
             : confirmAction === "repair"
               ? `Only needed if the connector on ${pcName} lost its pairing. If ${pcName} is just switched off, or the connector or Tally is closed, open them instead; it reconnects on its own. Pairing again keeps this same connection and its settings.`
-              : `Kalika workflows that use Tally on ${pcName} stop until you click Reconnect on that PC and approve the Local Agent. This connection, its settings and history stay.`
+              : `Kalika workflows that use Tally on ${pcName} will pause. Click Resume connection on that PC and approve the Local Agent to continue. The same connection, settings and history are preserved.`
         }
         footnote={null}
         loading={disconnecting || disconnectingOthers || creating}
@@ -1092,7 +1093,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         }}
         onOpenChange={(open) => { if (!open) setConfirmAction(null); }}
         open={canManage && confirmAction !== null}
-        title={confirmAction === "disconnect_others" ? "Disconnect PCs not seen for a week?" : confirmAction === "repair" ? `Pair ${pcName} again?` : `Disconnect ${pcName}?`}
+        title={confirmAction === "disconnect_others" ? "Disconnect PCs not seen for a week?" : confirmAction === "repair" ? `Pair ${pcName} again?` : `Pause ${pcName}?`}
       />
     </div>
   );

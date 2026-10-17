@@ -32,6 +32,29 @@ test('standalone gateway accepts IPv4 and IPv6 localhost', async t => {
   }
 });
 
+test('browser status tracks connector presence without leaking another owner or PC',async t=>{
+ const api=createServer(async(req,res)=>{
+  const owner=req.headers.authorization==='Bearer other-owner'?'other':'owner';
+  res.setHeader('Content-Type','application/json');res.end(JSON.stringify({authenticated:true,ownerUserId:owner}));
+ });
+ await new Promise(resolve=>api.listen(0,'127.0.0.1',resolve));
+ const gateway=startCashDiscountGateway({server:api,apiBaseUrl:`http://127.0.0.1:${api.address().port}`});
+ const sockets=[];
+ t.after(async()=>{for(const s of sockets)s.terminate();for(const s of gateway.clients)s.terminate();await new Promise(r=>gateway.close(r));await new Promise(r=>api.close(r));});
+ async function open(role,connectionId,token='owner'){
+  const socket=new WebSocket(`ws://127.0.0.1:${api.address().port}/agent-live`);sockets.push(socket);
+  await new Promise((r,j)=>{socket.once('open',r);socket.once('error',j);});
+  const authenticated=message(socket,'authenticated');socket.send(JSON.stringify({type:'authenticate',role,connectionId,token}));
+  return {socket,auth:await authenticated};
+ }
+ const browser=await open('browser','pc-a');assert.equal(browser.auth.connectorOnline,false);
+ const isolated=await open('browser','pc-b');let leaked=0;isolated.socket.on('message',b=>{if(JSON.parse(b).type==='connector_status')leaked++;});
+ const other=await open('browser','pc-a','other-owner');other.socket.on('message',b=>{if(JSON.parse(b).type==='connector_status')leaked++;});
+ let changed=message(browser.socket,'connector_status');const connector=await open('connector','pc-a');assert.equal((await changed).online,true);
+ changed=message(browser.socket,'connector_status');connector.socket.close();assert.equal((await changed).online,false);
+ assert.equal(leaked,0);
+});
+
 test('offline connector is reported before a missing bridge token becomes a pairing error', async t => {
   let operationChecks = 0;
   const api = createServer(async (request, response) => {
@@ -62,6 +85,6 @@ test('offline connector is reported before a missing bridge token becomes a pair
   socket.send(JSON.stringify({ type: 'request', requestId: 'settings', operation: 'ledger_masters', companyName: 'Company' }));
   const result = await reply;
   assert.equal(result.success, false);
-  assert.match(result.error, /not on the live Cash Discount channel/);
+  assert.match(result.error, /live Tally connection is unavailable/);
   assert.equal(operationChecks, 0);
 });

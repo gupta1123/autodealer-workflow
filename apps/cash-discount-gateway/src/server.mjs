@@ -20,6 +20,19 @@ const MAX_MESSAGE_BYTES = 30 * 1024 * 1024;
 const metadata = new WeakMap();
 const connectors = new Map();
 const pending = new Map();
+const CONNECTOR_OFFLINE = 'The live Tally connection is unavailable. Keep the Local Agent open; Kalika will reconnect automatically.';
+function connectorOnline(connectionId, ownerUserId) {
+  const socket=connectors.get(connectionId);
+  return !!socket && socket.readyState===WebSocket.OPEN && metadata.get(socket)?.ownerUserId===ownerUserId;
+}
+function broadcastConnectorStatus(connectionId, ownerUserId) {
+  for(const browser of liveBrowsers) {
+    const meta=metadata.get(browser);
+    if(meta?.connectionId===connectionId&&meta.ownerUserId===ownerUserId)
+      send(browser,{type:'connector_status',online:connectorOnline(connectionId,ownerUserId)});
+  }
+}
+const liveBrowsers = new Set();
 const activeDebitNotes = new Set();
 
 // Timeline of each live request as seen by the gateway, so a slow page can be
@@ -228,7 +241,9 @@ async function authenticate(socket, message) {
     const previous = connectors.get(connectionId);
     if (previous && previous !== socket) closeWithError(previous, "A newer connector live session replaced this one.", 1000);
     connectors.set(connectionId, socket);
+    broadcastConnectorStatus(connectionId, meta.ownerUserId);
   }
+  if(role==='browser')liveBrowsers.add(socket);
   if(role==='browser'&&meta.teamAccess&&process.env.BANK_LOCAL_PIPELINE_V2==='true') {
     meta.bankJobs=createScopedBankSubscriptions({
       authorize:jobId=>apiRequest(`/api/bank-statements/jobs/${jobId}/access`,{
@@ -236,7 +251,8 @@ async function authenticate(socket, message) {
       }),subscribe:subscribeBankJobEvents,send:event=>send(socket,event),
     });
   }
-  send(socket, { type: "authenticated", role, connectionId, scopedBankJobs:!!meta.bankJobs });
+  send(socket, { type: "authenticated", role, connectionId, scopedBankJobs:!!meta.bankJobs,
+    connectorOnline:connectorOnline(connectionId,meta.ownerUserId) });
   if (role === 'browser' && !meta.teamAccess && process.env.BANK_LOCAL_PIPELINE_V2 === 'true') {
     meta.unsubscribeBankJobs = subscribeBankJobEvents(meta.ownerUserId, connectionId,
       event => send(socket, event), online => send(socket, { type: 'bank_job_channel', online }));
@@ -247,7 +263,7 @@ async function authorizeLiveOperation(meta,message,previous) {
   const connector = connectors.get(meta.connectionId);
   const paired = connector ? metadata.get(connector) : null;
   if (!connector || connector.readyState !== WebSocket.OPEN || paired?.ownerUserId !== meta.ownerUserId) {
-    throw new Error('The Tally connector is not on the live Cash Discount channel. Update or restart the connector and try again.');
+    throw new Error(CONNECTOR_OFFLINE);
   }
   // The backend flag is authoritative, not a separately configured gateway flag.
   const authority=await apiRequest('/api/collections/live/session',{
@@ -322,7 +338,7 @@ async function handleBrowserRequest(socket, message, meta) {
       type: "result",
       requestId,
       success: false,
-      error: "The Tally connector is not on the live Cash Discount channel. Update or restart the connector and try again.",
+      error: CONNECTOR_OFFLINE,
     });
     return;
   }
@@ -674,9 +690,13 @@ export function startCashDiscountGateway(options = {}) {
   socket.on("close", () => {
     clearTimeout(authTimer);
     const meta = metadata.get(socket);
+    liveBrowsers.delete(socket);
     meta?.unsubscribeBankJobs?.();
     meta?.bankJobs?.close();
-    if (meta?.role === "connector" && connectors.get(meta.connectionId) === socket) connectors.delete(meta.connectionId);
+    if (meta?.role === "connector" && connectors.get(meta.connectionId) === socket) {
+      connectors.delete(meta.connectionId);
+      broadcastConnectorStatus(meta.connectionId,meta.ownerUserId);
+    }
     for (const [requestId, item] of pending) {
       if (item.browser === socket && ["ledger_masters", "scan", "followups_scan", "verify_bank_transaction", "fetch_customer_open_bills"].includes(item.operation)) failPending(requestId, new Error("Browser disconnected; scan cancelled."));
       else if (item.browser === socket && item.operation !== "create_debit_note") clearPending(requestId);

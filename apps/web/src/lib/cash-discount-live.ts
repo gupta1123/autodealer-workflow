@@ -50,6 +50,8 @@ type BrowserLiveSession = {
   pending: Map<string, PendingRequest>;
   authTimeout?: number;
   bankOnline: boolean;
+  connectorOnline: boolean | null;
+  connectionWatchers: Set<(online: boolean | null) => void>;
   scopedBankJobs?: boolean;
   bankWatchers: Set<{ jobId: string; event: (event: BankJobEvent) => void; online: (online: boolean) => void }>;
 };
@@ -113,6 +115,9 @@ function endSession(session: BrowserLiveSession, error: Error) {
   }
   session.pending.clear();
   session.bankOnline = false;
+  session.connectorOnline = false;
+  for(const watcher of session.connectionWatchers)watcher(false);
+  session.connectionWatchers.clear();
   for (const watcher of session.bankWatchers) watcher.online(false);
   session.bankWatchers.clear();
   if (cachedSession === session) cachedSession = null;
@@ -157,6 +162,8 @@ function createSession(params: {
     ended: false,
     pending: new Map(),
     bankOnline: false,
+    connectorOnline: null,
+    connectionWatchers: new Set(),
     bankWatchers: new Set(),
   };
 
@@ -172,7 +179,12 @@ function createSession(params: {
   });
   socket.addEventListener("message", (event) => {
     try {
-      const message = JSON.parse(String(event.data ?? "{}")) as LiveResult<unknown> & BankJobEvent & { online?: boolean; scopedBankJobs?: boolean };
+      const message = JSON.parse(String(event.data ?? "{}")) as LiveResult<unknown> & BankJobEvent & { online?: boolean; scopedBankJobs?: boolean; connectorOnline?: boolean };
+      if(message.type==='connector_status') {
+        session.connectorOnline=message.online===true;
+        for(const watcher of session.connectionWatchers)watcher(session.connectorOnline);
+        return;
+      }
       if (message.type === 'bank_job_channel') {
         if (!message.jobId) session.bankOnline = message.online === true;
         for (const watcher of session.bankWatchers) if(!message.jobId || watcher.jobId===message.jobId) watcher.online(message.online===true);
@@ -183,6 +195,7 @@ function createSession(params: {
         return;
       }
       if (message.type === "authenticated") {
+        session.connectorOnline=typeof message.connectorOnline==='boolean'?message.connectorOnline:null;
         session.scopedBankJobs=message.scopedBankJobs===true;
         window.clearTimeout(session.authTimeout);
         if (!session.readySettled) {
@@ -203,19 +216,25 @@ function createSession(params: {
         pending.cleanup();
         session.pending.delete(requestId);
         if (message.success === true) pending.resolve(message.data);
-        else pending.reject(new Error(message.error || "The live Tally request failed."));
+        else {
+          if(/live Tally connection is unavailable|not on the live.*channel/i.test(message.error||'')) {
+            session.connectorOnline=false;
+            for(const watcher of session.connectionWatchers)watcher(false);
+          }
+          pending.reject(new Error(message.error || "The live Tally request failed."));
+        }
       } else if (message.type === "error") {
-        endSession(session, new Error(message.error || "The live Cash Discount channel failed."));
+        endSession(session, new Error(message.error || "The live Tally connection failed."));
       }
     } catch {
-      endSession(session, new Error("The live Cash Discount channel returned an invalid response."));
+      endSession(session, new Error("The live Tally connection returned an invalid response."));
     }
   });
   socket.addEventListener("error", () => {
-    endSession(session, new Error("Could not connect to the live Cash Discount channel. Start the gateway and connector, then try again."));
+    endSession(session, new Error("Could not connect to the live Tally connection. Keep the Local Agent open; Kalika will retry."));
   });
   socket.addEventListener("close", () => {
-    endSession(session, new Error("The live Cash Discount channel closed before the request completed."));
+    endSession(session, new Error("The live Tally connection closed before the request completed."));
   });
   session.authTimeout = window.setTimeout(() => {
     endSession(session, new Error("Live Tally connection timed out. Check the connector and retry."));
@@ -239,7 +258,7 @@ async function getLiveSession(request: LiveRequest) {
     !cachedSession.ended &&
     cachedSession.key === key &&
     cachedSession.token === token &&
-    (Date.now() - cachedSession.createdAt < SESSION_MAX_AGE_MS || cachedSession.pending.size > 0 || cachedSession.bankWatchers.size > 0) &&
+    (Date.now() - cachedSession.createdAt < SESSION_MAX_AGE_MS || cachedSession.pending.size > 0 || cachedSession.bankWatchers.size > 0 || cachedSession.connectionWatchers.size > 0) &&
     (cachedSession.socket.readyState === WebSocket.CONNECTING || cachedSession.socket.readyState === WebSocket.OPEN);
   if (reusable) return cachedSession as BrowserLiveSession;
   if (cachedSession) closeSession(cachedSession);
@@ -298,7 +317,54 @@ export function watchBankJob(params: { connectionId: string; companyName: string
   return () => { stopped = true; clearTimeout(retry); detach(); };
 }
 
-export async function runCashDiscountLiveRequest<T>(request: LiveRequest) {
+export function watchTallyConnection(connectionId:string,onStatus:(online:boolean|null)=>void) {
+  let stopped=false, retry:ReturnType<typeof setTimeout>|undefined;
+  let detach=()=>{};
+  const connect=async()=>{
+    try {
+      const session=await getLiveSession({connectionId,companyName:'',operation:'company_check'});
+      await session.ready;
+      if(stopped)return;
+      const watcher=(online:boolean|null)=>{
+        if(stopped)return;
+        onStatus(online);
+        if(session.ended&&!retry)retry=setTimeout(()=>{retry=undefined;detach();void connect();},2000);
+      };
+      session.connectionWatchers.add(watcher);
+      detach=()=>{session.connectionWatchers.delete(watcher);};
+      watcher(session.connectorOnline);
+    }catch{
+      if(!stopped){onStatus(false);retry=setTimeout(()=>{retry=undefined;void connect();},2000);}
+    }
+  };
+  onStatus(null);void connect();
+  return ()=>{stopped=true;clearTimeout(retry);detach();};
+}
+
+const RECOVERABLE_READS=new Set<LiveRequest['operation']>(['company_check','bank_ledgers','ledger_masters','ledger_suggestions']);
+export async function runCashDiscountLiveRequest<T>(request: LiveRequest):Promise<T> {
+  const epoch=accessCacheEpoch();
+  const retryUntil=Date.now()+65_000;
+  // Only repeat reads after a transport interruption. Never replay a write,
+  // permission denial, scan, or an operation with an uncertain posting result.
+  for(let attempt=0;;attempt++){
+    try{return await runLiveRequestOnce<T>(request);}
+    catch(error){
+      if(!RECOVERABLE_READS.has(request.operation)||attempt>=12||Date.now()>=retryUntil||request.signal?.aborted||epoch!==accessCacheEpoch()||
+        !/live Tally connection (?:is unavailable|closed|failed)|not on the live.*channel|connector disconnected during|Could not connect to the live|Live Tally connection timed out/i.test(error instanceof Error?error.message:''))throw error;
+      request.onProgress?.('Reconnecting to the Local Agent; Tally data will load automatically…');
+      await new Promise<void>((resolve,reject)=>{
+        const aborted=()=>{window.clearTimeout(timer);request.signal?.removeEventListener('abort',aborted);reject(request.signal?.reason);};
+        const timer=window.setTimeout(()=>{request.signal?.removeEventListener('abort',aborted);resolve();},5000);
+        request.signal?.addEventListener('abort',aborted,{once:true});
+        if(request.signal?.aborted)aborted();
+      });
+      if(epoch!==accessCacheEpoch())throw new DOMException('Access changed during Tally reconnection.','AbortError');
+    }
+  }
+}
+
+async function runLiveRequestOnce<T>(request: LiveRequest) {
   const epoch=accessCacheEpoch();
   request.signal?.throwIfAborted();
   const session = await getLiveSession(request);

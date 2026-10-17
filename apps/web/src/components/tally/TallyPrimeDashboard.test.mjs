@@ -13,9 +13,9 @@ const code=ts.transpileModule(await readFile(new URL('./TallyPrimeDashboard.tsx'
  compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,jsx:ts.JsxEmit.ReactJSX},
 }).outputText;
 
-function fixture({module='bank',manager=false,allCompanies=false,connected=true,empty=false,view='connection'}={}) {
+function fixture({module='bank',manager=false,allCompanies=false,connected=true,empty=false,view='connection',paused=false}={}) {
  const snapshot={member:{status:'active',must_change_password:false,is_owner:false,modules:[module],all_companies:allCompanies,company_ids:['kalika']},role:{archived:false,permissions:[`${module}.view`,...(manager?['connections.manage']:[])]}};
- const connection={id:'connector',displayName:'Office Tally',status:'company_loaded',bridgeConnected:connected,companyLoaded:connected,tallyReachable:connected,pairedAt:'2026-10-16T10:00:00Z',lastCompanyName:'Kalika Steel'};
+ const connection={id:'connector',displayName:'Office Tally',status:'company_loaded',bridgeConnected:connected,companyLoaded:connected,tallyReachable:connected,pairedAt:paused?null:'2026-10-16T10:00:00Z',lastCompanyName:'Kalika Steel',revoked:paused,lastError:paused?'Disconnected by user.':null};
  let stateIndex=0;
  const container=({children})=>React.createElement('div',null,children);
  const button=({children,...props})=>React.createElement('button',props,children);
@@ -67,4 +67,11 @@ test('connection managers retain management, while company mapping needs all-com
 test('the integration hub only offers Bank Statements to users with Bank access',()=>{
  assert.doesNotMatch(fixture({view:'home',module:'purchases'}),/Bank Statements/);
  assert.match(fixture({view:'home',module:'bank'}),/Bank Statements/);
+});
+
+test('managers can pause an active connection and resume a paused connection',()=>{
+ assert.match(fixture({manager:true}),/Pause connection…/);
+ const html=fixture({manager:true,connected:false,paused:true});
+ assert.match(html,/>Paused</);assert.match(html,/Resume connection/);
+ assert.doesNotMatch(fixture({manager:false,connected:false,paused:true}),/Resume connection/);
 });

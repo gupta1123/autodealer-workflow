@@ -854,6 +854,7 @@ export function TallyPurchasePostingPanel({
     setLiveMastersReady(false);
     let cancelled = false;
     let loadCompleted = false;
+    const controller=new AbortController();
     void (async () => {
       const next = await load(false, null, true);
       if (cancelled) return;
@@ -953,9 +954,11 @@ export function TallyPurchasePostingPanel({
           companyName,
           operation: "ledger_masters",
           payload: cataloguePayload,
+          signal:controller.signal,
           onProgress: (message) => { if (!cancelled) setNotice(message); },
         });
         if (cancelled) return;
+        setError(null);
         if (!servedFromCache(cachedMasters)) {
           // No local catalogue: the connector already did a full live read.
           await applyCatalogue(cachedMasters, "Latest live Tally data loaded.");
@@ -982,6 +985,7 @@ export function TallyPurchasePostingPanel({
     })().finally(() => { loadCompleted = true; });
     return () => {
       cancelled = true;
+      controller.abort();
       // Only interrupted initial loads need a replacement run. Once loaded,
       // approval rechecks after saving or focus must keep the catalogue and
       // current selections instead of mounting a fresh review.

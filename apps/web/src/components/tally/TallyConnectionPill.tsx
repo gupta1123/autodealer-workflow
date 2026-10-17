@@ -1,6 +1,8 @@
 "use client";
 
 import Link from "next/link";
+import {useEffect,useState} from 'react';
+import {watchTallyConnection} from '@/lib/cash-discount-live';
 import { AlertTriangle, Loader2, RefreshCw } from "lucide-react";
 
 import { CompanyAvatar } from "@/components/ui/company-avatar";
@@ -20,6 +22,7 @@ type TallyConnectionPillProps = {
   onRefresh: () => void;
   secondaryAction?: TallyConnectionPillAction | null;
   className?: string;
+  connectionId?: string | null;
 };
 
 /**
@@ -35,21 +38,33 @@ export function TallyConnectionPill({
   onRefresh,
   secondaryAction = null,
   className = "",
+  connectionId = null,
 }: TallyConnectionPillProps) {
+  const [live,setLive]=useState<{id:string;online:boolean|null}|null>(null);
+  useEffect(()=>{
+    if(!connectionId)return;
+    return watchTallyConnection(connectionId,online=>setLive({id:connectionId,online}));
+  },[connectionId]);
+  const online=live?.id===connectionId?live?.online:null;
+  const checkingLive=!!connectionId&&online===null;
+  const disconnected=!!connectionId&&online===false;
+  const shownStatus=checkingLive?'checking':disconnected?'warning':status;
+  const shownTitle=checkingLive?'Checking live Tally connection':disconnected?'Live Tally connection unavailable':title;
+  const shownSubtitle=checkingLive?'Connecting to the Local Agent':disconnected?'Keep the Local Agent open. Reconnecting automatically.':subtitle;
   return (
     <div className={`inline-flex min-w-0 items-center gap-3 ${className}`}>
       <div className="flex min-w-0 items-center gap-2">
-        {status === "checking" ? (
+        {shownStatus === "checking" ? (
           <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[#8a7f72]" />
-        ) : status === "verified" ? (
+        ) : shownStatus === "verified" ? (
           <CompanyAvatar name={avatarName ?? ""} verified />
         ) : (
           <AlertTriangle className="h-4 w-4 shrink-0 text-amber-700" />
         )}
         <div className="min-w-0">
-          <div className="text-xs font-bold text-[#1a1a1a]">{title}</div>
+          <div className="text-xs font-bold text-[#1a1a1a]">{shownTitle}</div>
           <div className="mt-0.5 truncate text-[11px] font-semibold text-[#8a8177]">
-            {subtitle}
+            {shownSubtitle}
           </div>
         </div>
       </div>

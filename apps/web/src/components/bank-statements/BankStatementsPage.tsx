@@ -6883,6 +6883,7 @@ export function BankStatementsPage() {
                 </button>
             </h1>
             <TallyConnectionPill
+              connectionId={tallyConnectionId}
               title={
                 !tallyConnectionId
                   ? "Connect Tally"

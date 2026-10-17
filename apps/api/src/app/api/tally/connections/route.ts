@@ -118,7 +118,8 @@ function pickRelevantConnections(rows: TallyConnectionRow[]) {
     .filter(
       (row) =>
         Boolean(row.installation_id) &&
-        !row.revoked_at &&
+        (!row.revoked_at || RESUMABLE_REVOKE_REASONS.includes(row.revoked_reason ?? '')) &&
+        (!row.revoked_at || !rows.some(other=>!other.revoked_at&&other.installation_id===row.installation_id)) &&
         (Boolean(row.bridge_token_hash) || row.status === "waiting_for_bridge")
     )
     .map(serializeTallyConnectionStatus);
@@ -159,7 +160,7 @@ async function GETHandler(request: Request) {
       if(canAccess(access,'connections.manage')&&access.member.all_companies) {
         const result=await createSupabaseAdminClient().from('tally_connections').select(TALLY_CONNECTION_SELECT)
           .eq('organization_id',access.organizationId).eq('owner_user_id',access.member.user_id)
-          .is('revoked_at',null).order('updated_at',{ascending:false}).limit(50);
+          .or(`revoked_at.is.null,revoked_reason.in.(${RESUMABLE_REVOKE_REASONS.map(reason=>JSON.stringify(reason)).join(',')})`).order('updated_at',{ascending:false}).limit(50);
         if(result.error)throw result.error;
         rows=(result.data||[]) as unknown as TallyConnectionRow[];
       } else {
@@ -186,7 +187,7 @@ async function GETHandler(request: Request) {
       .from("tally_connections")
       .select(TALLY_CONNECTION_SELECT)
       .eq("owner_user_id", user.id)
-      .is("revoked_at", null)
+      .or(`revoked_at.is.null,revoked_reason.in.(${RESUMABLE_REVOKE_REASONS.map(reason=>JSON.stringify(reason)).join(',')})`)
       .order("updated_at", { ascending: false });
 
     if (error) {
@@ -198,6 +199,7 @@ async function GETHandler(request: Request) {
     const expiredPendingIds = rows
       .filter(
         (row) =>
+          !row.revoked_at &&
           !row.bridge_token_hash &&
           (!row.pairing_code_expires_at ||
             new Date(row.pairing_code_expires_at).getTime() <= now.getTime())

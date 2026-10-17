@@ -1168,6 +1168,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
           </div>
           {reviewMode === "tally" ? (
             <TallyConnectionPill
+              connectionId={tallyHeaderState?.selectedConnectionId}
               className="hidden shrink-0 md:inline-flex"
               title={tallyHeaderTitle}
               subtitle={

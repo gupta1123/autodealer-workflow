@@ -9,6 +9,9 @@ import ReactMarkdown from "react-markdown";
 import { PageHeader } from "@/components/dashboard/PageHeader";
 import {useAccess} from '@/components/access/AccessProvider';
 import {canAccess} from '@autodealer/shared/lib/access';
+import {apiFetch} from '@/lib/api-client';
+import {defaultCaseCompany} from '@/lib/default-case-company';
+import {readPreferredTallyConnectionId} from '@/lib/tally-company-selection';
 import {
   Card,
   CardContent,
@@ -480,8 +483,31 @@ export function WorkspacePage() {
   const teamAccess=useAccess();
   const [accessCompanyId,setAccessCompanyId]=useState('');
   const availableCompanies=teamAccess.snapshot?.companies.filter(c=>canAccess(teamAccess.snapshot,'purchases.prepare',c.id))??[];
-  const selectedAccessCompany=availableCompanies.some(c=>c.id===accessCompanyId)?accessCompanyId:availableCompanies.length===1?availableCompanies[0].id:'';
-  useEffect(()=>setAccessCompanyId(''),[teamAccess.snapshot?.organizationId]);
+  const selectedAccessCompany=defaultCaseCompany(availableCompanies,accessCompanyId);
+  const companyPreferenceKey=teamAccess.snapshot?`kalika.case-company.${teamAccess.snapshot.organizationId}.${teamAccess.snapshot.member.user_id}`:'';
+  useEffect(()=>{
+    setAccessCompanyId('');
+    if(!companyPreferenceKey)return;
+    let remembered='';
+    try{remembered=localStorage.getItem(companyPreferenceKey)||'';}catch{}
+    setAccessCompanyId(remembered);
+    if(remembered)return;
+    const connectionId=readPreferredTallyConnectionId();
+    if(!connectionId)return;
+    const controller=new AbortController();
+    void apiFetch(`/api/tally/companies?connectionId=${encodeURIComponent(connectionId)}`,{signal:controller.signal})
+      .then(async response=>response.ok?response.json():null).then(data=>{
+        if(controller.signal.aborted)return;
+        const active=(data?.companies||[]).filter((c:{isActive?:boolean;accessCompanyId?:string})=>c.isActive&&c.accessCompanyId);
+        const ids=[...new Set(active.map((c:{accessCompanyId:string})=>c.accessCompanyId))];
+        if(ids.length===1)setAccessCompanyId(current=>current||String(ids[0]));
+      }).catch(()=>{});
+    return ()=>controller.abort();
+  },[companyPreferenceKey]);
+  function selectCaseCompany(id:string){
+    setAccessCompanyId(id);
+    try{if(companyPreferenceKey)localStorage.setItem(companyPreferenceKey,id);}catch{}
+  }
   const router = useRouter();
   const {
     status: pipelineStatus,
@@ -1413,7 +1439,10 @@ export function WorkspacePage() {
           />
 
           {/* Centered Upload Card */}
-          {teamAccess.enforcementRequired&&<label className="mx-auto flex w-full max-w-2xl flex-col gap-2 text-sm font-medium">Company for this case<select value={selectedAccessCompany} onChange={e=>setAccessCompanyId(e.target.value)} className="rounded-lg border border-[#ded8d0] bg-white p-3"><option value="">Select a company</option>{availableCompanies.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></label>}
+          {teamAccess.enforcementRequired&&<details key={selectedAccessCompany?'selected':'choose'} open={!selectedAccessCompany} className="mx-auto w-full max-w-2xl text-sm">
+            <summary className="cursor-pointer text-[#6f6258]">{selectedAccessCompany?`Creating in ${availableCompanies.find(c=>c.id===selectedAccessCompany)?.name} · Change`:'Choose the company for this case'}</summary>
+            <label className="mt-2 flex flex-col gap-2 font-medium">Company and financial year<select value={selectedAccessCompany} onChange={e=>selectCaseCompany(e.target.value)} className="rounded-lg border border-[#ded8d0] bg-white p-3"><option value="">Select a company</option>{availableCompanies.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></label>
+          </details>}
           <div className="flex flex-1 items-center justify-center pb-12">
             <div className="w-full max-w-2xl">
           <div

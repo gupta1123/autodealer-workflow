@@ -33,7 +33,7 @@ async function run({workflow=null,prepare=true,loading=false,error=null,enabled=
   setLiveMastersReady:noop,setPayload:noop,setReview:noop,setSupplierLedgerMatch:noop,setLineMasterMatches:noop,
   setSupplierLedgerMatchError:noop,setLineMasterMatchError:noop,setNotice:noop,setRefreshingMasters:noop,setError:noop,
  };
- vm.runInNewContext(code,context);const cleanup=context.exports.run();
+ vm.runInNewContext(code,{...context,AbortController});const cleanup=context.exports.run();
  for(let i=0;i<4;i++)await new Promise(resolve=>setImmediate(resolve));
  if(approvalRefresh){
   cleanup?.();context.approval.loading=true;context.exports.run();
@@ -89,7 +89,7 @@ test('an interrupted initial load releases its guard so a replacement can finish
  const context={exports:{},caseId:'new-case',approval:{enabled:true,required:true,loading:false,error:null,workflow:null,snapshot},canAccess,
   automaticLiveRefreshRef:{current:null},setLiveMastersReady:()=>{},load:async()=>{calls.push('load-review');return deferred;},
  };
- vm.runInNewContext(code,context);
+ vm.runInNewContext(code,{...context,AbortController});
  const cleanup=context.exports.run();assert.equal(context.automaticLiveRefreshRef.current,'new-case');
  cleanup();assert.equal(context.automaticLiveRefreshRef.current,null);
  context.exports.run();assert.deepEqual(calls,['load-review','load-review']);
