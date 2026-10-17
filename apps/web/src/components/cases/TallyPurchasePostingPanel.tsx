@@ -1864,6 +1864,7 @@ export function TallyPurchasePostingPanel({
         onProgress: (message) => setNotice(message),
       });
       const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, review);
+      fullLiveMasterResultRef.current = liveMasters;
       liveMasterResultRef.current = liveCatalogue.compactResult;
       liveMasterOptionsRef.current = liveCatalogue.masterOptions;
       const prepared = await prepareTallyPurchasePostingFromLive(
