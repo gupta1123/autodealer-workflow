@@ -621,8 +621,9 @@ async function loadContext(
     connectionPredicate = ids.length ? `id.in.(${ids.map(id => JSON.stringify(id)).join(',')})` : 'id.is.null';
   }
   const loadMappings = options.loadMappings !== false;
+  const mappingScope = team ? { organizationId: team.access.organizationId, companyId: team.scope.company_id! } : undefined;
   const earlyMappingsResultPromise = loadMappings && requestedConnectionId && requestedCompanyName
-    ? readCompanyMappings(supabase, { connectionId: requestedConnectionId, companyName: requestedCompanyName })
+    ? readCompanyMappings(supabase, { connectionId: requestedConnectionId, companyName: requestedCompanyName, scope: mappingScope })
         .then((data) => ({ data, error: null }), (error: unknown) => ({ data: null, error }))
     : Promise.resolve({ data: [], error: null });
   const [caseResult, purchaseAccountingSettings, documentsResult, filesResult, connectionsResult, postingResult, earlyMappingsResult] = await Promise.all([
@@ -789,7 +790,7 @@ async function loadContext(
       if (canUseEarlyMappings) {
         mappings = (earlyMappingsResult.data ?? []) as PurchasePostingMappingInput[];
       } else {
-        mappings = (await readCompanyMappings(supabase, { connectionId: connection.id, companyName })) as PurchasePostingMappingInput[];
+        mappings = (await readCompanyMappings(supabase, { connectionId: connection.id, companyName, scope: mappingScope })) as PurchasePostingMappingInput[];
       }
     }
   }

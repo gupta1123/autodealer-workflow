@@ -2,7 +2,9 @@ import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
-import { readCompanyMappings, type CompanyMappingRow } from "@/lib/tally/company-mappings";
+import { companyMappingConnectionIds, readCompanyMappings, type CompanyMappingRow, type CompanyMappingScope } from "@/lib/tally/company-mappings";
+import { requireDataset } from '@/lib/access/dataset';
+import { accessFailureResponse } from '@/lib/access/failures';
 
 type SupabaseAdmin = ReturnType<typeof createSupabaseAdminClient>;
 
@@ -65,8 +67,14 @@ function legacyKeyFor(hsn: string, geography: Geography) {
   return starter ? `${starter.legacyKey}:${geography}` : null;
 }
 
-async function verifyConnection(ownerUserId: string, connectionId: string) {
+async function verifyConnection(request: Request, ownerUserId: string, connectionId: string, companyName: string) {
   const supabase = createSupabaseAdminClient();
+  if (process.env.TEAM_ACCESS_ENFORCEMENT === 'true') {
+    const dataset = await requireDataset(request, connectionId, { companyName }, 'settings.manage');
+    const scope = { organizationId: dataset.access.organizationId, companyId: dataset.link.company_id };
+    const mappingConnectionIds = await companyMappingConnectionIds(supabase, { connectionId, companyName, scope });
+    return { supabase, exists: true, scope, mappingConnectionIds };
+  }
   const { data, error } = await supabase
     .from("tally_connections")
     .select("id")
@@ -74,7 +82,7 @@ async function verifyConnection(ownerUserId: string, connectionId: string) {
     .eq("owner_user_id", ownerUserId)
     .maybeSingle();
   if (error) throw error;
-  return { supabase, exists: Boolean(data) };
+  return { supabase, exists: Boolean(data), scope: undefined, mappingConnectionIds: undefined };
 }
 
 // Replaces a company's choice on every connection, so an older connection's value can never
@@ -88,14 +96,19 @@ async function replaceMapping(supabase: SupabaseAdmin, params: {
   sourceLabel: string;
   targetType: string;
   target: { name: string; guid: string };
+  scope?: CompanyMappingScope;
+  mappingConnectionIds?: string[];
 }) {
-  const { error: deleteError } = await supabase
+  const ids = params.scope ? params.mappingConnectionIds : null;
+  if (params.scope && !ids?.includes(params.connectionId)) throw new Error('Verified company defaults scope is required.');
+  let deletion = supabase
     .from("tally_mapping_settings")
     .delete()
-    .eq("owner_user_id", params.ownerUserId)
     .ilike("company_name", escapeLikePattern(params.companyName))
     .eq("mapping_type", params.mappingType)
     .in("source_key", params.sourceKeys);
+  deletion = ids ? deletion.in('connection_id', ids) : deletion.eq('owner_user_id', params.ownerUserId);
+  const { error: deleteError } = await deletion;
   if (deleteError) throw deleteError;
   if (!params.target.name) return;
   const { error } = await supabase.from("tally_mapping_settings").insert({
@@ -161,9 +174,9 @@ async function GETHandler(request: Request) {
     if (!connectionId || !companyName) {
       return jsonWithCors(request, { error: "Tally connection and company are required." }, { status: 400 });
     }
-    const { supabase, exists } = await verifyConnection(user.id, connectionId);
+    const { supabase, exists, scope } = await verifyConnection(request, user.id, connectionId, companyName);
     if (!exists) return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
-    const rows = await readCompanyMappings(supabase, { connectionId, companyName, ownerUserId: user.id });
+    const rows = await readCompanyMappings(supabase, { connectionId, companyName, ownerUserId: user.id, scope });
     const defaults = Object.fromEntries([...ALLOWED_DEFAULTS].map(([id, definition]) => [
       id,
       rows.find((row) => row.mapping_type === definition.mappingType && row.source_key === definition.sourceKey)
@@ -171,6 +184,7 @@ async function GETHandler(request: Request) {
     ]));
     return jsonWithCors(request, { defaults, materials: buildMaterials(rows) });
   } catch (error) {
+    const denied = accessFailureResponse(request, error); if (denied) return denied;
     console.error("Error loading Purchase posting defaults:", error);
     return jsonWithCors(request, { error: error instanceof Error ? error.message : "Could not load defaults." }, { status: 500 });
   }
@@ -186,9 +200,9 @@ async function PUTHandler(request: Request) {
     if (!connectionId || !companyName) {
       return jsonWithCors(request, { error: "Tally connection and company are required." }, { status: 400 });
     }
-    const { supabase, exists } = await verifyConnection(user.id, connectionId);
+    const { supabase, exists, scope, mappingConnectionIds } = await verifyConnection(request, user.id, connectionId, companyName);
     if (!exists) return jsonWithCors(request, { error: "Tally connection not found." }, { status: 404 });
-    const base = { ownerUserId: user.id, connectionId, companyName };
+    const base = { ownerUserId: user.id, connectionId, companyName, scope, mappingConnectionIds };
 
     // Single defaults (GST, TDS, freight, ...): only the ones present in the request change.
     const defaults = body.defaults && typeof body.defaults === "object" && !Array.isArray(body.defaults)
@@ -251,6 +265,7 @@ async function PUTHandler(request: Request) {
 
     return jsonWithCors(request, { saved: true });
   } catch (error) {
+    const denied = accessFailureResponse(request, error); if (denied) return denied;
     console.error("Error saving Purchase posting defaults:", error);
     return jsonWithCors(request, { error: error instanceof Error ? error.message : "Could not save defaults." }, { status: 500 });
   }
