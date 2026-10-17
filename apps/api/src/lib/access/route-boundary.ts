@@ -45,7 +45,8 @@ export function withTeamAccess<R extends Request,A extends unknown[]>(handler:(r
       for(const key of policy.permissions){
         const permission=key==='@connection-status'?CONNECTION_STATUS_PERMISSIONS.find(p=>canAccess(context,p)):key;
         if(!permission||!canAccess(context,permission))throw new AccessError('You do not have permission for this action.',403);
-        if(policy.resource)await requireResourceAccess(request,policy.resource.type,policy.resource.id,permission);
+        if(policy.resource)await requireResourceAccess(request,policy.resource.type,policy.resource.id,
+          key==='@connection-status'?key:permission);
       }
       return handler(request,...args);
     } catch(error) {

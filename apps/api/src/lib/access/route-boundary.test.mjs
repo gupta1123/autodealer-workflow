@@ -6,18 +6,18 @@ const source=await readFile(new URL('./route-boundary.ts',import.meta.url),'utf8
 const compiled=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
 class AccessError extends Error{constructor(message,status=403){super(message);this.status=status;}}
 function setup(snapshot,options){
- let calls=0,queries=0;
+ let calls=0,queries=0;const resourcePermissions=[];
  const exports={};const env={TEAM_ACCESS_ENFORCEMENT:'true'};
  const imports={
   '@autodealer/shared/lib/access':{canAccess},
   '@/lib/api/cors':{jsonWithCors:(_request,data,init)=>Response.json(data,init)},
   './server':{AccessError,requireAccessContext:async()=>{queries++;if(!snapshot)throw new AccessError('Please sign in.',401);return snapshot;}},
-  './resources':{requireResourceAccess:async(_req,_type,id,permission)=>{if(id==='outside'||!canAccess(snapshot,permission,'company-a'))throw new AccessError('Outside scope',404);}},
+  './resources':{requireResourceAccess:async(_req,_type,id,permission)=>{resourcePermissions.push(permission);const allowed=permission==='@connection-status'?policies.CONNECTION_STATUS_PERMISSIONS.some(key=>canAccess(snapshot,key,'company-a')):canAccess(snapshot,permission,'company-a');if(id==='outside'||!allowed)throw new AccessError('Outside scope',404);}},
   './route-policy':policies,
  };
  vm.runInNewContext(compiled,{exports,require:name=>{if(!imports[name])throw Error(`Unexpected dependency ${name}`);return imports[name];},process:{env},URL,Buffer});
  const handle=exports.withTeamAccess(async()=>{calls++;return Response.json({ok:true});},options);
- return {handle,env,get calls(){return calls;},get queries(){return queries;}};
+ return {handle,env,resourcePermissions,get calls(){return calls;},get queries(){return queries;}};
 }
 function snapshot(role){return {organizationId:'org-a',sharingEnabled:true,member:{user_id:'user',status:'active',must_change_password:false,is_owner:false,modules:['purchases','bank','discounts','followups'],all_companies:false,company_ids:['company-a']},role:{...role,archived:false}};}
 test('default role API matrix denies before handlers execute',async()=>{
@@ -41,4 +41,13 @@ test('only explicit connector-session branch reaches bridge-token authentication
  const bridge=setup(null,{bridgeSession:true});assert.equal((await bridge.handle(make('connector'))).status,200);assert.equal(bridge.queries,0);
  assert.equal((await bridge.handle(make('browser'))).status,401);
  const ordinary=setup(null);assert.equal((await ordinary.handle(make('connector'))).status,401);
+});
+
+test('connection status keeps read authority even when a user can manage connections',async()=>{
+ const s=snapshot({...DEFAULT_ROLES[2],permissions:['connections.manage','purchases.view']});s.member.modules.push('connections');
+ for(const tail of ['status','agent-status','masters','commands']){
+  const r=setup(s);assert.equal((await r.handle(new Request('http://localhost/api/tally/connections/c1/'+tail))).status,200);
+  assert.deepEqual(r.resourcePermissions,['@connection-status']);
+ }
+ const r=setup(s);assert.equal((await r.handle(new Request('http://localhost/api/tally/connections/c1/disconnect',{method:'POST'}))).status,200);assert.deepEqual(r.resourcePermissions,['connections.manage']);
 });

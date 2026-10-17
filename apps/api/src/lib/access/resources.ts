@@ -2,6 +2,7 @@ import { canAccess } from '@autodealer/shared/lib/access';
 import { createSupabaseAdminClient } from '@/lib/supabase/admin';
 import { AccessError, requireAccessContext } from './server';
 import {permittedConnections} from './connection-scope';
+import {CONNECTION_STATUS_PERMISSIONS} from './route-policy';
 
 export type AccessResourceType = 'case' | 'bank_import' | 'bank_account' | 'proposal' | 'connection';
 export type ResourceScope = { organization_id: string; company_id: string | null; creator_user_id: string | null; source_revision: number };
@@ -10,13 +11,17 @@ const scopes = new WeakMap<Request,Map<string,Promise<ResourceScope|null>>>();
 /** Resource identity comes from a reviewed database mapping, never from request company names. */
 export async function requireResourceAccess(request: Request, type: AccessResourceType, id: string, permission: string) {
   const access = await requireAccessContext(request);
-  if (!canAccess(access, permission)) throw new AccessError('You do not have permission for this action.');
+  const statusRead = type==='connection' && permission==='@connection-status';
+  const permissions = statusRead ? CONNECTION_STATUS_PERMISSIONS : [permission];
+  if (!permissions.some(key=>canAccess(access,key))) throw new AccessError('You do not have permission for this action.');
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new AccessError('Resource not found.', 404);
   const db = createSupabaseAdminClient();
   if(type==='connection') {
     const {links,rows}=await permittedConnections(request,id);
-    const link=links.find(link=>canAccess(access,permission,link.company_id));
+    const link=links.find(link=>permissions.some(key=>canAccess(access,key,link.company_id)));
     if(!link||!rows.length)throw new AccessError('Connection not found or outside your company access.',404);
+    // Read-only status uses the already filtered company links. Only actions
+    // that manage the whole connection require access to every linked company.
     if(permission==='connections.manage') {
       const all=await db.from('access_company_links').select('organization_id,company_id')
         .eq('connection_id',id).eq('installation_id',rows[0].installation_id).limit(1000);
