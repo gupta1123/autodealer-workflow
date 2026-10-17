@@ -805,6 +805,7 @@ export function TallyPurchasePostingPanel({
   // must not replace them; a failed automatic save waits for the next edit.
   const currentReviewRef = useRef<TallyPostingReview | null>(null);
   const autoSaveFailedReviewRef = useRef<TallyPostingReview | null>(null);
+  const invoiceSelectionRevisionRef = useRef(0);
 
   const withLiveMasterOptions = useCallback((next: TallyPostingResponse) =>
     liveMasterOptionsRef.current
@@ -855,6 +856,7 @@ export function TallyPurchasePostingPanel({
     let cancelled = false;
     let loadCompleted = false;
     const controller=new AbortController();
+    const selectionRevision = invoiceSelectionRevisionRef.current;
     void (async () => {
       const next = await load(false, null, true);
       if (cancelled) return;
@@ -889,7 +891,7 @@ export function TallyPurchasePostingPanel({
           companyName,
           liveCatalogue.compactResult
         );
-        if (cancelled) return false;
+        if (cancelled || invoiceSelectionRevisionRef.current !== selectionRevision) return false;
         const hydrated = withLiveMasterOptions(prepared);
         setPayload(hydrated);
         setReview(hydrated.review);
@@ -921,7 +923,7 @@ export function TallyPurchasePostingPanel({
             liveCatalogue.compactResult,
             true
           );
-          if (cancelled) return;
+          if (cancelled || invoiceSelectionRevisionRef.current !== selectionRevision) return;
           const hydrated = withLiveMasterOptions(prepared);
           if (!hydrated.review) {
             throw new Error("The cached Tally catalogue did not return a purchase review.");
@@ -1663,7 +1665,8 @@ export function TallyPurchasePostingPanel({
   }
 
   async function handleInvoiceSelection(documentId: string) {
-    if (!selectedConnectionId || !selectedCompanyName || locked) return;
+    if (!selectedConnectionId || !selectedCompanyName || locked || saving) return;
+    invoiceSelectionRevisionRef.current += 1;
     setSelectingInvoiceId(documentId);
     setError(null);
     try {
@@ -1891,6 +1894,7 @@ export function TallyPurchasePostingPanel({
     selectedConnectionId &&
     selectedCompanyName &&
     !locked &&
+    !selectingInvoiceId &&
     !refreshingMasters &&
     (hasUnsavedChanges || !payload?.posting)
   );
@@ -2001,6 +2005,11 @@ export function TallyPurchasePostingPanel({
         <p className="mt-2 text-sm text-slate-600">
           Duplicate copies have already been combined. Select the invoice billed to the active Tally company; an upstream mother bill should normally be left unselected.
         </p>
+        {error ? (
+          <div role="alert" className="mt-4 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
+            {error}
+          </div>
+        ) : null}
         <div className="mt-5 grid gap-3">
           {candidates.map((candidate) => (
             <div className={`rounded-xl border p-4 ${candidate.recommended ? "border-emerald-300 bg-emerald-50/60" : "border-slate-200"}`} key={candidate.documentId}>
@@ -2015,7 +2024,7 @@ export function TallyPurchasePostingPanel({
                   <p className="mt-1 text-xs text-slate-500">{candidate.reason}</p>
                 </div>
                 <Button
-                  disabled={!selectedConnectionId || !selectedCompanyName || selectingInvoiceId !== null}
+                  disabled={!selectedConnectionId || !selectedCompanyName || saving || selectingInvoiceId !== null}
                   onClick={() => void handleInvoiceSelection(candidate.documentId)}
                   variant={candidate.recommended ? "default" : "outline"}
                 >
@@ -2230,7 +2239,7 @@ export function TallyPurchasePostingPanel({
               return (
                 <Button
                   className="h-auto min-h-9 whitespace-normal px-3 py-2 text-left"
-                  disabled={locked || selectingInvoiceId !== null}
+                  disabled={locked || saving || selectingInvoiceId !== null}
                   key={candidate.documentId}
                   onClick={() => void handleInvoiceSelection(candidate.documentId)}
                   variant={selected ? "default" : "outline"}

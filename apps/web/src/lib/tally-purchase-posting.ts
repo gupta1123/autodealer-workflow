@@ -808,6 +808,7 @@ export async function selectTallyPurchaseInvoice(
 ) {
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
     method: "PATCH",
+    signal: AbortSignal.timeout(25_000),
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       review: { selectedInvoiceDocumentId },

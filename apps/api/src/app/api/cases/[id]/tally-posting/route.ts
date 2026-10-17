@@ -80,6 +80,7 @@ type LoadedContext = {
   connectionStatus: ReturnType<typeof serializeTallyConnectionStatus> | null;
   liveCompanies: Array<{ companyName: string; isActive: boolean }>;
   selectedCompanyName: string | null;
+  postingCompanyId: string | null;
   masters: PurchasePostingMasterInput[];
   liveMasterCommandId: string | null;
   liveMasterFetchedAt: string | null;
@@ -621,12 +622,7 @@ async function loadContext(
     connectionPredicate = ids.length ? `id.in.(${ids.map(id => JSON.stringify(id)).join(',')})` : 'id.is.null';
   }
   const loadMappings = options.loadMappings !== false;
-  const mappingScope = team ? { organizationId: team.access.organizationId, companyId: team.scope.company_id! } : undefined;
-  const earlyMappingsResultPromise = loadMappings && requestedConnectionId && requestedCompanyName
-    ? readCompanyMappings(supabase, { connectionId: requestedConnectionId, companyName: requestedCompanyName, scope: mappingScope })
-        .then((data) => ({ data, error: null }), (error: unknown) => ({ data: null, error }))
-    : Promise.resolve({ data: [], error: null });
-  const [caseResult, purchaseAccountingSettings, documentsResult, filesResult, connectionsResult, postingResult, earlyMappingsResult] = await Promise.all([
+  const [caseResult, purchaseAccountingSettings, documentsResult, filesResult, connectionsResult, postingResult] = await Promise.all([
     supabase
       .from("packet_cases")
       .select("id, status, owner_user_id")
@@ -660,7 +656,6 @@ async function loadContext(
       .eq("case_id", caseId)
       .or(team ? 'id.not.is.null' : `owner_user_id.eq.${JSON.stringify(ownerUserId)}`)
       .maybeSingle(),
-    earlyMappingsResultPromise,
   ]);
 
   if (caseResult.error) throw caseResult.error;
@@ -669,7 +664,6 @@ async function loadContext(
   if (filesResult.error) throw filesResult.error;
   if (connectionsResult.error) throw connectionsResult.error;
   if (postingResult.error) throw postingResult.error;
-  if (earlyMappingsResult.error) throw earlyMappingsResult.error;
 
   const caseRow = caseResult.data;
   const documents = (documentsResult.data ?? []) as PurchasePostingDocumentInput[];
@@ -757,6 +751,23 @@ async function loadContext(
     liveCompanies.find((company) => company.isActive)?.companyName ??
     null;
   const companyName = selectedCompanyName;
+  // The case year classifies its documents. Tally may keep the same business
+  // open under an older year label. Resolve the actual posting dataset using
+  // verified installation/GUID links and permissions on BOTH company records.
+  // Defaults and masters always come from that actual target, never another FY.
+  let postingCompanyId = team?.scope.company_id ?? null;
+  if (team && connection && companyName) {
+    const target = await supabase.rpc('access_purchase_posting_company', {
+      p_actor: ownerUserId, p_org: team.access.organizationId, p_case: caseId,
+      p_connection: connection.id, p_company_name: companyName,
+      p_permission: request.method === 'GET' ? 'purchases.view' : 'purchases.prepare',
+    });
+    if (target.error) throw target.error;
+    if (typeof target.data !== 'string') throw new AccessError('The Tally purchase company could not be verified.', 409);
+    postingCompanyId = target.data;
+  }
+  const mappingScope = team && postingCompanyId
+    ? { organizationId: team.access.organizationId, companyId: postingCompanyId } : undefined;
 
   let masters: PurchasePostingMasterInput[] = [];
   let mappings: PurchasePostingMappingInput[] = [];
@@ -784,14 +795,7 @@ async function loadContext(
     }
 
     if (loadMappings) {
-      const canUseEarlyMappings =
-        connection.id === requestedConnectionId &&
-        normalizeCompanyName(companyName) === normalizeCompanyName(requestedCompanyName);
-      if (canUseEarlyMappings) {
-        mappings = (earlyMappingsResult.data ?? []) as PurchasePostingMappingInput[];
-      } else {
-        mappings = (await readCompanyMappings(supabase, { connectionId: connection.id, companyName, scope: mappingScope })) as PurchasePostingMappingInput[];
-      }
+      mappings = (await readCompanyMappings(supabase, { connectionId: connection.id, companyName, scope: mappingScope })) as PurchasePostingMappingInput[];
     }
   }
 
@@ -819,6 +823,7 @@ async function loadContext(
     connectionStatus,
     liveCompanies,
     selectedCompanyName,
+    postingCompanyId,
     masters,
     liveMasterCommandId,
     liveMasterFetchedAt,
@@ -1155,7 +1160,10 @@ async function PATCHHandler(request: Request, contextParam: { params: Promise<{ 
       revision: nextRevision,
       duplicate_key: duplicate,
       idempotency_key: null,
-      review_patch: compactPurchasePostingReview(defaults.review, prepared.review),
+      review_patch: {
+        ...compactPurchasePostingReview(defaults.review, prepared.review),
+        ...(context.postingCompanyId ? { postingCompanyId: context.postingCompanyId } : {}),
+      },
       approved_payload_hash: null,
       approved_at: null,
       queued_at: null,
@@ -1565,7 +1573,7 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
     }
     const sourceDocumentFolder = await readPurchaseDocumentFolder(
       team?.access.organizationId ?? user.id,
-      purchaseDocumentCompanyKeys(team?.scope.company_id ?? undefined, context.connection.id, context.selectedCompanyName || '',
+      purchaseDocumentCompanyKeys(context.postingCompanyId ?? undefined, context.connection.id, context.selectedCompanyName || '',
         context.liveCompanyProfile?.guid)
     );
     if (sourceDocumentFolder && !context.connectionStatus?.agentCapabilities?.includes('purchase-shared-folder-v1')) {
