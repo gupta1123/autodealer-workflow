@@ -24,10 +24,12 @@ import { TallyCompanyLinkingPanel } from "@/components/tally/TallyCompanyLinking
 import { CaseConfirmDialog } from "@/components/cases/CaseConfirmDialog";
 import { useAccess } from '@/components/access/AccessProvider';
 import { canAccess } from '@autodealer/shared/lib/access';
+import { chooseTallyConnection } from '@/lib/tally-connection-choice';
 
 const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_LAN_TALLY_URL = "http://192.168.1.10:9000";
 const SELECTED_CONNECTION_STORAGE_KEY = "kalika:selected-tally-connection";
+const EXPLICIT_CONNECTION_STORAGE_KEY = "kalika:tally-connection-choice";
 const EXPECTED_MACHINE_STORAGE_PREFIX = "kalika:tally-connector-machine:";
 const CONNECTION_CONTROL_STORAGE_PREFIX = "kalika:tally-connection-control:";
 // Another PC is offered for disconnecting only after it has not checked in for a week.
@@ -328,6 +330,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     text: string;
   } | null>(null);
   const statusRefreshInFlight = useRef(false);
+  const companyRequestConnection = useRef('');
 
   const selectedConnection =
     connections.find((connection) => connection.id === selectedId) ??
@@ -389,11 +392,14 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         typeof window !== "undefined"
           ? (window.localStorage.getItem(SELECTED_CONNECTION_STORAGE_KEY) ?? "")
           : "";
-      const selectedConnectionId = nextConnections.some(
-        (connection) => connection.id === (selectedId || stored),
-      )
-        ? (selectedId || stored)
-        : nextConnections[0]?.id || "";
+      const selectedConnectionId = chooseTallyConnection(nextConnections, {
+        explicitId: window.localStorage.getItem(EXPLICIT_CONNECTION_STORAGE_KEY),
+        previousId: selectedId || stored,
+        locallyPairedIds: nextConnections.filter(connection => window.localStorage.getItem(
+          `${CONNECTION_CONTROL_STORAGE_PREFIX}${connection.id}`,
+        )).map(connection => connection.id),
+      });
+      companyRequestConnection.current = selectedConnectionId;
       setSelectedId(() => {
         if (typeof window !== "undefined" && selectedConnectionId) {
           window.localStorage.setItem(SELECTED_CONNECTION_STORAGE_KEY, selectedConnectionId);
@@ -409,7 +415,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         if (companyResponse.ok) {
           const companyPayload =
             (await companyResponse.json()) as CompaniesResponse;
-          setCompanies(companyPayload.companies ?? []);
+          if (companyRequestConnection.current === selectedConnectionId) setCompanies(companyPayload.companies ?? []);
         }
       } else {
         setCompanies([]);
@@ -424,6 +430,25 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
       });
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function selectConnection(connectionId: string) {
+    if (!connections.some(connection => connection.id === connectionId)) return;
+    companyRequestConnection.current = connectionId;
+    setSelectedId(connectionId);
+    setCompanies([]);
+    setMessage(null);
+    window.localStorage.setItem(SELECTED_CONNECTION_STORAGE_KEY, connectionId);
+    window.localStorage.setItem(EXPLICIT_CONNECTION_STORAGE_KEY, connectionId);
+    window.dispatchEvent(new Event('kalika:tally-status-invalidated'));
+    try {
+      const response = await apiFetch(`/api/tally/companies?connectionId=${encodeURIComponent(connectionId)}`, {cache: 'no-store'});
+      if (!response.ok) throw new Error(await readError(response));
+      const payload = await response.json() as CompaniesResponse;
+      if (companyRequestConnection.current === connectionId) setCompanies(payload.companies ?? []);
+    } catch (error) {
+      if (companyRequestConnection.current === connectionId) setMessage({tone: 'error', text: error instanceof Error ? error.message : 'Could not load this PC’s Tally companies.'});
     }
   }
 
@@ -542,6 +567,8 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         ...current.filter((connection) => connection.id !== payload.connection?.id),
       ]);
       setSelectedId(payload.connection.id);
+      companyRequestConnection.current = payload.connection.id;
+      window.localStorage.setItem(EXPLICIT_CONNECTION_STORAGE_KEY, payload.connection.id);
       window.localStorage.setItem(
         SELECTED_CONNECTION_STORAGE_KEY,
         payload.connection.id,
@@ -813,6 +840,18 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     <div className="flex min-h-[calc(100vh-4rem)] flex-col overflow-y-auto animate-in fade-in slide-in-from-bottom-4 duration-500">
       <PageHeader sticky={false} className="mb-4" title="Tally Connection"
         subtitle="Connect Tally Prime to sync workflows and post entries" />
+
+      {connections.length > 1 ? (
+        <div className="mb-4 max-w-5xl">
+          <label className="mb-1.5 block text-xs font-semibold text-[#6f6255]" htmlFor="tally-pc-selection">Tally PC</label>
+          <select id="tally-pc-selection" value={selectedConnectionId} onChange={event => void selectConnection(event.target.value)}
+            className="h-10 w-full max-w-xl rounded-xl border border-[#ddd5c9] bg-white px-3 text-sm text-[#2b1a10] focus:outline-none focus:ring-2 focus:ring-amber-200">
+            {connections.map(connection => <option key={connection.id} value={connection.id}>
+              {connection.bridgeMachineName || connection.displayName} — {connection.bridgeConnected ? 'Connected' : connection.revoked ? 'Paused' : 'Offline'}{connection.lastCompanyName ? ` · ${connection.lastCompanyName}` : ''}
+            </option>)}
+          </select>
+        </div>
+      ) : null}
 
       <section className="relative mb-5 max-w-5xl overflow-hidden rounded-2xl border border-[#ddd5c9] bg-white shadow-[0_10px_28px_rgba(64,51,35,0.06)]">
         <div className="absolute inset-y-0 right-0 hidden w-[42%] bg-[#f6f0e6] sm:block">
