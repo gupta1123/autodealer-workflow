@@ -287,6 +287,7 @@ type LedgerRecommendationAction =
   | "needs_review";
 
 type LedgerRecommendation = {
+  status?: string;
   matchType?: "direct_match" | "close_match" | "suspense";
   action: LedgerRecommendationAction;
   ledgerName: string | null;
@@ -298,6 +299,7 @@ type LedgerRecommendation = {
 };
 
 type ReviewTransaction = {
+  matchingUnavailable?: boolean;
   id: string;
   transactionDate: string;
   valueDate: string;
@@ -1001,10 +1003,11 @@ function standardLedgerNameForTransaction(
 
 function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMasters: TallyMaster[]): ReviewTransaction {
   const recommendation = readRecommendation(transaction);
+  const matchingUnavailable = Boolean(recommendation?.status && recommendation.status !== "completed");
   const suggestedLedgerName = transaction.suggestedLedgerName || "";
   const action = recommendation?.action ?? "needs_review";
   const aiVetoesDerivedAutoMatch = Boolean(
-    recommendation && (action === "use_suspense" || action === "needs_review")
+    recommendation && (matchingUnavailable || action === "use_suspense" || action === "needs_review")
   );
   const aiCandidateLedgerNames = Array.isArray(recommendation?.candidateLedgerNames)
     ? recommendation.candidateLedgerNames
@@ -1070,7 +1073,9 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     counterpartyName: transaction.counterpartyName || "",
     suggestedLedgerName: reviewSuggestedLedgerName,
     suggestionConfidence: recommendation?.confidence ?? transaction.suggestionConfidence ?? null,
-    suggestionReason: hasCloseMatchCandidates
+    suggestionReason: matchingUnavailable
+      ? recommendation?.reason || 'Ledger matching did not complete. Choose and confirm a ledger before posting.'
+      : hasCloseMatchCandidates
         ? `Close Tally ledger matches found: ${candidateLedgerNames.join(", ")}.`
       : ledgerAction === "use_suspense" && !matchedLedger
         ? "No matching Tally ledger was found. This row will go to Suspense unless changed."
@@ -1079,7 +1084,8 @@ function normalizeReviewTransaction(transaction: PreviewTransaction, ledgerMaste
     selectedLedgerName,
     ledgerAction,
     ledgerGroup: recommendation?.ledgerGroup || "",
-    requiresUserConfirmation: hasCloseMatchCandidates,
+    matchingUnavailable,
+    requiresUserConfirmation: hasCloseMatchCandidates || (matchingUnavailable && !confirmedLedger),
     ledgerSelectionTouched: false,
   };
 }
@@ -2102,6 +2108,9 @@ function getReviewStatus(transaction: ReviewTransaction): ReviewStatusFilter {
 }
 
 function getReviewStatusLabel(transaction: ReviewTransaction) {
+  if (transaction.matchingUnavailable && !transaction.ledgerSelectionTouched && transaction.requiresUserConfirmation) {
+    return "Matching unavailable";
+  }
   const status = getReviewStatus(transaction);
   if (status === "matched") return "Ledger matched";
   if (status === "suspense") return "In Suspense";
@@ -6047,6 +6056,8 @@ export function BankStatementsPage() {
                 : transaction.selectedLedgerName,
               narration: transaction.description,
               referenceNumber: transaction.referenceNumber || getTransactionReference(transaction),
+              bankReferenceNumber: transaction.referenceNumber || null,
+              referenceSource: transaction.referenceNumber ? 'bank' : 'generated',
             };
           }),
       },
@@ -6132,6 +6143,8 @@ export function BankStatementsPage() {
                 : transaction.selectedLedgerName,
               narration: transaction.description,
               referenceNumber: transaction.referenceNumber || getTransactionReference(transaction),
+              bankReferenceNumber: transaction.referenceNumber || null,
+              referenceSource: transaction.referenceNumber ? 'bank' : 'generated',
               transactionType: transaction.transactionType,
               category: transaction.category,
               counterpartyName: transaction.counterpartyName || getTransactionPartyTitle(transaction),

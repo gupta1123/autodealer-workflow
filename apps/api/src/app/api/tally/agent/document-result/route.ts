@@ -11,6 +11,7 @@ import { publishBankJobEvent, subscribeBankJobEvents } from '@/lib/processing/ba
 import { watchBankAnalysis } from '@/lib/processing/bank-local-v2-cancellation.mjs';
 import {subscribeAccessChanges} from '@/lib/access/events';
 import { suggestBankLedgersForTransactions, type VectorLedgerCandidate } from '@/lib/bank-statement-ledger-matching';
+import { getBankLedgerMatchingModel } from '@/lib/processing/openrouter';
 
 type ParsedBankTransaction = {
   transaction_date?: string | null;
@@ -73,6 +74,7 @@ export async function POST(request: Request) {
           coverage: { complete: true, method: input.parserDiagnostics?.pipeline || 'connector_deterministic',
             sourceRows: sourceRows.length, returnedRows: sourceRows.length }, mode: 'connector_anydoc_vector_v1',
           parserDiagnostics: input.parserDiagnostics, connectorMeasurements: input.connectorMeasurements,
+          ledgerRecommendations: matching, ledgerModel: getBankLedgerMatchingModel(),
           vectorCandidates: input.vectorCandidates,
           vectorCandidateCount: input.vectorCandidates.reduce((total: number, rows) => total + (rows?.length || 0), 0) };
       },

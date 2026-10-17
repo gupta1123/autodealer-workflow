@@ -69,7 +69,9 @@ export class LocalDocumentService {
     const queries = parsed.parsed.transactions.map((transaction, index) => ({ id: String(index), name: transaction.description }));
     const matches = {};
     for (let offset = 0; offset < queries.length; offset += 256) {
-      Object.assign(matches, await this.suggestLedgerBatch(queries.slice(offset, offset + 256), { identity: payload.agentIdentity }));
+      Object.assign(matches, await this.suggestLedgerBatch(queries.slice(offset, offset + 256), {
+        identity: payload.agentIdentity, vectorOnly: true, topK: 10,
+      }));
     }
     const vectorCandidates = queries.map((query) => (matches[String(query.id)]?.suggestions || []).map((candidate, rank) => ({
       ledgerName: candidate.ledger?.name || candidate.ledger?.masterName || candidate.name,

@@ -73,6 +73,7 @@ Allowed ledgers:
 Choose only from the provided tallyLedgers list. Copy every selected ledger name exactly as provided.
 The tallyLedgers list is shared by every transaction in the request.
 When a transaction includes allowedLedgerNames, that transaction may choose and may return candidates only from its own allowedLedgerNames list.
+vectorCandidates are semantic retrieval results, not final decisions. Their score and rank may help you inspect the shortlist, but neither proves identity and neither overrides the collision and safety rules below.
 Never invent, modify, shorten, merge, or create a ledger.
 Never create a new party, expense, tax, bank, transfer, or suspense ledger.
 If no existing ledger is uniquely supported, use suspense.
@@ -97,6 +98,11 @@ Allowed matchType values: direct_match, close_match, suspense.
 
 Direct match:
 Use direct_match only when the transaction evidence uniquely identifies exactly one existing ledger. The closest or highest-scoring name is not enough when another ledger remains plausible.
+Collision precedence is absolute: enumerate all plausible ledger collisions before
+considering any exact-name, shortened-name, OCR, or prefix match. If two or more
+ledgers share the meaningful narrated party root, the result must be close_match
+or suspense; never direct_match. The unique-shortened-name rule below applies
+only after this collision scan proves that exactly one ledger shares the root.
 For direct_match, action must be "use_existing_ledger", ledgerName must be one exact name from tallyLedgers, candidateLedgerNames must be [], and confidence must be at least 0.90.
 
 Close match:
@@ -155,6 +161,11 @@ For example, with ledgers Orchid Foundry and Orchid Foundry Supplies, narration 
 
 Do not use ledger group, customer/supplier role, debit/credit direction, amount, or category to choose between colliding names.
 When a real collision exists, return close_match and include every plausible colliding ledger, not only the closest one. A candidate list is never permission to select a candidate.
+If the raw narration contains a distinguishing descriptor that belongs to one
+ledger (for example a product, business type, or location) and the other root-
+matching ledgers do not contain that descriptor, that descriptor resolves the
+collision and the matching ledger may be direct_match. If the descriptor is
+absent or shared, keep close_match.
 Use token boundaries when identifying roots: OM may match ledgers beginning with the separate token OM, but OM must not match OMKAR merely because the letters are a prefix.
 
 Collision examples:
@@ -213,8 +224,24 @@ Reference and memory safety:
 referenceNumber is normally a bank UTR/RRN/reference and does not identify a Tally ledger by itself. A visible invoice or bill reference may support a direct match only when the supplied evidence explicitly connects that reference to one ledger; do not invent that connection. Saved narration mappings are validated before this AI request and are therefore not represented by a guessed AI match.
 
 Final decision rules:
-First verify that the raw description contains identity or purpose evidence. Then check for an exact complete-name match, apply the exact complete-name precedence and its exceptions, and finally run the remaining collision veto. Use direct_match only when exactly one ledger remains possible after these checks; "more likely than the others" is not unique identification.
+First verify that the raw description contains identity or purpose evidence. Then
+perform the complete collision scan. Collision results take precedence over every
+exact, shortened, prefix, OCR, phonetic, or legal-suffix rule. Only after the
+scan confirms exactly one plausible ledger may you apply exact-name or
+shortened-name matching. Use direct_match only when exactly one ledger remains
+possible after these checks; "more likely than the others" is not unique
+identification.
 A unique shortened party name is a direct match when no competing ledger shares that root.
+A shortened-name direct-match rule:
+When the normalized narration contains a contiguous sequence of the complete
+meaningful party-root tokens from exactly one allowed ledger, use direct_match
+even if that ledger has additional descriptive words, products, divisions,
+locations, or legal suffixes that are absent from the bank narration. Bank
+narrations are often truncated after the party root. Missing trailing
+descriptors do not create ambiguity by themselves. Keep suspense or close_match
+only when another allowed ledger shares the same meaningful root, the omitted
+words could identify a different entity, or the narration does not establish a
+credible party root at all.
 A character-for-character match to a shorter ledger is still close_match when another ledger extends that complete name with additional identity words.
 A character-for-character match to one complete ledger is direct_match when the only alternatives are spelling, phonetic, OCR, singular/plural, or legal-suffix variants of that same complete name and no extension or derived-field conflict exists.
 A typo, OCR issue, joined word, missing space, or phonetic variation can still be a direct match when one ledger clearly fits.
@@ -341,6 +368,75 @@ function findCloseLedgerMatches(ledgers: TallyMasterRow[], candidateName?: strin
   return matches.sort((left, right) => right.score - left.score || left.ledgerName.localeCompare(right.ledgerName));
 }
 
+const BANK_LEDGER_AI_CANDIDATES_PER_TRANSACTION = Math.min(
+  100,
+  Math.max(10, Number(process.env.OPENROUTER_BANK_LEDGER_CANDIDATE_LIMIT ?? 40) || 40)
+);
+
+const BANK_NARRATION_NOISE_TOKENS = new Set([
+  "ach", "bank", "beneficiary", "by", "cash", "chq", "cr", "credit", "debit", "dr",
+  "from", "ifsc", "imps", "nach", "neft", "nrtgs", "payment", "ref", "reference",
+  "rrn", "rtgs", "to", "transaction", "transfer", "txn", "upi", "upiref", "utr",
+]);
+
+/**
+ * Produce bounded identity/purpose phrases directly from the bank narration.
+ * A parsed counterparty is useful evidence, but is intentionally not required:
+ * banks frequently encode parties after slash-delimited routing references.
+ */
+export function bankNarrationMatchingQueries(description?: string | null) {
+  const raw = String(description ?? "").trim();
+  if (!raw) return [];
+
+  const tokens = ledgerNameTokens(raw)
+    .filter((token) => {
+      if (!token || BANK_NARRATION_NOISE_TOKENS.has(token)) return false;
+      if (/^\d+$/.test(token)) return false;
+      if (/^(?=.*\d)[a-z0-9]+$/i.test(token)) return false;
+      return token.length > 1;
+    });
+  const phrases = new Set<string>();
+  // Longer phrases retain party identity; shorter ones recover truncated names.
+  for (let size = Math.min(6, tokens.length); size >= 2; size -= 1) {
+    for (let index = 0; index + size <= tokens.length; index += 1) {
+      const phrase = tokens.slice(index, index + size).join(" ");
+      if (phrase.length >= 5) phrases.add(phrase);
+      if (phrases.size >= 60) return Array.from(phrases);
+    }
+  }
+  if (tokens.length === 1 && tokens[0].length >= 5) phrases.add(tokens[0]);
+  return Array.from(phrases);
+}
+
+export function shortlistBankLedgersForTransaction(
+  ledgers: TallyMasterRow[],
+  transaction: MatchableTransaction,
+  counterpartyName?: string | null,
+  limit = BANK_LEDGER_AI_CANDIDATES_PER_TRANSACTION
+) {
+  const rawDescription = String(transaction.description ?? "").trim();
+  const normalizedDescription = normalizeName(rawDescription);
+  const queries = Array.from(new Set([
+    counterpartyName,
+    transaction.counterpartyName,
+    extractCounterpartyName(rawDescription),
+    ...bankNarrationMatchingQueries(rawDescription),
+  ].map((value) => String(value ?? "").trim()).filter(Boolean)));
+  if (queries.length === 0) return [];
+
+  return ledgers
+    .map((ledger) => {
+      const normalizedLedger = normalizeName(ledger.tally_name);
+      const lexical = Math.max(...queries.map((query) => ledgerNameSimilarity(query, ledger.tally_name)));
+      const contained = normalizedLedger.length >= 5 && normalizedDescription.includes(normalizedLedger) ? 1 : 0;
+      return { ledger, score: Math.max(lexical, contained) };
+    })
+    .filter((entry) => entry.score >= 0.34)
+    .sort((left, right) => right.score - left.score || left.ledger.tally_name.localeCompare(right.ledger.tally_name))
+    .slice(0, Math.max(1, limit))
+    .map((entry) => entry.ledger);
+}
+
 function safeJsonParse<T>(raw: string, fallback: T): T {
   try {
     return JSON.parse(raw) as T;
@@ -437,10 +533,10 @@ async function aiMatchLedgersForTransactions(input: {
   if (input.transactions.length === 0) return [];
 
   const ledgerByName = new Map(input.ledgers.map((ledger) => [normalizeName(ledger.tally_name), ledger]));
-  const allowedLedgersByIndex = input.transactions.map(({ vectorCandidates }) => {
+  const allowedLedgersByIndex = input.transactions.map(({ transaction, counterpartyName, vectorCandidates }) => {
     const shortlisted = (vectorCandidates || []).map(candidate => ledgerByName.get(normalizeName(candidate.ledgerName)))
       .filter((ledger): ledger is TallyMasterRow => Boolean(ledger));
-    return shortlisted.length ? Array.from(new Map(shortlisted.map(ledger => [normalizeName(ledger.tally_name), ledger])).values()) : input.ledgers;
+    return shortlisted.length ? Array.from(new Map(shortlisted.map(ledger => [normalizeName(ledger.tally_name), ledger])).values()) : shortlistBankLedgersForTransaction(input.ledgers, transaction, counterpartyName);
   });
   const candidateLedgerByKey = new Map<string, TallyMasterRow>();
   for (const rows of allowedLedgersByIndex) for (const ledger of rows) {

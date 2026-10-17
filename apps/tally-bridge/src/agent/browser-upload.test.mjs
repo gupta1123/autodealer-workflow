@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { EventEmitter } from "node:events";
 import { gunzipSync } from "node:zlib";
 import { BrowserDocumentUpload } from "./browser-upload.mjs";
 import { LocalDocumentService } from "./document-service.mjs";
@@ -87,7 +88,7 @@ test("real PDF travels browser → agent → Markdown-only callback with no reta
     res.end("{}");
   });
   await new Promise(resolve => callback.listen(0, "127.0.0.1", resolve));
-  t.after(() => new Promise(resolve => callback.close(resolve)));
+  t.after(() => new Promise(resolve => { callback.closeAllConnections(); callback.close(resolve); }));
   const service = new LocalDocumentService({ temporaryDirectory: f.dir, browserUpload: f.server });
   const resultPromise = service.parse({
     browserUpload: { ...f.ticket, sizeBytes: source.length }, expectedSha256: hash(source),
@@ -184,11 +185,13 @@ test('duplicate session registration cannot replace a pending upload', async t =
   await pending;
 });
 
-for (const contextFirst of [true, false]) test(`v2 real parser and HTTP finalization: ${contextFirst ? 'context' : 'parsing'} finishes first`, async t => {
+for (const contextFirst of [true, false]) test(`v2 structured parser result and HTTP finalization: ${contextFirst ? 'context' : 'parsing'} finishes first`, async t => {
   const f = await setup(t);
   const source = await fs.readFile(new URL('../../../../test-assets/bank-statements/kalika-sbi-june-ai-sample.pdf', import.meta.url));
   let committed = false, calls = 0, claims = 0, receivedContext;
-  // This fixture tests transport/coordination, not the AI's extraction accuracy.
+  // Exercise the schema-3 HTTP handoff with structured parser/vector fixtures.
+  // The real AnyDoc parser is covered above and in document-parsing/parser.test.
+  // There are no paid embeddings, AI calls, database writes or Tally writes.
   const callback = http.createServer(async (req, res) => {
     try {
       const chunks = []; for await (const chunk of req) chunks.push(chunk);
@@ -206,9 +209,14 @@ for (const contextFirst of [true, false]) test(`v2 real parser and HTTP finaliza
           fail: async () => { throw new Error('unexpected analysis failure'); },
         },
         analyze: async input => {
-          calls++; assert.ok(input.markdown.length > 100); assert.ok(!input.markdown.startsWith('%PDF'));
+          calls++;
+          assert.ok(input.parsed.transactions.length > 0);
+          assert.equal(input.markdown, undefined);
+          assert.equal(input.vectorCandidates.length, input.parsed.transactions.length);
           receivedContext = { ledgerNames: input.ledgerNames, bankAccountCandidates: input.bankAccountCandidates };
           return { data: { account: {}, transactions: [{ date: '2026-09-01', description: 'Fixture receipt', credit: 20, balance: 120, suggestedLedgerName: 'Customer A' }] },
+            mode: 'connector_anydoc_vector_v1', ledgerModel: 'fixture-model',
+            ledgerRecommendations: [{ mappingSource: 'vector_ai_match', matchType: 'direct_match', ledgerName: 'Customer A', confidence: 0.95 }],
             aiMs: 1, coverage: { complete: true, sourceRows: 1 } };
         },
       });
@@ -218,9 +226,28 @@ for (const contextFirst of [true, false]) test(`v2 real parser and HTTP finaliza
     } catch { res.writeHead(500); res.end(); }
   });
   await new Promise(resolve => callback.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise(resolve => callback.close(resolve)));
+  t.after(() => new Promise(resolve => { callback.closeAllConnections(); callback.close(resolve); }));
   const base = `http://127.0.0.1:${callback.address().port}`;
-  const service = new LocalDocumentService({ temporaryDirectory: f.dir, browserUpload: f.server });
+  const service = new LocalDocumentService({ temporaryDirectory: f.dir, browserUpload: f.server,
+    forkWorker() {
+      const child = new EventEmitter();
+      child.kill = () => {};
+      child.send = ({ id }) => queueMicrotask(() => child.emit('message', { id, result: {
+        sha256: hash(source), parseMs: 1, markdownBytes: 100,
+        parsed: { account: {}, transactions: [{ transaction_date: '2026-09-01', description: 'Fixture receipt', credit_amount: 20, balance_amount: 120 }] },
+        parserDiagnostics: { pipeline: 'fixture' },
+      } }));
+      return child;
+    },
+    suggestLedgerBatch: async (queries, options) => {
+      assert.equal(options.vectorOnly, true);
+      assert.equal(options.topK, 10);
+      assert.deepEqual(options.identity, identity);
+      return Object.fromEntries(queries.map(query => [query.id, {
+        suggestions: [{ ledger: { name: 'Customer A' }, score: 0.95 }],
+      }]));
+    },
+  });
   let parsedResolve;
   const parsed = new Promise(resolve => { parsedResolve = resolve; });
   const originalParse = service.parseFresh.bind(service);
@@ -228,10 +255,11 @@ for (const contextFirst of [true, false]) test(`v2 real parser and HTTP finaliza
   const processing = service.parse({ pipelineVersion: 2, agentIdentity: identity, bankStatementJobId: 'job', commandId: 'command',
     browserUpload: { ...f.ticket, sizeBytes: source.length }, expectedSha256: hash(source), documentDeadlineAt: Date.now() + 60_000,
     resultUploadUrl: `${base}/result`, resultStatusUrl: `${base}/status`, resultUploadToken: 'test-job-token' });
+  t.after(() => { f.server.reportPhase(f.ticket.tokenHash, 'failed', 'Fixture cleanup'); callback.closeAllConnections(); });
   processing.catch(() => {});
   if (contextFirst) assert.equal((await contextRequest(f)).status, 200);
   const upload = await fetch(`${f.base}/document`, { method: 'POST', headers: f.headers, body: source });
-  if (!contextFirst) { await parsed; assert.equal(calls, 0); assert.equal((await contextRequest(f)).status, 200); }
+  if (!contextFirst) { await Promise.race([parsed, processing]); assert.equal(calls, 0); assert.equal((await contextRequest(f)).status, 200); }
   const result = await processing;
   const stream = await upload.text();
   assert.equal(result.result.state, 'completed'); assert.equal(committed, true);

@@ -35,21 +35,72 @@ export function prepareLocalPreview(local, ledgerNames) {
   const extraction = validateLocalBalances(prepareLocalExtraction(local));
   const { parsed, diagnostics, extractionError, extractionSource } = extraction;
   const extractionIncomplete = Boolean(extractionError) || diagnostics.coverageComplete === false;
-  const ledgerRecommendationError = extractionIncomplete
+  let ledgerRecommendationError = extractionIncomplete
     ? 'Ledger matching is paused because one or more statement pages still need extraction review.' : null;
   const rows = extractionIncomplete
     ? markBankLedgerRecommendationsUnavailable(parsed.transactions, ledgerRecommendationError, 'deferred')
-    : markCombinedLedgerRecommendationsCompleted(parsed.transactions, ledgerNames);
+    : local.diagnostics?.mode === 'connector_anydoc_vector_v1'
+      ? markStructuredLedgerRecommendations(parsed.transactions, local.diagnostics?.ledgerRecommendations, ledgerNames, local.diagnostics?.ledgerModel)
+      : markCombinedLedgerRecommendationsCompleted(parsed.transactions, ledgerNames);
+  const incompleteRecommendations = rows.filter(
+    row => row.raw_payload?.aiLedgerRecommendation?.status !== 'completed'
+  ).length;
+  if (!extractionIncomplete && incompleteRecommendations) {
+    ledgerRecommendationError = `Ledger matching is unavailable for ${incompleteRecommendations} transaction${incompleteRecommendations === 1 ? '' : 's'}. Review these rows before posting.`;
+  }
   return {
     rows, account: parsed.account, normalizedAccountNumber: normalizeAccountNumber(parsed.account.accountNumber),
     statementPeriodStart: parsed.statementPeriodStart, statementPeriodEnd: parsed.statementPeriodEnd, extractionIncomplete,
     metadata: { parser: 'openrouter_bank_statement_v1', extractionSource, jobStatus: 'completed', extractionError,
-      extractionDiagnostics: diagnostics, ledgerRecommendationError, ledgerRecommendationIncompleteCount: extractionIncomplete ? rows.length : 0,
+      extractionDiagnostics: diagnostics, ledgerRecommendationError, ledgerRecommendationIncompleteCount: incompleteRecommendations,
       normalizedAccountNumber: normalizeAccountNumber(parsed.account.accountNumber), maskedAccountNumber: maskAccountNumber(parsed.account.accountNumber),
       ifscCode: parsed.account.ifscCode, previewTransactionCount: rows.length,
       analysis: { stage: rows.length && !extractionIncomplete ? 'Statement analyzed' : 'Extraction needs attention',
         extractedStatementPeriodStart: parsed.statementPeriodStart, extractedStatementPeriodEnd: parsed.statementPeriodEnd } },
   };
+}
+
+// Structured connector matching is a separate decision from PDF extraction.
+// Preserve its close matches and unavailable status instead of reconstructing
+// a supposedly completed decision from the nullable selected ledger name.
+export function markStructuredLedgerRecommendations(rows, recommendations = [], ledgerNames = [], model) {
+  const allowed = new Map(ledgerNames.map(name => [normalizeName(name), name]));
+  const completedSources = new Set(['ai_match', 'vector_ai_match', 'saved_narration', 'ledger_name', 'category', 'close_match']);
+  return rows.map((row, index) => {
+    const result = recommendations?.[index];
+    if (!result || !completedSources.has(result.mappingSource)) {
+      return markBankLedgerRecommendationsUnavailable(
+        [row], result?.reason || 'Ledger matching did not complete. Review this transaction.'
+      )[0];
+    }
+    const confidence = Number.isFinite(result.confidence) ? Math.max(0, Math.min(1, result.confidence)) : 0;
+    const name = allowed.get(normalizeName(result.ledgerName));
+    const candidates = [...new Set((Array.isArray(result.candidateLedgerNames) ? result.candidateLedgerNames : [])
+      .map(name => allowed.get(normalizeName(name))).filter(Boolean))];
+    const direct = result.matchType === 'direct_match' && name && confidence >= 0.9;
+    const close = result.matchType === 'close_match' && candidates.length >= 2;
+    const reason = result.reason || 'Ledger matching completed.';
+    return {
+      ...row,
+      suggested_ledger_name: direct ? name : null,
+      suggestion_confidence: direct ? confidence : 0,
+      suggestion_reason: reason,
+      raw_payload: {
+        ...row.raw_payload,
+        aiLedgerRecommendation: {
+          matchType: direct ? 'direct_match' : close ? 'close_match' : 'suspense',
+          action: direct ? 'use_existing_ledger' : 'use_suspense',
+          ledgerName: direct ? name : null,
+          candidateLedgerNames: close ? candidates : [],
+          confidence: direct ? confidence : 0,
+          reason,
+          model: ['ai_match', 'vector_ai_match'].includes(result.mappingSource) ? model || null : result.mappingSource,
+          source: result.mappingSource,
+          status: 'completed',
+        },
+      },
+    };
+  });
 }
 
 export function markCombinedLedgerRecommendationsCompleted(rows, ledgerNames = [], model = process.env.OPENROUTER_ANYDOC_MODEL || 'openai/gpt-5.6-luna') {
@@ -94,9 +145,11 @@ export function prepareLocalExtraction(local) {
     } } };
   });
   const connectorVector = local.diagnostics?.mode === 'connector_anydoc_vector_v1';
+  const localDiagnostics = { ...local.diagnostics };
+  delete localDiagnostics.ledgerRecommendations;
   return { parsed, extractionSource: connectorVector ? 'connector_anydoc_vector_v1' : 'anydoc_markdown_combined_ai',
     extractionError: coverageVerified ? null : 'Source transaction coverage could not be verified. Review is required before posting.',
-    diagnostics: { pipeline: connectorVector ? 'connector_anydoc_vector_v1' : 'local_agent_markdown_combined_ai', localParsing: local.diagnostics,
+    diagnostics: { pipeline: connectorVector ? 'connector_anydoc_vector_v1' : 'local_agent_markdown_combined_ai', localParsing: localDiagnostics,
       connectorParser: local.diagnostics?.parserDiagnostics || null, vectorCandidateCount: local.diagnostics?.vectorCandidateCount || 0,
       connectorTiming: local.diagnostics?.connectorMeasurements || null, coverageComplete: coverageVerified,
       errors: coverageVerified ? [] : ['Source transaction coverage could not be verified.'] } };

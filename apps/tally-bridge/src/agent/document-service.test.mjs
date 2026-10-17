@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { LocalDocumentService } from "./document-service.mjs";
+import {gunzipSync} from 'node:zlib';
 
 function fixture(error) {
   const requests = [];
@@ -47,6 +48,19 @@ test("parse failure propagates rather than falling back to cached Markdown", asy
     code: "DOCUMENT_HASH_MISMATCH",
   });
   assert.equal(f.storageCalls(), 0);
+});
+
+test('v2 bank documents request ten vector-only candidates and keep the result envelope scoped',async()=>{
+ const original=globalThis.fetch;let uploaded;
+ const controller=new AbortController(),identity={organizationId:'org',companyGuid:'company',installationId:'pc'};
+ const context={ledgerNames:[],bankAccountCandidates:[],contextHash:'b'.repeat(64)};
+ const service=new LocalDocumentService({temporaryDirectory:'unused',browserUpload:{contextSignal:()=>controller.signal,waitForContext:async()=>context,reportPhase(){}},
+  suggestLedgerBatch:async(queries,options)=>{assert.equal(options.vectorOnly,true);assert.equal(options.topK,10);assert.equal(options.identity,identity);return Object.fromEntries(queries.map(q=>[q.id,{suggestions:[{ledger:{name:'Allowed ledger',guid:'ledger-guid'},score:0.95}]}]));}});
+ service.parseFresh=async()=>({parsed:{transactions:[{description:'Receipt'}]},parserDiagnostics:{pipeline:'fixture'},parseMs:1});
+ globalThis.fetch=async(url,options)=>{assert.equal(url,'https://fixture.invalid/result');uploaded=JSON.parse(gunzipSync(options.body));return new Response('{"type":"result","state":"completed"}\n');};
+ try{await service.parseV2({browserUpload:{tokenHash:'a'.repeat(64)},agentIdentity:identity,resultUploadUrl:'https://fixture.invalid/result',resultStatusUrl:'https://fixture.invalid/result',resultUploadToken:'fixture',documentDeadlineAt:Date.now()+10000,expectedSha256:'c'.repeat(64),bankStatementJobId:'job',commandId:'command'},'unused-local-path');}
+ finally{globalThis.fetch=original;}
+ assert.deepEqual(uploaded.identity,identity);assert.equal(uploaded.vectorCandidates[0][0].ledgerName,'Allowed ledger');assert.equal(uploaded.contextHash,context.contextHash);
 });
 
 test('cancelling preparation terminates the active parser without sending an AbortSignal over IPC', async () => {

@@ -67,7 +67,8 @@ export async function processLocalBankV2({ envelope, store, analyze = (input, co
         markdownChars: envelope.markdown?.length || 0,
         aiMs: extraction.aiMs, coverage: extraction.coverage, mode: extraction.mode,
         parserDiagnostics: extraction.parserDiagnostics, vectorCandidateCount: extraction.vectorCandidateCount,
-        vectorCandidates: extraction.vectorCandidates, connectorMeasurements: extraction.connectorMeasurements } }, effectiveLedgerNames));
+        vectorCandidates: extraction.vectorCandidates, connectorMeasurements: extraction.connectorMeasurements,
+        ledgerRecommendations: extraction.ledgerRecommendations, ledgerModel: extraction.ledgerModel } }, effectiveLedgerNames));
     digest = createHash('sha256').update(JSON.stringify(prepared)).digest('hex');
     await report({ phase: 'saving_preview' });
   } catch (error) {

@@ -811,6 +811,8 @@ async function POSTHandler(request: Request) {
         );
         const referenceNumber =
           transaction.reference_number || buildVoucherReference(transaction, referenceBankCode);
+        const bankReferenceNumber = transaction.reference_number || null;
+        const referenceSource = bankReferenceNumber ? "bank" : "generated";
 
         if (outgoingPayment && outgoingAction === "verify") {
           const nextCommands: TallyCommandInsert[] = [];
@@ -832,6 +834,8 @@ async function POSTHandler(request: Request) {
               amount,
               narration: transaction.description,
               referenceNumber,
+              bankReferenceNumber,
+              referenceSource,
               transactionType: transaction.transaction_type,
               category: transaction.category,
               counterpartyName: transaction.counterparty_name,
@@ -931,6 +935,8 @@ async function POSTHandler(request: Request) {
             amount,
             narration: buildVoucherNarration(transaction.description, referenceNumber),
             referenceNumber,
+            bankReferenceNumber,
+            referenceSource,
             transactionType: transaction.transaction_type,
             category: transaction.category,
             counterpartyName: transaction.counterparty_name,

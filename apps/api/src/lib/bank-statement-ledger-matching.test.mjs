@@ -1,9 +1,44 @@
-import assert from 'node:assert/strict';
-import test from 'node:test';
+import assert from "node:assert/strict";
+import test from "node:test";
 
-import { suggestBankLedgersForTransactions } from './bank-statement-ledger-matching.ts';
+import {
+  bankNarrationMatchingQueries,
+  shortlistBankLedgersForTransaction,
+  suggestBankLedgersForTransactions,
+} from "./bank-statement-ledger-matching.ts";
 
-test('complete connector vector shortlists do not read the cloud master catalogue', async () => {
+function ledger(name, parent = "Sundry Creditors") {
+  return { tally_name: name, parent_name: parent };
+}
+
+test("PNB slash narration retrieves ledgers without a parsed counterparty", () => {
+  const description = "NRTGS/PUNBR52026090511997279/5282432411/SHRI MAA S";
+  const queries = bankNarrationMatchingQueries(description);
+  assert.ok(queries.includes("shree maa"));
+
+  const matches = shortlistBankLedgersForTransaction(
+    [ledger("Shree Maa Steels Private Limited"), ledger("Unrelated Traders")],
+    { description },
+    null
+  );
+  assert.equal(matches[0]?.tally_name, "Shree Maa Steels Private Limited");
+});
+
+test("raw narration remains usable when deterministic counterparty parsing returns null", () => {
+  const matches = shortlistBankLedgersForTransaction(
+    [ledger("Chaman Metals"), ledger("Cash Discount")],
+    { description: "NRTGS/PUNBR52026090511997093/5282432017/CHAMAN MET" },
+    null
+  );
+  assert.equal(matches[0]?.tally_name, "Chaman Metals");
+});
+
+test("routing references are excluded from narration retrieval queries", () => {
+  const queries = bankNarrationMatchingQueries("NRTGS/PUNBR52026090511997279/5282432411/SHRI MAA STEELS");
+  assert.ok(queries.every((query) => !/520260905|5282432411/i.test(query)));
+});
+
+test("complete connector vector shortlists do not read the cloud master catalogue", async () => {
   let cloudReads = 0;
   const originalWarn = console.warn;
   console.warn = () => undefined;
@@ -12,25 +47,25 @@ test('complete connector vector shortlists do not read the cloud master catalogu
       supabase: {
         from() {
           cloudReads += 1;
-          throw new Error('cloud catalogue must not be read');
+          throw new Error("cloud catalogue must not be read");
         },
       },
-      ownerUserId: 'user-1',
-      connectionId: 'connection-1',
-      companyName: 'Example Company',
+      ownerUserId: "user-1",
+      connectionId: "connection-1",
+      companyName: "Example Company",
       vectorCandidates: [[{
-        ledgerName: 'Shree Maa Steels Private Limited',
-        tallyGuid: 'ledger-guid-1',
-        parentGroup: 'Sundry Debtors',
+        ledgerName: "Shree Maa Steels Private Limited",
+        tallyGuid: "ledger-guid-1",
+        parentGroup: "Sundry Debtors",
         vectorScore: 0.91,
         rank: 1,
       }]],
       transactions: [{
-        accountId: 'account-1',
+        accountId: "account-1",
         transaction: {
-          description: 'RTGS SHREE MAA STEELS',
-          category: 'customer_receipt',
-          counterpartyName: 'Shree Maa Steels',
+          description: "RTGS SHREE MAA STEELS",
+          category: "customer_receipt",
+          counterpartyName: "Shree Maa Steels",
         },
       }],
     });

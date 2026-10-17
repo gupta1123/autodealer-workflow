@@ -763,7 +763,7 @@ export class LocalAgentRuntime {
     return { suggestions, deterministic: deterministic.slice(0, 5), vectorEnabled: true };
   }
 
-  async suggestLedgerBatch(queries = [], { identity = this.activeIdentity, savedMappings = [] } = {}) {
+  async suggestLedgerBatch(queries = [], { identity = this.activeIdentity, savedMappings = [], vectorOnly = false, topK = 8 } = {}) {
     if (!identity) return {};
     const key = datasetKey(identity);
     const rows = await this.storage.call("listMasters", { datasetKey: key, masterType: "ledger" });
@@ -772,12 +772,13 @@ export class LocalAgentRuntime {
       lookup = buildLedgerLookup(rows);
       this.ledgerLookupCache.set(key, lookup);
     }
+    const limit=Math.max(1,Math.min(20,Math.trunc(Number(topK)||8)));
     const prepared = queries.slice(0, 256).map((query, index) => {
-      const shortlist = shortlistLedgers(query, lookup, savedMappings);
+      const shortlist = vectorOnly ? [] : shortlistLedgers(query, lookup, savedMappings);
       return {
         id: String(query.id || query.name || index),
         query,
-        deterministic: deterministicLedgerCandidates(query, shortlist, savedMappings).slice(0, 8),
+        deterministic: vectorOnly ? [] : deterministicLedgerCandidates(query, shortlist, savedMappings).slice(0, limit),
       };
     });
     await this.ensureVectorIndex(identity);
@@ -789,7 +790,7 @@ export class LocalAgentRuntime {
       datasetKey: key,
       dimensions: LOCAL_LEDGER_VECTOR_DIMENSIONS,
       embedding,
-      topK: 8,
+      topK: limit,
     })));
     const byId = new Map(rows.map((ledger) => [String(ledger.guid || ledger.masterId || ledger.id || ledger.name), ledger]));
     return Object.fromEntries(prepared.map((item, index) => {
@@ -798,18 +799,19 @@ export class LocalAgentRuntime {
         return ledger ? [{ ledger, score: Number(hit.score || 0), source: "openrouter_vector" }] : [];
       });
       const seen = new Set();
-      const suggestions = [...item.deterministic.filter((entry) => entry.score >= 0.94), ...vector, ...item.deterministic]
+      const suggestions = (vectorOnly ? vector : [...item.deterministic.filter((entry) => entry.score >= 0.94), ...vector, ...item.deterministic])
         .filter((entry) => {
           const id = String(entry.ledger?.guid || entry.ledger?.masterId || entry.ledger?.name || "");
           if (!id || seen.has(id)) return false;
           seen.add(id);
           return true;
         })
-        .slice(0, 8);
+        .slice(0, limit);
       return [item.id, {
         suggestions,
         deterministic: item.deterministic.slice(0, 5),
         vectorEnabled: true,
+        searchMode: vectorOnly ? 'vector_only' : 'hybrid',
         embeddingModel: LOCAL_LEDGER_VECTOR_MODEL,
       }];
     }));
