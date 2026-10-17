@@ -90,6 +90,15 @@ test('access change during reconnection prevents replay in another company scope
  assert.equal(socket.sent.filter(m=>m.type==='request').length,1);
 });
 
+test('a delayed retry cannot replace the newly selected PC session',async()=>{
+ const h=harness();const first=h.request({connectionId:'pc-A',companyName:'A',operation:'ledger_masters'});
+ const rejected=assert.rejects(first,e=>e.name==='AbortError');await tick();
+ h.sockets[0].message({type:'result',requestId:h.sockets[0].sent.at(-1).requestId,success:false,error:'The live Tally connection is unavailable.'});
+ await tick();const second=h.request({connectionId:'pc-B',companyName:'B',operation:'company_check'});await tick();
+ const socket=h.sockets[1];socket.message({type:'result',requestId:socket.sent.at(-1).requestId,success:true,data:{}});await second;
+ h.resume();await rejected;assert.equal(h.sockets.length,2);assert.equal(socket.closes,0);
+});
+
 test('live status follows connector loss and recovery without reading Tally',async()=>{
  const h=harness(),states=[];const stop=h.watch('pc-A',state=>states.push(state));await tick();
  const socket=h.sockets[0];socket.message({type:'connector_status',online:false});socket.message({type:'connector_status',online:true});

@@ -360,6 +360,8 @@ export async function runCashDiscountLiveRequest<T>(request: LiveRequest):Promis
         if(request.signal?.aborted)aborted();
       });
       if(epoch!==accessCacheEpoch())throw new DOMException('Access changed during Tally reconnection.','AbortError');
+      if(cachedSession&&!cachedSession.ended&&!cachedSession.key.endsWith(`|${request.connectionId}`))
+        throw new DOMException('The selected Tally connection changed during reconnection.','AbortError');
     }
   }
 }
@@ -371,6 +373,7 @@ async function runLiveRequestOnce<T>(request: LiveRequest) {
   await session.ready;
   if(epoch!==accessCacheEpoch())throw new DOMException('Access changed before the live request started.','AbortError');
   request.signal?.throwIfAborted();
+  if(session.ended||session.socket.readyState!==WebSocket.OPEN)throw new Error('The live Tally connection closed before the request started.');
   return new Promise<T>((resolve, reject) => {
     const requestId = crypto.randomUUID();
     const cancel = () => {
