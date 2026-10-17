@@ -1,5 +1,5 @@
 import { withTeamAccess } from '@/lib/access/route-boundary';
-import { newResourceScope } from '@/lib/access/new-resource';
+import { newCaseResourceScope } from '@/lib/access/new-resource';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { listAccessPredicate } from "@/lib/access/list-scope";
@@ -1342,7 +1342,7 @@ async function POSTHandler(request: Request) {
 
     supabase = createSupabaseAdminClient();
     const formData = (await request.formData()) as unknown as WebFormData;
-    const resourceScope = await newResourceScope(request, formData.get('accessCompanyId'), 'purchases.prepare');
+    const resourceScope = await newCaseResourceScope(request, formData.get('accessCompanyId'), 'purchases.prepare');
     const mode = typeof formData.get("mode") === "string" ? formData.get("mode") : null;
     const allowDuplicateUpload = readBooleanFormValue(formData.getAll("allowDuplicate")[0]);
     const files = formData.getAll("files").filter(isFileEntry);
