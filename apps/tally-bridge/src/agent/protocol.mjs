@@ -1,4 +1,4 @@
-export const AGENT_VERSION = "1.2.37";
+export const AGENT_VERSION = "1.2.38";
 export const AGENT_PROTOCOL_VERSION = 1;
 export const LOCAL_SCHEMA_VERSION = 3;
 export const TDL_REPORT_VERSION = 1;
@@ -29,6 +29,7 @@ export const AGENT_CAPABILITIES = Object.freeze([
   "bank-reference-preflight-v1",
   "bank-reference-preflight-v2",
   "bank-vector-candidates-v2",
+  "bank-account-header-v2",
   "document-cli-v1",
 ]);
 

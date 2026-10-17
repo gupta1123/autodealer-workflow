@@ -39,6 +39,7 @@ import { buildBankBookCsv } from "@/lib/bank-book-csv";
 import { isPreviewExtractionIncomplete } from "@/lib/bank-statement-extraction-state";
 import { isReadyForTallyPosting } from "@/lib/bank-statement-posting-readiness";
 import { runCashDiscountLiveRequest } from "@/lib/cash-discount-live";
+import { useBankAccountCatalogue } from "@/lib/use-bank-account-catalogue";
 import { readPreferredTallyConnectionId } from "@/lib/tally-company-selection";
 import { pdfToImagePages } from "@/services/pdf";
 
@@ -95,14 +96,6 @@ type LocalBankLedger = {
   bankAccountNumber?: string | null;
   closingBalance?: number | null;
   closingBalanceType?: "Dr" | "Cr" | null;
-};
-
-type LiveBankLedgerResult = {
-  companyName?: string | null;
-  companyNames?: string[];
-  bankLedgers?: LocalBankLedger[];
-  byCompany?: Record<string, LocalBankLedger[]>;
-  errors?: Array<{ companyName?: string; error?: string }>;
 };
 
 const BANK_STATEMENT_COMPANY_SELECTION_KEY = "kalika.bankStatements.selectedCompany.v1";
@@ -3226,7 +3219,6 @@ export function BankStatementsPage() {
   const [pendingBankLedgerName, setPendingBankLedgerName] = useState("");
   const [ledgerMasters, setLedgerMasters] = useState<TallyMaster[]>([]);
   const localLedgerSuggestionKeyRef = useRef("");
-  const [tallyBankLedgersByCompany, setTallyBankLedgersByCompany] = useState<Record<string, LocalBankLedger[]>>({});
   const [transactions, setTransactions] = useState<ReviewTransaction[]>([]);
   const [editingLedgerIds, setEditingLedgerIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
@@ -3238,7 +3230,6 @@ export function BankStatementsPage() {
   const [tallyCheckAttempted, setTallyCheckAttempted] = useState(false);
   const [statementDirectionsSwapped, setStatementDirectionsSwapped] = useState(false);
   const [syncingMasters, setSyncingMasters] = useState(false);
-  const [loadingBankLedgers, setLoadingBankLedgers] = useState(false);
   const [refreshingConnections, setRefreshingConnections] = useState(false);
   const [banner, setBanner] = useState<{ tone: MessageTone; text: string } | null>(null);
   const [postUploadSyncImportId, setPostUploadSyncImportId] = useState<string | null>(null);
@@ -3272,7 +3263,6 @@ export function BankStatementsPage() {
   const reviewSearchInputRef = useRef<HTMLInputElement>(null);
   const reviewPeriodInputRef = useRef<HTMLInputElement>(null);
   const ledgerLoadSeqRef = useRef(0);
-  const bankLedgerLoadKeyRef = useRef("");
   const initialSummaryLoadStartedRef = useRef(false);
   const tallyStatusStartedAtRef = useRef(Date.now());
   const lastNonEmptyCompaniesRef = useRef<CompanyOption[]>([]);
@@ -3415,16 +3405,15 @@ export function BankStatementsPage() {
       activeTallyCompanyFresh &&
       normalizeName(selectedCompanyName) !== normalizeName(activeTallyCompanyName)
   );
+  const bankAccountCatalogue = useBankAccountCatalogue({
+    connectionId: tallyConnectionId,
+    companyName: selectedCompanyName,
+    companyGuid: selectedCompany?.companyGuid,
+    financialYear: selectedFinancialYear,
+  }, Boolean(tallyCompanyContextVerified && tallyConnectionId && allowed('bank.view')));
+  const loadingBankLedgers = bankAccountCatalogue.loading;
   const bankLedgerOptions = useMemo(() => {
-    const hasFetchedBankLedgers = selectedCompanyName
-      ? Object.prototype.hasOwnProperty.call(tallyBankLedgersByCompany, selectedCompanyName)
-      : false;
-    const fetchedBankLedgers = selectedCompanyName ? tallyBankLedgersByCompany[selectedCompanyName] : undefined;
-    const sourceBankLedgers =
-      hasFetchedBankLedgers
-        ? fetchedBankLedgers ?? []
-        : selectedCompany?.bankLedgers ?? [];
-    const localBankLedgers = sourceBankLedgers.map((ledger) => ({
+    const localBankLedgers = bankAccountCatalogue.ledgers.map((ledger) => ({
       key: `local-bank-ledger:${selectedCompany?.id ?? ""}:${ledger.name}`,
       name: ledger.name,
       type: "ledger",
@@ -3438,15 +3427,15 @@ export function BankStatementsPage() {
       billWiseEnabled: null,
       ledgerType: "other",
     } satisfies TallyMaster));
-    const merged = [...localBankLedgers, ...ledgerMasters.filter(isBankLedgerMaster)];
+    // Transaction candidates are not the bank-account catalogue.
     const seen = new Set<string>();
-    return merged.filter((ledger) => {
+    return localBankLedgers.filter((ledger) => {
       const key = ledger.name.trim().toLowerCase();
       if (!key || seen.has(key)) return false;
       seen.add(key);
       return true;
     });
-  }, [ledgerMasters, selectedCompany, selectedCompanyName, tallyBankLedgersByCompany]);
+  }, [bankAccountCatalogue.ledgers, selectedCompany?.id]);
   const originalSuggestedBankLedgerName = preview?.account.tallyLedgerName?.trim() || "";
   const bankLedgerPickerGroups = useMemo<LedgerSearchGroup[]>(() => {
     const originalSuggestionKey = normalizeName(originalSuggestedBankLedgerName);
@@ -4316,63 +4305,6 @@ export function BankStatementsPage() {
     return null;
   }, []);
 
-  async function fetchTallyBankLedgersForCompanies(
-    connectionId: string,
-    companyNames: string[],
-    options?: { quiet?: boolean }
-  ) {
-    const cleanCompanyNames = Array.from(
-      new Set(companyNames.map((name) => name.trim()).filter(Boolean))
-    );
-    if (!connectionId || cleanCompanyNames.length === 0) return null;
-
-    try {
-      setLoadingBankLedgers(true);
-      // Fetch the selected company directly over the already-authenticated
-      // Electron WebSocket. Do not queue a command or wait for a Supabase
-      // write/read round trip before showing the live Tally result.
-      const requestedCompanyName = selectedCompanyName || cleanCompanyNames[0] || "";
-      const payload = await runCashDiscountLiveRequest<LiveBankLedgerResult>({
-        connectionId,
-        companyName: requestedCompanyName,
-        companyNames: [requestedCompanyName],
-        operation: "bank_ledgers",
-        onProgress: (message) => {
-          if (!options?.quiet) setBanner({ tone: "info", text: message });
-        },
-      });
-      const returnedCompanyName = String(payload.companyName || requestedCompanyName).trim();
-      const returnedLedgers = payload.byCompany?.[returnedCompanyName] ?? payload.bankLedgers ?? [];
-      const byCompany = { [returnedCompanyName]: returnedLedgers } as Record<string, LocalBankLedger[]>;
-      const firstError = payload.errors?.find((item) => item.error)?.error;
-      if (returnedLedgers.length === 0 && firstError) throw new Error(firstError);
-      setTallyBankLedgersByCompany((current) => ({
-        ...current,
-        ...byCompany,
-      }));
-
-      if (!options?.quiet) {
-        const count = Object.values(byCompany).reduce((total, ledgers) => total + ledgers.length, 0);
-        setBanner({
-          tone: "success",
-          text: count > 0 ? "Bank accounts refreshed from Tally." : "No Tally bank accounts were returned.",
-        });
-      }
-
-      return byCompany;
-    } catch (error) {
-      if (!options?.quiet) {
-        setBanner({
-          tone: "error",
-          text: error instanceof Error ? error.message : "Could not fetch Tally bank accounts.",
-        });
-      }
-      return null;
-    } finally {
-      setLoadingBankLedgers(false);
-    }
-  }
-
   const clearStatementReview = useCallback((options?: { preserveSelectedFile?: boolean }) => {
     setPreview(null);
     setTransactions([]);
@@ -5003,10 +4935,9 @@ export function BankStatementsPage() {
           current && loadedCompanies.some((company) => company.id === current) ? current : restoredCompany?.id ?? ""
         );
         setTallyConnectionId(nextConnectionId);
-        // Keep the header refresh lightweight. Live bank ledgers and the full
-        // ledger master list are fetched on demand when analysis/posting needs
-        // them; loading both here made Refresh much slower than Finora.
-        bankLedgerLoadKeyRef.current = "";
+        // Refresh account discovery independently of the full transaction
+        // catalogue so an existing shortlist cannot suppress bank matching.
+        void bankAccountCatalogue.refresh().catch(() => {});
         ledgerLoadSeqRef.current += 1;
         setLedgerMasters([]);
       }
@@ -5282,10 +5213,9 @@ export function BankStatementsPage() {
       jobId: traceJobId, phase, elapsedMs: Math.round(performance.now() - started), ...measurements,
     });
     const abort = new AbortController();
-    // Start the existing fresh read immediately, with its original scope and
-    // ordering. Import creation and PDF parsing do not wait on this promise.
-    // Gajkesari parity: parsing and retrieval use the connector's prepared
-    // local catalogue. Never block an upload on retransferring 12k ledgers.
+    // Parsing and vector retrieval use the connector's prepared local catalogue.
+    // Bank-account discovery runs independently; neither needs to transfer the
+    // full transaction catalogue before the PDF can be parsed.
     const mastersPromise = Promise.resolve(ledgerMasters);
     const form = new FormData();
     form.set('pipelineVersion', '2');
@@ -5905,12 +5835,9 @@ export function BankStatementsPage() {
 
   async function handleSyncLedgerMasters() {
     if (tallyConnectionId && companyOptions.length > 0) {
-      bankLedgerLoadKeyRef.current = "";
-      await fetchTallyBankLedgersForCompanies(
-        tallyConnectionId,
-        companyOptions.map((company) => company.companyName),
-        { quiet: false }
-      );
+      await bankAccountCatalogue.refresh().catch(error => {
+        showToast("error", error instanceof Error ? error.message : "Could not load bank accounts.");
+      });
     }
     await syncCompanyData();
   }
@@ -7510,7 +7437,7 @@ export function BankStatementsPage() {
                     <div className="min-w-0 py-0.5">
                       <div className="text-[9px] font-extrabold uppercase tracking-[0.12em] text-slate-400">Statement account</div>
                       <div className="mt-0.5 truncate text-[11px] font-extrabold leading-[13px] text-[#1a1a1a]" title={`${account.bankName || ""} ${account.accountNumber || ""}`}>
-                        {account.bankName || "Account not detected"}
+                        {account.bankName || (account.accountNumber ? "Bank name not detected" : "Account not detected")}
                         {account.accountNumber ? ` - ${account.accountNumber}` : ""}
                       </div>
                       <div className="mt-0.5 truncate text-[9px] font-semibold leading-3 text-slate-400">
@@ -7556,7 +7483,7 @@ export function BankStatementsPage() {
                             ) : (
                               <div className="mt-1 flex items-start gap-1.5 text-[10px] font-semibold text-amber-700">
                                 <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                                <span>Choose the intended ledger - no exact account match was found.</span>
+                                <span>{loadingBankLedgers ? "Loading bank accounts from Tally…" : bankAccountCatalogue.error || "Choose the intended ledger - no exact account match was found."}</span>
                               </div>
                             )}
                           </div>
@@ -7767,7 +7694,7 @@ export function BankStatementsPage() {
                       <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" />
                       <div className="min-w-0">
                         <div className="truncate text-sm font-semibold text-[#2b241d]">
-                          {account.bankName || "Account not detected"}
+                          {account.bankName || (account.accountNumber ? "Bank name not detected" : "Account not detected")}
                           {account.accountNumber ? ` - ${account.accountNumber}` : ""}
                         </div>
                         <div className="truncate text-xs font-semibold text-[#8a7f72]">
