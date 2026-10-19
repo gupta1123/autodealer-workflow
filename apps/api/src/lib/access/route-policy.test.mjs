@@ -12,6 +12,7 @@ test('purchase approval, posting and permanent deletion have separate permission
  assert.deepEqual(policy('/api/cases/c1/approval','POST','approve').permissions,['purchases.approve']);
  assert.deepEqual(policy('/api/cases/c1','DELETE','permanent').permissions,['purchases.delete']);
  assert.deepEqual(policy('/api/cases/c1','DELETE').permissions,['purchases.recycle']);
+ assert.deepEqual(policy('/api/cases/analysis-progress').permissions,['purchases.view']);
 });
 test('resource checks use the path parent, not a caller-supplied company',()=>{
  assert.deepEqual(policy('/api/cases/c1/mismatches/m1','PATCH').resource,{type:'case',id:'c1'});

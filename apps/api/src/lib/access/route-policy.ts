@@ -24,6 +24,8 @@ export function userRoutePolicy(path: string, method: string, action?: string, c
   if (path.startsWith('/api/settings/')) return simple('settings.manage');
   if (path === '/api/ai/openrouter') return simple('purchases.prepare');
   if (path === '/api/cases') return simple(read ? 'purchases.view' : 'purchases.prepare');
+  // Lists progress for several cases at once; the route itself filters to the cases the user can see.
+  if (path === '/api/cases/analysis-progress' && read) return simple('purchases.view');
   if ((m=path.match(/^\/api\/cases\/([^/]+)(?:\/(.*))?$/))) {
     const tail=m[2]||'';
     if (tail==='approval') return resource('case',m[1],read?'purchases.view':action==='prepare'?'purchases.prepare':action==='submit'?'purchases.submit':'purchases.approve',!read);
