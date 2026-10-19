@@ -21,12 +21,77 @@ export type ProcessingJobRow = {
   updated_at: string;
 };
 
-export function mapProcessingJob(job: ProcessingJobRow | null) {
+// A typical packet takes about two minutes end to end; used until the run has enough progress to
+// extrapolate from its own speed.
+const TYPICAL_RUN_SECONDS = 120;
+
+function readNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** Seconds left for a running job: a prior early on, then extrapolated from the run's own pace. */
+export function estimateRemainingSeconds(job: ProcessingJobRow, now = Date.now()) {
+  if (job.status !== "running") return null;
+  const progress = Math.min(99, Math.max(0, job.progress ?? 0));
+  const result = job.result ?? {};
+  const runStartedAt = Date.parse(String(result.activeRunStartedAt ?? job.started_at ?? ""));
+  const elapsed = Number.isFinite(runStartedAt) ? Math.max(0, (now - runStartedAt) / 1000) : 0;
+
+  const prior = (TYPICAL_RUN_SECONDS * (100 - progress)) / 100;
+  const paced = progress >= 15 && elapsed > 0 ? (elapsed * (100 - progress)) / progress : prior;
+  // Blend so the estimate does not swing when progress first crosses the threshold.
+  const weight = Math.min(1, Math.max(0, (progress - 5) / 25));
+  const seconds = prior * (1 - weight) + paced * weight;
+  return Math.max(5, Math.round(seconds / 5) * 5);
+}
+
+/** How many queued jobs are ahead of this one (1 = next to run). */
+export async function getQueuePositions(jobs: ProcessingJobRow[]) {
+  const positions = new Map<string, number>();
+  const queued = jobs.filter((job) => job.status === "queued");
+  if (!queued.length) return positions;
+
+  const supabase = createSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("packet_processing_jobs")
+    .select("id, created_at")
+    .eq("status", "queued")
+    .order("created_at", { ascending: true })
+    .limit(500);
+  if (error) throw error;
+  const order = (data ?? []).map((row) => row.id as string);
+  for (const job of queued) {
+    const index = order.indexOf(job.id);
+    if (index >= 0) positions.set(job.id, index + 1);
+  }
+  return positions;
+}
+
+export function mapProcessingJob(job: ProcessingJobRow | null, queuePosition?: number | null) {
   if (!job) {
     return null;
   }
 
+  // The checkpoint holds every extracted document; it is large and only the worker needs it.
+  const { checkpoint: _checkpoint, ...visibleResult } = (job.result ?? {}) as Record<string, unknown>;
+  void _checkpoint;
+  const detail = visibleResult.progressDetail;
+  delete visibleResult.progressDetail;
+
   return {
+    etaSeconds: estimateRemainingSeconds(job),
+    queuePosition: queuePosition ?? null,
+    progressDetail:
+      detail && typeof detail === "object"
+        ? {
+            step: String((detail as Record<string, unknown>).step ?? ""),
+            done: readNumber((detail as Record<string, unknown>).done),
+            total: readNumber((detail as Record<string, unknown>).total),
+            pages: readNumber((detail as Record<string, unknown>).pages),
+            fileIndex: readNumber((detail as Record<string, unknown>).fileIndex),
+            fileCount: readNumber((detail as Record<string, unknown>).fileCount),
+          }
+        : null,
     id: job.id,
     caseId: job.case_id,
     jobType: job.job_type,
@@ -36,7 +101,7 @@ export function mapProcessingJob(job: ProcessingJobRow | null) {
     progress: job.progress,
     stage: job.stage,
     error: job.error,
-    result: job.result ?? {},
+    result: visibleResult,
     lockedAt: job.locked_at,
     lockedBy: job.locked_by,
     nextRunAt: job.next_run_at,

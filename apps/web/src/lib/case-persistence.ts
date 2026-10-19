@@ -99,7 +99,28 @@ export type SavedCaseDetail = {
   shipmentCases?: ShipmentBatchCase[];
 };
 
+export type AnalysisProgressDetail = {
+  step: string;
+  done: number | null;
+  total: number | null;
+  pages: number | null;
+  fileIndex: number | null;
+  fileCount: number | null;
+};
+
+export type CaseAnalysisProgress = {
+  status: string;
+  progress: number;
+  stage: string | null;
+  etaSeconds: number | null;
+  queuePosition: number | null;
+  detail: AnalysisProgressDetail | null;
+};
+
 export type SavedAnalysisJob = {
+  etaSeconds?: number | null;
+  queuePosition?: number | null;
+  progressDetail?: AnalysisProgressDetail | null;
   id: string;
   caseId: string;
   jobType: string;
@@ -585,6 +606,19 @@ export async function fetchCaseAnalysisStatus(
     caseStatus: payload.caseStatus,
     job: payload.job ?? null,
   };
+}
+
+export async function fetchCaseAnalysisProgress(
+  caseIds: string[],
+  signal?: AbortSignal
+): Promise<Record<string, CaseAnalysisProgress>> {
+  if (!caseIds.length) return {};
+  const response = await performApiFetch(
+    `/api/cases/analysis-progress?ids=${encodeURIComponent(caseIds.join(","))}`,
+    { cache: "no-store", signal }
+  );
+  const { payload } = await readApiResponse<{ progress?: Record<string, CaseAnalysisProgress> }>(response);
+  return response.ok ? payload.progress ?? {} : {};
 }
 
 export async function fetchRecentCases(limit = 12): Promise<RecentCasesResponse> {

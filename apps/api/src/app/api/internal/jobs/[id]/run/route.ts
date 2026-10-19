@@ -486,6 +486,9 @@ export async function POST(
   // Results of finished AI steps are saved on the job, so a retry resumes instead of redoing them.
   const checkpointStore = new Map<string, unknown>(Object.entries(readRecord(jobResult.checkpoint)));
   let checkpointFlush: Promise<void> = Promise.resolve();
+  // Latest step detail for the progress UI; kept in the job result next to the checkpoint.
+  let progressDetail: Record<string, unknown> | null = null;
+  let lastProgress = 0;
   const checkpoint: PipelineCheckpoint = {
     get: <T,>(key: string) => checkpointStore.get(key) as T | undefined,
     set: (key, value) => {
@@ -498,6 +501,7 @@ export async function POST(
               activeRunId: runId,
               activeRunStartedAt: now,
               checkpoint: Object.fromEntries(checkpointStore),
+              ...(progressDetail ? { progressDetail } : {}),
             },
           })
         )
@@ -550,12 +554,33 @@ export async function POST(
         analysisMode,
         comparisonOptions,
         checkpoint,
-        onProgress: async ({ progress, stage }) => {
-          await updateCurrentJob({
-            progress,
-            stage,
-            error: null,
-          });
+        onProgress: async ({ progress, stage, detail }) => {
+          // Parallel steps report out of order; never move the bar backwards.
+          if (progress < lastProgress) return;
+          lastProgress = progress;
+          if (detail) progressDetail = detail;
+          if (!detail) {
+            await updateCurrentJob({ progress, stage, error: null });
+            return;
+          }
+          // Share the serial write chain with checkpoint saves so neither overwrites the other.
+          checkpointFlush = checkpointFlush
+            .then(() =>
+              updateCurrentJob({
+                progress,
+                stage,
+                error: null,
+                result: {
+                  ...jobResult,
+                  activeRunId: runId,
+                  activeRunStartedAt: now,
+                  checkpoint: Object.fromEntries(checkpointStore),
+                  progressDetail: detail,
+                },
+              })
+            )
+            .catch((progressError) => console.warn("Failed to save analysis progress", toMessage(progressError)));
+          await checkpointFlush;
         },
       })
     );

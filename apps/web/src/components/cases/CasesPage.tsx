@@ -28,7 +28,10 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { describeAnalysisStep, formatEta } from "@/lib/analysis-progress";
 import {
+  type CaseAnalysisProgress,
+  fetchCaseAnalysisProgress,
   fetchCasePage,
   recycleCase,
   type SavedCaseRecord,
@@ -185,6 +188,7 @@ export function CasesPage() {
   const [cacheEpoch,setCacheEpoch]=useState(accessCacheEpoch);
   useEffect(()=>{const reset=()=>{setCacheEpoch(accessCacheEpoch());setCases([]);setTotalCount(0);setPendingCase(null);};window.addEventListener('kalika-access-invalidated',reset);return()=>window.removeEventListener('kalika-access-invalidated',reset);},[]);
   const [cases, setCases] = useState<SavedCaseRecord[]>([]);
+  const [progressByCase, setProgressByCase] = useState<Record<string, CaseAnalysisProgress>>({});
   const [status, setStatus] = useState<LoadState>("loading");
   const [error, setError] = useState<string | null>(null);
 
@@ -305,8 +309,30 @@ export function CasesPage() {
           totalCount: nextTotalCount,
           totalPages: nextTotalPages,
         });
-        if (payload.cases.some((item) => item.status === "processing" || item.status === "queued")) {
-          refreshTimer = setTimeout(refresh, 5000);
+        const activeIds = payload.cases
+          .filter((item) => item.status === "processing" || item.status === "queued")
+          .map((item) => item.id);
+        if (activeIds.length) {
+          // Progress and time left for the rows that are still being analysed.
+          fetchCaseAnalysisProgress(activeIds, controller.signal)
+            .then((next) => {
+              if (controller.signal.aborted) return;
+              // A retry restarts the job at 0; keep the bar from stepping back between polls.
+              setProgressByCase((previous) =>
+                Object.fromEntries(
+                  Object.entries(next).map(([caseId, live]) => [
+                    caseId,
+                    previous[caseId]?.status === "running" && live.status === "running"
+                      ? { ...live, progress: Math.max(live.progress, previous[caseId].progress) }
+                      : live,
+                  ])
+                )
+              );
+            })
+            .catch(() => undefined);
+          refreshTimer = setTimeout(refresh, 4000);
+        } else {
+          setProgressByCase({});
         }
       })
       .catch((loadError) => {
@@ -535,6 +561,31 @@ export function CasesPage() {
                               <span className={`h-1.5 w-1.5 rounded-full ${pill.dotColor}`} />
                               {pill.label}
                             </span>
+                            {(item.status === "processing" || item.status === "queued") && (() => {
+                              const live = progressByCase[item.id];
+                              if (!live) return null;
+                              const eta = live.status === "running" ? formatEta(live.etaSeconds) : null;
+                              const stepLabel = describeAnalysisStep({
+                                status: live.status,
+                                stage: live.stage,
+                                detail: live.detail,
+                                queuePosition: live.queuePosition,
+                              });
+                              return (
+                                <div className="mt-1.5 w-44" title={stepLabel}>
+                                  <div className="h-1 overflow-hidden rounded-full bg-[#ece8e0]">
+                                    <div
+                                      className="h-full rounded-full bg-[#2b6cb0] transition-all duration-500"
+                                      style={{ width: `${live.status === "queued" ? 4 : Math.min(100, Math.max(4, live.progress))}%` }}
+                                    />
+                                  </div>
+                                  <div className="mt-0.5 flex justify-between gap-2 text-[10px] text-[#8a7f72]">
+                                    <span className="truncate">{live.status === "queued" ? stepLabel : `${Math.round(live.progress)}%`}</span>
+                                    {eta ? <span className="shrink-0">{eta}</span> : null}
+                                  </div>
+                                </div>
+                              );
+                            })()}
                           </TableCell>
 
                           {/* Reconciliation */}

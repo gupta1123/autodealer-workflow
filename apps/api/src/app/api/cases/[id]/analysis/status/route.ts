@@ -4,6 +4,7 @@ import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
   getLatestProcessingJob,
+  getQueuePositions,
   mapProcessingJob,
   settleOrphanedProcessingCase,
 } from "@/lib/processing/jobs";
@@ -49,9 +50,10 @@ async function GETHandler(
     }
 
     const job = await getLatestProcessingJob(id);
+    const positions = job ? await getQueuePositions([job]) : new Map<string, number>();
     return jsonWithCors(request, {
       caseStatus,
-      job: mapProcessingJob(job),
+      job: mapProcessingJob(job, job ? positions.get(job.id) : null),
     });
   } catch (error) {
     return jsonWithCors(

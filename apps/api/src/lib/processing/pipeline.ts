@@ -4776,17 +4776,20 @@ async function splitPdfIntoDocumentGroups(params: {
   fileName: string;
   textPages: string[];
   pageImages: string[];
+  onBatchDone?: (done: number, total: number) => Promise<void> | void;
 }): Promise<PdfDocumentGroup[]> {
   const pageCount = Math.max(params.textPages.length, params.pageImages.length);
   if (pageCount <= 1 || !params.pageImages.length) {
     return splitPdfBatchIntoDocumentGroups(params);
   }
   const batches = planImageBatches(params.pageImages, pageCount);
+  await params.onBatchDone?.(0, batches.length);
+  let batchesDone = 0;
   // Batches are independent (each already shares a boundary page with the next), so they run in
   // parallel; mergeOverlappingPageGroups sorts the combined result by page.
   const batchResults = await mapWithConcurrency(batches, PACKET_AI_CONCURRENCY, async (batch) => {
     console.info(`[packet-processing] grouping pages ${batch.start + 1}-${batch.end} of ${pageCount}; imageBytes=${batch.bytes}`);
-    return runWithImageSizeFallback(batch.start, batch.end, async (start, end) => {
+    const batchGroups = await runWithImageSizeFallback(batch.start, batch.end, async (start, end) => {
       const localGroups = await splitPdfBatchIntoDocumentGroups({
         fileName: params.fileName,
         textPages: params.textPages.slice(start, end),
@@ -4794,6 +4797,9 @@ async function splitPdfIntoDocumentGroups(params: {
       });
       return localGroups.map((group) => ({ ...group, pageStart: group.pageStart + start, pageEnd: group.pageEnd + start }));
     });
+    batchesDone += 1;
+    await params.onBatchDone?.(batchesDone, batches.length);
+    return batchGroups;
   });
   return mergeOverlappingPageGroups(batchResults.flat());
 }
@@ -5026,7 +5032,7 @@ async function extractPdfDocumentGroups(params: {
   pageImages: string[];
   groups: PdfDocumentGroup[];
   checkpoint?: PipelineCheckpoint;
-  onGroupProgress?: (details: { current: number; total: number; group: PdfDocumentGroup }) => Promise<void> | void;
+  onGroupProgress?: (details: { done: number; total: number }) => Promise<void> | void;
 }) {
   const hasText = hasMeaningfulTextPages(params.textPages);
   const distinctGroups = dropRedundantPdfGroups(params.groups);
@@ -5042,13 +5048,7 @@ async function extractPdfDocumentGroups(params: {
     );
   }
 
-  return mapWithConcurrency(groups, PACKET_AI_CONCURRENCY, async (group, index) => {
-    await params.onGroupProgress?.({
-      current: index + 1,
-      total: groups.length,
-      group,
-    });
-
+  const extractGroup = async (group: PdfDocumentGroup): Promise<CaseDoc> => {
     const checkpointKey = pdfGroupCheckpointKey(group);
     const savedDocument = params.checkpoint?.get<CaseDoc>(checkpointKey);
     if (savedDocument) return savedDocument;
@@ -5136,6 +5136,16 @@ async function extractPdfDocumentGroups(params: {
     document.sourceFileName = params.fileName;
     document.pages = Math.max(1, group.pageEnd - group.pageStart + 1);
     await params.checkpoint?.set(checkpointKey, document);
+    return document;
+  };
+
+  // Progress counts finished groups (not started ones): groups run in parallel and finish out of order.
+  let groupsDone = 0;
+  await params.onGroupProgress?.({ done: 0, total: groups.length });
+  return mapWithConcurrency(groups, PACKET_AI_CONCURRENCY, async (group) => {
+    const document = await extractGroup(group);
+    groupsDone += 1;
+    await params.onGroupProgress?.({ done: groupsDone, total: groups.length });
     return document;
   });
 }
@@ -5494,6 +5504,16 @@ export function verifyProcessedDocuments(
   return buildProcessedVerificationResult(verificationResult);
 }
 
+// Structured progress for the UI: which step is running and how many of its units have finished.
+export type ProgressDetail = {
+  step: "render" | "group" | "extract";
+  done: number;
+  total: number;
+  pages?: number;
+  fileIndex?: number;
+  fileCount?: number;
+};
+
 // Extracts every document from one file (image or PDF). Shared by stored-case processing and the
 // extraction test endpoint so both run the same classification and extraction path.
 export async function extractFileDocuments(params: {
@@ -5503,7 +5523,7 @@ export async function extractFileDocuments(params: {
   analysisMode: CaseAnalysisMode;
   position?: string;
   checkpoint?: PipelineCheckpoint;
-  onProgress?: (phase: number, stage: string) => Promise<void> | void;
+  onProgress?: (phase: number, stage: string, detail?: ProgressDetail) => Promise<void> | void;
 }): Promise<CaseDoc[]> {
   const { bytes, fileName, analysisMode } = params;
   const position = params.position ?? "1 of 1";
@@ -5529,7 +5549,7 @@ export async function extractFileDocuments(params: {
   } else if (mimeType === "application/pdf") {
     const textPages = await extractPdfTextPages(bytes.slice());
     if (analysisMode === "smart_split") {
-      await params.onProgress?.(0.18, `Organizing PDF ${position}: ${fileName}`);
+      await params.onProgress?.(0.02, `Rendering PDF pages (${position})`, { step: "render", done: 0, total: 1 });
 
       const savedGroups = params.checkpoint?.get<PdfDocumentGroup[]>("groups");
       const allGroupsExtracted =
@@ -5565,6 +5585,14 @@ export async function extractFileDocuments(params: {
         );
       }
 
+      if (!savedGroups) {
+        await params.onProgress?.(0.06, `Finding documents in the PDF (${position})`, {
+          step: "group",
+          done: 0,
+          total: 1,
+          pages: Math.max(textPages.length, pageImages.length),
+        });
+      }
       const groups =
         savedGroups ??
         (await timeStage("group", () =>
@@ -5572,6 +5600,13 @@ export async function extractFileDocuments(params: {
             fileName,
             textPages,
             pageImages,
+            onBatchDone: async (done, total) => {
+              await params.onProgress?.(
+                0.06 + (done / Math.max(1, total)) * 0.19,
+                `Finding documents in the PDF (${position})`,
+                { step: "group", done, total, pages: Math.max(textPages.length, pageImages.length) }
+              );
+            },
           })
         ));
       if (!savedGroups) await params.checkpoint?.set("groups", groups);
@@ -5582,10 +5617,11 @@ export async function extractFileDocuments(params: {
         pageImages,
         groups,
         checkpoint: params.checkpoint,
-        onGroupProgress: async ({ current, total, group }) => {
+        onGroupProgress: async ({ done, total }) => {
           await params.onProgress?.(
-            0.2 + (current / Math.max(1, total)) * 0.72,
-            `Extracting document ${current} of ${total} from PDF ${position}: ${formatDocType(group.documentType)}`
+            0.25 + (done / Math.max(1, total)) * 0.75,
+            `Extracting documents: ${done} of ${total} done`,
+            { step: "extract", done, total }
           );
         },
       }));
@@ -5682,7 +5718,7 @@ export async function processStoredCaseFiles(params: {
   analysisMode?: CaseAnalysisMode;
   comparisonOptions?: unknown;
   checkpoint?: PipelineCheckpoint;
-  onProgress?: (details: { progress: number; stage: string }) => Promise<void> | void;
+  onProgress?: (details: { progress: number; stage: string; detail?: ProgressDetail }) => Promise<void> | void;
 }) {
   const supabase = createSupabaseAdminClient();
   if(process.env.TEAM_ACCESS_ENFORCEMENT==='true'&&!params.fieldConfiguration) {
@@ -5737,7 +5773,12 @@ export async function processStoredCaseFiles(params: {
       analysisMode,
       checkpoint: fileCheckpoint,
       position: `${index + 1} of ${files.length}`,
-      onProgress: (phase, stage) => params.onProgress?.({ progress: fileProgress(phase), stage }),
+      onProgress: (phase, stage, detail) =>
+        params.onProgress?.({
+          progress: fileProgress(phase),
+          stage,
+          detail: detail && { ...detail, fileIndex: index + 1, fileCount: files.length },
+        }),
     });
     documents.push(...fileDocuments);
   }
@@ -5757,7 +5798,7 @@ export async function finalizeExtractedDocuments(params: {
   comparisonOptions: ReturnType<typeof readComparisonOptions>;
   analysisMode: CaseAnalysisMode;
   fieldConfiguration: Awaited<ReturnType<typeof getPersistedPacketFieldConfiguration>>;
-  onProgress?: (details: { progress: number; stage: string }) => Promise<void> | void;
+  onProgress?: (details: { progress: number; stage: string; detail?: ProgressDetail }) => Promise<void> | void;
 }) {
   const { comparisonOptions, analysisMode, fieldConfiguration } = params;
   const canonicalDocuments = collapseDuplicateInvoiceCopies(params.documents);

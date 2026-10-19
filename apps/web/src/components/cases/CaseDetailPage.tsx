@@ -58,6 +58,7 @@ import { isLineItemMismatchField } from "@/lib/line-items";
 import {
   appendCaseFiles,
   enqueueCaseAnalysis,
+  type AnalysisProgressDetail,
   fetchCaseAnalysisStatus,
   fetchCaseDetail,
   fetchCaseDetailPreferCache,
@@ -67,6 +68,7 @@ import {
   type CaseDecision,
   type SavedCaseDetail,
 } from "@/lib/case-persistence";
+import { describeAnalysisStep, formatEta } from "@/lib/analysis-progress";
 import { readUploadGroupMeta } from "@/lib/upload-groups";
 import type {
   CaseAnalysisMode,
@@ -1228,6 +1230,12 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   const [analysisStatus, setAnalysisStatus] = useState<"idle" | "processing" | "error">("idle");
   const [analysisProgress, setAnalysisProgress] = useState(0);
   const [analysisStage, setAnalysisStage] = useState<string | null>(null);
+  const [analysisLive, setAnalysisLive] = useState<{
+    jobStatus: string | null;
+    etaSeconds: number | null;
+    queuePosition: number | null;
+    detail: AnalysisProgressDetail | null;
+  } | null>(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [analysisOptionsOpen, setAnalysisOptionsOpen] = useState(false);
   const [pendingAnalysisMode, setPendingAnalysisMode] = useState<CaseAnalysisMode>("standard");
@@ -1343,6 +1351,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     let active = true;
     let timeoutId: number | undefined;
     let pollCount = 0;
+    let shownProgress = 0;
 
     const scheduleNext = () => {
       if (!active) return;
@@ -1383,8 +1392,16 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
         }
 
         setAnalysisStatus("processing");
-        setAnalysisProgress(nextStatus.job?.progress ?? 0);
+        // Parallel steps and retries can report a lower number than before; never step back.
+        shownProgress = Math.max(shownProgress, nextStatus.job?.progress ?? 0);
+        setAnalysisProgress(shownProgress);
         setAnalysisStage(nextStatus.job?.stage ?? null);
+        setAnalysisLive({
+          jobStatus: nextStatus.job?.status ?? null,
+          etaSeconds: nextStatus.job?.etaSeconds ?? null,
+          queuePosition: nextStatus.job?.queuePosition ?? null,
+          detail: nextStatus.job?.progressDetail ?? null,
+        });
         setAnalysisError(nextStatus.job?.status === "failed" ? nextStatus.job.error ?? null : null);
         scheduleNext();
       } catch (statusError) {
@@ -2027,7 +2044,16 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   ) {
     const isAnalyzing = detail.case.status === "processing" || analysisStatus === "processing";
     const canRetry = detail.case.status === "failed";
-    const stageLabel = getFriendlyAnalysisStage(analysisStage, analysisStatus);
+    const stageLabel =
+      analysisStatus === "processing" && analysisLive
+        ? describeAnalysisStep({
+            status: analysisLive.jobStatus,
+            stage: analysisStage,
+            detail: analysisLive.detail,
+            queuePosition: analysisLive.queuePosition,
+          })
+        : getFriendlyAnalysisStage(analysisStage, analysisStatus);
+    const etaLabel = analysisLive?.jobStatus === "running" ? formatEta(analysisLive.etaSeconds) : null;
     const readyCount = detail.files.length;
     const isRecycled = Boolean(detail.case.deletedAt);
 
@@ -2093,6 +2119,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
                       <span>{stageLabel}</span>
                       <span>{analysisProgress}%</span>
                     </div>
+                    {etaLabel ? <div className="text-xs font-normal text-[#8a7f72]">{etaLabel}</div> : null}
                     <div className="h-2.5 overflow-hidden rounded-full bg-[#ece8e0]">
                       <div
                         className="h-full rounded-full bg-[#1a1a1a] transition-all duration-300 ease-out"
