@@ -47,6 +47,37 @@ export function mapProcessingJob(job: ProcessingJobRow | null) {
   };
 }
 
+/**
+ * A case marked "processing" with no queued or running job is stuck (the job was
+ * cancelled when the case was recycled, or the worker died). Put it back into a
+ * usable state and return the new status, or null when nothing needed fixing.
+ */
+export async function settleOrphanedProcessingCase(caseId: string) {
+  const supabase = createSupabaseAdminClient();
+  const latestJob = await getLatestProcessingJob(caseId);
+  if (latestJob && (latestJob.status === "queued" || latestJob.status === "running")) {
+    return null;
+  }
+
+  const documents = await supabase
+    .from("packet_documents")
+    .select("id", { count: "exact", head: true })
+    .eq("case_id", caseId);
+  if (documents.error) throw documents.error;
+
+  const nextStatus =
+    latestJob?.status === "failed" ? "failed" : (documents.count ?? 0) > 0 ? "completed" : "draft";
+  const updated = await supabase
+    .from("packet_cases")
+    .update({ status: nextStatus })
+    .eq("id", caseId)
+    .eq("status", "processing")
+    .select("status")
+    .maybeSingle();
+  if (updated.error) throw updated.error;
+  return (updated.data?.status as string | undefined) ?? null;
+}
+
 export async function getLatestProcessingJob(caseId: string) {
   const supabase = createSupabaseAdminClient();
   const { data, error } = await supabase

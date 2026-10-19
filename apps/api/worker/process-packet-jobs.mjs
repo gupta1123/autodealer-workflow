@@ -66,7 +66,9 @@ const WORKER_POOL =
 const WORKER_NAME = process.env.WORKER_NAME || `${WORKER_POOL}-worker-${process.pid}`;
 const WORKER_POLL_INTERVAL_MS = Number(process.env.WORKER_POLL_INTERVAL_MS ?? 5000);
 const HEROKU_ROUTER_TIMEOUT_GRACE_MS = Number(process.env.HEROKU_ROUTER_TIMEOUT_GRACE_MS ?? 29_000);
-const WORKER_STALE_RUNNING_JOB_MS = Number(process.env.WORKER_STALE_RUNNING_JOB_MS ?? 20 * 60_000);
+// The run route refreshes locked_at every 30 s, so a run silent for 3 min is really gone.
+const WORKER_STALE_RUNNING_JOB_MS = Number(process.env.WORKER_STALE_RUNNING_JOB_MS ?? 3 * 60_000);
+const WORKER_PACKET_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.WORKER_PACKET_CONCURRENCY ?? 2) || 2));
 const WORKER_STALE_RUNNING_JOB_INTERVAL = `${Math.max(1, Math.round(WORKER_STALE_RUNNING_JOB_MS / 60_000))} minutes`;
 const WORKER_IN_FLIGHT_WAIT_MS = Number(process.env.WORKER_IN_FLIGHT_WAIT_MS ?? 2 * 60_000);
 const WORKER_IN_FLIGHT_POLL_MS = Number(process.env.WORKER_IN_FLIGHT_POLL_MS ?? 5_000);
@@ -188,6 +190,11 @@ if (!WORKER_SECRET) {
 if (!APP_BASE_URL) {
   throw new Error("APP_BASE_URL is required for the worker.");
 }
+
+const STORAGE_CLEANUP_INTERVAL_MS = Math.max(
+  60_000,
+  Number(process.env.STORAGE_CLEANUP_INTERVAL_MS) || 10 * 60_000
+);
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false },
@@ -2393,15 +2400,14 @@ async function recoverStaleRunningJobs() {
 async function claimNextJob() {
   await recoverStaleRunningJobs();
 
-  // Also respect analyses already running when this worker restarted or lost
-  // its router connection; never start another packet just because dispatch ended.
-  const { data: active, error: activeError } = await supabase
-    .from("packet_processing_jobs").select("id").eq("status", "running").limit(1).maybeSingle();
+  // Count analyses already running, including ones this worker no longer tracks after a
+  // restart or a lost router connection; never exceed the concurrency cap.
+  const { count: runningCount, error: activeError } = await supabase
+    .from("packet_processing_jobs")
+    .select("id", { count: "exact", head: true })
+    .eq("status", "running");
   if (activeError) throw activeError;
-  if (active?.id) {
-    await waitForInFlightRun(active.id);
-    return null;
-  }
+  if ((runningCount ?? 0) >= WORKER_PACKET_CONCURRENCY) return null;
 
   const { data, error } = await supabase.rpc("claim_packet_processing_job", {
     worker_name: WORKER_NAME,
@@ -2525,12 +2531,36 @@ async function waitForInFlightRun(jobId) {
   });
 }
 
+async function dispatchPacketJob(job) {
+  try {
+    await runJob(job);
+    console.log(`[worker] completed packet job ${job.id}`);
+  } catch (error) {
+    try {
+      const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
+      if (error instanceof JobMayStillBeRunningError) {
+        console.warn(`[worker] job ${job.id} exceeded router timeout; waiting for in-flight run instead of requeueing`);
+        const latestJob = await waitForInFlightRun(job.id);
+        if (latestJob?.status === "running") {
+          console.warn(`[worker] job ${job.id} is still running; leaving it locked for stale recovery`);
+        }
+        return;
+      }
+      console.error(`[worker] dispatch failed for job ${job.id}: ${message}`);
+      await requeueJob(job.id, message);
+    } catch (handlingError) {
+      console.error(`[worker] could not settle packet job ${job.id}: ${formatError(handlingError)}`);
+    }
+  }
+}
+
 async function main() {
   console.log(
     `[worker] started name=${WORKER_NAME} pool=${WORKER_POOL} appBase=${APP_BASE_URL} pollMs=${WORKER_POLL_INTERVAL_MS} bankPdfMode=adaptive_ai batchPages=${BANK_STATEMENT_BATCH_PAGE_SIZE} concurrency=${BANK_STATEMENT_BATCH_CONCURRENCY}`
   );
   let lastIdleLogAt = 0;
   let lastLeaseCleanupAt = 0;
+  let lastStorageCleanupAt = 0;
   const workerWake = createCoalescingWakeSignal();
   startPostgresJobWake({
     connectionString: resolvePostgresWakeUrl(),
@@ -2569,6 +2599,25 @@ async function main() {
         const { error } = await supabase.rpc("quarantine_expired_tally_commands");
         if (error && error.code !== "PGRST202") {
           console.warn("[worker] command lease cleanup unavailable:", error.code);
+        }
+      }
+      if (Date.now() - lastStorageCleanupAt >= STORAGE_CLEANUP_INTERVAL_MS) {
+        lastStorageCleanupAt = Date.now();
+        try {
+          const response = await fetch(`${APP_BASE_URL}/api/internal/storage-cleanup`, {
+            method: "POST",
+            headers: { "x-worker-secret": WORKER_SECRET },
+          });
+          if (response.ok) {
+            const summary = await response.json().catch(() => null);
+            if (summary && (summary.removed || summary.failed)) {
+              console.log(`[worker] storage cleanup removed=${summary.removed} retained=${summary.retained} failed=${summary.failed}`);
+            }
+          } else {
+            console.warn(`[worker] storage cleanup returned ${response.status}; will retry`);
+          }
+        } catch {
+          console.warn("[worker] storage cleanup unavailable; will retry");
         }
       }
       const tallyQueueJob = await claimNextTallyQueueJob();
@@ -2614,25 +2663,12 @@ async function main() {
         continue;
       }
 
-      try {
-        console.log(
-          `[worker] claimed packet job ${job.id} case=${job.case_id ?? "<unknown>"} attempt=${job.attempt_count ?? "?"}/${job.max_attempts ?? "?"}`
-        );
-        await runJob(job);
-        console.log(`[worker] completed packet job ${job.id}`);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
-        if (error instanceof JobMayStillBeRunningError) {
-          console.warn(`[worker] job ${job.id} exceeded router timeout; waiting for in-flight run instead of requeueing`);
-          const latestJob = await waitForInFlightRun(job.id);
-          if (latestJob?.status === "running") {
-            console.warn(`[worker] job ${job.id} is still running; leaving it locked for stale recovery`);
-          }
-          continue;
-        }
-        console.error(`[worker] dispatch failed for job ${job.id}: ${message}`);
-        await requeueJob(job.id, message);
-      }
+      // Packet analyses run in the background so a long one neither blocks the
+      // other queues nor the next packet (up to WORKER_PACKET_CONCURRENCY at once).
+      console.log(
+        `[worker] claimed packet job ${job.id} case=${job.case_id ?? "<unknown>"} attempt=${job.attempt_count ?? "?"}/${job.max_attempts ?? "?"}`
+      );
+      void dispatchPacketJob(job).finally(() => workerWake.notify());
     } catch (error) {
       const message = formatError(error);
       console.error(`[worker] polling failed: ${message}`);

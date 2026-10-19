@@ -2,7 +2,7 @@ import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { listAccessPredicate } from "@/lib/access/list-scope";
-import { AccessError, requireAccessContext } from "@/lib/access/server";
+import { AccessError, requireAccessContext, requirePermission } from "@/lib/access/server";
 import {
   getMismatchResolutionStatusForCaseDecision,
   isMismatchResolutionSchemaMissing,
@@ -35,6 +35,8 @@ import {
   readStoredLineItems,
   stripStoredLineItems,
 } from "@/lib/line-items";
+import { publicErrorMessage } from "@/lib/api/public-error";
+import { settleOrphanedProcessingCase } from "@/lib/processing/jobs";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import {
   enqueueStorageCleanup,
@@ -248,46 +250,44 @@ function isRecycleBinSchemaMissing(error: unknown) {
 }
 
 function serializeError(error: unknown) {
-  if (error instanceof Error) {
-    return error.message;
+  return publicErrorMessage(error);
+}
+
+// With team enforcement on, withTeamAccess already checks the exact permission per
+// method/action. Before enforcement the handlers only scoped rows by 'purchases.view',
+// which let any viewer recycle, restore, decide or permanently delete a case.
+async function requireLegacyPermission(request: Request, permission: string) {
+  if (process.env.TEAM_ACCESS_ENFORCEMENT === "true") return;
+  await requirePermission(request, permission);
+}
+
+// Recycle-bin mutations should tell the user why they were refused (permission,
+// or the DB guard that keeps cases with posting/approval history) instead of a bare 500.
+function recycleFailureResponse(request: Request, error: unknown) {
+  if (error instanceof AccessError) {
+    return jsonWithCors(request, { error: error.message }, { status: error.status });
   }
 
   if (error && typeof error === "object") {
     const record = error as Record<string, unknown>;
-    const parts: string[] = [];
-
-    const message = [record.message, record.error_description, record.error].find(
-      (value): value is string => typeof value === "string" && value.trim().length > 0
-    );
-
-    if (message) {
-      parts.push(message);
+    const code = typeof record.code === "string" ? record.code : "";
+    if (code === "55000") {
+      const message =
+        typeof record.message === "string" && record.message.trim()
+          ? record.message
+          : "This case has purchase, approval or ERP history and cannot be deleted permanently.";
+      return jsonWithCors(request, { error: message }, { status: 409 });
     }
-    if (typeof record.details === "string" && record.details.trim().length > 0) {
-      parts.push(record.details);
+    if (code === "42501") {
+      return jsonWithCors(
+        request,
+        { error: "Your current access does not permit this action." },
+        { status: 403 }
+      );
     }
-    if (typeof record.hint === "string" && record.hint.trim().length > 0) {
-      parts.push(`Hint: ${record.hint}`);
-    }
-
-    if (parts.length > 0) {
-      const combined = parts.join(" ");
-      if (/deleted_at|deleted_by_user_id/i.test(combined)) {
-        return `${combined} Run the recycle bin migration in Supabase using supabase/packet_recycle_bin_backend_v3.sql, then retry.`;
-      }
-      if (/packet_cases_status_check|violates check constraint/i.test(combined)) {
-        return `${combined} Run the case draft migration in Supabase using supabase/packet_case_draft_backend_v5.sql, then retry.`;
-      }
-      if (/resolution_status|resolved_at/i.test(combined)) {
-        return `${combined} Run the mismatch resolution migration in Supabase using supabase/packet_mismatch_resolution_backend_v8.sql, then retry.`;
-      }
-      return combined;
-    }
-
-    return JSON.stringify(error);
   }
 
-  return String(error ?? "Unknown error");
+  return null;
 }
 
 async function fetchCaseMismatches(
@@ -637,6 +637,8 @@ async function DELETEHandler(
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }
 
+    await requireLegacyPermission(request, mode === "hard" ? "purchases.delete" : "purchases.recycle");
+
     const supabase = createSupabaseAdminClient();
 
     if (mode === "hard") {
@@ -828,9 +830,31 @@ async function DELETEHandler(
       };
     }
 
+    // Queued analysis for a recycled case is pointless and would rewrite its data;
+    // the job runner also refuses recycled cases for jobs that were already claimed.
+    const cancelQueued = await supabase
+      .from("packet_processing_jobs")
+      .update({
+        status: "cancelled",
+        error: "Case was moved to the recycle bin.",
+        finished_at: new Date().toISOString(),
+      })
+      .eq("case_id", id)
+      .eq("status", "queued");
+    if (cancelQueued.error) {
+      console.error("Failed to cancel queued jobs for recycled case", id, cancelQueued.error);
+    } else {
+      // A cancelled job must not leave the case showing "processing" forever.
+      await settleOrphanedProcessingCase(id).catch((settleError) =>
+        console.error("Failed to release a stuck processing case", id, settleError)
+      );
+    }
+
     return jsonWithCors(request, { case: mapCaseRow(data) });
   } catch (error) {
-    return jsonWithCors(request, 
+    const refusal = recycleFailureResponse(request, error);
+    if (refusal) return refusal;
+    return jsonWithCors(request,
       {
         error: serializeError(error),
       },
@@ -856,6 +880,11 @@ async function PATCHHandler(
       return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     }
 
+    await requireLegacyPermission(
+      request,
+      payload.action === "restore" ? "purchases.recycle" : "purchases.approve"
+    );
+
     const supabase = createSupabaseAdminClient();
 
     if (payload.action === "accept" || payload.action === "reject") {
@@ -863,11 +892,59 @@ async function PATCHHandler(
       const nextMismatchResolutionStatus = getMismatchResolutionStatusForCaseDecision(payload.action);
       const resolvedAt = new Date().toISOString();
 
+      // Preferred path: one database transaction for the case and its mismatches
+      // (packet_case_decide). Row access is checked first with the usual predicate.
+      // If the function is not installed yet, fall through to the two-step path below.
+      const decisionScope = await supabase
+        .from("packet_cases")
+        .select("id, status")
+        .eq("id", id)
+        .or(await listAccessPredicate(request, user.id, 'purchases.view'))
+        .is("deleted_at", null)
+        .maybeSingle();
+      if (decisionScope.error) throw decisionScope.error;
+      if (!decisionScope.data) {
+        return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
+      }
+      if (decisionScope.data.status !== "completed") {
+        const current = decisionScope.data.status as string;
+        const message =
+          current === "accepted" || current === "rejected"
+            ? `This case was already ${current}. A final decision cannot be changed.`
+            : "Only an analysed case can be accepted or rejected. Finish or retry the analysis first.";
+        return jsonWithCors(request, { error: message }, { status: 409 });
+      }
+
+      const decided = await supabase.rpc("packet_case_decide", {
+        p_case_id: id,
+        p_case_status: nextStatus,
+        p_resolution_status: nextMismatchResolutionStatus,
+        p_resolved_at: resolvedAt,
+      });
+      if (!decided.error) {
+        if (decided.data !== true) {
+          return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
+        }
+        const decidedRow = await supabase
+          .from("packet_cases")
+          .select(
+            "id, slug, display_name, buyer_name, po_number, invoice_number, status, risk_score, upload_count, document_count, mismatch_count, created_at, processing_meta, deleted_at"
+          )
+          .eq("id", id)
+          .single();
+        if (decidedRow.error) throw decidedRow.error;
+        return jsonWithCors(request, { case: mapCaseRow(decidedRow.data) });
+      }
+      if (!/PGRST202|42883|42703/.test(`${decided.error.code} ${decided.error.message}`)) {
+        throw decided.error;
+      }
+
       try {
         const result = await supabase
           .from("packet_cases")
           .update({ status: nextStatus })
           .eq("id", id)
+          .eq("status", "completed")
           .or(await listAccessPredicate(request, user.id, 'purchases.view'))
           .is("deleted_at", null)
           .select(
@@ -889,7 +966,8 @@ async function PATCHHandler(
               resolution_status: nextMismatchResolutionStatus,
               resolved_at: resolvedAt,
             })
-            .eq("case_id", id);
+            .eq("case_id", id)
+            .eq("resolution_status", "pending");
 
           if (mismatchUpdate.error && !isMismatchResolutionSchemaMissing(mismatchUpdate.error)) {
             throw mismatchUpdate.error;
@@ -933,7 +1011,8 @@ async function PATCHHandler(
               resolution_status: nextMismatchResolutionStatus,
               resolved_at: resolvedAt,
             })
-            .eq("case_id", id);
+            .eq("case_id", id)
+            .eq("resolution_status", "pending");
 
           if (mismatchUpdate.error && !isMismatchResolutionSchemaMissing(mismatchUpdate.error)) {
             throw mismatchUpdate.error;
@@ -1051,9 +1130,19 @@ async function PATCHHandler(
       };
     }
 
+    if (data.status === "processing") {
+      const settledStatus = await settleOrphanedProcessingCase(id).catch((settleError) => {
+        console.error("Failed to release a stuck processing case", id, settleError);
+        return null;
+      });
+      if (settledStatus) data = { ...data, status: settledStatus };
+    }
+
     return jsonWithCors(request, { case: mapCaseRow(data) });
   } catch (error) {
-    return jsonWithCors(request, 
+    const refusal = recycleFailureResponse(request, error);
+    if (refusal) return refusal;
+    return jsonWithCors(request,
       {
         error: serializeError(error),
       },

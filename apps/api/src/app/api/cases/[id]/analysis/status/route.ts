@@ -2,7 +2,11 @@ import { listAccessPredicate } from '@/lib/access/list-scope';
 import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
-import { getLatestProcessingJob, mapProcessingJob } from "@/lib/processing/jobs";
+import {
+  getLatestProcessingJob,
+  mapProcessingJob,
+  settleOrphanedProcessingCase,
+} from "@/lib/processing/jobs";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 
 async function GETHandler(
@@ -33,9 +37,20 @@ async function GETHandler(
       return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
     }
 
+    let caseStatus = caseRow.status as string;
+    if (caseStatus === "processing") {
+      // No queued/running job behind a "processing" case means it is stuck
+      // (cancelled with the recycle bin, or a dead worker); release it.
+      try {
+        caseStatus = (await settleOrphanedProcessingCase(id)) ?? caseStatus;
+      } catch (settleError) {
+        console.error("Failed to release a stuck processing case", id, settleError);
+      }
+    }
+
     const job = await getLatestProcessingJob(id);
     return jsonWithCors(request, {
-      caseStatus: caseRow.status,
+      caseStatus,
       job: mapProcessingJob(job),
     });
   } catch (error) {

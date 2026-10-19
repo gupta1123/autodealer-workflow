@@ -124,6 +124,54 @@ export function runWithAiTestOverrides<T>(overrides: AiTestOverrides, run: () =>
   return aiTestContext.run(overrides, run);
 }
 
+// Per-run timing totals. A run that wants them wraps its work in runWithTimings; everything
+// else (bank statements, case naming) sees no store and records nothing.
+export type RunTimings = {
+  aiCalls: number;
+  aiMs: number;
+  aiMaxMs: number;
+  aiRetries: number;
+  stagesMs: Record<string, number>;
+};
+
+export function createRunTimings(): RunTimings {
+  return { aiCalls: 0, aiMs: 0, aiMaxMs: 0, aiRetries: 0, stagesMs: {} };
+}
+
+const runTimingContext = new AsyncLocalStorage<RunTimings>();
+
+export function runWithTimings<T>(timings: RunTimings, run: () => Promise<T>) {
+  return runTimingContext.run(timings, run);
+}
+
+// Stages can overlap (parallel batches), so their sum may exceed the wall-clock time.
+export async function timeStage<T>(name: string, run: () => Promise<T>): Promise<T> {
+  const startedAt = Date.now();
+  try {
+    return await run();
+  } finally {
+    const store = runTimingContext.getStore();
+    if (store) store.stagesMs[name] = (store.stagesMs[name] ?? 0) + (Date.now() - startedAt);
+  }
+}
+
+function recordAiCall(durationMs: number, attempts: number) {
+  const store = runTimingContext.getStore();
+  if (!store) return;
+  store.aiCalls += 1;
+  store.aiMs += durationMs;
+  store.aiMaxMs = Math.max(store.aiMaxMs, durationMs);
+  store.aiRetries += Math.max(0, attempts - 1);
+}
+
+// Page classification and grouping do not need the heavy extraction model or any reasoning.
+// With OPENROUTER_FAST_MODEL unset the call options pass through unchanged.
+export function withFastModel<T extends object>(options: T): T {
+  const model = process.env.OPENROUTER_FAST_MODEL?.trim();
+  if (!model) return options;
+  return { ...options, model, reasoning: { enabled: false, effort: "none" } } as T;
+}
+
 function messageText(message: OpenRouterMessage) {
   return typeof message.content === "string"
     ? message.content
@@ -285,6 +333,7 @@ export async function callOpenRouter(
         usage: payload?.usage ?? null,
         response: content,
       });
+      recordAiCall(Date.now() - callStartedAt, attempt + 1);
       return content;
     } catch (error) {
       clearTimeout(timeoutId);

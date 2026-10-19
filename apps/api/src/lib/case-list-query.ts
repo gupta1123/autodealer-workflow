@@ -29,7 +29,7 @@ export function readCaseCursor(raw:string|null, scope:Scope, sort:Sort): CaseDir
 }
 export function cursorPredicate(cursor:CaseDirectoryCursor, scope:Scope, sort:Sort) {
   const column = scope==='deleted'?'deleted_at':sort==='name'?'display_name':'created_at';
-  const ascending = scope!=='deleted' && sort!=='recent';
+  const ascending = scope==='deleted' ? sort==='oldest' : sort!=='recent';
   const direction = ascending?'gt':'lt';
   const idDirection = scope!=='deleted' && sort==='name'?'gt':'lt';
   const quoted = `"${cursor.sortValue.replace(/\\/g,'\\\\').replace(/"/g,'\\"')}"`;

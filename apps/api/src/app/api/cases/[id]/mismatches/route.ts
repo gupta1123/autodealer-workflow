@@ -69,7 +69,7 @@ async function PATCHHandler(
 
     const { data: caseRow, error: caseError } = await supabase
       .from("packet_cases")
-      .select("id, status, processing_meta")
+      .select("id, status, processing_meta, deleted_at")
       .eq("id", id)
       .or(await listAccessPredicate(request, user.id, 'purchases.view'))
       .single();
@@ -81,7 +81,7 @@ async function PATCHHandler(
       throw caseError;
     }
 
-    if (isCaseRecycled(caseRow.processing_meta)) {
+    if (caseRow.deleted_at || isCaseRecycled(caseRow.processing_meta)) {
       return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
     }
 

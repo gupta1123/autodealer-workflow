@@ -1,5 +1,5 @@
 import { listAccessPredicate } from '@/lib/access/list-scope';
-import {requireAccessContext} from '@/lib/access/server';
+import { AccessError, requireAccessContext } from '@/lib/access/server';
 import { withTeamAccess } from '@/lib/access/route-boundary';
 import { NextResponse } from "next/server";
 
@@ -8,6 +8,8 @@ import {
   optionsWithCors,
 } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { publicErrorMessage } from "@/lib/api/public-error";
+import { caseHasPurchaseHistory } from "@/lib/case-history";
 import {
   getCaseCategoryFromProcessingMeta,
   resolveCaseDisplayName,
@@ -69,20 +71,11 @@ function isRecycleBinSchemaMissing(error: unknown) {
 }
 
 function serializeError(error: unknown) {
-  if (error instanceof Error) return error.message;
-  if (!error || typeof error !== "object") return String(error ?? "Unknown error");
+  return publicErrorMessage(error);
+}
 
-  const record = error as Record<string, unknown>;
-  const combined =
-    [record.message, record.details, record.hint, record.error]
-      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-      .join(" ") || JSON.stringify(error);
-
-  if (/packet_cases_status_check|violates check constraint/i.test(combined)) {
-    return `${combined} Run the case draft migration in Supabase using supabase/packet_case_draft_backend_v5.sql, then retry.`;
-  }
-
-  return combined;
+function json(request: Request, body: unknown, status = 200) {
+  return applyCorsHeaders(NextResponse.json(body, { status }), request);
 }
 
 function parseOptionalJsonField<T>(value: FormDataEntryValue | null): T | null {
@@ -260,7 +253,7 @@ async function POSTHandler(
 
       if (result.error) {
         if (result.error.code === "PGRST116") {
-          return NextResponse.json({ error: "Case not found." }, { status: 404 });
+          return json(request, { error: "Case not found." }, 404);
         }
         throw result.error;
       }
@@ -280,7 +273,7 @@ async function POSTHandler(
 
       if (fallback.error) {
         if (fallback.error.code === "PGRST116") {
-          return NextResponse.json({ error: "Case not found." }, { status: 404 });
+          return json(request, { error: "Case not found." }, 404);
         }
         throw fallback.error;
       }
@@ -289,7 +282,24 @@ async function POSTHandler(
     }
 
     if ((existing.deleted_at ?? null) || isCaseRecycled(existing.processing_meta)) {
-      return NextResponse.json({ error: "Case not found." }, { status: 404 });
+      return json(request, { error: "Case not found." }, 404);
+    }
+
+    // Re-analysing rewrites documents and mismatches, so it must not touch a case
+    // that was already decided or has purchase posting / approval history.
+    if (existing.status === "accepted" || existing.status === "rejected") {
+      return json(
+        request,
+        { error: "This case was already decided and cannot be analysed again." },
+        409
+      );
+    }
+    if (await caseHasPurchaseHistory(supabase, id)) {
+      return json(
+        request,
+        { error: "This case has purchase posting or approval history and cannot be analysed again." },
+        409
+      );
     }
 
     if (!rawDocuments) {
@@ -307,6 +317,45 @@ async function POSTHandler(
           }),
           request
         );
+      }
+
+      // Queue the job before flipping the case to "processing": a case can then
+      // never be left "processing" without a job, and the one-active-job-per-case
+      // index makes a double click return the job that already exists.
+      const { data: insertedJob, error: insertJobError } = await supabase
+        .from("packet_processing_jobs")
+        .insert({
+          case_id: id,
+          owner_user_id: user.id,
+          job_type: "case_analysis",
+          status: "queued",
+          attempt_count: 0,
+          max_attempts: 3,
+          progress: 0,
+          stage: "Queued for analysis",
+          error: null,
+          result: {
+            analysisMode,
+            comparisonOptions,
+          },
+        })
+        .select("*")
+        .single();
+
+      if (insertJobError) {
+        if (insertJobError.code === "23505") {
+          const activeJob = await getLatestProcessingJob(id);
+          if (activeJob && (activeJob.status === "queued" || activeJob.status === "running")) {
+            return applyCorsHeaders(
+              NextResponse.json({
+                case: mapCaseRow({ ...existing, status: "processing" } as Parameters<typeof mapCaseRow>[0]),
+                job: mapProcessingJob(activeJob),
+              }),
+              request
+            );
+          }
+        }
+        throw insertJobError;
       }
 
       const existingMeta =
@@ -374,30 +423,6 @@ async function POSTHandler(
         queuedCase = fallback.data;
       }
 
-      const { data: insertedJob, error: insertJobError } = await supabase
-        .from("packet_processing_jobs")
-        .insert({
-          case_id: id,
-          owner_user_id: user.id,
-          job_type: "case_analysis",
-          status: "queued",
-          attempt_count: 0,
-          max_attempts: 3,
-          progress: 0,
-          stage: "Queued for analysis",
-          error: null,
-          result: {
-            analysisMode,
-            comparisonOptions,
-          },
-        })
-        .select("*")
-        .single();
-
-      if (insertJobError) {
-        throw insertJobError;
-      }
-
       return applyCorsHeaders(
         NextResponse.json({
           case: mapCaseRow(queuedCase),
@@ -415,17 +440,12 @@ async function POSTHandler(
     );
 
     if (!documents.length) {
-      return NextResponse.json(
-        { error: "No processed documents were provided to save." },
-        { status: 400 }
-      );
+      return json(request, { error: "No processed documents were provided to save." }, 400);
     }
 
     const [
       { data: existingDocuments, error: existingDocumentsError },
       { count: uploadCount, error: fileCountError },
-      { error: documentDeleteError },
-      { error: mismatchDeleteError },
     ] = await Promise.all([
       supabase
         .from("packet_documents")
@@ -435,14 +455,10 @@ async function POSTHandler(
         .from("packet_case_files")
         .select("id", { count: "exact", head: true })
         .eq("case_id", id),
-      supabase.from("packet_documents").delete().eq("case_id", id),
-      supabase.from("packet_mismatches").delete().eq("case_id", id),
     ]);
 
     if (existingDocumentsError) throw existingDocumentsError;
     if (fileCountError) throw fileCountError;
-    if (documentDeleteError) throw documentDeleteError;
-    if (mismatchDeleteError) throw mismatchDeleteError;
 
     const documentsWithPersistedStructuredData = enrichDocumentsWithPacketGstTaxContext(
       mergePersistedStructuredData(
@@ -466,21 +482,43 @@ async function POSTHandler(
       markdown: document.md ?? "",
     }));
 
-    const { error: documentInsertError } = await supabase.from("packet_documents").insert(documentRows);
-    if (documentInsertError) throw documentInsertError;
+    const mismatchRows = mismatches.map((mismatch) => ({
+      case_id: id,
+      client_mismatch_id: mismatch.id,
+      field_name: mismatch.field,
+      values_json: mismatch.values ?? [],
+      analysis: mismatch.analysis ?? null,
+      fix_plan: mismatch.fixPlan ?? null,
+    }));
 
-    if (mismatches.length) {
-      const mismatchRows = mismatches.map((mismatch) => ({
-        case_id: id,
-        client_mismatch_id: mismatch.id,
-        field_name: mismatch.field,
-        values_json: mismatch.values ?? [],
-        analysis: mismatch.analysis ?? null,
-        fix_plan: mismatch.fixPlan ?? null,
-      }));
+    // Preferred: swap documents and mismatches in one transaction so a failure can
+    // never leave the case empty. Falls back to delete + insert until the
+    // packet_case_replace_analysis migration is applied.
+    const replaced = await supabase.rpc("packet_case_replace_analysis", {
+      p_case_id: id,
+      // case_id is supplied by the function itself; undefined drops it from the JSON.
+      p_documents: documentRows.map((row) => ({ ...row, case_id: undefined })),
+      p_mismatches: mismatchRows.map((row) => ({ ...row, case_id: undefined })),
+    });
+    if (replaced.error) {
+      if (!/PGRST202|42883/.test(`${replaced.error.code} ${replaced.error.message}`)) {
+        throw replaced.error;
+      }
 
-      const { error: mismatchInsertError } = await supabase.from("packet_mismatches").insert(mismatchRows);
-      if (mismatchInsertError) throw mismatchInsertError;
+      const [{ error: documentDeleteError }, { error: mismatchDeleteError }] = await Promise.all([
+        supabase.from("packet_documents").delete().eq("case_id", id),
+        supabase.from("packet_mismatches").delete().eq("case_id", id),
+      ]);
+      if (documentDeleteError) throw documentDeleteError;
+      if (mismatchDeleteError) throw mismatchDeleteError;
+
+      const { error: documentInsertError } = await supabase.from("packet_documents").insert(documentRows);
+      if (documentInsertError) throw documentInsertError;
+
+      if (mismatchRows.length) {
+        const { error: mismatchInsertError } = await supabase.from("packet_mismatches").insert(mismatchRows);
+        if (mismatchInsertError) throw mismatchInsertError;
+      }
     }
 
     const summary = summarizeCase(
@@ -575,7 +613,10 @@ async function POSTHandler(
 
     return applyCorsHeaders(NextResponse.json({ case: mapCaseRow(updatedCase) }), request);
   } catch (error) {
-    return applyCorsHeaders(NextResponse.json({ error: serializeError(error) }, { status: 500 }), request);
+    if (error instanceof AccessError) {
+      return json(request, { error: error.message }, error.status);
+    }
+    return json(request, { error: serializeError(error) }, 500);
   }
 }
 

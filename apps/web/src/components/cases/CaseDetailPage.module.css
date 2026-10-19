@@ -895,6 +895,20 @@
   text-align: center;
 }
 
+/* The zoom percentage doubles as the "reset zoom" button. */
+.redesignZoomControls .redesignZoomValue {
+  width: auto;
+  min-width: 44px;
+  padding: 0 4px;
+  color: var(--cd-muted);
+  font-size: 11px;
+}
+
+.redesignZoomControls .redesignZoomValue:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
 .redesignViewerStage {
   position: relative;
   min-height: 0;
@@ -1527,15 +1541,18 @@
   align-items: start;
 }
 
+/* Wide screens: the source document is the thing being checked, so it gets a
+   proportional share of the width (about 45%) instead of a capped column. */
 @media (min-width: 1440px) {
   .splitWorkspace {
-    grid-template-columns: minmax(480px, 560px) minmax(560px, 1fr);
+    grid-template-columns: minmax(560px, 5fr) minmax(560px, 6fr);
   }
 }
 
-@media (min-width: 1680px) {
+@media (min-width: 1920px) {
   .splitWorkspace {
-    grid-template-columns: minmax(520px, 600px) minmax(640px, 1fr);
+    grid-template-columns: minmax(760px, 1fr) minmax(720px, 1fr);
+    gap: 20px;
   }
 }
 
@@ -1632,6 +1649,18 @@
   background: #ffffff;
   overflow: hidden;
   box-shadow: 0 1px 3px rgba(43, 26, 16, 0.04);
+}
+
+/* Tall wide screens: fill the viewport below the header and document strip so
+   the panes do not end halfway down the screen. Declared after the base pane
+   rules above so it wins. */
+@media (min-width: 1440px) and (min-height: 760px) {
+  .splitPreviewPane,
+  .splitDataPane {
+    height: calc(100vh - 230px);
+    min-height: 560px;
+    max-height: none;
+  }
 }
 
 .splitDataPaneRoot {

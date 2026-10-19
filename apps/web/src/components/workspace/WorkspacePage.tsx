@@ -1160,10 +1160,14 @@ export function WorkspacePage() {
             <TriangleAlert className="h-5 w-5" />
           </div>
           <div className="min-w-0">
-            <div className="text-sm font-extrabold text-amber-900">Existing case found</div>
+            <div className="text-sm font-extrabold text-amber-900">
+              {duplicateCaseNotice.inRecycleBin ? "Found in your recycle bin" : "Existing case found"}
+            </div>
             <p className="mt-1 text-sm font-medium leading-relaxed text-amber-800">
-              This upload already exists as <span className="font-bold">{duplicateCaseNotice.displayName}</span>.
+              This upload already exists as <span className="font-bold">{duplicateCaseNotice.displayName}</span>
+              {duplicateCaseNotice.inRecycleBin ? ", which is in the recycle bin" : ""}.
               Created {formatDuplicateCaseDate(duplicateCaseNotice.createdAt)}.
+              {duplicateCaseNotice.inRecycleBin ? " Open it to restore it." : ""}
             </p>
           </div>
         </div>
@@ -1181,7 +1185,7 @@ export function WorkspacePage() {
             className="rounded-xl bg-amber-900 text-white hover:bg-amber-950"
             onClick={() => router.replace(`/cases/${duplicateCaseNotice.id}`)}
           >
-            Open existing case
+            {duplicateCaseNotice.inRecycleBin ? "Open and restore" : "Open existing case"}
           </Button>
         </div>
       </div>

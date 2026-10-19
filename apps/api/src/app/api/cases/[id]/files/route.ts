@@ -2,6 +2,8 @@ import { withTeamAccess } from '@/lib/access/route-boundary';
 import { applyCorsHeaders, jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { NextResponse } from 'next/server';
 import { requireRequestUser } from "@/lib/api/request-auth";
+import { publicErrorMessage } from "@/lib/api/public-error";
+import { caseHasPurchaseHistory } from "@/lib/case-history";
 import { listAccessPredicate } from "@/lib/access/list-scope";
 import { AccessError, requireAccessContext } from "@/lib/access/server";
 
@@ -78,13 +80,7 @@ function parseUploadGroups(value: FormDataEntryValue | null) {
 }
 
 function serializeError(error: unknown) {
-  if (error instanceof Error) return error.message;
-  if (!error || typeof error !== "object") return String(error ?? "Unknown error");
-
-  const record = error as Record<string, unknown>;
-  return [record.message, record.details, record.hint, record.error]
-    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
-    .join(" ") || JSON.stringify(error);
+  return publicErrorMessage(error);
 }
 
 function mapCaseRow(row: {
@@ -198,9 +194,9 @@ async function GETHandler(
       };
     }
 
-    if ((existing.deleted_at ?? null) || isCaseRecycled(existing.processing_meta)) {
-      return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
-    }
+    // Recycled cases stay viewable (read-only) so the bin's "View" link can show
+    // their documents; only the write handlers below refuse recycled cases.
+    void existing;
 
     const { data: file, error: fileError } = await supabase
       .from("packet_case_files")
@@ -347,6 +343,26 @@ async function POSTHandler(
 
     if ((existing.deleted_at ?? null) || isCaseRecycled(existing.processing_meta)) {
       return jsonWithCors(request, { error: "Case not found." }, { status: 404 });
+    }
+
+    // Files change what the analysis was based on, so only editable cases accept them.
+    if (existing.status === "processing") {
+      return jsonWithCors(
+        request,
+        { error: "This case is being analysed. Wait for it to finish before adding documents." },
+        { status: 409 }
+      );
+    }
+    if (
+      existing.status === "accepted" ||
+      existing.status === "rejected" ||
+      (await caseHasPurchaseHistory(supabase, id))
+    ) {
+      return jsonWithCors(
+        request,
+        { error: "Documents cannot be changed on a decided or posted case." },
+        { status: 409 }
+      );
     }
 
     let oldFiles: Array<{

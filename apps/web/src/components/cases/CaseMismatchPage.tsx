@@ -36,6 +36,7 @@ import {
 import { isLineItemMismatchField } from "@/lib/line-items";
 import {
   fetchCaseDetail,
+  restoreCase,
   updateCaseDecision,
   updateCaseMismatchDecisions,
   updateCaseMismatchDecision,
@@ -749,6 +750,8 @@ function MismatchReviewSkeleton() {
 
 export function CaseMismatchPage({ caseId }: { caseId: string }) {
   const [detail, setDetail] = useState<SavedCaseDetail | null>(null);
+  const [restoringFromBin, setRestoringFromBin] = useState(false);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
   const [status, setStatus] = useState<LoadState>("loading");
   const [error, setError] = useState<string | null>(null);
   const [activeMismatchId, setActiveMismatchId] = useState<string | null>(null);
@@ -1193,6 +1196,44 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
             />
           ) : null}
         </header>
+
+        {detail?.case.deletedAt ? (
+          <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-[#f2c7c4] bg-[#fbf0ef] px-4 py-2.5 text-xs text-[#8c1d18] sm:px-6">
+            <p className="font-medium">
+              This case is in the recycle bin. It is read-only and cannot be reviewed or posted to Tally until you restore it.
+              {restoreError ? <span className="ml-2 font-semibold">{restoreError}</span> : null}
+            </p>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={restoringFromBin}
+              className="h-8 rounded-lg border-[#e3b5b1] bg-white text-xs font-semibold text-[#8c1d18] hover:bg-[#fbf0ef]"
+              onClick={async () => {
+                setRestoringFromBin(true);
+                setRestoreError(null);
+                try {
+                  await restoreCase(caseId);
+                  setDetail((current) =>
+                    current
+                      ? { ...current, case: { ...current.case, deletedAt: null } }
+                      : current
+                  );
+                } catch (restoreFailure) {
+                  setRestoreError(
+                    restoreFailure instanceof Error
+                      ? restoreFailure.message
+                      : "Could not restore this case."
+                  );
+                } finally {
+                  setRestoringFromBin(false);
+                }
+              }}
+            >
+              {restoringFromBin ? "Restoring..." : "Restore case"}
+            </Button>
+          </div>
+        ) : null}
 
         {/* Loading State */}
         {status === "loading" && (

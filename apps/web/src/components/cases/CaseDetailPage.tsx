@@ -7,9 +7,6 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import {
   ArrowLeft,
   CheckCircle2,
-  ChevronLeft,
-  ChevronRight,
-  Eye,
   FileText,
   Folder,
   Loader2,
@@ -17,16 +14,10 @@ import {
   ShieldAlert,
   Sparkles,
   TriangleAlert,
-  Database,
   Check,
-  X,
   FileSearch,
   Play,
-  ZoomIn,
-  ZoomOut,
-  RotateCw,
   GripVertical,
-  type LucideIcon,
 } from "lucide-react";
 
 import { AppShell } from "@/components/dashboard/AppShell";
@@ -34,6 +25,7 @@ import {
   CaseDetailRedesign,
   type RedesignedDocumentCard,
 } from "@/components/cases/CaseDetailRedesign";
+import { CaseConfirmDialog } from "@/components/cases/CaseConfirmDialog";
 import { PdfEvidencePreview } from "@/components/cases/PdfEvidencePreview";
 import {releaseProtectedPreview} from '@/lib/protected-preview';
 import { TallyInReviewPanel } from "@/components/cases/TallyInReviewPanel";
@@ -50,7 +42,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   getComparableFieldValue,
   getComparisonModeLabel,
@@ -71,6 +62,7 @@ import {
   fetchCaseDetail,
   fetchCaseDetailPreferCache,
   fetchCaseFileSignedUrlPreferCache,
+  restoreCase,
   updateCaseDecision,
   type CaseDecision,
   type SavedCaseDetail,
@@ -99,9 +91,6 @@ type PreviewFocus = {
 type DocumentFieldComparison = { key: string; label: string } | null;
 const DEFAULT_DATA_PANE_WIDTH = 576;
 const DEFAULT_PREVIEW_ZOOM = 1;
-const MIN_DATA_PANE_WIDTH = 280;
-const MIN_PREVIEW_PANE_WIDTH = 440;
-const PANE_RESIZE_STEP = 24;
 const PURCHASE_ORDER_DOCUMENT_TYPES = new Set(["Purchase Order", "Amended Purchase Order"]);
 const TERMS_CHECKLIST_DEFINITIONS = [
   { key: "paymentTerms", label: "Payment", keywords: ["payment", "advance", "proforma"] },
@@ -116,11 +105,6 @@ const TERMS_CHECKLIST_DEFINITIONS = [
 ] as const;
 const TERMS_FIELD_KEYS = TERMS_CHECKLIST_DEFINITIONS.map((item) => item.key);
 const TERMS_FIELD_KEY_SET = new Set<string>(TERMS_FIELD_KEYS);
-
-const DETAIL_TABS: { id: ActiveTab; label: string; icon: LucideIcon }[] = [
-  { id: "preview", label: "Original", icon: Eye },
-  { id: "data", label: "Data", icon: Database },
-];
 
 const FIELD_LABEL_LOOKUP = ACTIVE_FIELD_DEFINITIONS.reduce(
   (acc, field) => {
@@ -145,22 +129,6 @@ type TermsComplianceChecklistItem = {
 
 type CaseDetailDocument = SavedCaseDetail["documents"][number];
 
-type SplitSiblingCase = {
-  id: string;
-  displayName: string;
-  groupIndex: number;
-};
-
-type SplitAnalysisMeta = {
-  groupCount: number;
-  groupIndex: number;
-  sourceCaseId: string;
-  sourceFileNames: string[];
-  groupId: string;
-  siblingCases: SplitSiblingCase[];
-  note: string;
-};
-
 type SellerChainRoleSelectionMeta = {
   primaryDocumentIds: string[];
   contextDocumentIds: string[];
@@ -171,49 +139,6 @@ function readStringArray(value: unknown) {
   return Array.isArray(value)
     ? value.map((entry) => String(entry ?? "").trim()).filter(Boolean)
     : [];
-}
-
-function readSplitAnalysisMeta(processingMeta: unknown): SplitAnalysisMeta | null {
-  if (!processingMeta || typeof processingMeta !== "object" || Array.isArray(processingMeta)) {
-    return null;
-  }
-
-  const raw = (processingMeta as Record<string, unknown>).splitAnalysis;
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return null;
-  }
-
-  const record = raw as Record<string, unknown>;
-  const groupCount = Number(record.groupCount);
-  const groupIndex = Number(record.groupIndex);
-  const sourceCaseId = String(record.sourceCaseId ?? "").trim();
-  const groupId = String(record.groupId ?? "").trim();
-  const note = String(record.note ?? "").trim();
-  if (!Number.isFinite(groupCount) || groupCount < 2 || !Number.isFinite(groupIndex) || groupIndex < 1) {
-    return null;
-  }
-
-  const siblingCases = Array.isArray(record.siblingCases)
-    ? record.siblingCases.flatMap((entry): SplitSiblingCase[] => {
-        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
-        const sibling = entry as Record<string, unknown>;
-        const id = String(sibling.id ?? "").trim();
-        const displayName = String(sibling.displayName ?? "").trim();
-        const siblingGroupIndex = Number(sibling.groupIndex);
-        if (!id || !displayName || !Number.isFinite(siblingGroupIndex)) return [];
-        return [{ id, displayName, groupIndex: siblingGroupIndex }];
-      })
-    : [];
-
-  return {
-    groupCount,
-    groupIndex,
-    sourceCaseId,
-    sourceFileNames: readStringArray(record.sourceFileNames),
-    groupId,
-    siblingCases,
-    note: note || `This uploaded file was split into ${groupCount} separate cases during analysis.`,
-  };
 }
 
 function readSellerChainRoleSelectionMeta(processingMeta: unknown): SellerChainRoleSelectionMeta | null {
@@ -743,7 +668,37 @@ function getDisplayDocuments(documents: CaseDetailDocument[]) {
     }
   }
 
-  return displayDocuments;
+  return hideAbsorbedBlankPages(displayDocuments);
+}
+
+function hasExtractedContent(document: CaseDetailDocument) {
+  const hasFields = Object.values(document.extractedFields || {}).some(
+    (value) => value !== null && value !== undefined && String(value).trim() !== ""
+  );
+  return hasFields || (document.lineItems?.length ?? 0) > 0;
+}
+
+// A blank back side is split out as an empty "Unknown" document, but the page before it
+// already spans it (for example "pages 3-4"). Showing both gives one page two owners.
+function hideAbsorbedBlankPages(documents: CaseDetailDocument[]) {
+  return documents.filter((document) => {
+    if (String(document.documentType || "").toLowerCase() !== "unknown") return true;
+    if (hasExtractedContent(document)) return true;
+
+    const key = getDocumentSourceKey(document);
+    if (!key) return true;
+    const range = getDocumentPageRange(document);
+
+    return !documents.some((other) => {
+      if (other === document || getDocumentSourceKey(other) !== key) return false;
+      const otherRange = getDocumentPageRange(other);
+      return (
+        otherRange.end > otherRange.start &&
+        range.start >= otherRange.start &&
+        range.end <= otherRange.end
+      );
+    });
+  });
 }
 
 function displayValue(value: unknown) {
@@ -763,7 +718,7 @@ function formatMoney(value: number | null | undefined) {
 }
 function getDocumentIndexDetails(document: SavedCaseDetail["documents"][number]) {
   const type = document.documentType || "Document";
-  const sourcePage = getDocumentSourcePage(document);
+  const pageRange = getDocumentPageRange(document);
   const fileName =
     document.sourceFileName ||
     document.sourceHint?.replace(/^pages?\s+\d+\s*[-:]\s*/i, "").trim() ||
@@ -773,7 +728,10 @@ function getDocumentIndexDetails(document: SavedCaseDetail["documents"][number])
   return {
     type,
     fileName,
-    pageLabel: `Page ${sourcePage}`,
+    pageLabel:
+      pageRange.end > pageRange.start
+        ? `pp. ${pageRange.start}–${pageRange.end}`
+        : `p. ${pageRange.start}`,
   };
 }
 
@@ -838,39 +796,41 @@ function isImageSourceFile(mimeType?: string | null, sourceName?: string | null)
   return false;
 }
 
-function getDocumentSourcePage(document?: SavedCaseDetail["documents"][number] | null) {
+// The pipeline labels each document split out of a PDF as "<file name> (pages 3-4)".
+const PAGE_RANGE_SUFFIX = /\s*\(pages?\s+(\d+)(?:\s*[-–]\s*(\d+))?\)\s*$/i;
+
+function getDocumentPageRange(document?: SavedCaseDetail["documents"][number] | null) {
+  const pageCount = Math.max(1, document?.pageCount || 1);
+
+  // Prefer the exact suffix so a file that merely has "page 2" in its name is not misread.
+  for (const text of [document?.sourceHint, document?.sourceFileName, document?.title]) {
+    const match = text?.match(PAGE_RANGE_SUFFIX);
+    if (!match) continue;
+    const start = Math.round(Number(match[1]));
+    if (!Number.isFinite(start) || start < 1) continue;
+    const end = Math.round(Number(match[2] ?? match[1]));
+    return { start, end: Number.isFinite(end) && end >= start ? end : start, explicit: true };
+  }
+
   const sourceText = [document?.sourceHint, document?.sourceFileName, document?.title]
     .filter(Boolean)
     .join(" ");
-  const match = sourceText.match(/\bpages?\s+(\d+)/i);
-  if (!match) return 1;
-  const page = Number(match[1]);
-  return Number.isFinite(page) && page > 0 ? Math.round(page) : 1;
+  const loose = sourceText.match(/\bpages?\s+(\d+)/i);
+  const start = loose ? Math.round(Number(loose[1])) : 1;
+  const safeStart = Number.isFinite(start) && start > 0 ? start : 1;
+  return { start: safeStart, end: safeStart + pageCount - 1, explicit: false };
 }
 
-function getLineItemPreviewPage(
-  document: SavedCaseDetail["documents"][number] | null,
-  item: CommercialLineItem
-) {
-  const documentStartPage = getDocumentSourcePage(document);
-  const itemSourcePage = Number(item.sourcePage);
-  if (!Number.isFinite(itemSourcePage) || itemSourcePage < 1) return documentStartPage;
-
-  const documentPageCount = Math.max(1, document?.pageCount || 1);
-  if (itemSourcePage <= documentPageCount) {
-    return documentStartPage + itemSourcePage - 1;
-  }
-
-  return Math.round(itemSourcePage);
+function getDocumentSourcePage(document?: SavedCaseDetail["documents"][number] | null) {
+  return getDocumentPageRange(document).start;
 }
 
-function normalizeEvidenceValue(value: unknown) {
-  return String(value ?? "")
-    .normalize("NFKD")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+// Documents split from the same uploaded file share this key.
+function getDocumentSourceKey(document: SavedCaseDetail["documents"][number]) {
+  return normalizeText(document.sourceFileName || document.sourceHint || "").replace(
+    PAGE_RANGE_SUFFIX,
+    ""
+  );
 }
 
 function getCaseStatusLabel(status: string) {
@@ -1204,9 +1164,65 @@ function CaseDetailSkeleton() {
   );
 }
 
+function RecycledCaseBanner({
+  caseId,
+  deletedAt,
+  onRestored,
+}: {
+  caseId: string;
+  deletedAt: string;
+  onRestored: () => void;
+}) {
+  const [restoring, setRestoring] = useState(false);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  const deletedLabel = new Date(deletedAt).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+
+  return (
+    <div
+      role="status"
+      className="sticky top-0 z-20 flex flex-wrap items-center justify-between gap-3 border-b border-[#f2c7c4] bg-[#fbf0ef] px-4 py-2.5 text-xs text-[#8c1d18] sm:px-6"
+    >
+      <p className="font-medium">
+        This case is in the recycle bin (deleted {deletedLabel}). It is read-only and cannot be
+        analyzed, reviewed or posted to Tally until you restore it.
+        {restoreError ? <span className="ml-2 font-semibold">{restoreError}</span> : null}
+      </p>
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        disabled={restoring}
+        className="h-8 rounded-lg border-[#e3b5b1] bg-white text-xs font-semibold text-[#8c1d18] hover:bg-[#fbf0ef]"
+        onClick={async () => {
+          setRestoring(true);
+          setRestoreError(null);
+          try {
+            await restoreCase(caseId);
+            onRestored();
+          } catch (failure) {
+            setRestoreError(failure instanceof Error ? failure.message : "Could not restore this case.");
+          } finally {
+            setRestoring(false);
+          }
+        }}
+      >
+        {restoring ? "Restoring..." : "Restore case"}
+      </Button>
+    </div>
+  );
+}
+
 export function CaseDetailPage({ caseId }: { caseId: string }) {
   const router = useRouter();
   const [detail, setDetail] = useState<SavedCaseDetail | null>(null);
+  const markRestored = () =>
+    setDetail((current) =>
+      current ? { ...current, case: { ...current.case, deletedAt: null } } : current
+    );
   const [status, setStatus] = useState<LoadState>("loading");
   const [error, setError] = useState<string | null>(null);
   const [analysisStatus, setAnalysisStatus] = useState<"idle" | "processing" | "error">("idle");
@@ -1219,7 +1235,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   const [draftFileError, setDraftFileError] = useState<string | null>(null);
   const [decisionStatus, setDecisionStatus] = useState<"idle" | "updating" | "error">("idle");
   const [decisionError, setDecisionError] = useState<string | null>(null);
-  const [isMismatchNavigationPending, setIsMismatchNavigationPending] = useState(false);
+  const [pendingDecision, setPendingDecision] = useState<CaseDecision | null>(null);
   const [isTallyReviewOpen, setIsTallyReviewOpen] = useState(false);
 
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
@@ -1227,13 +1243,16 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   const [activeDataView, setActiveDataView] = useState<DataViewMode>("fields");
   const [previewPageIndex, setPreviewPageIndex] = useState(0);
   const [previewZoom, setPreviewZoom] = useState(DEFAULT_PREVIEW_ZOOM);
-  const [previewFocus, setPreviewFocus] = useState<PreviewFocus | null>(null);
+  const [, setPreviewFocus] = useState<PreviewFocus | null>(null);
   const [previewPdfPage, setPreviewPdfPage] = useState<number | null>(null);
   const [previewPdfPageCount, setPreviewPdfPageCount] = useState(1);
+  const [pdfFitMode, setPdfFitMode] = useState<"width" | "page">("width");
+  // Clockwise degrees the reviewer added to a sideways scan, kept per file page for this visit.
+  const [pdfRotations, setPdfRotations] = useState<Record<string, number>>({});
+  const lastPreviewDocumentIdRef = useRef<string | null>(null);
+  const pagedToDocumentIdRef = useRef<string | null>(null);
   const [documentFieldComparison, setDocumentFieldComparison] =
     useState<DocumentFieldComparison>(null);
-  const [dataPaneWidth, setDataPaneWidth] = useState(DEFAULT_DATA_PANE_WIDTH);
-  const [isPaneResizing, setIsPaneResizing] = useState(false);
   const [signedFileUrls, setSignedFileUrls] = useState<Record<string, string | null>>({});
   const protectedPreviews = useRef(new Set<string>());
   useEffect(() => {
@@ -1253,8 +1272,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   const [loadingPreviewFileId, setLoadingPreviewFileId] = useState<string | null>(null);
   const [previewUrlError, setPreviewUrlError] = useState<string | null>(null);
   const draftFileInputRef = useRef<HTMLInputElement | null>(null);
-  const desktopWorkspaceRef = useRef<HTMLDivElement | null>(null);
-  const paneResizeStartRef = useRef<{ pointerX: number; paneWidth: number } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -1280,7 +1297,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     setSignedFileUrls({});
     setLoadingPreviewFileId(null);
     setPreviewUrlError(null);
-    setDataPaneWidth(DEFAULT_DATA_PANE_WIDTH);
     setDocumentFieldComparison(null);
   }, [caseId]);
 
@@ -1304,22 +1320,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     return () => document.removeEventListener("pointerdown", clearComparisonWhenClickingOutside);
   }, [documentFieldComparison]);
 
-  useEffect(() => {
-    const workspace = desktopWorkspaceRef.current;
-    if (!workspace) return;
-
-    const observer = new ResizeObserver(([entry]) => {
-      const workspaceWidth = entry?.contentRect.width || workspace.clientWidth;
-      const maximumWidth = Math.max(
-        MIN_DATA_PANE_WIDTH,
-        workspaceWidth - MIN_PREVIEW_PANE_WIDTH - 8
-      );
-      setDataPaneWidth((current) => Math.min(current, maximumWidth));
-    });
-    observer.observe(workspace);
-    return () => observer.disconnect();
-  }, [status]);
-
   const displayDocuments = useMemo(
     () => (detail ? getDisplayDocuments(detail.documents) : []),
     [detail]
@@ -1341,53 +1341,67 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     }
 
     let active = true;
+    let timeoutId: number | undefined;
+    let pollCount = 0;
+
+    const scheduleNext = () => {
+      if (!active) return;
+      // 3s at first, easing to 10s for long-running analyses.
+      const delay = Math.min(10000, 3000 + Math.floor(pollCount / 10) * 1000);
+      timeoutId = window.setTimeout(() => void pollStatus(), delay);
+    };
 
     const pollStatus = async () => {
+      // Do not poll from a background tab; resume when it becomes visible again.
+      if (document.hidden) {
+        scheduleNext();
+        return;
+      }
+      pollCount += 1;
+
       try {
         const nextStatus = await fetchCaseAnalysisStatus(detail.case.id);
         if (!active) return;
+
+        if (nextStatus.caseStatus !== "processing") {
+          // Finished, failed, or released by the server (for example after the case
+          // came back from the recycle bin): reload the case and stop polling.
+          const refreshed = await fetchCaseDetail(detail.case.id);
+          if (!active) return;
+          setDetail(refreshed);
+          if (nextStatus.caseStatus === "failed") {
+            setAnalysisStatus("error");
+            setAnalysisError(nextStatus.job?.error ?? "Case analysis failed.");
+            setAnalysisStage(nextStatus.job?.stage ?? "Failed");
+          } else {
+            setAnalysisStatus("idle");
+            setAnalysisProgress(nextStatus.caseStatus === "draft" ? 0 : 100);
+            setAnalysisStage(null);
+            setAnalysisError(null);
+          }
+          return;
+        }
 
         setAnalysisStatus("processing");
         setAnalysisProgress(nextStatus.job?.progress ?? 0);
         setAnalysisStage(nextStatus.job?.stage ?? null);
         setAnalysisError(nextStatus.job?.status === "failed" ? nextStatus.job.error ?? null : null);
-
-        if (nextStatus.caseStatus === "completed" || nextStatus.caseStatus === "accepted" || nextStatus.caseStatus === "rejected") {
-          const refreshed = await fetchCaseDetail(detail.case.id);
-          if (!active) return;
-          setDetail(refreshed);
-          setAnalysisStatus("idle");
-          setAnalysisProgress(100);
-          setAnalysisStage(null);
-          setAnalysisError(null);
-          return;
-        }
-
-        if (nextStatus.caseStatus === "failed") {
-          const refreshed = await fetchCaseDetail(detail.case.id);
-          if (!active) return;
-          setDetail(refreshed);
-          setAnalysisStatus("error");
-          setAnalysisError(nextStatus.job?.error ?? "Case analysis failed.");
-          setAnalysisStage(nextStatus.job?.stage ?? "Failed");
-        }
+        scheduleNext();
       } catch (statusError) {
         if (!active) return;
         setAnalysisStatus("error");
         setAnalysisError(
           statusError instanceof Error ? statusError.message : "Failed to load analysis progress."
         );
+        scheduleNext();
       }
     };
 
     void pollStatus();
-    const intervalId = window.setInterval(() => {
-      void pollStatus();
-    }, 3000);
 
     return () => {
       active = false;
-      window.clearInterval(intervalId);
+      window.clearTimeout(timeoutId);
     };
   }, [detail, detail?.case.id, detail?.case.status]);
 
@@ -1440,15 +1454,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     if (status !== "ready" || visibleMismatches.length === 0) return;
     router.prefetch(mismatchReviewHref);
   }, [mismatchReviewHref, router, status, visibleMismatches.length]);
-
-  function prepareMismatchNavigation() {
-    router.prefetch(mismatchReviewHref);
-  }
-
-  function beginMismatchNavigation() {
-    setIsMismatchNavigationPending(true);
-    prepareMismatchNavigation();
-  }
 
   const reviewSummary = useMemo(() => {
     if (!detail) {
@@ -1669,8 +1674,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
     return activeDocumentEntries.filter(([key]) => !TERMS_FIELD_KEY_SET.has(key));
   }, [activeDocumentEntries, activeTermsChecklistRows.length]);
-  const activeFieldDataCount =
-    activeDocumentFieldEntries.length + activeTermsChecklistRows.length + unmatchedTermsIssues.length;
   const activeDocumentLineItems = useMemo(
     () => activeDocument?.lineItems ?? [],
     [activeDocument]
@@ -1744,27 +1747,27 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     activePreviewFile?.originalName || activeDocument?.sourceFileName || activeDocument?.sourceHint
   );
   const activeDocumentSourcePage = getDocumentSourcePage(activeDocument);
+  const activeDocumentRange = getDocumentPageRange(activeDocument);
+  // Every document split from the same uploaded file, in page order.
+  const sourceSiblingDocuments = useMemo(() => {
+    if (!activeDocument) return [];
+    const activeKey = getDocumentSourceKey(activeDocument);
+    if (!activeKey) return [activeDocument];
+    return displayDocuments
+      .filter((document) => getDocumentSourceKey(document) === activeKey)
+      .sort((left, right) => getDocumentSourcePage(left) - getDocumentSourcePage(right));
+  }, [activeDocument, displayDocuments]);
   const inferredPdfPageCount = useMemo(() => {
-    const activeSourceName = normalizeText(
-      activeDocument?.sourceFileName || activeDocument?.sourceHint || ""
+    const documents = sourceSiblingDocuments.length
+      ? sourceSiblingDocuments
+      : activeDocument
+        ? [activeDocument]
+        : [];
+    return documents.reduce(
+      (highestPage, document) => Math.max(highestPage, getDocumentPageRange(document).end),
+      1
     );
-    const activeDocumentPageEnd =
-      activeDocumentSourcePage + Math.max(1, activeDocument?.pageCount || 1) - 1;
-
-    if (!activeSourceName) return activeDocumentPageEnd;
-
-    return displayDocuments.reduce((highestPage, document) => {
-      const documentSourceName = normalizeText(
-        document.sourceFileName || document.sourceHint || ""
-      );
-      if (documentSourceName !== activeSourceName) return highestPage;
-
-      return Math.max(
-        highestPage,
-        getDocumentSourcePage(document) + Math.max(1, document.pageCount || 1) - 1
-      );
-    }, activeDocumentPageEnd);
-  }, [activeDocument, activeDocumentSourcePage, displayDocuments]);
+  }, [activeDocument, sourceSiblingDocuments]);
   const activePdfPage = Math.min(
     Math.max(1, previewPdfPage ?? activeDocumentSourcePage),
     Math.max(1, previewPdfPageCount, inferredPdfPageCount)
@@ -1776,15 +1779,30 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     activeSourceIsImage
       ? activeDocumentFiles.length > 0 && previewPageIndex < activeDocumentFiles.length - 1
       : activePdfPage < previewPdfPageCount;
+  const pdfRotationKey = `${activePreviewFile?.id ?? ""}:${activePdfPage}`;
+  const activePdfRotation = pdfRotations[pdfRotationKey] ?? 0;
   const canZoomOut = Boolean(activeFileUrl) && previewZoom > 0.75;
   const canZoomIn = Boolean(activeFileUrl) && previewZoom < 3;
 
   useEffect(() => {
+    // The viewer reports the real page count once the file loads; never drop below it here.
+    setPreviewPdfPageCount((current) => Math.max(current, inferredPdfPageCount));
+
+    // Only a change of document resets the viewer. A refetch that leaves the same
+    // document active must not throw the reader back to its first page.
+    if (lastPreviewDocumentIdRef.current === activeDocumentId) return;
+    lastPreviewDocumentIdRef.current = activeDocumentId;
+
+    // Paging across a document boundary changed the selection; keep that page.
+    if (pagedToDocumentIdRef.current === activeDocumentId) {
+      pagedToDocumentIdRef.current = null;
+      return;
+    }
+
     setPreviewPageIndex(0);
     setPreviewZoom(DEFAULT_PREVIEW_ZOOM);
     setPreviewFocus(null);
     setPreviewPdfPage(activeDocumentSourcePage);
-    setPreviewPdfPageCount(inferredPdfPageCount);
   }, [activeDocumentId, activeDocumentSourcePage, inferredPdfPageCount]);
 
   useEffect(() => {
@@ -1928,6 +1946,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           : current
       );
       setDecisionStatus("idle");
+      setPendingDecision(null);
     } catch (decisionFailure) {
       setDecisionError(
         decisionFailure instanceof Error
@@ -1938,76 +1957,33 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     }
   }
 
+  // Move the PDF to a page and keep the selected document in step with it.
+  function goToPdfPage(page: number) {
+    const target = Math.min(
+      Math.max(1, previewPdfPageCount, inferredPdfPageCount),
+      Math.max(1, Math.round(page))
+    );
+    setPreviewFocus(null);
+    setPreviewPdfPage(target);
+
+    // Keep the current document while the page is still inside its own range.
+    if (target >= activeDocumentRange.start && target <= activeDocumentRange.end) return;
+
+    const owner = sourceSiblingDocuments.find((document) => {
+      const range = getDocumentPageRange(document);
+      return target >= range.start && target <= range.end;
+    });
+    if (owner && owner.id !== activeDocumentId) {
+      pagedToDocumentIdRef.current = owner.id;
+      setActiveDocumentId(owner.id);
+    }
+  }
+
   function handleDocumentSelection(documentId: string) {
     const selectedDocument = displayDocuments.find((document) => document.id === documentId);
     setActiveDocumentId(documentId);
     setPreviewPdfPage(getDocumentSourcePage(selectedDocument));
     setActiveTab("preview");
-  }
-
-  function handlePreviewFocus(nextFocus: PreviewFocus) {
-    setPreviewFocus(nextFocus);
-    if (nextFocus.pageNumber && nextFocus.pageNumber > 0) {
-      setPreviewPdfPage(nextFocus.pageNumber);
-    }
-    setActiveTab("preview");
-  }
-
-  function getDataPaneWidthBounds() {
-    const workspaceWidth = desktopWorkspaceRef.current?.clientWidth || 0;
-    return {
-      min: MIN_DATA_PANE_WIDTH,
-      max: Math.max(
-        MIN_DATA_PANE_WIDTH,
-        workspaceWidth > 0
-          ? workspaceWidth - MIN_PREVIEW_PANE_WIDTH - 8
-          : DEFAULT_DATA_PANE_WIDTH
-      ),
-    };
-  }
-
-  function resizeDataPane(nextWidth: number) {
-    const bounds = getDataPaneWidthBounds();
-    setDataPaneWidth(Math.min(bounds.max, Math.max(bounds.min, Math.round(nextWidth))));
-  }
-
-  function handlePaneResizeStart(event: React.PointerEvent<HTMLButtonElement>) {
-    if (event.button !== 0) return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    paneResizeStartRef.current = { pointerX: event.clientX, paneWidth: dataPaneWidth };
-    setIsPaneResizing(true);
-  }
-
-  function handlePaneResizeMove(event: React.PointerEvent<HTMLButtonElement>) {
-    const resizeStart = paneResizeStartRef.current;
-    if (!resizeStart) return;
-    resizeDataPane(resizeStart.paneWidth + resizeStart.pointerX - event.clientX);
-  }
-
-  function handlePaneResizeEnd(event: React.PointerEvent<HTMLButtonElement>) {
-    if (!paneResizeStartRef.current) return;
-    paneResizeStartRef.current = null;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    setIsPaneResizing(false);
-  }
-
-  function handlePaneResizeKeyDown(event: React.KeyboardEvent<HTMLButtonElement>) {
-    if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      resizeDataPane(dataPaneWidth + PANE_RESIZE_STEP);
-    } else if (event.key === "ArrowRight") {
-      event.preventDefault();
-      resizeDataPane(dataPaneWidth - PANE_RESIZE_STEP);
-    } else if (event.key === "Home") {
-      event.preventDefault();
-      resizeDataPane(MIN_DATA_PANE_WIDTH);
-    } else if (event.key === "Enter") {
-      event.preventDefault();
-      resizeDataPane(DEFAULT_DATA_PANE_WIDTH);
-    }
   }
 
   const isFinalDecision = detail?.case.status === "accepted" || detail?.case.status === "rejected";
@@ -2053,9 +2029,13 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     const canRetry = detail.case.status === "failed";
     const stageLabel = getFriendlyAnalysisStage(analysisStage, analysisStatus);
     const readyCount = detail.files.length;
+    const isRecycled = Boolean(detail.case.deletedAt);
 
     return (
       <AppShell defaultSidebarCollapsed>
+        {detail.case.deletedAt ? (
+          <RecycledCaseBanner caseId={caseId} deletedAt={detail.case.deletedAt} onRestored={markRestored} />
+        ) : null}
         <div className="flex flex-1 flex-col bg-[#f7f7f5] animate-in fade-in duration-500 min-h-[calc(100vh-4rem)] tracking-normal">
           <header className="flex h-14 sm:h-16 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 sm:px-6">
             <div className="flex items-center gap-3 sm:gap-4 w-full">
@@ -2169,7 +2149,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
                   <Button
                     variant="outline"
-                    disabled={draftFileStatus === "saving"}
+                    disabled={draftFileStatus === "saving" || isRecycled}
                     className="rounded-2xl px-6 py-6 text-base font-medium border-[#e5ddd0] text-[#5a5046] bg-white hover:bg-[#faf8f4] hover:text-[#1a1a1a] shadow-sm transition-transform hover:scale-[1.02]"
                     onClick={() => draftFileInputRef.current?.click()}
                   >
@@ -2179,7 +2159,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
                   <Button
                     type="button"
-                    disabled={detail.files.length === 0 || draftFileStatus === "saving"}
+                    disabled={detail.files.length === 0 || draftFileStatus === "saving" || isRecycled}
                     className="flex-1 rounded-2xl bg-[#1a1a1a] px-8 py-6 text-base font-medium text-white shadow-lg shadow-[#1a1a1a]/15 hover:bg-[#2d2d2d] transition-transform hover:scale-[1.02]"
                     onClick={() => {
                       setPendingAnalysisMode("standard");
@@ -2192,7 +2172,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
 
                   <Button
                     type="button"
-                    disabled={detail.files.length === 0 || draftFileStatus === "saving"}
+                    disabled={detail.files.length === 0 || draftFileStatus === "saving" || isRecycled}
                     variant="outline"
                     className="rounded-2xl border-emerald-200 bg-emerald-50 px-6 py-6 text-base font-medium text-emerald-800 shadow-sm transition-transform hover:scale-[1.02] hover:bg-emerald-100 hover:text-emerald-900"
                     onClick={() => {
@@ -2224,42 +2204,19 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
   // =========================================
   // ANALYZED STATE (Split Screen View)
   // =========================================
-  const showActions = detail && detail.case.status !== "draft" && !isFinalDecision;
-  const reviewCountLabel =
-    visibleMismatches.length > 0
-      ? isFinalDecision
-        ? `${visibleMismatches.length} reviewed`
-        : `${pendingMismatchCount || visibleMismatches.length} open`
-      : `${displayDocuments.length} checked`;
-  const splitAnalysisMeta = readSplitAnalysisMeta(detail?.case.processingMeta);
+  // Only an analysed, not-yet-decided case can be decided, and never while it sits in the bin.
+  const showActions = Boolean(
+    detail && detail.case.status === "completed" && !detail.case.deletedAt && !isFinalDecision
+  );
   const sellerChainRoleMeta =
     readSellerChainRoleSelectionMeta(detail?.case.processingMeta) ??
     (detail ? inferSellerChainRoleSelection(displayDocuments) : null);
-  const packetPageCount = displayDocuments.reduce(
-    (total, document) => total + Math.max(1, document.pageCount || 1),
-    0
-  );
   const headerInvoiceAmount = formatMoney(
     displayDocuments
       .map((document) => getInvoiceAmount(document))
       .find((value): value is number => value !== null)
   );
   const currentDocumentIndex = activeDocument ? getDocumentIndexDetails(activeDocument) : null;
-  const caseStatusTone =
-    detail?.case.status === "accepted"
-      ? styles.statusAccepted
-      : detail?.case.status === "rejected"
-        ? styles.statusRejected
-        : visibleMismatches.length > 0
-          ? styles.statusReview
-          : styles.statusNeutral;
-  const reviewBarTone =
-    reviewSummary?.tone === "emerald"
-      ? styles.reviewBarGreen
-      : reviewSummary?.tone === "rose"
-        ? styles.reviewBarRed
-        : styles.reviewBarAmber;
-
   const redesignedDetail = detail;
   if (Boolean(redesignedDetail)) {
     const detail = redesignedDetail as SavedCaseDetail;
@@ -2361,6 +2318,8 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
             url={activeFileUrl}
             pageNumber={activePdfPage}
             zoom={previewZoom}
+            fitMode={pdfFitMode}
+            rotation={activePdfRotation}
             searchPageStart={activeDocumentSourcePage}
             searchPageEnd={
               activeDocumentSourcePage + Math.max(1, activeDocument?.pageCount || 1) - 1
@@ -2521,16 +2480,35 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
       </div>
     );
 
+    const analyzedAtRaw =
+      detail.case.processingMeta && typeof detail.case.processingMeta === "object"
+        ? (detail.case.processingMeta as Record<string, unknown>).analyzedAt
+        : null;
+    const analyzedAtDate =
+      typeof analyzedAtRaw === "string" && !Number.isNaN(Date.parse(analyzedAtRaw))
+        ? new Date(analyzedAtRaw)
+        : null;
+    const analyzedLabel = analyzedAtDate
+      ? new Intl.DateTimeFormat("en-IN", {
+          day: "2-digit",
+          month: "short",
+          hour: "2-digit",
+          minute: "2-digit",
+        }).format(analyzedAtDate)
+      : createdDate;
     const activityContent = (
       <div className={styles.redesignActivityList}>
         <article><i /><time>{uploadedLabel}</time><p><strong>Case created</strong> with {detail.files.length} uploaded file{detail.files.length === 1 ? "" : "s"}.</p></article>
-        <article><i /><time>{createdDate}</time><p><strong>Packet analyzed</strong> into {displayDocuments.length} classified document{displayDocuments.length === 1 ? "" : "s"}.</p></article>
+        <article><i /><time>{analyzedLabel}</time><p><strong>Packet analyzed</strong> into {displayDocuments.length} classified document{displayDocuments.length === 1 ? "" : "s"}.</p></article>
         <article><i /><time>Current</time><p><strong>Status: {getCaseStatusLabel(detail.case.status)}</strong>{visibleMismatches.length ? ` · ${visibleMismatches.length} mismatch${visibleMismatches.length === 1 ? "" : "es"} on record.` : " · no mismatches found."}</p></article>
       </div>
     );
 
     return (
       <AppShell defaultSidebarCollapsed>
+        {detail.case.deletedAt ? (
+          <RecycledCaseBanner caseId={caseId} deletedAt={detail.case.deletedAt} onRestored={markRestored} />
+        ) : null}
         <CaseDetailRedesign
           caseId={caseId}
           caseSlug={detail.case.slug}
@@ -2545,8 +2523,17 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           status={detail.case.status}
           showActions={Boolean(showActions)}
           decisionUpdating={decisionStatus === "updating"}
-          decisionError={decisionStatus === "error" ? decisionError : null}
-          onDecision={(decision) => void handleCaseDecision(decision)}
+          decisionError={decisionStatus === "error" && !pendingDecision ? decisionError : null}
+          onDecision={(decision) => {
+            setDecisionError(null);
+            setDecisionStatus("idle");
+            setPendingDecision(decision);
+          }}
+          onRetryAnalysis={() => {
+            setPendingAnalysisMode("standard");
+            setAnalysisOptionsOpen(true);
+          }}
+          retryDisabled={analysisStatus === "processing" || Boolean(detail.case.deletedAt)}
           documents={redesignedDocuments}
           comparisonFieldLabel={documentFieldComparison?.label}
           activeDocumentId={activeDocumentId}
@@ -2567,16 +2554,25 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           canPreviousPage={canGoToPreviousPreviewPage}
           canNextPage={canGoToNextPreviewPage}
           showPageControls={activeSourceIsImage ? previewPageCount > 1 : previewPdfPageCount > 1}
-          pageLabel={activeSourceIsImage ? `${Math.min(previewPageIndex + 1, previewPageCount)} / ${previewPageCount}` : `${activePdfPage} / ${previewPdfPageCount}`}
+          pageLabel={
+            activeSourceIsImage
+              ? `${Math.min(previewPageIndex + 1, previewPageCount)} / ${previewPageCount}`
+              : sourceSiblingDocuments.length > 1
+                ? `${Math.min(
+                    Math.max(1, activePdfPage - activeDocumentRange.start + 1),
+                    activeDocumentRange.end - activeDocumentRange.start + 1
+                  )} / ${activeDocumentRange.end - activeDocumentRange.start + 1}`
+                : `${activePdfPage} / ${previewPdfPageCount}`
+          }
           onPreviousPage={() => {
             setPreviewFocus(null);
             if (activeSourceIsImage) setPreviewPageIndex((current) => Math.max(0, current - 1));
-            else setPreviewPdfPage(Math.max(1, activePdfPage - 1));
+            else goToPdfPage(activePdfPage - 1);
           }}
           onNextPage={() => {
             setPreviewFocus(null);
             if (activeSourceIsImage) setPreviewPageIndex((current) => Math.min(Math.max(activeDocumentFiles.length - 1, 0), current + 1));
-            else setPreviewPdfPage(Math.min(previewPdfPageCount, activePdfPage + 1));
+            else goToPdfPage(activePdfPage + 1);
           }}
           zoom={previewZoom}
           canZoomOut={canZoomOut}
@@ -2584,6 +2580,21 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           onZoomOut={() => setPreviewZoom((current) => Math.max(0.75, Number((current - 0.25).toFixed(2))))}
           onZoomIn={() => setPreviewZoom((current) => Math.min(3, Number((current + 0.25).toFixed(2))))}
           onResetZoom={() => setPreviewZoom(DEFAULT_PREVIEW_ZOOM)}
+          fitMode={activeSourceIsImage ? undefined : pdfFitMode}
+          onToggleFit={
+            activeSourceIsImage
+              ? undefined
+              : () => setPdfFitMode((current) => (current === "width" ? "page" : "width"))
+          }
+          onRotate={
+            activeSourceIsImage
+              ? undefined
+              : (delta) =>
+                  setPdfRotations((current) => ({
+                    ...current,
+                    [pdfRotationKey]: (((current[pdfRotationKey] ?? 0) + delta) % 360 + 360) % 360,
+                  }))
+          }
         />
 
         <AnalysisOptionsDialog
@@ -2592,6 +2603,35 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           onSelect={(nextOptions) => {
             setAnalysisOptionsOpen(false);
             void handleAnalyzeDraftCase(nextOptions, pendingAnalysisMode);
+          }}
+        />
+
+        <CaseConfirmDialog
+          open={pendingDecision !== null}
+          onOpenChange={(open) => {
+            if (!open && decisionStatus !== "updating") {
+              setPendingDecision(null);
+              setDecisionError(null);
+              setDecisionStatus("idle");
+            }
+          }}
+          variant={pendingDecision === "rejected" ? "danger" : "default"}
+          title={pendingDecision === "rejected" ? "Reject this case?" : "Approve this case?"}
+          description={
+            pendingDecision === "rejected"
+              ? pendingMismatchCount > 0
+                ? `${pendingMismatchCount} unreviewed ${pendingMismatchCount === 1 ? "issue" : "issues"} will be marked rejected.`
+                : "The case will be marked rejected."
+              : pendingMismatchCount > 0
+                ? `${pendingMismatchCount} unreviewed ${pendingMismatchCount === 1 ? "issue" : "issues"} will be accepted along with it. Issues you already reviewed keep their decision.`
+                : "All issues are reviewed. The case will be marked approved."
+          }
+          confirmLabel={pendingDecision === "rejected" ? "Reject case" : "Approve case"}
+          footnote="This is a final decision and cannot be changed afterwards."
+          error={decisionStatus === "error" ? decisionError : null}
+          loading={decisionStatus === "updating"}
+          onConfirm={() => {
+            if (pendingDecision) void handleCaseDecision(pendingDecision);
           }}
         />
 
@@ -2621,1450 +2661,6 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
     );
   }
 
-  return (
-    <AppShell defaultSidebarCollapsed>
-      <div
-        className={`${styles.page} animate-in fade-in duration-300`}
-      >
-
-        {/* Top Navigation Bar */}
-        <header className={styles.header}>
-          <Link href="/cases" className={styles.backButton} aria-label="Back to cases">
-            <ArrowLeft className="h-4 w-4" />
-          </Link>
-          <div className={styles.breadcrumb}>
-            <span className={styles.breadcrumbParent}>
-              {detail?.case.receiverName || detail?.case.buyerName || "Cases"}
-            </span>
-            <span className={styles.breadcrumbSeparator}>/</span>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <h1 className={styles.breadcrumbCurrent} tabIndex={0}>
-                  {detail?.case.displayName}
-                </h1>
-              </TooltipTrigger>
-              <TooltipContent
-                side="bottom"
-                align="start"
-                sideOffset={8}
-                className={styles.breadcrumbTooltip}
-              >
-                {detail?.case.displayName}
-              </TooltipContent>
-            </Tooltip>
-          </div>
-          <div className={styles.headerSpacer} />
-          <div className={styles.headerMeta}>
-            {[headerInvoiceAmount, `${displayDocuments.length} documents`, `${packetPageCount} pages`]
-              .filter(Boolean)
-              .join(" · ")}
-          </div>
-          <div className={`${styles.statusPill} ${caseStatusTone}`}>
-            <span className={styles.statusDot} />
-            {getCaseStatusLabel(detail?.case.status || "")}
-          </div>
-          {showActions ? (
-            <>
-              <Button
-                size="sm"
-                variant="outline"
-                className={`${styles.headerAction} ${styles.rejectAction}`}
-                disabled={decisionStatus === "updating"}
-                onClick={() => handleCaseDecision("rejected")}
-              >
-                Reject
-              </Button>
-              <Button
-                size="sm"
-                className={`${styles.headerAction} ${styles.acceptAction}`}
-                disabled={decisionStatus === "updating"}
-                onClick={() => handleCaseDecision("accepted")}
-              >
-                {decisionStatus === "updating" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-                Accept case
-              </Button>
-            </>
-          ) : null}
-        </header>
-
-        {decisionStatus === "error" && decisionError ? (
-          <div className={styles.decisionError}>{decisionError}</div>
-        ) : null}
-
-        {(splitAnalysisMeta || sellerChainRoleMeta) && (
-          <div className={styles.noticeStack}>
-            {splitAnalysisMeta ? (
-              <div className={styles.contextNotice}>
-                <Sparkles className={styles.contextNoticeIcon} />
-                <div className={styles.contextNoticeBody}>
-                  <div className={styles.contextNoticeTitle}>{splitAnalysisMeta.note}</div>
-                  <div className={styles.contextNoticeMeta}>
-                    Case {splitAnalysisMeta.groupIndex} of {splitAnalysisMeta.groupCount}
-                    {splitAnalysisMeta.sourceFileNames.length
-                      ? ` · ${splitAnalysisMeta.sourceFileNames.join(", ")}`
-                      : ""}
-                  </div>
-                </div>
-                {splitAnalysisMeta.siblingCases.length > 0 ? (
-                  <div className={styles.siblingLinks}>
-                    {splitAnalysisMeta.siblingCases.map((sibling) => (
-                      <Link key={sibling.id} href={`/cases/${sibling.id}`} className={styles.siblingLink}>
-                        Case {sibling.groupIndex}
-                      </Link>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-            {sellerChainRoleMeta ? (
-              <div className={`${styles.contextNotice} ${styles.contextNoticeAmber}`}>
-                <ShieldAlert className={styles.contextNoticeIcon} />
-                <div className={styles.contextNoticeBody}>
-                  <div className={styles.contextNoticeTitle}>{sellerChainRoleMeta.note}</div>
-                  <div className={styles.contextNoticeMeta}>
-                    {sellerChainRoleMeta.primaryDocumentIds.length} reconciliation ·{" "}
-                    {sellerChainRoleMeta.contextDocumentIds.length} context
-                  </div>
-                </div>
-              </div>
-            ) : null}
-          </div>
-        )}
-
-        {reviewSummary ? (
-          <div className={`${styles.reviewBar} ${reviewBarTone}`}>
-            <span className={styles.severityDot} />
-            <div className={styles.reviewCopy}>
-              <div className={styles.reviewTitle}>{reviewSummary.title}</div>
-              <div className={styles.reviewDescription}>
-                {reviewSummary.description} {reviewSummary.actionHint}
-              </div>
-            </div>
-            <span className={styles.reviewCount}>{reviewCountLabel}</span>
-            <div className={styles.reviewActions}>
-              {reviewSummary.action === "review" ? (
-                <Link
-                  href={mismatchReviewHref}
-                  prefetch
-                  className={styles.reviewButton}
-                  aria-label={isMismatchNavigationPending ? "Opening mismatch review" : "Review mismatches"}
-                  onPointerEnter={prepareMismatchNavigation}
-                  onFocus={prepareMismatchNavigation}
-                  onClick={beginMismatchNavigation}
-                >
-                  {isMismatchNavigationPending ? (
-                    <>
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      Opening review…
-                    </>
-                  ) : (
-                    <>
-                      Review mismatches
-                      <span className={styles.mono}>{visibleMismatches.length}</span>
-                    </>
-                  )}
-                </Link>
-              ) : reviewSummary.action === "approve" && showActions ? (
-                <button
-                  type="button"
-                  className={styles.reviewButton}
-                  disabled={decisionStatus === "updating"}
-                  onClick={() => handleCaseDecision("accepted")}
-                >
-                  Approve case
-                </button>
-              ) : reviewSummary.action === "retry" ? (
-                <button
-                  type="button"
-                  className={styles.reviewButton}
-                  onClick={() => {
-                    setPendingAnalysisMode("standard");
-                    setAnalysisOptionsOpen(true);
-                  }}
-                >
-                  Retry analysis
-                </button>
-              ) : null}
-              {detail?.case.status === "accepted" ? (
-                <button
-                  type="button"
-                  className={`${styles.reviewButton} ${styles.tallyReviewButton}`}
-                  onClick={() => setIsTallyReviewOpen(true)}
-                >
-                  <Database aria-hidden="true" />
-                  Tally review
-                </button>
-              ) : null}
-            </div>
-          </div>
-        ) : null}
-
-        <section className={styles.packetStrip} aria-label="Documents in packet">
-          <div className={styles.packetStripLabel}>
-            Documents in packet <span>· {displayDocuments.length}</span>
-          </div>
-          <div className={styles.packetCards}>
-            {displayDocuments.map((doc) => {
-              const isActive = activeDocumentId === doc.id;
-              const documentIndex = getDocumentIndexDetails(doc);
-              const documentIdentifiers = [doc.id, doc.clientDocumentId, doc.sourceHint, doc.title]
-                .filter((value): value is string => Boolean(value));
-              const hasIssue = visibleMismatches.some((mismatch) =>
-                mismatch.values.some(
-                  (entry) => entry.docId && documentIdentifiers.includes(entry.docId)
-                )
-              );
-
-              return (
-                <button
-                  key={doc.id}
-                  type="button"
-                  className={`${styles.packetCard} ${isActive ? styles.packetCardActive : ""}`}
-                  onClick={() => handleDocumentSelection(doc.id)}
-                  aria-pressed={isActive}
-                >
-                  <span className={styles.packetCardTopline}>
-                    <span className={styles.pageBadge}>{documentIndex.pageLabel}</span>
-                    <span
-                      className={`${styles.documentStateDot} ${hasIssue ? styles.documentStateDotIssue : ""}`}
-                      aria-label={hasIssue ? "Has mismatch" : "Checked"}
-                    />
-                  </span>
-                  <span className={styles.packetCardName}>{documentIndex.type}</span>
-                  <span className={styles.packetCardMeta} title={documentIndex.fileName}>
-                    {documentIndex.fileName}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </section>
-
-        {/* Desktop review workspace: source document and extracted data stay visible together. */}
-        <div
-          ref={desktopWorkspaceRef}
-          className={`${styles.workspace} ${styles.desktopWorkspace} ${isPaneResizing ? styles.workspaceResizing : ""}`}
-          style={{ "--data-pane-width": `${dataPaneWidth}px` } as CSSProperties}
-        >
-          <main className={styles.viewerPane}>
-            <div className={styles.viewerToolbar}>
-              <span className={styles.viewerTitle}>{currentDocumentIndex?.type || "Document preview"}</span>
-              <span className={styles.viewerSource} title={currentDocumentIndex?.fileName}>
-                {currentDocumentIndex?.fileName || activeSourceLabel}
-              </span>
-              {previewFocus ? (
-                <button
-                  type="button"
-                  className={styles.focusChip}
-                  onClick={() => setPreviewFocus(null)}
-                  title="Clear preview highlight"
-                >
-                  <span className={styles.focusChipDot} />
-                  {previewFocus.label}
-                  <X className="h-3 w-3" />
-                </button>
-              ) : null}
-              <span className={styles.toolbarDivider} />
-              <div className={styles.pageControls} aria-label="Page controls">
-                <button
-                  type="button"
-                  className={styles.toolButton}
-                  disabled={!canGoToPreviousPreviewPage}
-                  onClick={() => {
-                    setPreviewFocus(null);
-                    if (activeSourceIsImage) {
-                      setPreviewPageIndex((current) => Math.max(0, current - 1));
-                    } else {
-                      setPreviewPdfPage(Math.max(1, activePdfPage - 1));
-                    }
-                  }}
-                  aria-label="Previous page"
-                >
-                  <ChevronLeft className="h-3.5 w-3.5" />
-                </button>
-                <span className={styles.pageCounter}>
-                  {activeSourceIsImage
-                    ? `${Math.min(previewPageIndex + 1, previewPageCount)} / ${previewPageCount}`
-                    : `${activePdfPage} / ${previewPdfPageCount}`}
-                </span>
-                <button
-                  type="button"
-                  className={styles.toolButton}
-                  disabled={!canGoToNextPreviewPage}
-                  onClick={() => {
-                    setPreviewFocus(null);
-                    if (activeSourceIsImage) {
-                      setPreviewPageIndex((current) =>
-                        Math.min(Math.max(activeDocumentFiles.length - 1, 0), current + 1)
-                      );
-                    } else {
-                      setPreviewPdfPage(Math.min(previewPdfPageCount, activePdfPage + 1));
-                    }
-                  }}
-                  aria-label="Next page"
-                >
-                  <ChevronRight className="h-3.5 w-3.5" />
-                </button>
-              </div>
-              <div className={styles.zoomControls} aria-label="Zoom controls">
-                <button
-                  type="button"
-                  className={styles.toolButton}
-                  disabled={!canZoomOut}
-                  onClick={() =>
-                    setPreviewZoom((current) => Math.max(0.75, Number((current - 0.25).toFixed(2))))
-                  }
-                  aria-label="Zoom out"
-                >
-                  <ZoomOut className="h-3.5 w-3.5" />
-                </button>
-                <span className={styles.zoomLabel}>{Math.round(previewZoom * 100)}%</span>
-                <button
-                  type="button"
-                  className={styles.toolButton}
-                  disabled={!canZoomIn}
-                  onClick={() =>
-                    setPreviewZoom((current) => Math.min(3, Number((current + 0.25).toFixed(2))))
-                  }
-                  aria-label="Zoom in"
-                >
-                  <ZoomIn className="h-3.5 w-3.5" />
-                </button>
-                <button
-                  type="button"
-                  className={styles.toolButton}
-                  disabled={!activeFileUrl || previewZoom === DEFAULT_PREVIEW_ZOOM}
-                  onClick={() => setPreviewZoom(DEFAULT_PREVIEW_ZOOM)}
-                  aria-label="Reset zoom"
-                >
-                  <RotateCw className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            </div>
-
-            <div className={styles.viewerCanvas}>
-              {activeFileUrl ? (
-                activeSourceIsImage ? (
-                  <div className={styles.previewScroller}>
-                    <div className={styles.previewImageWrap}>
-                      <div
-                        className={styles.previewImageScale}
-                        style={{ transform: `scale(${previewZoom})` }}
-                      >
-                        <Image
-                          src={activeFileUrl}
-                          alt={`Document preview page ${previewPageIndex + 1}`}
-                          width={1200}
-                          height={1600}
-                          unoptimized
-                          sizes="(min-width: 1240px) 50vw, 44vw"
-                          className={styles.previewImage}
-                          draggable={false}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <PdfEvidencePreview
-                    url={activeFileUrl}
-                    pageNumber={activePdfPage}
-                    zoom={previewZoom}
-                    highlightText={previewFocus?.query}
-                    highlightLabel={previewFocus?.label}
-                    highlightOccurrence={previewFocus?.occurrence}
-                    searchPageStart={activeDocumentSourcePage}
-                    searchPageEnd={
-                      activeDocumentSourcePage + Math.max(1, activeDocument?.pageCount || 1) - 1
-                    }
-                    onHighlightPageChange={setPreviewPdfPage}
-                    onPageCountChange={setPreviewPdfPageCount}
-                  />
-                )
-              ) : (
-                <div className={styles.previewEmpty}>
-                  <div className={styles.previewEmptyInner}>
-                    {isPreviewUrlLoading ? (
-                      <Loader2 className="h-8 w-8 animate-spin opacity-60" />
-                    ) : (
-                      <FileSearch className="h-8 w-8 opacity-50" />
-                    )}
-                    <span>
-                      {isPreviewUrlLoading
-                        ? "Loading source preview…"
-                        : previewUrlError || "Source preview is not available for this document."}
-                    </span>
-                  </div>
-                </div>
-              )}
-            </div>
-          </main>
-
-          <button
-            type="button"
-            role="separator"
-            className={styles.paneResizeHandle}
-            aria-label="Resize PDF preview and extracted data panels"
-            aria-orientation="vertical"
-            aria-valuemin={MIN_DATA_PANE_WIDTH}
-            aria-valuemax={getDataPaneWidthBounds().max}
-            aria-valuenow={dataPaneWidth}
-            title="Drag to resize · Double-click to reset"
-            onPointerDown={handlePaneResizeStart}
-            onPointerMove={handlePaneResizeMove}
-            onPointerUp={handlePaneResizeEnd}
-            onPointerCancel={handlePaneResizeEnd}
-            onDoubleClick={() => resizeDataPane(DEFAULT_DATA_PANE_WIDTH)}
-            onKeyDown={handlePaneResizeKeyDown}
-          >
-            <GripVertical aria-hidden="true" />
-          </button>
-
-          <aside className={styles.dataPane} aria-label="Extracted document data">
-            <div className={styles.dataTabs} role="tablist" aria-label="Extracted data views">
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeDataView === "fields"}
-                className={`${styles.dataTab} ${activeDataView === "fields" ? styles.dataTabActive : ""}`}
-                onClick={() => setActiveDataView("fields")}
-              >
-                Fields <span className={styles.dataTabCount}>{activeDocumentFieldEntries.length}</span>
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeDataView === "lineItems"}
-                className={`${styles.dataTab} ${activeDataView === "lineItems" ? styles.dataTabActive : ""}`}
-                onClick={() => setActiveDataView("lineItems")}
-              >
-                Line items <span className={styles.dataTabCount}>{activeDocumentLineItems.length}</span>
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeDataView === "terms"}
-                className={`${styles.dataTab} ${activeDataView === "terms" ? styles.dataTabActive : ""}`}
-                onClick={() => setActiveDataView("terms")}
-              >
-                PO terms{" "}
-                <span className={styles.dataTabCount}>
-                  {activeTermsChecklistRows.length + unmatchedTermsIssues.length}
-                </span>
-              </button>
-            </div>
-
-            <div className={styles.dataBody}>
-              {activeDataView === "fields" ? (
-                <>
-                  <div className={styles.dataHint}>
-                    <Eye className="h-3.5 w-3.5" /> Values extracted from the selected document
-                  </div>
-                  <div className={styles.dataGroupLabel}>{currentDocumentIndex?.type || "Document"}</div>
-                  {activeDocumentFieldEntries.length > 0 ? (
-                    activeDocumentFieldEntries.map(([key, value]) => {
-                      const currentValue = typeof value === "string" ? value : displayValue(value);
-                      const fieldLabel = getDocumentFieldLabel(activeDocument?.documentType, key);
-                      const focusId = `field-${activeDocument?.id || "document"}-${key}`;
-                      return (
-                        <button
-                          key={key}
-                          type="button"
-                          className={`${styles.fieldRow} ${previewFocus?.id === focusId ? styles.dataRowActive : ""}`}
-                          onClick={() =>
-                            handlePreviewFocus({
-                              id: focusId,
-                              label: fieldLabel,
-                              query: currentValue,
-                              pageNumber: activeDocumentSourcePage,
-                            })
-                          }
-                        >
-                          <div className={styles.fieldKey}>
-                            {fieldLabel}
-                          </div>
-                          <div className={styles.fieldValue}>
-                            {currentValue || <span className={styles.emptyValue}>Not detected</span>}
-                          </div>
-                        </button>
-                      );
-                    })
-                  ) : (
-                    <div className={styles.emptyState}>No scalar fields were extracted for this document.</div>
-                  )}
-                </>
-              ) : null}
-
-              {activeDataView === "lineItems" ? (
-                <>
-                  <div className={styles.lineSummary}>
-                    <div className={styles.lineSummaryItem}>
-                      <div className={styles.lineSummaryLabel}>Rows</div>
-                      <div className={styles.lineSummaryValue}>{activeDocumentLineItems.length}</div>
-                    </div>
-                    <div className={styles.lineSummaryItem}>
-                      <div className={styles.lineSummaryLabel}>Document total</div>
-                      <div className={styles.lineSummaryValue}>
-                        {formatMoney(activeDocument ? getInvoiceAmount(activeDocument) : null) || "—"}
-                      </div>
-                    </div>
-                  </div>
-                  {activeDocumentLineItems.length > 0 ? (
-                    <div className={styles.lineTableWrap}>
-                      <table className={styles.lineTable}>
-                        <thead>
-                          <tr>
-                            {activeDocumentLineItemColumns.map((column) => (
-                              <th key={column.key}>{column.label}</th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {activeDocumentLineItems.map((item, itemIndex) => {
-                            const focusPrefix = `line-item-${activeDocument?.id || "document"}-${itemIndex}`;
-                            const focusId = `${focusPrefix}-row`;
-                            const lineLabel = `Line item ${item.lineNumber || itemIndex + 1}`;
-                            const lineQuery =
-                              item.rawText || item.description || item.itemCode || item.lineNumber || "";
-                            const linePageNumber = getLineItemPreviewPage(activeDocument, item);
-                            const normalizedLineQuery = normalizeEvidenceValue(lineQuery);
-                            const lineOccurrence = activeDocumentLineItems
-                              .slice(0, itemIndex)
-                              .filter(
-                                (previousItem) =>
-                                  getLineItemPreviewPage(activeDocument, previousItem) === linePageNumber &&
-                                  normalizeEvidenceValue(
-                                    previousItem.rawText ||
-                                      previousItem.description ||
-                                      previousItem.itemCode ||
-                                      previousItem.lineNumber ||
-                                      ""
-                                  ) === normalizedLineQuery
-                              ).length;
-                            const selectLineItem = () =>
-                              handlePreviewFocus({
-                                id: focusId,
-                                label: lineLabel,
-                                query: lineQuery,
-                                pageNumber: linePageNumber,
-                                occurrence: lineOccurrence,
-                              });
-
-                            return (
-                              <tr
-                                key={`${item.lineNumber ?? itemIndex}-${item.description ?? item.rawText ?? ""}`}
-                                className={previewFocus?.id.startsWith(focusPrefix) ? styles.dataRowActive : undefined}
-                                role="button"
-                                tabIndex={0}
-                                onClick={selectLineItem}
-                                onKeyDown={(event) => {
-                                  if (event.key === "Enter" || event.key === " ") {
-                                    event.preventDefault();
-                                    selectLineItem();
-                                  }
-                                }}
-                              >
-                                {activeDocumentLineItemColumns.map((column) => {
-                                  const value =
-                                    column.key === "lineNumber"
-                                      ? getLineItemValue(item, column.key) || String(itemIndex + 1)
-                                      : getLineItemValue(item, column.key);
-                                  const displayText = value ? String(value) : "—";
-                                  const cellQuery =
-                                    column.key === "lineNumber"
-                                      ? item.itemCode || item.description || displayText
-                                      : value
-                                        ? String(value)
-                                        : "";
-                                  const cellFocusId = `${focusPrefix}-${column.key}`;
-                                  const normalizedCellQuery = normalizeEvidenceValue(cellQuery);
-                                  const cellOccurrence = activeDocumentLineItems
-                                    .slice(0, itemIndex)
-                                    .filter((previousItem) => {
-                                      if (
-                                        getLineItemPreviewPage(activeDocument, previousItem) !== linePageNumber
-                                      ) {
-                                        return false;
-                                      }
-                                      const previousValue =
-                                        column.key === "lineNumber"
-                                          ? previousItem.itemCode || previousItem.description || ""
-                                          : getLineItemValue(previousItem, column.key);
-                                      return normalizeEvidenceValue(previousValue) === normalizedCellQuery;
-                                    }).length;
-                                  const selectCell = () =>
-                                    handlePreviewFocus({
-                                      id: cellFocusId,
-                                      label: `${column.label} · ${lineLabel}`,
-                                      query: cellQuery,
-                                      pageNumber: linePageNumber,
-                                      occurrence: cellOccurrence,
-                                    });
-
-                                  return (
-                                    <td
-                                      key={column.key}
-                                      className={previewFocus?.id === cellFocusId ? styles.lineCellActive : undefined}
-                                      role="button"
-                                      tabIndex={0}
-                                      onClick={(event) => {
-                                        event.stopPropagation();
-                                        selectCell();
-                                      }}
-                                      onKeyDown={(event) => {
-                                        if (event.key === "Enter" || event.key === " ") {
-                                          event.preventDefault();
-                                          event.stopPropagation();
-                                          selectCell();
-                                        }
-                                      }}
-                                    >
-                                      {displayText}
-                                    </td>
-                                  );
-                                })}
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  ) : (
-                    <div className={styles.emptyState}>No line-item table was extracted for this document.</div>
-                  )}
-                </>
-              ) : null}
-
-              {activeDataView === "terms" ? (
-                <>
-                  <div className={styles.termsSummary}>
-                    <div>
-                      <div className={styles.termsSummaryTitle}>Terms compliance</div>
-                      <div className={styles.termsSummaryCopy}>
-                        {activeTermsChecklistRows.length} extracted clause
-                        {activeTermsChecklistRows.length === 1 ? "" : "s"}
-                      </div>
-                    </div>
-                    <span
-                      className={`${styles.termsStatus} ${activeTermsIssues.length > 0 ? styles.termsStatusIssue : ""}`}
-                    >
-                      {activeTermsIssues.length > 0 ? (
-                        <TriangleAlert className="h-3 w-3" />
-                      ) : (
-                        <CheckCircle2 className="h-3 w-3" />
-                      )}
-                      {activeTermsIssues.length > 0 ? `${activeTermsIssues.length} flagged` : "Clear"}
-                    </span>
-                  </div>
-
-                  {activeTermsChecklistRows.map((row) => {
-                    const StatusIcon = row.status.icon;
-                    const focusId = `term-${activeDocument?.id || "document"}-${row.key}`;
-                    return (
-                      <div
-                        key={row.key}
-                        className={`${styles.termRow} ${previewFocus?.id === focusId ? styles.dataRowActive : ""}`}
-                        role="button"
-                        tabIndex={0}
-                        onClick={() =>
-                          handlePreviewFocus({
-                            id: focusId,
-                            label: row.label,
-                            query: row.value,
-                            pageNumber: activeDocumentSourcePage,
-                          })
-                        }
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" || event.key === " ") {
-                            event.preventDefault();
-                            handlePreviewFocus({
-                              id: focusId,
-                              label: row.label,
-                              query: row.value,
-                              pageNumber: activeDocumentSourcePage,
-                            });
-                          }
-                        }}
-                      >
-                        <div className={styles.termHeader}>
-                          <div className={styles.termCategory}>{row.label}</div>
-                          <span className={`${styles.termBadge} ${row.status.className}`}>
-                            <StatusIcon className="h-3 w-3" /> {row.status.label}
-                          </span>
-                        </div>
-                        <div className={styles.termText}>{row.value}</div>
-                        {row.detail ? <div className={styles.termDetail}>{row.detail}</div> : null}
-                        {row.evidence ? <div className={styles.termEvidence}>{row.evidence}</div> : null}
-                        {row.issue?.analysis ? <div className={styles.termIssue}>{row.issue.analysis}</div> : null}
-                      </div>
-                    );
-                  })}
-
-                  {unmatchedTermsIssues.map((issue) => {
-                    const status = getTermsIssueStatus(issue);
-                    const StatusIcon = status.icon;
-                    const focusId = `term-issue-${activeDocument?.id || "document"}-${issue.id}`;
-                    const issueText =
-                      issue.analysis || issue.fixPlan || getTermsIssueText(issue) || "Terms issue requires review.";
-                    const issueQuery =
-                      issue.values
-                        .map((entry) => String(entry.value ?? "").trim())
-                        .find(Boolean) || issueText;
-                    const selectIssue = () =>
-                      handlePreviewFocus({
-                        id: focusId,
-                        label: "Terms review item",
-                        query: issueQuery,
-                        pageNumber: activeDocumentSourcePage,
-                      });
-                    return (
-                      <div
-                        key={issue.id}
-                        className={`${styles.termRow} ${previewFocus?.id === focusId ? styles.dataRowActive : ""}`}
-                        role="button"
-                        tabIndex={0}
-                        onClick={selectIssue}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" || event.key === " ") {
-                            event.preventDefault();
-                            selectIssue();
-                          }
-                        }}
-                      >
-                        <div className={styles.termHeader}>
-                          <div className={styles.termCategory}>Review item</div>
-                          <span className={`${styles.termBadge} ${status.className}`}>
-                            <StatusIcon className="h-3 w-3" /> {status.label}
-                          </span>
-                        </div>
-                        <div className={styles.termText}>{issueText}</div>
-                      </div>
-                    );
-                  })}
-
-                  {activeTermsChecklistRows.length === 0 && unmatchedTermsIssues.length === 0 ? (
-                    <div className={styles.emptyState}>No purchase-order terms were extracted for this document.</div>
-                  ) : null}
-                </>
-              ) : null}
-            </div>
-          </aside>
-        </div>
-
-        {/* Main Content Split */}
-        <div className={`${styles.legacyMobileWorkspace} flex-1 min-h-0 relative`}>
-
-          {/* Left Sidebar (Desktop only) */}
-          <aside className="hidden">
-            <div className="min-w-0 shrink-0 p-5 pb-4">
-
-                {/* Decision Summary Card */}
-                {detail && reviewSummary && (
-                  <div
-                    className={`flex w-full max-w-full flex-col overflow-hidden rounded-2xl border bg-white shadow-sm ${
-                      reviewSummary.tone === "emerald"
-                        ? "border-emerald-200"
-                        : reviewSummary.tone === "amber"
-                          ? "border-amber-200"
-                          : "border-rose-200"
-                    }`}
-                  >
-
-                    <div
-                      className={`p-5 ${
-                        reviewSummary.tone === "emerald"
-                          ? "bg-emerald-50/70"
-                          : reviewSummary.tone === "amber"
-                            ? "bg-amber-50/70"
-                            : "bg-rose-50/70"
-                      }`}
-                    >
-                      <div className="mb-3 flex items-start justify-between gap-3">
-                        <div className="flex min-w-0 items-center gap-2">
-                          <div
-                            className={`rounded-full p-1.5 shadow-sm ${
-                              reviewSummary.tone === "emerald"
-                                ? "bg-emerald-100 text-emerald-600"
-                                : reviewSummary.tone === "amber"
-                                  ? "bg-amber-100 text-amber-600"
-                                  : "bg-rose-100 text-rose-600"
-                            }`}
-                          >
-                            {reviewSummary.tone === "emerald" ? (
-                              <CheckCircle2 className="h-4 w-4" />
-                            ) : reviewSummary.title === "Processing" ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : (
-                              <TriangleAlert className="h-4 w-4" />
-                            )}
-                          </div>
-                          <h3
-                            className={`truncate text-base font-medium ${
-                              reviewSummary.tone === "emerald"
-                                ? "text-emerald-950"
-                                : reviewSummary.tone === "amber"
-                                  ? "text-amber-950"
-                                  : "text-rose-950"
-                            }`}
-                          >
-                            {reviewSummary.title}
-                          </h3>
-                        </div>
-                        {reviewSummary.showBadge ? (
-                          <span
-                            className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-medium uppercase tracking-wider ${
-                              reviewSummary.tone === "emerald"
-                                ? "bg-emerald-100 text-emerald-700"
-                                : reviewSummary.tone === "amber"
-                                  ? "bg-amber-100 text-amber-700"
-                                  : "bg-rose-100 text-rose-700"
-                            }`}
-                          >
-                            {reviewSummary.badgeLabel}
-                          </span>
-                        ) : null}
-                      </div>
-
-                      <p
-                        className={`text-sm font-medium leading-snug ${
-                          reviewSummary.tone === "emerald"
-                            ? "text-emerald-800"
-                            : reviewSummary.tone === "amber"
-                              ? "text-amber-800"
-                              : "text-rose-800"
-                        }`}
-                      >
-                        {reviewSummary.description}
-                      </p>
-                      {reviewSummary.action !== "approve" && reviewSummary.actionHint ? (
-                        <p className="mt-2 text-xs font-medium leading-snug text-slate-600">
-                          {reviewSummary.actionHint}
-                        </p>
-                      ) : null}
-
-                      {reviewSummary.buttonLabel && reviewSummary.action === "review" && (
-                        <Button
-                          asChild
-                          className={`mt-4 h-10 w-full text-white shadow-sm font-medium ${
-                            reviewSummary.tone === "emerald"
-                              ? "bg-emerald-600 hover:bg-emerald-700"
-                              : reviewSummary.tone === "amber"
-                                ? "bg-amber-600 hover:bg-amber-700"
-                                : "bg-rose-600 hover:bg-rose-700"
-                          }`}
-                        >
-                          <Link
-                            href={mismatchReviewHref}
-                            prefetch
-                            onPointerEnter={prepareMismatchNavigation}
-                            onFocus={prepareMismatchNavigation}
-                            onClick={beginMismatchNavigation}
-                          >
-                            {isMismatchNavigationPending ? (
-                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                            ) : (
-                              <TriangleAlert className="mr-2 h-4 w-4" />
-                            )}
-                            {isMismatchNavigationPending ? "Opening review…" : reviewSummary.buttonLabel}
-                          </Link>
-                        </Button>
-                      )}
-
-                      {reviewSummary.buttonLabel && reviewSummary.action === "approve" && showActions && (
-                        <Button
-                          className="mt-4 h-10 w-full bg-emerald-600 font-medium text-white shadow-sm hover:bg-emerald-700"
-                          disabled={decisionStatus === "updating"}
-                          onClick={() => handleCaseDecision("accepted")}
-                        >
-                          {decisionStatus === "updating" ? (
-                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          ) : (
-                            <Check className="mr-2 h-4 w-4" />
-                          )}
-                          {reviewSummary.buttonLabel}
-                        </Button>
-                      )}
-
-                      {reviewSummary.buttonLabel && reviewSummary.action === "retry" && (
-                        <Button
-                          className="mt-4 h-10 w-full bg-rose-600 font-medium text-white shadow-sm hover:bg-rose-700"
-                          onClick={() => {
-                            setPendingAnalysisMode("standard");
-                            setAnalysisOptionsOpen(true);
-                          }}
-                        >
-                          <Play className="mr-2 h-4 w-4 fill-white" />
-                          {reviewSummary.buttonLabel}
-                        </Button>
-                      )}
-
-                      {reviewSummary.showConfidence && (
-                        <div className="mt-4 flex items-center justify-center gap-2 rounded-lg border border-emerald-100 bg-emerald-100/60 py-2 text-xs font-medium text-emerald-700">
-                          <Sparkles className="h-3.5 w-3.5" /> High Confidence
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="border-t border-slate-100 bg-white p-4">
-                      <div className="grid grid-cols-1 gap-2">
-                        {reviewSummary.facts.map((fact) => (
-                          <div
-                            key={`${fact.label}-${fact.value}`}
-                            className="flex min-w-0 items-center justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2"
-                          >
-                            <span className="shrink-0 text-[10px] font-medium uppercase tracking-widest text-slate-400">
-                              {fact.label}
-                            </span>
-                            <span className="min-w-0 truncate text-right text-xs font-medium text-slate-800" title={fact.value}>
-                              {fact.value}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-            </div>
-
-            {/* Documents List */}
-            <div className="flex min-h-0 flex-1 flex-col border-t border-slate-200 px-5 pb-5 pt-4">
-                  <div className="mb-3 flex shrink-0 items-center justify-between px-1">
-                    <h3 className="text-[11px] font-medium text-slate-500 uppercase tracking-widest">Documents in Packet</h3>
-                    <span className="rounded-full bg-slate-200/50 px-2 py-0.5 text-[10px] font-medium text-slate-500">{displayDocuments.length}</span>
-                  </div>
-                  <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
-                    {displayDocuments.map((doc) => {
-                      const isActive = activeDocumentId === doc.id;
-                      const documentIndex = getDocumentIndexDetails(doc);
-                      return (
-                        <button
-                          key={doc.id}
-                          onClick={() => setActiveDocumentId(doc.id)}
-                          className={`flex w-full min-w-0 items-start gap-3 rounded-xl px-3 py-3 text-left transition-all ${isActive ? 'bg-white shadow-sm border border-slate-200 ring-1 ring-slate-200' : 'hover:bg-slate-200/50 border border-transparent'
-                            }`}
-                        >
-                          <div className={`mt-0.5 shrink-0 h-8 w-8 rounded-lg flex items-center justify-center ${isActive ? 'bg-indigo-50 text-indigo-600' : 'bg-white text-slate-400 border border-slate-200'}`}>
-                            <FileText className="h-4 w-4" />
-                          </div>
-                          <div className="min-w-0 flex-1">
-                            <p className={`whitespace-normal text-sm font-medium leading-snug [overflow-wrap:anywhere] ${isActive ? 'text-slate-950' : 'text-slate-700'}`}>
-                              {documentIndex.type}
-                            </p>
-                            <p className={`mt-1 truncate text-xs font-medium leading-snug ${isActive ? 'text-slate-700' : 'text-slate-500'}`} title={documentIndex.fileName}>
-                              {documentIndex.fileName}
-                            </p>
-                            <p className="mt-1 line-clamp-1 text-[10px] font-medium uppercase tracking-wider text-slate-400 [overflow-wrap:anywhere]">
-                              {documentIndex.pageLabel}
-                            </p>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-            </div>
-          </aside>
-
-          {/* Right Main Area (Document Viewer Card) */}
-          <main className="flex-1 flex flex-col min-w-0 bg-[#fafafa] pt-2.5 px-2.5 pb-0 sm:p-4 md:p-6 lg:p-8 relative">
-
-            {/* Mobile Document Selector (Horizontal scroll) */}
-            <div className="bg-white border border-[#e5ddd0] rounded-xl mb-3 p-1.5 shrink-0 z-10 relative overflow-hidden shadow-sm">
-              <div className="flex overflow-x-auto gap-2 snap-x scrollbar-hide py-0.5 px-0.5">
-                {displayDocuments.map((doc) => {
-                  const isActive = activeDocumentId === doc.id;
-                  const documentIndex = getDocumentIndexDetails(doc);
-                  return (
-                      <button
-                        key={doc.id}
-                      onClick={() => setActiveDocumentId(doc.id)}
-                      className={`snap-start shrink-0 flex flex-col items-center justify-center px-4 py-2 rounded-lg text-center transition-all border ${isActive 
-                        ? 'bg-[#1a1a1a] border-slate-900 shadow-md text-white' 
-                        : 'bg-[#f0ece6] border-[#e5ddd0] text-[#5a5046]'
-                        }`}
-                      style={{ minWidth: '160px' }}
-                    >
-                      <p className="w-full truncate text-[11px] font-medium">{documentIndex.type}</p>
-                      <p className={`mt-0.5 w-full truncate text-[9px] font-medium opacity-70 ${isActive ? 'text-white' : 'text-[#8a7f72]'}`}>{documentIndex.fileName}</p>
-                      <p className={`mt-0.5 w-full truncate text-[8px] font-medium uppercase tracking-wider opacity-60 ${isActive ? 'text-white' : 'text-[#8a7f72]'}`}>{documentIndex.pageLabel}</p>
-                    </button>
-                  )
-                })}
-              </div>
-            </div>
-
-            {/* The Unified Card Container */}
-            <div className="flex flex-col flex-1 bg-white sm:border border-slate-200 sm:rounded-2xl shadow-sm overflow-hidden mb-2 sm:mb-0">
-
-              {/* Card Header (Tabs & Title) */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-2 sm:p-3 border-b border-slate-100 bg-white shrink-0">
-
-                {/* Left Side: Title & Badge (Desktop Only) */}
-                <div className="hidden sm:flex items-center gap-3">
-                  <div className="flex items-center gap-2">
-                    {activeTab === 'preview' ? <Eye className="h-5 w-5 text-slate-500" /> : <Database className="h-5 w-5 text-slate-500" />}
-                    <h2 className="text-base font-medium text-slate-900">
-                      {activeTab === 'preview' ? 'Preview' : 'Extracted Data'}
-                    </h2>
-                  </div>
-                  <Badge variant="outline" className="rounded-full px-2.5 py-0.5 text-[10px] uppercase font-medium text-slate-500 bg-slate-50 border-slate-200">
-                    {activeTab === 'preview' ? activeSourceLabel : 'View'}
-                  </Badge>
-                </div>
-
-                {/* Right Side: Segmented Control & Actions */}
-                <div className="flex items-center justify-between sm:justify-end w-full sm:w-auto gap-3">
-
-                  {/* Segmented Control */}
-                  <div className="flex items-center bg-[#f0ece6] p-1 rounded-xl w-full sm:w-auto border border-[#e5ddd0]">
-                    {DETAIL_TABS.map((tab) => {
-                      const isActive = activeTab === tab.id;
-                      return (
-                        <button
-                          key={tab.id}
-                          onClick={() => setActiveTab(tab.id)}
-                          className={`flex-1 sm:flex-none flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg text-[11px] sm:text-xs font-medium transition-all ${isActive
-                              ? 'bg-[#1a1a1a] text-white shadow-md'
-                              : 'text-[#5a5046] hover:bg-[#e5ddd0]/30'
-                            }`}
-                        >
-                          <tab.icon className={`h-3.5 w-3.5 ${isActive ? 'text-white' : 'text-[#8a7f72]'}`} />
-                          <span>{tab.label}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-
-                </div>
-              </div>
-
-              {/* Card Body (The Views) */}
-              <div className="flex-1 relative bg-white overflow-hidden">
-
-                {/* 1. Preview View */}
-                {activeTab === 'preview' && (
-                  <div className="absolute inset-0 flex flex-col bg-[#525659]">
-
-                    {/* PDF/Image Canvas */}
-                    <div className="flex-1 relative overflow-hidden">
-                      {activeFileUrl ? (
-                        activeSourceIsImage ? (
-                          <div className="absolute inset-0 overflow-auto">
-                            <div className="flex min-h-full min-w-full items-start justify-center px-3 py-5 sm:px-6 sm:py-8">
-                              <div
-                                className="relative flex w-full max-w-[min(100%,880px)] justify-center transition-transform duration-150 ease-out"
-                                style={{ transform: `scale(${previewZoom})`, transformOrigin: "top center" }}
-                              >
-                                <Image
-                                  src={activeFileUrl}
-                                  alt={`Document preview page ${previewPageIndex + 1}`}
-                                  width={1200}
-                                  height={1600}
-                                  unoptimized
-                                  sizes="(min-width: 1024px) 70vw, 92vw"
-                                  className="h-auto max-h-[calc(100vh-13rem)] w-auto max-w-full rounded-sm bg-white object-contain shadow-2xl"
-                                  draggable={false}
-                                />
-                              </div>
-                            </div>
-                          </div>
-                        ) : (
-                          <iframe
-                            key={`${activeFileUrl}-${activeDocumentSourcePage}`}
-                            src={`${activeFileUrl}#page=${activeDocumentSourcePage}&toolbar=0&navpanes=0`}
-                            className="absolute inset-0 w-full h-full border-0 bg-white"
-                            title="Document Preview"
-                          />
-                        )
-                      ) : isPreviewUrlLoading ? (
-                        <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-300 gap-4 p-6 text-center">
-                          <Loader2 className="w-12 h-12 animate-spin opacity-70" />
-                          <p className="text-sm font-medium">Loading source preview...</p>
-                        </div>
-                      ) : (
-                        <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-300 gap-4 p-6 text-center">
-                          <FileSearch className="w-12 h-12 opacity-50" />
-                          <p className="text-sm font-medium">
-                            {previewUrlError || "Source preview not available for this document."}
-                          </p>
-                        </div>
-                      )}
-
-                      {/* Floating Dark Toolbar */}
-                      {activeFileUrl && (
-                        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-1 bg-slate-900/80 backdrop-blur-md px-2 py-1.5 rounded-xl border border-white/10 shadow-2xl z-20">
-                          {previewPageCount > 1 && (
-                            <>
-                              <button
-                                type="button"
-                                disabled={!canGoToPreviousPreviewPage}
-                                className="p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
-                                onClick={() => setPreviewPageIndex((current) => Math.max(0, current - 1))}
-                                aria-label="Previous page"
-                              >
-                                <ChevronLeft className="h-4 w-4" />
-                              </button>
-                            </>
-                          )}
-                          <div className="text-white text-[10px] sm:text-xs font-medium px-2 flex items-center gap-1">
-                            {Math.min(previewPageIndex + 1, previewPageCount)} <span className="opacity-50">/ {previewPageCount}</span>
-                          </div>
-                          {previewPageCount > 1 && (
-                            <>
-                              <button
-                                type="button"
-                                disabled={!canGoToNextPreviewPage}
-                                className="p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
-                                onClick={() =>
-                                  setPreviewPageIndex((current) =>
-                                    Math.min(Math.max(activeDocumentFiles.length - 1, 0), current + 1)
-                                  )
-                                }
-                                aria-label="Next page"
-                              >
-                                <ChevronRight className="h-4 w-4" />
-                              </button>
-                            </>
-                          )}
-                          <div className="h-3 w-px bg-white/20 mx-1"></div>
-                          <button
-                            type="button"
-                            disabled={!canZoomOut}
-                            className="p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
-                            onClick={() => setPreviewZoom((current) => Math.max(0.75, Number((current - 0.25).toFixed(2))))}
-                            aria-label="Zoom out"
-                          >
-                            <ZoomOut className="h-4 w-4" />
-                          </button>
-                          <button
-                            type="button"
-                            disabled={!canZoomIn}
-                            className="p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
-                            onClick={() => setPreviewZoom((current) => Math.min(3, Number((current + 0.25).toFixed(2))))}
-                            aria-label="Zoom in"
-                          >
-                            <ZoomIn className="h-4 w-4" />
-                          </button>
-                          <div className="h-3 w-px bg-white/20 mx-1 hidden sm:block"></div>
-                          <button
-                            type="button"
-                            disabled={!activeSourceIsImage || previewZoom === DEFAULT_PREVIEW_ZOOM}
-                            className="hidden sm:block p-1.5 rounded-lg text-slate-300 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
-                            onClick={() => setPreviewZoom(DEFAULT_PREVIEW_ZOOM)}
-                            aria-label="Reset zoom"
-                          >
-                            <RotateCw className="h-4 w-4" />
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                {/* 2. Data View */}
-                {activeTab === 'data' && (
-                  <div className="absolute inset-0 overflow-y-auto">
-                    <div className="mx-auto max-w-5xl space-y-3 p-3 pb-5 sm:p-4">
-                      {(activeFieldDataCount > 0 || activeDocumentLineItems.length > 0) && (
-                        <div className="flex flex-col gap-2 rounded-xl border border-slate-100 bg-white px-3 py-2 shadow-sm sm:flex-row sm:items-center sm:justify-between">
-                          <div>
-                            <div className="text-[10px] font-medium uppercase tracking-wider text-slate-400">
-                              Data View
-                            </div>
-                            <div className="text-xs font-medium text-slate-700">
-                              {activeDocument?.title ?? "Selected document"}
-                            </div>
-                          </div>
-                          <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-0.5">
-                            <button
-                              type="button"
-                              className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
-                                activeDataView === "fields"
-                                  ? "bg-white text-slate-950 shadow-sm"
-                                  : "text-slate-500 hover:text-slate-800"
-                              }`}
-                              onClick={() => setActiveDataView("fields")}
-                            >
-                              Fields ({activeFieldDataCount})
-                            </button>
-                            <button
-                              type="button"
-                              disabled={activeDocumentLineItems.length === 0}
-                              className={`rounded-md px-2.5 py-1.5 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
-                                activeDataView === "lineItems"
-                                  ? "bg-white text-slate-950 shadow-sm"
-                                  : "text-slate-500 hover:text-slate-800"
-                              }`}
-                              onClick={() => setActiveDataView("lineItems")}
-                            >
-                              Line items ({activeDocumentLineItems.length})
-                            </button>
-                          </div>
-                        </div>
-                      )}
-
-                      {activeFieldDataCount === 0 && activeDocumentLineItems.length === 0 ? (
-                        <div className="py-12 text-center text-sm font-medium text-slate-500">
-                          No specific fields extracted for this document type.
-                        </div>
-                      ) : activeDataView === "fields" && activeFieldDataCount > 0 ? (
-                        <div className="space-y-3">
-                          {(activeTermsChecklistRows.length > 0 || unmatchedTermsIssues.length > 0) && (
-                            <div className="overflow-hidden rounded-xl border border-slate-100 bg-white shadow-sm">
-                              <div className="flex flex-col gap-2 border-b border-slate-100 px-4 py-3 sm:flex-row sm:items-start sm:justify-between">
-                                <div>
-                                  <div className="text-xs font-medium uppercase tracking-wider text-slate-500">
-                                    Terms & Conditions Compliance Checklist
-                                  </div>
-                                  <div className="mt-1 text-xs font-medium text-slate-700">
-                                    {activeTermsChecklistRows.length} clause{activeTermsChecklistRows.length === 1 ? "" : "s"} extracted from this document.
-                                  </div>
-                                </div>
-                                <div
-                                  className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium ${
-                                    activeTermsIssues.length > 0
-                                      ? "border-amber-200 bg-amber-50 text-amber-700"
-                                      : "border-emerald-200 bg-emerald-50 text-emerald-700"
-                                  }`}
-                                >
-                                  {activeTermsIssues.length > 0 ? (
-                                    <TriangleAlert className="h-3.5 w-3.5" />
-                                  ) : (
-                                    <CheckCircle2 className="h-3.5 w-3.5" />
-                                  )}
-                                  {activeTermsIssues.length > 0
-                                    ? `${activeTermsIssues.length} issue${activeTermsIssues.length === 1 ? "" : "s"} flagged`
-                                    : "No issue flagged"}
-                                </div>
-                              </div>
-
-                              <div className="divide-y divide-slate-100">
-                                {activeTermsChecklistRows.map((row) => {
-                                  const StatusIcon = row.status.icon;
-
-                                  return (
-                                    <div
-                                      key={row.key}
-                                      className="grid gap-2 px-4 py-3 sm:grid-cols-[9rem_minmax(0,1fr)_auto]"
-                                    >
-                                      <div className="text-[11px] font-medium uppercase tracking-wider text-slate-500">
-                                        {row.label}
-                                      </div>
-                                      <div className="min-w-0">
-                                        <div className="whitespace-pre-wrap break-words text-xs font-medium leading-snug text-slate-900">
-                                          {row.value}
-                                        </div>
-                                        {row.detail ? (
-                                          <div className="mt-2 text-xs font-medium uppercase tracking-wide text-slate-500">
-                                            {row.detail}
-                                          </div>
-                                        ) : null}
-                                        {row.evidence ? (
-                                          <div className="mt-2 rounded-lg bg-slate-50 px-3 py-2 text-xs font-medium leading-relaxed text-slate-700">
-                                            {row.evidence}
-                                          </div>
-                                        ) : null}
-                                        {row.issue?.analysis ? (
-                                          <div className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs font-medium leading-relaxed text-amber-800">
-                                            {row.issue.analysis}
-                                          </div>
-                                        ) : null}
-                                      </div>
-                                      <div
-                                        className={`inline-flex h-fit w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium ${row.status.className}`}
-                                      >
-                                        <StatusIcon className="h-3.5 w-3.5" />
-                                        {row.status.label}
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-
-                                {unmatchedTermsIssues.map((issue) => {
-                                  const status = getTermsIssueStatus(issue);
-                                  const StatusIcon = status.icon;
-                                  const issueText =
-                                    issue.analysis ||
-                                    issue.fixPlan ||
-                                    getTermsIssueText(issue) ||
-                                    "Terms issue requires review.";
-
-                                  return (
-                                    <div
-                                      key={issue.id}
-                                      className="grid gap-2 px-4 py-3 sm:grid-cols-[9rem_minmax(0,1fr)_auto]"
-                                    >
-                                      <div className="text-[11px] font-medium uppercase tracking-wider text-slate-500">
-                                        Review Item
-                                      </div>
-                                      <div className="min-w-0 whitespace-pre-wrap break-words text-xs font-medium leading-snug text-slate-900">
-                                        {issueText}
-                                      </div>
-                                      <div
-                                        className={`inline-flex h-fit w-fit items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium ${status.className}`}
-                                      >
-                                        <StatusIcon className="h-3.5 w-3.5" />
-                                        {status.label}
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          )}
-
-                          {activeDocumentFieldEntries.length > 0 ? (
-                            <div className="flex flex-col overflow-hidden rounded-xl border border-slate-100 text-sm shadow-sm">
-                              {activeDocumentFieldEntries.map(([key, value], index) => {
-                                const currentValue = typeof value === "string" ? value : displayValue(value);
-
-                                return (
-                                  <div key={key} className={`flex flex-col bg-white px-3 py-2.5 transition-colors hover:bg-slate-50/50 sm:grid sm:grid-cols-[13rem_minmax(0,1fr)] sm:items-start sm:gap-4 sm:px-4 sm:py-3 ${index !== activeDocumentFieldEntries.length - 1 ? 'border-b border-slate-100' : ''}`}>
-                                    <div className="mb-1 w-full pr-4 sm:mb-0">
-                                      <div className="flex items-center gap-2 text-[11px] font-medium text-slate-500">
-                                        {getDocumentFieldLabel(activeDocument?.documentType, key)}
-                                      </div>
-                                    </div>
-                                    <div className="w-full break-words text-sm font-medium leading-snug text-slate-900">
-                                      {currentValue || <span className="font-normal italic text-slate-300">Not detected</span>}
-                                    </div>
-                                  </div>
-                                )
-                              })}
-                            </div>
-                          ) : null}
-                        </div>
-                      ) : activeDataView === "fields" ? (
-                        <div className="rounded-xl border border-dashed border-slate-200 bg-white p-8 text-center text-sm font-medium text-slate-500">
-                          No scalar fields were extracted for this document.
-                        </div>
-                      ) : null}
-
-                      {activeDataView === "lineItems" && activeDocumentLineItems.length > 0 && (
-                        <div className="rounded-xl border border-slate-100 bg-white shadow-sm">
-                          <div className="flex flex-col gap-1 border-b border-slate-100 px-4 py-2.5">
-                            <div className="text-xs font-medium uppercase tracking-wider text-slate-500">
-                              Line Items
-                            </div>
-                            <div className="text-xs font-medium text-slate-700">
-                              {activeDocumentLineItems.length} row{activeDocumentLineItems.length === 1 ? "" : "s"} extracted from the document table.
-                            </div>
-                          </div>
-                          <div className="overflow-x-auto">
-                            <table className="w-full min-w-[760px] border-collapse text-left text-xs sm:text-sm">
-                              <thead className="bg-slate-50 text-[10px] uppercase tracking-wider text-slate-500">
-                                <tr>
-                                  {activeDocumentLineItemColumns.map((column) => (
-                                    <th
-                                      key={column.key}
-                                      className={`border-b border-slate-100 px-3 py-2 font-medium ${column.className ?? ""}`}
-                                    >
-                                      {column.label}
-                                    </th>
-                                  ))}
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {activeDocumentLineItems.map((item, itemIndex) => (
-                                  <tr key={`${item.lineNumber ?? itemIndex}-${item.description ?? item.rawText ?? ""}`} className="border-b border-slate-100 last:border-0">
-                                    {activeDocumentLineItemColumns.map((column) => {
-                                      const value =
-                                        column.key === "lineNumber"
-                                          ? getLineItemValue(item, column.key) || String(itemIndex + 1)
-                                          : getLineItemValue(item, column.key);
-
-                                      return (
-                                        <td
-                                          key={column.key}
-                                          className={`align-top px-3 py-3 font-medium text-slate-800 ${column.className ?? ""}`}
-                                        >
-                                          {value ? String(value) : <span className="text-slate-300">-</span>}
-                                        </td>
-                                      );
-                                    })}
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        </div>
-                      )}
-                      {activeDataView === "lineItems" && activeDocumentLineItems.length === 0 && (
-                        <div className="rounded-xl border border-dashed border-slate-200 bg-white p-8 text-center text-sm font-medium text-slate-500">
-                          No line-item table was extracted for this document.
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-
-          </main>
-        </div>
-
-        {/* Mobile Sticky Action Bar */}
-        {showActions && (
-          <div
-            className={styles.mobileActionBar}
-            style={{ bottom: "calc(5.25rem + env(safe-area-inset-bottom))" }}
-          >
-            <Button
-              variant="outline"
-              className={`${styles.mobileActionButton} text-rose-600 hover:bg-rose-50 hover:text-rose-700 border-slate-200 shadow-sm font-medium`}
-              disabled={decisionStatus === "updating"}
-              onClick={() => handleCaseDecision("rejected")}
-            >
-              <X className="h-5 w-5 mr-2" /> Reject
-            </Button>
-            <Button
-              className={`${styles.mobileActionButton} bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm font-medium`}
-              disabled={decisionStatus === "updating"}
-              onClick={() => handleCaseDecision("accepted")}
-            >
-              {decisionStatus === "updating" ? (
-                <Loader2 className="h-5 w-5 animate-spin mr-2" />
-              ) : (
-                <Check className="h-5 w-5 mr-2" />
-              )}
-              Accept
-            </Button>
-          </div>
-        )}
-
-        <AnalysisOptionsDialog
-          open={analysisOptionsOpen}
-          onOpenChange={setAnalysisOptionsOpen}
-          onSelect={(nextOptions) => {
-            setAnalysisOptionsOpen(false);
-            void handleAnalyzeDraftCase(nextOptions, pendingAnalysisMode);
-          }}
-        />
-
-        <Dialog open={isTallyReviewOpen} onOpenChange={setIsTallyReviewOpen}>
-          <DialogContent className={styles.tallyReviewDialog}>
-            <DialogHeader className={styles.tallyReviewDialogHeader}>
-              <DialogTitle className={styles.tallyReviewDialogTitle}>
-                Approved case · Tally review
-              </DialogTitle>
-              <DialogDescription className={styles.tallyReviewDialogDescription}>
-                Review the prepared Purchase voucher and posting status without leaving the case workspace.
-              </DialogDescription>
-            </DialogHeader>
-            <div className={styles.tallyReviewDialogBody}>
-              {isTallyReviewOpen ? (
-                <TallyInReviewPanel
-                  caseId={caseId}
-                  onViewOriginal={(documentId) => {
-                    setActiveDocumentId(documentId);
-                    setActiveTab("preview");
-                    setIsTallyReviewOpen(false);
-                  }}
-                />
-              ) : null}
-            </div>
-          </DialogContent>
-        </Dialog>
-      </div>
-    </AppShell>
-  );
+  // Unreachable once the case has loaded: every ready state returns above.
+  return null;
 }

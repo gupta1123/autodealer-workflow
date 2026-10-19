@@ -27,6 +27,8 @@ export type SavedCaseRecord = {
   mismatchCount: number;
   createdAt: string;
   deletedAt: string | null;
+  /** Recycle bin only: has purchase posting/approval history, so it is never auto-purged. */
+  keptForHistory?: boolean;
 };
 
 export type DuplicateCaseReference = {
@@ -34,6 +36,7 @@ export type DuplicateCaseReference = {
   displayName: string;
   status: string;
   createdAt: string;
+  inRecycleBin?: boolean;
 };
 
 export type ShipmentBatchCase = {
@@ -163,6 +166,7 @@ export type FetchCasesOptions = {
   statusFilter?: "all" | "pending" | "in_review" | "completed" | "failed";
   approvalFilter?: "all" | "approved" | "pending" | "rejected";
   reconciliationFilter?: "all" | "clean" | "issues";
+  expiring?: boolean;
   signal?: AbortSignal;
 };
 
@@ -366,6 +370,7 @@ function readDuplicateCase(payload: unknown): DuplicateCaseReference | undefined
         displayName: record.displayName,
         status: record.status,
         createdAt: record.createdAt,
+        inRecycleBin: record.inRecycleBin === true,
       }
     : undefined;
 }
@@ -603,6 +608,7 @@ export async function fetchCasePage({
   statusFilter,
   approvalFilter,
   reconciliationFilter,
+  expiring,
   signal,
 }: FetchCasesOptions): Promise<RecentCasesResponse> {
   const query = new URLSearchParams();
@@ -624,6 +630,9 @@ export async function fetchCasePage({
   }
   if (reconciliationFilter && reconciliationFilter !== "all") {
     query.set("reconciliation", reconciliationFilter);
+  }
+  if (expiring) {
+    query.set("expiring", "1");
   }
   if (sortMode && sortMode !== "recent") {
     query.set("sort", sortMode);

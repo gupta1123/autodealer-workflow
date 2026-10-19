@@ -45,6 +45,8 @@ import {
   getExtractionReviewReasoningEffort,
   getQualityExtractionModel,
   getQualityExtractionReasoning,
+  timeStage,
+  withFastModel,
 } from "./openrouter";
 
 const STORAGE_BUCKET = "packet-files";
@@ -57,7 +59,7 @@ const PROVIDER_IMAGE_TARGET_BYTES = Math.min(PROVIDER_IMAGE_HARD_LIMIT_BYTES, Ma
 const PROVIDER_IMAGE_MAX_DIMENSION = Number(process.env.PACKET_PROVIDER_IMAGE_MAX_DIMENSION ?? 3200);
 const PACKET_AI_CONCURRENCY = Math.max(
   1,
-  Math.min(6, Number(process.env.PACKET_AI_CONCURRENCY ?? 3) || 3)
+  Math.min(6, Number(process.env.PACKET_AI_CONCURRENCY ?? 5) || 5)
 );
 const PHOTO_VEHICLE_NUMBER_NOT_VISIBLE_COPY = "Vehicle number is not clearly visible in this image.";
 const PO_NUMBER_FIELD_KEYS: FieldKey[] = ["poNumber", "referencePoNumber"];
@@ -4413,7 +4415,7 @@ async function classifyDocumentFromImage(image: string, fileName = ""): Promise<
         ],
       },
     ],
-    { expectJson: true }
+    withFastModel({ expectJson: true })
   );
 
   const parsed = safeJsonParse<{ documentType?: string }>(raw, {});
@@ -4443,7 +4445,7 @@ async function classifyDocumentFromText(textPages: string[], fileName = ""): Pro
         content: `File name: ${fileName}\n\nVisible text:\n${visibleText}`,
       },
     ],
-    { expectJson: true }
+    withFastModel({ expectJson: true })
   );
 
   const parsed = safeJsonParse<{ documentType?: string }>(raw, {});
@@ -4688,11 +4690,11 @@ async function splitPdfPagesIndividually(params: {
               ],
             },
           ],
-          {
+          withFastModel({
             expectJson: true,
             model: getQualityExtractionModel(),
             reasoning: getQualityExtractionReasoning(),
-          }
+          })
         )
       : await callOpenRouter(
           [
@@ -4707,11 +4709,11 @@ async function splitPdfPagesIndividually(params: {
                 `Visible text:\n${pageText.slice(0, 12000)}`,
             },
           ],
-          {
+          withFastModel({
             expectJson: true,
             model: getQualityExtractionModel(),
             reasoning: getQualityExtractionReasoning(),
-          }
+          })
         );
 
     const parsed = safeJsonParse<{ documents?: unknown }>(raw, {});
@@ -4754,10 +4756,11 @@ async function splitPdfIntoDocumentGroups(params: {
     return splitPdfBatchIntoDocumentGroups(params);
   }
   const batches = planImageBatches(params.pageImages, pageCount);
-  const groups: PdfDocumentGroup[] = [];
-  for (const batch of batches) {
+  // Batches are independent (each already shares a boundary page with the next), so they run in
+  // parallel; mergeOverlappingPageGroups sorts the combined result by page.
+  const batchResults = await mapWithConcurrency(batches, PACKET_AI_CONCURRENCY, async (batch) => {
     console.info(`[packet-processing] grouping pages ${batch.start + 1}-${batch.end} of ${pageCount}; imageBytes=${batch.bytes}`);
-    const batchGroups = await runWithImageSizeFallback(batch.start, batch.end, async (start, end) => {
+    return runWithImageSizeFallback(batch.start, batch.end, async (start, end) => {
       const localGroups = await splitPdfBatchIntoDocumentGroups({
         fileName: params.fileName,
         textPages: params.textPages.slice(start, end),
@@ -4765,9 +4768,8 @@ async function splitPdfIntoDocumentGroups(params: {
       });
       return localGroups.map((group) => ({ ...group, pageStart: group.pageStart + start, pageEnd: group.pageEnd + start }));
     });
-    groups.push(...batchGroups);
-  }
-  return mergeOverlappingPageGroups(groups);
+  });
+  return mergeOverlappingPageGroups(batchResults.flat());
 }
 
 async function splitPdfBatchIntoDocumentGroups(params: {
@@ -4827,11 +4829,11 @@ async function splitPdfBatchIntoDocumentGroups(params: {
               pageTextSummary,
           },
         ],
-        {
+        withFastModel({
           expectJson: true,
           model: getQualityExtractionModel(),
           reasoning: getQualityExtractionReasoning(),
-        }
+        })
       )
     : params.pageImages.length
     ? await callOpenRouter(
@@ -4856,11 +4858,11 @@ async function splitPdfBatchIntoDocumentGroups(params: {
             ],
           },
         ],
-        {
+        withFastModel({
           expectJson: true,
           model: getQualityExtractionModel(),
           reasoning: getQualityExtractionReasoning(),
-        }
+        })
       )
     : await callOpenRouter(
         [
@@ -4882,7 +4884,7 @@ async function splitPdfBatchIntoDocumentGroups(params: {
             ],
           },
         ],
-        { expectJson: true }
+        withFastModel({ expectJson: true })
       );
 
   const parsed = safeJsonParse<{ documents?: unknown; groups?: unknown }>(raw, {});
@@ -4911,21 +4913,79 @@ async function splitPdfBatchIntoDocumentGroups(params: {
   return normalized;
 }
 
+// Saved intermediate results of one analysis attempt, so a retry or a restarted run resumes
+// instead of paying for the same AI calls again.
+export type PipelineCheckpoint = {
+  get<T>(key: string): T | undefined;
+  set(key: string, value: unknown): Promise<void> | void;
+};
+
+function pdfGroupCheckpointKey(group: PdfDocumentGroup) {
+  return `doc:${group.documentType}:${group.pageStart}-${group.pageEnd}:${group.documentNumber ?? ""}`;
+}
+
+// Drops groups that only repeat pages another group already covers: a same-type group inside a
+// larger one (no conflicting identity), and "Unknown" groups inside a recognised document. Each
+// dropped group would otherwise cost a full extraction call and show up as a duplicate card.
+function dropRedundantPdfGroups(groups: PdfDocumentGroup[]) {
+  return groups.filter((group, index) => {
+    return !groups.some((other, otherIndex) => {
+      if (otherIndex === index) return false;
+      if (other.pageStart > group.pageStart || other.pageEnd < group.pageEnd) return false;
+      if (group.documentType === "Unknown") return other.documentType !== "Unknown";
+      if (other.documentType !== group.documentType) return false;
+      if (
+        hasConflictingPdfGroupIdentity(group.documentNumber, other.documentNumber) ||
+        hasConflictingPdfGroupIdentity(group.primaryPartyName, other.primaryPartyName) ||
+        hasConflictingPdfGroupIdentity(group.vehicleNumber, other.vehicleNumber)
+      ) {
+        return false;
+      }
+      const sameRange = other.pageStart === group.pageStart && other.pageEnd === group.pageEnd;
+      // Identical ranges: keep the first of the pair.
+      return sameRange ? otherIndex < index : true;
+    });
+  });
+}
+
+// A blank scan side is near-uniform; a page with any print or stamp has far more tonal spread.
+async function isLikelyBlankPageImage(dataUrl: string) {
+  try {
+    const comma = dataUrl.indexOf(",");
+    if (comma < 0) return false;
+    const { channels } = await sharp(Buffer.from(dataUrl.slice(comma + 1), "base64")).greyscale().stats();
+    return (channels[0]?.stdev ?? Infinity) < 6;
+  } catch {
+    return false;
+  }
+}
+
 async function extractPdfDocumentGroups(params: {
   fileName: string;
   textPages: string[];
   pageImages: string[];
   groups: PdfDocumentGroup[];
+  checkpoint?: PipelineCheckpoint;
   onGroupProgress?: (details: { current: number; total: number; group: PdfDocumentGroup }) => Promise<void> | void;
 }) {
   const hasText = hasMeaningfulTextPages(params.textPages);
+  const groups = dropRedundantPdfGroups(params.groups);
+  if (groups.length < params.groups.length) {
+    console.info(
+      `[packet-processing] ${params.fileName}: skipped ${params.groups.length - groups.length} duplicate/contained page group(s)`
+    );
+  }
 
-  return mapWithConcurrency(params.groups, PACKET_AI_CONCURRENCY, async (group, index) => {
+  return mapWithConcurrency(groups, PACKET_AI_CONCURRENCY, async (group, index) => {
     await params.onGroupProgress?.({
       current: index + 1,
-      total: params.groups.length,
+      total: groups.length,
       group,
     });
+
+    const checkpointKey = pdfGroupCheckpointKey(group);
+    const savedDocument = params.checkpoint?.get<CaseDoc>(checkpointKey);
+    if (savedDocument) return savedDocument;
 
     const pageStartIndex = group.pageStart - 1;
     const pageEndIndex = group.pageEnd;
@@ -4935,8 +4995,19 @@ async function extractPdfDocumentGroups(params: {
     const groupPageImages = params.pageImages.slice(pageStartIndex, pageEndIndex);
     const hasGroupText = groupTextPages.some((page) => page.replace(/\s+/g, "").length > 20);
 
-    let document =
-      hasText && hasGroupText
+    // Blank "Unknown" pages keep their placeholder card but do not pay for an AI call.
+    const skipBlankGroup =
+      group.documentType === "Unknown" &&
+      !hasGroupText &&
+      groupPageImages.length > 0 &&
+      (await Promise.all(groupPageImages.map(isLikelyBlankPageImage))).every(Boolean);
+
+    let document = skipBlankGroup
+      ? fallbackDoc(groupFileName, group.documentType, {
+          pages: Math.max(1, group.pageEnd - group.pageStart + 1),
+          visibleTextPages: groupTextPages,
+        })
+      : hasText && hasGroupText
         ? await extractDataFromTextPages({
               fileName: groupFileName,
               textPages: groupTextPages,
@@ -4956,7 +5027,7 @@ async function extractPdfDocumentGroups(params: {
     const needsQualityRetry = hasGroupText
       ? needsImageFallbackForTextExtraction(document)
       : isWeakExtraction(document);
-    if (needsQualityRetry && group.documentType !== "Unknown") {
+    if (!skipBlankGroup && needsQualityRetry && group.documentType !== "Unknown") {
       const qualityModel = getQualityExtractionModel();
       const qualityReasoning = getQualityExtractionReasoning();
       const retryDocument =
@@ -4991,6 +5062,7 @@ async function extractPdfDocumentGroups(params: {
     document.sourceHint = sourceHint;
     document.sourceFileName = params.fileName;
     document.pages = Math.max(1, group.pageEnd - group.pageStart + 1);
+    await params.checkpoint?.set(checkpointKey, document);
     return document;
   });
 }
@@ -5357,6 +5429,7 @@ export async function extractFileDocuments(params: {
   mimeType?: string | null;
   analysisMode: CaseAnalysisMode;
   position?: string;
+  checkpoint?: PipelineCheckpoint;
   onProgress?: (phase: number, stage: string) => Promise<void> | void;
 }): Promise<CaseDoc[]> {
   const { bytes, fileName, analysisMode } = params;
@@ -5385,40 +5458,71 @@ export async function extractFileDocuments(params: {
     if (analysisMode === "smart_split") {
       await params.onProgress?.(0.18, `Organizing PDF ${position}: ${fileName}`);
 
+      const savedGroups = params.checkpoint?.get<PdfDocumentGroup[]>("groups");
+      const allGroupsExtracted =
+        !!savedGroups &&
+        dropRedundantPdfGroups(savedGroups).every((group) =>
+          params.checkpoint?.get(pdfGroupCheckpointKey(group))
+        );
+
       let pageImages: string[] = [];
-      try {
-        pageImages = await renderPdfToImagePages(bytes, {
-          maxPages: PDF_SMART_SPLIT_MAX_PAGES,
-          sourceName: fileName,
-        });
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error ?? "Unknown error");
-        if (!hasMeaningfulTextPages(textPages)) {
-          throw new Error(
-            `Unable to render scanned PDF "${fileName}". Install poppler-utils/pdftoppm in the API runtime. ${reason}`
+      if (!allGroupsExtracted) {
+        try {
+          pageImages = await timeStage("render", () =>
+            renderPdfToImagePages(bytes, {
+              maxPages: PDF_SMART_SPLIT_MAX_PAGES,
+              sourceName: fileName,
+            })
           );
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error ?? "Unknown error");
+          if (!hasMeaningfulTextPages(textPages)) {
+            throw new Error(
+              `Unable to render scanned PDF "${fileName}". Install poppler-utils/pdftoppm in the API runtime. ${reason}`
+            );
+          }
+          console.warn(`Unable to render PDF "${fileName}" for smart split image fallback. Continuing with text only. ${reason}`);
         }
-        console.warn(`Unable to render PDF "${fileName}" for smart split image fallback. Continuing with text only. ${reason}`);
       }
 
-      const groups = await splitPdfIntoDocumentGroups({
-        fileName,
-        textPages,
-        pageImages,
-      });
+      const pagesNotRendered = Math.max(0, textPages.length - Math.max(pageImages.length, PDF_SMART_SPLIT_MAX_PAGES));
+      if (pagesNotRendered > 0 && pageImages.length > 0) {
+        console.warn(
+          `[packet-processing] "${fileName}" has ${textPages.length} pages; pages beyond ${pageImages.length} are not analysed.`
+        );
+      }
 
-      fileDocuments = await extractPdfDocumentGroups({
+      const groups =
+        savedGroups ??
+        (await timeStage("group", () =>
+          splitPdfIntoDocumentGroups({
+            fileName,
+            textPages,
+            pageImages,
+          })
+        ));
+      if (!savedGroups) await params.checkpoint?.set("groups", groups);
+
+      fileDocuments = await timeStage("extract", () => extractPdfDocumentGroups({
         fileName,
         textPages,
         pageImages,
         groups,
+        checkpoint: params.checkpoint,
         onGroupProgress: async ({ current, total, group }) => {
           await params.onProgress?.(
             0.2 + (current / Math.max(1, total)) * 0.72,
             `Extracting document ${current} of ${total} from PDF ${position}: ${formatDocType(group.documentType)}`
           );
         },
-      });
+      }));
+      if (pagesNotRendered > 0 && fileDocuments.length) {
+        const last = fileDocuments[fileDocuments.length - 1];
+        fileDocuments[fileDocuments.length - 1] = {
+          ...last,
+          md: `${last.md}\n\n> Pages ${pageImages.length + 1}-${textPages.length} of this PDF were not analysed (limit ${pageImages.length} pages).`,
+        };
+      }
     } else if (hasMeaningfulTextPages(textPages)) {
       const documentType = await classifyDocumentFromText(textPages, fileName);
       let document = await extractDataFromTextPages({
@@ -5473,6 +5577,18 @@ export async function extractFileDocuments(params: {
           pageImages,
           documentType,
         });
+        const skippedPages = Math.max(0, textPages.length - pageImages.length);
+        if (skippedPages > 0) {
+          // pdftoppm is capped at PDF_RENDER_MAX_PAGES; say so instead of silently dropping pages.
+          console.warn(
+            `[packet-processing] "${fileName}" has ${textPages.length} pages but only ${pageImages.length} were rendered (PACKET_PDF_RENDER_MAX_PAGES).`
+          );
+          document = {
+            ...document,
+            pages: Math.max(document.pages, textPages.length),
+            md: `${document.md}\n\n> Only the first ${pageImages.length} of ${textPages.length} pages of this scanned PDF were analysed.`,
+          };
+        }
         fileDocuments = [document];
       }
     }
@@ -5492,6 +5608,7 @@ export async function processStoredCaseFiles(params: {
   fieldConfiguration?: Awaited<ReturnType<typeof getPersistedPacketFieldConfiguration>>;
   analysisMode?: CaseAnalysisMode;
   comparisonOptions?: unknown;
+  checkpoint?: PipelineCheckpoint;
   onProgress?: (details: { progress: number; stage: string }) => Promise<void> | void;
 }) {
   const supabase = createSupabaseAdminClient();
@@ -5534,11 +5651,18 @@ export async function processStoredCaseFiles(params: {
       throw download.error;
     }
 
+    const scope = `${file.id}:${analysisMode}:${PDF_SMART_SPLIT_MAX_PAGES}:`;
+    const fileCheckpoint: PipelineCheckpoint | undefined = params.checkpoint && {
+      get: (key) => params.checkpoint!.get(scope + key),
+      set: (key, value) => params.checkpoint!.set(scope + key, value),
+    };
+
     const fileDocuments = await extractFileDocuments({
       bytes: new Uint8Array(await download.data.arrayBuffer()),
       fileName: file.original_name,
       mimeType: file.mime_type,
       analysisMode,
+      checkpoint: fileCheckpoint,
       position: `${index + 1} of ${files.length}`,
       onProgress: (phase, stage) => params.onProgress?.({ progress: fileProgress(phase), stage }),
     });

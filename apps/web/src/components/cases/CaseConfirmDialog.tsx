@@ -21,6 +21,8 @@ type CaseConfirmDialogProps = {
   variant?: "danger" | "default";
   /** Overrides the case-specific footnote; pass null to hide it. */
   footnote?: string | null;
+  /** Shown inside the dialog when the confirmed action failed. */
+  error?: string | null;
   onOpenChange: (open: boolean) => void;
   onConfirm: () => void;
 };
@@ -33,6 +35,7 @@ export function CaseConfirmDialog({
   loading = false,
   variant = "danger",
   footnote,
+  error,
   onOpenChange,
   onConfirm,
 }: CaseConfirmDialogProps) {
@@ -54,6 +57,14 @@ export function CaseConfirmDialog({
               </div>
             </div>
           </DialogHeader>
+          {error ? (
+            <p
+              role="alert"
+              className="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium leading-4 text-rose-700"
+            >
+              {error}
+            </p>
+          ) : null}
         </div>
 
         <div className="border-t border-[#f0ece4] bg-[#fbfaf8] px-6 py-4">

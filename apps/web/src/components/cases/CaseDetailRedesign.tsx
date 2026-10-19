@@ -11,6 +11,9 @@ import {
   Database,
   Eye,
   Loader2,
+  Maximize2,
+  MoveHorizontal,
+  RotateCcw,
   RotateCw,
   ShieldCheck,
   TriangleAlert,
@@ -53,6 +56,9 @@ type CaseDetailRedesignProps = {
   decisionUpdating: boolean;
   decisionError: string | null;
   onDecision: (decision: "accepted" | "rejected") => void;
+  /** Shown when the last analysis failed. */
+  onRetryAnalysis?: () => void;
+  retryDisabled?: boolean;
   documents: RedesignedDocumentCard[];
   comparisonFieldLabel?: string | null;
   activeDocumentId: string | null;
@@ -82,6 +88,10 @@ type CaseDetailRedesignProps = {
   onZoomOut: () => void;
   onZoomIn: () => void;
   onResetZoom: () => void;
+  /** PDF-only viewer controls; omitted for image sources. */
+  fitMode?: "width" | "page";
+  onToggleFit?: () => void;
+  onRotate?: (delta: -90 | 90) => void;
 };
 
 function getStatusClass(status: string) {
@@ -107,6 +117,8 @@ export function CaseDetailRedesign({
   decisionUpdating,
   decisionError,
   onDecision,
+  onRetryAnalysis,
+  retryDisabled = false,
   documents,
   comparisonFieldLabel,
   activeDocumentId,
@@ -136,6 +148,9 @@ export function CaseDetailRedesign({
   onZoomOut,
   onZoomIn,
   onResetZoom,
+  fitMode,
+  onToggleFit,
+  onRotate,
 }: CaseDetailRedesignProps) {
   const [section, setSection] = useState<CaseSection>("documents");
 
@@ -210,8 +225,8 @@ export function CaseDetailRedesign({
           {comparisonFieldLabel
             ? comparisonValue
             : document.fieldCount
-              ? `${document.fieldCount} fields`
-              : document.pageLabel}
+              ? `${document.fieldCount} fields · ${document.pageLabel}`
+              : `No fields · ${document.pageLabel}`}
         </div>
       </button>
     );
@@ -278,6 +293,16 @@ export function CaseDetailRedesign({
                   <><Database /> Tally review</>
                 )}
               </Link>
+            ) : null}
+            {status === "failed" && onRetryAnalysis ? (
+              <button
+                type="button"
+                className={styles.redesignButtonPrimary}
+                disabled={retryDisabled}
+                onClick={onRetryAnalysis}
+              >
+                <RotateCw /> Retry analysis
+              </button>
             ) : null}
             {showActions ? (
               <>
@@ -389,7 +414,16 @@ export function CaseDetailRedesign({
                     >
                       <ZoomOut />
                     </button>
-                    <span>{Math.round(zoom * 100)}%</span>
+                    <button
+                      type="button"
+                      className={styles.redesignZoomValue}
+                      onClick={onResetZoom}
+                      disabled={zoom === 1}
+                      aria-label="Reset zoom to 100%"
+                      title="Reset zoom"
+                    >
+                      {Math.round(zoom * 100)}%
+                    </button>
                     <button
                       type="button"
                       disabled={!canZoomIn}
@@ -398,15 +432,39 @@ export function CaseDetailRedesign({
                     >
                       <ZoomIn />
                     </button>
-                    <button
-                      type="button"
-                      onClick={onResetZoom}
-                      disabled={zoom === 1}
-                      aria-label="Reset zoom"
-                    >
-                      <RotateCw />
-                    </button>
                   </div>
+                  {onToggleFit && fitMode ? (
+                    <div className={styles.redesignZoomControls}>
+                      <button
+                        type="button"
+                        onClick={onToggleFit}
+                        aria-label={fitMode === "page" ? "Fit to width" : "Fit whole page"}
+                        title={fitMode === "page" ? "Fit to width" : "Fit whole page"}
+                      >
+                        {fitMode === "page" ? <MoveHorizontal /> : <Maximize2 />}
+                      </button>
+                    </div>
+                  ) : null}
+                  {onRotate ? (
+                    <div className={styles.redesignZoomControls}>
+                      <button
+                        type="button"
+                        onClick={() => onRotate(-90)}
+                        aria-label="Rotate page left"
+                        title="Rotate left"
+                      >
+                        <RotateCcw />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onRotate(90)}
+                        aria-label="Rotate page right"
+                        title="Rotate right"
+                      >
+                        <RotateCw />
+                      </button>
+                    </div>
+                  ) : null}
                 </div>
               </div>
 

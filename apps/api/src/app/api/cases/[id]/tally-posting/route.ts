@@ -1085,11 +1085,28 @@ async function GETHandler(request: Request, contextParam: { params: Promise<{ id
   }
 }
 
+// A case in the recycle bin stays viewable but must not be reviewed or posted to Tally.
+async function recycledCaseResponse(request: Request, caseId: string) {
+  const { data } = await createSupabaseAdminClient()
+    .from("packet_cases")
+    .select("deleted_at")
+    .eq("id", caseId)
+    .maybeSingle();
+  if (!data?.deleted_at) return null;
+  return jsonWithCors(
+    request,
+    { error: "This case is in the recycle bin. Restore it before posting to Tally." },
+    { status: 409 }
+  );
+}
+
 async function PATCHHandler(request: Request, contextParam: { params: Promise<{ id: string }> }) {
   try {
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     const { id } = await contextParam.params;
+    const recycledPatch = await recycledCaseResponse(request, id);
+    if (recycledPatch) return recycledPatch;
     const body = await request.json().catch(() => ({}));
     const requestedReview = asSavedReview(body.review);
     const requestedConnectionId =
@@ -1245,6 +1262,8 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
     const user = await requireRequestUser(request);
     if (!user) return jsonWithCors(request, { error: "Unauthorized" }, { status: 401 });
     const { id } = await contextParam.params;
+    const recycledPost = await recycledCaseResponse(request, id);
+    if (recycledPost) return recycledPost;
     const body = await request.json().catch(() => ({}));
     if (body.action === "verify_existing") {
       const requestedConnectionId = typeof body.connectionId === "string" ? body.connectionId : null;

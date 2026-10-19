@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ChevronLeft,
@@ -157,10 +157,27 @@ const RECONCILIATION_OPTIONS = [
 ];
 
 const ROWS_PER_PAGE_OPTIONS = [
+  { value: "auto", label: "Auto" },
   { value: "10", label: "10" },
   { value: "20", label: "20" },
   { value: "50", label: "50" },
 ];
+
+// Auto sizing fits the table to the window: row height plus the table header
+// and the pagination footer/page padding that sit around the rows.
+const AUTO_ROW_HEIGHT_PX = 53;
+const AUTO_TABLE_CHROME_PX = 120;
+const AUTO_MIN_ROWS = 5;
+const AUTO_MAX_ROWS = 100;
+const FALLBACK_PAGE_SIZE = 10;
+
+function getOffsetTopInScrollParents(element: HTMLElement) {
+  let top = element.getBoundingClientRect().top;
+  for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+    top += parent.scrollTop;
+  }
+  return top;
+}
 
 export function CasesPage() {
   const router = useRouter();
@@ -180,7 +197,12 @@ export function CasesPage() {
 
   // Pagination
   const [currentPage, setCurrentPage] = useState(1);
-  const [pageSize, setPageSize] = useState(10);
+  const [rowsMode, setRowsMode] = useState("auto");
+  const [autoPageSize, setAutoPageSize] = useState<number | null>(null);
+  const tableAreaRef = useRef<HTMLDivElement | null>(null);
+  const measuredRowsRef = useRef<number | null>(null);
+  const pageSizeReady = rowsMode !== "auto" || autoPageSize !== null;
+  const pageSize = rowsMode === "auto" ? autoPageSize ?? FALLBACK_PAGE_SIZE : Number(rowsMode);
   const [totalCount, setTotalCount] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
   const [listRevision, setListRevision] = useState(0);
@@ -194,6 +216,38 @@ export function CasesPage() {
     [currentPage, debouncedSearchQuery, selectedApproval, selectedReconciliation, pageSize,cacheEpoch,listRevision,snapshot?.member.user_id,snapshot?.organizationId,snapshot?.revision]
   );
 
+  // Size the page from the window height so laptops and large monitors both
+  // fill their screen without scrolling. Re-measured when the window resizes.
+  useEffect(() => {
+    if (rowsMode !== "auto") return;
+
+    const measure = () => {
+      const area = tableAreaRef.current;
+      if (!area) return;
+      const available = window.innerHeight - getOffsetTopInScrollParents(area) - AUTO_TABLE_CHROME_PX;
+      const rows = Math.min(
+        AUTO_MAX_ROWS,
+        Math.max(AUTO_MIN_ROWS, Math.floor(available / AUTO_ROW_HEIGHT_PX))
+      );
+      if (measuredRowsRef.current === rows) return;
+      if (measuredRowsRef.current !== null) setCurrentPage(1);
+      measuredRowsRef.current = rows;
+      setAutoPageSize(rows);
+    };
+
+    measure();
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+    const onResize = () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(measure, 200);
+    };
+    window.addEventListener("resize", onResize);
+    return () => {
+      clearTimeout(resizeTimer);
+      window.removeEventListener("resize", onResize);
+    };
+  }, [rowsMode]);
+
   useEffect(() => {
     const timeout = window.setTimeout(() => {
       setDebouncedSearchQuery(searchQuery.trim());
@@ -204,6 +258,9 @@ export function CasesPage() {
   }, [searchQuery]);
 
   useEffect(() => {
+    // Wait for the first window measurement so the list is fetched once at
+    // the right size instead of fetching a default and then refetching.
+    if (!pageSizeReady) return;
     const cached = caseListCache.get(cacheKey);
     if (cached) {
       setCases(cached.cases);
@@ -264,7 +321,7 @@ export function CasesPage() {
     void refresh();
 
     return () => { controller.abort(); clearTimeout(refreshTimer); };
-  }, [cacheKey, currentPage, debouncedSearchQuery, pageSize]);
+  }, [cacheKey, currentPage, debouncedSearchQuery, pageSize, pageSizeReady]);
 
   async function handleConfirmDelete() {
     if (!pendingCase) return;
@@ -371,7 +428,7 @@ export function CasesPage() {
           </PageHeader>
 
           {/* ── Seamless Cardless Table ── */}
-          <div className="w-full pt-1">
+          <div ref={tableAreaRef} className="w-full pt-1">
             {status === "loading" && (
               <div className="space-y-3 py-4">
                 {Array.from({ length: 8 }).map((_, i) => (
@@ -538,14 +595,15 @@ export function CasesPage() {
                   <span>Rows per page:</span>
                   <SelectDropdown
                     size="sm"
-                    value={String(pageSize)}
+                    value={rowsMode}
                     onChange={(val) => {
-                      setPageSize(Number(val));
+                      setRowsMode(val);
                       setCurrentPage(1);
                     }}
                     options={ROWS_PER_PAGE_OPTIONS}
-                    className="w-16"
+                    className="w-20"
                   />
+                  {rowsMode === "auto" && <span>({pageSize} fit your screen)</span>}
                 </div>
 
                 {/* Page Navigation */}

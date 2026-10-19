@@ -12,7 +12,10 @@ import {
   processStoredCaseFiles,
   reviewAndCorrectExtractedDocuments,
   verifyProcessedDocuments,
+  type PipelineCheckpoint,
 } from "@/lib/processing/pipeline";
+import { createRunTimings, runWithTimings } from "@/lib/processing/openrouter";
+import { settleOrphanedProcessingCase } from "@/lib/processing/jobs";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { TERMS_COMPLIANCE_MISMATCH_MODE } from "@/lib/terms-compliance";
 import { groupDocumentsForVerification } from "@/services/verification";
@@ -22,11 +25,20 @@ import { randomUUID } from "crypto";
 const WORKER_SECRET = process.env.WORKER_SECRET || "";
 const STALE_JOB_RUN_MESSAGE = "This processing run was superseded by another worker run.";
 const STORAGE_BUCKET = "packet-files";
+const WORKER_HEARTBEAT_MS = 30_000;
 
 class StaleJobRunError extends Error {
   constructor(message = STALE_JOB_RUN_MESSAGE) {
     super(message);
     this.name = "StaleJobRunError";
+  }
+}
+
+// Thrown at a run checkpoint when the case was moved to the recycle bin mid-run.
+class RecycledCaseRunError extends Error {
+  constructor() {
+    super("Case was moved to the recycle bin.");
+    this.name = "RecycledCaseRunError";
   }
 }
 
@@ -188,7 +200,9 @@ async function insertCaseDocumentsAndMismatches(
   supabase: ReturnType<typeof createSupabaseAdminClient>,
   caseId: string,
   documents: CaseDoc[],
-  mismatches: Mismatch[]
+  mismatches: Mismatch[],
+  // true for a case that already has results: they are swapped in one transaction.
+  replaceExisting = false
 ) {
   const documentRows = documents.map((document) => ({
     case_id: caseId,
@@ -201,22 +215,41 @@ async function insertCaseDocumentsAndMismatches(
     extracted_fields: serializeFieldsWithLineItems(document),
     markdown: document.md ?? "",
   }));
+  const mismatchRows = mismatches.map((mismatch) => ({
+    case_id: caseId,
+    client_mismatch_id: mismatch.id,
+    field_name: mismatch.field,
+    values_json: mismatch.values ?? [],
+    analysis: mismatch.analysis ?? null,
+    fix_plan: mismatch.fixPlan ?? null,
+  }));
+
+  if (replaceExisting) {
+    const replaced = await supabase.rpc("packet_case_replace_analysis", {
+      p_case_id: caseId,
+      // case_id is supplied by the function itself; undefined drops it from the JSON.
+      p_documents: documentRows.map((row) => ({ ...row, case_id: undefined })),
+      p_mismatches: mismatchRows.map((row) => ({ ...row, case_id: undefined })),
+    });
+    if (!replaced.error) return;
+    // Until the migration is applied, fall back to delete + insert.
+    if (!/PGRST202|42883/.test(`${replaced.error.code} ${replaced.error.message}`)) {
+      throw replaced.error;
+    }
+    const [documentDelete, mismatchDelete] = await Promise.all([
+      supabase.from("packet_documents").delete().eq("case_id", caseId),
+      supabase.from("packet_mismatches").delete().eq("case_id", caseId),
+    ]);
+    if (documentDelete.error) throw documentDelete.error;
+    if (mismatchDelete.error) throw mismatchDelete.error;
+  }
 
   if (documentRows.length) {
     const { error } = await supabase.from("packet_documents").insert(documentRows);
     if (error) throw error;
   }
 
-  if (mismatches.length) {
-    const mismatchRows = mismatches.map((mismatch) => ({
-      case_id: caseId,
-      client_mismatch_id: mismatch.id,
-      field_name: mismatch.field,
-      values_json: mismatch.values ?? [],
-      analysis: mismatch.analysis ?? null,
-      fix_plan: mismatch.fixPlan ?? null,
-    }));
-
+  if (mismatchRows.length) {
     const { error } = await supabase.from("packet_mismatches").insert(mismatchRows);
     if (error) throw error;
   }
@@ -303,12 +336,34 @@ export async function POST(
 
   const { data: caseRow, error: caseError } = await supabase
     .from("packet_cases")
-    .select("id, owner_user_id, upload_count, processing_meta")
+    .select("id, owner_user_id, upload_count, processing_meta, deleted_at")
     .eq("id", job.case_id)
     .single();
 
   if (caseError) {
     return jsonWithCors(request, { error: toMessage(caseError) }, { status: 500 });
+  }
+
+  // Recycled while the job was queued or starting: do not rewrite its analysis.
+  if (caseRow.deleted_at) {
+    const cancelled = await supabase
+      .from("packet_processing_jobs")
+      .update({
+        status: "cancelled",
+        error: "Case was moved to the recycle bin.",
+        finished_at: now,
+        locked_at: null,
+        locked_by: null,
+      })
+      .eq("id", id)
+      .eq("status", "running");
+    if (cancelled.error) {
+      return jsonWithCors(request, { error: "Could not cancel work for a recycled case." }, { status: 503 });
+    }
+    await settleOrphanedProcessingCase(job.case_id).catch((settleError) =>
+      console.error("Failed to release a stuck processing case", job.case_id, settleError)
+    );
+    return jsonWithCors(request, { error: "Case is in the recycle bin." }, { status: 409 });
   }
 
   const assertCurrentRun = async () => {
@@ -330,6 +385,18 @@ export async function POST(
       currentResult.activeRunId !== runId
     ) {
       throw new StaleJobRunError();
+    }
+
+    const { data: caseState, error: caseStateError } = await supabase
+      .from("packet_cases")
+      .select("deleted_at")
+      .eq("id", job.case_id)
+      .maybeSingle();
+    if (caseStateError) {
+      throw caseStateError;
+    }
+    if (caseState?.deleted_at) {
+      throw new RecycledCaseRunError();
     }
   };
 
@@ -416,14 +483,49 @@ export async function POST(
     });
   };
 
+  // Results of finished AI steps are saved on the job, so a retry resumes instead of redoing them.
+  const checkpointStore = new Map<string, unknown>(Object.entries(readRecord(jobResult.checkpoint)));
+  let checkpointFlush: Promise<void> = Promise.resolve();
+  const checkpoint: PipelineCheckpoint = {
+    get: <T,>(key: string) => checkpointStore.get(key) as T | undefined,
+    set: (key, value) => {
+      checkpointStore.set(key, value);
+      checkpointFlush = checkpointFlush
+        .then(() =>
+          updateCurrentJob({
+            result: {
+              ...jobResult,
+              activeRunId: runId,
+              activeRunStartedAt: now,
+              checkpoint: Object.fromEntries(checkpointStore),
+            },
+          })
+        )
+        .catch((checkpointError) => console.warn("Failed to save analysis checkpoint", toMessage(checkpointError)));
+      return checkpointFlush;
+    },
+  };
+
+  // Progress updates do not touch locked_at; without this a long run looks abandoned.
+  const heartbeat = setInterval(() => {
+    updateCurrentJob({ locked_at: new Date().toISOString() }).catch(() => undefined);
+  }, WORKER_HEARTBEAT_MS);
+
   try {
     const runStartedAt = Date.now();
+    const timings = createRunTimings();
     const performance = {
       extractionMs: 0,
       reviewMs: 0,
       finalizeMs: 0,
       totalMs: 0,
     };
+    const withTimings = () => ({
+      ...performance,
+      ai: { calls: timings.aiCalls, ms: timings.aiMs, maxMs: timings.aiMaxMs, retries: timings.aiRetries },
+      stagesMs: timings.stagesMs,
+      resumedSteps: checkpointStore.size,
+    });
     await updateCurrentJob({
       stage: "Preparing files",
       progress: 2,
@@ -441,19 +543,23 @@ export async function POST(
     const fieldConfiguration = await getPersistedPacketFieldConfiguration(jobScope?.organization_id ?? 'default');
 
     const extractionStartedAt = Date.now();
-    const processed = await processStoredCaseFiles({
-      caseId: job.case_id,
-      fieldConfiguration,
-      analysisMode,
-      comparisonOptions,
-      onProgress: async ({ progress, stage }) => {
-        await updateCurrentJob({
-          progress,
-          stage,
-          error: null,
-        });
-      },
-    });
+    const processed = await runWithTimings(timings, () =>
+      processStoredCaseFiles({
+        caseId: job.case_id,
+        fieldConfiguration,
+        analysisMode,
+        comparisonOptions,
+        checkpoint,
+        onProgress: async ({ progress, stage }) => {
+          await updateCurrentJob({
+            progress,
+            stage,
+            error: null,
+          });
+        },
+      })
+    );
+    await checkpointFlush;
     performance.extractionMs = Date.now() - extractionStartedAt;
 
     await assertCurrentRun();
@@ -465,11 +571,12 @@ export async function POST(
 
     await assertCurrentRun();
 
+    // The previous documents are replaced only when the new results are ready to be
+    // saved (see insertCaseDocumentsAndMismatches), not here: the AI review below is
+    // slow and a failure during it must not leave the case without documents.
     const [
       { data: existingDocuments, error: existingDocumentsError },
       { data: caseFiles, error: caseFilesError },
-      { error: documentDeleteError },
-      { error: mismatchDeleteError },
     ] = await Promise.all([
       supabase
         .from("packet_documents")
@@ -481,14 +588,10 @@ export async function POST(
           "id, original_name, storage_asset_id, content_sha256, storage_bucket, storage_path, mime_type, size_bytes"
         )
         .eq("case_id", job.case_id),
-      supabase.from("packet_documents").delete().eq("case_id", job.case_id),
-      supabase.from("packet_mismatches").delete().eq("case_id", job.case_id),
     ]);
 
     if (existingDocumentsError) throw existingDocumentsError;
     if (caseFilesError) throw caseFilesError;
-    if (documentDeleteError) throw documentDeleteError;
-    if (mismatchDeleteError) throw mismatchDeleteError;
     const storedCaseFiles = (caseFiles ?? []) as StoredCaseFileRow[];
     const uploadCount = storedCaseFiles.length || caseRow.upload_count;
 
@@ -512,9 +615,11 @@ export async function POST(
         mismatch.values.map((value) => value.docId)
       )
     );
-    const extractionReview = await reviewAndCorrectExtractedDocuments(documents, {
-      candidateDocumentIds: reviewCandidateDocumentIds,
-    });
+    const extractionReview = await runWithTimings(timings, () =>
+      reviewAndCorrectExtractedDocuments(documents, {
+        candidateDocumentIds: reviewCandidateDocumentIds,
+      })
+    );
     documents = enrichProcessedDocuments(extractionReview.documents);
     performance.reviewMs = Date.now() - reviewStartedAt;
     const finalizeStartedAt = Date.now();
@@ -542,7 +647,9 @@ export async function POST(
         const splitGroup = verificationSplitGroups[index];
         const groupDocuments = splitGroup.docs;
         const groupBaseVerified = verifyProcessedDocuments(groupDocuments, processed.comparisonOptions);
-        const groupTermsCompliance = await assessCaseTermsComplianceDetailed(groupDocuments);
+        const groupTermsCompliance = await runWithTimings(timings, () =>
+          assessCaseTermsComplianceDetailed(groupDocuments)
+        );
         const groupMismatches = [
           ...filterMismatchesForDocuments(groupBaseVerified.mismatches, groupDocuments),
           ...filterMismatchesForDocuments(groupTermsCompliance.mismatches, groupDocuments),
@@ -664,7 +771,7 @@ export async function POST(
       };
 
       const [primaryGroup, ...siblingGroups] = preparedGroups;
-      await insertCaseDocumentsAndMismatches(supabase, primaryGroup.caseId, primaryGroup.documents, primaryGroup.mismatches);
+      await insertCaseDocumentsAndMismatches(supabase, primaryGroup.caseId, primaryGroup.documents, primaryGroup.mismatches, true);
       const { error: primaryUpdateError } = await updateCaseFromGroup(primaryGroup, uploadCount);
       if (primaryUpdateError) throw primaryUpdateError;
 
@@ -677,7 +784,7 @@ export async function POST(
 
       performance.finalizeMs = Date.now() - finalizeStartedAt;
       performance.totalMs = Date.now() - runStartedAt;
-      console.info("[packet-performance]", JSON.stringify({ jobId: id, caseId: job.case_id, analysisMode, ...performance }));
+      console.info("[packet-performance]", JSON.stringify({ jobId: id, caseId: job.case_id, analysisMode, ...withTimings() }));
 
       await updateCurrentJob({
         status: "succeeded",
@@ -694,7 +801,7 @@ export async function POST(
             sourceCaseId: job.case_id,
           },
           extractionReview: extractionReview.review,
-          performance,
+          performance: withTimings(),
         },
         finished_at: new Date().toISOString(),
       });
@@ -703,19 +810,22 @@ export async function POST(
     }
 
     const baseVerified = verifyProcessedDocuments(documents, processed.comparisonOptions);
-    const termsCompliance = await assessCaseTermsComplianceDetailed(documents);
+    // The terms check is a separate AI call (up to ~40 s). The case is shown without it and the
+    // checklist and any extra mismatches are added right after (see the end of this handler).
+    const termsCompliance: { checklist: unknown[]; mismatches: Mismatch[] } = { checklist: [], mismatches: [] };
     const verified = {
       ...baseVerified,
-      mismatches: [...baseVerified.mismatches, ...termsCompliance.mismatches],
+      mismatches: [...baseVerified.mismatches],
     };
     const summary = summarizeCase(documents, verified.mismatches, fieldConfiguration);
     const displayName = await resolveCaseDisplayNameWithAI(documents, summary);
 
-    await insertCaseDocumentsAndMismatches(supabase, job.case_id, documents, verified.mismatches);
+    await insertCaseDocumentsAndMismatches(supabase, job.case_id, documents, verified.mismatches, true);
 
     await deleteDuplicateAnalysisRows(job.case_id);
     await assertCurrentRun();
 
+    const analyzedAt = new Date().toISOString();
     const { error: updateCaseError } = await supabase
       .from("packet_cases")
       .update({
@@ -732,7 +842,8 @@ export async function POST(
         processing_meta: {
           ...existingMeta,
           draft: false,
-          analyzedAt: new Date().toISOString(),
+          analyzedAt,
+          termsCompliancePending: true,
           caseCategory: summary.category,
           packetCategory: summary.packetCategory,
           documentTypes: summary.documentTypes,
@@ -755,7 +866,7 @@ export async function POST(
 
     performance.finalizeMs = Date.now() - finalizeStartedAt;
     performance.totalMs = Date.now() - runStartedAt;
-    console.info("[packet-performance]", JSON.stringify({ jobId: id, caseId: job.case_id, analysisMode, ...performance }));
+    console.info("[packet-performance]", JSON.stringify({ jobId: id, caseId: job.case_id, analysisMode, ...withTimings() }));
 
     await updateCurrentJob({
       status: "succeeded",
@@ -769,10 +880,51 @@ export async function POST(
         mismatchCount: verified.mismatches.length,
         verificationGroupCount: verified.verificationGroups.length,
         extractionReview: extractionReview.review,
-        performance,
+        performance: withTimings(),
       },
       finished_at: new Date().toISOString(),
     });
+
+    // Deferred terms check: runs after the job is closed, on a best-effort basis. It only
+    // writes if the case still holds this exact analysis.
+    void (async () => {
+      const finishPending = async (extra: Record<string, unknown>, caseFields: Record<string, unknown> = {}) => {
+        const { data: current } = await supabase
+          .from("packet_cases")
+          .select("processing_meta, deleted_at")
+          .eq("id", job.case_id)
+          .maybeSingle();
+        const currentMeta = readRecord(current?.processing_meta);
+        if (!current || current.deleted_at || currentMeta.analyzedAt !== analyzedAt) return false;
+        const { error: metaError } = await supabase
+          .from("packet_cases")
+          .update({
+            ...caseFields,
+            processing_meta: { ...currentMeta, termsCompliancePending: false, ...extra },
+          })
+          .eq("id", job.case_id);
+        return !metaError;
+      };
+
+      try {
+        const terms = await runWithTimings(createRunTimings(), () => assessCaseTermsComplianceDetailed(documents));
+        if (terms.mismatches.length) {
+          const allMismatches = [...verified.mismatches, ...terms.mismatches];
+          const termsSummary = summarizeCase(documents, allMismatches, fieldConfiguration);
+          const saved = await finishPending(
+            { termsComplianceChecklist: terms.checklist },
+            { mismatch_count: allMismatches.length, risk_score: termsSummary.riskScore }
+          );
+          // Append only after the case is confirmed unchanged, so a newer run is never polluted.
+          if (saved) await insertCaseDocumentsAndMismatches(supabase, job.case_id, [], terms.mismatches);
+        } else {
+          await finishPending({ termsComplianceChecklist: terms.checklist });
+        }
+      } catch (termsError) {
+        console.warn("Deferred terms compliance failed", job.case_id, toMessage(termsError));
+        await finishPending({ termsComplianceError: toMessage(termsError) }).catch(() => undefined);
+      }
+    })();
 
     return jsonWithCors(request, { ok: true });
   } catch (error) {
@@ -798,6 +950,25 @@ export async function POST(
       } catch (cleanupError) {
         console.warn("Failed to clean up partial split-analysis cases", cleanupError);
       }
+    }
+
+    if (error instanceof RecycledCaseRunError) {
+      // Do not retry work for a recycled case; close the job as cancelled.
+      await supabase
+        .from("packet_processing_jobs")
+        .update({
+          status: "cancelled",
+          error: message,
+          finished_at: new Date().toISOString(),
+          locked_at: null,
+          locked_by: null,
+        })
+        .eq("id", id)
+        .eq("status", "running");
+      await settleOrphanedProcessingCase(job.case_id).catch((settleError) =>
+        console.error("Failed to release a stuck processing case", job.case_id, settleError)
+      );
+      return jsonWithCors(request, { ok: false, cancelled: true, error: message }, { status: 409 });
     }
 
     const shouldRetry = !isImageSizeError(error) && job.attempt_count < job.max_attempts;
@@ -842,5 +1013,7 @@ export async function POST(
       .eq("id", job.case_id);
 
     return jsonWithCors(request, { error: message }, { status: 500 });
+  } finally {
+    clearInterval(heartbeat);
   }
 }

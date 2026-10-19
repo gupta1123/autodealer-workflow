@@ -4,6 +4,7 @@ import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import { listAccessPredicate } from "@/lib/access/list-scope";
 import { AccessError,requireAccessContext } from "@/lib/access/server";
+import { findHistoryProtectedCaseIds } from '@/lib/case-history';
 import { CASE_LIST_COLUMNS, CASE_LIST_COLUMNS_LEGACY, restoreCaseListMetadata,
   makeCaseCursor, readCaseCursor, cursorPredicate, missingCaseColumn } from '@/lib/case-list-query';
 
@@ -127,12 +128,14 @@ type DuplicateCaseCandidate = {
   created_at: string;
   upload_count?: number | null;
   processing_meta?: unknown;
+  deleted_at?: string | null;
 };
 type DuplicateCaseResponse = {
   id: string;
   displayName: string;
   status: string;
   createdAt: string;
+  inRecycleBin: boolean;
 };
 type StoredCaseFileIdentity = {
   original_name: string;
@@ -499,10 +502,14 @@ function mapDuplicateCaseResponse(row: DuplicateCaseCandidate): DuplicateCaseRes
     displayName: row.display_name,
     status: row.status,
     createdAt: row.created_at,
+    inRecycleBin: Boolean(row.deleted_at) || isCaseRecycled(row.processing_meta),
   };
 }
 
 function duplicateCaseMessage(row: DuplicateCaseCandidate) {
+  if (row.deleted_at || isCaseRecycled(row.processing_meta)) {
+    return `This packet is already saved as "${row.display_name}", which is in your recycle bin. Restore it instead of creating a duplicate.`;
+  }
   return `This packet is already saved as "${row.display_name}". Open the existing case instead of creating a duplicate.`;
 }
 
@@ -518,7 +525,7 @@ async function fetchAllOwnerCaseCandidates(
   for (let offset = 0; ; offset += pageSize) {
     const { data, error } = await supabase
       .from("packet_cases")
-      .select("id, display_name, status, created_at, upload_count, processing_meta")
+      .select("id, display_name, status, created_at, upload_count, processing_meta, deleted_at")
       .or(scope ? `and(access_organization_id.eq.${JSON.stringify(scope.access_organization_id)},access_company_id.eq.${JSON.stringify(scope.access_company_id)})` : `owner_user_id.eq.${JSON.stringify(ownerUserId)}`)
       .eq("upload_count", uploadCount)
       .order("created_at", { ascending: false })
@@ -1088,6 +1095,9 @@ async function GETHandler(request: Request) {
     const approvalFilter = readCaseApprovalFilter(url.searchParams.get("approval"));
     const reconciliationFilter = readCaseReconciliationFilter(url.searchParams.get("reconciliation"));
     const sortMode = readCaseSortMode(url.searchParams.get("sort"));
+    // Recycle bin only: cases deleted 23+ days ago, i.e. within a week of the 30-day purge.
+    const expiringSoon = scope === "deleted" && url.searchParams.get("expiring") === "1";
+    const expiringBefore = new Date(Date.now() - 23 * 24 * 60 * 60 * 1000).toISOString();
     let cursor;
     try { cursor = readCaseCursor(url.searchParams.get('cursor'), scope, sortMode); }
     catch { return jsonWithCors(request, {error:'Invalid pagination cursor. Restart from the first page.'}, {status:400}); }
@@ -1123,7 +1133,8 @@ async function GETHandler(request: Request) {
         if (cursor) {
           query = query.or(cursorPredicate(cursor, scope, sortMode));
         }
-        query = query.order("deleted_at", { ascending: false }).order("id", { ascending: false });
+        if (expiringSoon) query = query.lte("deleted_at", expiringBefore);
+        query = query.order("deleted_at", { ascending: sortMode === "oldest" }).order("id", { ascending: false });
       } else {
         query = query.is("deleted_at", null);
         if (statusValues) {
@@ -1180,8 +1191,9 @@ async function GETHandler(request: Request) {
               cursorPredicate(cursor, scope, sortMode)
             );
           }
+          if (expiringSoon) fallbackSearchQuery = fallbackSearchQuery.lte("deleted_at", expiringBefore);
           fallbackSearchQuery = fallbackSearchQuery
-            .order("deleted_at", { ascending: false })
+            .order("deleted_at", { ascending: sortMode === "oldest" })
             .order("id", { ascending: false });
         } else {
           fallbackSearchQuery = fallbackSearchQuery.is("deleted_at", null);
@@ -1290,18 +1302,24 @@ async function GETHandler(request: Request) {
       );
     }
 
+    const keptCaseIds =
+      scope === "deleted"
+        ? await findHistoryProtectedCaseIds(supabase, pageRows.map((row) => row.id))
+        : null;
+
     const serializeStartedAt = nowMs();
     const body = {
-      cases: pageRows.map((row) =>
-        mapCaseRow(
+      cases: pageRows.map((row) => {
+        const mapped = mapCaseRow(
           row,
           documentsByCaseId.get(row.id) ?? [],
           shouldDeriveSummaryFromDocuments
             ? (mismatchCountsByCaseId.get(row.id) ?? 0)
             : undefined,
           fieldConfiguration
-        )
-      ),
+        );
+        return keptCaseIds ? { ...mapped, keptForHistory: keptCaseIds.has(row.id) } : mapped;
+      }),
       nextCursor,
       hasMore,
       page: page ?? undefined,

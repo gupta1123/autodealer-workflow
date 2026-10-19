@@ -189,12 +189,34 @@ export async function removeStorageObjectsIfUnreferenced(
     );
   }
 
+  // Referenced asset ids come from one query per table; only candidates without an
+  // asset id (legacy path-addressed files) still need a per-path count.
+  const assetIds = [
+    ...new Set(
+      [...unique.values()]
+        .map((candidate) => candidate.storageAssetId)
+        .filter((assetId): assetId is string => Boolean(assetId))
+    ),
+  ];
+  const referencedAssetIds = new Set<string>();
+  if (assetIds.length > 0) {
+    for (const table of ["packet_case_files", "bank_statement_imports"] as const) {
+      const referenced = await supabase.from(table).select("storage_asset_id").in("storage_asset_id", assetIds);
+      if (referenced.error) throw referenced.error;
+      for (const row of referenced.data ?? []) {
+        if (row.storage_asset_id) referencedAssetIds.add(row.storage_asset_id as string);
+      }
+    }
+  }
+
   const removed: StorageObjectCandidate[] = [];
   const retained: StorageObjectCandidate[] = [];
   for (const candidate of unique.values()) {
-    const packetReferences = await countReferences(supabase, "packet_case_files", candidate);
-    const bankReferences = await countReferences(supabase, "bank_statement_imports", candidate);
-    if (packetReferences + bankReferences > 0) {
+    const referenceCount = candidate.storageAssetId
+      ? Number(referencedAssetIds.has(candidate.storageAssetId))
+      : (await countReferences(supabase, "packet_case_files", candidate)) +
+        (await countReferences(supabase, "bank_statement_imports", candidate));
+    if (referenceCount > 0) {
       retained.push(candidate);
       continue;
     }
@@ -244,14 +266,16 @@ export async function enqueueStorageCleanup(
 
 export async function processStorageCleanupQueue(
   supabase: StorageAssetClient,
-  ownerUserId: string,
+  // null drains every owner's entries (used by the worker and the recycle-bin purge).
+  ownerUserId: string | null,
   options?: { limit?: number }
 ) {
   const limit = Math.max(1, Math.min(options?.limit ?? 25, 100));
-  const queued = await supabase
+  let queuedQuery = supabase
     .from("storage_cleanup_queue")
-    .select("id, storage_asset_id, storage_bucket, storage_path, attempt_count")
-    .eq("owner_user_id", ownerUserId)
+    .select("id, storage_asset_id, storage_bucket, storage_path, attempt_count");
+  if (ownerUserId) queuedQuery = queuedQuery.eq("owner_user_id", ownerUserId);
+  const queued = await queuedQuery
     .order("requested_at", { ascending: true })
     .limit(limit);
   if (queued.error) throw queued.error;
