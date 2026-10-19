@@ -55,7 +55,7 @@ const PDF_RENDER_DPI = Number(process.env.PACKET_PDF_RENDER_DPI ?? 160);
 const PDF_RENDER_JPEG_QUALITY = Math.min(100, Math.max(60, Number(process.env.PACKET_PDF_RENDER_JPEG_QUALITY ?? 90) || 90));
 const PDF_RENDER_PARALLEL_RANGES = Math.max(1, Math.min(6, Number(process.env.PACKET_PDF_RENDER_PARALLEL ?? 4) || 4));
 const PDF_RENDER_MAX_PAGES =Number(process.env.PACKET_PDF_RENDER_MAX_PAGES ?? 8);
-const PDF_SMART_SPLIT_MAX_PAGES = Number(process.env.PACKET_PDF_SMART_SPLIT_MAX_PAGES ?? 20);
+const PDF_SMART_SPLIT_MAX_PAGES = Number(process.env.PACKET_PDF_SMART_SPLIT_MAX_PAGES ?? 30);
 const PROVIDER_IMAGE_HARD_LIMIT_BYTES = Math.min(8 * 1024 * 1024, Math.max(1, Number(process.env.PACKET_PROVIDER_IMAGE_HARD_LIMIT_BYTES) || 8 * 1024 * 1024));
 const PROVIDER_IMAGE_TARGET_BYTES = Math.min(PROVIDER_IMAGE_HARD_LIMIT_BYTES, Math.max(1, Number(process.env.PACKET_PROVIDER_IMAGE_TARGET_BYTES) || 1.5 * 1024 * 1024));
 const PROVIDER_IMAGE_MAX_DIMENSION = Number(process.env.PACKET_PROVIDER_IMAGE_MAX_DIMENSION ?? 3200);
@@ -4960,30 +4960,64 @@ function dropRedundantPdfGroups(groups: PdfDocumentGroup[]) {
       if (other.pageStart > group.pageStart || other.pageEnd < group.pageEnd) return false;
       if (group.documentType === "Unknown") return other.documentType !== "Unknown";
       if (other.documentType !== group.documentType) return false;
-      if (
+      // The same document type on exactly the same pages is one document, whatever identity
+      // each read produced: keep the first of the pair.
+      if (other.pageStart === group.pageStart && other.pageEnd === group.pageEnd) {
+        return otherIndex < index;
+      }
+      return !(
         hasConflictingPdfGroupIdentity(group.documentNumber, other.documentNumber) ||
         hasConflictingPdfGroupIdentity(group.primaryPartyName, other.primaryPartyName) ||
         hasConflictingPdfGroupIdentity(group.vehicleNumber, other.vehicleNumber)
-      ) {
-        return false;
-      }
-      const sameRange = other.pageStart === group.pageStart && other.pageEnd === group.pageEnd;
-      // Identical ranges: keep the first of the pair.
-      return sameRange ? otherIndex < index : true;
+      );
     });
   });
 }
 
-// A blank scan side is near-uniform; a page with any print or stamp has far more tonal spread.
+// A blank scan side is near-uniform with almost no ink; a page with any print, stamp or photo
+// has far more tonal spread (measured: blank sides 2.8-8.1, content pages 32+).
 async function isLikelyBlankPageImage(dataUrl: string) {
   try {
     const comma = dataUrl.indexOf(",");
     if (comma < 0) return false;
-    const { channels } = await sharp(Buffer.from(dataUrl.slice(comma + 1), "base64")).greyscale().stats();
-    return (channels[0]?.stdev ?? Infinity) < 6;
+    const image = sharp(Buffer.from(dataUrl.slice(comma + 1), "base64")).greyscale();
+    const { channels } = await image.clone().stats();
+    if ((channels[0]?.stdev ?? Infinity) >= 10) return false;
+    const { data } = await image.clone().resize({ width: 400 }).raw().toBuffer({ resolveWithObject: true });
+    const threshold = (channels[0]?.mean ?? 255) - 45;
+    let ink = 0;
+    for (const value of data) if (value < threshold) ink += 1;
+    return ink / Math.max(1, data.length) < 0.005;
   } catch {
     return false;
   }
+}
+
+// Blank back sides become part of the document before them instead of separate "Unknown" cards.
+async function absorbBlankPdfPages(groups: PdfDocumentGroup[], textPages: string[], pageImages: string[]) {
+  const result: PdfDocumentGroup[] = [];
+  for (const group of groups) {
+    const previous = result[result.length - 1];
+    const pageCount = group.pageEnd - group.pageStart + 1;
+    const images = pageImages.slice(group.pageStart - 1, group.pageEnd);
+    const hasText = textPages
+      .slice(group.pageStart - 1, group.pageEnd)
+      .some((page) => page.replace(/\s+/g, "").length > 20);
+    if (
+      group.documentType === "Unknown" &&
+      previous &&
+      previous.documentType !== "Unknown" &&
+      previous.pageEnd === group.pageStart - 1 &&
+      !hasText &&
+      images.length === pageCount &&
+      (await Promise.all(images.map(isLikelyBlankPageImage))).every(Boolean)
+    ) {
+      result[result.length - 1] = { ...previous, pageEnd: group.pageEnd };
+      continue;
+    }
+    result.push(group);
+  }
+  return result;
 }
 
 async function extractPdfDocumentGroups(params: {
@@ -4995,10 +5029,16 @@ async function extractPdfDocumentGroups(params: {
   onGroupProgress?: (details: { current: number; total: number; group: PdfDocumentGroup }) => Promise<void> | void;
 }) {
   const hasText = hasMeaningfulTextPages(params.textPages);
-  const groups = dropRedundantPdfGroups(params.groups);
-  if (groups.length < params.groups.length) {
+  const distinctGroups = dropRedundantPdfGroups(params.groups);
+  if (distinctGroups.length < params.groups.length) {
     console.info(
-      `[packet-processing] ${params.fileName}: skipped ${params.groups.length - groups.length} duplicate/contained page group(s)`
+      `[packet-processing] ${params.fileName}: skipped ${params.groups.length - distinctGroups.length} duplicate/contained page group(s)`
+    );
+  }
+  const groups = await absorbBlankPdfPages(distinctGroups, params.textPages, params.pageImages);
+  if (groups.length < distinctGroups.length) {
+    console.info(
+      `[packet-processing] ${params.fileName}: merged ${distinctGroups.length - groups.length} blank page group(s) into the previous document`
     );
   }
 
@@ -5028,8 +5068,15 @@ async function extractPdfDocumentGroups(params: {
       groupPageImages.length > 0 &&
       (await Promise.all(groupPageImages.map(isLikelyBlankPageImage))).every(Boolean);
 
+    // A page with real content that grouping left as "Unknown" (a photo, a stamp page) gets a
+    // type of its own so it is extracted instead of shown as an empty card.
+    let documentType = group.documentType;
+    if (documentType === "Unknown" && !skipBlankGroup && !hasGroupText && groupPageImages.length > 0) {
+      documentType = await classifyDocumentFromImage(groupPageImages[0], groupFileName);
+    }
+
     let document = skipBlankGroup
-      ? fallbackDoc(groupFileName, group.documentType, {
+      ? fallbackDoc(groupFileName, documentType, {
           pages: Math.max(1, group.pageEnd - group.pageStart + 1),
           visibleTextPages: groupTextPages,
         })
@@ -5037,15 +5084,15 @@ async function extractPdfDocumentGroups(params: {
         ? await extractDataFromTextPages({
               fileName: groupFileName,
               textPages: groupTextPages,
-              documentType: group.documentType,
+              documentType,
             })
         : groupPageImages.length
           ? await extractDataFromImagePages({
               fileName: groupFileName,
               pageImages: groupPageImages,
-              documentType: group.documentType,
+              documentType,
             })
-          : fallbackDoc(groupFileName, group.documentType, {
+          : fallbackDoc(groupFileName, documentType, {
               pages: Math.max(1, group.pageEnd - group.pageStart + 1),
               visibleTextPages: groupTextPages,
             });
@@ -5053,7 +5100,7 @@ async function extractPdfDocumentGroups(params: {
     const needsQualityRetry = hasGroupText
       ? needsImageFallbackForTextExtraction(document)
       : isWeakExtraction(document);
-    if (!skipBlankGroup && needsQualityRetry && group.documentType !== "Unknown") {
+    if (!skipBlankGroup && needsQualityRetry && documentType !== "Unknown") {
       const qualityModel = getQualityExtractionModel();
       const qualityReasoning = getQualityExtractionReasoning();
       const retryDocument =
@@ -5061,7 +5108,7 @@ async function extractPdfDocumentGroups(params: {
           ? await extractDataFromImagePages({
               fileName: groupFileName,
               pageImages: groupPageImages,
-              documentType: group.documentType,
+              documentType,
               model: qualityModel,
               reasoning: qualityReasoning,
               qualityRetry: true,
@@ -5070,7 +5117,7 @@ async function extractPdfDocumentGroups(params: {
           ? await extractDataFromTextPages({
               fileName: groupFileName,
               textPages: groupTextPages,
-              documentType: group.documentType,
+              documentType,
               model: qualityModel,
               reasoning: qualityReasoning,
               qualityRetry: true,
