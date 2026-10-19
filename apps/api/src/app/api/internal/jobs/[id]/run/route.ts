@@ -327,7 +327,8 @@ export async function POST(
     }
     return jsonWithCors(request,{error:'Queued authorization is unavailable.'},{status:503});
   }
-  const jobResult = readRecord(job.result);
+  // The checkpoint lives in its own column; rows from before that column kept it inside `result`.
+  const { checkpoint: legacyCheckpoint, ...jobResult } = readRecord(job.result);
   const lockedBy = typeof job.locked_by === "string" && job.locked_by.trim() ? job.locked_by : null;
   const attemptCount = asNumber(job.attempt_count);
   if (!lockedBy) {
@@ -484,27 +485,24 @@ export async function POST(
   };
 
   // Results of finished AI steps are saved on the job, so a retry resumes instead of redoing them.
-  const checkpointStore = new Map<string, unknown>(Object.entries(readRecord(jobResult.checkpoint)));
+  const checkpointStore = new Map<string, unknown>(
+    Object.entries(readRecord(job.checkpoint ?? legacyCheckpoint))
+  );
+  const reusedCheckpointKeys = new Set<string>();
   let checkpointFlush: Promise<void> = Promise.resolve();
-  // Latest step detail for the progress UI; kept in the job result next to the checkpoint.
-  let progressDetail: Record<string, unknown> | null = null;
+  let progressFlush: Promise<void> = Promise.resolve();
   let lastProgress = 0;
   const checkpoint: PipelineCheckpoint = {
-    get: <T,>(key: string) => checkpointStore.get(key) as T | undefined,
+    get: <T,>(key: string) => {
+      const saved = checkpointStore.get(key) as T | undefined;
+      if (saved !== undefined) reusedCheckpointKeys.add(key);
+      return saved;
+    },
     set: (key, value) => {
       checkpointStore.set(key, value);
+      // Writes only the checkpoint column, so progress updates never rewrite saved documents.
       checkpointFlush = checkpointFlush
-        .then(() =>
-          updateCurrentJob({
-            result: {
-              ...jobResult,
-              activeRunId: runId,
-              activeRunStartedAt: now,
-              checkpoint: Object.fromEntries(checkpointStore),
-              ...(progressDetail ? { progressDetail } : {}),
-            },
-          })
-        )
+        .then(() => updateCurrentJob({ checkpoint: Object.fromEntries(checkpointStore) }))
         .catch((checkpointError) => console.warn("Failed to save analysis checkpoint", toMessage(checkpointError)));
       return checkpointFlush;
     },
@@ -528,7 +526,7 @@ export async function POST(
       ...performance,
       ai: { calls: timings.aiCalls, ms: timings.aiMs, maxMs: timings.aiMaxMs, retries: timings.aiRetries },
       stagesMs: timings.stagesMs,
-      resumedSteps: checkpointStore.size,
+      resumedSteps: reusedCheckpointKeys.size,
     });
     await updateCurrentJob({
       stage: "Preparing files",
@@ -558,13 +556,12 @@ export async function POST(
           // Parallel steps report out of order; never move the bar backwards.
           if (progress < lastProgress) return;
           lastProgress = progress;
-          if (detail) progressDetail = detail;
           if (!detail) {
             await updateCurrentJob({ progress, stage, error: null });
             return;
           }
-          // Share the serial write chain with checkpoint saves so neither overwrites the other.
-          checkpointFlush = checkpointFlush
+          // Serial, so parallel steps cannot land their writes out of order.
+          progressFlush = progressFlush
             .then(() =>
               updateCurrentJob({
                 progress,
@@ -574,17 +571,16 @@ export async function POST(
                   ...jobResult,
                   activeRunId: runId,
                   activeRunStartedAt: now,
-                  checkpoint: Object.fromEntries(checkpointStore),
                   progressDetail: detail,
                 },
               })
             )
             .catch((progressError) => console.warn("Failed to save analysis progress", toMessage(progressError)));
-          await checkpointFlush;
+          await progressFlush;
         },
       })
     );
-    await checkpointFlush;
+    await Promise.all([checkpointFlush, progressFlush]);
     performance.extractionMs = Date.now() - extractionStartedAt;
 
     await assertCurrentRun();
@@ -816,6 +812,7 @@ export async function POST(
         progress: 100,
         stage: "Completed",
         error: null,
+        checkpoint: null,
         result: {
           analysisMode,
           documentCount: documents.length,
@@ -898,6 +895,7 @@ export async function POST(
       progress: 100,
       stage: "Completed",
       error: null,
+      checkpoint: null,
       result: {
         summary,
         analysisMode,

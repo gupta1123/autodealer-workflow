@@ -52,18 +52,17 @@ export async function getQueuePositions(jobs: ProcessingJobRow[]) {
   if (!queued.length) return positions;
 
   const supabase = createSupabaseAdminClient();
-  const { data, error } = await supabase
-    .from("packet_processing_jobs")
-    .select("id, created_at")
-    .eq("status", "queued")
-    .order("created_at", { ascending: true })
-    .limit(500);
-  if (error) throw error;
-  const order = (data ?? []).map((row) => row.id as string);
-  for (const job of queued) {
-    const index = order.indexOf(job.id);
-    if (index >= 0) positions.set(job.id, index + 1);
-  }
+  await Promise.all(
+    queued.map(async (job) => {
+      const { count, error } = await supabase
+        .from("packet_processing_jobs")
+        .select("id", { count: "exact", head: true })
+        .eq("status", "queued")
+        .lt("created_at", job.created_at);
+      if (error) throw error;
+      positions.set(job.id, (count ?? 0) + 1);
+    })
+  );
   return positions;
 }
 
@@ -143,11 +142,15 @@ export async function settleOrphanedProcessingCase(caseId: string) {
   return (updated.data?.status as string | undefined) ?? null;
 }
 
+// Everything except `checkpoint`, which can be hundreds of KB and is only read by the worker.
+export const PROCESSING_JOB_COLUMNS =
+  "id, case_id, owner_user_id, job_type, status, attempt_count, max_attempts, progress, stage, error, result, locked_at, locked_by, next_run_at, started_at, finished_at, created_at, updated_at";
+
 export async function getLatestProcessingJob(caseId: string) {
   const supabase = createSupabaseAdminClient();
   const { data, error } = await supabase
     .from("packet_processing_jobs")
-    .select("*")
+    .select(PROCESSING_JOB_COLUMNS)
     .eq("case_id", caseId)
     .order("created_at", { ascending: false })
     .limit(1)

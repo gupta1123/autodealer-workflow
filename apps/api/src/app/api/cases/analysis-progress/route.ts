@@ -3,6 +3,7 @@ import { withTeamAccess } from '@/lib/access/route-boundary';
 import { jsonWithCors, optionsWithCors } from "@/lib/api/cors";
 import { requireRequestUser } from "@/lib/api/request-auth";
 import {
+  PROCESSING_JOB_COLUMNS,
   getQueuePositions,
   mapProcessingJob,
   type ProcessingJobRow,
@@ -44,7 +45,7 @@ async function GETHandler(request: Request) {
 
     const { data: jobs, error: jobsError } = await supabase
       .from("packet_processing_jobs")
-      .select("*")
+      .select(PROCESSING_JOB_COLUMNS)
       .in("case_id", visibleIds)
       .in("status", ["queued", "running"])
       .order("created_at", { ascending: false });
