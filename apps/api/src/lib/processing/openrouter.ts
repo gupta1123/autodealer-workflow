@@ -169,7 +169,8 @@ function recordAiCall(durationMs: number, attempts: number) {
 export function withFastModel<T extends object>(options: T): T {
   const model = process.env.OPENROUTER_FAST_MODEL?.trim();
   if (!model) return options;
-  return { ...options, model, reasoning: { enabled: false, effort: "none" } } as T;
+  // Some fast models reject reasoning being turned off, so keep it at the lowest setting.
+  return { ...options, model, reasoning: { effort: "low", exclude: true } } as T;
 }
 
 function messageText(message: OpenRouterMessage) {
