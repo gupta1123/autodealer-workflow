@@ -762,6 +762,10 @@ async function loadContext(
       p_connection: connection.id, p_company_name: companyName,
       p_permission: request.method === 'GET' ? 'purchases.view' : 'purchases.prepare',
     });
+    // These two refusals are company routing, not missing permissions: say so.
+    if (target.error && /Select one verified purchase company|different business from this case/.test(target.error.message || '')) {
+      throw new AccessError(`This PC is not linked to the case's company for "${companyName}" in Tally. Open the case's company in Tally on this PC, or ask an administrator to link it.`, 409);
+    }
     if (target.error) throw target.error;
     if (typeof target.data !== 'string') throw new AccessError('The Tally purchase company could not be verified.', 409);
     postingCompanyId = target.data;

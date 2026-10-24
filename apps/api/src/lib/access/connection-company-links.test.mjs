@@ -69,3 +69,35 @@ test('automatic company selection creates a stable identity only when no company
   assert.equal(result.kind, 'create');
   assert.equal(result.erpIdentity, 'tally-guid:guid-a:fy:2026-27');
 });
+
+test('other financial years of the same Tally company are found by exact GUID only', () => {
+  const observed = { companyGuid: 'guid-a', companyName: 'Kalika - (25-26)', financialYear: '2025-26', isActive: true };
+  const siblings = exports.sameTallyCompanyOtherYears(observed, [
+    { id: 'fy25', name: 'Kalika - (25-26)', erp_identity: 'tally-guid:guid-a:fy:2025-26' },
+    { id: 'fy26', name: 'Kalika - (26-27)', erp_identity: 'tally-guid:guid-a:fy:2026-27' },
+    { id: 'other', name: 'Other', erp_identity: 'tally-guid:guid-b:fy:2026-27' },
+    { id: 'legacy', name: 'Kalika', erp_identity: '["tally","guid-a"]' },
+  ]);
+  assert.equal(JSON.stringify(siblings.map((entry) => [entry.company.id, entry.financialYear])), JSON.stringify([['fy26', '2026-27']]));
+});
+
+test('a newly paired PC showing last year is also linked to the current year of the same Tally company', async () => {
+  const upserts = [];
+  const companies = [
+    { id: 'fy25', name: 'Kalika - (25-26)', erp_identity: 'tally-guid:guid-a:fy:2025-26' },
+    { id: 'fy26', name: 'Kalika - (26-27)', erp_identity: 'tally-guid:guid-a:fy:2026-27' },
+  ];
+  const existing = [{ company_id: 'fy25', company_guid: 'guid-a', financial_year: '2025-26' }];
+  const query = (data) => { const chain = { select: () => chain, eq: () => chain, limit: async () => ({ data, error: null }) }; return chain; };
+  const db = { from: (table) => table === 'access_companies' ? query(companies)
+    : { ...query(existing), upsert: async (row) => { upserts.push({ table, row }); return { error: null }; } } };
+  const result = await exports.automaticallyLinkObservedActiveCompanies({ db, organizationId: 'org', connectionId: 'new-pc', installationId: 'pc-new',
+    companies: [{ guid: 'guid-a', companyName: 'Kalika - (25-26)', financialYear: '2025-26', isActive: true }], now: '2026-10-24T00:00:00Z' });
+  assert.equal(result.linked, 1);
+  const link = upserts.find((entry) => entry.table === 'access_company_links').row;
+  assert.equal(link.company_id, 'fy26');
+  assert.equal(link.financial_year, '2026-27');
+  assert.equal(link.company_guid, 'guid-a');
+  assert.equal(link.installation_id, 'pc-new');
+  assert.equal(link.evidence, 'automatic-same-tally-company-other-year');
+});

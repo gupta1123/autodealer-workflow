@@ -47,6 +47,20 @@ export function chooseAutomaticCompanyTarget(company: ObservedCompanyIdentity, c
   return { kind: 'create' as const, erpIdentity };
 }
 
+/** One Tally company (one GUID) can hold several financial years, each its own
+ * application company with an exact `tally-guid:<guid>:fy:<year>` identity.
+ * A PC observing that GUID under one year can post the other years too, so it
+ * is linked to every year this organization has already verified for the GUID. */
+export function sameTallyCompanyOtherYears(company: ObservedCompanyIdentity, candidates: ApplicationCompanyIdentity[]) {
+  const prefix = `tally-guid:${company.companyGuid}:fy:`;
+  return candidates.flatMap((candidate) => {
+    if (!candidate.erp_identity?.startsWith(prefix)) return [];
+    const financialYear = candidate.erp_identity.slice(prefix.length);
+    return /^\d{4}-\d{2}$/.test(financialYear) && financialYear !== company.financialYear
+      ? [{ company: candidate, financialYear }] : [];
+  });
+}
+
 function identityKey(link: Pick<CompanyLinkIdentity, 'company_guid' | 'financial_year'>) {
   return `${text(link.company_guid)}\u0000${text(link.financial_year)}`;
 }
@@ -241,8 +255,25 @@ export async function automaticallyLinkObservedActiveCompanies(input: {
   const links = [...(linkResult.data || [])];
   let linked = 0;
   let skipped = 0;
+  const hasLink = (companyGuid: string, financialYear: string) =>
+    links.some((link) => link.company_guid === companyGuid && link.financial_year === financialYear);
   for (const company of candidates) {
-    if (links.some((link) => link.company_guid === company.companyGuid && link.financial_year === company.financialYear)) continue;
+    for (const sibling of sameTallyCompanyOtherYears(company, applicationCompanies)) {
+      if (hasLink(company.companyGuid, sibling.financialYear)) continue;
+      links.push(await bindConnectionCompanyLink({
+        db,
+        organizationId: input.organizationId,
+        companyId: sibling.company.id,
+        connectionId: input.connectionId,
+        installationId: input.installationId,
+        companyGuid: company.companyGuid,
+        financialYear: sibling.financialYear,
+        evidence: 'automatic-same-tally-company-other-year',
+        now: input.now,
+      }));
+      linked += 1;
+    }
+    if (hasLink(company.companyGuid, company.financialYear)) continue;
     const target = chooseAutomaticCompanyTarget(company, applicationCompanies);
     if (target.kind === 'ambiguous') { skipped += 1; continue; }
     let applicationCompany = target.kind === 'existing' ? target.company : null;
