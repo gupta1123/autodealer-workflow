@@ -132,6 +132,7 @@ export function serializeTallyCandidate(params) {
         cashDiscountRuleName: termsLabel,
         discountDeadline: params.analysis.discountDeadline,
         receiptDate: params.analysis.receiptDate,
+        receipts: Array.isArray(params.bill.receipts) ? params.bill.receipts : [],
         amountReceived,
         recoverableAmount,
         pendingAmount,
@@ -225,6 +226,8 @@ export function serializePaymentFollowUp(params) {
         partyPhone: readRawText(raw, 'phone', 80), partyEmail: readRawText(raw, 'email', 320),
         linkedInvoiceNumber: invoiceNumber, linkedInvoiceDate: invoiceDate,
         originalInvoiceAmount, outstandingAmount, amountReceived,
+        lastReceiptDate: params.bill.receiptDate ?? null,
+        receipts: Array.isArray(params.bill.receipts) ? params.bill.receipts : [],
         narration: params.analysis.sourceNarration,
         // Collection amounts always describe the remaining Tally balance.
         paymentAmountIfPaidToday: outstandingAmount,

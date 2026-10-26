@@ -285,6 +285,8 @@ function isPartySettlementType(type) {
   return /receipt|payment/.test(String(type || "").toLowerCase());
 }
 
+const MAX_RECEIPTS_PER_INVOICE = 20;
+
 // indexInvoiceNarrations on fields.
 // Resolve every bill to its Sales voucher before interpreting opening balances.
 // A pre-invoice receipt may own the New Ref and Bill date in Tally.
@@ -336,7 +338,7 @@ function indexInvoiceEvidence(vouchers, requestedLedgerByKey) {
         const aliasKey = openBillNarrationKey(ledgerName, allocation.referenceName);
         const invoice = invoices.get(aliasKey);
         if (!invoice) { if (/advance|new ref/i.test(allocation.billType || '')) advanceReferenceKeys.add(aliasKey); continue; }
-        const proof = settlements.get(invoice.key) || { adjustments: 0, receipts: 0, lastReceiptDate: null, ambiguous: false };
+        const proof = settlements.get(invoice.key) || { adjustments: 0, receipts: 0, lastReceiptDate: null, ambiguous: false, receiptList: [] };
         const signedAmount = entry.isDebit ? -allocation.amount : allocation.amount;
         proof.adjustments += signedAmount;
         if (isPartySettlementType(voucher.type)) {
@@ -344,6 +346,11 @@ function indexInvoiceEvidence(vouchers, requestedLedgerByKey) {
           const date = parseTallyDate(voucher.effectiveDate || voucher.date);
           if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) proof.ambiguous = true;
           else if (!proof.lastReceiptDate || date > proof.lastReceiptDate) proof.lastReceiptDate = date;
+          // Each receipt, for the invoice timeline in Kalika (bounded per invoice).
+          if (proof.receiptList.length < MAX_RECEIPTS_PER_INVOICE) proof.receiptList.push({
+            date: date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null, amount: Math.round(signedAmount * 100) / 100,
+            voucherNumber: voucher.number || null, voucherType: voucher.type || null,
+          });
         }
         settlements.set(invoice.key, proof);
       }
@@ -375,6 +382,7 @@ export function openBillsByLedgerFromFields(ledgerNames, bills, vouchers) {
       narration: invoice.narration,
       receiptDate: proof?.lastReceiptDate || null,
       matchedReceiptAmount: proof ? Math.round(proof.receipts * 100) / 100 : null,
+      receipts: [...(proof?.receiptList || [])].sort((left, right) => String(left.date ?? '').localeCompare(String(right.date ?? ''))),
       invoiceEvidenceAmbiguous: invoice.invoiceEvidenceAmbiguous || Boolean(proof?.ambiguous) || disagreement || computed < -0.01,
       status: pendingAmount <= 0.005 ? 'settled' : 'open',
     };

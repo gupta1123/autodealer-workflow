@@ -55,6 +55,16 @@ test('closed late-paid invoices remain available separately for CD review', asyn
   assert.deepEqual(result,await xmlResult(['Customer'],[],vouchers));
 });
 
+test('each receipt against an invoice is listed in date order for the invoice timeline', async () => {
+  const vouchers=[sales(),receipt(30000,'20261016','INV-ADV',14),receipt(20000,'20261014','INV-ADV',13)];
+  const result=fieldResult(['Customer'],[bill({name:'INV-ADV',ledger:'Customer',closing:-48500})],vouchers);
+  assert.deepEqual(result.Customer.openBills[0].receipts,[
+    {date:'2026-10-14',amount:20000,voucherNumber:'R-13',voucherType:'Receipt'},
+    {date:'2026-10-16',amount:30000,voucherNumber:'R-14',voucherType:'Receipt'},
+  ]);
+  assert.equal(result.Customer.openBills[0].receiptDate,'2026-10-16');
+});
+
 test('refunds reopen a balance; cancelled receipts and free-text references cannot prove settlement', () => {
   const ref='INV-ADV';
   const refund=voucher({id:13,type:'Payment',date:'20261015',number:'P1',party:'Customer',entries:[entry('Customer',-5000,true,[[ref,-5000,'Agst Ref']]),entry('Bank',5000,false)]});

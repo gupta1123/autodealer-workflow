@@ -33,6 +33,8 @@ export type OpenBillRow = {
   narration?: string | null;
   receiptDate?: string | null;
   matchedReceiptAmount?: number | string | null;
+  /** Each receipt allocated to the invoice (Local Agent 1.2.39+). */
+  receipts?: Array<{ date: string | null; amount: number; voucherNumber: string | null; voucherType: string | null }>;
   invoiceEvidenceAmbiguous?: boolean;
   sourceSalesLedgerName?: string | null;
   status?: string | null;
@@ -200,6 +202,7 @@ export function serializeTallyCandidate(params: {
     cashDiscountRuleName: termsLabel,
     discountDeadline: params.analysis.discountDeadline,
     receiptDate: params.analysis.receiptDate,
+    receipts: Array.isArray(params.bill.receipts) ? params.bill.receipts : [],
     amountReceived,
     recoverableAmount,
     pendingAmount,
@@ -302,6 +305,8 @@ export function serializePaymentFollowUp(params: {
     partyPhone: readRawText(raw, 'phone', 80), partyEmail: readRawText(raw, 'email', 320),
     linkedInvoiceNumber: invoiceNumber, linkedInvoiceDate: invoiceDate,
     originalInvoiceAmount, outstandingAmount, amountReceived,
+    lastReceiptDate: params.bill.receiptDate ?? null,
+    receipts: Array.isArray(params.bill.receipts) ? params.bill.receipts : [],
     narration: params.analysis.sourceNarration,
     // Collection amounts always describe the remaining Tally balance.
     paymentAmountIfPaidToday: outstandingAmount,

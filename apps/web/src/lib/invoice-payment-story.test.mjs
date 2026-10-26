@@ -11,6 +11,8 @@ async function load(name, imports = {}) {
   vm.runInNewContext(code, { exports, require: (path) => imports[path], Intl, Date, Math, Number, String });
   return exports;
 }
+// Values built inside the sandbox have their own Array prototype.
+const plain = (value) => JSON.parse(JSON.stringify(value));
 const terms = await load('payment-terms-label');
 const { invoicePaymentStory, rtgsRuleText } = await load('invoice-payment-story', { './payment-terms-label': terms });
 
@@ -53,6 +55,36 @@ test('unpaid, paid on time and regular credit invoices', () => {
 
 test('before the deadline the discount is still open', () => {
   assert.equal(invoicePaymentStory({ ...anant, deadline: '2026-10-30' }).discount.status, 'open');
+});
+
+test('the Advance RTGS timeline shows the pay-by date before the invoice, then the late payment and today', () => {
+  const story = invoicePaymentStory(anant);
+  assert.equal(story.verdict, '45% paid, 3 days late · 1.5% discount lost');
+  assert.deepEqual(plain(story.timeline.map((event) => [event.kind, event.date, event.detail])), [
+    ['deadline', '2026-10-02', 'Missed'],
+    ['invoice', '2026-10-03', 'Advance RTGS · 1.5% · pay before invoice date'],
+    ['payment', '2026-10-05', '3 days late'],
+    ['today', '2026-10-26', '24 days past the deadline'],
+  ]);
+});
+
+test('each receipt is its own step when the agent sends them', () => {
+  const story = invoicePaymentStory({ ...anant, lastReceiptDate: null, receipts: [
+    { date: '2026-10-07', amount: 23001.87, voucherNumber: '2760', voucherType: 'Receipt' },
+    { date: '2026-10-05', amount: 100000, voucherNumber: '2749', voucherType: 'Receipt' },
+  ] });
+  const payments = story.timeline.filter((event) => event.kind === 'payment');
+  assert.deepEqual(plain(payments.map((event) => [event.date, event.amount, event.detail])), [
+    ['2026-10-05', 100000, 'Receipt 2749 · 3 days late'],
+    ['2026-10-07', 23001.87, 'Receipt 2760 · 5 days late'],
+  ]);
+  assert.equal(story.summary, 'Part-paid 45% · 7 Oct · 5 days late');
+});
+
+test('a follow-up without payment dates still shows what was received, just before today', () => {
+  const story = invoicePaymentStory({ ...anant, lastReceiptDate: null });
+  assert.deepEqual(plain(story.timeline.map((event) => event.kind)), ['deadline', 'invoice', 'payment', 'today']);
+  assert.equal(story.timeline[2].title, 'Received so far');
 });
 
 test('RTGS rules are written for people, not as day offsets', () => {

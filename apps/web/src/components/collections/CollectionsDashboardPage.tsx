@@ -24,7 +24,7 @@ import { apiFetch } from "@/lib/api-client";
 import { accessCacheEpoch, registerAccessCache } from '@/lib/access-cache';
 import { collectionsAccessReady } from '@/lib/collections-access-ready';
 import { paymentTermsLabel } from '@/lib/payment-terms-label';
-import { invoicePaymentStory, rtgsRuleText } from '@/lib/invoice-payment-story';
+import { invoicePaymentStory, rtgsRuleText, type InvoiceReceipt } from '@/lib/invoice-payment-story';
 import { InvoiceStoryPanel, type InvoiceStory } from './InvoiceStoryPanel';
 import styles from './CollectionsDashboardPage.module.css';
 import {companyOptionIdentity} from '@/lib/company-option-identity';
@@ -136,6 +136,9 @@ type PaymentFollowUp = {
   originalInvoiceAmount: number;
   outstandingAmount: number;
   amountReceived: number;
+  // Local Agent 1.2.39+: each receipt allocated to the invoice.
+  lastReceiptDate?: string | null;
+  receipts?: InvoiceReceipt[] | null;
   narration: string;
   matchedCashDiscountContext: string | null;
   terms: CashDiscountTerm[];
@@ -181,6 +184,7 @@ type DebitNoteProposal = {
   recoverableAmount: number;
   remainingRecoverableAmount: number | null;
   receiptDate: string | null;
+  receipts?: InvoiceReceipt[] | null;
   discountDeadline: string | null;
   debitNoteDate: string;
   status: string;
@@ -423,6 +427,7 @@ function followUpStory(followUp: PaymentFollowUp): InvoiceStory {
   return {
     customer: followUp.partyLedgerName, invoiceNumber: followUp.linkedInvoiceNumber, invoiceDate: followUp.linkedInvoiceDate,
     invoiceAmount: followUp.originalInvoiceAmount, outstandingAmount: followUp.outstandingAmount, amountReceived: followUp.amountReceived,
+    lastReceiptDate: followUp.lastReceiptDate, receipts: followUp.receipts,
     deadline: followUp.dueDate, paymentCategory: followUp.paymentCategory, narration: followUp.narration,
   };
 }
@@ -432,7 +437,7 @@ function proposalStory(proposal: DebitNoteProposal): InvoiceStory {
   return {
     customer: proposal.partyLedgerName, invoiceNumber: proposal.linkedInvoiceNumber, invoiceDate: proposal.linkedInvoiceDate,
     invoiceAmount: proposal.originalInvoiceAmount, outstandingAmount: proposal.pendingAmount ?? null, amountReceived: proposal.amountReceived,
-    lastReceiptDate: proposal.receiptDate, deadline: proposal.discountDeadline, narration: analysis?.sourceNarration ?? proposal.narration,
+    lastReceiptDate: proposal.receiptDate, receipts: proposal.receipts, deadline: proposal.discountDeadline, narration: analysis?.sourceNarration ?? proposal.narration,
     grossInvoiceAmount: analysis?.reversalPlan?.grossInvoiceAmount ?? null, debitNoteAmount: proposal.recoverableAmount,
   };
 }
@@ -697,6 +702,7 @@ export function CollectionsDashboardPage({
   const [pendingPage, setPendingPage] = useState(1);
   const [createdPage, setCreatedPage] = useState(1);
   const [followUpsPage, setFollowUpsPage] = useState(1);
+  const [followUpQuery, setFollowUpQuery] = useState("");
   const [focusedReminder,setFocusedReminder]=useState('');
   const [remindersDue,setRemindersDue]=useState<number|null>(null);
   const [reminderToolbar,setReminderToolbar]=useState<HTMLDivElement|null>(null);
@@ -1418,7 +1424,7 @@ export function CollectionsDashboardPage({
   useEffect(() => {
     setFollowUpsPage(1);
     setSelectedFollowUpIds(new Set());
-  }, [paymentFollowUpSort, followUpPaymentType]);
+  }, [paymentFollowUpSort, followUpPaymentType, followUpQuery]);
 
   useEffect(() => {
     setPendingPage(1);
@@ -1481,7 +1487,7 @@ export function CollectionsDashboardPage({
   const followUpKpis = summary?.followUps ?? { total: 0, needsFollowUp: 0, escalated: 0, needsReview: 0, outstanding: 0 };
   const followUpsList = useCollectionsList<PaymentFollowUp>(dashboard,
     activeView === 'followUps' && reminderTab === 'outstanding' && !reminderInvoice
-      ? { view: 'followUps', paymentType: followUpPaymentType, sort: paymentFollowUpSort, page: followUpsPage, pageSize } : null,
+      ? { view: 'followUps', paymentType: followUpPaymentType, search: followUpQuery, sort: paymentFollowUpSort, page: followUpsPage, pageSize } : null,
     collectionsRemote, onCollectionsExpired);
   const pendingList = useCollectionsList<DebitNoteProposal>(dashboard,
     activeView === 'needsAction' ? { view: 'pending', paymentType: cdPaymentType, filter: pendingFilter, search: pendingQuery, sort: pendingSort, page: pendingPage, pageSize } : null,
@@ -2051,6 +2057,12 @@ export function CollectionsDashboardPage({
 
       {!companyContextLocked && activeView==='followUps'?<div className="flex shrink-0 flex-wrap items-center justify-between gap-x-5 border-b border-[#ded8d0]"><nav aria-label="Payment follow-up views" className="flex min-w-0 gap-5 overflow-x-auto text-sm">{([['due','Reminders due'],['outstanding','Unpaid invoices'],['pipelines','Reminder tracking'],['history','Sent messages']] as const).map(([key,label])=><button key={key} type="button" aria-current={reminderTab===key?'page':undefined} className={`whitespace-nowrap border-b-2 px-1 py-3 ${reminderTab===key?'border-[#2d2d2d] font-medium text-[#1a1a1a]':'border-transparent text-[#82776a]'}`} onClick={()=>{setReminderTab(key);setReminderInvoice(null);setFocusedReminder('');setSelectedFollowUpIds(new Set());}}>{label}{key==='due'&&remindersDue!==null&&remindersDue>0?<span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900">{remindersDue}</span>:null}</button>)}</nav><div className="ml-auto flex items-center gap-2 py-1.5">          {reminderTab==='outstanding'&&!reminderInvoice&&followUpKpis.total > 0 ? (
             <div className="flex flex-wrap justify-end gap-2">{selectedFollowUpIds.size?<><span className="self-center text-xs font-semibold text-[#51483f]">{selectedFollowUpIds.size} selected</span><button className={styles.messageAction} onClick={()=>openFollowUpBulk('enroll')}>Start reminders</button><button className={styles.messageAction} onClick={()=>openFollowUpBulk('send_once')}>Send once</button><button className={styles.messageAction} onClick={exportSelectedFollowUps}>CSV</button><button className={styles.messageAction} onClick={()=>setSelectedFollowUpIds(new Set())}>Clear</button></>:null}
+            <label className="relative block w-56">
+              <span className="sr-only">Search customer or invoice</span>
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+              <input type="search" value={followUpQuery} onChange={(event)=>setFollowUpQuery(event.target.value)} placeholder="Search customer or invoice"
+                className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white pl-9 pr-3 text-xs font-semibold text-[#1a1a1a] outline-none transition placeholder:text-slate-400 focus:border-amber-400 focus:ring-2 focus:ring-amber-100" />
+            </label>
             <PaymentTypeFilter value={followUpPaymentType} onChange={setFollowUpPaymentType} />
             <label className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
               Sort
@@ -2075,7 +2087,7 @@ export function CollectionsDashboardPage({
         <section className={styles.results} aria-label="Payment follow-ups">
           {followUpsList.error ? <div role="alert" className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">{followUpsList.error}</div> : followUpKpis.total === 0 ? (
             <EmptyState>There are no payments to follow up from the latest Tally scan.</EmptyState>
-          ) : followUpsList.page?.total === 0 ? <EmptyState>No unpaid invoices match this payment type.</EmptyState> : (
+          ) : followUpsList.page?.total === 0 ? <EmptyState>{followUpQuery.trim() ? `No unpaid invoices match "${followUpQuery.trim()}".` : 'No unpaid invoices match this payment type.'}</EmptyState> : (
             <div className={styles.flatTable}>
               <div tabIndex={0} role="region" aria-label="Payment follow-ups table">
                 <table className={`${styles.createdTable} ${styles.followUpsTable}`}>
