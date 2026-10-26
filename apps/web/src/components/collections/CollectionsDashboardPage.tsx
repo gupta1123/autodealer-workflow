@@ -24,6 +24,8 @@ import { apiFetch } from "@/lib/api-client";
 import { accessCacheEpoch, registerAccessCache } from '@/lib/access-cache';
 import { collectionsAccessReady } from '@/lib/collections-access-ready';
 import { paymentTermsLabel } from '@/lib/payment-terms-label';
+import { invoicePaymentStory, rtgsRuleText } from '@/lib/invoice-payment-story';
+import { InvoiceStoryPanel, type InvoiceStory } from './InvoiceStoryPanel';
 import styles from './CollectionsDashboardPage.module.css';
 import {companyOptionIdentity} from '@/lib/company-option-identity';
 import {useActionAccess} from '@/components/access/useActionAccess';
@@ -412,9 +414,27 @@ function issueLabel(proposal: DebitNoteProposal) {
 function conciseTermsLabel(proposal: DebitNoteProposal) {
   const terms = proposal.cashDiscountAnalysis?.terms ?? [];
   if (terms.length > 0) {
-    return terms.map((term) => `${term.ratePercent}% / ${term.eligibilityDays} days`).join(" → ");
+    return terms.map((term) => rtgsRuleText(term.ratePercent, term.eligibilityDays)).join(" → ");
   }
   return proposal.cashDiscountAnalysis?.termsLabel || proposal.cashDiscountRuleName || "Fixed cash-discount rule";
+}
+
+function followUpStory(followUp: PaymentFollowUp): InvoiceStory {
+  return {
+    customer: followUp.partyLedgerName, invoiceNumber: followUp.linkedInvoiceNumber, invoiceDate: followUp.linkedInvoiceDate,
+    invoiceAmount: followUp.originalInvoiceAmount, outstandingAmount: followUp.outstandingAmount, amountReceived: followUp.amountReceived,
+    deadline: followUp.dueDate, paymentCategory: followUp.paymentCategory, narration: followUp.narration,
+  };
+}
+
+function proposalStory(proposal: DebitNoteProposal): InvoiceStory {
+  const analysis = proposal.cashDiscountAnalysis;
+  return {
+    customer: proposal.partyLedgerName, invoiceNumber: proposal.linkedInvoiceNumber, invoiceDate: proposal.linkedInvoiceDate,
+    invoiceAmount: proposal.originalInvoiceAmount, outstandingAmount: proposal.pendingAmount ?? null, amountReceived: proposal.amountReceived,
+    lastReceiptDate: proposal.receiptDate, deadline: proposal.discountDeadline, narration: analysis?.sourceNarration ?? proposal.narration,
+    grossInvoiceAmount: analysis?.reversalPlan?.grossInvoiceAmount ?? null, debitNoteAmount: proposal.recoverableAmount,
+  };
 }
 
 function canCreateInTally(proposal: DebitNoteProposal) {
@@ -714,6 +734,7 @@ export function CollectionsDashboardPage({
   const [selectedPendingIds, setSelectedPendingIds] = useState<Set<string>>(() => new Set());
   const [selectedCreatedIds, setSelectedCreatedIds] = useState<Set<string>>(() => new Set());
   const [reviewingProposal, setReviewingProposal] = useState<DebitNoteProposal | null>(null);
+  const [storyInvoice, setStoryInvoice] = useState<{ story: InvoiceStory; proposal?: DebitNoteProposal } | null>(null);
   const [reviewAcknowledged, setReviewAcknowledged] = useState(false);
   const [whatsappDialogProposals, setWhatsappDialogProposals] = useState<DebitNoteProposal[]>([]);
   const [whatsappPhoneInputs, setWhatsappPhoneInputs] = useState<Record<string, string>>({});
@@ -1998,9 +2019,11 @@ export function CollectionsDashboardPage({
                           onChange={event=>togglePendingSelection(proposal.id,event.target.checked)} className="h-4 w-4 accent-[#2d2d2d]" /></td>
                         <td className="px-3 py-2"><span className="block max-w-[240px] truncate text-[13px] font-medium text-[#111827]" title={proposal.partyLedgerName}>{proposal.partyLedgerName}</span>
                           {!proposal.partyPhone && !proposal.partyEmail ? <span className="text-[11px] font-normal text-[#8a7f72]">No contact</span> : null}</td>
-                        <td className="px-3 py-2"><span className="block max-w-[180px] truncate text-[13px] font-medium" title={proposal.linkedInvoiceNumber || ''}>{shortText(proposal.linkedInvoiceNumber,'No invoice')}</span>
+                        <td className="px-3 py-2"><button type="button" className="block max-w-[180px] truncate text-left text-[13px] font-medium underline decoration-[#d8cfc3] underline-offset-4 hover:decoration-[#5a5046]" title="See payment details"
+                          onClick={()=>setStoryInvoice({story:proposalStory(proposal),proposal})}>{shortText(proposal.linkedInvoiceNumber,'No invoice')}</button>
                           <span className="text-[11px] text-[#8a7f72]">{formatDate(proposal.linkedInvoiceDate)}</span></td>
-                        <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-[#5a5046]">{formatMoney(proposal.pendingAmount)}</td>
+                        <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-[#5a5046]">{formatMoney(proposal.pendingAmount)}
+                          <span className="block text-[11px] text-[#8a7f72]">{invoicePaymentStory(proposalStory(proposal)).summary}</span></td>
                         <td className="px-3 py-2"><span className="inline-flex whitespace-nowrap rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-900">
                           {proposal.status==='failed' ? 'Creation failed' : proposal.status==='approved' || proposal.status==='queued_in_tally' ? 'Creating' : issueLabel(proposal)}
                         </span></td>
@@ -2069,15 +2092,11 @@ export function CollectionsDashboardPage({
                     <tr key={followUp.id}>
                       <td><input type="checkbox" aria-label={`Select ${followUp.linkedInvoiceNumber||followUp.partyLedgerName}`} disabled={!followUp.linkedInvoiceNumber||!followUp.linkedInvoiceDate} checked={selectedFollowUpIds.has(followUp.id)} onChange={event=>setSelectedFollowUpIds(current=>{const next=new Set(current);event.target.checked?next.add(followUp.id):next.delete(followUp.id);return next;})}/></td><td><span className={styles.customerName} title={followUp.partyLedgerName}>{followUp.partyLedgerName}</span>
                         <span className={styles.secondary}>{followUp.partyPhone || followUp.partyEmail || 'No contact'}</span></td>
-                      <td><details className={styles.invoiceDetails}>
-                        <summary title={followUp.linkedInvoiceNumber || 'No linked invoice'}>{shortText(followUp.linkedInvoiceNumber,'No linked invoice')}</summary>
-                        <div className="py-2 text-[11px] leading-relaxed text-[#5a5046]">
-                          <p>Invoice value {formatMoney(followUp.originalInvoiceAmount)}</p>
-                          <p>Received {formatMoney(followUp.amountReceived)}</p>
-                          {followUp.currentDiscount ? <p>Cash discount {followUp.currentDiscount.ratePercent}% until {formatDate(followUp.currentDiscount.discountDeadline)}</p> : null}
-                        </div>
-                      </details><span className={styles.secondary}>{formatDate(followUp.linkedInvoiceDate)}</span></td>
-                      <td className="whitespace-nowrap text-right font-medium tabular-nums">{formatMoney(followUp.outstandingAmount)}</td>
+                      <td><button type="button" className="block max-w-full truncate text-left font-medium underline decoration-[#d8cfc3] underline-offset-4 hover:decoration-[#5a5046]" title="See payment details"
+                        onClick={()=>setStoryInvoice({story:followUpStory(followUp)})}>{shortText(followUp.linkedInvoiceNumber,'No linked invoice')}</button>
+                      <span className={styles.secondary}>{formatDate(followUp.linkedInvoiceDate)}</span></td>
+                      <td className="whitespace-nowrap text-right font-medium tabular-nums">{formatMoney(followUp.outstandingAmount)}
+                        <span className={`${styles.secondary} font-normal`}>{invoicePaymentStory(followUpStory(followUp)).summary}</span></td>
                       <td><span className={styles.primary}>{paymentTermsLabel(followUp).name}</span>
                         <span className={styles.secondary}>{paymentTermsLabel(followUp).timing}</span></td>
                       <td><span className={styles.primary}>{followUp.ageLabel}</span>
@@ -2219,6 +2238,10 @@ export function CollectionsDashboardPage({
         </DialogContent>
       </Dialog>
 
+      <InvoiceStoryPanel invoice={storyInvoice?.story ?? null} onClose={()=>setStoryInvoice(null)}
+        actions={storyInvoice?.proposal ? <button type="button" className="rounded-lg bg-[#2f2924] px-4 py-2 text-xs font-semibold text-white"
+          onClick={()=>{const proposal=storyInvoice.proposal!;setStoryInvoice(null);setReviewAcknowledged(false);setReviewingProposal(proposal);}}>Review debit note</button> : undefined} />
+
       {reviewingProposal ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-4 backdrop-blur-sm">
           <div
@@ -2265,7 +2288,7 @@ export function CollectionsDashboardPage({
                     <div className="bg-[#2d2d2d] p-4 text-white"><dt className="text-[10px] font-semibold uppercase tracking-wide text-stone-300">New outstanding</dt><dd className="mt-1 tabular-nums text-base font-semibold">{formatMoney((Number(reviewingProposal.pendingAmount) || 0) + reviewingProposal.recoverableAmount)}</dd></div>
                   </dl>
 
-                  {reviewingProposal.cashDiscountAnalysis?.reversalPlan ? <p className="mt-3 text-xs leading-5 text-[#756b60]"><span className="font-semibold text-[#332c26]">Calculation:</span> {formatMoney(reviewingProposal.cashDiscountAnalysis.reversalPlan.grossInvoiceAmount)} gross − {formatMoney(reviewingProposal.originalInvoiceAmount)} recorded = {formatMoney(reviewingProposal.recoverableAmount)}</p> : null}
+                  {reviewingProposal.cashDiscountAnalysis?.reversalPlan ? <p className="mt-3 text-xs leading-5 text-[#756b60]"><span className="font-semibold text-[#332c26]">Calculation:</span> {formatMoney(reviewingProposal.cashDiscountAnalysis.reversalPlan.grossInvoiceAmount)} gross − {formatMoney(reviewingProposal.originalInvoiceAmount)} recorded = {formatMoney(reviewingProposal.recoverableAmount)} ({reviewingProposal.cashDiscountAnalysis.reversalPlan.initialDiscount.ratePercent}% of the gross amount)</p> : null}
                 </div>
 
                 <div className="rounded-lg border border-[#ded8d0] bg-[#fcfbfa] p-4 text-xs text-[#5f554b]">
