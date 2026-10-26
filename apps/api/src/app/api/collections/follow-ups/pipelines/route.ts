@@ -20,6 +20,9 @@ async function context(request:Request,body:Record<string,unknown>,permission:st
   return requireDataset(request,String(body.connectionId||''),scopeOf(body),permission);
 }
 function phone(raw:unknown) {const value=normalizeWhatsappPhone(raw);if(!/^91\d{10}$/.test(value))throw new AccessError('Enter a valid Indian WhatsApp number.',400);return value;}
+/** Customer, invoice or phone search text, reduced to characters that cannot
+ * change a PostgREST filter expression. */
+function searchText(raw:unknown) {return String(raw??'').slice(0,80).replace(/[^\p{L}\p{N}\s/._@+-]/gu,' ').replace(/\s+/g,' ').trim();}
 const batchItems=(value:unknown)=>{
   if(!Array.isArray(value)||!value.length||value.length>100)throw new AccessError('Select between 1 and 100 invoices.',400);
   return value as Array<Record<string,unknown>>;
@@ -30,16 +33,23 @@ async function GETHandler(request:Request) {
     const {access,link,connection}=await context(request,body,'followups.view');
     const db=createSupabaseAdminClient();
     const limit=25, page=Math.max(1,Math.min(10000,Number(body.page)||1));
+    const search=searchText(body.q);
+    // A number searches WhatsApp numbers; anything else searches customer and invoice.
+    const phoneSearch=/^[+\d\s-]{4,}$/.test(search)?search.replace(/\D/g,''):'';
     if(body.view==='history') {
-      const result=await db.from('invoice_followup_attempts').select('id,status,recipient,outstanding,stage_index,created_at,error,invoice_followup_pipelines!inner(customer,invoice,organization_id,company_id,connection_id,installation_id,company_guid,financial_year)',{count:'exact'})
+      let history=db.from('invoice_followup_attempts').select('id,status,recipient,outstanding,stage_index,created_at,error,invoice_followup_pipelines!inner(customer,invoice,organization_id,company_id,connection_id,installation_id,company_guid,financial_year)',{count:'exact'})
         .eq('invoice_followup_pipelines.organization_id',access.organizationId).eq('invoice_followup_pipelines.company_id',link.company_id)
-        .eq('invoice_followup_pipelines.installation_id',connection.installation_id).eq('invoice_followup_pipelines.company_guid',link.company_guid).eq('invoice_followup_pipelines.financial_year',link.financial_year)
-        .order('created_at',{ascending:false}).order('id').range((page-1)*limit,page*limit-1);
+        .eq('invoice_followup_pipelines.installation_id',connection.installation_id).eq('invoice_followup_pipelines.company_guid',link.company_guid).eq('invoice_followup_pipelines.financial_year',link.financial_year);
+      if(phoneSearch)history=history.ilike('recipient',`%${phoneSearch}%`);
+      else if(search)history=history.or(`customer.ilike."*${search}*",invoice.ilike."*${search}*"`,{referencedTable:'invoice_followup_pipelines'});
+      const result=await history.order('created_at',{ascending:false}).order('id').range((page-1)*limit,page*limit-1);
       checked(result);
       return jsonWithCors(request,{attempts:result.data,total:result.count,pageSize:limit,rows:[],templates:[],messages:[]},{headers:{'Cache-Control':'private, no-store'}});
     }
     let query=db.from('invoice_followup_pipelines').select('*',{count:'exact'}).eq('organization_id',access.organizationId).eq('company_id',link.company_id).eq('installation_id',connection.installation_id).eq('company_guid',link.company_guid).eq('financial_year',link.financial_year);
     if(body.id)query=query.eq('id',body.id);
+    if(phoneSearch)query=query.ilike('recipient',`%${phoneSearch}%`);
+    else if(search)query=query.or(`customer.ilike."*${search}*",invoice.ilike."*${search}*"`);
     if(body.status==='due')query=query.eq('mode','pipeline').eq('status','active').lte('next_due_at',new Date().toISOString());
     else if(['active','paused','review','settled','finished','stopped','sending','uncertain'].includes(body.status))query=query.eq('status',body.status);
     const rows=await query.order('next_due_at',{ascending:true,nullsFirst:false}).order('id').range((page-1)*limit,page*limit-1);

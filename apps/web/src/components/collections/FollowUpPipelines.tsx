@@ -1,7 +1,7 @@
 'use client';
 import {createPortal} from 'react-dom';
 import {Fragment,useCallback,useEffect,useState} from 'react';
-import {ArrowLeft,Download,MessageCircle,Repeat2,MoreHorizontal} from 'lucide-react';
+import {ArrowLeft,Download,MessageCircle,Repeat2,MoreHorizontal,Search} from 'lucide-react';
 import {Popover,PopoverTrigger,PopoverContent} from '@/components/ui/popover';
 import {apiFetch} from '@/lib/api-client';
 import {useActionAccess} from '@/components/access/useActionAccess';
@@ -45,6 +45,9 @@ export function FollowUpPipelines({toolbarTarget,focusId='',view,connectionId,co
   const allowed=useActionAccess(companyId);
   const [data,setData]=useState<Data|null>(null),[error,setError]=useState(''),[busy,setBusy]=useState(false);
   const [filter,setFilter]=useState(view==='due'?'due':'all'),[page,setPage]=useState(1),[recipient,setRecipient]=useState('');
+  // What the user typed, and the settled value sent to the server.
+  const [search,setSearch]=useState(''),[query,setQuery]=useState('');
+  useEffect(()=>{const timer=setTimeout(()=>{setQuery(search.trim());setPage(1);},300);return()=>clearTimeout(timer);},[search]);
   const [checkNotice,setCheckNotice]=useState('');
   const [menuId,setMenuId]=useState<string|null>(null);
   const [selectedIds,setSelectedIds]=useState<Set<string>>(()=>new Set());
@@ -81,9 +84,10 @@ export function FollowUpPipelines({toolbarTarget,focusId='',view,connectionId,co
     return ()=>controller.abort();
   },[expandedStageId,panelTab,connectionId,companyId,companyGuid,companyName,financialYear]);
   const load=useCallback(async()=>{
-    const response=await apiFetch(`/api/collections/follow-ups/pipelines?${new URLSearchParams({connectionId,companyId:companyId||'',companyGuid:companyGuid||'',companyName,financialYear,view,id:focusId,status:filter,page:String(page)})}`,{cache:'no-store'});
-    const result=await response.json();if(!response.ok)throw new Error(result.error||'Could not load pipelines.');setData(result);if(view==='due'&&!focusId)onDueCount?.(result.total);
-  },[connectionId,companyId,companyGuid,companyName,financialYear,filter,page,view,onDueCount,focusId]);
+    const response=await apiFetch(`/api/collections/follow-ups/pipelines?${new URLSearchParams({connectionId,companyId:companyId||'',companyGuid:companyGuid||'',companyName,financialYear,view,id:focusId,status:filter,page:String(page),q:query})}`,{cache:'no-store'});
+    // The "Reminders due" badge counts everything due, not just search matches.
+    const result=await response.json();if(!response.ok)throw new Error(result.error||'Could not load pipelines.');setData(result);if(view==='due'&&!focusId&&!query)onDueCount?.(result.total);
+  },[connectionId,companyId,companyGuid,companyName,financialYear,filter,page,view,onDueCount,focusId,query]);
   useEffect(()=>{void load().catch(e=>setError(e.message));},[load]);
   useEffect(()=>{if(busy||preview||invoice)return;const timer=setInterval(()=>{void load().catch(e=>setError(e.message));},30000);return()=>clearInterval(timer);},[load,busy,preview,invoice]);
   useEffect(()=>{if(invoice){setRecipient(invoice.partyPhone||'');setError('');}},[invoice]);
@@ -104,7 +108,7 @@ export function FollowUpPipelines({toolbarTarget,focusId='',view,connectionId,co
   const input='h-8 min-w-0 rounded-md border border-[#ded8d0] bg-white px-2 text-xs';
   const button=styles.messageAction;
   const close=()=>{if(busy)return;onClearInvoice();setPreview(null);setHistory(null);};
-  const toolbar=!invoice?(<div className="flex flex-wrap items-center gap-2">{selectedIds.size?<><span className="text-xs font-semibold text-[#51483f]">{selectedIds.size} selected</span><button className={button} disabled={busy} onClick={()=>void bulk('bulk_check')}>Check Tally</button>{view==='due'?<button className={button} disabled={busy} onClick={()=>{if(window.confirm(`Verify and send ${selectedIds.size} due reminders? Each message will be recorded separately.`))void bulk('bulk_send');}}>Review & send due</button>:<><button className={button} disabled={busy} onClick={()=>void bulk('bulk_pause')}>Pause</button><button className={button} disabled={busy} onClick={()=>void bulk('bulk_resume')}>Resume</button><button className={button} disabled={busy} onClick={()=>{if(window.confirm(`Stop reminders for ${selectedIds.size} selected schedules?`))void bulk('bulk_stop');}}>Stop</button>{data?.templates?.length?<><select className={input} aria-label="Change reminder sequence" value={selectedPlanId} onChange={event=>setSelectedPlanId(event.target.value)}><option value="">Change sequence…</option>{data.templates.map(plan=><option value={plan.id} key={plan.id}>{plan.name}</option>)}</select><button className={button} disabled={busy||!selectedPlanId} onClick={()=>{const plan=data.templates.find(value=>value.id===selectedPlanId);if(plan&&window.confirm(`Restart the selected schedules using “${plan.name}”?`))void bulk('bulk_plan',{plan});}}>Apply</button></>:null}</>}<button className={button} disabled={busy} onClick={exportRows}><Download className="size-3.5"/>CSV</button><button className={button} disabled={busy} onClick={()=>setSelectedIds(new Set())}>Clear</button></>:<>{view==='pipelines'?<select aria-label="Pipeline status" className={input} value={filter} onChange={e=>{setFilter(e.target.value);setPage(1);}}><option value="all">All statuses</option>{Object.entries(statusLabel).map(([key,label])=><option value={key} key={key}>{label}</option>)}</select>:null}<button className={button} disabled={busy} onClick={()=>void run(load)}>{view==='history'?'Refresh history':'Refresh'}</button></>}</div>):null;
+  const toolbar=!invoice?(<div className="flex flex-wrap items-center gap-2">{selectedIds.size?<><span className="text-xs font-semibold text-[#51483f]">{selectedIds.size} selected</span><button className={button} disabled={busy} onClick={()=>void bulk('bulk_check')}>Check Tally</button>{view==='due'?<button className={button} disabled={busy} onClick={()=>{if(window.confirm(`Verify and send ${selectedIds.size} due reminders? Each message will be recorded separately.`))void bulk('bulk_send');}}>Review & send due</button>:<><button className={button} disabled={busy} onClick={()=>void bulk('bulk_pause')}>Pause</button><button className={button} disabled={busy} onClick={()=>void bulk('bulk_resume')}>Resume</button><button className={button} disabled={busy} onClick={()=>{if(window.confirm(`Stop reminders for ${selectedIds.size} selected schedules?`))void bulk('bulk_stop');}}>Stop</button>{data?.templates?.length?<><select className={input} aria-label="Change reminder sequence" value={selectedPlanId} onChange={event=>setSelectedPlanId(event.target.value)}><option value="">Change sequence…</option>{data.templates.map(plan=><option value={plan.id} key={plan.id}>{plan.name}</option>)}</select><button className={button} disabled={busy||!selectedPlanId} onClick={()=>{const plan=data.templates.find(value=>value.id===selectedPlanId);if(plan&&window.confirm(`Restart the selected schedules using “${plan.name}”?`))void bulk('bulk_plan',{plan});}}>Apply</button></>:null}</>}<button className={button} disabled={busy} onClick={exportRows}><Download className="size-3.5"/>CSV</button><button className={button} disabled={busy} onClick={()=>setSelectedIds(new Set())}>Clear</button></>:<><label className="relative block w-56"><span className="sr-only">Search customer, invoice or WhatsApp number</span><Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400"/><input type="search" value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search customer, invoice or number" className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white pl-9 pr-3 text-xs font-semibold text-[#1a1a1a] outline-none transition placeholder:text-slate-400 focus:border-amber-400 focus:ring-2 focus:ring-amber-100"/></label>{view==='pipelines'?<select aria-label="Pipeline status" className={input} value={filter} onChange={e=>{setFilter(e.target.value);setPage(1);}}><option value="all">All statuses</option>{Object.entries(statusLabel).map(([key,label])=><option value={key} key={key}>{label}</option>)}</select>:null}<button className={button} disabled={busy} onClick={()=>void run(load)}>{view==='history'?'Refresh history':'Refresh'}</button></>}</div>):null;
   return <>
       {toolbarTarget?createPortal(toolbar,toolbarTarget):toolbar}
       <section className={styles.results} aria-label="Invoice reminders">
@@ -152,7 +156,7 @@ export function FollowUpPipelines({toolbarTarget,focusId='',view,connectionId,co
 
           <p className="mb-2 text-xs text-[#756b60]">Every WhatsApp reminder submitted, newest first. {SUBMITTED_NOTE}</p>
           <div className="overflow-x-auto"><table className={styles.createdTable}><thead><tr><th>Customer / invoice</th><th>Amount</th><th>WhatsApp number</th><th>Submitted at</th><th>Status</th></tr></thead><tbody>{data?.attempts?.map(a=><tr key={a.id}><td>{a.invoice_followup_pipelines.customer}<span className={styles.secondary}>{a.invoice_followup_pipelines.invoice}</span></td><td>{money(a.outstanding)}</td><td>{a.recipient}</td><td>{date(a.created_at)}</td><td>{attemptLabel(a.status)}<span className={styles.secondary}>{a.error}</span></td></tr>)}</tbody></table></div>
-          {!error&&!data?.attempts?.length?<p className="py-8 text-center text-xs">No messages submitted yet.</p>:null}
+          {!error&&!data?.attempts?.length?<p className="py-8 text-center text-xs">{query?`No sent messages match "${query}".`:'No messages submitted yet.'}</p>:null}
           <footer className="my-3 flex justify-end gap-4 text-xs"><span>{data?.total||0} messages · Page {page}</span><button disabled={busy||page===1} onClick={()=>setPage(p=>p-1)}>Previous</button><button disabled={busy||page*25>=(data?.total||0)} onClick={()=>setPage(p=>p+1)}>Next</button></footer>
         </>:<>
 
@@ -181,7 +185,7 @@ export function FollowUpPipelines({toolbarTarget,focusId='',view,connectionId,co
               </Popover>
             </div></td>
           </tr></Fragment>)}</tbody></table></div>
-          {!error&&!data?.rows.length?<p className="py-6 text-center text-xs text-[#756b60]">{data?(view==='due'?'No reminders due right now.':'No reminder schedules in this view.'):'Loading…'}</p>:null}
+          {!error&&!data?.rows.length?<p className="py-6 text-center text-xs text-[#756b60]">{data?(query?`Nothing matches "${query}".`:view==='due'?'No reminders due right now.':'No reminder schedules in this view.'):'Loading…'}</p>:null}
           <footer className="mt-3 flex items-center justify-end gap-3 text-xs"><span>{data?.total||0} invoices · Page {page}</span><button disabled={busy||page<=1} onClick={()=>setPage(p=>p-1)}>Previous</button><button disabled={busy||page*(data?.pageSize||25)>=(data?.total||0)} onClick={()=>setPage(p=>p+1)}>Next</button></footer>
         </>}
         </div>
