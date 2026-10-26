@@ -1,3 +1,16 @@
+import { normalizeFinancialYear } from "./identity.mjs";
+
+// A sync reads from Tally, so the company and year must be open there. Asking
+// Tally for a closed year held the agent (and its heartbeat) for 20 minutes.
+// Returns null while no company list has been observed yet.
+export function datasetOpenInTally(companies, identity) {
+  const loaded = (companies || []).filter((company) => company?.guid && company?.financialYear);
+  if (!loaded.length) return null;
+  const year = normalizeFinancialYear(identity?.financialYear);
+  return loaded.some((company) => String(company.guid) === String(identity?.companyGuid)
+    && normalizeFinancialYear(company.financialYear) === year);
+}
+
 // Automatic background synchronization is allowed only when Tally exposes a
 // trustworthy global AlterID watermark. Without it, polling every minute means
 // repeatedly querying four large master collections and can monopolize Tally's

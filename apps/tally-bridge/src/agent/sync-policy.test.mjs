@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { automaticCatalogueSyncPlan } from "./sync-policy.mjs";
+import { automaticCatalogueSyncPlan, datasetOpenInTally } from "./sync-policy.mjs";
 
 test("a ready fallback catalogue never triggers automatic Tally scans", () => {
   assert.deepEqual(automaticCatalogueSyncPlan({
@@ -35,4 +35,13 @@ test("an unreliable capability response never starts a fallback scan", () => {
     sync: false,
     reason: "unreliable_global_watermark",
   });
+});
+
+test("a sync runs only for a company year that is open in Tally", () => {
+  const open = [{ guid: "g-1", companyName: "Kalika Steel Alloys Pvt Ltd - (26-27)", financialYear: "2026-27", isActive: true }];
+  assert.equal(datasetOpenInTally(open, { companyGuid: "g-1", financialYear: "2026-27" }), true);
+  // Same Tally company, other year: not open, so the agent refuses instead of waiting on Tally.
+  assert.equal(datasetOpenInTally(open, { companyGuid: "g-1", financialYear: "2025-26" }), false);
+  assert.equal(datasetOpenInTally(open, { companyGuid: "g-2", financialYear: "2026-27" }), false);
+  assert.equal(datasetOpenInTally([], { companyGuid: "g-1", financialYear: "2026-27" }), null, "unknown before the first company check");
 });

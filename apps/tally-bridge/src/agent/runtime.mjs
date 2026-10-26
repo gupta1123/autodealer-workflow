@@ -19,7 +19,7 @@ import {
 import { AGENT_CAPABILITIES, AGENT_PROTOCOL_VERSION, AGENT_VERSION, LOCAL_SCHEMA_VERSION, TDL_REPORT_VERSION, jobClassForCommand } from "./protocol.mjs";
 import { assertAgentIdentity, identityFromCommand, datasetKey, normalizeFinancialYear } from "./identity.mjs";
 import { resourceSnapshot } from "./resource-policy.mjs";
-import { automaticCatalogueSyncPlan } from "./sync-policy.mjs";
+import { automaticCatalogueSyncPlan, datasetOpenInTally } from "./sync-policy.mjs";
 import { ReceivablesPreparer, financialYearRange, RECEIVABLE_RECONCILIATION_VERSION } from "./receivables.mjs";
 
 const AGENT_COMMANDS = new Set([
@@ -486,6 +486,7 @@ export class LocalAgentRuntime {
   }
 
   async observeTallyCompanies(companies = []) {
+    this.loadedCompanies = companies;
     const company = companies.find((entry) => entry?.isActive && entry?.guid && entry?.financialYear);
     if (!company) return;
     const identity = {
@@ -968,6 +969,10 @@ export class LocalAgentRuntime {
 
   async execute(command) {
     const identity = this.validateCommandIdentity(command);
+    if (["agent_sync_dataset", "agent_reconcile_dataset"].includes(command.commandType)
+      && datasetOpenInTally(this.loadedCompanies, identity) === false) {
+      return { success: false, result: {}, error: `Open ${identity.companyName || "this company"} in Tally, then sync again.` };
+    }
     const job = await this.scheduler.enqueue({
       // A redelivered command must attach to the existing local job, including
       // its terminal result, rather than create another parser/AI attempt.

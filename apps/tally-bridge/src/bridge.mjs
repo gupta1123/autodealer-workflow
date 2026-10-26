@@ -7967,6 +7967,11 @@ function cashDiscountGatewayUrl(config) {
 // unreachable server cannot flood the log (previously ~20 lines per minute).
 const LIVE_RECONNECT_MIN_MS = 3_000;
 const LIVE_RECONNECT_MAX_MS = 60_000;
+// The gateway drops a silent connector, but a network drop or a busy PC can
+// leave this side holding a dead socket that never closes. Ask every 30 s;
+// with nothing heard for 75 s, reconnect.
+const LIVE_KEEPALIVE_MS = 30_000;
+const LIVE_STALE_AFTER_MS = 75_000;
 
 export function createReconnectBackoff() {
   let failures = 0;
@@ -7992,10 +7997,15 @@ export function createReconnectBackoff() {
   };
 }
 
-function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
+export function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
   let socket = null;
   let reconnectTimer = null;
+  let keepaliveTimer = null;
+  let lastHeardAt = 0;
+  let authenticated = false;
   let stopped = false;
+  const keepaliveMs = options.liveKeepaliveMs ?? LIVE_KEEPALIVE_MS;
+  const staleAfterMs = options.liveStaleAfterMs ?? LIVE_STALE_AFTER_MS;
   const backoff = createReconnectBackoff();
   const activeReads = new Map();
   const pendingPurchaseReads = new Map();
@@ -8481,8 +8491,13 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
     }
     try {
       // Compressed when the gateway allows it: a scan result shrinks about 13x.
-      socket = new WebSocket(cashDiscountGatewayUrl(config), { perMessageDeflate: true });
-      socket.addEventListener("open", () => {
+      const current = new WebSocket(cashDiscountGatewayUrl(config), { perMessageDeflate: true });
+      socket = current;
+      authenticated = false;
+      lastHeardAt = Date.now();
+      current.addEventListener("open", () => {
+        if (socket !== current) return;
+        lastHeardAt = Date.now();
         send({
           type: "authenticate",
           role: "connector",
@@ -8491,10 +8506,13 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
           bridgeVersion: BRIDGE_VERSION,
         });
       });
-      socket.addEventListener("message", (event) => {
+      current.addEventListener("message", (event) => {
+        if (socket !== current) return;
+        lastHeardAt = Date.now();
         try {
           const message = JSON.parse(String(event.data || "{}"));
           if (message.type === "authenticated") {
+            authenticated = true;
             log("info", backoff.connected() ? "Cash Discount live channel reconnected." : "Cash Discount live channel connected.");
           } else if (message.type === "operation") {
             void handleOperation(message);
@@ -8510,12 +8528,12 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
           log("error", error instanceof Error ? error.message : "Invalid Cash Discount live message.");
         }
       });
-      socket.addEventListener("error", () => {
+      current.addEventListener("error", () => {
+        if (socket !== current) return;
         if (backoff.shouldLog()) log("error", "Cash Discount live channel is unavailable; retrying with backoff.");
       });
-      socket.addEventListener("close", () => {
-        for (const controller of activeReads.values()) controller.abort(new Error("Live channel disconnected."));
-        scheduleReconnect();
+      current.addEventListener("close", () => {
+        if (socket === current) abandon(current);
       });
     } catch (error) {
       if (backoff.shouldLog()) log("error", error instanceof Error ? error.message : "Could not start the Cash Discount live channel.");
@@ -8523,10 +8541,29 @@ function startCashDiscountLiveChannel(config, executeExclusive, options = {}) {
     }
   };
 
+  // A socket that closed, or went silent, is dropped; its late events are ignored.
+  const abandon = (stale) => {
+    socket = null;
+    for (const controller of activeReads.values()) controller.abort(new Error("Live channel disconnected."));
+    try { stale.close(); } catch { /* already closed */ }
+    scheduleReconnect();
+  };
+
   connect();
+  keepaliveTimer = setInterval(() => {
+    if (!socket) return;
+    if (Date.now() - lastHeardAt > staleAfterMs) {
+      log("error", "Cash Discount live channel stopped answering; reconnecting.");
+      abandon(socket);
+    } else if (authenticated) {
+      send({ type: "heartbeat" });
+    }
+  }, keepaliveMs);
+  keepaliveTimer.unref?.();
   return () => {
     stopped = true;
     if (reconnectTimer) clearTimeout(reconnectTimer);
+    clearInterval(keepaliveTimer);
     socket?.close();
   };
 }
