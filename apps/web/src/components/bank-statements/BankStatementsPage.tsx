@@ -3225,6 +3225,8 @@ export function BankStatementsPage() {
   const [sendingMode, setSendingMode] = useState<TallySendMode | null>(null);
   const [pendingDirectPostMode, setPendingDirectPostMode] = useState<TallySendMode | null>(null);
   const [tallyPostingScope, setTallyPostingScope] = useState<TallyPostingScope>("all");
+  // Entries the user unticked: kept out of posting until ticked again.
+  const [postingExcludedIds, setPostingExcludedIds] = useState<Set<string>>(() => new Set());
   const sending = sendingMode !== null;
   const [matchingBills, setMatchingBills] = useState(false);
   const [tallyCheckAttempted, setTallyCheckAttempted] = useState(false);
@@ -3584,7 +3586,7 @@ export function BankStatementsPage() {
   const ambiguousTallyPresenceCount = validTransactions.filter(
     (transaction) => tallyPresenceByTransactionId[transaction.id]?.status === "ambiguous"
   ).length;
-  const transactionsNeedingTallyWork = useMemo(
+  const postableTransactions = useMemo(
     () => validTransactions.filter((transaction) => {
       const status = tallyPresenceByTransactionId[transaction.id]?.status;
       if (status === "found" || status === "ambiguous") return false;
@@ -3592,6 +3594,30 @@ export function BankStatementsPage() {
     }),
     [tallyCheckAttempted, tallyPresenceByTransactionId, validTransactions]
   );
+  const postableTransactionIds = useMemo(
+    () => new Set(postableTransactions.map((transaction) => transaction.id)),
+    [postableTransactions]
+  );
+  // Only ticked entries are posted, counted and checked for bill matching.
+  const transactionsNeedingTallyWork = useMemo(
+    () => postableTransactions.filter((transaction) => !postingExcludedIds.has(transaction.id)),
+    [postableTransactions, postingExcludedIds]
+  );
+  const untickedPostingCount = postableTransactions.length - transactionsNeedingTallyWork.length;
+  const setPostingTicked = useCallback((ids: string[], ticked: boolean) => {
+    setPostingExcludedIds((current) => {
+      const next = new Set(current);
+      for (const id of ids) {
+        if (ticked) next.delete(id);
+        else next.add(id);
+      }
+      return next;
+    });
+  }, []);
+  const previewImportId = preview?.import.id ?? null;
+  useEffect(() => {
+    setPostingExcludedIds(new Set());
+  }, [previewImportId]);
   const receiptTransactionsNeedingPost = useMemo(
     () => transactionsNeedingTallyWork.filter(isIncomingReceiptRow),
     [transactionsNeedingTallyWork]
@@ -3803,6 +3829,10 @@ export function BankStatementsPage() {
     visibleReviewTransactions.length === 0
       ? 0
       : Math.min(reviewRangeStart + visibleReviewTransactions.length - 1, filteredTransactions.length);
+  const visiblePostableIds = visibleReviewTransactions
+    .filter((transaction) => postableTransactionIds.has(transaction.id))
+    .map((transaction) => transaction.id);
+  const visibleTickedCount = visiblePostableIds.filter((id) => !postingExcludedIds.has(id)).length;
   const tallyPostingInProgress = Boolean(tallyPostingStatus && !tallyPostingStatus.finished);
   const bankPostingCompleted = Boolean(
     statementCompletedCleanly &&
@@ -6289,7 +6319,9 @@ export function BankStatementsPage() {
     if (selectedTallyWorkTransactions.length === 0) {
       showToast(
         "info",
-        mode === "post_receipts"
+        untickedPostingCount > 0 && candidateTallyWorkTransactions.length === 0
+          ? "No ticked entries to post. Tick the entries you want to send to Tally."
+          : mode === "post_receipts"
           ? "No new receipts to post."
           : mode === "post_payments"
             ? "No new outgoing payments to post."
@@ -8014,6 +8046,20 @@ export function BankStatementsPage() {
                   <table className="bank-statements-review-table w-full min-w-[1120px] table-fixed border-collapse text-left">
                     <thead className="sticky top-0 z-20">
                       <tr className="border-b border-[#e5ddd0] bg-[#fcfbfa] text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                        <th className="w-10 px-3 py-3.5">
+                          <input
+                            aria-label="Tick all entries on this page for posting"
+                            checked={visiblePostableIds.length > 0 && visibleTickedCount === visiblePostableIds.length}
+                            className="h-3.5 w-3.5 cursor-pointer accent-[#2d2d2d] disabled:cursor-not-allowed"
+                            disabled={visiblePostableIds.length === 0 || tallyPostingInProgress || sending}
+                            onChange={(event) => setPostingTicked(visiblePostableIds, event.target.checked)}
+                            ref={(node) => {
+                              if (node) node.indeterminate = visibleTickedCount > 0 && visibleTickedCount < visiblePostableIds.length;
+                            }}
+                            title="Only ticked entries are posted to Tally"
+                            type="checkbox"
+                          />
+                        </th>
                         <th className="w-[6%] px-3 py-3.5">Date</th>
                         <th className="w-[22%] px-3 py-3.5">Particulars</th>
                         <th className="w-[7%] px-3 py-3.5">Vch type</th>
@@ -8028,13 +8074,13 @@ export function BankStatementsPage() {
                     <tbody className="divide-y divide-[#e5ddd0] text-xs font-semibold text-slate-600">
                       {validTransactions.length === 0 ? (
                         <tr>
-                          <td colSpan={9} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
+                          <td colSpan={10} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
                             No posting rows were extracted. Upload another file or add rows after extraction support improves.
                           </td>
                         </tr>
                       ) : visibleReviewTransactions.length === 0 ? (
                         <tr>
-                          <td colSpan={9} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
+                          <td colSpan={10} className="px-6 py-12 text-center text-xs font-semibold text-slate-400">
                             No rows match the current filters.
                           </td>
                         </tr>
@@ -8075,6 +8121,30 @@ export function BankStatementsPage() {
                                 else reviewRowRefs.current.delete(transaction.id);
                               }}
                             >
+                              <td className="px-3 py-4" onClick={(event) => event.stopPropagation()} onMouseDown={(event) => event.stopPropagation()}>
+                                {postableTransactionIds.has(transaction.id) ? (
+                                  <input
+                                    aria-label={`Post ${partyTitle} to Tally`}
+                                    checked={!postingExcludedIds.has(transaction.id)}
+                                    className="h-3.5 w-3.5 cursor-pointer accent-[#2d2d2d] disabled:cursor-not-allowed"
+                                    disabled={tallyPostingInProgress || sending}
+                                    onChange={(event) => setPostingTicked([transaction.id], event.target.checked)}
+                                    title={postingExcludedIds.has(transaction.id) ? "Not posted. Tick to include it." : "Will be posted when you click Post"}
+                                    type="checkbox"
+                                  />
+                                ) : (
+                                  <span
+                                    className="block text-center text-slate-300"
+                                    title={tallyPresence?.status === "found"
+                                      ? "Already in Tally"
+                                      : tallyPresence?.status === "ambiguous"
+                                        ? "Review the possible Tally match first"
+                                        : "Nothing to post for this entry"}
+                                  >
+                                    –
+                                  </span>
+                                )}
+                              </td>
                               <td className="px-3 py-4 text-xs font-medium text-slate-500">
                                 {formatShortDate(transaction.transactionDate)}
                               </td>
@@ -9024,11 +9094,26 @@ export function BankStatementsPage() {
                         ? `${transactionsNeedingTallyWork.length} entr${transactionsNeedingTallyWork.length === 1 ? "y" : "ies"} ready · bill matching optional`
                       : transactionsNeedingTallyWork.length > 0
                         ? `${transactionsNeedingTallyWork.length} entr${transactionsNeedingTallyWork.length === 1 ? "y" : "ies"} ready to post · ${newReceiptCount} receipt${newReceiptCount === 1 ? "" : "s"} · ${missingOutgoingCount} payment${missingOutgoingCount === 1 ? "" : "s"}`
-                        : "Nothing to post"}
+                        : untickedPostingCount > 0
+                          ? "No entries ticked"
+                          : "Nothing to post"}
                     </span>
                     {!statementCompletedCleanly && selectedPostingSuspenseCount > 0 ? (
                       <span className="inline-flex h-6 items-center rounded-full border border-amber-200 bg-amber-50 px-2.5 text-[11px] font-bold text-amber-800">
                         {selectedPostingSuspenseCount} entr{selectedPostingSuspenseCount === 1 ? "y" : "ies"} will use Suspense
+                      </span>
+                    ) : null}
+                    {!statementCompletedCleanly && untickedPostingCount > 0 ? (
+                      <span className="inline-flex h-6 items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-2.5 text-[11px] font-bold text-slate-600">
+                        {untickedPostingCount} unticked · not posted
+                        <button
+                          className="underline underline-offset-2 hover:text-slate-900 disabled:no-underline disabled:opacity-50"
+                          disabled={tallyPostingInProgress || sending}
+                          onClick={() => setPostingExcludedIds(new Set())}
+                          type="button"
+                        >
+                          Tick all
+                        </button>
                       </span>
                     ) : null}
                   </div>
