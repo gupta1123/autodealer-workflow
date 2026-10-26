@@ -143,6 +143,13 @@ export function useCollectionsList<T>(
           if (isExpiredCollectionsError(error) && recoveryAttempted.current !== recoveryKey) {
             recoveryAttempted.current = recoveryKey;
             expiredRef.current();
+            // The page re-checks quietly; keep the current rows until it answers.
+            // A new result replaces this request; if none arrives, say so.
+            setState((current) => ({ ...current, loading: true, error: null }));
+            window.setTimeout(() => {
+              if (request === latest.current) setState({ page: null, loading: false, error: error instanceof Error ? error.message : 'Could not load this list.' });
+            }, 20_000);
+            return;
           }
           setState({ page: null, loading: false, error: error instanceof Error ? error.message : 'Could not load this list.' });
         },

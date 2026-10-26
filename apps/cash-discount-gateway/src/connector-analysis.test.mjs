@@ -26,7 +26,9 @@ async function withGateway(bridgeVersion, run) {
     for await (const chunk of request) chunks.push(chunk);
     requests.push({ url: request.url, body: JSON.parse(Buffer.concat(chunks).toString() || "{}") });
     response.setHeader("Content-Type", "application/json");
-    if (request.url === "/api/collections/live/session") return response.end(JSON.stringify({ authenticated: true, ownerUserId: "user-1", connectionId: "connection-1" }));
+    // Teammates share the connection owner; the signed-in user differs by token.
+    if (request.url === "/api/collections/live/session") return response.end(JSON.stringify({ authenticated: true, ownerUserId: "user-1", connectionId: "connection-1",
+      initiatingUserId: /other-token/.test(request.headers.authorization || "") ? "teammate-2" : "user-1" }));
     if (request.url === "/api/collections/live/analysis-context") return response.end(JSON.stringify({ proposalRows: [{ id: "dn-1" }], connectionStatus: "company_loaded", lastHeartbeatAt: "2026-09-29T10:00:00Z" }));
     if (request.url === "/api/collections/live/analyse") return response.end(JSON.stringify({ setupRequired: false, from: "api" }));
     if (request.url === "/api/collections/live/scan-event") return response.end("{}");
@@ -114,8 +116,18 @@ test("a paged scan: a current connector keeps the dashboard, and only the browse
     otherBrowser.send(JSON.stringify({ type: "request", requestId: "page-o", operation: "collections_query",
       payload: { dashboardId: "connection-1|solutionnyx|2026-27|discounts|r1", query: { view: "followUps" } } }));
     const refused = await nextMessage(otherBrowser, (message) => message.requestId === "page-o");
-    assert.equal(refused.success, false, "another browser connection cannot read this dashboard");
+    assert.equal(refused.success, false, "a teammate's browser cannot read this dashboard");
     otherBrowser.close();
+
+    // The browser replaces an idle connection; the same person keeps reading.
+    const replacement = await open({ role: "browser", token: "browser-token-renewed", companyName: "Solution Nyx" });
+    replacement.send(JSON.stringify({ type: "request", requestId: "page-r", operation: "collections_query",
+      payload: { dashboardId: "connection-1|solutionnyx|2026-27|discounts|r1", query: { view: "followUps" } } }));
+    await nextMessage(connector, (message) => message.requestId === "page-r");
+    connector.send(JSON.stringify({ type: "operation_result", requestId: "page-r", success: true, data: { total: 9071, page: 1, rows: [{ id: "fu-1" }] } }));
+    const renewed = await nextMessage(replacement, (message) => message.requestId === "page-r");
+    assert.equal(renewed.success, true, "the scanning user's replacement connection can read the same dashboard");
+    replacement.close();
   });
 });
 

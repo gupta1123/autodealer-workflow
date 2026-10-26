@@ -1685,6 +1685,10 @@ export function CollectionsDashboardPage({
       if(!stopped)setBulkResultMessage(current=>current||`All ${confirmed} debit notes were confirmed created in Tally.`);
     } finally {
       bulkRunning.current=false;setBulkCreating(false);setApprovingId('');setBulkPhase('results');
+      // Each note's progress was shown in the page banner; replace the last step with the outcome.
+      setMessage(stopped||confirmed<batch.length
+        ? {tone:'notice',text:`${confirmed} of ${batch.length} debit notes confirmed in Tally. See the review window for the rest.`}
+        : {tone:'success',text:`${confirmed} debit note${confirmed===1?'':'s'} created in Tally.`});
     }
   }
 

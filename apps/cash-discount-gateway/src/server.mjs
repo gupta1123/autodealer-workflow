@@ -221,6 +221,8 @@ async function authenticate(socket, message) {
     role,
     connectionId,
     ownerUserId: session.ownerUserId,
+    // The signed-in person; teammates on one connection share ownerUserId.
+    userId: role === "browser" ? String(session.initiatingUserId || session.ownerUserId || "") : null,
     organizationId: session.organizationId || String(message.organizationId||''),
     teamAccess: session.teamAccess === true,
     installationId:session.installationId,
@@ -282,20 +284,30 @@ async function authorizeLiveOperation(meta,message,previous) {
 // produced, for this long. Each page is then not re-authorized with the
 // database; the next scan (or reconnect) authorizes again.
 const DASHBOARD_GRANT_MS = 30 * 60_000;
+// Grants belong to the signed-in user, organization and Tally connection that
+// ran the scan, not to one browser socket: the browser replaces an idle socket
+// after two minutes, and its next page request must not be refused as
+// "expired". Teammates on the same connection never share a grant.
+const dashboardGrants = new Map();
+const grantOwner = (meta) => `${meta.userId || ""}|${meta.ownerUserId}|${meta.organizationId || ""}|${meta.connectionId}`;
 
 function grantDashboard(browser, dashboardId) {
   const meta = metadata.get(browser);
   if (!meta || !dashboardId) return;
-  meta.dashboardGrants ||= new Map();
   const now = Date.now();
-  for (const [id, expiresAt] of meta.dashboardGrants) if (expiresAt <= now) meta.dashboardGrants.delete(id);
-  meta.dashboardGrants.set(dashboardId, now + DASHBOARD_GRANT_MS);
+  for (const [key, grants] of dashboardGrants) {
+    for (const [id, expiresAt] of grants) if (expiresAt <= now) grants.delete(id);
+    if (!grants.size) dashboardGrants.delete(key);
+  }
+  const owner = grantOwner(meta);
+  if (!dashboardGrants.has(owner)) dashboardGrants.set(owner, new Map());
+  dashboardGrants.get(owner).set(dashboardId, now + DASHBOARD_GRANT_MS);
 }
 
 function handleCollectionsRequest(socket, message, meta, requestId, operation) {
   const dashboardId = String(message.payload?.dashboardId || "");
   const fail = (error) => send(socket, { type: "result", requestId, success: false, error });
-  if ((meta.dashboardGrants?.get(dashboardId) || 0) <= Date.now()) return fail("These results have expired. Refresh to continue.");
+  if ((dashboardGrants.get(grantOwner(meta))?.get(dashboardId) || 0) <= Date.now()) return fail("These results have expired. Refresh to continue.");
   if (pending.has(requestId)) return fail("This live request is already running.");
   const connector = connectors.get(meta.connectionId);
   if (!connector || connector.readyState !== WebSocket.OPEN || metadata.get(connector)?.ownerUserId !== meta.ownerUserId) {
