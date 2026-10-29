@@ -68,7 +68,8 @@ const WORKER_POLL_INTERVAL_MS = Number(process.env.WORKER_POLL_INTERVAL_MS ?? 50
 const HEROKU_ROUTER_TIMEOUT_GRACE_MS = Number(process.env.HEROKU_ROUTER_TIMEOUT_GRACE_MS ?? 29_000);
 // The run route refreshes locked_at every 30 s, so a run silent for 3 min is really gone.
 const WORKER_STALE_RUNNING_JOB_MS = Number(process.env.WORKER_STALE_RUNNING_JOB_MS ?? 3 * 60_000);
-const WORKER_PACKET_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.WORKER_PACKET_CONCURRENCY ?? 2) || 2));
+// Packet runs execute on the web dyno; the cap keeps a typo from flooding it.
+const WORKER_PACKET_CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.WORKER_PACKET_CONCURRENCY ?? 2) || 2));
 const WORKER_STALE_RUNNING_JOB_INTERVAL = `${Math.max(1, Math.round(WORKER_STALE_RUNNING_JOB_MS / 60_000))} minutes`;
 const WORKER_IN_FLIGHT_WAIT_MS = Number(process.env.WORKER_IN_FLIGHT_WAIT_MS ?? 2 * 60_000);
 const WORKER_IN_FLIGHT_POLL_MS = Number(process.env.WORKER_IN_FLIGHT_POLL_MS ?? 5_000);
