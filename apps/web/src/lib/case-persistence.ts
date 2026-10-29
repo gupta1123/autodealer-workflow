@@ -29,6 +29,12 @@ export type SavedCaseRecord = {
   deletedAt: string | null;
   /** Recycle bin only: has purchase posting/approval history, so it is never auto-purged. */
   keptForHistory?: boolean;
+  /** Active list only: the case's purchase posting to Tally, if one was started. */
+  tallyPosting?: {
+    status: string;
+    voucherNumber: string | null;
+    postedAt: string | null;
+  } | null;
 };
 
 export type DuplicateCaseReference = {

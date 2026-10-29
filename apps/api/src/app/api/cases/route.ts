@@ -895,6 +895,37 @@ async function fetchCaseMismatchCountsForSummary(
   return mismatchCountsByCaseId;
 }
 
+type CaseListTallyPosting = {
+  status: string;
+  voucherNumber: string | null;
+  postedAt: string | null;
+};
+
+// One purchase posting per case (unique case_id); the list shows its state and Tally voucher number.
+async function fetchTallyPostingsForList(
+  supabase: ReturnType<typeof createSupabaseAdminClient>,
+  caseIds: string[]
+) {
+  const postings = new Map<string, CaseListTallyPosting>();
+  if (!caseIds.length) return postings;
+  const { data, error } = await supabase
+    .from("purchase_invoice_tally_postings")
+    .select("case_id, status, tally_voucher_number, tally_created_at")
+    .in("case_id", caseIds);
+  if (error) {
+    console.warn("[cases] tally postings unavailable for list", error.message);
+    return postings;
+  }
+  for (const row of data ?? []) {
+    postings.set(row.case_id as string, {
+      status: row.status as string,
+      voucherNumber: (row.tally_voucher_number as string | null) ?? null,
+      postedAt: (row.tally_created_at as string | null) ?? null,
+    });
+  }
+  return postings;
+}
+
 function mapCaseRow(
   row: {
     id: string;
@@ -1306,6 +1337,9 @@ async function GETHandler(request: Request) {
       scope === "deleted"
         ? await findHistoryProtectedCaseIds(supabase, pageRows.map((row) => row.id))
         : null;
+    const postingsByCaseId = scope === "active"
+      ? await fetchTallyPostingsForList(supabase, pageRows.map((row) => row.id))
+      : new Map<string, CaseListTallyPosting>();
 
     const serializeStartedAt = nowMs();
     const body = {
@@ -1318,7 +1352,8 @@ async function GETHandler(request: Request) {
             : undefined,
           fieldConfiguration
         );
-        return keptCaseIds ? { ...mapped, keptForHistory: keptCaseIds.has(row.id) } : mapped;
+        if (keptCaseIds) return { ...mapped, keptForHistory: keptCaseIds.has(row.id) };
+        return scope === "active" ? { ...mapped, tallyPosting: postingsByCaseId.get(row.id) ?? null } : mapped;
       }),
       nextCursor,
       hasMore,

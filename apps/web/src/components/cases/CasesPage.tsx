@@ -182,6 +182,27 @@ function getOffsetTopInScrollParents(element: HTMLElement) {
   return top;
 }
 
+function getTallyPostingLabel(posting: SavedCaseRecord["tallyPosting"]) {
+  const status = posting?.status;
+  if (status === "created") {
+    return {
+      label: posting?.voucherNumber ? `Posted · ${posting.voucherNumber}` : "Posted",
+      className: "font-medium text-[#2d6a4f]",
+      title: posting?.postedAt ? `Posted to Tally ${formatRelativeDate(posting.postedAt)}` : "Posted to Tally",
+    };
+  }
+  if (status === "approved" || status === "queued" || status === "creating" || status === "sending") {
+    return { label: "Posting…", className: "font-medium text-[#2b6cb0]", title: "Sending to Tally" };
+  }
+  if (status === "verification_required") {
+    return { label: posting?.voucherNumber ? `Check in Tally · ${posting.voucherNumber}` : "Check in Tally", className: "font-semibold text-[#9a6700]", title: "Tally's reply was lost; check whether the voucher exists" };
+  }
+  if (status === "failed") {
+    return { label: "Posting failed", className: "font-semibold text-[#8c1d18]", title: "Open the case to see why and retry" };
+  }
+  return { label: "Not posted", className: "text-[#a89d91]", title: "Not posted to Tally yet" };
+}
+
 export function CasesPage() {
   const router = useRouter();
   const {snapshot}=useAccess();
@@ -515,6 +536,9 @@ export function CasesPage() {
                       <TableHead className="h-10 px-3 text-xs font-semibold text-[#3d3530]">
                         Reconciliation
                       </TableHead>
+                      <TableHead className="h-10 px-3 text-xs font-semibold text-[#3d3530]">
+                        Tally
+                      </TableHead>
                       <TableHead className="h-10 px-2.5 text-center text-xs font-semibold text-[#3d3530]">
                         Docs
                       </TableHead>
@@ -599,6 +623,18 @@ export function CasesPage() {
                             ) : (
                               <span className="text-[#a89d91]">—</span>
                             )}
+                          </TableCell>
+
+                          {/* Tally posting */}
+                          <TableCell className="px-3 py-2 text-xs font-normal whitespace-nowrap">
+                            {(() => {
+                              const posting = getTallyPostingLabel(item.tallyPosting);
+                              return (
+                                <span className={posting.className} title={posting.title}>
+                                  {posting.label}
+                                </span>
+                              );
+                            })()}
                           </TableCell>
 
                           {/* Docs */}
