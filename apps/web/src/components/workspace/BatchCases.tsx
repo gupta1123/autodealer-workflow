@@ -83,7 +83,9 @@ export function BatchCases({ uploads, onRemoveUpload, onStarted, onReset }: Batc
 
   const queueAnalysis = useCallback(async (row: Pick<BatchRow, "key">, caseId: string) => {
     try {
-      await enqueueCaseAnalysis(caseId, { analysisMode: "standard", comparisonOptions: optionsRef.current ?? undefined });
+      // Batch files are usually whole packets (invoice + e-way bill + weighment in one PDF),
+      // so each case is split into its documents, as "Analyze multi-doc" does.
+      await enqueueCaseAnalysis(caseId, { analysisMode: "smart_split", comparisonOptions: optionsRef.current ?? undefined });
       patch(row.key, { state: "queued", error: null, progress: 0, stage: "Queued for analysis" });
     } catch (error) {
       patch(row.key, { state: "failed", error: errorMessage(error, "Analysis could not be started.") });
