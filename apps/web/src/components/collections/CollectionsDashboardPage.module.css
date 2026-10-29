@@ -256,3 +256,122 @@
 @media (prefers-reduced-motion: reduce) {
   .cashDiscounts * { animation: none !important; transition: none !important; }
 }
+
+/* Selection actions cover the tab bar while rows are ticked (as in Gajkesari). */
+.tabBar { position: relative; }
+.bulkBar {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px 0 16px;
+  overflow-x: auto;
+  white-space: nowrap;
+  border-radius: 10px 10px 0 0;
+  background: #2f2924;
+  color: #fff;
+}
+.bulkCount { margin-right: 6px; font-size: 13px; font-weight: 600; }
+.bulkButton {
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  padding: 7px 12px;
+  color: #f3eee8;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.bulkButton:hover:not(:disabled) { background: rgb(255 255 255 / 14%); }
+.bulkButton:disabled { cursor: not-allowed; opacity: .35; }
+.bulkButton small { margin-left: 4px; opacity: .65; }
+.bulkPrimary { background: #fff; color: #2f2924; font-weight: 600; }
+.bulkPrimary:hover:not(:disabled) { background: #efe9e1; }
+.bulkDanger { color: #fca5a5; }
+.bulkWarn { color: #fcd34d; }
+.bulkSeparator { width: 1px; height: 18px; margin: 0 4px; background: rgb(255 255 255 / 22%); }
+.bulkClose {
+  margin-left: auto;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #f3eee8;
+  font-size: 20px;
+  line-height: 1;
+}
+.bulkClose:hover { background: rgb(255 255 255 / 14%); }
+
+/* Status pills */
+.pill { display: inline-flex; white-space: nowrap; border-radius: 999px; padding: 4px 8px; font-size: 11px; font-weight: 500; }
+.pillStone { background: #f5f5f4; color: #57534e; }
+.pillGreen { background: #ecfdf5; color: #065f46; }
+.pillAmber { background: #fffbeb; color: #92400e; }
+.pillRed { background: #fef2f2; color: #b91c1c; }
+.pillSky { background: #e0f2fe; color: #0369a1; }
+.ageWarn { color: #92400e; font-weight: 500; }
+.ageBad { color: #b91c1c; font-weight: 500; }
+
+/* Customers with unpaid invoices: a grid so the columns always line up. */
+.customerGrid { margin-top: 4px; font-size: 12px; color: #5a5046; }
+.customerRow {
+  display: grid;
+  grid-template-columns: 28px minmax(220px, 1fr) 80px 150px 160px 180px;
+  gap: 0 14px;
+  align-items: center;
+  min-height: 56px;
+  padding: 0 4px 0 0;
+  border-bottom: 1px solid #ece6dc;
+}
+.customerHead { min-height: 40px; border-bottom-color: #e0d8cc; background: #f7f4ef; color: #3d3530; font-weight: 600; }
+.customerGrid .right { text-align: right; }
+.customerGroup:hover > .customerRow { background: rgb(237 230 217 / 35%); }
+.customerToggle {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  text-align: left;
+}
+.customerToggle:focus-visible { outline: 2px solid #976322; outline-offset: 2px; border-radius: 6px; }
+.customerToggle > span { min-width: 0; }
+.customerToggle b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #111827; font-size: 13px; font-weight: 500; line-height: 1.35; }
+.customerToggle small { display: block; margin-top: 2px; color: #8a7f72; font-size: 11px; }
+.chevron { flex: none; color: #a89d8f; transition: transform .15s; }
+.customerToggle:hover .chevron { color: #2f2924; }
+.customerOpen .chevron { transform: rotate(90deg); }
+.customerInvoices { border-bottom: 1px solid #ece6dc; background: #faf8f5; padding: 4px 0 4px 46px; }
+.customerInvoice {
+  display: grid;
+  grid-template-columns: minmax(200px, 1fr) 150px 190px minmax(0, 200px);
+  gap: 14px;
+  align-items: center;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 18px 0 0;
+  border-top: 1px solid #f1ece4;
+  text-align: left;
+}
+.customerInvoice:first-child { border-top: 0; }
+.customerInvoice:hover { background: rgb(237 230 217 / 50%); }
+.customerInvoice:focus-visible { outline: 2px solid #976322; outline-offset: -2px; }
+.invoiceNumber { color: #2f2924; font-size: 12.5px; }
+.invoiceNumber small { display: block; margin-top: 2px; color: #8a7f72; font-size: 11px; }
+@media (max-width: 900px) {
+  .customerGrid { overflow-x: auto; }
+  .customerRow, .customerInvoice { min-width: 760px; }
+}
+
+/* The message exactly as WhatsApp shows it. */
+.whatsapp { max-width: 360px; margin: 0 auto; overflow: hidden; border: 1px solid #d1d7db; border-radius: 14px; background: #efeae2; box-shadow: 0 6px 18px rgb(0 0 0 / 8%); font-family: "Segoe UI", Helvetica, Arial, sans-serif; }
+.whatsappBar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #008069; color: #fff; }
+.whatsappAvatar { display: flex; width: 36px; height: 36px; align-items: center; justify-content: center; border-radius: 50%; background: #dfe5e7; color: #54656f; font-size: 13px; font-weight: 600; }
+.whatsappWho { min-width: 0; flex: 1; line-height: 1.25; }
+.whatsappWho b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; font-weight: 500; }
+.whatsappWho small { font-size: 11.5px; opacity: .85; }
+.whatsappBody { min-height: 200px; padding: 12px 10px 18px; background-color: #efeae2; background-image: radial-gradient(rgb(11 20 26 / 4.5%) 1.2px, transparent 1.2px); background-size: 16px 16px; }
+.whatsappDay { width: max-content; margin: 0 auto 10px; border-radius: 7px; background: #fff; padding: 4px 10px; color: #54656f; font-size: 11px; }
+.whatsappMessage { max-width: 88%; margin-left: auto; border-radius: 8px 0 8px 8px; background: #d9fdd3; padding: 7px 10px 6px; color: #111b21; font-size: 13.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 1px 1px rgb(11 20 26 / 14%); }

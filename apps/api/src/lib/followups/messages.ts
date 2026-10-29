@@ -1,7 +1,11 @@
 import {WhatsappRejectedError} from '@/lib/msg91/whatsapp';
 
 type Message = {key:string;name:string;language:string;namespace:string;text:string;components:Record<string,string>};
-const fields=['customer','company','invoice','invoice_date','outstanding'];
+type ListedInvoice = {invoice:string;invoice_date?:string|null;outstanding:number};
+type MessageRow = {customer:string;company_name:string;invoice:string;invoice_date?:string;outstanding:number;invoices?:ListedInvoice[]|null};
+const fields=['customer','company','invoice','invoice_date','outstanding','invoice_count','invoice_list'];
+/** The message one customer reminder sends when it lists two or more invoices. */
+export const SUMMARY_MESSAGE='payment_reminder_summary';
 
 // This is an approved MSG91 template owned by the Kalika account. Keeping the
 // safe metadata here means a fresh install can use the reminder flow before an
@@ -14,6 +18,15 @@ const BUILTIN_MESSAGES:Message[]=[{
   namespace:'2bf6cec8_61b1_4925_8632_49e9ddebff44',
   text:'Hello {{customer}},\n\nThis is a payment reminder for ₹{{outstanding}} pending against invoice {{invoice}} dated {{invoice_date}}.\n\nPlease arrange payment at your earliest convenience. If payment has already been made, please ignore this message.\n\nRegards,\n{{company}} Accounts Team',
   components:{body_1:'customer',body_2:'outstanding',body_3:'invoice',body_4:'invoice_date',body_5:'company'},
+},{
+  // Same template Gajkesari sends from this MSG91 namespace: one message per
+  // customer, their unpaid invoices on a single line.
+  key:SUMMARY_MESSAGE,
+  name:SUMMARY_MESSAGE,
+  language:'en',
+  namespace:'2bf6cec8_61b1_4925_8632_49e9ddebff44',
+  text:'Hello {{customer}},\n\nThis is a payment reminder. You have {{invoice_count}} unpaid invoices totalling ₹{{outstanding}}:\n\n{{invoice_list}}\n\nPlease arrange payment at your earliest convenience. If payment has already been made, please ignore this message.\n\nRegards,\n{{company}} Accounts Team',
+  components:{body_1:'customer',body_2:'invoice_count',body_3:'outstanding',body_4:'invoice_list',body_5:'company'},
 }];
 export function reminderMessages():Message[] {
   const raw=JSON.parse(process.env.FOLLOWUP_WHATSAPP_TEMPLATES_JSON||'[]');
@@ -23,17 +36,34 @@ export function reminderMessages():Message[] {
   for(const message of configured)byKey.set(message.key,message);
   return [...byKey.values()];
 }
-export function reminderMessageValues(row:{customer:string;company_name:string;invoice:string;invoice_date?:string;outstanding:number}) {
-  const invoiceDate=row.invoice_date?new Intl.DateTimeFormat('en-IN',{day:'2-digit',month:'short',year:'numeric'}).format(new Date(`${row.invoice_date}T00:00:00`)):'';
-  return {customer:row.customer,company:row.company_name,invoice:row.invoice,invoice_date:invoiceDate,outstanding:new Intl.NumberFormat('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}).format(row.outstanding)};
+const day=(value:string,year=true)=>new Intl.DateTimeFormat('en-IN',year?{day:'2-digit',month:'short',year:'numeric'}:{day:'numeric',month:'short'}).format(new Date(`${value}T00:00:00`));
+/** The invoices of a customer reminder on one line, oldest first, then "and N
+ * more". A WhatsApp variable cannot hold line breaks, so they are separated by semicolons. */
+export function invoiceListLine(invoices:ListedInvoice[],show=5) {
+  const sorted=[...invoices].sort((a,b)=>String(a.invoice_date??'9999').localeCompare(String(b.invoice_date??'9999')));
+  const parts=sorted.slice(0,show).map(item=>`${item.invoice.replace(/\s+/g,' ').trim()} ₹${new Intl.NumberFormat('en-IN',{maximumFractionDigits:2}).format(item.outstanding)}${item.invoice_date?` (${day(item.invoice_date,false)})`:''}`);
+  const rest=sorted.length-parts.length;
+  return `${parts.join('; ')}${rest>0?`; and ${rest} more`:''}`;
 }
-export function reminderPreview(key:string,row:Parameters<typeof reminderMessageValues>[0]) {
+/** Two or more invoices go out as the summary message; one uses the stage's own. */
+export function templateForRow(row:{invoices?:unknown[]|null},stageTemplate:string) {
+  return row.invoices&&row.invoices.length>1?SUMMARY_MESSAGE:stageTemplate;
+}
+export function reminderMessageValues(row:MessageRow) {
+  // A customer reminder down to one invoice reads as that invoice's own reminder.
+  const only=row.invoices?.length===1?row.invoices[0]:null;
+  const invoiceDate=only?.invoice_date??row.invoice_date;
+  return {customer:row.customer,company:row.company_name,invoice:only?.invoice??row.invoice,invoice_date:invoiceDate?day(invoiceDate):'',
+    outstanding:new Intl.NumberFormat('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}).format(row.outstanding),
+    invoice_count:String(row.invoices?.length??1),invoice_list:row.invoices?.length?invoiceListLine(row.invoices):row.invoice};
+}
+export function reminderPreview(key:string,row:MessageRow) {
   const message=reminderMessages().find(m=>m.key===key);
   if(!message)throw new Error('Select a configured WhatsApp reminder template.');
   const values=reminderMessageValues(row);
-  return message.text.replace(/\{\{(customer|company|invoice|invoice_date|outstanding)\}\}/g,(_,field:keyof typeof values)=>values[field]);
+  return message.text.replace(/\{\{(customer|company|invoice|invoice_date|outstanding|invoice_count|invoice_list)\}\}/g,(_,field:keyof typeof values)=>values[field]);
 }
-export async function submitReminder(key:string,row:Parameters<typeof reminderMessageValues>[0],phone:string) {
+export async function submitReminder(key:string,row:MessageRow,phone:string) {
   const message=reminderMessages().find(m=>m.key===key);
   if(!message||!process.env.MSG91_AUTHKEY||!process.env.MSG91_WHATSAPP_NUMBER)throw new WhatsappRejectedError('Configure a WhatsApp sender and approved reminder template first.');
   const values=reminderMessageValues(row);

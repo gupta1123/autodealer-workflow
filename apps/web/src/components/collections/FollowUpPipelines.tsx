@@ -8,9 +8,11 @@ import {useActionAccess} from '@/components/access/useActionAccess';
 import {Dialog,DialogContent,DialogTitle,DialogDescription,DialogFooter} from '@/components/ui/dialog';
 import {type ReminderPlan,type ReminderStage} from '@autodealer/shared/lib/followup-pipeline';
 import styles from './CollectionsDashboardPage.module.css';
+import {WhatsappBubble,maskPhone} from './WhatsappBubble';
 
 type Invoice={partyLedgerName:string;linkedInvoiceNumber:string|null;linkedInvoiceDate:string|null;partyPhone:string|null};
-type Row={automatic?:boolean;mode?:'once'|'pipeline';id:string;revision:number;customer:string;invoice:string;outstanding:number|null;status:string;plan_name:string;stage_index:number;stage_sent:number;stages:ReminderStage[];next_due_at:string|null;verification_expires_at:string|null;note:string|null;last_attempt?:{status:string;created_at:string;error:string|null}|null};
+// kind 'customer': one reminder listing several invoices of the customer.
+type Row={kind?:'invoice'|'customer';invoices?:Array<{invoice:string;invoice_date:string;outstanding:number}>|null;recipient:string;automatic?:boolean;mode?:'once'|'pipeline';id:string;revision:number;customer:string;invoice:string;outstanding:number|null;status:string;plan_name:string;stage_index:number;stage_sent:number;stages:ReminderStage[];next_due_at:string|null;verification_expires_at:string|null;note:string|null;last_attempt?:{status:string;created_at:string;error:string|null}|null};
 // What happened to a WhatsApp submission, in the words the page uses everywhere.
 const attemptLabel=(status:string)=>status==='accepted'?'Submitted':status==='rejected'?'Not sent':status==='submitting'?'Submitting':status==='skipped'?'Skipped':'Needs verification';
 const SUBMITTED_NOTE='Submitted means WhatsApp accepted the message; delivery is not confirmed.';
@@ -64,7 +66,8 @@ export function FollowUpPipelines({toolbarTarget,focusId='',view,connectionId,co
   const [savePhone,setSavePhone]=useState(false),[notice,setNotice]=useState('');
   const [requestId]=useState(()=>crypto.randomUUID());
   const [submitted,setSubmitted]=useState(false);
-  const [preview,setPreview]=useState<{row:Row;text:string;recipient:string}|null>(null);
+  // Review & send: each reminder checked in Tally just now, with the exact message.
+  const [review,setReview]=useState<{ids:string[];rows:Record<string,Row>;texts:Record<string,string>;focus:string;off:Set<string>}|null>(null);
   const [history,setHistory]=useState<Array<{id:string;status:string;created_at:string;error:string|null}>|null>(null);
   const [panelTab,setPanelTab]=useState<'details'|'history'>('details');
   const [historyError,setHistoryError]=useState('');
@@ -89,7 +92,7 @@ export function FollowUpPipelines({toolbarTarget,focusId='',view,connectionId,co
     const result=await response.json();if(!response.ok)throw new Error(result.error||'Could not load pipelines.');setData(result);if(view==='due'&&!focusId&&!query)onDueCount?.(result.total);
   },[connectionId,companyId,companyGuid,companyName,financialYear,filter,page,view,onDueCount,focusId,query]);
   useEffect(()=>{void load().catch(e=>setError(e.message));},[load]);
-  useEffect(()=>{if(busy||preview||invoice)return;const timer=setInterval(()=>{void load().catch(e=>setError(e.message));},30000);return()=>clearInterval(timer);},[load,busy,preview,invoice]);
+  useEffect(()=>{if(busy||review||invoice)return;const timer=setInterval(()=>{void load().catch(e=>setError(e.message));},30000);return()=>clearInterval(timer);},[load,busy,review,invoice]);
   useEffect(()=>{if(invoice){setRecipient(invoice.partyPhone||'');setError('');}},[invoice]);
   async function action(body:Record<string,unknown>) {
     const response=await apiFetch('/api/collections/follow-ups/pipelines',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...scope,...body})});
@@ -103,12 +106,60 @@ export function FollowUpPipelines({toolbarTarget,focusId='',view,connectionId,co
     if(!rows.length)return;
     await run(async()=>{const result=await action({action:actionName,items:rows.map(row=>({id:row.id,revision:row.revision,key:row.invoice})),...extra});setBulkAction(actionName);setBulkResults(result.results||[]);setSelectedIds(new Set());});
   }
+  const rowName=(row:Row)=>`${row.customer} · ${row.invoice}`;
+  // Checks the selected due reminders in Tally, then shows each message before anything is sent.
+  async function openReview(){
+    const chosen=(data?.rows||[]).filter(row=>selectedIds.has(row.id));
+    if(!chosen.length)return;
+    await run(async()=>{
+      const checked=await action({action:'bulk_check',items:chosen.map(row=>({id:row.id,revision:row.revision,key:row.invoice}))});
+      const fresh=((checked.results||[]) as Array<{row?:Row}>).map(result=>result.row).filter((row):row is Row=>Boolean(row));
+      const ready=fresh.filter(row=>row.status==='active'&&row.next_due_at&&Date.parse(row.next_due_at)<=Date.now());
+      const left=chosen.length-ready.length;
+      if(!ready.length){setCheckNotice('Nothing left to send. The checked invoices were paid, need review, or are not due yet.');return;}
+      const texts:Record<string,string>={};
+      for(const row of ready)texts[row.id]=(await action({action:'preview',id:row.id,revision:row.revision})).text;
+      setSelectedIds(new Set());
+      if(left)setCheckNotice(`${left} left out: paid in full, held for review, or not due yet.`);
+      setReview({ids:ready.map(row=>row.id),rows:Object.fromEntries(ready.map(row=>[row.id,row])),texts,focus:ready[0].id,off:new Set()});
+    });
+  }
+  async function sendReviewed(){
+    if(!review||busy)return;
+    const ids=review.ids.filter(id=>!review.off.has(id));
+    await run(async()=>{
+      const results:Array<{key:string;status:string;message?:string}>=[];let single:SendOutcome|null=null;
+      for(const id of ids){
+        const row=review.rows[id];
+        try{
+          const result=await action({action:'send',id,revision:row.revision});
+          results.push({key:rowName(row),status:String(result.status||'uncertain'),message:result.error||undefined});
+          single={customer:row.customer,invoice:row.invoice,status:String(result.status||'uncertain'),error:result.error||null,submittedAt:result.submittedAt||null,scheduleStatus:result.scheduleStatus||null,nextDueAt:result.nextDueAt||null};
+        }catch(reason){results.push({key:rowName(row),status:'skipped',message:reason instanceof Error?reason.message:'Not sent.'});}
+      }
+      setReview(null);
+      if(ids.length===1&&single)setSendOutcome(single);
+      else{setBulkAction('bulk_send');setBulkResults(results);}
+    });
+  }
   function exportRows(){const rows=(data?.rows||[]).filter(row=>selectedIds.has(row.id));if(!rows.length)return;const quote=(value:unknown)=>`"${String(value??'').replaceAll('"','""')}"`;const csv=[['Customer','Invoice','Outstanding','Status','Plan','Next reminder'],...rows.map(row=>[row.customer,row.invoice,row.outstanding??'',statusLabel[row.status]||row.status,row.plan_name,row.next_due_at||''])].map(line=>line.map(quote).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\ufeff',csv],{type:'text/csv;charset=utf-8'}));const anchor=document.createElement('a');anchor.href=url;anchor.download='payment-follow-ups.csv';anchor.click();URL.revokeObjectURL(url);}
   async function submitInvoice(once:boolean){if(!invoice||busy||submitted)return;setBusy(true);setError('');try{const result=await action({action:once?'send_once':'enroll',requestId,recipient,savePhoneToTally:savePhone,customer:invoice.partyLedgerName,invoice:invoice.linkedInvoiceNumber,invoiceDate:invoice.linkedInvoiceDate});setSubmitted(true);if(result.error)setError(result.error);setNotice(`${once?(result.status==='accepted'?`Message submitted to WhatsApp. ${SUBMITTED_NOTE} It is listed in Sent messages.`:'Message requires verification. Check it in Sent messages before sending again.'):'Reminders started. They appear in Reminders due when each one is due.'} ${result.phoneNotice||''}`);}catch(e){setError(e instanceof Error?e.message:'Operation failed.');}finally{setBusy(false);}}
   const input='h-8 min-w-0 rounded-md border border-[#ded8d0] bg-white px-2 text-xs';
   const button=styles.messageAction;
-  const close=()=>{if(busy)return;onClearInvoice();setPreview(null);setHistory(null);};
-  const toolbar=!invoice?(<div className="flex flex-wrap items-center gap-2">{selectedIds.size?<><span className="text-xs font-semibold text-[#51483f]">{selectedIds.size} selected</span><button className={button} disabled={busy} onClick={()=>void bulk('bulk_check')}>Check Tally</button>{view==='due'?<button className={button} disabled={busy} onClick={()=>{if(window.confirm(`Verify and send ${selectedIds.size} due reminders? Each message will be recorded separately.`))void bulk('bulk_send');}}>Review & send due</button>:<><button className={button} disabled={busy} onClick={()=>void bulk('bulk_pause')}>Pause</button><button className={button} disabled={busy} onClick={()=>void bulk('bulk_resume')}>Resume</button><button className={button} disabled={busy} onClick={()=>{if(window.confirm(`Stop reminders for ${selectedIds.size} selected schedules?`))void bulk('bulk_stop');}}>Stop</button>{data?.templates?.length?<><select className={input} aria-label="Change reminder sequence" value={selectedPlanId} onChange={event=>setSelectedPlanId(event.target.value)}><option value="">Change sequence…</option>{data.templates.map(plan=><option value={plan.id} key={plan.id}>{plan.name}</option>)}</select><button className={button} disabled={busy||!selectedPlanId} onClick={()=>{const plan=data.templates.find(value=>value.id===selectedPlanId);if(plan&&window.confirm(`Restart the selected schedules using “${plan.name}”?`))void bulk('bulk_plan',{plan});}}>Apply</button></>:null}</>}<button className={button} disabled={busy} onClick={exportRows}><Download className="size-3.5"/>CSV</button><button className={button} disabled={busy} onClick={()=>setSelectedIds(new Set())}>Clear</button></>:<><label className="relative block w-56"><span className="sr-only">Search customer, invoice or WhatsApp number</span><Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400"/><input type="search" value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search customer, invoice or number" className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white pl-9 pr-3 text-xs font-semibold text-[#1a1a1a] outline-none transition placeholder:text-slate-400 focus:border-amber-400 focus:ring-2 focus:ring-amber-100"/></label>{view==='pipelines'?<select aria-label="Pipeline status" className={input} value={filter} onChange={e=>{setFilter(e.target.value);setPage(1);}}><option value="all">All statuses</option>{Object.entries(statusLabel).map(([key,label])=><option value={key} key={key}>{label}</option>)}</select>:null}<button className={button} disabled={busy} onClick={()=>void run(load)}>{view==='history'?'Refresh history':'Refresh'}</button></>}</div>):null;
+  const close=()=>{if(busy)return;onClearInvoice();setReview(null);setHistory(null);};
+  const toolbar=!invoice?(<div className="flex flex-wrap items-center gap-2">{selectedIds.size?<div className={styles.bulkBar}>
+    <span className={styles.bulkCount}>{selectedIds.size} selected</span><span className={styles.bulkSeparator}/>
+    {view==='due'&&allowed('followups.export')?<button type="button" className={`${styles.bulkButton} ${styles.bulkPrimary}`} disabled={busy} onClick={()=>void openReview()}>Review &amp; send<small>{selectedIds.size}</small></button>:null}
+    <button type="button" className={styles.bulkButton} disabled={busy} onClick={()=>void bulk('bulk_check')}>Check Tally</button>
+    {view!=='due'?<>
+      <button type="button" className={styles.bulkButton} disabled={busy} onClick={()=>void bulk('bulk_pause')}>Pause</button>
+      <button type="button" className={styles.bulkButton} disabled={busy} onClick={()=>void bulk('bulk_resume')}>Resume</button>
+      <button type="button" className={`${styles.bulkButton} ${styles.bulkDanger}`} disabled={busy} onClick={()=>{if(window.confirm(`Stop reminders for ${selectedIds.size} selected schedules?`))void bulk('bulk_stop');}}>Stop reminders</button>
+      {data?.templates?.length?<><span className={styles.bulkSeparator}/><select className="h-8 rounded-md border-0 bg-white/10 px-2 text-xs text-white" aria-label="Change reminder sequence" value={selectedPlanId} onChange={event=>setSelectedPlanId(event.target.value)}><option value="" className="text-black">Change sequence…</option>{data.templates.map(plan=><option className="text-black" value={plan.id} key={plan.id}>{plan.name}</option>)}</select><button type="button" className={styles.bulkButton} disabled={busy||!selectedPlanId} onClick={()=>{const plan=data.templates.find(value=>value.id===selectedPlanId);if(plan&&window.confirm(`Restart the selected schedules using “${plan.name}”?`))void bulk('bulk_plan',{plan});}}>Apply</button></>:null}
+    </>:null}
+    <button type="button" className={styles.bulkButton} disabled={busy} onClick={exportRows}><Download className="mr-1 inline size-3.5"/>CSV</button>
+    <button type="button" className={styles.bulkClose} aria-label="Clear selection" disabled={busy} onClick={()=>setSelectedIds(new Set())}>×</button>
+  </div>:<><label className="relative block w-56"><span className="sr-only">Search customer, invoice or WhatsApp number</span><Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400"/><input type="search" value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search customer, invoice or number" className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white pl-9 pr-3 text-xs font-semibold text-[#1a1a1a] outline-none transition placeholder:text-slate-400 focus:border-amber-400 focus:ring-2 focus:ring-amber-100"/></label>{view==='pipelines'?<select aria-label="Pipeline status" className={input} value={filter} onChange={e=>{setFilter(e.target.value);setPage(1);}}><option value="all">All statuses</option>{Object.entries(statusLabel).map(([key,label])=><option value={key} key={key}>{label}</option>)}</select>:null}<button className={button} disabled={busy} onClick={()=>void run(load)}>{view==='history'?'Refresh history':'Refresh'}</button></>}</div>):null;
   return <>
       {toolbarTarget?createPortal(toolbar,toolbarTarget):toolbar}
       <section className={styles.results} aria-label="Invoice reminders">
@@ -155,18 +206,18 @@ export function FollowUpPipelines({toolbarTarget,focusId='',view,connectionId,co
         </div>:view==='history'?<>
 
           <p className="mb-2 text-xs text-[#756b60]">Every WhatsApp reminder submitted, newest first. {SUBMITTED_NOTE}</p>
-          <div className="overflow-x-auto"><table className={styles.createdTable}><thead><tr><th>Customer / invoice</th><th>Amount</th><th>WhatsApp number</th><th>Submitted at</th><th>Status</th></tr></thead><tbody>{data?.attempts?.map(a=><tr key={a.id}><td>{a.invoice_followup_pipelines.customer}<span className={styles.secondary}>{a.invoice_followup_pipelines.invoice}</span></td><td>{money(a.outstanding)}</td><td>{a.recipient}</td><td>{date(a.created_at)}</td><td>{attemptLabel(a.status)}<span className={styles.secondary}>{a.error}</span></td></tr>)}</tbody></table></div>
+          <div className="overflow-x-auto"><table className={styles.createdTable}><thead><tr><th>Customer / invoice</th><th>Amount</th><th>WhatsApp number</th><th>Submitted at</th><th>Status</th></tr></thead><tbody>{data?.attempts?.map(a=><tr key={a.id}><td>{a.invoice_followup_pipelines.customer}<span className={styles.secondary}>{a.invoice_followup_pipelines.invoice}</span></td><td className="tabular-nums">{money(a.outstanding)}</td><td>{maskPhone(a.recipient)}</td><td>{date(a.created_at)}</td><td><span className={`${styles.pill} ${a.status==='accepted'?styles.pillAmber:a.status==='rejected'?styles.pillRed:a.status==='submitting'?styles.pillStone:styles.pillSky}`}>{attemptLabel(a.status)}</span>{a.error?<span className={styles.statusNote}>{a.error}</span>:null}</td></tr>)}</tbody></table></div>
           {!error&&!data?.attempts?.length?<p className="py-8 text-center text-xs">{query?`No sent messages match "${query}".`:'No messages submitted yet.'}</p>:null}
           <footer className="my-3 flex justify-end gap-4 text-xs"><span>{data?.total||0} messages · Page {page}</span><button disabled={busy||page===1} onClick={()=>setPage(p=>p-1)}>Previous</button><button disabled={busy||page*25>=(data?.total||0)} onClick={()=>setPage(p=>p+1)}>Next</button></footer>
         </>:<>
 
           <div className={styles.flatTable}><table className={`${styles.createdTable} ${styles.pipelineTable}`}><thead><tr><th className="w-9"><input type="checkbox" aria-label="Select this page" checked={Boolean(data?.rows.length)&&data!.rows.every(row=>selectedIds.has(row.id))} onChange={event=>setSelectedIds(event.target.checked?new Set(data?.rows.map(row=>row.id)):new Set())}/></th><th>Customer / invoice</th><th>Outstanding</th><th>Stage</th><th>Next reminder</th><th>Status</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{data?.rows.map(row=><Fragment key={row.id}><tr>
-            <td><input type="checkbox" aria-label={`Select ${row.invoice}`} checked={selectedIds.has(row.id)} onChange={event=>setSelectedIds(current=>{const next=new Set(current);event.target.checked?next.add(row.id):next.delete(row.id);return next;})}/></td><td><span className={styles.customerName}>{row.customer}</span><span className={styles.secondary}>{row.invoice}</span>{row.automatic?<span className={styles.secondary}>Automatic RTGS reminders</span>:null}</td><td>{money(row.outstanding)}</td>
+            <td><input type="checkbox" aria-label={`Select ${row.invoice}`} checked={selectedIds.has(row.id)} onChange={event=>setSelectedIds(current=>{const next=new Set(current);event.target.checked?next.add(row.id):next.delete(row.id);return next;})}/></td><td><span className={styles.customerName}>{row.customer}</span><span className={styles.secondary}>{row.invoice}{row.kind==='customer'?' · customer reminder':''}</span>{row.automatic?<span className={styles.secondary}>Automatic RTGS reminders</span>:null}</td><td>{money(row.outstanding)}</td>
             <td>{row.mode==='once'?<span>One-time message</span>:<button type="button" className="rounded text-left focus-visible:outline focus-visible:outline-2" aria-expanded={expandedStageId===row.id} aria-controls={`stages-${row.id}`} onClick={()=>{setPanelTab('details');setExpandedStageId(row.id);}}><span aria-hidden="true">{expandedStageId===row.id?'▾':'▸'} </span>{row.stages[row.stage_index]?.name}<span className={styles.secondary}>Stage {row.stage_index+1} of {row.stages.length} · {row.stage_sent}/{row.stages[row.stage_index]?.limit} submitted</span></button>}</td>
             <td>{row.next_due_at?date(row.next_due_at):<span className={styles.mutedValue}>None</span>}</td><td><span className={`inline-flex rounded-full px-2 py-1 text-[11px] font-medium ${row.status==='settled'?'bg-emerald-50 text-emerald-800':['review','uncertain'].includes(row.status)?'bg-amber-50 text-amber-800':'bg-stone-100 text-stone-600'}`}>{row.mode==='once'&&row.status==='finished'?'Message submitted':statusLabel[row.status]}</span>{statusNote(row)?<span className={styles.statusNote}>{statusNote(row)}</span>:null}{row.verification_expires_at?<span className={styles.secondary}>Check valid until {date(row.verification_expires_at)}</span>:null}{row.last_attempt?<span className={`${styles.secondary} ${row.last_attempt.status==='accepted'?'':'text-amber-800'}`} title={SUBMITTED_NOTE}>Last message: {attemptLabel(row.last_attempt.status)} · {date(row.last_attempt.created_at)}{row.last_attempt.error?` — ${row.last_attempt.error}`:''}</span>:row.mode!=='once'?<span className={styles.secondary}>No message sent yet</span>:null}</td>
             <td><div className="flex items-center gap-1.5">
               {allowed('followups.export')&&row.status==='active'&&row.verification_expires_at&&Date.parse(row.verification_expires_at)>now?
-                <button className={button} disabled={busy||!row.next_due_at||Date.parse(row.next_due_at)>now} title={row.next_due_at&&Date.parse(row.next_due_at)>now?'This reminder is not due yet.':undefined} onClick={()=>void run(async()=>{const result=await action({action:'preview',id:row.id,revision:row.revision});setPreview({row,...result});})}>Review & send</button>:
+                <button className={button} disabled={busy||!row.next_due_at||Date.parse(row.next_due_at)>now} title={row.next_due_at&&Date.parse(row.next_due_at)>now?'This reminder is not due yet.':undefined} onClick={()=>void run(async()=>{const result=await action({action:'preview',id:row.id,revision:row.revision});setReview({ids:[row.id],rows:{[row.id]:row},texts:{[row.id]:result.text},focus:row.id,off:new Set()});})}>Review & send</button>:
                 allowed('followups.prepare')&&['active','review','paused'].includes(row.status)?<button className={button} disabled={busy} onClick={()=>void run(async()=>{await action({action:'check',id:row.id,revision:row.revision});setNow(Date.now());})}>Check outstanding</button>:null}
               <Popover open={menuId===row.id} onOpenChange={open=>{setMenuId(open?row.id:null);setStopId(null);}}>
                 <PopoverTrigger asChild><button type="button" className={styles.rowMenuButton} disabled={busy} aria-label={`More actions for ${row.invoice}`}><MoreHorizontal className="size-4" aria-hidden="true"/></button></PopoverTrigger>
@@ -206,7 +257,7 @@ export function FollowUpPipelines({toolbarTarget,focusId='',view,connectionId,co
             </section>:<>
             {data?.rows.filter(row=>row.id===expandedStageId).map(row=><div key={row.id}>
               <dl className="mb-5 grid grid-cols-2 gap-4 text-xs">
-                <div><dt className="text-[#756b60]">Invoice</dt><dd className="mt-1 break-words font-medium">{row.invoice}</dd></div>
+                <div><dt className="text-[#756b60]">{row.kind==='customer'?'Invoices':'Invoice'}</dt><dd className="mt-1 break-words font-medium">{row.kind==='customer'?<ul className="space-y-1">{(row.invoices||[]).map(item=><li key={`${item.invoice}|${item.invoice_date}`}>{item.invoice} · {money(item.outstanding)}</li>)}</ul>:row.invoice}</dd></div>
                 <div><dt className="text-[#756b60]">Outstanding</dt><dd className="mt-1 font-medium">{money(row.outstanding)}</dd></div>
                 <div><dt className="text-[#756b60]">Status</dt><dd className="mt-1">{statusLabel[row.status]||row.status}</dd></div>
                 <div><dt className="text-[#756b60]">Next reminder</dt><dd className="mt-1">{row.next_due_at?date(row.next_due_at):'None'}</dd></div>
@@ -224,20 +275,27 @@ export function FollowUpPipelines({toolbarTarget,focusId='',view,connectionId,co
           </div>
         </DialogContent>
       </Dialog>
-      <Dialog open={!!preview} onOpenChange={open=>{if(!open&&!busy)setPreview(null);}}>
-        <DialogContent className="flex max-h-[85dvh] max-w-xl flex-col overflow-hidden rounded-xl border-[#ded8d0] p-0" showClose={!busy}>
-          <div className="shrink-0 border-b border-[#e8e2db] px-5 py-4 pr-14">
-            <DialogTitle className="text-base font-semibold text-[#28231f]">Review reminder</DialogTitle>
-            <DialogDescription className="mt-1 break-words text-xs text-[#756b60]">{preview?.row.customer} · {preview?.row.invoice}</DialogDescription>
+      <Dialog open={!!review} onOpenChange={open=>{if(!open&&!busy)setReview(null);}}>
+        <DialogContent placement="right" className="border-[#ded8d0] p-0" showClose={!busy}>
+          <div className="shrink-0 border-b border-[#e8e2db] px-5 py-5 pr-14">
+            <DialogTitle className="text-base font-semibold text-[#28231f]">Review &amp; send</DialogTitle>
+            <DialogDescription className="mt-1 text-xs text-[#756b60]">{review?.ids.length===1?'1 reminder':`${review?.ids.length||0} reminders`} ready to send · checked in Tally just now</DialogDescription>
           </div>
-          <div className="min-h-0 overflow-y-auto px-5 py-4">
-            <p className="mb-3 text-xs text-[#756b60]">WhatsApp to <span className="font-medium text-[#28231f]">{preview?.recipient}</span></p>
-            <p className="whitespace-pre-wrap break-words rounded-lg border border-[#e8e2db] bg-[#faf8f5] p-4 text-sm leading-6 text-[#28231f]">{preview?.text}</p>
+          <div className="min-h-0 flex-1 overflow-y-auto p-5">
+            {review&&review.ids.length>1?<div className="mb-4 overflow-hidden rounded-lg border border-[#e0d9d0]">{review.ids.map(id=>{const row=review.rows[id];return <div key={id} className={`flex items-center gap-2 border-b border-[#eee8e0] px-3 py-2 text-xs last:border-0 ${id===review.focus?'bg-[#f1f7f2]':'bg-white'}`}>
+              <input type="checkbox" className="accent-[#2f2924]" aria-label={`Send to ${row.customer}`} checked={!review.off.has(id)} onChange={event=>setReview(current=>{if(!current)return current;const off=new Set(current.off);if(event.target.checked)off.delete(id);else off.add(id);return {...current,off};})}/>
+              <button type="button" className="min-w-0 flex-1 text-left" onClick={()=>setReview(current=>current&&{...current,focus:id})}><b className="block truncate">{row.customer}</b><span className="text-[#756b60]">{row.invoice} · {money(row.outstanding)}</span></button>
+            </div>;})}</div>:null}
+            {review?(()=>{const row=review.rows[review.focus];return <>
+              <p className="mb-3 text-xs text-[#756b60]">To {maskPhone(row.recipient)}. This is exactly what the customer will receive.</p>
+              <WhatsappBubble name={row.customer} phone={row.recipient} text={review.texts[row.id]||'No message template is configured.'}/>
+            </>;})():null}
             {error?<p role="alert" className="mt-3 rounded border border-red-200 bg-red-50 p-2 text-xs text-red-800">{error}</p>:null}
+            <p className="mt-4 text-xs leading-5 text-[#756b60]">{SUBMITTED_NOTE}</p>
           </div>
           <DialogFooter className="m-0 shrink-0 border-t border-[#e8e2db] px-5 py-4">
-            <button className={button} disabled={busy} onClick={()=>setPreview(null)}>Cancel</button>
-            <button className="inline-flex min-h-9 items-center justify-center gap-2 rounded-lg bg-[#2f2924] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1f1b18] disabled:opacity-45" disabled={busy} onClick={()=>{if(!preview||busy)return;const sent=preview.row;void run(async()=>{const result=await action({action:'send',id:sent.id,revision:sent.revision});setPreview(null);setSendOutcome({customer:sent.customer,invoice:sent.invoice,status:String(result.status||'uncertain'),error:result.error||null,submittedAt:result.submittedAt||null,scheduleStatus:result.scheduleStatus||null,nextDueAt:result.nextDueAt||null});});}}><MessageCircle className="size-4" aria-hidden="true"/>{busy?'Please wait…':'Send WhatsApp'}</button>
+            <button className={button} disabled={busy} onClick={()=>setReview(null)}>Cancel</button>
+            {(()=>{const count=review?review.ids.filter(id=>!review.off.has(id)).length:0;return <button className="inline-flex min-h-9 items-center justify-center gap-2 rounded-lg bg-[#2f2924] px-4 py-2 text-xs font-semibold text-white hover:bg-[#1f1b18] disabled:opacity-45" disabled={busy||!count} onClick={()=>void sendReviewed()}><MessageCircle className="size-4" aria-hidden="true"/>{busy?'Sending…':`Send ${count} WhatsApp message${count===1?'':'s'}`}</button>;})()}
           </DialogFooter>
         </DialogContent>
       </Dialog>

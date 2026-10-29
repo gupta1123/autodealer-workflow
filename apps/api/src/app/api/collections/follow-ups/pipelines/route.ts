@@ -4,15 +4,29 @@ import {requireDataset} from '@/lib/access/dataset';
 import {AccessError} from '@/lib/access/server';
 import {jsonWithCors,optionsWithCors} from '@/lib/api/cors';
 import {createSupabaseAdminClient} from '@/lib/supabase/admin';
-import {validateReminderPlan,advanceReminder,stageMs,verificationOutcome,REMINDER_CHECK_MS,type ReminderStage} from '@autodealer/shared/lib/followup-pipeline';
+import {validateReminderPlan,advanceReminder,stageMs,verificationOutcome,customerOutcome,REMINDER_CHECK_MS,type ReminderStage,type ReminderInvoice} from '@autodealer/shared/lib/followup-pipeline';
 import {readReminderBills} from '@/lib/followups/live-read';
-import {reminderMessages,reminderPreview,submitReminder} from '@/lib/followups/messages';
+import {reminderMessages,reminderPreview,submitReminder,templateForRow} from '@/lib/followups/messages';
 import {WhatsappRejectedError,normalizeWhatsappPhone} from '@/lib/msg91/whatsapp';
 import {reminderDefaults} from '@/lib/followups/defaults';
 import {wakeTallyConnector} from '@/lib/tally/command-wake';
 
 export const OPTIONS=optionsWithCors;
-type Pipeline={id:string;organization_id:string;company_id:string;connection_id:string;installation_id:string;session_generation:number;company_guid:string;financial_year:string;company_name:string;customer:string;invoice:string;invoice_date:string;recipient:string;mode:'pipeline'|'once';stages:ReminderStage[];stage_index:number;stage_sent:number;status:string;revision:number;outstanding:number;next_due_at:string|null;verified_at:string|null;verification_expires_at:string|null;plan_name:string};
+type Pipeline={id:string;organization_id:string;company_id:string;connection_id:string;installation_id:string;session_generation:number;company_guid:string;financial_year:string;company_name:string;customer:string;invoice:string;invoice_date:string;recipient:string;mode:'pipeline'|'once';stages:ReminderStage[];stage_index:number;stage_sent:number;status:string;revision:number;outstanding:number;next_due_at:string|null;verified_at:string|null;verification_expires_at:string|null;plan_name:string;kind?:'invoice'|'customer';invoices?:ReminderInvoice[]|null};
+type Bills=Parameters<typeof verificationOutcome>[0];
+const invoiceCount=(count:number)=>`${count} invoice${count===1?'':'s'}`;
+const UNFINISHED='(settled,finished,stopped)';
+/** What Tally says now about a schedule: its one invoice, or every invoice a
+ * customer reminder lists (paid ones drop out of the message). */
+function outcomeOf(row:Pipeline,evidence:Record<string,unknown>|null) {
+  const bills=(evidence?.byLedger as Record<string,{openBills?:Bills}>|undefined)?.[row.customer]?.openBills;
+  if(evidence?.complete===false||!Array.isArray(bills))throw new AccessError('Tally did not return complete invoice evidence.',409);
+  if(row.kind==='customer'){
+    const result=customerOutcome(bills,row.invoices||[]);
+    return {status:result.status,outstanding:result.outstanding,note:result.note,patch:result.invoices.length?{invoices:result.invoices,invoice:invoiceCount(result.invoices.length)}:{}};
+  }
+  return {...verificationOutcome(bills,row.invoice,row.invoice_date,evidence?.settlementEvidence as Parameters<typeof verificationOutcome>[3],row.customer),patch:{}};
+}
 const scopeOf=(body:Record<string,unknown>)=>({companyId:body.companyId,companyGuid:body.companyGuid,companyName:body.companyName,financialYear:body.financialYear});
 const failure=(request:Request,error:unknown)=>jsonWithCors(request,{error:error instanceof Error?error.message:'Follow-up operation failed.'},{status:error instanceof AccessError?error.status:503});
 function checked<T>(result:{data:T;error:unknown}):T {if(result.error)throw new Error('Follow-up storage is unavailable. Check that the pipeline migration has been applied.');return result.data;}
@@ -31,6 +45,8 @@ async function GETHandler(request:Request) {
   try {
     const body=Object.fromEntries(new URL(request.url).searchParams);
     const {access,link,connection}=await context(request,body,'followups.view');
+    // Message texts alone, for previews before anything is started.
+    if(body.view==='messages')return jsonWithCors(request,{messages:reminderMessages().map(m=>({key:m.key,text:m.text}))},{headers:{'Cache-Control':'private, no-store'}});
     const db=createSupabaseAdminClient();
     const limit=25, page=Math.max(1,Math.min(10000,Number(body.page)||1));
     const search=searchText(body.q);
@@ -73,13 +89,61 @@ async function POSTHandler(request:Request) {
   try {
     const body=await request.json();
     let action=String(body.action||'');
-    const permission=action==='history'||action==='statuses'?'followups.view':action==='send'||action==='send_once'||action==='preview'||action==='bulk_send'||action==='bulk_send_once'?'followups.export':action==='save_template'?'settings.manage':'followups.prepare';
+    const permission=action==='history'||action==='statuses'?'followups.view':action==='send'||action==='send_once'||action==='preview'||action==='bulk_send'||action==='bulk_send_once'||action==='bulk_send_once_customers'?'followups.export':action==='save_template'?'settings.manage':'followups.prepare';
     const {access,link,connection}=await context(request,body,permission);
     const db=createSupabaseAdminClient();
+    // Schedules of this company and installation only.
+    const scoped=()=>db.from('invoice_followup_pipelines').select('*').eq('organization_id',access.organizationId).eq('company_id',link.company_id).eq('installation_id',connection.installation_id).eq('company_guid',link.company_guid).eq('financial_year',link.financial_year);
+    // An invoice listed in a running customer reminder does not get a second one of its own.
+    const inCustomerReminder=async(customer:string,invoice:string,invoiceDate:string)=>{
+      const rows=checked(await scoped().eq('customer',customer).eq('kind','customer').eq('mode','pipeline').not('status','in',UNFINISHED).limit(10)) as Array<{invoices:ReminderInvoice[]|null}>;
+      return rows.some(row=>(row.invoices||[]).some(item=>item.invoice===invoice&&item.invoice_date===invoiceDate));
+    };
     if(action.startsWith('bulk_')) {
       const items=batchItems(body.items);
       const results:Array<{key:string;status:string;message?:string;row?:unknown}>=[];
       const keyOf=(item:Record<string,unknown>)=>String(item.key||item.id||item.invoice||'').slice(0,500);
+      if(action==='bulk_enroll_customers'||action==='bulk_send_once_customers') {
+        // One reminder per customer, listing that customer's selected unpaid invoices.
+        const once=action==='bulk_send_once_customers';
+        const defaults=(await reminderDefaults(access.organizationId)).value;
+        if(!defaults)throw new AccessError('Set up Payment reminders in Settings first.',409);
+        if(once&&(!process.env.MSG91_AUTHKEY||!process.env.MSG91_WHATSAPP_NUMBER))throw new AccessError('Configure the WhatsApp sender before sending.',409);
+        const plan=validateReminderPlan(once?{name:'One-time reminder',stages:[{name:'One-time reminder',template:defaults.onceTemplate,delay:0,every:1,unit:'days',limit:1}]}:defaults.plan);
+        const valid=items.map(item=>({item,customer:String(item.customer||'').trim(),recipient:phone(item.recipient),
+          tracked:(Array.isArray(item.invoices)?item.invoices as Array<Record<string,unknown>>:[]).map(x=>({invoice:String(x.invoice||'').trim(),invoice_date:String(x.invoiceDate||'')}))}));
+        if(valid.some(x=>!x.customer||x.customer.length>500||!x.tracked.length||x.tracked.length>200||x.tracked.some(i=>!i.invoice||i.invoice.length>500||!/^\d{4}-\d{2}-\d{2}$/.test(i.invoice_date))))throw new AccessError('Every customer needs between 1 and 200 invoices, each with its number and date.',400);
+        if(new Set(valid.map(x=>x.customer)).size!==valid.length)throw new AccessError('Select each customer once.',400);
+        const evidence=await readReminderBills(request,{connectionId:connection.id,companyName:link.company_name,financialYear:link.financial_year,organizationId:access.organizationId},valid.map(x=>x.customer));
+        const byLedger=evidence.byLedger as Record<string,{openBills?:Bills}>|undefined;
+        if(evidence.complete===false||!byLedger)throw new AccessError('Tally verification is incomplete. Nothing was changed.',409);
+        for(const x of valid){
+          try{
+            const bills=byLedger[x.customer]?.openBills;if(!Array.isArray(bills))throw new Error('Tally did not return this customer completely.');
+            const outcome=customerOutcome(bills,x.tracked);if(outcome.status!=='active')throw new Error(outcome.note||'Nothing is outstanding in Tally.');
+            // An invoice with its own running reminder is not repeated in the customer message.
+            const own=checked(await scoped().eq('customer',x.customer).eq('kind','invoice').eq('mode','pipeline').not('status','in',UNFINISHED).limit(1000)) as Array<{invoice:string;invoice_date:string}>;
+            const taken=new Set(own.map(row=>JSON.stringify([row.invoice,row.invoice_date])));
+            const listed=outcome.invoices.filter(item=>!taken.has(JSON.stringify([item.invoice,item.invoice_date])));
+            if(!listed.length)throw new Error('Every selected invoice already has its own reminder.');
+            const outstanding=Math.round(listed.reduce((sum,item)=>sum+item.outstanding,0)*100)/100;
+            const left=x.tracked.length-listed.length;
+            const id=/^[0-9a-f-]{36}$/i.test(String(x.item.requestId||''))?String(x.item.requestId):randomUUID();
+            const result=await db.from('invoice_followup_pipelines').insert({id,organization_id:access.organizationId,company_id:link.company_id,connection_id:connection.id,installation_id:connection.installation_id,session_generation:connection.session_generation,company_guid:link.company_guid,company_name:link.company_name,financial_year:link.financial_year,
+              kind:'customer',customer:x.customer,invoice:invoiceCount(listed.length),invoice_date:listed.map(item=>item.invoice_date).sort()[0],invoices:listed,invoice_key:createHash('sha256').update(JSON.stringify(['customer',x.customer])).digest('hex'),
+              recipient:x.recipient,plan_name:plan.name,stages:plan.stages,next_due_at:new Date(Date.now()+stageMs(plan.stages[0],'delay')).toISOString(),created_by:access.member.user_id,mode:once?'once':'pipeline',outstanding,
+              note:left?`${left} invoice${left===1?'':'s'} left out: paid, no longer open, or already reminded on ${left===1?'its':'their'} own.`:null,verified_at:new Date().toISOString(),verification_expires_at:new Date(Date.now()+REMINDER_CHECK_MS).toISOString()}).select('*').single();
+            if(result.error?.code==='23505')throw new Error('This customer already has a reminder running.');
+            const inserted=checked(result) as Pipeline;
+            if(x.item.savePhoneToTally===true){const queued=await db.rpc('followup_queue_phone',{p_actor:access.member.user_id,p_org:access.organizationId,p_id:inserted.id});if(!queued.error)await wakeTallyConnector(connection.id).catch(()=>{});}
+            if(!once){results.push({key:keyOf(x.item),status:'enrolled',row:inserted});continue;}
+            const claim=checked(await db.rpc('followup_claim_send',{p_id:inserted.id,p_revision:inserted.revision,p_actor:access.member.user_id,p_org:access.organizationId,p_company:link.company_id,p_installation:connection.installation_id,p_generation:connection.session_generation}));
+            let sendStatus='uncertain',provider:string|null=null,sendError:string|null=null;try{provider=await submitReminder(templateForRow(inserted,plan.stages[0].template),inserted,x.recipient);sendStatus='accepted';}catch(reason){sendStatus=reason instanceof WhatsappRejectedError?'rejected':'uncertain';sendError=reason instanceof Error?reason.message:'Submission needs verification.';}
+            const next=sendStatus==='accepted'?advanceReminder(plan.stages,0,0):null;checked(await db.rpc('followup_finish_send',{p_id:inserted.id,p_attempt:claim.attempt_id,p_status:sendStatus,p_provider:provider,p_error:sendError,p_next:next}));results.push({key:keyOf(x.item),status:sendStatus,message:sendError||undefined});
+          }catch(error){results.push({key:keyOf(x.item),status:'skipped',message:error instanceof Error?error.message:'Could not process customer.'});}
+        }
+        return jsonWithCors(request,{results});
+      }
       if(action==='bulk_enroll'||action==='bulk_send_once') {
         const once=action==='bulk_send_once';
         const defaults=(await reminderDefaults(access.organizationId)).value;
@@ -96,7 +160,7 @@ async function POSTHandler(request:Request) {
             const bills=byLedger[x.customer]?.openBills;if(!Array.isArray(bills))throw new Error('Tally did not return this customer completely.');
             const outcome=verificationOutcome(bills,x.invoice,x.invoiceDate);if(outcome.status!=='active')throw new Error('Invoice is settled or needs review in Tally.');
             const invoiceKey=createHash('sha256').update(JSON.stringify([x.customer,x.invoice,x.invoiceDate])).digest('hex');
-            if(!once){const unfinished=checked(await db.from('invoice_followup_pipelines').select('id').eq('organization_id',access.organizationId).eq('company_id',link.company_id).eq('installation_id',connection.installation_id).eq('company_guid',link.company_guid).eq('financial_year',link.financial_year).eq('invoice_key',invoiceKey).eq('mode','pipeline').not('status','in','(settled,finished,stopped)').limit(1));if(unfinished?.length)throw new Error('A reminder schedule already exists.');}
+            if(!once){const unfinished=checked(await db.from('invoice_followup_pipelines').select('id').eq('organization_id',access.organizationId).eq('company_id',link.company_id).eq('installation_id',connection.installation_id).eq('company_guid',link.company_guid).eq('financial_year',link.financial_year).eq('invoice_key',invoiceKey).eq('mode','pipeline').not('status','in','(settled,finished,stopped)').limit(1));if(unfinished?.length)throw new Error('A reminder schedule already exists.');if(await inCustomerReminder(x.customer,x.invoice,x.invoiceDate))throw new Error('This invoice is already in the customer’s reminder.');}
             const id=/^[0-9a-f-]{36}$/i.test(String(x.item.requestId||''))?String(x.item.requestId):randomUUID();
             const inserted=checked(await db.from('invoice_followup_pipelines').insert({id,organization_id:access.organizationId,company_id:link.company_id,connection_id:connection.id,installation_id:connection.installation_id,session_generation:connection.session_generation,company_guid:link.company_guid,company_name:link.company_name,financial_year:link.financial_year,customer:x.customer,invoice:x.invoice,invoice_date:x.invoiceDate,invoice_key:invoiceKey,recipient:x.recipient,plan_name:plan.name,stages:plan.stages,next_due_at:new Date(Date.now()+stageMs(plan.stages[0],'delay')).toISOString(),created_by:access.member.user_id,mode:once?'once':'pipeline',outstanding:outcome.outstanding,verified_at:new Date().toISOString(),verification_expires_at:new Date(Date.now()+REMINDER_CHECK_MS).toISOString()}).select('*').single()) as Pipeline;
             if(x.item.savePhoneToTally===true){const queued=await db.rpc('followup_queue_phone',{p_actor:access.member.user_id,p_org:access.organizationId,p_id:inserted.id});if(!queued.error)await wakeTallyConnector(connection.id).catch(()=>{});}
@@ -117,9 +181,9 @@ async function POSTHandler(request:Request) {
         if(action==='bulk_plan'){if(!['active','paused','review'].includes(row.status))throw new Error('The reminder sequence cannot be changed in its current state.');const plan=validateReminderPlan(item.plan||body.plan);if(plan.stages.some(s=>!reminderMessages().some(m=>m.key===s.template)))throw new Error('The selected reminder sequence is invalid.');const updated=checked(await db.from('invoice_followup_pipelines').update({plan_name:plan.name,stages:plan.stages,stage_index:0,stage_sent:0,next_due_at:new Date(Date.now()+stageMs(plan.stages[0],'delay')).toISOString(),revision:row.revision+1,updated_at:new Date().toISOString(),verification_expires_at:null}).eq('id',row.id).eq('revision',row.revision).select('*').maybeSingle());if(!updated)throw new Error('Schedule changed. Refresh and retry.');results.push({key:keyOf(item),status:'updated',row:updated});continue;}
         if(['sending','uncertain'].includes(row.status))throw new Error('The previous submission needs provider verification before another action.');
         if(!['active','review','paused'].includes(row.status))throw new Error('Schedule cannot be checked in its current state.');
-        const byLedger=evidence?.byLedger as Record<string,{openBills?:Parameters<typeof verificationOutcome>[0]}>|undefined;const bills=byLedger?.[row.customer]?.openBills;if(evidence?.complete===false||!Array.isArray(bills))throw new Error('Tally did not return complete invoice evidence.');const outcome=verificationOutcome(bills,row.invoice,row.invoice_date,evidence?.settlementEvidence as Parameters<typeof verificationOutcome>[3],row.customer);
-        const updated=checked(await db.from('invoice_followup_pipelines').update({outstanding:outcome.outstanding,status:row.status==='paused'&&outcome.status==='active'?'paused':outcome.status,note:outcome.note,verified_at:new Date().toISOString(),verification_expires_at:outcome.status==='active'?new Date(Date.now()+REMINDER_CHECK_MS).toISOString():null,...(outcome.status==='settled'?{next_due_at:null}:{}),revision:row.revision+1,updated_at:new Date().toISOString()}).eq('id',row.id).eq('revision',row.revision).select('*').maybeSingle()) as Pipeline|null;if(!updated)throw new Error('Schedule changed. Refresh and retry.');
-        if(action==='bulk_check'){results.push({key:keyOf(item),status:outcome.status,row:updated});continue;}if(row.status!=='active')throw new Error('Only active schedules can send due reminders.');if(outcome.status!=='active')throw new Error('Invoice is settled or needs review.');if(!updated.next_due_at||Date.parse(updated.next_due_at)>Date.now())throw new Error('Reminder is not due yet.');const claim=checked(await db.rpc('followup_claim_send',{p_id:updated.id,p_revision:updated.revision,p_actor:access.member.user_id,p_org:access.organizationId,p_company:link.company_id,p_installation:connection.installation_id,p_generation:connection.session_generation}));let sendStatus='uncertain',provider:string|null=null,sendError:string|null=null;try{provider=await submitReminder(updated.stages[updated.stage_index].template,updated,updated.recipient);sendStatus='accepted';}catch(reason){sendStatus=reason instanceof WhatsappRejectedError?'rejected':'uncertain';sendError=reason instanceof Error?reason.message:'Submission needs verification.';}const next=sendStatus==='accepted'?advanceReminder(updated.stages,updated.stage_index,updated.stage_sent):null;checked(await db.rpc('followup_finish_send',{p_id:updated.id,p_attempt:claim.attempt_id,p_status:sendStatus,p_provider:provider,p_error:sendError,p_next:next}));results.push({key:keyOf(item),status:sendStatus,message:sendError||undefined});
+        const outcome=outcomeOf(row,evidence);
+        const updated=checked(await db.from('invoice_followup_pipelines').update({...outcome.patch,outstanding:outcome.outstanding,status:row.status==='paused'&&outcome.status==='active'?'paused':outcome.status,note:outcome.note,verified_at:new Date().toISOString(),verification_expires_at:outcome.status==='active'?new Date(Date.now()+REMINDER_CHECK_MS).toISOString():null,...(outcome.status==='settled'?{next_due_at:null}:{}),revision:row.revision+1,updated_at:new Date().toISOString()}).eq('id',row.id).eq('revision',row.revision).select('*').maybeSingle()) as Pipeline|null;if(!updated)throw new Error('Schedule changed. Refresh and retry.');
+        if(action==='bulk_check'){results.push({key:keyOf(item),status:outcome.status,row:updated});continue;}if(row.status!=='active')throw new Error('Only active schedules can send due reminders.');if(outcome.status!=='active')throw new Error('Invoice is settled or needs review.');if(!updated.next_due_at||Date.parse(updated.next_due_at)>Date.now())throw new Error('Reminder is not due yet.');const claim=checked(await db.rpc('followup_claim_send',{p_id:updated.id,p_revision:updated.revision,p_actor:access.member.user_id,p_org:access.organizationId,p_company:link.company_id,p_installation:connection.installation_id,p_generation:connection.session_generation}));let sendStatus='uncertain',provider:string|null=null,sendError:string|null=null;try{provider=await submitReminder(templateForRow(updated,updated.stages[updated.stage_index].template),updated,updated.recipient);sendStatus='accepted';}catch(reason){sendStatus=reason instanceof WhatsappRejectedError?'rejected':'uncertain';sendError=reason instanceof Error?reason.message:'Submission needs verification.';}const next=sendStatus==='accepted'?advanceReminder(updated.stages,updated.stage_index,updated.stage_sent):null;checked(await db.rpc('followup_finish_send',{p_id:updated.id,p_attempt:claim.attempt_id,p_status:sendStatus,p_provider:provider,p_error:sendError,p_next:next}));results.push({key:keyOf(item),status:sendStatus,message:sendError||undefined});
       }catch(error){results.push({key:keyOf(item),status:'skipped',message:error instanceof Error?error.message:'Could not process schedule.'});}}
       return jsonWithCors(request,{results});
     }
@@ -135,7 +199,13 @@ async function POSTHandler(request:Request) {
         .eq('organization_id',access.organizationId).eq('company_id',link.company_id).eq('installation_id',connection.installation_id).eq('company_guid',link.company_guid).eq('financial_year',link.financial_year)
         .eq('mode','pipeline').in('invoice_key',keys).order('created_at',{ascending:false}).order('id').limit(1000));
       if(!rows||rows.length===1000)throw new AccessError('Schedule history could not be verified completely.',409);
-      return jsonWithCors(request,{rows},{headers:{'Cache-Control':'private, no-store'}});
+      // Invoices listed in a customer reminder report that reminder's status.
+      const selection=body.invoices as InvoiceSelection[];
+      const customers=[...new Set(selection.map(x=>x.customer.trim()))];
+      const grouped=checked(await scoped().eq('kind','customer').eq('mode','pipeline').in('customer',customers).order('created_at',{ascending:false}).order('id').limit(500)) as Array<{id:string;customer:string;invoices:ReminderInvoice[]|null;status:string;next_due_at:string|null;created_at:string}>;
+      const covered=grouped.flatMap(row=>selection.filter(x=>x.customer.trim()===row.customer&&(row.invoices||[]).some(item=>item.invoice===x.invoice.trim()&&item.invoice_date===x.date))
+        .map(x=>({id:row.id,customer:row.customer,invoice:x.invoice.trim(),invoice_date:x.date,status:row.status,next_due_at:row.next_due_at,created_at:row.created_at,kind:'customer'})));
+      return jsonWithCors(request,{rows:[...rows,...covered]},{headers:{'Cache-Control':'private, no-store'}});
     }
     if(action==='save_template') {
       const plan=validateReminderPlan(body.plan);
@@ -169,6 +239,7 @@ async function POSTHandler(request:Request) {
           .eq('financial_year',link.financial_year).eq('invoice_key',invoiceKey).eq('mode','pipeline')
           .not('status','in','(settled,finished,stopped)').limit(1));
         if(unfinished?.length)throw new AccessError('This invoice already has a reminder schedule. Check reminder tracking before retrying.',409);
+        if(await inCustomerReminder(customer,invoice,invoiceDate))throw new AccessError('This invoice is already in the customer’s reminder. Check reminder tracking.',409);
       }
       const result=await db.from('invoice_followup_pipelines').insert({...record,id:body.requestId,mode:once?'once':'pipeline',outstanding:outcome.outstanding,verified_at:new Date().toISOString(),verification_expires_at:new Date(Date.now()+REMINDER_CHECK_MS).toISOString()}).select('*').single();
       if(result.error?.code==='23505')throw new AccessError('This request was already recorded or the invoice already has a schedule. Check reminder tracking before retrying.',409);
@@ -199,22 +270,21 @@ async function POSTHandler(request:Request) {
     }
     if(action==='check') {
       if(!['active','review','paused'].includes(row.status))throw new AccessError('This pipeline cannot be checked in its current state.',409);
-      const result=await readReminderBills(request,{connectionId:connection.id,companyName:link.company_name,financialYear:link.financial_year,organizationId:access.organizationId},row.customer,{invoice:row.invoice,invoiceDate:row.invoice_date});
-      const byLedger=result.byLedger as Record<string,{openBills?:Parameters<typeof verificationOutcome>[0]}>|undefined;
-      if(result.complete===false||!byLedger||!Array.isArray(byLedger[row.customer]?.openBills))throw new AccessError('Tally did not return complete invoice evidence.',409);
-      const outcome=verificationOutcome(byLedger[row.customer].openBills!,row.invoice,row.invoice_date,result.settlementEvidence as Parameters<typeof verificationOutcome>[3],row.customer);
-      return save({outstanding:outcome.outstanding,status:row.status==='paused'&&outcome.status==='active'?'paused':outcome.status,note:outcome.note,...(outcome.status==='settled'?{next_due_at:null}:{}),verified_at:new Date().toISOString(),verification_expires_at:outcome.status==='active'?new Date(Date.now()+REMINDER_CHECK_MS).toISOString():null,connection_id:connection.id,installation_id:connection.installation_id,session_generation:connection.session_generation});
+      const result=await readReminderBills(request,{connectionId:connection.id,companyName:link.company_name,financialYear:link.financial_year,organizationId:access.organizationId},row.customer,row.kind==='customer'?undefined:{invoice:row.invoice,invoiceDate:row.invoice_date});
+      const outcome=outcomeOf(row,result);
+      return save({...outcome.patch,outstanding:outcome.outstanding,status:row.status==='paused'&&outcome.status==='active'?'paused':outcome.status,note:outcome.note,...(outcome.status==='settled'?{next_due_at:null}:{}),verified_at:new Date().toISOString(),verification_expires_at:outcome.status==='active'?new Date(Date.now()+REMINDER_CHECK_MS).toISOString():null,connection_id:connection.id,installation_id:connection.installation_id,session_generation:connection.session_generation});
     }
     if(action==='preview') {
-      return jsonWithCors(request,{text:reminderPreview(row.stages[row.stage_index].template,row),recipient:row.recipient,outstanding:row.outstanding});
+      return jsonWithCors(request,{text:reminderPreview(templateForRow(row,row.stages[row.stage_index].template),row),recipient:row.recipient,outstanding:row.outstanding,invoices:row.invoices??null});
     }
+    const template=templateForRow(row,row.stages[row.stage_index]?.template||'');
     if(action==='send') {
-      reminderPreview(row.stages[row.stage_index].template,row);
+      reminderPreview(template,row);
       if(!process.env.MSG91_AUTHKEY||!process.env.MSG91_WHATSAPP_NUMBER)throw new AccessError('Configure the WhatsApp sender before sending.',409);
       const claim=checked(await db.rpc('followup_claim_send',{p_id:row.id,p_revision:row.revision,p_actor:access.member.user_id,p_org:access.organizationId,p_company:link.company_id,p_installation:connection.installation_id,p_generation:connection.session_generation}));
       if(!claim?.attempt_id)throw new AccessError('Check outstanding again before sending. The invoice may have changed or reached its limit.',409);
       let status='uncertain',provider:string|null=null,error:string|null=null;
-      try {provider=await submitReminder(row.stages[row.stage_index].template,row,row.recipient);status='accepted';}
+      try {provider=await submitReminder(template,row,row.recipient);status='accepted';}
       catch(reason){status=reason instanceof WhatsappRejectedError?'rejected':'uncertain';error=reason instanceof Error?reason.message:'Submission needs verification.';}
       const next=status==='accepted'?advanceReminder(row.stages,row.stage_index,row.stage_sent):null;
       checked(await db.rpc('followup_finish_send',{p_id:row.id,p_attempt:claim.attempt_id,p_status:status,p_provider:provider,p_error:error,p_next:next}));

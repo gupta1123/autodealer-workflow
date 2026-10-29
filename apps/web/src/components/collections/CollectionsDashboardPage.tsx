@@ -30,6 +30,7 @@ import styles from './CollectionsDashboardPage.module.css';
 import {companyOptionIdentity} from '@/lib/company-option-identity';
 import {useActionAccess} from '@/components/access/useActionAccess';
 import {FollowUpPipelines} from './FollowUpPipelines';
+import {UnpaidByCustomer} from './UnpaidByCustomer';
 import {useReminderStatuses,invoiceKey,reminderLabel} from './useReminderStatuses';
 import {useAccess} from '@/components/access/AccessProvider';
 import {canAccess} from '@autodealer/shared/lib/access';
@@ -495,7 +496,7 @@ function Section({
     <section className="rounded-2xl border border-[#e5ddd0] bg-white shadow-[0_2px_8px_rgba(0,0,0,0.02)]">
       <div className="flex flex-col gap-2 border-b border-[#e5ddd0] bg-[#fcfbfa]/80 px-4 py-3 sm:flex-row sm:items-center sm:justify-between rounded-t-2xl">
         <div>
-          <h3 className="text-xs font-semibold uppercase tracking-wider text-[#1a1a1a]">{title}</h3>
+          <h3 className="text-sm font-semibold text-[#1a1a1a]">{title}</h3>
           {description ? <p className="mt-0.5 text-[11px] font-semibold text-slate-400">{description}</p> : null}
         </div>
         {action}
@@ -573,9 +574,9 @@ function PaginationControls({
 }
 
 function PaymentTypeFilter({ value, onChange, cashDiscount = false }: { value: string; onChange: (value: string) => void; cashDiscount?: boolean }) {
-  return <label className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+  return <label className="flex items-center gap-2 text-xs font-medium text-[#756b60]">
     Type
-    <select aria-label="Filter by payment type" value={value} onChange={event => onChange(event.target.value)} className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium normal-case tracking-normal text-[#1a1a1a] outline-none focus:border-amber-400 focus:ring-2 focus:ring-amber-100">
+    <select aria-label="Filter by payment type" value={value} onChange={event => onChange(event.target.value)} className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#1a1a1a] outline-none focus:border-amber-400 focus:ring-2 focus:ring-amber-100">
       <option value="all">All types</option>
       {!cashDiscount ? <option value="regular_credit">Regular credit</option> : null}
       <option value="same_day_rtgs">Same-day RTGS</option>
@@ -707,6 +708,8 @@ export function CollectionsDashboardPage({
   const [remindersDue,setRemindersDue]=useState<number|null>(null);
   const [reminderToolbar,setReminderToolbar]=useState<HTMLDivElement|null>(null);
   const [reminderTab,setReminderTab]=useState<'outstanding'|'due'|'pipelines'|'history'>('due');
+  // Unpaid invoices: one row per customer (one reminder each) or per invoice.
+  const [unpaidView,setUnpaidView]=useState<'customer'|'invoice'>('customer');
   const [reminderInvoice, setReminderInvoice] = useState<{partyLedgerName:string;linkedInvoiceNumber:string|null;linkedInvoiceDate:string|null;partyPhone:string|null}|null>(null);
   const [selectedFollowUpIds,setSelectedFollowUpIds]=useState<Set<string>>(()=>new Set());
   const [followUpBulkMode,setFollowUpBulkMode]=useState<'enroll'|'send_once'|null>(null);
@@ -1486,7 +1489,7 @@ export function CollectionsDashboardPage({
   const onCollectionsExpired = useCallback(() => { void refreshAll({ quiet: true }); }, [refreshAll]);
   const followUpKpis = summary?.followUps ?? { total: 0, needsFollowUp: 0, escalated: 0, needsReview: 0, outstanding: 0 };
   const followUpsList = useCollectionsList<PaymentFollowUp>(dashboard,
-    activeView === 'followUps' && reminderTab === 'outstanding' && !reminderInvoice
+    activeView === 'followUps' && reminderTab === 'outstanding' && !reminderInvoice && unpaidView === 'invoice'
       ? { view: 'followUps', paymentType: followUpPaymentType, search: followUpQuery, sort: paymentFollowUpSort, page: followUpsPage, pageSize } : null,
     collectionsRemote, onCollectionsExpired);
   const pendingList = useCollectionsList<DebitNoteProposal>(dashboard,
@@ -1551,7 +1554,7 @@ export function CollectionsDashboardPage({
     }catch(error){setMessage({tone:'error',text:error instanceof Error?error.message:'Bulk reminder action failed.'});}finally{setFollowUpBulkBusy(false);}
   };
   const exportSelectedFollowUps=async()=>{let rows:PaymentFollowUp[];try{rows=await loadSelectedFollowUps();}catch(error){setMessage({tone:'error',text:error instanceof Error?error.message:'Could not load the selected invoices.'});return;}if(!rows.length)return;const q=(value:unknown)=>`"${String(value??'').replaceAll('"','""')}"`;const csv=[['Customer','Invoice','Invoice date','Outstanding','Phone','Payment terms','Payment age'],...rows.map(row=>[row.partyLedgerName,row.linkedInvoiceNumber,row.linkedInvoiceDate,row.outstandingAmount,row.partyPhone||'',paymentTermsLabel(row).label,row.ageLabel])].map(line=>line.map(q).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob(['\ufeff',csv],{type:'text/csv;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download='unpaid-invoices.csv';a.click();window.setTimeout(()=>URL.revokeObjectURL(url),1000);};
-  const scheduleStatuses=useReminderStatuses({connectionId:selectedConnectionId,companyId:selectedCompany?.accessCompanyId,companyGuid:selectedCompany?.companyGuid,companyName:selectedCompany?.companyName||'',financialYear:selectedCompany?.financialYear||''},pagedPaymentFollowUps,activeView==='followUps'&&reminderTab==='outstanding'&&!reminderInvoice);
+  const scheduleStatuses=useReminderStatuses({connectionId:selectedConnectionId,companyId:selectedCompany?.accessCompanyId,companyGuid:selectedCompany?.companyGuid,companyName:selectedCompany?.companyName||'',financialYear:selectedCompany?.financialYear||''},pagedPaymentFollowUps,activeView==='followUps'&&reminderTab==='outstanding'&&!reminderInvoice&&unpaidView==='invoice');
   const selectablePendingOnPage = tallyCompanyVerified ? pagedPendingProposals.filter(canCreateInTally) : [];
   const canMessageProposal = (proposal: DebitNoteProposal) =>
     !sentLocks.has(proposal.id) && (proposal.communicationStatus !== "sent" || needsUpdatedPdfDelivery(proposal));
@@ -2059,8 +2062,19 @@ export function CollectionsDashboardPage({
         </section>
       ) : null}
 
-      {!companyContextLocked && activeView==='followUps'?<div className="flex shrink-0 flex-wrap items-center justify-between gap-x-5 border-b border-[#ded8d0]"><nav aria-label="Payment follow-up views" className="flex min-w-0 gap-5 overflow-x-auto text-sm">{([['due','Reminders due'],['outstanding','Unpaid invoices'],['pipelines','Reminder tracking'],['history','Sent messages']] as const).map(([key,label])=><button key={key} type="button" aria-current={reminderTab===key?'page':undefined} className={`whitespace-nowrap border-b-2 px-1 py-3 ${reminderTab===key?'border-[#2d2d2d] font-medium text-[#1a1a1a]':'border-transparent text-[#82776a]'}`} onClick={()=>{setReminderTab(key);setReminderInvoice(null);setFocusedReminder('');setSelectedFollowUpIds(new Set());}}>{label}{key==='due'&&remindersDue!==null&&remindersDue>0?<span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900">{remindersDue}</span>:null}</button>)}</nav><div className="ml-auto flex items-center gap-2 py-1.5">          {reminderTab==='outstanding'&&!reminderInvoice&&followUpKpis.total > 0 ? (
-            <div className="flex flex-wrap justify-end gap-2">{selectedFollowUpIds.size?<><span className="self-center text-xs font-semibold text-[#51483f]">{selectedFollowUpIds.size} selected</span><button className={styles.messageAction} onClick={()=>openFollowUpBulk('enroll')}>Start reminders</button><button className={styles.messageAction} onClick={()=>openFollowUpBulk('send_once')}>Send once</button><button className={styles.messageAction} onClick={exportSelectedFollowUps}>CSV</button><button className={styles.messageAction} onClick={()=>setSelectedFollowUpIds(new Set())}>Clear</button></>:null}
+      {!companyContextLocked && activeView==='followUps'?<div className={`${styles.tabBar} flex shrink-0 flex-wrap items-center justify-between gap-x-5 border-b border-[#ded8d0]`}><nav aria-label="Payment follow-up views" className="flex min-w-0 gap-5 overflow-x-auto text-sm">{([['due','Reminders due'],['outstanding','Unpaid invoices'],['pipelines','Reminder tracking'],['history','Sent messages']] as const).map(([key,label])=><button key={key} type="button" aria-current={reminderTab===key?'page':undefined} className={`whitespace-nowrap border-b-2 px-1 py-3 ${reminderTab===key?'border-[#2d2d2d] font-medium text-[#1a1a1a]':'border-transparent text-[#82776a]'}`} onClick={()=>{setReminderTab(key);setReminderInvoice(null);setFocusedReminder('');setSelectedFollowUpIds(new Set());}}>{label}{key==='due'&&remindersDue!==null&&remindersDue>0?<span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900">{remindersDue}</span>:null}</button>)}</nav><div className="ml-auto flex items-center gap-2 py-1.5">          {reminderTab==='outstanding'&&!reminderInvoice&&followUpKpis.total > 0 ? (
+            <div className="flex flex-wrap justify-end gap-2">{unpaidView==='invoice'&&selectedFollowUpIds.size?<div className={styles.bulkBar}>
+              <span className={styles.bulkCount}>{selectedFollowUpIds.size} selected</span><span className={styles.bulkSeparator}/>
+              {allowed('followups.prepare')?<button type="button" className={`${styles.bulkButton} ${styles.bulkPrimary}`} onClick={()=>void openFollowUpBulk('enroll')}>Start reminders<small>{selectedFollowUpIds.size}</small></button>:null}
+              {allowed('followups.export')?<button type="button" className={styles.bulkButton} onClick={()=>void openFollowUpBulk('send_once')}>Send once<small>{selectedFollowUpIds.size}</small></button>:null}
+              <button type="button" className={styles.bulkButton} onClick={()=>void exportSelectedFollowUps()}>CSV</button>
+              <button type="button" className={styles.bulkClose} aria-label="Clear selection" onClick={()=>setSelectedFollowUpIds(new Set())}>×</button>
+            </div>:null}
+            <select aria-label="Group unpaid invoices" value={unpaidView} onChange={(event)=>{setUnpaidView(event.target.value as 'customer'|'invoice');setSelectedFollowUpIds(new Set());}}
+              className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#1a1a1a] outline-none transition focus:border-amber-400 focus:ring-2 focus:ring-amber-100">
+              <option value="customer">By customer</option>
+              <option value="invoice">By invoice</option>
+            </select>
             <label className="relative block w-56">
               <span className="sr-only">Search customer or invoice</span>
               <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
@@ -2068,11 +2082,11 @@ export function CollectionsDashboardPage({
                 className="h-9 w-full rounded-xl border border-[#e5ddd0] bg-white pl-9 pr-3 text-xs font-semibold text-[#1a1a1a] outline-none transition placeholder:text-slate-400 focus:border-amber-400 focus:ring-2 focus:ring-amber-100" />
             </label>
             <PaymentTypeFilter value={followUpPaymentType} onChange={setFollowUpPaymentType} />
-            <label className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+            <label className="flex items-center gap-2 text-xs font-medium text-[#756b60]">
               Sort
               <select
                 aria-label="Sort payment follow-ups"
-                className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium normal-case tracking-normal text-[#1a1a1a] outline-none transition focus:border-amber-400 focus:ring-2 focus:ring-amber-100"
+                className="h-9 rounded-xl border border-[#e5ddd0] bg-white px-3 text-xs font-medium text-[#1a1a1a] outline-none transition focus:border-amber-400 focus:ring-2 focus:ring-amber-100"
                 onChange={(event) => setPaymentFollowUpSort(event.target.value as PaymentFollowUpSort)}
                 value={paymentFollowUpSort}
               >
@@ -2091,6 +2105,14 @@ export function CollectionsDashboardPage({
         <section className={styles.results} aria-label="Payment follow-ups">
           {followUpsList.error ? <div role="alert" className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">{followUpsList.error}</div> : followUpKpis.total === 0 ? (
             <EmptyState>There are no payments to follow up from the latest Tally scan.</EmptyState>
+          ) : unpaidView === 'customer' && selectedCompany ? (
+            <UnpaidByCustomer dashboard={dashboard} revision={`${dashboard?.dashboardId ?? ''}:${collectionsRevision(dashboard)}`}
+              paymentType={followUpPaymentType} search={followUpQuery} sort={paymentFollowUpSort} remote={collectionsRemote} onExpired={onCollectionsExpired}
+              scope={{connectionId:selectedConnectionId,companyId:selectedCompany.accessCompanyId,companyGuid:selectedCompany.companyGuid,companyName:selectedCompany.companyName,financialYear:selectedCompany.financialYear||''}}
+              toolbarTarget={reminderToolbar}
+              onOpenInvoice={(row)=>setStoryInvoice({story:followUpStory(row as unknown as PaymentFollowUp)})}
+              onShowSchedule={(id)=>{setFocusedReminder(id);setReminderTab('pipelines');}}
+              onDone={(result,tab)=>{setMessage(result.tone==='info'?{tone:'notice',text:result.text}:result);if(tab){setFocusedReminder('');setReminderTab(tab);}}} />
           ) : followUpsList.page?.total === 0 ? <EmptyState>{followUpQuery.trim() ? `No unpaid invoices match "${followUpQuery.trim()}".` : 'No unpaid invoices match this payment type.'}</EmptyState> : (
             <div className={styles.flatTable}>
               <div tabIndex={0} role="region" aria-label="Payment follow-ups table">
@@ -2119,7 +2141,11 @@ export function CollectionsDashboardPage({
                         <span className={styles.secondary}>{followUp.ageBasis === 'due_date'
                           ? `Due ${formatDate(followUp.dueDate)}`
                           : followUp.ageBasis === 'invoice_date' ? 'Invoice age · due date missing' : 'Confirm invoice and due dates'}</span></td>
-                      <td>{(()=>{const row=scheduleStatuses?.rows[invoiceKey(followUp.partyLedgerName,followUp.linkedInvoiceNumber,followUp.linkedInvoiceDate)];const info=reminderLabel(row);const valid=Boolean(followUp.linkedInvoiceNumber&&followUp.linkedInvoiceDate);return <><span className={styles.followUpStatus}>{!valid?'Invoice details missing':!scheduleStatuses?'Checking reminders…':scheduleStatuses.error?'Status unavailable':info.label}</span>{valid&&scheduleStatuses&&!scheduleStatuses.error&&(row||allowed('followups.prepare'))?<button type="button" className="mt-2 block text-xs underline underline-offset-4" onClick={()=>{if(row){setFocusedReminder(row.id);setReminderTab(info.action==='Check & send'?'due':'pipelines');}else{setFocusedReminder('');setReminderInvoice({...followUp,partyPhone:followUp.partyPhone||null});}}}>{info.action}</button>:null}</>;})()}</td>
+                      <td>{(()=>{const row=scheduleStatuses?.rows[invoiceKey(followUp.partyLedgerName,followUp.linkedInvoiceNumber,followUp.linkedInvoiceDate)];const info=reminderLabel(row);const valid=Boolean(followUp.linkedInvoiceNumber&&followUp.linkedInvoiceDate);
+                        if(!valid||!scheduleStatuses||scheduleStatuses.error)return <span className={styles.followUpStatus}>{!valid?'Invoice details missing':!scheduleStatuses?'Checking reminders…':'Status unavailable'}</span>;
+                        if(!row)return allowed('followups.prepare')?<button type="button" className={styles.messageAction} onClick={()=>{setFocusedReminder('');setReminderInvoice({...followUp,partyPhone:followUp.partyPhone||null});}}>Start reminders</button>:<span className={styles.followUpStatus}>{info.label}</span>;
+                        return <><span className={`${styles.pill} ${['review','uncertain'].includes(row.status)?styles.pillAmber:row.status==='settled'?styles.pillGreen:styles.pillStone}`}>{row.kind==='customer'?'In customer reminder':info.label}</span>
+                          <button type="button" className="mt-1 block text-xs underline underline-offset-4" onClick={()=>{setFocusedReminder(row.id);setReminderTab(info.action==='Check & send'?'due':'pipelines');}}>{info.action}</button></>;})()}</td>
                     </tr>
                   ))}</tbody>
                 </table>
@@ -2299,9 +2325,9 @@ export function CollectionsDashboardPage({
                   </div>
 
                   <dl className="mt-4 grid overflow-hidden rounded-lg border border-[#ded8d0] sm:grid-cols-3">
-                    <div className="border-b border-[#e8e2db] bg-[#fcfbfa] p-4 sm:border-b-0 sm:border-r"><dt className="text-[10px] font-semibold uppercase tracking-wide text-[#756b60]">Recorded invoice</dt><dd className="mt-1 tabular-nums text-base font-semibold">{formatMoney(reviewingProposal.originalInvoiceAmount)}</dd></div>
-                    <div className="border-b border-amber-200 bg-amber-50 p-4 sm:border-b-0 sm:border-r"><dt className="text-[10px] font-semibold uppercase tracking-wide text-amber-800">Debit note</dt><dd className="mt-1 tabular-nums text-base font-semibold text-amber-950">+ {formatMoney(reviewingProposal.recoverableAmount)}</dd></div>
-                    <div className="bg-[#2d2d2d] p-4 text-white"><dt className="text-[10px] font-semibold uppercase tracking-wide text-stone-300">New outstanding</dt><dd className="mt-1 tabular-nums text-base font-semibold">{formatMoney((Number(reviewingProposal.pendingAmount) || 0) + reviewingProposal.recoverableAmount)}</dd></div>
+                    <div className="border-b border-[#e8e2db] bg-[#fcfbfa] p-4 sm:border-b-0 sm:border-r"><dt className="text-[11px] font-semibold text-[#756b60]">Recorded invoice</dt><dd className="mt-1 tabular-nums text-base font-semibold">{formatMoney(reviewingProposal.originalInvoiceAmount)}</dd></div>
+                    <div className="border-b border-amber-200 bg-amber-50 p-4 sm:border-b-0 sm:border-r"><dt className="text-[11px] font-semibold text-amber-800">Debit note</dt><dd className="mt-1 tabular-nums text-base font-semibold text-amber-950">+ {formatMoney(reviewingProposal.recoverableAmount)}</dd></div>
+                    <div className="bg-[#2d2d2d] p-4 text-white"><dt className="text-[11px] font-semibold text-stone-300">New outstanding</dt><dd className="mt-1 tabular-nums text-base font-semibold">{formatMoney((Number(reviewingProposal.pendingAmount) || 0) + reviewingProposal.recoverableAmount)}</dd></div>
                   </dl>
 
                   {reviewingProposal.cashDiscountAnalysis?.reversalPlan ? <p className="mt-3 text-xs leading-5 text-[#756b60]"><span className="font-semibold text-[#332c26]">Calculation:</span> {formatMoney(reviewingProposal.cashDiscountAnalysis.reversalPlan.grossInvoiceAmount)} gross − {formatMoney(reviewingProposal.originalInvoiceAmount)} recorded = {formatMoney(reviewingProposal.recoverableAmount)} ({reviewingProposal.cashDiscountAnalysis.reversalPlan.initialDiscount.ratePercent}% of the gross amount)</p> : null}
@@ -2386,7 +2412,7 @@ export function CollectionsDashboardPage({
             <div className="mt-5 max-h-[450px] overflow-auto rounded-xl border border-[#e5ddd0]/80">
               <table className="w-full min-w-[620px] table-fixed border-collapse text-left">
                 <thead className="sticky top-0 z-10 bg-[#fcfbfa]">
-                  <tr className="border-b border-[#e5ddd0] text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  <tr className="border-b border-[#e5ddd0] text-xs font-semibold text-slate-500">
                     <th className="w-[32%] px-4 py-3 bg-[#fcfbfa]">Customer</th>
                     <th className="w-[20%] px-4 py-3 bg-[#fcfbfa]">Debit note</th>
                     <th className="w-[18%] px-4 py-3 text-right bg-[#fcfbfa]">Amount</th>

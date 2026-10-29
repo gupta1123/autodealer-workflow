@@ -3,13 +3,14 @@ import {withTeamAccess} from '@/lib/access/route-boundary';
 import {jsonWithCors,optionsWithCors} from '@/lib/api/cors';
 import {createSupabaseAdminClient} from '@/lib/supabase/admin';
 import {reminderDefaults,REMINDER_SETTING} from '@/lib/followups/defaults';
-import {reminderMessages} from '@/lib/followups/messages';
+import {reminderMessages,SUMMARY_MESSAGE} from '@/lib/followups/messages';
 import {validateReminderPlan} from '@autodealer/shared/lib/followup-pipeline';
 export const OPTIONS=optionsWithCors;
 async function handle(request:Request) {
  try {
   const access=await requirePermission(request,'settings.manage');
-  const messages=reminderMessages();
+  // The customer summary is chosen automatically for customer reminders, not as a stage message.
+  const messages=reminderMessages().filter(m=>m.key!==SUMMARY_MESSAGE);
   if(request.method==='GET')return jsonWithCors(request,{...await reminderDefaults(access.organizationId),messages:messages.map(m=>({key:m.key,text:m.text}))},{headers:{'Cache-Control':'private, no-store'}});
   const body=await request.json();const plan=validateReminderPlan(body.plan);
   if(!Number.isSafeInteger(body.revision)||body.revision<0||![body.onceTemplate,...plan.stages.map(s=>s.template)].every(k=>messages.some(m=>m.key===k)))throw new AccessError('Choose approved templates and reload the current settings.',400);

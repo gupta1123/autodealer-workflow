@@ -1,7 +1,8 @@
 'use client';
 import {useEffect,useState} from 'react';
 import {apiFetch} from '@/lib/api-client';
-export type ScheduleStatus={id:string;customer:string;invoice:string;invoice_date:string;status:string;next_due_at:string|null};
+// kind 'customer': the invoice is listed in its customer's one reminder.
+export type ScheduleStatus={id:string;customer:string;invoice:string;invoice_date:string;status:string;next_due_at:string|null;kind?:'invoice'|'customer'};
 export const invoiceKey=(customer:string,invoice:string|null,date:string|null)=>JSON.stringify([customer.trim(),invoice?.trim(),date]);
 export function reminderLabel(row:ScheduleStatus|undefined,now=Date.now()) {
  if(!row)return {label:'Not scheduled',action:'Set up reminders'};

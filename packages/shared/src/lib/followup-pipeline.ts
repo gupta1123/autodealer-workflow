@@ -29,3 +29,23 @@ export function verificationOutcome(bills:Array<{referenceName?:string;voucherNu
   if (typeof amount!=='number'||!Number.isFinite(amount)||amount<0) throw new Error('Tally returned an invalid outstanding amount.');
   return {status:amount<=0.005?'settled':'active',outstanding:Math.round(amount*100)/100,note:amount<=0.005?'Invoice settled. No further reminders will be sent.':typeof matches[0].originalAmount==='number'&&matches[0].originalAmount!>amount+0.005?'Part payment recorded. Reminders continue for the remaining balance.':null};
 }
+export type ReminderInvoice = { invoice: string; invoice_date: string; outstanding: number };
+/** One reminder per customer: the invoices it lists, re-read from Tally. Paid
+ * invoices drop out and the rest carry their fresh balances. A missing bill is
+ * never read as paid (see verificationOutcome), so the reminder is held for
+ * review only when nothing is left to send. */
+export function customerOutcome(bills:Parameters<typeof verificationOutcome>[0], tracked:Array<{invoice:string;invoice_date:string}>) {
+  const open:ReminderInvoice[]=[];let settled=0,unclear=0;
+  for(const item of tracked){
+    const result=verificationOutcome(bills,item.invoice,item.invoice_date);
+    if(result.status==='active'&&result.outstanding)open.push({invoice:item.invoice,invoice_date:item.invoice_date,outstanding:result.outstanding});
+    else if(result.status==='settled')settled+=1;
+    else unclear+=1;
+  }
+  const left=settled+unclear;
+  if(!open.length)return unclear
+    ?{status:'review',outstanding:null,invoices:[] as ReminderInvoice[],note:'None of these invoices is open in Tally now. Check whether they were paid or changed.'}
+    :{status:'settled',outstanding:0,invoices:[] as ReminderInvoice[],note:'All invoices settled. No further reminders will be sent.'};
+  const outstanding=Math.round(open.reduce((sum,item)=>sum+item.outstanding,0)*100)/100;
+  return {status:'active',outstanding,invoices:open,note:left?`${left} invoice${left===1?'':'s'} left out: paid or no longer open in Tally.`:null};
+}

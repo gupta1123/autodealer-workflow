@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {validateReminderPlan,advanceReminder,verificationOutcome,stageMs} from './followup-pipeline.ts';
+import {validateReminderPlan,advanceReminder,verificationOutcome,customerOutcome,stageMs} from './followup-pipeline.ts';
 const stage={name:'First',template:'approved',delay:0,every:2,unit:'days',limit:2};
 test('missing bill requires scoped balanced proof; partial balance remains active',()=>{
  const proof={verified:true,ledgerName:'Customer',invoice:'INV-1',invoiceDate:'2026-09-07',originalAmount:100,allocatedAmount:100};
@@ -26,4 +26,16 @@ test('partial payment uses current balance; ambiguous or absent evidence cannot 
  assert.equal(verificationOutcome([{...bill,pendingAmount:0}],'INV-1','2026-09-07').status,'settled');
  for(const bills of [[],[bill,bill],[{...bill,invoiceDate:'2025-09-07'}]])assert.equal(verificationOutcome(bills,'INV-1','2026-09-07').status,'review');
  assert.throws(()=>verificationOutcome([{...bill,pendingAmount:NaN}],'INV-1','2026-09-07'));
+});
+test('a customer reminder lists only the invoices still open, with fresh balances',()=>{
+ const bills=[{referenceName:'A1',invoiceDate:'2026-08-01',pendingAmount:400,originalAmount:1000},{referenceName:'A2',invoiceDate:'2026-08-05',pendingAmount:0,originalAmount:500}];
+ const result=customerOutcome(bills,[{invoice:'A1',invoice_date:'2026-08-01'},{invoice:'A2',invoice_date:'2026-08-05'},{invoice:'A3',invoice_date:'2026-08-09'}]);
+ assert.equal(result.status,'active');assert.equal(result.outstanding,400);
+ assert.deepEqual(result.invoices,[{invoice:'A1',invoice_date:'2026-08-01',outstanding:400}]);
+ assert.match(result.note,/2 invoices left out/);
+});
+test('a customer reminder settles only when every invoice is seen paid, else waits for review',()=>{
+ assert.equal(customerOutcome([{referenceName:'A1',invoiceDate:'2026-08-01',pendingAmount:0}],[{invoice:'A1',invoice_date:'2026-08-01'}]).status,'settled');
+ const missing=customerOutcome([],[{invoice:'A1',invoice_date:'2026-08-01'}]);
+ assert.equal(missing.status,'review');assert.equal(missing.outstanding,null);
 });
