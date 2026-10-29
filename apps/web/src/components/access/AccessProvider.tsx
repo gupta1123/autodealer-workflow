@@ -22,6 +22,7 @@ export function AccessProvider({ children }: { children: ReactNode }) {
   const waiting = useRef<Array<()=>void>>([]);
   const mounted = useRef(true);
   const currentRevision = useRef(0);
+  const retry = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const pathname = usePathname(), router = useRouter();
   const invalidate = useCallback(() => {
     window.dispatchEvent(new CustomEvent('kalika-access-invalidated'));
@@ -34,8 +35,17 @@ export function AccessProvider({ children }: { children: ReactNode }) {
       return new Promise<void>(resolve=>waiting.current.push(resolve));
     }
     running.current = true; const version = generation.current;
+    clearTimeout(retry.current);
+    // A background re-check that times out or hits a server error keeps the access
+    // already shown and tries again; only a real answer (401/403/404) takes it away.
+    const keepAndRetry = () => {
+      if (!revision.current) return false;
+      retry.current = setTimeout(() => { if (mounted.current) void refresh(); }, 5000);
+      return true;
+    };
     try {
       const response = await apiFetch('/api/access/me', { cache: 'no-store', signal: AbortSignal.timeout(10000) });
+      if (!response.ok && ![401, 403, 404].includes(response.status) && keepAndRetry()) return;
       const data = await response.json();
       if (version !== generation.current) return;
       if(data.sharingEnabled||data.enforcementRequired)setEnforcementRequired(true);
@@ -53,7 +63,7 @@ export function AccessProvider({ children }: { children: ReactNode }) {
       revision.current = key; currentRevision.current = data.revision;
       setSnapshot(previous => previous && unchanged ? previous : data);
     } catch {
-      if (version === generation.current) { invalidate(); setSnapshot(null); setError('Could not verify access. Try again.'); }
+      if (version === generation.current && !keepAndRetry()) { invalidate(); setSnapshot(null); setError('Could not verify access. Try again.'); }
     } finally {
       running.current = false;
       if (version === generation.current || !mounted.current) {
@@ -72,7 +82,7 @@ export function AccessProvider({ children }: { children: ReactNode }) {
     const timer = setInterval(() => { if (available.current && !live.current) focus(); }, 30000);
     return () => {
       mounted.current=false;
-      generation.current++; clearInterval(timer);
+      generation.current++; clearInterval(timer); clearTimeout(retry.current);
       window.removeEventListener('focus', focus); window.removeEventListener('kalika-access-changed', focus);
       window.removeEventListener('kalika-auth-changed', authChanged);
     };
