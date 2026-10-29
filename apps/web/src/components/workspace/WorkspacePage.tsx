@@ -44,6 +44,7 @@ import {
 } from "@/components/ui/popover";
 import { AppShell } from "@/components/dashboard/AppShell";
 import { AnalysisOptionsDialog } from "@/components/workspace/AnalysisOptionsDialog";
+import { BatchCases } from "@/components/workspace/BatchCases";
 import { DuplicateUploadDialog } from "@/components/workspace/DuplicateUploadDialog";
 import { summarizeCase } from "@/lib/case-summary";
 import {
@@ -513,6 +514,8 @@ export function WorkspacePage() {
   const [cameraPageFiles, setCameraPageFiles] = useState<File[]>([]);
   const [imagePreviewUploadId, setImagePreviewUploadId] = useState<string | null>(null);
   const [isUploadDragActive, setIsUploadDragActive] = useState(false);
+  const [uploadMode, setUploadMode] = useState<"one" | "separate">("one");
+  const [batchStarted, setBatchStarted] = useState(false);
 
   const cameraSessionRef = useRef(createCameraSessionStamp());
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -1049,6 +1052,8 @@ export function WorkspacePage() {
     setAnalysisOptionsOpen(false);
     closeCameraCapture();
     setComparisonOptions(DEFAULT_COMPARISON_OPTIONS);
+    setUploadMode("one");
+    setBatchStarted(false);
     resetPipeline();
   };
 
@@ -1384,12 +1389,13 @@ export function WorkspacePage() {
   // STATE 1: IDLE / UPLOAD SCREEN
   // =========================================================================
   if (pipelineStatus === "idle" && !caseDraftCreated) {
+    const separateCases = uploadMode === "separate" && queuedUploads.length > 1 && !persistence.savedCase;
     return renderWithSidebar(
       <div className="min-h-full bg-[#f7f4ef] px-4 py-5 text-[#111827] sm:px-6 lg:px-8">
         <div className="mx-auto flex w-full max-w-[1540px] flex-col gap-6">
           <PageHeader
             title="Add Case"
-            subtitle="Upload or scan documents for one case"
+            subtitle="Upload or scan documents for one case, or many at once"
             badge={
               <div className="flex items-center gap-1.5 rounded-lg border border-[#e6ded2] bg-[#fbfaf8] px-2.5 py-1 text-xs font-medium text-[#5b4b3d] shadow-sm">
                 <Shield className="h-3 w-3 text-[#8a7f72]" />
@@ -1409,7 +1415,8 @@ export function WorkspacePage() {
 
           {/* Centered Upload Card */}
           <div className="flex flex-1 items-center justify-center pb-12">
-            <div className="w-full max-w-2xl">
+            <div className={`w-full ${separateCases ? "max-w-3xl" : "max-w-2xl"}`}>
+          {!batchStarted && (
           <div
             className={`w-full rounded-2xl border-2 border-dashed px-6 py-8 text-center transition-all sm:px-10 sm:py-10 ${
               isUploadDragActive
@@ -1503,6 +1510,7 @@ export function WorkspacePage() {
               </Button>
             </div>
           </div>
+          )}
 
           {/* Draft Error & Queue Overlays */}
           {draftCaseStatus === "error" && draftCaseError && (
@@ -1518,6 +1526,43 @@ export function WorkspacePage() {
               animate={{ opacity: 1, y: 0 }}
               className="mt-6 flex flex-col items-center w-full"
             >
+              {queuedUploads.length > 1 && !persistence.savedCase && !batchStarted && (
+                <div className="mb-3 flex w-full flex-col gap-2 rounded-2xl border border-[#ded8d0] bg-white p-3 sm:flex-row sm:items-center sm:justify-between">
+                  <span className="text-xs font-medium text-[#3d3530]">
+                    {queuedUploads.length} files added. Are they one case or separate cases?
+                  </span>
+                  <div className="inline-flex rounded-lg border border-[#ded8d0] bg-[#fbfaf8] p-0.5" role="radiogroup" aria-label="How to make cases">
+                    {([
+                      ["one", "One case"],
+                      ["separate", "Separate cases"],
+                    ] as const).map(([mode, label]) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        role="radio"
+                        aria-checked={uploadMode === mode}
+                        onClick={() => setUploadMode(mode)}
+                        className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
+                          uploadMode === mode ? "bg-[#2b1a10] text-white shadow-2xs" : "text-[#5b4b3d] hover:text-[#111827]"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {separateCases ? (
+                <div className="w-full rounded-2xl border border-[#ded8d0] bg-white p-4 sm:p-5 shadow-xs">
+                  <BatchCases
+                    uploads={queuedUploads}
+                    onRemoveUpload={removeUpload}
+                    onStarted={() => setBatchStarted(true)}
+                    onReset={resetWorkspace}
+                  />
+                </div>
+              ) : (
+              <>
               <div className="w-full rounded-2xl border border-[#ded8d0] bg-white p-4 sm:p-5 shadow-xs">
                 {queuedUploadRail}
               </div>
@@ -1542,6 +1587,8 @@ export function WorkspacePage() {
                   )}
                 </Button>
               </div>
+              </>
+              )}
             </motion.div>
           )}
 
