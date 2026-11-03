@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { useAccess } from '@/components/access/AccessProvider';
 import { canAccess } from '@autodealer/shared/lib/access';
 
-type Props = { connectionId: string; companyName?: string | null };
+type Props = { connectionId: string; companyName?: string | null; tallyLive?: boolean };
 type Company = { companyName?: string; guid?: string; financialYear?: string; isActive?: boolean; accessCompanyId?: string };
 type AgentPayload = {
   connection?: { organizationId?: string; installationId?: string; sessionGeneration?: number; companies?: Company[] };
@@ -27,7 +27,7 @@ function friendlyPhase(phase?: string) {
   return "Updating Tally data";
 }
 
-export function LocalAgentPanel({ connectionId, companyName }: Props) {
+export function LocalAgentPanel({ connectionId, companyName, tallyLive = true }: Props) {
   const {enforcementRequired, snapshot} = useAccess();
   const [payload, setPayload] = useState<AgentPayload>({});
   const [busy, setBusy] = useState(false);
@@ -98,7 +98,9 @@ export function LocalAgentPanel({ connectionId, companyName }: Props) {
   }
   const progress = activeJob?.progress;
   const percent = progress?.total ? Math.min(100, Math.round(((progress.processed ?? 0) / progress.total) * 100)) : null;
-  const ready = Boolean(dataset?.last_synced_at);
+  const hasData = Boolean(dataset?.last_synced_at);
+  // Saved data can be used while Tally is not answering, but it is not confirmed as current.
+  const ready = hasData && tallyLive;
   return (
     <section className="rounded-2xl border border-[#e5ddd0] bg-white p-5 shadow-sm">
       <div className="flex items-center justify-between gap-4">
@@ -108,12 +110,12 @@ export function LocalAgentPanel({ connectionId, companyName }: Props) {
           </div>
           <div className="min-w-0">
             <h3 className="text-sm font-semibold text-[#24140c]">
-              {activeJob ? `${friendlyPhase(progress?.phase || activeJob.jobClass)}…` : ready ? "Tally data is ready" : "Tally data not loaded yet"}
+              {activeJob ? `${friendlyPhase(progress?.phase || activeJob.jobClass)}…` : ready ? "Tally data is ready" : hasData ? "Showing saved Tally data" : "Tally data not loaded yet"}
             </h3>
             <p className="mt-0.5 truncate text-xs font-medium text-[#8a7f72]">
               {activeJob
                 ? percent !== null ? `${percent}% complete` : "Working in the background"
-                : ready
+                : hasData
                   ? `${company?.companyName || companyName || "Company"} · Updated ${new Date(dataset!.last_synced_at!).toLocaleString()}`
                   : "Click Refresh from Tally to load ledgers for this company."}
             </p>

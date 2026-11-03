@@ -13,9 +13,9 @@ const code=ts.transpileModule(await readFile(new URL('./TallyPrimeDashboard.tsx'
  compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,jsx:ts.JsxEmit.ReactJSX},
 }).outputText;
 
-function fixture({module='bank',manager=false,allCompanies=false,connected=true,empty=false,view='connection',paused=false}={}) {
+function fixture({module='bank',manager=false,allCompanies=false,connected=true,empty=false,view='connection',paused=false,staleCheck=false}={}) {
  const snapshot={member:{status:'active',must_change_password:false,is_owner:false,modules:[module],all_companies:allCompanies,company_ids:['kalika']},role:{archived:false,permissions:[`${module}.view`,...(manager?['connections.manage']:[])]}};
- const connection={id:'connector',displayName:'Office Tally',status:'company_loaded',bridgeConnected:connected,companyLoaded:connected,tallyReachable:connected,pairedAt:paused?null:'2026-10-16T10:00:00Z',lastCompanyName:'Kalika Steel',revoked:paused,lastError:paused?'Disconnected by user.':null};
+ const connection={id:'connector',displayName:'Office Tally',status:'company_loaded',bridgeConnected:connected,companyLoaded:connected&&!staleCheck,tallyReachable:connected&&!staleCheck,tallyObservationStale:staleCheck,pairedAt:paused?null:'2026-10-16T10:00:00Z',lastCompanyName:'Kalika Steel',revoked:paused,lastError:paused?'Disconnected by user.':null};
  let stateIndex=0;
  const container=({children})=>React.createElement('div',null,children);
  const button=({children,...props})=>React.createElement('button',props,children);
@@ -26,6 +26,7 @@ function fixture({module='bank',manager=false,allCompanies=false,connected=true,
   },useEffect:()=>{},useCallback:fn=>fn,useRef:()=>({current:false})},
   'react/jsx-runtime':jsx,'lucide-react':icons,'next/navigation':{useRouter:()=>({push(){}})},
   '@/lib/api-client':{apiFetch:()=>{throw Error('Unexpected API call during render');}},
+  '@/lib/tally-connection-choice':{chooseTallyConnection:()=>'connector'},
   '@/components/dashboard/PageHeader':{PageHeader:({title})=>React.createElement('h1',null,title)},
   '@/components/ui/badge':{Badge:container},'@/components/ui/button':{Button:button},
   '@/components/ui/input':{Input:()=>React.createElement('input')},
@@ -62,6 +63,17 @@ test('connection managers retain management, while company mapping needs all-com
  assert.doesNotMatch(fixture({manager:true}),/Company mapping controls/);
  assert.match(fixture({manager:true,allCompanies:true}),/Company mapping controls/);
  assert.match(fixture({manager:true,empty:true}),/Connect Tally Prime<\/button>/);
+});
+
+test('an old Tally check is not shown as a live company or as a failed check',()=>{
+ const html=fixture({staleCheck:true});
+ assert.match(html,/Waiting for Tally to respond/);
+ assert.match(html,/Not checked recently/);assert.match(html,/Not confirmed/);
+ assert.match(html,/Last seen: Kalika Steel/);
+ assert.doesNotMatch(html,/Company loaded|Not reachable|Bring Tally Prime online/);
+ const live=fixture();
+ assert.match(live,/Connected to Kalika Steel/);assert.match(live,/Company loaded/);
+ assert.doesNotMatch(live,/Last seen:|Waiting for Tally/);
 });
 
 test('the integration hub only offers Bank Statements to users with Bank access',()=>{

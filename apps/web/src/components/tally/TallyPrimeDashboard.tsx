@@ -59,6 +59,7 @@ type TallyConnection = {
   tallyReachable?: boolean;
   companyLoaded?: boolean;
   heartbeatStale?: boolean;
+  tallyObservationStale?: boolean;
   agentUpdate?: {
     installedVersion: string | null;
     latestVersion: string;
@@ -123,8 +124,16 @@ function formatTime(value?: string | null) {
   }).format(new Date(value));
 }
 
+// The connector is checking in but its last Tally check is too old to trust, so the saved
+// status and company may no longer be true. A heavy sync can delay these checks.
+function isWaitingForTally(connection?: TallyConnection | null) {
+  return Boolean(connection?.bridgeConnected && (connection.tallyObservationStale ||
+    (connection.status === "company_loaded" && connection.companyLoaded === false)));
+}
+
 function getStatusLabel(connection?: TallyConnection | null) {
   if (!connection) return "Not connected";
+  if (isWaitingForTally(connection)) return "Waiting for Tally";
   if (connection.status === "company_loaded") return "Company loaded";
   if (connection.status === "tally_reachable") return "Tally reachable";
   if (connection.status === "bridge_connected") return "Connector connected";
@@ -136,6 +145,7 @@ function getStatusLabel(connection?: TallyConnection | null) {
 
 function getStatusTone(connection?: TallyConnection | null) {
   if (!connection) return "neutral";
+  if (isWaitingForTally(connection)) return "warning";
   if (connection.status === "company_loaded") return "success";
   if (
     connection.status === "tally_reachable" ||
@@ -367,6 +377,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   );
   const tallyReachable = selectedConnection?.tallyReachable === true;
   const companyLoaded = selectedConnection?.companyLoaded === true;
+  const waitingForTally = isWaitingForTally(selectedConnection);
   const pcName = selectedConnection?.bridgeMachineName || "the Tally PC";
   const companyDetail =
     selectedConnection?.lastCompanyName ||
@@ -847,7 +858,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           <select id="tally-pc-selection" value={selectedConnectionId} onChange={event => void selectConnection(event.target.value)}
             className="h-10 w-full max-w-xl rounded-xl border border-[#ddd5c9] bg-white px-3 text-sm text-[#2b1a10] focus:outline-none focus:ring-2 focus:ring-amber-200">
             {connections.map(connection => <option key={connection.id} value={connection.id}>
-              {connection.bridgeMachineName || connection.displayName} — {connection.bridgeConnected ? 'Connected' : connection.revoked ? 'Paused' : 'Offline'}{connection.lastCompanyName ? ` · ${connection.lastCompanyName}` : ''}
+              {connection.bridgeMachineName || connection.displayName} — {connection.bridgeConnected ? (connection.companyLoaded === false ? 'Connector online' : 'Connected') : connection.revoked ? 'Paused' : 'Offline'}{connection.lastCompanyName ? ` · ${connection.companyLoaded === false ? 'last seen ' : ''}${connection.lastCompanyName}` : ''}
             </option>)}
           </select>
         </div>
@@ -868,10 +879,10 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
             {companyLoaded ? "Connection ready" : connectorActive ? "Connector online" : "Setup required"}
           </div>
           <h2 className="mt-2 text-xl font-black tracking-tight text-[#1a1a1a] sm:text-2xl">
-            {companyLoaded ? `Connected to ${selectedConnection?.lastCompanyName || "Tally Prime"}` : "Bring Tally Prime online"}
+            {companyLoaded ? `Connected to ${selectedConnection?.lastCompanyName || "Tally Prime"}` : waitingForTally ? "Waiting for Tally to respond" : "Bring Tally Prime online"}
           </h2>
           <p className="mt-2 max-w-md text-xs font-semibold leading-5 text-[#6f6255]">
-            {companyLoaded ? "Your connector, Tally Prime, and company are ready for Kalika workflows." : "Connect this workstation to sync companies, masters, and accounting entries."}
+            {companyLoaded ? "Your connector, Tally Prime, and company are ready for Kalika workflows." : waitingForTally ? "Tally has not answered recently. It may be busy or closed. This updates by itself once Tally responds." : "Connect this workstation to sync companies, masters, and accounting entries."}
           </p>
         </div>
       </section>
@@ -1005,6 +1016,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
                     </Badge>
                   </div>
                   <div className="mt-1 max-w-3xl text-xs font-medium text-[#8a7f72]">
+                    {!companyLoaded && selectedConnection.lastCompanyName ? "Last seen: " : ""}
                     {selectedCompany?.financialYear
                       ? formatCompanyOptionLabel(selectedCompany)
                       : companyDetail}
@@ -1064,23 +1076,23 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               detail={`Last checked: ${formatTime(selectedConnection.lastTestedAt)}`}
               ok={tallyReachable}
               title="Tally"
-              value={tallyReachable ? "Reachable" : "Not reachable"}
+              value={tallyReachable ? "Reachable" : selectedConnection.tallyObservationStale && connectorActive ? "Not checked recently" : "Not reachable"}
             />
             <StatusCard
               detail={
-                selectedConnection.lastCompanyName ||
-                selectedConnection.lastError ||
-                companyDetail
+                selectedConnection.lastCompanyName
+                  ? `${companyLoaded ? "" : "Last seen: "}${selectedConnection.lastCompanyName}`
+                  : selectedConnection.lastError || companyDetail
               }
               ok={companyLoaded}
               title="Company"
-              value={companyLoaded ? "Loaded" : "Not detected"}
+              value={companyLoaded ? "Loaded" : waitingForTally ? "Not confirmed" : "Not detected"}
             />
           </div>
           {connectorActive ? (
             <>
               {canLinkCompanies ? <TallyCompanyLinkingPanel connectionId={selectedConnection.id} onLinked={() => loadConnections({ quiet: true })} /> : null}
-              <LocalAgentPanel connectionId={selectedConnection.id} companyName={selectedConnection.lastCompanyName} />
+              <LocalAgentPanel connectionId={selectedConnection.id} companyName={selectedConnection.lastCompanyName} tallyLive={companyLoaded} />
             </>
           ) : null}
         </div>
