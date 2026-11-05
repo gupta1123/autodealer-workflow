@@ -707,6 +707,17 @@ export function purchaseVoucherNumber(invoiceNumber: unknown, invoiceDate: unkno
   return `${invoice} / ${day}-${monthName}-${year.slice(-2)}`;
 }
 
+// Clients name purchase bills "<invoice no>/<DD.MM.YY>" in Tally, so this is what goes into the
+// voucher's Reference and bill reference. The app keeps the plain number for duplicate checks.
+export function purchaseTallyInvoiceReference(invoiceNumber: unknown, invoiceDate: unknown) {
+  const invoice = text(invoiceNumber);
+  const normalizedDate = normalizePurchasePostingDate(invoiceDate);
+  if (!invoice || !/^\d{4}-\d{2}-\d{2}$/.test(normalizedDate)) return invoice;
+  const [year, month, day] = normalizedDate.split("-");
+  const suffix = `/${day}.${month}.${year.slice(-2)}`;
+  return invoice.endsWith(suffix) ? invoice : `${invoice}${suffix}`;
+}
+
 function invoiceRoundOffAmount(
   fields: Record<string, unknown>,
   commercialFields: ReturnType<typeof extractInvoiceCommercialFieldsFromText>,
@@ -2355,12 +2366,12 @@ export function preparePurchasePosting(params: {
   const tallyPayload = {
     companyName: params.companyName,
     voucherType: "Purchase",
-    // The standard Purchase voucher type is automatically numbered by Tally.
-    // Supplying the supplier's invoice identity as VOUCHERNUMBER overrides that
-    // sequence and Tally may reject the import without a field-level error.
-    // Keep the supplier invoice in REFERENCE/BILLALLOCATIONS and read back the
-    // voucher number assigned by Tally after creation.
-    supplierInvoiceNumber: review.invoiceNumber,
+    // The connector only uses voucherNumber when the company's Purchase voucher type allows
+    // manual numbering; otherwise it drops it and reads back the number Tally assigned. Sent
+    // explicitly so the connector does not build it from the dated reference below (double date).
+    voucherNumber: purchaseVoucherNumber(review.invoiceNumber, review.invoiceDate),
+    // Goes into REFERENCE and BILLALLOCATIONS, and is what the connector looks up afterwards.
+    supplierInvoiceNumber: purchaseTallyInvoiceReference(review.invoiceNumber, review.invoiceDate),
     supplierInvoiceDate: review.invoiceDate,
     voucherDate: review.voucherDate,
     supplierLedgerName: review.supplierLedgerName,

@@ -47,6 +47,7 @@ const {
   preparePurchasePosting,
   getCanonicalInvoiceDocuments,
   getPurchaseInvoiceCandidates,
+  purchaseTallyInvoiceReference,
   purchaseVoucherNumber,
   transportTdsRateForPayee,
 } = await loadPurchasePostingModule();
@@ -56,6 +57,13 @@ test("purchase voucher number matches the frontend invoice/date reference", () =
     purchaseVoucherNumber("SSTC/INV/26-27/G01", "2026-08-21"),
     "SSTC/INV/26-27/G01 / 21-Aug-26"
   );
+});
+
+test("Tally invoice reference appends the supplier invoice date once", () => {
+  assert.equal(purchaseTallyInvoiceReference("PSP/26-27/4800", "2026-10-09"), "PSP/26-27/4800/09.10.26");
+  assert.equal(purchaseTallyInvoiceReference("PSP/26-27/4800/09.10.26", "2026-10-09"), "PSP/26-27/4800/09.10.26");
+  assert.equal(purchaseTallyInvoiceReference("PSP/26-27/4800", ""), "PSP/26-27/4800");
+  assert.equal(purchaseTallyInvoiceReference("", "2026-10-09"), "");
 });
 
 const supplierGstin = "27AAAAA0000A1Z5";
@@ -254,6 +262,11 @@ test("72044900 maps to the combined client stock and Maharashtra purchase rules"
   // intrastate ledgers must still receive 1% CGST and 1% SGST individually.
   document.extracted_fields.gstTdsRate = "2";
   const result = prepare(document);
+  // The dated reference goes to Tally; the voucher number and the app's invoice number stay plain.
+  const { invoiceNumber, invoiceDate } = result.review;
+  assert.ok(invoiceNumber && !invoiceNumber.endsWith(result.tallyPayload.supplierInvoiceNumber.slice(-9)));
+  assert.equal(result.tallyPayload.supplierInvoiceNumber, purchaseTallyInvoiceReference(invoiceNumber, invoiceDate));
+  assert.equal(result.tallyPayload.voucherNumber, purchaseVoucherNumber(invoiceNumber, invoiceDate));
   assert.equal(result.review.lines[0].stockItemName, "M S Scrap & Sponge Iron");
   assert.equal(result.review.lines[0].unit, "MT");
   assert.equal(result.tallyPayload.items[0].unit, "MTS");
