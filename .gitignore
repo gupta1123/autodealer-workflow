@@ -27,6 +27,18 @@ installer/**/release/
 installer/**/.cache/
 *.zip
 
+# Client data, exports and scratch (never commit; keep client files outside the repo)
+/downloads/
+/outputs/
+.codex-run/
+.next-*/
+**/.next-*/
+apps/web/.netlify/
+*.stackdump
+/*.PNG
+/*.png
+/*.jpg
+
 # Runtime and diagnostic logs
 *.log
 *.out.log
