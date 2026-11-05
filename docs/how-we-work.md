@@ -37,7 +37,9 @@ The website/API and the connector deploy separately. A website or API change doe
 ## 4. Environments
 
 - **Local:** your own Tally and a dev database. Test posting and parsing here first. Use a test company, never a client's. Never insert test vouchers into past dates of auto-renumber voucher types.
-- **Staging (to set up):** a second Heroku app, a Netlify branch/preview deploy, and a separate Supabase project with test data. Everything is tried here before production.
+- **No staging, on purpose (decided 2026-11-05):** we do not run a second Heroku app or Supabase project, to avoid extra cost. Do not suggest or set one up unless the owner asks.
+- Because there is no staging, be extra careful with production: test locally first, make small changes, deploy one thing at a time, check the Heroku release and logs right after, and tag the release so rollback is easy.
+- Risky database changes: take a copy of the affected rows first and save an undo file before changing production data.
 - **Production:** deploys come only from `main`.
 
 ## 5. Making a change (the flow)
@@ -86,12 +88,13 @@ The website/API and the connector deploy separately. A website or API change doe
 - Commit messages end with the attribution line given in your instructions.
 - When unsure whether something is live, check the actual state (git, Heroku, Netlify, Supabase). Do not guess.
 
-## 10. Cleanup and setup still to do
+## 10. Cleanup status (2026-11-05)
 
-1. Gitignore: `downloads/`, `outputs/`, `.codex-run/`, `.next-*`, `*.stackdump`, screenshots, logs.
-2. Commit the supplier invoice date change on its own (`purchase-posting.ts` and its test).
-3. Decide on the unfinished connector and bank-statement work (`tally-bridge` parser/package files, `bank-statement-layout.mjs`).
-4. Delete old `.broken` folders, zips and dated backup branches (tag first if needed).
-5. Move to working from `main` instead of `codex/kalika-deploy`.
-6. Create staging (Heroku app, Netlify preview, Supabase project).
-7. Update `docs/workflow-deployment-remotes-guide.md` or fold it into this file.
+Done: gitignore updated; invoice-date change committed and deployed (Heroku v218, tag `api-v218`); old junk folders deleted; working on `main`; old backup branches saved as `archive/*` tags and deleted.
+
+Still open:
+1. Unfinished work left uncommitted on purpose: `apps/tally-bridge` parser/package files, installer `package*.json`, root `package-lock.json`, `apps/api/worker/bank-statement-layout.mjs` (+ test), `main.mjs`, `native-1.1.4-ok.txt`. Finish and commit, or discard, once the owner decides. Do not push them by accident.
+2. Six old project zips (V8 to V13) in the repo root are kept as backups; they are gitignored. Move them outside the repo when convenient.
+3. `codex/kalika-deploy` and `master` branches still exist locally; delete when no longer needed.
+4. Update `docs/workflow-deployment-remotes-guide.md` or fold it into this file.
+5. Tags (`archive/*`, `api-v218`) exist locally only; push them to GitHub if wanted.
