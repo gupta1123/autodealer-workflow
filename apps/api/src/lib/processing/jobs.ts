@@ -1,4 +1,5 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { PAUSED_STAGE, friendlyProcessingError } from "@autodealer/shared/lib/processing-errors";
 
 export type ProcessingJobRow = {
   id: string;
@@ -99,7 +100,10 @@ export function mapProcessingJob(job: ProcessingJobRow | null, queuePosition?: n
     maxAttempts: job.max_attempts,
     progress: job.progress,
     stage: job.stage,
-    error: job.error,
+    // Waiting for the AI service to recover; the job resumes by itself.
+    paused: job.status === "queued" && job.stage === PAUSED_STAGE,
+    // Never send raw provider text to the browser; this also cleans failures stored before the fix.
+    error: job.error ? friendlyProcessingError(job.error) : job.error,
     result: visibleResult,
     lockedAt: job.locked_at,
     lockedBy: job.locked_by,

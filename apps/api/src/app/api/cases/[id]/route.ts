@@ -36,6 +36,7 @@ import {
   stripStoredLineItems,
 } from "@/lib/line-items";
 import { publicErrorMessage } from "@/lib/api/public-error";
+import { sanitizeProcessingMeta } from "@autodealer/shared/lib/processing-errors";
 import { settleOrphanedProcessingCase } from "@/lib/processing/jobs";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import {
@@ -416,7 +417,7 @@ function mapCaseRow(
     mismatchCount,
     createdAt: row.created_at,
     deletedAt: row.deleted_at ?? getRecycleBinDeletedAt(row.processing_meta),
-    processingMeta: row.processing_meta ?? {},
+    processingMeta: sanitizeProcessingMeta(row.processing_meta) ?? {},
   };
 }
 

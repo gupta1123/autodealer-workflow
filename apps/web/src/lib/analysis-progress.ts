@@ -1,4 +1,10 @@
 import type { AnalysisProgressDetail } from "@/lib/case-persistence";
+import { PAUSED_STAGE } from "@autodealer/shared/lib/processing-errors";
+
+/** True when an analysis is waiting for the AI service to recover and will resume by itself. */
+export function isAnalysisPaused(progress: { status?: string | null; stage?: string | null } | null | undefined) {
+  return progress?.status === "queued" && progress?.stage === PAUSED_STAGE;
+}
 
 export function formatEta(seconds: number | null | undefined) {
   if (seconds == null || !Number.isFinite(seconds)) return null;
@@ -16,6 +22,7 @@ export function describeAnalysisStep(params: {
   queuePosition?: number | null;
 }) {
   const { status, stage, detail, queuePosition } = params;
+  if (isAnalysisPaused({ status, stage })) return "Paused for now. Will continue automatically.";
   if (status === "queued") {
     return queuePosition && queuePosition > 1
       ? `Waiting for a free slot (${queuePosition - 1} ahead)`

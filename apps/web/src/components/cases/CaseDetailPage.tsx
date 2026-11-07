@@ -69,6 +69,7 @@ import {
   type SavedCaseDetail,
 } from "@/lib/case-persistence";
 import { describeAnalysisStep, formatEta } from "@/lib/analysis-progress";
+import { friendlyProcessingError } from "@autodealer/shared/lib/processing-errors";
 import { readUploadGroupMeta } from "@/lib/upload-groups";
 import type {
   CaseAnalysisMode,
@@ -1380,7 +1381,7 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           setDetail(refreshed);
           if (nextStatus.caseStatus === "failed") {
             setAnalysisStatus("error");
-            setAnalysisError(nextStatus.job?.error ?? "Case analysis failed.");
+            setAnalysisError(friendlyProcessingError(nextStatus.job?.error) || "Case analysis failed.");
             setAnalysisStage(nextStatus.job?.stage ?? "Failed");
           } else {
             setAnalysisStatus("idle");
@@ -1402,7 +1403,9 @@ export function CaseDetailPage({ caseId }: { caseId: string }) {
           queuePosition: nextStatus.job?.queuePosition ?? null,
           detail: nextStatus.job?.progressDetail ?? null,
         });
-        setAnalysisError(nextStatus.job?.status === "failed" ? nextStatus.job.error ?? null : null);
+        setAnalysisError(
+          nextStatus.job?.status === "failed" ? friendlyProcessingError(nextStatus.job.error) || null : null
+        );
         scheduleNext();
       } catch (statusError) {
         if (!active) return;

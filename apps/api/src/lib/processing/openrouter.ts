@@ -85,6 +85,11 @@ function isRetryableStatus(status: number) {
   return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
+// A refusal caused only by other requests still running (not by an empty balance) clears by itself.
+function isTransientCapacityError(message: string) {
+  return /in-flight|in flight/i.test(message);
+}
+
 function normalizeMaxTokens(value: number) {
   if (!Number.isFinite(value) || value <= 0) {
     return undefined;
@@ -303,7 +308,8 @@ export async function callOpenRouter(
           error: errorText,
         });
 
-        if (isImageSizeError(errorText) || !isRetryableStatus(response.status) || isHardQuotaError(errorText) || attempt === maxRetries) {
+        const retryable = isRetryableStatus(response.status) || isTransientCapacityError(errorText);
+        if (isImageSizeError(errorText) || !retryable || isHardQuotaError(errorText) || attempt === maxRetries) {
           throw new Error(errorText);
         }
 

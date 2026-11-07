@@ -21,6 +21,13 @@ import { TERMS_COMPLIANCE_MISMATCH_MODE } from "@/lib/terms-compliance";
 import { groupDocumentsForVerification } from "@/services/verification";
 import type { CaseAnalysisMode, CaseDoc, Mismatch } from "@/types/pipeline";
 import { randomUUID } from "crypto";
+import {
+  PAUSED_STAGE,
+  PAUSE_GIVE_UP_MS,
+  classifyProcessingError,
+  friendlyProcessingMessage,
+  isProviderPauseCode,
+} from "@autodealer/shared/lib/processing-errors";
 
 const WORKER_SECRET = process.env.WORKER_SECRET || "";
 const STALE_JOB_RUN_MESSAGE = "This processing run was superseded by another worker run.";
@@ -729,6 +736,9 @@ export async function POST(
               extractionReview: extractionReview.review,
               splitAnalysis,
               lastProcessingError: null,
+              paused: false,
+              pausedSince: null,
+              pauseCount: 0,
             },
           })
           .eq("id", group.caseId);
@@ -776,6 +786,9 @@ export async function POST(
             extractionReview: extractionReview.review,
             splitAnalysis,
             lastProcessingError: null,
+            paused: false,
+            pausedSince: null,
+            pauseCount: 0,
           },
         });
 
@@ -878,6 +891,9 @@ export async function POST(
           termsComplianceMismatchMode: TERMS_COMPLIANCE_MISMATCH_MODE,
           extractionReview: extractionReview.review,
           lastProcessingError: null,
+          paused: false,
+          pausedSince: null,
+          pauseCount: 0,
         },
       })
       .eq("id", job.case_id);
@@ -994,31 +1010,64 @@ export async function POST(
       return jsonWithCors(request, { ok: false, cancelled: true, error: message }, { status: 409 });
     }
 
-    const shouldRetry = !isImageSizeError(error) && job.attempt_count < job.max_attempts;
+    // The real reason goes to the server log only. Everything stored for the browser is customer-safe.
+    const code = classifyProcessingError(error);
+    const friendly = friendlyProcessingMessage(code);
+    const meta = readRecord(caseRow.processing_meta);
+    const pausedSinceMs = Date.parse(String(meta.pausedSince ?? ""));
+    const pausedForMs = Number.isFinite(pausedSinceMs) ? Date.now() - pausedSinceMs : 0;
+    // When the AI service is the problem, wait and resume instead of using up the job's attempts.
+    const shouldPause = isProviderPauseCode(code) && pausedForMs < PAUSE_GIVE_UP_MS;
+    console.error(
+      `[processing] job=${id} case=${job.case_id} code=${code} attempt=${job.attempt_count}/${job.max_attempts} paused=${shouldPause} detail=${message}`
+    );
+    if (code === "provider_billing") {
+      console.error(
+        `[ALERT] The AI provider is refusing requests (billing or credits). Analyses are paused and resume automatically once this is fixed. job=${id}`
+      );
+    }
+
+    const shouldRetry = shouldPause || (!isImageSizeError(error) && job.attempt_count < job.max_attempts);
+    const pauseCount = asNumber(meta.pauseCount) + 1;
+    // Paused jobs come back spread out, so a whole batch does not hit the AI service at the same moment.
     const nextRunAt = new Date(
-      Date.now() + Math.min(60_000 * Math.pow(2, Math.max(0, job.attempt_count - 1)), 15 * 60_000)
+      shouldPause
+        ? Date.now() + Math.min(2 * 60_000 * pauseCount, 10 * 60_000) + Math.floor(Math.random() * 60_000)
+        : Date.now() + Math.min(60_000 * Math.pow(2, Math.max(0, job.attempt_count - 1)), 15 * 60_000)
     ).toISOString();
 
     await supabase
       .from("packet_processing_jobs")
       .update(
-        shouldRetry
+        shouldPause
           ? {
               status: "queued",
               progress: 0,
-              stage: "Queued for retry",
-              error: message,
+              stage: PAUSED_STAGE,
+              error: friendly,
+              // Give back the attempt this run used, so waiting never ends in a failed job.
+              attempt_count: Math.max(0, asNumber(job.attempt_count) - 1),
               locked_at: null,
               locked_by: null,
               next_run_at: nextRunAt,
             }
-          : {
-              status: "failed",
-              progress: 100,
-              stage: "Failed",
-              error: message,
-              finished_at: new Date().toISOString(),
-            }
+          : shouldRetry
+            ? {
+                status: "queued",
+                progress: 0,
+                stage: "Queued for retry",
+                error: friendly,
+                locked_at: null,
+                locked_by: null,
+                next_run_at: nextRunAt,
+              }
+            : {
+                status: "failed",
+                progress: 100,
+                stage: "Failed",
+                error: friendly,
+                finished_at: new Date().toISOString(),
+              }
       )
       .eq("id", id);
 
@@ -1027,15 +1076,20 @@ export async function POST(
       .update({
         status: shouldRetry ? "processing" : "failed",
         processing_meta: {
-          ...(caseRow.processing_meta && typeof caseRow.processing_meta === "object"
-            ? (caseRow.processing_meta as Record<string, unknown>)
-            : {}),
-          lastProcessingError: message,
+          ...meta,
+          lastProcessingError: friendly,
+          lastProcessingErrorCode: code,
+          ...(shouldPause
+            ? { paused: true, pausedSince: meta.pausedSince ?? new Date().toISOString(), pauseCount }
+            : { paused: false, pausedSince: null, pauseCount: 0 }),
         },
       })
       .eq("id", job.case_id);
 
-    return jsonWithCors(request, { error: message }, { status: 500 });
+    if (shouldPause) {
+      return jsonWithCors(request, { ok: false, paused: true });
+    }
+    return jsonWithCors(request, { error: friendly }, { status: 500 });
   } finally {
     clearInterval(heartbeat);
   }

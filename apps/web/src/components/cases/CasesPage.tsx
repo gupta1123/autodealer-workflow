@@ -28,7 +28,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { describeAnalysisStep, formatEta } from "@/lib/analysis-progress";
+import { describeAnalysisStep, formatEta, isAnalysisPaused } from "@/lib/analysis-progress";
 import {
   type CaseAnalysisProgress,
   fetchCaseAnalysisProgress,
@@ -519,6 +519,16 @@ export function CasesPage() {
               </div>
             )}
 
+            {status === "ready" && Object.values(progressByCase).some(isAnalysisPaused) && (
+              <div
+                role="status"
+                className="mb-3 rounded-lg border border-[#e8d9a8] bg-[#fdf6dc] px-3.5 py-2.5 text-xs text-[#6b5200]"
+              >
+                Some cases are waiting to be processed. We&apos;re on it. You don&apos;t need to do anything or upload
+                them again.
+              </div>
+            )}
+
             {status === "ready" && cases.length > 0 && (
               <div className="w-full">
                 <Table className="w-full">
@@ -599,7 +609,7 @@ export function CasesPage() {
                                 <div className="mt-1.5 w-44" title={stepLabel}>
                                   <div className="h-1 overflow-hidden rounded-full bg-[#ece8e0]">
                                     <div
-                                      className="h-full rounded-full bg-[#2b6cb0] transition-all duration-500"
+                                      className={`h-full rounded-full transition-all duration-500 ${isAnalysisPaused(live) ? "bg-[#c9a227]" : "bg-[#2b6cb0]"}`}
                                       style={{ width: `${live.status === "queued" ? 4 : Math.min(100, Math.max(4, live.progress))}%` }}
                                     />
                                   </div>

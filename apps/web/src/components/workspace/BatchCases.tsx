@@ -16,6 +16,7 @@ import {
 } from "@/lib/case-persistence";
 import { batchStateRank, planBatchCases, type BatchPlanAdjustments, type BatchRowState } from "@/lib/batch-cases";
 import { getQueuedUploadPageCount } from "@/lib/upload-groups";
+import { PAUSED_STAGE, friendlyProcessingError } from "@autodealer/shared/lib/processing-errors";
 import type { ComparisonOptions, QueuedUpload } from "@/types/pipeline";
 
 // Two uploads at a time keeps the browser responsive; the analysis worker has its own limit.
@@ -172,7 +173,7 @@ export function BatchCases({ uploads, onRemoveUpload, onStarted, onReset }: Batc
         if (!result || cancelled) continue;
         const status = result.job?.status;
         if (status === "failed" || status === "cancelled") {
-          patch(row.key, { state: "failed", error: result.job?.error || "Analysis failed." });
+          patch(row.key, { state: "failed", error: friendlyProcessingError(result.job?.error) || "Analysis failed." });
         } else if (status === "succeeded" || (!result.job && result.caseStatus !== "processing" && result.caseStatus !== "draft")) {
           patch(row.key, { state: "ready", progress: 1 });
           void fetchCaseDetail(row.caseId!)
@@ -370,7 +371,13 @@ export function BatchCases({ uploads, onRemoveUpload, onStarted, onReset }: Batc
                         : ""}
                       {row.state === "running" ? `, ${row.stage ?? "Analysing"} ${Math.round(row.progress * 100)}%` : ""}
                       {row.state === "uploading" ? ", uploading files" : ""}
-                      {row.state === "queued" ? (row.queuePosition ? `, number ${row.queuePosition} in queue` : ", queued") : ""}
+                      {row.state === "queued"
+                        ? row.stage === PAUSED_STAGE
+                          ? ", paused, will continue automatically"
+                          : row.queuePosition
+                            ? `, number ${row.queuePosition} in queue`
+                            : ", queued"
+                        : ""}
                     </div>
                     {row.state === "failed" && row.error && (
                       <div className="mt-0.5 text-[11px] font-medium text-[#8c1d18]">{row.error}</div>
