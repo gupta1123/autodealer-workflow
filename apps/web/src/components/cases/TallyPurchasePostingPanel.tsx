@@ -2142,6 +2142,32 @@ export function TallyPurchasePostingPanel({
   const sgstTdsActive = Number(calculation?.sgstTdsAmount || 0) > 0;
   const igstTdsActive = Number(calculation?.igstTdsAmount || 0) > 0;
   const transporterTdsActive = review.applyTransportTds;
+  // GST TDS comes from the invoice's printed amount or the automatic scrap rule. When the
+  // toggle is on and neither gives an amount, say why instead of silently adding no row.
+  const gstTdsOnWithoutAmount = Boolean(
+    deductionSettings.gstTdsEnabled && review.applyGstTds && calculation &&
+    !cgstTdsActive && !sgstTdsActive && !igstTdsActive
+  );
+  const gstTdsNotAppliedReason = (() => {
+    if (!calculation) return "";
+    const scrapBasis = Number(calculation.gstTdsBasisAmount || 0);
+    if (calculation.scrapGstTdsEligible) {
+      return "The invoice does not print a GST TDS amount. Check the invoice and the GST TDS settings.";
+    }
+    if (scrapBasis <= 0) {
+      return "The invoice does not print a GST TDS amount, and it has no MS scrap (HSN 7204) lines for the automatic scrap GST TDS.";
+    }
+    if (review.invoiceDate && review.invoiceDate < "2024-10-10") {
+      return `The automatic scrap GST TDS applies only to invoices dated on or after 10 Oct 2024. This invoice is dated ${tallyDate(review.invoiceDate)}, and it does not print a GST TDS amount.`;
+    }
+    if (scrapBasis <= 250000) {
+      return "The scrap value on this invoice is ₹2.5 lakh or less, so the automatic scrap GST TDS does not apply, and the invoice does not print a GST TDS amount.";
+    }
+    if (calculation.taxMode === "unknown") {
+      return "The supplier or buyer GSTIN is missing or invalid, so the tax type cannot be worked out.";
+    }
+    return "The invoice does not print a GST TDS amount and the automatic scrap GST TDS conditions are not met.";
+  })();
   const invoiceFreightPresent = Number(payload.source?.invoiceFreightAmount) > 0;
   const freightRelevant =
     invoiceFreightPresent ||
@@ -2957,6 +2983,13 @@ export function TallyPurchasePostingPanel({
                       <div className={`pt-1 text-xs font-semibold ${invoiceIgstTdsKnown && Math.abs(Number(numericDifference(payload.source?.invoiceIgstTdsAmount, calculation?.igstTdsAmount))) > 1 ? "text-rose-600" : invoiceIgstTdsKnown ? "text-emerald-700" : "text-slate-400"}`}>
                         {invoiceIgstTdsKnown ? money(numericDifference(payload.source?.invoiceIgstTdsAmount, calculation?.igstTdsAmount)) : "—"}
                       </div>
+                    </div>
+                  ) : null}
+
+                  {gstTdsOnWithoutAmount ? (
+                    <div className="border-t border-slate-100 bg-amber-50 px-3 py-2 text-xs text-amber-800" id="gst-tds-not-applied">
+                      <span className="font-semibold">GST TDS is on, but no amount applies, so no row was added.</span>{" "}
+                      {gstTdsNotAppliedReason}
                     </div>
                   ) : null}
 
