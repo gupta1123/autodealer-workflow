@@ -47,23 +47,16 @@ const {
   preparePurchasePosting,
   getCanonicalInvoiceDocuments,
   getPurchaseInvoiceCandidates,
-  purchaseTallyInvoiceReference,
   purchaseVoucherNumber,
   transportTdsRateForPayee,
 } = await loadPurchasePostingModule();
 
-test("purchase voucher number matches the frontend invoice/date reference", () => {
-  assert.equal(
-    purchaseVoucherNumber("SSTC/INV/26-27/G01", "2026-08-21"),
-    "SSTC/INV/26-27/G01 / 21-Aug-26"
-  );
-});
-
-test("Tally invoice reference appends the supplier invoice date once", () => {
-  assert.equal(purchaseTallyInvoiceReference("PSP/26-27/4800", "2026-10-09"), "PSP/26-27/4800/09.10.26");
-  assert.equal(purchaseTallyInvoiceReference("PSP/26-27/4800/09.10.26", "2026-10-09"), "PSP/26-27/4800/09.10.26");
-  assert.equal(purchaseTallyInvoiceReference("PSP/26-27/4800", ""), "PSP/26-27/4800");
-  assert.equal(purchaseTallyInvoiceReference("", "2026-10-09"), "");
+test("Tally voucher number is the invoice number with the invoice date appended once", () => {
+  assert.equal(purchaseVoucherNumber("2026-27/430", "2026-10-12"), "2026-27/430/12.10.26");
+  assert.equal(purchaseVoucherNumber("PSP/26-27/4800", "2026-10-09"), "PSP/26-27/4800/09.10.26");
+  assert.equal(purchaseVoucherNumber("PSP/26-27/4800/09.10.26", "2026-10-09"), "PSP/26-27/4800/09.10.26");
+  assert.equal(purchaseVoucherNumber("PSP/26-27/4800", ""), "PSP/26-27/4800");
+  assert.equal(purchaseVoucherNumber("", "2026-10-09"), "");
 });
 
 const supplierGstin = "27AAAAA0000A1Z5";
@@ -262,10 +255,10 @@ test("72044900 maps to the combined client stock and Maharashtra purchase rules"
   // intrastate ledgers must still receive 1% CGST and 1% SGST individually.
   document.extracted_fields.gstTdsRate = "2";
   const result = prepare(document);
-  // The dated reference goes to Tally; the voucher number and the app's invoice number stay plain.
+  // The dated number is the Tally voucher No.; the supplier invoice number stays plain.
   const { invoiceNumber, invoiceDate } = result.review;
-  assert.ok(invoiceNumber && !invoiceNumber.endsWith(result.tallyPayload.supplierInvoiceNumber.slice(-9)));
-  assert.equal(result.tallyPayload.supplierInvoiceNumber, purchaseTallyInvoiceReference(invoiceNumber, invoiceDate));
+  assert.ok(invoiceNumber && result.tallyPayload.voucherNumber.startsWith(`${invoiceNumber}/`));
+  assert.equal(result.tallyPayload.supplierInvoiceNumber, invoiceNumber);
   assert.equal(result.tallyPayload.voucherNumber, purchaseVoucherNumber(invoiceNumber, invoiceDate));
   assert.equal(result.review.lines[0].stockItemName, "M S Scrap & Sponge Iron");
   assert.equal(result.review.lines[0].unit, "MT");
@@ -1634,4 +1627,81 @@ test("a Materials row maps any HSN to its purchase ledger, and longer HSNs inher
   assert.equal(ledgerFor("73089090"), "Structural Steel Purchase");
   // 72044900 has no row of its own, so it uses the 7204 row before the older material key.
   assert.equal(ledgerFor("72044900"), "Scrap Trim Purchase");
+});
+
+function prepareWithPacket(invoice, supporting) {
+  return preparePurchasePosting({
+    documents: [invoice, ...supporting],
+    masters: completeMasters,
+    mappings: [],
+    savedReview: { sourceReferenceApproved: true, applyTds194q: true, tds194qRounding: "paise" },
+    caseStatus: "accepted",
+    connectionReady: true,
+    companyName: "Test Company",
+    companyGstin: maharashtraBuyerGstin,
+    sourceDocumentReference: "https://app.example/cases/case-1?sourceFileId=file-1",
+    duplicateExists: false,
+    accountingSettings: { purchaseGoodsTdsEnabled: true, transporterTdsEnabled: true, gstTdsEnabled: true },
+  });
+}
+
+const supportingDocument = (id, document_type, fields) => ({
+  id, document_type, source_file_name: "packet.pdf", source_hint: "packet.pdf", title: document_type, extracted_fields: fields,
+});
+
+test("an invoice that agrees with its e-way bill and weighbridge raises no packet warnings", () => {
+  const result = prepareWithPacket(invoiceDocument(), [
+    supportingDocument("eway", "E-Way Bill", { referenceInvoiceNumber: "INV-100", totalAmount: "1159.00", documentDate: "27/07/2026 10:15 PM", vehicleNumber: "MH12AB1234" }),
+    supportingDocument("weigh", "Weighment Slip", { netWeight: "1000", documentDate: "27/07/2026" }),
+  ]);
+  assert.deepEqual(result.warnings.filter((warning) => warning.code.startsWith("PACKET_")), []);
+});
+
+test("an invoice that disagrees with its e-way bill and weighbridge is flagged for acknowledgement", () => {
+  const result = prepareWithPacket(invoiceDocument(), [
+    supportingDocument("eway", "E-Way Bill", { referenceInvoiceNumber: "INV-100", totalAmount: "4836.53", documentDate: "28/09/2026 11:09 PM", vehicleNumber: "MH12DT3784" }),
+    supportingDocument("weigh", "Weighment Slip", { netWeight: "500" }),
+    supportingDocument("lr", "Lorry Receipt", { netWeight: "510" }),
+  ]);
+  const byCode = new Map(result.warnings.map((warning) => [warning.code, warning]));
+  assert.equal(byCode.get("PACKET_EWAY_TOTAL_MISMATCH")?.requiresAcknowledgement, true);
+  assert.equal(byCode.get("PACKET_EWAY_DATE_MISMATCH")?.requiresAcknowledgement, true);
+  assert.equal(byCode.get("PACKET_WEIGHT_MISMATCH")?.requiresAcknowledgement, true);
+  assert.ok(byCode.has("PACKET_EWAY_VEHICLE_MISMATCH"));
+});
+
+test("e-way bills that never quote the invoice number are reported", () => {
+  const result = prepareWithPacket(invoiceDocument(), [
+    supportingDocument("eway", "E-Way Bill", { referenceInvoiceNumber: "UPSTREAM-7", totalAmount: "900.00" }),
+  ]);
+  assert.ok(result.warnings.some((warning) => warning.code === "PACKET_EWAY_REFERENCE_MISSING"));
+  assert.ok(!result.warnings.some((warning) => warning.code === "PACKET_EWAY_TOTAL_MISMATCH"));
+});
+
+test("every bill up a trading chain is recognised as a mother bill, by GSTIN, by name or by vehicle", () => {
+  const seemaGstin = "27AMRPC2505P1ZQ";
+  const bill = (id, fields) => {
+    const document = invoiceDocument({ id });
+    document.extracted_fields = { ...document.extracted_fields, vehicleNumber: "MH12DT3784", ...fields };
+    return document;
+  };
+  const kalika = bill("kalika", { invoiceNumber: "2026-27/400", vendorName: "M/s. SEEMA TRADERS", supplierGstin: seemaGstin, buyerName: "Kalika Steel Alloys Pvt Ltd", buyerGstin: maharashtraBuyerGstin });
+  // Buyer GSTIN misread, but the buyer name is Seema Traders.
+  const pallavi = bill("pallavi", { invoiceNumber: "PE/26-27/B218", vendorName: "Pallavi Enterprises", supplierGstin: "27BITPC0502M1Z8", buyerName: "Seema Traders", buyerGstin: "27ADQPS3551P1Z2" });
+  const national = bill("national", { invoiceNumber: "284", vendorName: "NATIONAL TRADERS", supplierGstin: "27EDTPK6392F1ZV", buyerName: "Pallavi Enterprises", buyerGstin: "27BITPC0502M1Z8" });
+  // Buyer not read at all; same truck.
+  const autogen = bill("autogen", { invoiceNumber: "AGI2627-11611", vendorName: "AutoGen India Private Limited", supplierGstin: "27AAPCA3537J1ZC", buyerName: "", buyerGstin: "" });
+  // A different truck with an unreadable buyer is not assumed to be part of the chain.
+  const unrelated = bill("unrelated", { invoiceNumber: "X-1", vendorName: "Other Co", supplierGstin: "27CCCCC0000C1Z5", buyerName: "", buyerGstin: "", vehicleNumber: "MH01AA0001" });
+
+  const roles = new Map(
+    getPurchaseInvoiceCandidates([autogen, national, pallavi, kalika, unrelated], maharashtraBuyerGstin)
+      .map((candidate) => [candidate.documentId, candidate])
+  );
+  assert.equal(roles.get("kalika").role, "kalika_facing");
+  assert.equal(roles.get("pallavi").role, "mother_bill");
+  assert.equal(roles.get("national").role, "mother_bill");
+  assert.equal(roles.get("autogen").role, "mother_bill");
+  assert.match(roles.get("autogen").reason, /same vehicle/);
+  assert.equal(roles.get("unrelated").role, "other");
 });

@@ -95,6 +95,10 @@ export async function GET(request: Request) {
     const now = new Date().toISOString();
     const sessionFilter = `protocol_version.eq.0,and(installation_id.eq.${connection.installation_id},session_generation.eq.${connection.session_generation})`;
     const staleClaimedBefore = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    // A Purchase write runs a financial-year duplicate scan, a save that can take over a
+    // minute on a large company, and a read-back, so it gets a longer window before its
+    // claim is treated as lost.
+    const stalePurchaseClaimedBefore = new Date(Date.now() - 5 * 60 * 1000).toISOString();
     // A Purchase write may have reached Tally even when the connector result was
     // lost. Never requeue it automatically: preserve the frozen payload and
     // require a read-only verification pass before any later create command.
@@ -109,7 +113,7 @@ export async function GET(request: Request) {
       .or(sessionFilter)
       .eq("command_type", "create_purchase_voucher")
       .eq("status", "claimed")
-      .lt("claimed_at", staleClaimedBefore)
+      .lt("claimed_at", stalePurchaseClaimedBefore)
       .select("id");
     if (uncertainPurchaseError) throw uncertainPurchaseError;
     const uncertainPurchaseIds = (uncertainPurchaseCommands ?? []).map((command) => command.id);
@@ -157,14 +161,28 @@ export async function GET(request: Request) {
       .select("id, command_type");
 
     if (staleClaimError) throw staleClaimError;
-    const { data: commandData, error: commandError } = await supabase
+    // One purchase write at a time: while another purchase on this connection is running,
+    // leave queued purchases waiting so their claim window starts when they actually run.
+    const { count: runningPurchaseCount, error: runningPurchaseError } = await supabase
+      .from("tally_bridge_commands")
+      .select("id", { count: "exact", head: true })
+      .eq("connection_id", connection.id)
+      .eq("command_type", "create_purchase_voucher")
+      .eq("status", "claimed")
+      .gte("claimed_at", stalePurchaseClaimedBefore);
+    if (runningPurchaseError) throw runningPurchaseError;
+    let nextCommandQuery = supabase
       .from("tally_bridge_commands")
       .select("*")
       .eq("connection_id", connection.id)
       .or(sessionFilter)
       .eq("status", "queued")
       .lte("available_at", now)
-      .lt("attempts", 3)
+      .lt("attempts", 3);
+    if ((runningPurchaseCount ?? 0) > 0) {
+      nextCommandQuery = nextCommandQuery.neq("command_type", "create_purchase_voucher");
+    }
+    const { data: commandData, error: commandError } = await nextCommandQuery
       .order("priority", { ascending: false })
       .order("created_at", { ascending: true })
       .limit(1)

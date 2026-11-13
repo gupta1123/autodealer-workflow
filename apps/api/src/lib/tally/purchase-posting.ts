@@ -456,26 +456,199 @@ export function getCanonicalInvoiceDocuments(documents: PurchasePostingDocumentI
   return Array.from(byIdentity.values());
 }
 
+const PACKET_WEIGHT_TOLERANCE = 0.01;
+const PACKET_EWAY_DATE_TOLERANCE_DAYS = 3;
+
+function kilograms(quantity: unknown, unit: unknown) {
+  const value = quantityMillis(quantity);
+  if (value === null || value <= 0) return null;
+  const amount = value / 1000;
+  const normalizedUnit = text(unit).toLowerCase().replace(/[^a-z]/g, "");
+  if (/^(mt|mts|metricton|metrictons|ton|tons|tonne|tonnes)$/.test(normalizedUnit)) return amount * 1000;
+  if (/^(kg|kgs|kilogram|kilograms)$/.test(normalizedUnit)) return amount;
+  if (!normalizedUnit) return amount < 100 ? amount * 1000 : amount;
+  return null;
+}
+
+function formatRupees(paise: number) {
+  return `₹${(paise / 100).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+// Compares the invoice being posted with the packet's own e-way bill, weighbridge slips and
+// lorry receipts. On real packets the e-way bill always carries the invoice's exact total
+// and date, and at least one weighbridge slip or LR carries its net weight, so a difference
+// usually means the invoice (or its item lines) was read wrongly.
+function packetConsistencyWarnings(
+  review: PurchasePostingReview,
+  documents: PurchasePostingDocumentInput[]
+) {
+  const warnings: PurchasePostingIssue[] = [];
+  const invoiceNumber = normalizeKey(review.invoiceNumber);
+  const ewayBills = documents.filter((document) => /e-?way\s*bill/i.test(document.document_type));
+  const matchingEway = ewayBills.filter(
+    (document) => invoiceNumber && normalizeKey(fieldsOf(document).referenceInvoiceNumber) === invoiceNumber
+  );
+
+  if (ewayBills.length > 0 && matchingEway.length === 0) {
+    warnings.push(issue(
+      "PACKET_EWAY_REFERENCE_MISSING",
+      "No e-way bill quotes this invoice",
+      `The packet has ${ewayBills.length} e-way bill${ewayBills.length === 1 ? "" : "s"}, but none quotes invoice ${review.invoiceNumber}. Check the invoice number.`,
+      "invoice"
+    ));
+  }
+
+  // A packet can hold more than one e-way bill quoting the same number (for example a part
+  // movement); compare with the one whose total agrees, if any.
+  const invoiceTotal = moneyPaise(review.invoiceTotal);
+  const eway = matchingEway.find((document) => {
+    const total = moneyPaise(fieldsOf(document).totalAmount);
+    return total !== null && invoiceTotal !== null && Math.abs(total - invoiceTotal) <= 100;
+  }) ?? matchingEway[0];
+  if (eway) {
+    const ewayFields = fieldsOf(eway);
+    const ewayTotal = moneyPaise(ewayFields.totalAmount);
+    if (ewayTotal !== null && invoiceTotal !== null && Math.abs(ewayTotal - invoiceTotal) > 100) {
+      warnings.push({
+        ...issue(
+          "PACKET_EWAY_TOTAL_MISMATCH",
+          "Invoice total differs from the e-way bill",
+          `The invoice total is ${formatRupees(invoiceTotal)}, but the e-way bill for this invoice says ${formatRupees(ewayTotal)}.`,
+          "invoice"
+        ),
+        requiresAcknowledgement: true,
+      });
+    }
+    const ewayDate = parseDate(ewayFields.documentDate);
+    if (isValidIsoDate(ewayDate) && isValidIsoDate(review.invoiceDate)) {
+      const days = Math.abs(Date.parse(`${ewayDate}T00:00:00Z`) - Date.parse(`${review.invoiceDate}T00:00:00Z`)) / 86_400_000;
+      if (days > PACKET_EWAY_DATE_TOLERANCE_DAYS) {
+        warnings.push({
+          ...issue(
+            "PACKET_EWAY_DATE_MISMATCH",
+            "Invoice date differs from the e-way bill",
+            `The invoice is dated ${review.invoiceDate}, but its e-way bill was generated on ${ewayDate}.`,
+            "invoice"
+          ),
+          requiresAcknowledgement: true,
+        });
+      }
+    }
+    const ewayVehicle = vehicleKey(ewayFields.vehicleNumber);
+    const invoiceVehicle = vehicleKey(review.vehicleNumber);
+    if (ewayVehicle && invoiceVehicle && ewayVehicle !== invoiceVehicle) {
+      warnings.push(issue(
+        "PACKET_EWAY_VEHICLE_MISMATCH",
+        "Vehicle differs from the e-way bill",
+        `The invoice vehicle is ${review.vehicleNumber}, but the e-way bill shows ${text(ewayFields.vehicleNumber)}.`,
+        "invoice"
+      ));
+    }
+  }
+
+  const lineWeights = review.lines.map((line) => kilograms(line.quantity, line.unit));
+  const invoiceKg = lineWeights.length > 0 && lineWeights.every((value) => value !== null)
+    ? lineWeights.reduce<number>((total, value) => total + (value ?? 0), 0)
+    : null;
+  const packetWeights = documents
+    .filter((document) => /weigh|lorry/i.test(document.document_type))
+    .map((document) => kilograms(fieldsOf(document).netWeight, ""))
+    .filter((value): value is number => value !== null);
+  if (invoiceKg && packetWeights.length > 0) {
+    const matches = packetWeights.some((weight) => Math.abs(weight - invoiceKg) <= invoiceKg * PACKET_WEIGHT_TOLERANCE);
+    if (!matches) {
+      const shown = Array.from(new Set(packetWeights.map((weight) => `${weight.toLocaleString("en-IN")} kg`))).slice(0, 3);
+      warnings.push({
+        ...issue(
+          "PACKET_WEIGHT_MISMATCH",
+          "Invoice quantity differs from the weighbridge and LR",
+          `The invoice lines add up to ${invoiceKg.toLocaleString("en-IN")} kg, but the weighbridge slips and lorry receipts show ${shown.join(", ")}. Check for a missing or repeated item line.`,
+          "line"
+        ),
+        requiresAcknowledgement: true,
+      });
+    }
+  }
+  return warnings;
+}
+
+function partyKeys(gstin: unknown, name: unknown) {
+  const keys: string[] = [];
+  const normalizedGstin = normalizeGstin(gstin);
+  if (normalizedGstin.length === 15) keys.push(`gstin:${normalizedGstin}`);
+  const nameKey = text(name)
+    .toLowerCase()
+    .replace(/^m\s*\/\s*s\.?\s*/, "")
+    .replace(/\b(private|pvt|limited|ltd)\b\.?/g, "")
+    .replace(/[^a-z0-9]+/g, "");
+  if (nameKey.length >= 4) keys.push(`name:${nameKey}`);
+  return keys;
+}
+
+function vehicleKey(value: unknown) {
+  return text(value).toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+// Walks a trading chain back from the invoice(s) billed to the company: a bill whose buyer
+// is the seller of a bill already in the chain is the next one up (AutoGen -> RSV ->
+// National -> Pallavi -> Seema -> Kalika). Buyers are matched by GSTIN or by name. A bill
+// whose buyer could not be read at all is linked when it travelled on the same vehicle.
+// Returns documentId -> how it was linked.
+function findUpstreamChainBills(
+  invoices: PurchasePostingDocumentInput[],
+  activeCompanyGstin: string
+) {
+  const links = new Map<string, "party" | "vehicle">();
+  if (!activeCompanyGstin) return links;
+  const companyFacing = invoices.filter(
+    (document) => normalizeGstin(fieldsOf(document).buyerGstin) === activeCompanyGstin
+  );
+  if (companyFacing.length === 0) return links;
+
+  const chainSellers = new Set(
+    companyFacing.flatMap((document) => partyKeys(fieldsOf(document).supplierGstin, fieldsOf(document).vendorName))
+  );
+  let added = true;
+  while (added) {
+    added = false;
+    for (const document of invoices) {
+      if (links.has(document.id) || companyFacing.includes(document)) continue;
+      const fields = fieldsOf(document);
+      if (!partyKeys(fields.buyerGstin, fields.buyerName).some((key) => chainSellers.has(key))) continue;
+      links.set(document.id, "party");
+      for (const key of partyKeys(fields.supplierGstin, fields.vendorName)) chainSellers.add(key);
+      added = true;
+    }
+  }
+
+  const companyVehicles = new Set(
+    companyFacing.map((document) => vehicleKey(fieldsOf(document).vehicleNumber)).filter(Boolean)
+  );
+  for (const document of invoices) {
+    if (links.has(document.id) || companyFacing.includes(document)) continue;
+    const fields = fieldsOf(document);
+    const buyerUnread = partyKeys(fields.buyerGstin, fields.buyerName).length === 0;
+    const vehicle = vehicleKey(fields.vehicleNumber);
+    if (buyerUnread && vehicle && companyVehicles.has(vehicle)) links.set(document.id, "vehicle");
+  }
+  return links;
+}
+
 export function getPurchaseInvoiceCandidates(
   documents: PurchasePostingDocumentInput[],
   companyGstin?: string | null
 ): PurchaseInvoiceCandidate[] {
   const canonicalInvoices = getCanonicalInvoiceDocuments(documents);
   const activeCompanyGstin = normalizeGstin(companyGstin);
+  const upstream = findUpstreamChainBills(canonicalInvoices, activeCompanyGstin);
 
   return canonicalInvoices.map((document) => {
     const fields = fieldsOf(document);
     const supplierGstin = normalizeGstin(fields.supplierGstin);
     const buyerGstin = normalizeGstin(fields.buyerGstin);
     const isKalikaFacing = Boolean(activeCompanyGstin && buyerGstin === activeCompanyGstin);
-    const isMotherBill = !isKalikaFacing && Boolean(
-      buyerGstin && canonicalInvoices.some((candidate) => {
-        if (candidate.id === document.id) return false;
-        const candidateFields = fieldsOf(candidate);
-        return normalizeGstin(candidateFields.supplierGstin) === buyerGstin &&
-          normalizeGstin(candidateFields.buyerGstin) === activeCompanyGstin;
-      })
-    );
+    const upstreamLink = isKalikaFacing ? undefined : upstream.get(document.id);
+    const isMotherBill = Boolean(upstreamLink);
     const role: PurchaseInvoiceCandidate["role"] = isKalikaFacing
       ? "kalika_facing"
       : isMotherBill
@@ -495,9 +668,11 @@ export function getPurchaseInvoiceCandidates(
       recommended: isKalikaFacing,
       reason: isKalikaFacing
         ? "Billed to the active Tally company"
-        : isMotherBill
-          ? "Upstream mother bill; its buyer becomes the seller on another invoice"
-          : "Buyer does not match the active Tally company",
+        : upstreamLink === "vehicle"
+          ? "Earlier bill in the same consignment (same vehicle); its buyer could not be read"
+          : isMotherBill
+            ? "Upstream mother bill; its buyer becomes the seller on another invoice"
+            : "Buyer does not match the active Tally company",
     };
   });
 }
@@ -694,22 +869,9 @@ function packetInventoryText(
   return candidates.find((value) => normalizeKey(value) === unique[0]) ?? "";
 }
 
+// Clients name purchase vouchers "<invoice no>/<DD.MM.YY>" in Tally's voucher No. field. The
+// Supplier Invoice No. field keeps the plain invoice number (its date sits in the Date field).
 export function purchaseVoucherNumber(invoiceNumber: unknown, invoiceDate: unknown) {
-  const invoice = text(invoiceNumber);
-  const normalizedDate = normalizePurchasePostingDate(invoiceDate);
-  if (!invoice || !/^\d{4}-\d{2}-\d{2}$/.test(normalizedDate)) return invoice;
-  const [year, month, day] = normalizedDate.split("-");
-  const monthName = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-  ][Number(month) - 1];
-  if (!monthName) return invoice;
-  return `${invoice} / ${day}-${monthName}-${year.slice(-2)}`;
-}
-
-// Clients name purchase bills "<invoice no>/<DD.MM.YY>" in Tally, so this is what goes into the
-// voucher's Reference and bill reference. The app keeps the plain number for duplicate checks.
-export function purchaseTallyInvoiceReference(invoiceNumber: unknown, invoiceDate: unknown) {
   const invoice = text(invoiceNumber);
   const normalizedDate = normalizePurchasePostingDate(invoiceDate);
   if (!invoice || !/^\d{4}-\d{2}-\d{2}$/.test(normalizedDate)) return invoice;
@@ -1801,6 +1963,7 @@ export function preparePurchasePosting(params: {
     params.savedReview
   );
   review.selectedInvoiceDocumentId = invoice.id;
+  warnings.push(...packetConsistencyWarnings(review, params.documents));
   if (selectedCandidate.role === "mother_bill") {
     warnings.push(issue(
       "MOTHER_BILL_SELECTED",
@@ -2368,10 +2531,10 @@ export function preparePurchasePosting(params: {
     voucherType: "Purchase",
     // The connector only uses voucherNumber when the company's Purchase voucher type allows
     // manual numbering; otherwise it drops it and reads back the number Tally assigned. Sent
-    // explicitly so the connector does not build it from the dated reference below (double date).
+    // explicitly as "<invoice no>/<DD.MM.YY>" so the connector does not build it itself.
     voucherNumber: purchaseVoucherNumber(review.invoiceNumber, review.invoiceDate),
     // Goes into REFERENCE and BILLALLOCATIONS, and is what the connector looks up afterwards.
-    supplierInvoiceNumber: purchaseTallyInvoiceReference(review.invoiceNumber, review.invoiceDate),
+    supplierInvoiceNumber: text(review.invoiceNumber),
     supplierInvoiceDate: review.invoiceDate,
     voucherDate: review.voucherDate,
     supplierLedgerName: review.supplierLedgerName,
