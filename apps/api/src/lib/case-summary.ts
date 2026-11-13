@@ -147,7 +147,11 @@ const INTERNAL_PARTY_NAME_HINTS = [
   "kalika steel alloys private limited",
 ].map(normalizeMatchKey);
 
+// Kalika written in Devanagari on Hindi/Marathi transport receipts.
+const INTERNAL_PARTY_NAME_DEVANAGARI = /काल[िी]का/;
+
 function isInternalPartyName(value?: string | null) {
+  if (INTERNAL_PARTY_NAME_DEVANAGARI.test(normalizeValue(value))) return true;
   const key = normalizeMatchKey(normalizeValue(value));
   if (!key) return false;
   return INTERNAL_PARTY_NAME_HINTS.some((hint) => hint && key.includes(hint));
@@ -343,7 +347,39 @@ function derivePreferredCounterpartyName(documents: CaseDoc[]) {
   return buyerCandidate?.value || vendorCandidate?.value || "";
 }
 
+function cleanPartyName(value: string) {
+  return value.replace(/^m\s*\/\s*s\.?\s+/i, "").trim();
+}
+
+// The invoice billed to our own company (Kalika). In a trading chain every middleman is the
+// buyer on one bill and the seller on the next, so counting names across the packet cannot
+// tell who sold to us; this invoice can. Its seller names the case and its number is the
+// case reference. Returns null when there is no such invoice or they name different sellers.
+export function findCompanyFacingInvoice(documents: CaseDoc[]) {
+  const invoices = documents.filter((document) =>
+    (document.type === "Tax Invoice" || document.type === "Invoice") &&
+    isInternalPartyName(document.fields.buyerName) &&
+    normalizePartyName(document.fields.vendorName) &&
+    !isInternalPartyName(document.fields.vendorName)
+  );
+  if (invoices.length === 0) return null;
+  const sellers = new Set(
+    invoices.map((document) => normalizeMatchKey(cleanPartyName(normalizeValue(document.fields.vendorName))))
+  );
+  if (sellers.size !== 1) return null;
+  const withNumber = invoices.find((document) => normalizeValue(document.fields.invoiceNumber)) ?? invoices[0];
+  return {
+    sellerName: cleanPartyName(normalizeValue(withNumber.fields.vendorName)),
+    invoiceNumber: normalizeValue(withNumber.fields.invoiceNumber),
+  };
+}
+
 export function deriveCaseReceiverName(documents: CaseDoc[]) {
+  const companyFacingInvoice = findCompanyFacingInvoice(documents);
+  if (companyFacingInvoice) {
+    return companyFacingInvoice.sellerName;
+  }
+
   const preferredCounterpartyName = derivePreferredCounterpartyName(documents);
   if (preferredCounterpartyName) {
     return preferredCounterpartyName;
@@ -375,6 +411,11 @@ function deriveSourceDisplayName(documents: CaseDoc[]) {
 }
 
 function derivePrimaryReference(documents: CaseDoc[]) {
+  const companyFacingNumber = findCompanyFacingInvoice(documents)?.invoiceNumber;
+  if (companyFacingNumber) {
+    return companyFacingNumber;
+  }
+
   const invoiceReference = pickWeightedDocumentValue(
     documents,
     (document) => normalizeValue(document.fields.invoiceNumber ?? document.fields.referenceInvoiceNumber),
@@ -629,7 +670,9 @@ export function summarizeCase(
   const buyerName = deriveCaseReceiverName(documents);
   const poNumber = firstFieldValue(documents, "poNumber") || firstFieldValue(documents, "referencePoNumber");
   const invoiceNumber =
-    firstFieldValue(documents, "invoiceNumber") || firstFieldValue(documents, "referenceInvoiceNumber");
+    findCompanyFacingInvoice(documents)?.invoiceNumber ||
+    firstFieldValue(documents, "invoiceNumber") ||
+    firstFieldValue(documents, "referenceInvoiceNumber");
   const primaryReference = derivePrimaryReference(documents);
   const sourceDisplayName = deriveSourceDisplayName(documents);
   const packetCategory = derivePacketCategory(documents, fieldConfiguration);

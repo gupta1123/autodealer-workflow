@@ -76,6 +76,11 @@ const DUPLICATE_COPY_LINE_ITEM_SIGNATURE_KEYS = LINE_ITEM_SIGNATURE_KEYS.filter(
     key !== "taxableAmount" &&
     key !== "lineTotal"
 );
+// On a page already identified as another copy of the same invoice, one copy's HSN can be
+// missed by OCR; the row is still the same goods line.
+const DUPLICATE_COPY_WITHOUT_HSN_SIGNATURE_KEYS = DUPLICATE_COPY_LINE_ITEM_SIGNATURE_KEYS.filter(
+  (key) => key !== "hsnSac"
+);
 const TAX_RATE_KEYS: TaxRateKey[] = ["cgstRate", "sgstRate", "igstRate", "taxRate"];
 const DUPLICATE_COPY_PAGE_SIMILARITY_THRESHOLD = 0.88;
 const DUPLICATE_COPY_MIN_COMMON_TOKENS = 35;
@@ -528,15 +533,27 @@ function dedupeDuplicateCopyLineItems(
   const strictIndexBySignature = new Map<string, number>();
   const looseIndexBySignature = new Map<string, number>();
   const duplicateCopyIndexBySignature = new Map<string, number>();
+  const duplicateCopyWithoutHsnIndexBySignature = new Map<string, number>();
 
   for (const item of lineItems) {
     const strictSignature = buildLineItemSignature(item);
     const looseSignature = buildLineItemSignature(item, LOOSE_LINE_ITEM_SIGNATURE_KEYS);
     const duplicateCopySignature = buildLineItemSignature(item, DUPLICATE_COPY_LINE_ITEM_SIGNATURE_KEYS);
+    const duplicateCopyWithoutHsnSignature = buildLineItemSignature(
+      item,
+      DUPLICATE_COPY_WITHOUT_HSN_SIGNATURE_KEYS
+    );
     const sourcePage = item.sourcePage;
     const isFromDuplicateCopy = Boolean(sourcePage && duplicatePageNumbers.has(sourcePage));
+    const withoutHsnMatchIndex = duplicateCopyWithoutHsnSignature
+      ? duplicateCopyWithoutHsnIndexBySignature.get(duplicateCopyWithoutHsnSignature)
+      : undefined;
     const duplicateCopyMatchIndex = duplicateCopySignature
-      ? duplicateCopyIndexBySignature.get(duplicateCopySignature)
+      ? duplicateCopyIndexBySignature.get(duplicateCopySignature) ??
+        (withoutHsnMatchIndex !== undefined &&
+        (!hasLineItemTextValue(item.hsnSac) || !hasLineItemTextValue(result[withoutHsnMatchIndex].hsnSac))
+          ? withoutHsnMatchIndex
+          : undefined)
       : undefined;
     const looseMatchIndex = looseSignature ? looseIndexBySignature.get(looseSignature) : undefined;
     const strictMatchIndex = strictSignature ? strictIndexBySignature.get(strictSignature) : undefined;
@@ -567,6 +584,12 @@ function dedupeDuplicateCopyLineItems(
     }
     if (duplicateCopySignature && !duplicateCopyIndexBySignature.has(duplicateCopySignature)) {
       duplicateCopyIndexBySignature.set(duplicateCopySignature, nextIndex);
+    }
+    if (
+      duplicateCopyWithoutHsnSignature &&
+      !duplicateCopyWithoutHsnIndexBySignature.has(duplicateCopyWithoutHsnSignature)
+    ) {
+      duplicateCopyWithoutHsnIndexBySignature.set(duplicateCopyWithoutHsnSignature, nextIndex);
     }
   }
 

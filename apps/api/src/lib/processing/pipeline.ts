@@ -2980,6 +2980,25 @@ function isCorrectableGstinOcrValue(current: string | undefined, consensus: stri
   return current.slice(0, 2) === consensus.slice(0, 2) && editDistanceValue(current, consensus) <= 2;
 }
 
+const GSTIN_PARTY_NAME_FIELD = { supplierGstin: "vendorName", buyerGstin: "buyerName" } as const;
+
+function partyNameKey(value: string | undefined) {
+  return (value ?? "")
+    .toLowerCase()
+    .replace(/^m\s*\/\s*s\.?\s*/, "")
+    .replace(/\b(private|pvt|limited|ltd|and)\b\.?/g, "")
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function partyNameMatches(ownName: string, knownNames: Set<string>) {
+  return [...knownNames].some((name) => name.includes(ownName) || ownName.includes(name));
+}
+
+// The packet's most common supplier/buyer GSTIN is used only to repair that same party's
+// GSTIN on other documents: a near-miss OCR read, or a blank where the page shows it. A
+// packet can hold several bills between different parties (a trading chain), and a page
+// that merely mentions the common GSTIN (Kalika as ship-to, the middleman as buyer) is not
+// evidence that its own seller or buyer is that party.
 function enrichGstinConsensusValues(documents: CaseDoc[]) {
   const consensusByField = Object.fromEntries(
     GSTIN_CONSENSUS_FIELDS.map((field) => [field, getGstinConsensus(documents, field)])
@@ -2987,21 +3006,42 @@ function enrichGstinConsensusValues(documents: CaseDoc[]) {
 
   if (!Object.values(consensusByField).some(Boolean)) return documents;
 
+  const consensusNames = Object.fromEntries(
+    GSTIN_CONSENSUS_FIELDS.map((field) => {
+      const consensus = consensusByField[field];
+      const names = new Set(
+        documents
+          .filter((doc) => consensus && normalizeGstinForDisplay(doc.fields[field], field) === consensus)
+          .map((doc) => partyNameKey(doc.fields[GSTIN_PARTY_NAME_FIELD[field]]))
+          .filter((key) => key.length >= 4)
+      );
+      return [field, names];
+    })
+  ) as Record<(typeof GSTIN_CONSENSUS_FIELDS)[number], Set<string>>;
+
   return documents.map((doc) => {
     const fields = { ...doc.fields };
     let changed = false;
 
     for (const field of GSTIN_CONSENSUS_FIELDS) {
       const consensus = consensusByField[field];
+      if (!consensus) continue;
       const current = normalizeGstinForDisplay(fields[field], field);
-      if (
-        consensus &&
-        current !== consensus &&
-        (visibleTextSupportsGstin(doc, consensus) || isCorrectableGstinOcrValue(current, consensus))
-      ) {
-        fields[field] = consensus;
-        changed = true;
+      if (current === consensus) continue;
+
+      const ownName = partyNameKey(fields[GSTIN_PARTY_NAME_FIELD[field]]);
+      const sameParty = ownName.length >= 4 && partyNameMatches(ownName, consensusNames[field]);
+      const hasValidOwnGstin = Boolean(current && /^[0-9A-Z]{15}$/.test(current));
+      if (hasValidOwnGstin) {
+        // Another valid GSTIN is kept unless it is a near-miss of the common one or the
+        // document names the same party (a misread of that party's GSTIN).
+        if (!isCorrectableGstinOcrValue(current, consensus) && !sameParty) continue;
+      } else {
+        if ((ownName && !sameParty) || !visibleTextSupportsGstin(doc, consensus)) continue;
       }
+
+      fields[field] = consensus;
+      changed = true;
     }
 
     return changed ? { ...doc, fields } : doc;
@@ -5058,15 +5098,23 @@ async function extractPdfDocumentGroups(params: {
     const sourceHint = `${params.fileName} (${pageRangeLabel(group)})`;
     const groupFileName = sourceHint;
     const groupTextPages = params.textPages.slice(pageStartIndex, pageEndIndex);
-    const groupPageImages = params.pageImages.slice(pageStartIndex, pageEndIndex);
+    const allGroupPageImages = params.pageImages.slice(pageStartIndex, pageEndIndex);
     const hasGroupText = groupTextPages.some((page) => page.replace(/\s+/g, "").length > 20);
+    const blankPages = await Promise.all(allGroupPageImages.map(isLikelyBlankPageImage));
 
     // Blank "Unknown" pages keep their placeholder card but do not pay for an AI call.
     const skipBlankGroup =
       group.documentType === "Unknown" &&
       !hasGroupText &&
-      groupPageImages.length > 0 &&
-      (await Promise.all(groupPageImages.map(isLikelyBlankPageImage))).every(Boolean);
+      allGroupPageImages.length > 0 &&
+      blankPages.every(Boolean);
+
+    // Blank back sides of a double-sided scan stay in the document's page range but are not
+    // sent to the AI: on a near-empty page with faint show-through it can invent a whole
+    // invoice, and its fields then overwrite the real page's fields.
+    const groupPageImages = blankPages.some(Boolean) && !blankPages.every(Boolean)
+      ? allGroupPageImages.filter((_, index) => !blankPages[index])
+      : allGroupPageImages;
 
     // A page with real content that grouping left as "Unknown" (a photo, a stamp page) gets a
     // type of its own so it is extracted instead of shown as an empty card.
@@ -5178,6 +5226,7 @@ async function extractDataFromImagePages(params: {
             `Extract structured fields and visible text from procurement, logistics, transport, vehicle KYC, FASTag, quality certificate, and photo-evidence documents and return only JSON with keys "fields", "lineItems", and "visibleText". ` +
             `This document is a ${params.documentType}. Use only these field keys for this document type: ${allowedFieldKeysText}. ` +
             "visibleText must be a raw OCR-style transcription of the important visible text on the page. " +
+            "If the page is blank, nearly blank, or shows only faint mirror-image show-through from the other side of the sheet, return empty fields, empty lineItems and empty visibleText. Never reconstruct or guess a document from faint or reversed print. " +
             IMAGE_HANDWRITTEN_EXTRACTION_INSTRUCTION +
             AMOUNT_EXTRACTION_INSTRUCTION +
             CONSIGNEE_EXTRACTION_INSTRUCTION +
@@ -5208,7 +5257,9 @@ async function extractDataFromImagePages(params: {
     const parsed = safeJsonParse<{ fields?: Record<string, unknown>; lineItems?: unknown; visibleText?: unknown; text?: unknown; ocrText?: unknown }>(raw, {});
       return {
       fields: parsed.fields ?? {},
-      lineItems: sanitizeLineItems(parsed.lineItems).map((item) => ({ ...item, sourcePage: item.sourcePage ?? index + 1 })),
+      // Each call sees a single page image, so the model's own page number is always 1; the
+      // page's position here is what lets repeated copies of an invoice be recognised.
+      lineItems: sanitizeLineItems(parsed.lineItems).map((item) => ({ ...item, sourcePage: index + 1 })),
       visibleText: toText(parsed.visibleText) || toText(parsed.ocrText) || toText(parsed.text),
       };
     }
@@ -5221,7 +5272,8 @@ async function extractDataFromImagePages(params: {
   const lineItems = normalizeExtractedCommercialLineItems({
     docType: params.documentType,
     lineItems: extracted.flatMap((page) => page.lineItems),
-    visibleTextPages,
+    // Kept in page order (empty pages included) so page numbers on line items line up.
+    visibleTextPages: extracted.map((page) => page.visibleText),
     documentFields: mappedFields,
   });
   const fields = applyPoNumberLabelGuard(

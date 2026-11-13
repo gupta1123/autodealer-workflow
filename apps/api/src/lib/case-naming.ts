@@ -1,5 +1,5 @@
 import { callOpenRouter } from "@/lib/processing/openrouter";
-import type { CaseSummary } from "@/lib/case-summary";
+import { findCompanyFacingInvoice, type CaseSummary } from "@/lib/case-summary";
 import type { CaseDoc, FieldKey } from "@/types/pipeline";
 
 const SUBJECT_CANDIDATE_FIELDS: FieldKey[] = [
@@ -109,6 +109,13 @@ export async function resolveCaseDisplayNameWithAI(
   documents: CaseDoc[],
   summary: CaseSummary
 ) {
+  // The seller on the invoice billed to us names the case; scoring every party in a
+  // multi-bill trading chain would otherwise pick whichever bill comes first.
+  const companyFacingInvoice = findCompanyFacingInvoice(documents);
+  if (companyFacingInvoice) {
+    return composeDisplayName(companyFacingInvoice.sellerName, summary);
+  }
+
   const candidates = collectSubjectCandidates(documents);
   if (candidates.length === 0) {
     return summary.displayName;
