@@ -25,6 +25,7 @@ import {
   openBillBlockRequiresVoucherFallback,
   parseLedgerClosingBalance,
   purchasePayloadMasterNames,
+  purchaseDuplicateSearchRange,
   purchaseVoucherFinancialYearRange,
   purchaseVoucherReadbackComparison,
   getBankVoucherCommandBatchKey,
@@ -1308,4 +1309,24 @@ test("two items on one purchase ledger verify against Tally's single combined le
   assert.deepEqual(withLedgers([{ ledgerName: "M.S. Scrap Purchase", amount: -641067 }, { ledgerName: "M.S. Scrap Purchase", amount: -410571 }]), []);
   // A wrong total is still a mismatch.
   assert.ok(withLedgers([{ ledgerName: "M.S. Scrap Purchase", amount: -1000000 }]).some((text) => /M\.S\. Scrap Purchase purchase ledger/.test(text)));
+});
+
+test("purchase duplicate scan stops at today instead of the end of the financial year", () => {
+  assert.deepEqual(
+    purchaseDuplicateSearchRange("2026-11-12", "2026-11-13"),
+    { dateFrom: "2026-04-01", dateTo: "2026-11-13" }
+  );
+  // A voucher dated after today is still covered.
+  assert.deepEqual(
+    purchaseDuplicateSearchRange("2026-11-20", "2026-11-13"),
+    { dateFrom: "2026-04-01", dateTo: "2026-11-20" }
+  );
+  // A past financial year is scanned in full.
+  assert.deepEqual(
+    purchaseDuplicateSearchRange("2025-12-01", "2026-11-13"),
+    { dateFrom: "2025-04-01", dateTo: "2026-03-31" }
+  );
+  // Eight monthly reads instead of twelve for a November posting.
+  const range = purchaseDuplicateSearchRange("2026-11-12", "2026-11-13");
+  assert.equal(cashDiscountVoucherDateChunks(range.dateFrom, range.dateTo).length, 8);
 });

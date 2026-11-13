@@ -35,6 +35,14 @@ const DEFAULT_TALLY_URL = "http://localhost:9000";
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 const DEFAULT_COMPANY_LIST_INTERVAL_MS = 5 * 60_000;
 const TALLY_IMPORT_TIMEOUT_MS = 30_000;
+// Saving a purchase voucher with inventory into a large company routinely takes longer
+// than 30 seconds in Tally, and Tally finishes the save even after we stop waiting.
+// The whole command (duplicate check + save + read-back) must still finish inside the
+// server's purchase claim window (commands/next route).
+const PURCHASE_IMPORT_TIMEOUT_MS = 75_000;
+// After a save times out, look for the voucher again after this pause in case Tally
+// is still committing it.
+const PURCHASE_TIMEOUT_READBACK_RETRY_MS = 10_000;
 const TALLY_READINESS_TIMEOUT_MS = 5_000;
 // Exports can be larger than imports, but they must still release the bridge
 // cycle if Tally is busy or has stopped responding.
@@ -2173,6 +2181,23 @@ function purchaseVoucherFinancialYearRange(value) {
   };
 }
 
+function localIsoDate(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+// The duplicate scan covers the voucher's financial year, but nothing can be dated after
+// today (or after the voucher itself), so months still to come are not scanned. On a large
+// company each month is a multi-second read in Tally.
+export function purchaseDuplicateSearchRange(voucherDate, today = localIsoDate()) {
+  const range = purchaseVoucherFinancialYearRange(voucherDate);
+  const voucherDay = normalizeTallyDate(voucherDate);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(range.dateFrom) || !/^\d{4}-\d{2}-\d{2}$/.test(range.dateTo)) return range;
+  const latest = [today, voucherDay].filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value)).sort().pop();
+  if (!latest || latest < range.dateFrom || latest >= range.dateTo) return range;
+  return { dateFrom: range.dateFrom, dateTo: latest };
+}
+
 async function verifyPurchaseVoucherInTally(config, payload = {}, options = {}) {
   const companyName = payload?.companyName || config?.companyName || null;
   const tallyUrl = normalizeTallyUrl(payload?.tallyUrl || config?.tallyUrl);
@@ -2185,7 +2210,7 @@ async function verifyPurchaseVoucherInTally(config, payload = {}, options = {}) 
   }
 
   const searchRange = options.searchFinancialYear
-    ? purchaseVoucherFinancialYearRange(voucherDate)
+    ? purchaseDuplicateSearchRange(voucherDate)
     : { dateFrom: voucherDate, dateTo: voucherDate };
   const preferredMasterId = String(options.preferredMasterId || "").trim();
   const preferredMasterFormula = /^\d+$/.test(preferredMasterId)
@@ -2601,11 +2626,65 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName, options = {})
   try {
     options.onStage?.("importing_voucher");
     importOutcome = requireCreatedVoucher(
-      await measure("voucherImport", () => invokeTallyXml(tallyUrl, xml))
+      await measure("voucherImport", () => invokeTallyXml(tallyUrl, xml, PURCHASE_IMPORT_TIMEOUT_MS))
     );
   } catch (error) {
-    timings.totalMs = Date.now() - totalStartedAt;
     const message = error instanceof Error ? error.message : String(error);
+    const timedOut = /timed out|abort/i.test(message);
+    // Tally normally completes a save we stopped waiting for. Look for the voucher on its
+    // own date (a small read) before reporting the write as uncertain.
+    if (timedOut) {
+      options.onStage?.("verifying_voucher", { lastVchId: null, created: null, altered: null });
+      let timeoutReadback = null;
+      try {
+        timeoutReadback = await measure("timeoutReadback", async () => {
+          let attempt = await verifyPurchaseVoucherInTally({ tallyUrl, companyName }, postingPayload);
+          if (attempt.result?.verificationStatus === "missing") {
+            await new Promise((resolve) => setTimeout(resolve, PURCHASE_TIMEOUT_READBACK_RETRY_MS));
+            attempt = await verifyPurchaseVoucherInTally({ tallyUrl, companyName }, postingPayload);
+          }
+          return attempt;
+        });
+      } catch {
+        timeoutReadback = null;
+      }
+      if (timeoutReadback?.result?.verificationStatus === "verified") {
+        timings.totalMs = Date.now() - totalStartedAt;
+        return {
+          outcome: {
+            success: true,
+            result: {
+              ...timeoutReadback.result,
+              verification: timeoutReadback.result,
+              importTimedOutButVerified: true,
+              sourceDocumentVerified: Boolean(payload?.sourceDocumentPath),
+              voucherNumberingMethod: numbering.method,
+              proposedVoucherNumber: numbering.acceptsProvidedNumber ? proposedVoucherNumber : null,
+              voucherNumberAssignedByTally: !numbering.acceptsProvidedNumber,
+              timings,
+            },
+          },
+          xml,
+        };
+      }
+      timings.totalMs = Date.now() - totalStartedAt;
+      return {
+        outcome: {
+          success: false,
+          error: "The Purchase voucher write was sent to Tally, but its result is uncertain. Verify the existing voucher before retrying.",
+          result: {
+            voucherCreatedButVerificationFailed: true,
+            uncertainWrite: true,
+            uncertaintyReason: "import_timeout",
+            importError: message,
+            timeoutReadbackStatus: timeoutReadback?.result?.verificationStatus ?? "failed",
+            timings,
+          },
+        },
+        xml,
+      };
+    }
+    timings.totalMs = Date.now() - totalStartedAt;
     return {
       outcome: {
         success: false,
@@ -3276,7 +3355,7 @@ async function postDebitNote(tallyUrl, payload, companyName) {
   return { outcome, xml };
 }
 
-async function invokeTallyXml(tallyUrl, xml) {
+async function invokeTallyXml(tallyUrl, xml, timeoutMs = TALLY_IMPORT_TIMEOUT_MS) {
   const controller = new AbortController();
   let timeout;
 
@@ -3296,7 +3375,7 @@ async function invokeTallyXml(tallyUrl, xml) {
           const error = new Error("Tally import timed out.");
           error.name = "AbortError";
           reject(error);
-        }, TALLY_IMPORT_TIMEOUT_MS);
+        }, timeoutMs);
       }),
     ]);
 
