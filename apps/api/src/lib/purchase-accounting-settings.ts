@@ -48,7 +48,7 @@ export const DEFAULT_PURCHASE_VALIDATION_POLICY: PurchaseValidationPolicy = {
   supplierLedgerGstinMismatch: "block",
   hsnMissing: "warn",
   stockItemHsnMismatch: "warn",
-  stockItemUnitMismatch: "warn",
+  stockItemUnitMismatch: "block",
   sourceDocumentMissing: "warn",
   caseNotAccepted: "block",
   staleTallyMasters: "warn",

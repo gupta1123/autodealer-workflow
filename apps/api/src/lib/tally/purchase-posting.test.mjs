@@ -1705,3 +1705,51 @@ test("every bill up a trading chain is recognised as a mother bill, by GSTIN, by
   assert.match(roles.get("autogen").reason, /same vehicle/);
   assert.equal(roles.get("unrelated").role, "other");
 });
+
+function kilogramInvoice({ quantity = "25320", rate = "37", taxableAmount = "936840" } = {}) {
+  const document = invoiceDocument({ totalAmount: "", taxAmount: "", tdsAmount: "", lines: [{
+    description: "MS Steel Waste & Scrap", hsnSac: "72044900", quantity, unit: "KG", rate, taxableAmount, taxRate: "18",
+  }] });
+  Object.assign(document.extracted_fields, { totalTaxableAmount: taxableAmount, cgstTdsAmount: "", sgstTdsAmount: "" });
+  return document;
+}
+
+function withStockUnit(unitName, extra = []) {
+  return [
+    ...completeMasters.filter((row) => row.master_type !== "stock_item"),
+    master("stock_item", "M S Scrap & Sponge Iron", { unit_name: unitName }),
+    ...extra,
+  ];
+}
+
+test("a KG invoice line posts in the stock item's MTS unit with the same amount (LEO-500)", () => {
+  const result = prepare(kilogramInvoice(), { masters: withStockUnit("MTS") });
+  const [item] = result.tallyPayload.items;
+  assert.deepEqual({ quantity: item.quantity, unit: item.unit, rate: item.rate, taxableAmount: item.taxableAmount },
+    { quantity: "25.32", unit: "MTS", rate: "37000", taxableAmount: "936840" });
+  assert.equal(result.review.lines[0].quantity, "25320", "the review keeps the invoice's own figures");
+  assert.equal(result.review.lines[0].unit, "KG");
+  assert.ok(result.warnings.some((row) => row.code === "STOCK_ITEM_UNIT_CONVERTED" && /25\.32 MTS at ₹37000/.test(row.message)));
+  assert.equal([...result.blockers, ...result.warnings].some((row) => row.code === "STOCK_ITEM_UNIT_MISMATCH"), false);
+});
+
+test("an invoice unit Tally does not have is sent as the stock item's spelling (KG to KGS)", () => {
+  const result = prepare(kilogramInvoice(), { masters: withStockUnit("KGS") });
+  const [item] = result.tallyPayload.items;
+  assert.deepEqual({ quantity: item.quantity, unit: item.unit, rate: item.rate }, { quantity: "25320", unit: "KGS", rate: "37" });
+});
+
+test("units that cannot be converted stop the posting by default", () => {
+  const result = prepare(kilogramInvoice(), { masters: withStockUnit("Nos") });
+  const mismatch = result.blockers.find((row) => row.code === "STOCK_ITEM_UNIT_MISMATCH");
+  assert.ok(mismatch, "blocked, not just a warning");
+  assert.match(mismatch.message, /KG cannot be converted to Nos/);
+});
+
+test("a converted quantity that exceeds the Tally unit's decimals is stopped", () => {
+  const masters = withStockUnit("MTS", [master("unit", "MTS", { raw_payload: { decimalPlaces: 3 } })]);
+  const result = prepare(kilogramInvoice({ quantity: "25320.5", rate: "37", taxableAmount: "936858.50" }), { masters });
+  const precision = result.blockers.find((row) => row.code === "LINE_PRECISION_UNSUPPORTED");
+  assert.ok(precision);
+  assert.match(precision.message, /25\.3205 MTS/);
+});

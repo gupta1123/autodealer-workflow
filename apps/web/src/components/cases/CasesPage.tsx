@@ -191,8 +191,11 @@ function getTallyPostingLabel(posting: SavedCaseRecord["tallyPosting"]) {
       title: posting?.postedAt ? `Posted to Tally ${formatRelativeDate(posting.postedAt)}` : "Posted to Tally",
     };
   }
-  if (status === "approved" || status === "queued" || status === "creating" || status === "sending") {
-    return { label: "Posting…", className: "font-medium text-[#2b6cb0]", title: "Sending to Tally" };
+  if (status === "creating" || status === "sending") {
+    return { label: "Posting…", className: "font-medium text-[#2b6cb0]", title: "Tally is saving this voucher" };
+  }
+  if (status === "approved" || status === "queued") {
+    return { label: "In line for Tally", className: "font-medium text-[#2b6cb0]", title: "Purchase posts go to Tally one at a time; this one is waiting its turn" };
   }
   if (status === "verification_required") {
     return { label: posting?.voucherNumber ? `Check in Tally · ${posting.voucherNumber}` : "Check in Tally", className: "font-semibold text-[#9a6700]", title: "Tally's reply was lost; check whether the voucher exists" };
@@ -354,6 +357,12 @@ export function CasesPage() {
           refreshTimer = setTimeout(refresh, 4000);
         } else {
           setProgressByCase({});
+          // Purchase posts run one after another in the connector; keep their status live
+          // so people can queue several and watch them finish from the list.
+          const postingInFlight = payload.cases.some((item) =>
+            ["approved", "queued", "creating", "sending"].includes(item.tallyPosting?.status ?? "")
+          );
+          if (postingInFlight) refreshTimer = setTimeout(refresh, 10_000);
         }
       })
       .catch((loadError) => {

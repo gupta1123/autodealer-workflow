@@ -1055,10 +1055,12 @@ export function TallyPurchasePostingPanel({
     if (connectionId && commandId) {
       void (async () => {
         let pollAttempt = 0;
-        const pollingStartedAt = Date.now();
+        // Waiting in line behind other purchase posts is normal and has no time limit;
+        // only the post's own run (about two minutes on a large company) is timed.
+        let runStartedAt: number | null = null;
         try {
           while (!cancelled) {
-            if (Date.now() - pollingStartedAt > 180_000) {
+            if (runStartedAt !== null && Date.now() - runStartedAt > 6 * 60_000) {
               setNotice("Tally is taking longer than expected. Refresh status to verify the existing command; do not submit it again.");
               return;
             }
@@ -1067,6 +1069,17 @@ export function TallyPurchasePostingPanel({
               attempts: 1,
               intervalMs,
               onProgress: (phase) => setNotice(purchaseStageMessage(phase)),
+              onQueue: (queue, status) => {
+                if (cancelled) return;
+                if (status === "claimed" && runStartedAt === null) {
+                  runStartedAt = queue?.startedAt ? new Date(queue.startedAt).getTime() : Date.now();
+                }
+                if (status === "queued" && queue) {
+                  setNotice(queue.ahead > 0
+                    ? `In line for Tally: ${queue.ahead} purchase ${queue.ahead === 1 ? "post" : "posts"} ahead${queue.runningInvoiceNumber ? ` (now saving ${queue.runningInvoiceNumber})` : ""}. You can open other cases; this post continues on its own.`
+                    : "Next in line for Tally. You can open other cases; this post continues on its own.");
+                }
+              },
             });
             pollAttempt += 1;
             if (!terminal) continue;
@@ -1172,7 +1185,7 @@ export function TallyPurchasePostingPanel({
   }, [connectionDirty, dirty]);
 
   useEffect(() => {
-    if (!notice || refreshingMasters || /waiting|refreshing|queued|creating|sending|preparing/i.test(notice)) return;
+    if (!notice || refreshingMasters || /waiting|refreshing|queued|creating|sending|preparing|in line|next in line|tally is busy/i.test(notice)) return;
     const timeout = window.setTimeout(() => setNotice(null), 5000);
     return () => window.clearTimeout(timeout);
   }, [notice, refreshingMasters]);
@@ -3166,18 +3179,30 @@ export function TallyPurchasePostingPanel({
                   <span className="text-right">Amount</span>
                 </div>
                 <div className="min-h-[255px] py-1">
-                  {review.lines.map((line) => (
+                  {review.lines.map((line) => {
+                    // The saved Tally payload carries the stock item's own unit; show it when
+                    // the invoice unit is converted (25,320 KG -> 25.32 MTS).
+                    const tallyItems = Array.isArray(payload.tallyPayload?.items)
+                      ? (payload.tallyPayload.items as Array<Record<string, unknown>>)
+                      : [];
+                    const tallyItem = tallyItems.find((item) => item.lineId === line.lineId);
+                    const convertedUnit = tallyItem && typeof tallyItem.unit === "string" && tallyItem.unit !== line.unit
+                      ? `Posts to Tally as ${tallyQuantity(String(tallyItem.quantity ?? ""))} ${tallyItem.unit} @ ${tallyAmount(String(tallyItem.rate ?? ""))}`
+                      : null;
+                    return (
                     <div className="grid grid-cols-[minmax(280px,1fr)_120px_115px_60px_145px] items-start px-1 py-1" key={line.lineId}>
                       <div className="pr-5">
                         <strong>{line.stockItemName || line.description || "Item not mapped"}</strong>
                         <div className="text-[9px] text-[#657186]">{line.description || `HSN ${line.hsn || "missing"}`}</div>
+                        {convertedUnit ? <div className="text-[9px] font-semibold text-[#173b70]">{convertedUnit}</div> : null}
                       </div>
                       <strong className="text-right tabular-nums">{tallyQuantity(line.quantity)}</strong>
                       <strong className="text-right tabular-nums">{tallyAmount(line.rate)}</strong>
                       <span className="text-center">{line.unit || "—"}</span>
                       <strong className="text-right tabular-nums">{tallyAmount(line.taxableAmount)}</strong>
                     </div>
-                  ))}
+                    );
+                  })}
                   {previewLedgerRows.map((row, index) => (
                     <div className="grid grid-cols-[minmax(280px,1fr)_120px_115px_60px_145px] px-1 py-0.5" key={`${row.ledger}-${index}`}>
                       <strong>{row.ledger}</strong>
@@ -3254,7 +3279,7 @@ export function TallyPurchasePostingPanel({
           error
             ? "border-rose-200 bg-rose-50 text-rose-700"
             : ["approved", "queued", "creating"].includes(payload.posting?.status ?? "") ||
-                /waiting|refreshing|queued|creating|sending|preparing|reading/i.test(notice ?? "")
+                /waiting|refreshing|queued|creating|sending|preparing|reading|in line|tally is busy/i.test(notice ?? "")
               ? "border-blue-200 bg-blue-50 text-blue-800"
               : payload.posting?.status === "verification_required"
                 ? "border-amber-200 bg-amber-50 text-amber-800"

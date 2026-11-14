@@ -283,7 +283,9 @@ const DEFAULT_PURCHASE_VALIDATION_POLICY: PurchaseValidationPolicy = {
   supplierLedgerGstinMismatch: "block",
   hsnMissing: "warn",
   stockItemHsnMismatch: "warn",
-  stockItemUnitMismatch: "warn",
+  // Units of the same kind are converted to the stock item's unit before posting; what
+  // remains cannot be represented in Tally correctly, so it stops the posting by default.
+  stockItemUnitMismatch: "block",
   sourceDocumentMissing: "warn",
   caseNotAccepted: "block",
   staleTallyMasters: "warn",
@@ -413,6 +415,78 @@ function normalizeUnit(value: unknown) {
     return "metricton";
   }
   return normalized;
+}
+
+// Units that convert into each other by a power of ten: family plus the power of ten of
+// one unit in the family's base (kg, piece, litre, metre). Tally gets the quantity in the
+// stock item's own unit; an invoice unit Tally does not know (e.g. "KG" when the company
+// has only "KGS") would otherwise be stored wrongly.
+const UNIT_SCALES: Record<string, { family: string; exponent: number }> = {
+  ...Object.fromEntries(["g", "gm", "gms", "gram", "grams", "grm", "grms"].map((unit) => [unit, { family: "mass", exponent: -3 }])),
+  ...Object.fromEntries(["kg", "kgs", "kilo", "kilos", "kilogram", "kilograms"].map((unit) => [unit, { family: "mass", exponent: 0 }])),
+  ...Object.fromEntries(["qtl", "qtls", "quintal", "quintals"].map((unit) => [unit, { family: "mass", exponent: 2 }])),
+  ...Object.fromEntries(["mt", "mts", "metricton", "metrictons", "ton", "tons", "tonne", "tonnes"].map((unit) => [unit, { family: "mass", exponent: 3 }])),
+  ...Object.fromEntries(["no", "nos", "number", "numbers", "pc", "pcs", "piece", "pieces", "unit", "units", "ea", "each"].map((unit) => [unit, { family: "count", exponent: 0 }])),
+  ...Object.fromEntries(["ml", "mlt", "mls", "millilitre", "milliliter"].map((unit) => [unit, { family: "volume", exponent: -3 }])),
+  ...Object.fromEntries(["l", "ltr", "ltrs", "litre", "litres", "liter", "liters"].map((unit) => [unit, { family: "volume", exponent: 0 }])),
+  ...Object.fromEntries(["mm"].map((unit) => [unit, { family: "length", exponent: -3 }])),
+  ...Object.fromEntries(["cm"].map((unit) => [unit, { family: "length", exponent: -2 }])),
+  ...Object.fromEntries(["m", "mtr", "mtrs", "metre", "metres", "meter", "meters"].map((unit) => [unit, { family: "length", exponent: 0 }])),
+};
+
+function unitScale(value: unknown) {
+  return UNIT_SCALES[normalizeKey(value)] ?? null;
+}
+
+// Moves the decimal point of a plain decimal string without floating-point error.
+function shiftDecimal(value: string, places: number) {
+  const plain = value.replace(/,/g, "").trim();
+  const match = plain.match(/^(\d*)(?:\.(\d*))?$/);
+  if (!match || (!match[1] && !match[2])) return null;
+  const digits = `${match[1]}${match[2] ?? ""}`;
+  let point = match[1].length + places;
+  let padded = digits;
+  if (point < 0) {
+    padded = `${"0".repeat(-point)}${padded}`;
+    point = 0;
+  }
+  if (point > padded.length) padded = padded.padEnd(point, "0");
+  const integer = padded.slice(0, point).replace(/^0+(?=\d)/, "") || "0";
+  const fraction = padded.slice(point).replace(/0+$/, "");
+  return fraction ? `${integer}.${fraction}` : integer;
+}
+
+function decimalPlaces(value: string) {
+  return value.replace(/,/g, "").split(".")[1]?.length ?? 0;
+}
+
+type PostingQuantity = {
+  quantity: string;
+  rate: string;
+  unit: string;
+  converted: boolean;
+};
+
+// The quantity, rate and unit sent to Tally for a line: the stock item's own unit,
+// converted from the invoice unit when both are the same kind (25,320 KG at 37 becomes
+// 25.32 MTS at 37,000; the amount is unchanged). null when the units cannot be converted.
+function postingQuantityForLine(
+  line: Pick<PurchasePostingReviewLine, "quantity" | "rate" | "unit">,
+  stockUnit: string | null | undefined
+): PostingQuantity | null {
+  const unchanged = { quantity: line.quantity, rate: line.rate, unit: line.unit, converted: false };
+  if (!stockUnit) return unchanged;
+  if (normalizeUnit(stockUnit) === normalizeUnit(line.unit)) {
+    return { ...unchanged, unit: stockUnit };
+  }
+  const from = unitScale(line.unit);
+  const to = unitScale(stockUnit);
+  if (!from || !to || from.family !== to.family) return null;
+  const shift = from.exponent - to.exponent;
+  const quantity = shiftDecimal(line.quantity, shift);
+  const rate = shiftDecimal(line.rate, -shift);
+  if (quantity === null || rate === null) return null;
+  return { quantity, rate, unit: stockUnit, converted: shift !== 0 || normalizeKey(stockUnit) !== normalizeKey(line.unit) };
 }
 
 function materialFromHsn(hsnValue: string) {
@@ -2126,9 +2200,13 @@ export function preparePurchasePosting(params: {
     ) {
       blockers.push(issue("LINE_ACCOUNTING_FIELDS_REQUIRED", "Complete item values", "Description, quantity, unit, rate and taxable amount are required.", "line", line.lineId));
     } else {
-      const quantityDecimals = line.quantity.replace(/,/g, "").split(".")[1]?.length ?? 0;
-      const rateDecimals = line.rate.replace(/,/g, "").split(".")[1]?.length ?? 0;
-      const unitMaster = selectedMaster(params.masters, line.unit, ["unit"]);
+      // Precision applies to what Tally receives: the stock item's unit after conversion.
+      const lineStockItem = selectedMaster(params.masters, line.stockItemName, ["stock_item"]);
+      const posting = postingQuantityForLine(line, lineStockItem?.unit_name) ??
+        { quantity: line.quantity, rate: line.rate, unit: line.unit, converted: false };
+      const quantityDecimals = decimalPlaces(posting.quantity);
+      const rateDecimals = decimalPlaces(posting.rate);
+      const unitMaster = selectedMaster(params.masters, posting.unit, ["unit"]);
       const liveUnitPrecision = Number(unitMaster?.raw_payload?.decimalPlaces);
       const quantityPrecision = Number.isFinite(liveUnitPrecision)
         ? Math.max(0, Math.min(6, Math.trunc(liveUnitPrecision)))
@@ -2137,7 +2215,9 @@ export function preparePurchasePosting(params: {
         blockers.push(issue(
           "LINE_PRECISION_UNSUPPORTED",
           "Item precision is unsupported",
-          `The selected Tally unit supports ${quantityPrecision} quantity decimal place${quantityPrecision === 1 ? "" : "s"}; Purchase rates support up to 4 decimals.`,
+          posting.converted
+            ? `In Tally's unit this line is ${posting.quantity} ${posting.unit} at ₹${posting.rate}. The ${posting.unit} unit supports ${quantityPrecision} quantity decimal place${quantityPrecision === 1 ? "" : "s"}; Purchase rates support up to 4 decimals.`
+            : `The selected Tally unit supports ${quantityPrecision} quantity decimal place${quantityPrecision === 1 ? "" : "s"}; Purchase rates support up to 4 decimals.`,
           "line",
           line.lineId
         ));
@@ -2178,14 +2258,20 @@ export function preparePurchasePosting(params: {
           line.lineId
         ));
       }
-      if (
-        stockItem.unit_name &&
-        normalizeUnit(stockItem.unit_name) !== normalizeUnit(line.unit)
-      ) {
+      const posting = line.unit ? postingQuantityForLine(line, stockItem.unit_name) : null;
+      if (line.unit && !posting) {
         blockers.push(issue(
           "STOCK_ITEM_UNIT_MISMATCH",
           "Stock item unit does not match",
-          `${stockItem.tally_name} uses ${stockItem.unit_name}, but the invoice line uses ${line.unit}.`,
+          `${stockItem.tally_name} is kept in ${stockItem.unit_name} in Tally, but the invoice line is in ${line.unit}, and ${line.unit} cannot be converted to ${stockItem.unit_name}. Choose a stock item kept in ${line.unit}, or correct the unit.`,
+          "line",
+          line.lineId
+        ));
+      } else if (posting?.converted) {
+        warnings.push(issue(
+          "STOCK_ITEM_UNIT_CONVERTED",
+          "Posted in the stock item's unit",
+          `${stockItem.tally_name} is kept in ${posting.unit} in Tally, so this line posts as ${posting.quantity} ${posting.unit} at ₹${posting.rate} per ${posting.unit} (invoice: ${line.quantity} ${line.unit} at ₹${line.rate}). The amount is unchanged.`,
           "line",
           line.lineId
         ));
@@ -2549,20 +2635,19 @@ export function preparePurchasePosting(params: {
     taxMode: calculation.taxMode,
     items: review.lines.map((line) => {
       const stockItem = selectedMaster(params.masters, line.stockItemName, ["stock_item"]);
-      const postingUnit =
-        stockItem?.unit_name &&
-        normalizeUnit(stockItem.unit_name) === normalizeUnit(line.unit)
-          ? stockItem.unit_name
-          : line.unit;
+      // Tally receives the stock item's own unit; a mismatch that cannot be converted is
+      // stopped by STOCK_ITEM_UNIT_MISMATCH before approval.
+      const posting = postingQuantityForLine(line, stockItem?.unit_name) ??
+        { quantity: line.quantity, rate: line.rate, unit: line.unit, converted: false };
       return {
         lineId: line.lineId,
         stockItemName: line.stockItemName,
         purchaseLedgerName: line.purchaseLedgerName,
         description: line.description,
         hsn: normalizeHsn(line.hsn),
-        quantity: line.quantity,
-        unit: postingUnit,
-        rate: line.rate,
+        quantity: posting.quantity,
+        unit: posting.unit,
+        rate: posting.rate,
         taxableAmount: line.taxableAmount || formatPaise(calculateLineTaxable(line)),
         taxRate: line.taxRate || review.gstRate,
         godownName: line.godownName,

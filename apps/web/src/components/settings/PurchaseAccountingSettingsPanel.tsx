@@ -28,7 +28,7 @@ const RULE_GROUPS = [
     rules: [
       ["hsnMissing", "HSN missing", "Skipped when the Tally item already supplies it."],
       ["stockItemHsnMismatch", "Stock-item HSN differs", "Ask for review when invoice and Tally classification differ."],
-      ["stockItemUnitMismatch", "Stock-item unit differs", "Tally may support an alternate unit or conversion."],
+      ["stockItemUnitMismatch", "Stock-item unit cannot be converted", "Same-kind units (KG, MTS, KGS, Nos, PCS…) are converted to the stock item's Tally unit automatically. This rule covers units that cannot be converted."],
     ],
   },
   {

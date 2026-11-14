@@ -342,17 +342,31 @@ export function watchTallyConnection(connectionId:string,onStatus:(online:boolea
 }
 
 const RECOVERABLE_READS=new Set<LiveRequest['operation']>(['company_check','bank_ledgers','ledger_masters','ledger_suggestions']);
+const TRANSPORT_ERROR=/live Tally connection (?:is unavailable|closed|failed)|not on the live.*channel|connector disconnected during|Could not connect to the live|Live Tally connection timed out/i;
+// Tally answers one request at a time. While it saves a voucher (about a minute on a large
+// company) a read waits its turn and the connector gives up on it with one of these.
+const TALLY_BUSY_ERROR=/read deadline exceeded|A Tally read is already running|job expired before it could run/i;
+const TALLY_BUSY_WAIT_MS=6*60_000;
+export function isTallyBusyError(error: unknown){return TALLY_BUSY_ERROR.test(error instanceof Error?error.message:String(error??''));}
 export async function runCashDiscountLiveRequest<T>(request: LiveRequest):Promise<T> {
   const epoch=accessCacheEpoch();
   const retryUntil=Date.now()+65_000;
-  // Only repeat reads after a transport interruption. Never replay a write,
-  // permission denial, scan, or an operation with an uncertain posting result.
+  const busyUntil=Date.now()+TALLY_BUSY_WAIT_MS;
+  // Only repeat reads after a transport interruption or while Tally is busy. Never replay a
+  // write, permission denial, scan, or an operation with an uncertain posting result.
   for(let attempt=0;;attempt++){
     try{return await runLiveRequestOnce<T>(request);}
     catch(error){
-      if(!RECOVERABLE_READS.has(request.operation)||attempt>=12||Date.now()>=retryUntil||request.signal?.aborted||epoch!==accessCacheEpoch()||
-        !/live Tally connection (?:is unavailable|closed|failed)|not on the live.*channel|connector disconnected during|Could not connect to the live|Live Tally connection timed out/i.test(error instanceof Error?error.message:''))throw error;
-      request.onProgress?.('Reconnecting to the Local Agent; Tally data will load automatically…');
+      const message=error instanceof Error?error.message:'';
+      const recoverable=RECOVERABLE_READS.has(request.operation)&&!request.signal?.aborted&&epoch===accessCacheEpoch();
+      const busy=recoverable&&TALLY_BUSY_ERROR.test(message);
+      if(busy&&Date.now()>=busyUntil){
+        throw new Error('Tally stayed busy for several minutes (it was saving other vouchers), so its data could not be loaded. Use Refresh once posting has finished.');
+      }
+      if(!busy&&(!recoverable||attempt>=12||Date.now()>=retryUntil||!TRANSPORT_ERROR.test(message)))throw error;
+      request.onProgress?.(busy
+        ?'Tally is busy saving another voucher. Its data will load as soon as Tally is free…'
+        :'Reconnecting to the Local Agent; Tally data will load automatically…');
       await new Promise<void>((resolve,reject)=>{
         const aborted=()=>{window.clearTimeout(timer);request.signal?.removeEventListener('abort',aborted);reject(request.signal?.reason);};
         const timer=window.setTimeout(()=>{request.signal?.removeEventListener('abort',aborted);resolve();},5000);

@@ -958,10 +958,24 @@ export async function queueTallyMasterRefresh(connectionId: string, companyName:
   return payload;
 }
 
+export type TallyPurchaseQueue = {
+  position: number;
+  ahead: number;
+  total: number;
+  runningInvoiceNumber: string | null;
+  startedAt: string | null;
+};
+
 export async function waitForTallyCommand(
   connectionId: string,
   commandId: string,
-  options?: { attempts?: number; intervalMs?: number; onProgress?: (phase: string) => void }
+  options?: {
+    attempts?: number;
+    intervalMs?: number;
+    onProgress?: (phase: string) => void;
+    // Purchase posts wait in line: one at a time per Tally connection, oldest first.
+    onQueue?: (queue: TallyPurchaseQueue | null, status: string) => void;
+  }
 ) {
   const attempts = options?.attempts ?? 45;
   const intervalMs = options?.intervalMs ?? 2000;
@@ -981,6 +995,7 @@ export async function waitForTallyCommand(
         completedAt?: string | null;
         updatedAt?: string | null;
         compactProgress?: { phase?: string | null } | null;
+        queue?: TallyPurchaseQueue | null;
       } | null;
     } = {};
     try {
@@ -993,6 +1008,7 @@ export async function waitForTallyCommand(
     }
     const command = payload.command;
     if (!command) continue;
+    options?.onQueue?.(command.queue ?? null, command.status);
     if (command.compactProgress?.phase) options?.onProgress?.(command.compactProgress.phase);
     if (["succeeded", "failed", "canceled"].includes(command.status)) return command;
   }

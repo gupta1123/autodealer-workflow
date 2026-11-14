@@ -87,7 +87,16 @@ export async function GET(request: Request) {
           return jsonWithCors(request, { error: 'Command authorization or pairing is unavailable.' }, { status: claimed.error.code === '42501' ? 403 : 503 });
         }
         if (!claimed.data) break;
-        commands.push(serializeTallyBridgeCommand(claimed.data as TallyBridgeCommandRow));
+        const claimedRow = claimed.data as TallyBridgeCommandRow;
+        if (claimedRow.command_type === "create_purchase_voucher") {
+          // The case list shows "Posting…" for the one Tally is saving, "In line" for the rest.
+          await supabase
+            .from("purchase_invoice_tally_postings")
+            .update({ status: "creating" })
+            .eq("command_id", claimedRow.id)
+            .in("status", ["approved", "queued"]);
+        }
+        commands.push(serializeTallyBridgeCommand(claimedRow));
       }
       return jsonWithCors(request, { command: commands[0] ?? null, commands });
     }
