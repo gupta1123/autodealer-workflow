@@ -69,3 +69,32 @@ test('detached delivery is deduplicated and a lost ACK does not report a fabrica
   done.resolve({ success: true, result: {} });
   await until(() => deliveryErrors === 1); assert.equal(deliveries, 1);
 });
+
+test('a voucher write lets waiting screen reads through between its steps, without losing its place', async () => {
+  const { createInlinePriorityScheduler } = await import('./scheduler.mjs');
+  const lane = createInlinePriorityScheduler();
+  const order = [];
+  const stepDone = deferred();
+  const write = lane.run(async () => {
+    order.push('write:duplicate-check');
+    await stepDone.promise;
+    assert.equal(lane.backgroundBusy, true);
+    await lane.yieldToInteractive();
+    order.push('write:save');
+  }, { priority: 100 });
+  await tick();
+  const read = lane.run(async () => { order.push('read'); assert.equal(lane.backgroundBusy, false); return 'ledgers'; }, { priority: 50, interactive: true });
+  const background = lane.run(async () => { order.push('background'); }, { priority: 30 });
+  stepDone.resolve();
+  assert.equal(await read, 'ledgers');
+  await write;
+  await background;
+  assert.deepEqual(order, ['write:duplicate-check', 'read', 'write:save', 'background']);
+});
+
+test('yielding is a no-op outside the lane and for interactive work', async () => {
+  const { createInlinePriorityScheduler } = await import('./scheduler.mjs');
+  const lane = createInlinePriorityScheduler();
+  assert.equal(await lane.yieldToInteractive(), 0);
+  assert.equal(await lane.run(() => lane.yieldToInteractive(), { interactive: true }), 0);
+});

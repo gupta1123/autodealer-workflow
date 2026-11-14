@@ -94,39 +94,70 @@ export class AgentJobScheduler {
   }
 }
 
+// One lane to Tally: Tally answers one request at a time. Interactive work is a read
+// someone is waiting for on screen; everything else (voucher writes, background sync)
+// may hand the lane to the interactive reads waiting at that moment between its steps.
 export function createInlinePriorityScheduler() {
   const queue = [];
-  let active = false;
+  let active = null;
   let stopped = false;
   let sequence = 0;
   const executionContext = new AsyncLocalStorage();
   const schedulerToken = Symbol("kalika-tally-lane");
 
+  const execute = async (entry) => {
+    try {
+      entry.signal?.throwIfAborted?.();
+      if (Date.now() > entry.deadlineAt) throw new Error("The connector job expired before it could run.");
+      entry.resolve(await executionContext.run(schedulerToken, entry.task));
+    } catch (error) {
+      entry.reject(error);
+    }
+  };
+
   const drain = async () => {
     if (active || stopped) return;
     const next = queue.sort((left, right) => right.priority - left.priority || left.sequence - right.sequence).shift();
     if (!next) return;
-    active = true;
+    active = next;
     try {
-      next.signal?.throwIfAborted?.();
-      if (Date.now() > next.deadlineAt) throw new Error("The connector job expired before it could run.");
-      next.resolve(await executionContext.run(schedulerToken, next.task));
-    } catch (error) {
-      next.reject(error);
+      await execute(next);
     } finally {
-      active = false;
+      active = null;
       queueMicrotask(drain);
     }
   };
 
   return {
-    get busy() { return active || queue.length > 0; },
+    get busy() { return Boolean(active) || queue.length > 0; },
     get queued() { return queue.length; },
+    // True while the lane runs non-interactive work, such as a voucher save.
+    get backgroundBusy() { return Boolean(active && !active.interactive); },
     stop() {
       stopped = true;
       while (queue.length) queue.shift().reject(new Error("The connector has stopped."));
     },
-    run(task, { signal, deadlineAt = Infinity, priority = 50 } = {}) {
+    // Called by lane-holding work between its own steps (never inside one): runs the
+    // interactive reads waiting right now, oldest first, then returns so the caller
+    // continues. Reads arriving meanwhile wait for the next step boundary, so the caller
+    // keeps its place and cannot be starved.
+    async yieldToInteractive() {
+      if (executionContext.getStore() !== schedulerToken || !active || active.interactive) return 0;
+      const waiting = queue.filter((entry) => entry.interactive).sort((left, right) => left.sequence - right.sequence);
+      if (waiting.length === 0) return 0;
+      for (const entry of waiting) queue.splice(queue.indexOf(entry), 1);
+      const owner = active;
+      try {
+        for (const entry of waiting) {
+          active = entry;
+          await execute(entry);
+        }
+      } finally {
+        active = owner;
+      }
+      return waiting.length;
+    },
+    run(task, { signal, deadlineAt = Infinity, priority = 50, interactive = false } = {}) {
       if (stopped) return Promise.reject(new Error("The connector has stopped."));
       if (executionContext.getStore() === schedulerToken) {
         signal?.throwIfAborted?.();
@@ -134,7 +165,7 @@ export function createInlinePriorityScheduler() {
         return Promise.resolve().then(task);
       }
       return new Promise((resolve, reject) => {
-        queue.push({ task, signal, deadlineAt, priority: Number(priority), sequence: sequence++, resolve, reject });
+        queue.push({ task, signal, deadlineAt, priority: Number(priority), interactive: Boolean(interactive), sequence: sequence++, resolve, reject });
         void drain();
       });
     },

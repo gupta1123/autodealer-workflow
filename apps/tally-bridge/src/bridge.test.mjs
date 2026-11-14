@@ -26,6 +26,8 @@ import {
   parseLedgerClosingBalance,
   purchasePayloadMasterNames,
   purchaseDuplicateSearchRange,
+  purchaseGodownsForCatalogue,
+  verifyPurchaseVoucherInTally,
   purchaseVoucherFinancialYearRange,
   purchaseVoucherReadbackComparison,
   getBankVoucherCommandBatchKey,
@@ -1329,4 +1331,58 @@ test("purchase duplicate scan stops at today instead of the end of the financial
   // Eight monthly reads instead of twelve for a November posting.
   const range = purchaseDuplicateSearchRange("2026-11-12", "2026-11-13");
   assert.equal(cashDiscountVoucherDateChunks(range.dateFrom, range.dateTo).length, 8);
+});
+
+const purchaseVoucherXml = ({ date = "20261008", reference = "1164/2026-27", party = "Smelter AB Bros LLP", type = "Purchase", masterId = "1008248" } = {}) =>
+  `<ENVELOPE><COLLECTION><VOUCHER><DATE>${date}</DATE><VOUCHERTYPENAME>${type}</VOUCHERTYPENAME><VOUCHERNUMBER>${reference}/08.10.26</VOUCHERNUMBER>` +
+  `<REFERENCE>${reference}</REFERENCE><PARTYLEDGERNAME>${party}</PARTYLEDGERNAME><MASTERID>${masterId}</MASTERID></VOUCHER></COLLECTION></ENVELOPE>`;
+const duplicatePayload = {
+  companyName: "Kalika Steel Alloys Pvt Ltd - (25-26)",
+  voucherDate: "2026-11-14",
+  supplierInvoiceNumber: "1164/2026-27",
+  supplierLedgerName: "Smelter AB Bros LLP",
+};
+
+test("purchase duplicate check reads only the supplier's ledger vouchers, not every month of the year", async () => {
+  const calls = [];
+  const exportCollection = async (_url, options) => {
+    calls.push(options);
+    return options.tallyType === "Vouchers : Ledger"
+      ? purchaseVoucherXml() + purchaseVoucherXml({ date: "20250610", masterId: "1" }) + purchaseVoucherXml({ type: "Payment", masterId: "2" })
+      : purchaseVoucherXml();
+  };
+  const result = await verifyPurchaseVoucherInTally({ tallyUrl: "http://tally" }, duplicatePayload, { searchFinancialYear: true }, { exportCollection });
+  assert.equal(calls[0].tallyType, "Vouchers : Ledger");
+  assert.equal(calls[0].childOf, '"Smelter AB Bros LLP"');
+  assert.equal(calls.filter((call) => call.tallyType === "Voucher" && call.collectionName.includes("Identity")).length, 0, "no month-by-month scan");
+  assert.equal(result.result.masterId, "1008248", "last year's voucher with the same number and other voucher types are ignored");
+});
+
+test("purchase duplicate check falls back to the year scan when the supplier read fails", async () => {
+  const identityScans = [];
+  const exportCollection = async (_url, options) => {
+    if (options.tallyType === "Vouchers : Ledger") throw new Error("Tally is busy");
+    if (options.collectionName.includes("Identity")) identityScans.push(options.dateFrom);
+    return "<ENVELOPE><COLLECTION></COLLECTION></ENVELOPE>";
+  };
+  const result = await verifyPurchaseVoucherInTally({ tallyUrl: "http://tally" }, duplicatePayload, { searchFinancialYear: true }, { exportCollection });
+  assert.ok(identityScans.length >= 8, "the full year was still checked");
+  assert.equal(result.result.verificationStatus, "missing");
+});
+
+test("purchase godowns come from the last list while Tally is busy or the read fails", async () => {
+  let clock = 1_000;
+  const now = () => clock;
+  const live = [{ name: "Main Location" }];
+  const first = await purchaseGodownsForCatalogue({ companyName: "Kalika Godown Test", fetchLive: async () => live, now });
+  assert.deepEqual(first, live);
+  let fetched = false;
+  clock += 20 * 60_000;
+  const whileBusy = await purchaseGodownsForCatalogue({ companyName: "Kalika Godown Test", fetchLive: async () => { fetched = true; return []; }, now, laneBusy: () => true });
+  assert.deepEqual(whileBusy, live);
+  assert.equal(fetched, false, "a busy Tally is not asked");
+  const afterFailure = await purchaseGodownsForCatalogue({ companyName: "Kalika Godown Test", fetchLive: async () => { throw new Error("Cash Discount read deadline exceeded."); }, now, laneBusy: () => false });
+  assert.deepEqual(afterFailure, live);
+  const noneYet = await purchaseGodownsForCatalogue({ companyName: "Kalika Godown Other", fetchLive: async () => { throw new Error("timed out"); }, now });
+  assert.deepEqual(noneYet, [], "an optional list never fails the screen");
 });

@@ -1980,11 +1980,13 @@ function purchaseVoucherReadbackComparison(voucher, payload, options = {}) {
       differences.push(`Line ${index + 1} purchase ledger differs.`);
     }
     const actualQuantity = splitQuantity(actual.quantity);
-    if (!closeMoney(actualQuantity.value, Number(expected.quantity))) differences.push(`Line ${index + 1} quantity differs.`);
-    if (actualQuantity.unit && actualQuantity.unit !== normalizeLooseName(expected.unit)) differences.push(`Line ${index + 1} unit differs.`);
+    // Name both values: "differs" alone cannot tell a unit conversion from a wrong entry.
+    const shown = (value) => String(value ?? "").trim() || "nothing";
+    if (!closeMoney(actualQuantity.value, Number(expected.quantity))) differences.push(`Line ${index + 1} quantity differs (Tally: ${shown(actual.quantity)}, approved: ${shown(expected.quantity)} ${shown(expected.unit)}).`);
+    if (actualQuantity.unit && actualQuantity.unit !== normalizeLooseName(expected.unit)) differences.push(`Line ${index + 1} unit differs (Tally: ${shown(actual.quantity)}, approved: ${shown(expected.unit)}).`);
     const actualRate = splitRate(actual.rate);
-    if (!closeMoney(actualRate.value, Number(expected.rate))) differences.push(`Line ${index + 1} rate differs.`);
-    if (actualRate.unit && actualRate.unit !== normalizeLooseName(expected.unit)) differences.push(`Line ${index + 1} rate unit differs.`);
+    if (!closeMoney(actualRate.value, Number(expected.rate))) differences.push(`Line ${index + 1} rate differs (Tally: ${shown(actual.rate)}, approved: ${shown(expected.rate)}/${shown(expected.unit)}).`);
+    if (actualRate.unit && actualRate.unit !== normalizeLooseName(expected.unit)) differences.push(`Line ${index + 1} rate unit differs (Tally: ${shown(actual.rate)}, approved: ${shown(expected.unit)}).`);
     const expectedGodownName = String(expected.godownName || "").trim();
     const expectedBatchName = String(expected.batchName || "").trim();
     if (expectedGodownName && normalizeLooseName(actual.godownName) !== normalizeLooseName(expectedGodownName)) {
@@ -2198,7 +2200,53 @@ export function purchaseDuplicateSearchRange(voucherDate, today = localIsoDate()
   return { dateFrom: range.dateFrom, dateTo: latest };
 }
 
-async function verifyPurchaseVoucherInTally(config, payload = {}, options = {}) {
+// The connector's one lane to Tally. A long write (a purchase voucher: duplicate check,
+// master check, save, read-back) calls yieldTallyLane() between its steps so a read
+// someone is waiting for on screen gets its turn instead of timing out behind the save.
+let activeTallyLane = null;
+async function yieldTallyLane() {
+  try {
+    await activeTallyLane?.yieldToInteractive?.();
+  } catch (error) {
+    // A failed read belongs to its own caller; the write carries on.
+    console.warn(`A waiting Tally read failed during a voucher write: ${error instanceof Error ? error.message : error}`);
+  }
+}
+
+// The supplier's own vouchers with this reference, read through Tally's ledger index
+// ("Vouchers : Ledger"). On a company with years of vouchers this answers in a second or
+// two, where a company-wide scan takes about a minute and holds Tally the whole time.
+// Tally may ignore the date range on ledger collections, so dates are filtered here.
+async function findPurchaseVouchersBySupplierLedger(tallyUrl, {
+  companyName, supplierLedgerName, supplierInvoiceNumber, dateFrom, dateTo, exportCollection = exportTallyCollection,
+}) {
+  const filterName = "KalikaPurchaseLedgerReference";
+  const xml = await exportCollection(tallyUrl, {
+    collectionName: "Autodealer Purchase Ledger Identity",
+    tallyType: "Vouchers : Ledger",
+    childOf: tallyFormulaString(supplierLedgerName),
+    fetchFields: "Date,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,GUID,IsCancelled",
+    companyName,
+    dateFrom,
+    dateTo,
+    formulae: [{ name: filterName, formula: buildRequestedLedgerFormula([supplierInvoiceNumber], ["$Reference"]) }],
+    filterNames: [filterName],
+    timeoutMs: CASH_DISCOUNT_READ_MS,
+  });
+  if (!/<\/ENVELOPE\s*>/i.test(String(xml || ""))) {
+    throw new Error("Tally did not return a complete supplier voucher list.");
+  }
+  return parseVoucherCollection(xml).filter((voucher) => {
+    const date = normalizeTallyDate(voucher.date);
+    return /purchase/i.test(String(voucher.voucherType || "")) &&
+      !/^yes$/i.test(String(voucher.isCancelled || "")) &&
+      (!date || (date >= dateFrom && date <= dateTo)) &&
+      normalizeLooseName(voucher.reference) === normalizeLooseName(supplierInvoiceNumber) &&
+      normalizeLooseName(voucher.partyLedgerName) === normalizeLooseName(supplierLedgerName);
+  });
+}
+
+async function verifyPurchaseVoucherInTally(config, payload = {}, options = {}, dependencies = {}) {
   const companyName = payload?.companyName || config?.companyName || null;
   const tallyUrl = normalizeTallyUrl(payload?.tallyUrl || config?.tallyUrl);
   const voucherDate = payload?.voucherDate || payload?.supplierInvoiceDate;
@@ -2228,8 +2276,9 @@ async function verifyPurchaseVoucherInTally(config, payload = {}, options = {}) 
   ];
   const formulae = preferredMasterFormula.length > 0 ? preferredMasterFormula : identityFormulae;
   const filterNames = formulae.map((entry) => entry.name);
+  const exportCollection = dependencies.exportCollection || exportTallyCollection;
   const exportCandidates = async (dateFrom, dateTo, detailed) => parseVoucherCollection(
-    await exportTallyCollection(tallyUrl, {
+    await exportCollection(tallyUrl, {
       collectionName: detailed ? "Autodealer Purchase Voucher Verification" : "Autodealer Purchase Voucher Identity",
       tallyType: "Voucher",
       fetchFields: detailed
@@ -2252,9 +2301,31 @@ async function verifyPurchaseVoucherInTally(config, payload = {}, options = {}) 
   });
   let candidates = [];
   if (options.searchFinancialYear) {
-    for (const chunk of cashDiscountVoucherDateChunks(searchRange.dateFrom, searchRange.dateTo)) {
-      candidates.push(...await exportCandidates(chunk.dateFrom, chunk.dateTo, false));
-      if (candidates.length > 1) break;
+    let ledgerScoped = null;
+    if (preferredMasterFormula.length === 0) {
+      try {
+        ledgerScoped = await findPurchaseVouchersBySupplierLedger(tallyUrl, {
+          companyName,
+          supplierLedgerName,
+          supplierInvoiceNumber,
+          dateFrom: searchRange.dateFrom,
+          dateTo: searchRange.dateTo,
+          exportCollection,
+        });
+      } catch (error) {
+        // An unreadable ledger list must not weaken the duplicate check: scan the year instead.
+        console.warn(`Supplier-scoped purchase lookup failed; scanning the year instead: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+    if (ledgerScoped) {
+      candidates = ledgerScoped;
+    } else {
+      for (const chunk of cashDiscountVoucherDateChunks(searchRange.dateFrom, searchRange.dateTo)) {
+        candidates.push(...await exportCandidates(chunk.dateFrom, chunk.dateTo, false));
+        if (candidates.length > 1) break;
+        // Between month scans, let a waiting screen read have its turn with Tally.
+        await yieldTallyLane();
+      }
     }
     if (candidates.length === 1) {
       const candidateDate = normalizeTallyDate(candidates[0].date) || voucherDate;
@@ -2597,6 +2668,7 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName, options = {})
     };
   }
 
+  await yieldTallyLane();
   options.onStage?.("validating_masters");
   await measure("masterValidation", () =>
     validatePurchasePayloadMasters(tallyUrl, companyName, payload)
@@ -2623,6 +2695,8 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName, options = {})
   }
   let xml = buildPurchaseVoucherXml(postingPayload, companyName);
   let importOutcome;
+  // Last turn for waiting reads before the save, which holds Tally for up to a minute.
+  await yieldTallyLane();
   try {
     options.onStage?.("importing_voucher");
     importOutcome = requireCreatedVoucher(
@@ -2816,6 +2890,8 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName, options = {})
     };
   }
 
+  // Reads that waited through the save go next; the read-back follows them.
+  await yieldTallyLane();
   options.onStage?.("verifying_voucher", {
     lastVchId: importOutcome.result?.lastVchId ?? null,
     created: importOutcome.result?.created ?? null,
@@ -3404,7 +3480,7 @@ async function exportTallyXml(tallyUrl, xml, label = "Tally export", timeoutMs =
   if (readContext?.schedule && !readContext.inTallyLane) {
     return readContext.schedule(() => cashDiscountReadContext.run({ ...readContext, inTallyLane: true },
       () => exportTallyXml(tallyUrl, xml, label, timeoutMs)),
-      { signal: readContext.signal, deadlineAt: readContext.deadlineAt, priority: 50 });
+      { signal: readContext.signal, deadlineAt: readContext.deadlineAt, priority: 50, interactive: true });
   }
   const benchmarkStartedAt = performance.now();
   let benchmarkResponseBytes = 0;
@@ -6619,6 +6695,30 @@ async function fetchPurchaseMastersFromTally(config, commandPayload = {}) {
   };
 }
 
+// Godowns are the only part of the saved purchase catalogue read live from Tally, and
+// choosing one is optional. Keep the last list per company so a busy Tally (saving a
+// voucher) never fails the whole purchase screen.
+const PURCHASE_GODOWN_CACHE_MS = 10 * 60_000;
+const purchaseGodownCache = new Map();
+
+export async function purchaseGodownsForCatalogue({ companyName, requireFresh = false, signal = null, fetchLive, now = Date.now, laneBusy = () => Boolean(activeTallyLane?.backgroundBusy) }) {
+  const key = normalizeLooseName(companyName);
+  const cached = purchaseGodownCache.get(key);
+  if (cached && !requireFresh && (now() - cached.at < PURCHASE_GODOWN_CACHE_MS || laneBusy())) {
+    return cached.godowns;
+  }
+  try {
+    const godowns = await fetchLive();
+    purchaseGodownCache.set(key, { godowns, at: now() });
+    return godowns;
+  } catch (error) {
+    // A person cancelling is not a busy Tally: let that through.
+    if (signal?.aborted && !/deadline/i.test(String(signal.reason?.message || signal.reason || ""))) throw error;
+    console.warn(`Godowns unavailable, using ${cached ? "the last list" : "none"}: ${error instanceof Error ? error.message : error}`);
+    return cached?.godowns ?? [];
+  }
+}
+
 async function fetchPurchaseInventoryLocationsFromTally(config, commandPayload = {}) {
   const tallyUrl = normalizeTallyUrl(commandPayload.tallyUrl || config.tallyUrl);
   const readiness = await testTally(tallyUrl);
@@ -6776,7 +6876,7 @@ async function testTally(tallyUrl) {
   const readContext = cashDiscountReadContext.getStore();
   if (readContext?.schedule && !readContext.inTallyLane) {
     return readContext.schedule(() => cashDiscountReadContext.run({ ...readContext, inTallyLane: true },
-      () => testTally(tallyUrl)), { signal: readContext.signal, deadlineAt: readContext.deadlineAt, priority: 50 });
+      () => testTally(tallyUrl)), { signal: readContext.signal, deadlineAt: readContext.deadlineAt, priority: 50, interactive: true });
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), readContext
@@ -8222,12 +8322,17 @@ export function startCashDiscountLiveChannel(config, executeExclusive, options =
               ? "Local catalogue validated against Tally changes."
               : "Using the incrementally synced Local Agent catalogue…" });
             const godowns = message.payload?.includeInventoryLocations
-              ? await cashDiscountReadContext.run({
+              ? await purchaseGodownsForCatalogue({
+                  companyName: message.companyName,
+                  requireFresh: message.payload?.requireFresh === true,
                   signal: controller.signal,
-                  deadlineAt,
-                  benchmark,
-                  schedule: executeExclusive,
-                }, () => fetchPurchaseInventoryLocationsFromTally(config, { companyName: message.companyName }))
+                  fetchLive: () => cashDiscountReadContext.run({
+                    signal: controller.signal,
+                    deadlineAt,
+                    benchmark,
+                    schedule: executeExclusive,
+                  }, () => fetchPurchaseInventoryLocationsFromTally(config, { companyName: message.companyName })),
+                })
               : [];
             const catalogue = godowns.length || message.payload?.includeInventoryLocations
               ? {
@@ -8680,6 +8785,7 @@ async function processClaimedCommands(config, commands, options = {}) {
         }`
       );
     }
+    await yieldTallyLane();
   }
   if (bankVoucherCommands.length > 0) {
     await runBankVoucherCommandBatch(config, bankVoucherCommands, options);
@@ -8867,6 +8973,7 @@ async function startBridge(args) {
   console.log(`Sending heartbeat every ${intervalMs} ms.`);
 
   const scheduler = createTallyScheduler();
+  activeTallyLane = scheduler;
   const executeExclusive = (task, scheduling) => scheduler.run(task, scheduling);
   let heartbeatInFlight = false;
   const runSerially = async () => {
@@ -8926,6 +9033,7 @@ function createBridgeRunner(options = {}) {
   const intervalMs = Number(options.intervalMs || DEFAULT_HEARTBEAT_INTERVAL_MS);
   let timer = null;
   const scheduler = createTallyScheduler();
+  activeTallyLane = scheduler;
   const progressSentAt = new Map();
   const agentRuntime = createLocalAgentRuntime({
     config,
