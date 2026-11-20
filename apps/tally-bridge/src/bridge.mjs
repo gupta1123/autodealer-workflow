@@ -1337,19 +1337,23 @@ function buildAttachDocumentsAddOnXml(payload) {
 // The supplier's e-way bill, recorded on the purchase as reference exactly as
 // the client books it (their exported voucher): details filled in, but Tally's
 // e-way bill applicability left at No, since the supplier generated it.
-// The consignee (To) is the company's own address, read from Tally.
+// Older queued commands use the company address. New commands carry the reviewed ship-to address.
 function buildPurchaseEwayBillXml(ewayBill) {
   const number = String(ewayBill?.number || "").replace(/\D/g, "");
   const date = /^\d{4}-\d{2}-\d{2}/.test(String(ewayBill?.date || "")) ? toIsoLikeDate(ewayBill.date) : "";
   if (!/^\d{12}$/.test(number) || !date) return "";
   const value = (input) => escapeXml(String(input ?? "").trim());
-  const consignee = ewayBill.consignee || {};
-  const toAddress = consignee.address || "";
-  const toPlace = consignee.place || ewayBill.toPlace || "";
-  const toPincode = consignee.pincode || ewayBill.toPincode || "";
-  const toState = consignee.state || ewayBill.toState || "";
+  const consignee = ewayBill.toAddress === undefined ? (ewayBill.consignee || {}) : {};
+  const toAddress = ewayBill.toAddress ?? consignee.address ?? "";
+  const toPlace = ewayBill.toPlace || consignee.place || "";
+  const toPincode = ewayBill.toPincode || consignee.pincode || "";
+  const toState = ewayBill.toState || consignee.state || "";
   const distance = /^\d{1,4}$/.test(String(ewayBill.distanceKm || "")) ? ` ${ewayBill.distanceKm}` : "";
   return [
+    ...Object.entries({
+      PARTYMAILINGNAME: ewayBill.fromName, PARTYGSTIN: ewayBill.fromGstin, STATENAME: ewayBill.fromRegisteredState,
+      CONSIGNEEMAILINGNAME: ewayBill.toName, CONSIGNEEGSTIN: ewayBill.toGstin, CONSIGNEESTATENAME: ewayBill.toRegisteredState,
+    }).filter(([, field]) => field).map(([tag, field]) => `<${tag}>${value(field)}</${tag}>`),
     "<ISEWAYBILLAPPLICABLE>No</ISEWAYBILLAPPLICABLE>",
     "<OVRDNEWAYBILLAPPLICABILITY>No</OVRDNEWAYBILLAPPLICABILITY>",
     "<EWAYBILLDETAILS.LIST>",
@@ -1359,14 +1363,18 @@ function buildPurchaseEwayBillXml(ewayBill) {
     "<DOCUMENTTYPE>Tax Invoice</DOCUMENTTYPE>",
     toPincode ? `<CONSIGNEEPINCODE>${value(toPincode)}</CONSIGNEEPINCODE>` : "",
     `<BILLNUMBER>${number}</BILLNUMBER>`,
-    "<SUBTYPE>Supply</SUBTYPE>",
+    ewayBill.subType !== "" ? `<SUBTYPE>${value(ewayBill.subType ?? "Supply")}</SUBTYPE>` : "",
     ewayBill.fromPlace ? `<CONSIGNORPLACE>${value(ewayBill.fromPlace)}</CONSIGNORPLACE>` : "",
     ewayBill.fromPincode ? `<CONSIGNORPINCODE>${value(ewayBill.fromPincode)}</CONSIGNORPINCODE>` : "",
     toPlace ? `<CONSIGNEEPLACE>${value(toPlace)}</CONSIGNEEPLACE>` : "",
     ewayBill.fromState ? `<SHIPPEDFROMSTATE>${value(ewayBill.fromState)}</SHIPPEDFROMSTATE>` : "",
     toState ? `<SHIPPEDTOSTATE>${value(toState)}</SHIPPEDTOSTATE>` : "",
     "<TRANSPORTDETAILS.LIST>",
-    `<TRANSPORTMODE>${value(ewayBill.transportMode || "1 - Road")}</TRANSPORTMODE>`,
+    ewayBill.transportMode ? `<TRANSPORTMODE>${value(ewayBill.transportMode)}</TRANSPORTMODE>` : "",
+    ewayBill.transporterName ? `<TRANSPORTERNAME>${value(ewayBill.transporterName)}</TRANSPORTERNAME>` : "",
+    ewayBill.transporterId ? `<TRANSPORTERID>${value(ewayBill.transporterId)}</TRANSPORTERID>` : "",
+    ewayBill.transportDocumentDate ? `<BILLOFLADINGDATE>${value(toIsoLikeDate(ewayBill.transportDocumentDate))}</BILLOFLADINGDATE>` : "",
+    ewayBill.transportDocumentNumber ? `<BILLOFLADINGNO>${value(ewayBill.transportDocumentNumber)}</BILLOFLADINGNO>` : "",
     ewayBill.vehicleNumber ? `<VEHICLENUMBER>${value(ewayBill.vehicleNumber)}</VEHICLENUMBER>` : "",
     distance ? `<DISTANCE>${distance}</DISTANCE>` : "",
     "</TRANSPORTDETAILS.LIST>",
@@ -2106,6 +2114,20 @@ function purchaseVoucherReadbackComparison(voucher, payload, options = {}) {
       differences.push("Supplier outstanding bill amount differs.");
     }
   }
+  if (payload?.ewayBill?.number) {
+    const expected = payload.ewayBill;
+    const bill = voucher?.ewayBills?.find(entry => String(entry.number).replace(/\s/g, "") === expected.number);
+    if (!bill) {
+      differences.push("Supplier e-way bill number was not returned by Tally.");
+    } else {
+      if (normalizeTallyDate(bill.date) !== normalizeTallyDate(expected.date)) differences.push("Supplier e-way bill date differs.");
+      for (const [key, label] of [["vehicleNumber", "vehicle"], ["transporterName", "transporter"], ["transportDocumentNumber", "transport document number"]]) {
+        if (expected[key] && !bill.transport?.some(row => isSameTallyText(row[key], expected[key]))) {
+          differences.push(`Supplier e-way bill ${label} differs.`);
+        }
+      }
+    }
+  }
   if (payload?.sourceDocumentPath && !options.ignoreSourceDocumentIdentity) {
     const expectedDocument = {
       path: String(payload.sourceDocumentPath).trim(),
@@ -2282,7 +2304,7 @@ async function verifyPurchaseVoucherInTally(config, payload = {}, options = {}, 
       collectionName: detailed ? "Autodealer Purchase Voucher Verification" : "Autodealer Purchase Voucher Identity",
       tallyType: "Voucher",
       fetchFields: detailed
-        ? "Date,EffectiveDate,ReferenceDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,AlterID,GUID,Narration,KalikaSourceDocumentPath,KalikaSourceDocumentName,KalikaSourceDocumentSha256,KalikaSourceDocumentId,KalikaVehicleNumber,UDFForLinkDocumentFile,AllLedgerEntries.*,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.BillDate,AllLedgerEntries.BillAllocations.Amount,AllInventoryEntries.*"
+        ? "Date,EffectiveDate,ReferenceDate,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,AlterID,GUID,Narration,KalikaSourceDocumentPath,KalikaSourceDocumentName,KalikaSourceDocumentSha256,KalikaSourceDocumentId,KalikaVehicleNumber,UDFForLinkDocumentFile,AllLedgerEntries.*,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.BillDate,AllLedgerEntries.BillAllocations.Amount,AllInventoryEntries.*,EWayBillDetails.BillNumber,EWayBillDetails.BillDate,EWayBillDetails.TransportDetails.*"
         : "Date,VoucherTypeName,VoucherNumber,Reference,PartyLedgerName,MasterID,GUID",
       companyName,
       dateFrom,
@@ -2684,10 +2706,9 @@ async function postPurchaseVoucher(tallyUrl, payload, companyName, options = {})
   const numberedPayload = numbering.acceptsProvidedNumber && proposedVoucherNumber
     ? { ...payload, useCustomVoucherNumber: true, voucherNumber: proposedVoucherNumber }
     : { ...payload, useCustomVoucherNumber: false, voucherNumber: undefined };
-  // E-way bill consignee is the company's own address from Tally. If it cannot
-  // be read, the e-way bill's Ship To place/PIN are used instead.
+  // Previously queued payloads used the company's Tally address for the consignee.
   let postingPayload = numberedPayload;
-  if (payload?.ewayBill) {
+  if (payload?.ewayBill && payload.ewayBill.toAddress === undefined) {
     const companyAddress = await readCompanyAddress(tallyUrl, companyName).catch(() => null);
     if (companyAddress) {
       postingPayload = { ...numberedPayload, ewayBill: { ...payload.ewayBill, consignee: companyAddress } };
@@ -3904,6 +3925,14 @@ function toVoucher(block) {
     ledgerNames,
     ledgerEntries,
     bankReferences,
+    ewayBills: extractBlocks(block, "EWAYBILLDETAILS.LIST").map(bill => ({
+      number: getTagText(bill, "BILLNUMBER"), date: getTagText(bill, "BILLDATE"),
+      transport: extractBlocks(bill, "TRANSPORTDETAILS.LIST").map(entry => ({
+        transporterName: getTagText(entry, "TRANSPORTERNAME"),
+        transportDocumentNumber: getTagText(entry, "BILLOFLADINGNO"),
+        vehicleNumber: getTagText(entry, "VEHICLENUMBER"),
+      })),
+    })),
     billAllocations,
     inventoryEntries,
     masterId: getTagText(block, "MASTERID"),

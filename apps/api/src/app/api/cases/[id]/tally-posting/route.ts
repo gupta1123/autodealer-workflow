@@ -292,10 +292,10 @@ function asSavedReview(value: unknown): Partial<PurchasePostingReview> | null {
     const eway = input.ewayBill as Record<string, unknown>;
     const clean: Record<string, unknown> = {};
     if (typeof eway.record === "boolean") clean.record = eway.record;
-    for (const key of ["number", "date", "fromAddress", "fromPlace", "fromPincode", "fromState", "toPlace", "toPincode", "toState", "transportMode", "vehicleNumber", "distanceKm"] as const) {
+    for (const key of ["number", "date", "fromAddress", "fromName", "fromGstin", "fromRegisteredState", "toName", "toGstin", "toRegisteredState", "transporterId", "transportDocumentDate", "subType", "toAddress", "transporterName", "transportDocumentNumber", "fromPlace", "fromPincode", "fromState", "toPlace", "toPincode", "toState", "transportMode", "vehicleNumber", "distanceKm"] as const) {
       if (typeof eway[key] === "string") {
-        const value = eway[key].trim().slice(0, key === "fromAddress" ? 300 : 80);
-        clean[key] = key === "date" ? normalizePurchasePostingDate(value) : value;
+        const value = eway[key].trim().slice(0, key.endsWith("Address") ? 300 : 80);
+        clean[key] = (key === "date" || key === "transportDocumentDate") ? normalizePurchasePostingDate(value) : value;
       }
     }
     output.ewayBill = clean;
@@ -1517,6 +1517,10 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
     );
     const blockerKey = (blocker: typeof prepared.blockers[number]) =>
       `${blocker.code}:${blocker.lineId ?? blocker.scope}`;
+    // The reviewer must complete the reference or explicitly turn off recording.
+    for (const blocker of prepared.blockers) {
+      if (blocker.code.startsWith("EWAY_BILL_")) allowedBlockerKeys.delete(blockerKey(blocker));
+    }
     const allowedBlockers = prepared.blockers.filter((blocker) => allowedBlockerKeys.has(blockerKey(blocker)));
     const unallowedBlockers = prepared.blockers.filter((blocker) => !allowedBlockerKeys.has(blockerKey(blocker)));
     if (unallowedBlockers.length > 0) {

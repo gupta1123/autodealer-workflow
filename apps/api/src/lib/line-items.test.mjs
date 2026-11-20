@@ -79,3 +79,14 @@ test("identical rows without evidence of a copy remain separate", () => {
   });
   assert.equal(lines.length, 3);
 });
+
+test("PSP scrap subtotal and repeated serial are removed only when printed amounts reconcile", () => {
+  const goods = {sourcePage: 1, lineNumber: "1", description: "Scrap", quantity: "15.330", unit: "MT", rate: "40000", taxableAmount: "613200"};
+  const footer = {description: "Sub-Total", quantity: "15.330", unit: "MT", taxableAmount: "613200"};
+  const normalize = (lineItems, subtotal) => normalizeExtractedCommercialLineItems({docType: "Tax Invoice", lineItems, documentFields: {subtotal}});
+  assert.deepEqual(normalize([goods, {...goods}, footer], "6,13,200").map(row => row.description), ["Scrap"]);
+  assert.equal(normalize([goods, {...goods, lineNumber: "2"}], "1226400").length, 2);
+  assert.equal(normalize([goods, {...goods}], "1226400").length, 2);
+  assert.deepEqual(normalize([goods, {...goods}, footer], "1226400").map(row => row.description), ["Scrap", "Scrap"]);
+  assert.equal(normalize([goods, {...goods}], "").length, 2);
+});

@@ -1515,6 +1515,44 @@ function extractLabelledTaxRate(line: string, label: "cgst" | "sgst" | "igst") {
   return line.match(new RegExp(`\\b${label}\\s*rate\\b[^\\d%]{0,20}(\\d{1,2}(?:\\.\\d+)?)\\s*%?`, "i"))?.[1];
 }
 
+// Remove an extraction artefact only when the remaining rows independently
+// reconcile to the printed taxable subtotal. Keep the original indices so
+// previously saved reviews still refer to the same goods.
+export function invoiceArtefactIndices(rows: CommercialLineItem[], printedSubtotal: unknown) {
+  const footers = new Set<number>();
+  const duplicates = new Set<number>();
+  const subtotal = parseLineItemNumber(printedSubtotal);
+  if (subtotal === null || subtotal <= 0 || rows.length < 2) return footers;
+  const numberedRows = new Set<string>();
+  let goodsPaise = 0;
+  let duplicatePaise = 0;
+  for (const [index, row] of rows.entries()) {
+    const footer = /^(?:sub[ -]?total|total|grand total)[:.]?$/i.test((row.description ?? "").trim())
+      && !row.itemCode && !row.hsnSac && !row.lineNumber && !row.rate && !row.netRate;
+    if (footer) {
+      footers.add(index);
+      continue;
+    }
+    const amount = getLineCommercialAmount(row);
+    if (amount === null) return new Set<number>();
+    const paise = Math.round(amount * 100);
+    goodsPaise += paise;
+    if (!row.lineNumber || !row.description || !row.quantity || !(row.netRate || row.rate)) continue;
+    const signature = JSON.stringify([row.sourcePage, ...TEXT_LINE_ITEM_KEYS
+      .filter(key => key !== "rawText")
+      .map(key => normalizeSignatureValue(key, row[key]))]);
+    if (numberedRows.has(signature)) {
+      duplicates.add(index);
+      duplicatePaise += paise;
+    }
+    numberedRows.add(signature);
+  }
+  const printedPaise = Math.round(subtotal * 100);
+  if (goodsPaise === printedPaise) return footers;
+  if (goodsPaise - duplicatePaise === printedPaise) return new Set([...footers, ...duplicates]);
+  return new Set<number>();
+}
+
 export function normalizeExtractedCommercialLineItems(params: {
   docType: string;
   lineItems: CommercialLineItem[];
@@ -1533,10 +1571,13 @@ export function normalizeExtractedCommercialLineItems(params: {
   const deduped = INVOICE_DOC_TYPES.has(params.docType)
     ? mergeInvoicePageCopies(params.lineItems, visibleTextPages)
     : dedupeNonInvoiceLineItems(params.lineItems);
+  const artefacts = INVOICE_DOC_TYPES.has(params.docType)
+    ? invoiceArtefactIndices(deduped, params.documentFields?.totalTaxableAmount || params.documentFields?.subtotal)
+    : new Set<number>();
   const visibleText = visibleTextPages.join("\n");
   const withInvoiceAmounts = INVOICE_DOC_TYPES.has(params.docType)
     ? reconcileInvoiceChargeResiduals(
-        deduped.map(normalizeChargeLineAmounts).map(fillMissingTaxableAmountFromLineTotal),
+        deduped.filter((_, index) => !artefacts.has(index)).map(normalizeChargeLineAmounts).map(fillMissingTaxableAmountFromLineTotal),
         params.documentFields
       )
     : deduped;

@@ -33,6 +33,18 @@ export type TallyPostingEwayBill = {
   number: string;
   date: string;
   fromAddress: string;
+  fromName?: string;
+  fromGstin?: string;
+  fromRegisteredState?: string;
+  toName?: string;
+  toGstin?: string;
+  toRegisteredState?: string;
+  transporterId?: string;
+  transportDocumentDate?: string;
+  subType?: string;
+  toAddress?: string;
+  transporterName?: string;
+  transportDocumentNumber?: string;
   fromPlace: string;
   fromPincode: string;
   fromState: string;
@@ -394,7 +406,8 @@ function liveTokenAffinity(left: unknown, right: unknown) {
  */
 export function prepareLiveTallyCatalogue(
   resultValue: unknown,
-  review?: TallyPostingReview | null
+  review?: TallyPostingReview | null,
+  sourceLines: ReadonlyArray<Pick<TallyPostingLine, "stockItemName">> = []
 ): { compactResult: unknown; masterOptions: TallyPostingResponse["masterOptions"] } {
   const result = liveRecord(resultValue);
   const masters = liveRecord(result?.masters);
@@ -591,7 +604,7 @@ export function prepareLiveTallyCatalogue(
     const option = ledgerOptionByName.get(key);
     return option ? [liveValidationMasterRow(option)] : [];
   });
-  const selectedStockNames = new Set((review?.lines ?? [])
+  const selectedStockNames = new Set([...sourceLines, ...(review?.lines ?? [])]
     .map((line) => liveKey(line.stockItemName))
     .filter(Boolean));
   const compactStockByName = new Map<string, TallyMasterOption>();
