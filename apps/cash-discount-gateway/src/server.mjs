@@ -424,7 +424,7 @@ async function handleBrowserRequest(socket, message, meta) {
   send(connector, {
     type: "operation",
     requestId,
-    deadlineAt: Date.now() + 90_000,
+    deadlineAt: Date.now() + (operation === "verify_bank_transaction" ? 180_000 : 90_000),
       operation: operation === "test_purchase_document_folder" ? operation : operation === "company_check"
         ? "company_check"
         : operation === "bank_ledgers"
@@ -480,6 +480,10 @@ async function handleConnectorResult(socket, message, meta) {
   if (!item || item.connector !== socket || item.connectionId !== meta.connectionId) return;
   trace(requestId, `connector result received (${message.success === true ? "success" : "failed"})`);
   if (message.success !== true) {
+    if (item.operation === "verify_bank_transaction") {
+      const timeout = /^(Kalika Bank Statement Reconciliation|Kalika Bank Reference Identity) timed out after (\d+) seconds\.$/.exec(String(message.error ?? ""));
+      trace(requestId, timeout ? `${timeout[1]} timeout (${timeout[2]}s)` : "bank verification failed with another connector error");
+    }
     failPending(requestId, new Error(String(message.error ?? "Tally could not complete the live request.")));
     return;
   }

@@ -1334,6 +1334,11 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
   const candidateLedgers = (transaction.candidateLedgerNames ?? [])
     .map((ledgerName) => findLedgerByNormalizedName(ledgerMasters, ledgerName))
     .filter((ledger): ledger is TallyMaster => Boolean(ledger));
+  const narration = ` ${transaction.description.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()} `;
+  const exactNames = ledgerMasters.filter(ledger => {
+    const name = ledger.name.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    return name.length >= 5 && name.includes(" ") && narration.includes(` ${name} `);
+  });
   const commonLedgers = getCommonLedgerOptions(ledgerMasters);
   const groups: LedgerPickerGroup[] = [];
   const usedKeys = new Set<string>();
@@ -1387,6 +1392,12 @@ function buildLedgerPickerGroups(transaction: ReviewTransaction, ledgerMasters: 
       },
     ]);
   }
+
+  addGroup("Ledger names in statement", exactNames.map(ledger => ({
+    name: ledger.name, action: "use_existing_ledger", label: ledger.name,
+    helper: "Full ledger name appears in the bank narration.", badge: "Name match",
+    ...ledgerBalanceFields(ledger),
+  })));
 
   if (transaction.ledgerAction === "needs_review" || candidateLedgers.length > 0) {
     addGroup("Suggested matches", [
@@ -1742,8 +1753,8 @@ function LedgerReviewSelect({
   const [hasSearchStarted, setHasSearchStarted] = useState(false);
   const [activeOptionIndex, setActiveOptionIndex] = useState(0);
   const groups = useMemo(
-    () => buildLedgerPickerGroups(transaction, ledgerMasters),
-    [ledgerMasters, transaction]
+    () => open ? buildLedgerPickerGroups(transaction, ledgerMasters) : [],
+    [ledgerMasters, transaction, open]
   );
   const normalizedQuery = normalizeName(deferredQuery);
   const optionSearchTextByKey = useMemo(() => {
@@ -3265,6 +3276,7 @@ export function BankStatementsPage() {
   const reviewSearchInputRef = useRef<HTMLInputElement>(null);
   const reviewPeriodInputRef = useRef<HTMLInputElement>(null);
   const ledgerLoadSeqRef = useRef(0);
+  const completeLedgerScope = useRef("");
   const initialSummaryLoadStartedRef = useRef(false);
   const tallyStatusStartedAtRef = useRef(Date.now());
   const lastNonEmptyCompaniesRef = useRef<CompanyOption[]>([]);
@@ -4168,7 +4180,7 @@ export function BankStatementsPage() {
       return preferredConnection?.id || "";
     });
     return loadedConnections;
-  }, [companyOptions, selectedCompanyName]);
+  }, []);
 
   const loadCompanyOptions = useCallback(async (requestedConnectionId?: string) => {
     const connectionId =
@@ -4219,6 +4231,7 @@ export function BankStatementsPage() {
 
     if (!connectionId) {
       if (loadSeq === ledgerLoadSeqRef.current) {
+        completeLedgerScope.current = "";
         setLedgerMasters([]);
       }
       return [];
@@ -4234,7 +4247,10 @@ export function BankStatementsPage() {
       if(!response.ok)throw new Error(await readError(response));
       const result=await response.json() as {masters?:TallyMaster[]};
       const masters=result.masters||[];
-      if(loadSeq===ledgerLoadSeqRef.current)setLedgerMasters(masters);
+      if (loadSeq === ledgerLoadSeqRef.current) {
+        completeLedgerScope.current = JSON.stringify([connectionId, selectedCompanyId]);
+        setLedgerMasters(masters);
+      }
       return masters;
     }
     const payload = await runCashDiscountLiveRequest<{
@@ -4253,6 +4269,7 @@ export function BankStatementsPage() {
     if (exactScope) assertLocalBankContextIdentity(exactScope.identity, payload.bankDocumentIdentity);
     const masters = payload.ledgers ?? payload.masters?.ledgers ?? [];
     if (loadSeq === ledgerLoadSeqRef.current) {
+      completeLedgerScope.current = JSON.stringify([connectionId, selectedCompanyId]);
       setLedgerMasters(masters);
     }
     return masters;
@@ -4514,32 +4531,26 @@ export function BankStatementsPage() {
     return () => {
       cancelled = true;
     };
-  }, [loadCompanyOptions, loadLedgerMasters, loadTallyConnections, selectedCompanyId, tallyConnectionId]);
+  }, [loadCompanyOptions, loadTallyConnections, selectedCompanyId, tallyConnectionId]);
 
   useEffect(() => {
     let cancelled = false;
 
     if (!tallyConnectionId) {
+      completeLedgerScope.current = "";
       setLedgerMasters([]);
       return () => {
         cancelled = true;
       };
     }
 
-    if (transactions.length === 0 || ledgerMasters.length > 0) {
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    loadLedgerMasters(tallyConnectionId).catch(() => {
-      if (!cancelled) setLedgerMasters([]);
+    const scope = JSON.stringify([tallyConnectionId, selectedCompanyId]);
+    if (!transactions.length || !selectedCompanyId || completeLedgerScope.current === scope) return;
+    loadLedgerMasters(tallyConnectionId).catch((error) => {
+      if (!cancelled) setBanner({ tone: "error", text: `Could not load the full Tally ledger list. Use Refresh to retry. ${error instanceof Error ? error.message : ""}` });
     });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [ledgerMasters.length, loadLedgerMasters, tallyConnectionId, transactions.length]);
+    return () => { cancelled = true; };
+  }, [loadLedgerMasters, tallyConnectionId, selectedCompanyId, transactions.length]);
 
   useEffect(() => {
     if ((loading || sending || matchingBills || syncingMasters || postUploadSyncImportId) && selectedCompanyId) {
@@ -4614,7 +4625,8 @@ export function BankStatementsPage() {
   }, [ledgerMasters]);
 
   useEffect(() => {
-    if (!tallyConnectionId || !selectedCompany || ledgerMasters.length === 0) return;
+    if (!tallyConnectionId || !selectedCompany || ledgerMasters.length === 0 ||
+        completeLedgerScope.current !== JSON.stringify([tallyConnectionId, selectedCompany.id])) return;
     const eligible = transactions.filter((transaction) =>
       !transaction.ledgerSelectionTouched &&
       Boolean(transaction.counterpartyName || transaction.description) &&
@@ -4968,8 +4980,7 @@ export function BankStatementsPage() {
         // Refresh account discovery independently of the full transaction
         // catalogue so an existing shortlist cannot suppress bank matching.
         void bankAccountCatalogue.refresh().catch(() => {});
-        ledgerLoadSeqRef.current += 1;
-        setLedgerMasters([]);
+        if (transactions.length && nextConnectionId === tallyConnectionId) await loadLedgerMasters(nextConnectionId);
       }
       showToast("success", "Tally connection refreshed.");
     } catch (error) {
@@ -5000,6 +5011,7 @@ export function BankStatementsPage() {
       setPendingBankLedgerName("");
       setSelectedAccountId("");
       setAccount(EMPTY_ACCOUNT);
+      completeLedgerScope.current = "";
       setLedgerMasters([]);
       clearStatementReview();
       return;
@@ -5014,6 +5026,7 @@ export function BankStatementsPage() {
     setPendingBankLedgerName("");
     setSelectedAccountId("");
     setAccount(EMPTY_ACCOUNT);
+    completeLedgerScope.current = "";
     setLedgerMasters([]);
     clearStatementReview();
   }
@@ -5110,7 +5123,9 @@ export function BankStatementsPage() {
     const candidateMasters = connectorCandidateMasters(payload.transactions);
     const effectiveLedgerMasters = Array.from(new Map([...ledgerMastersForReview, ...candidateMasters]
       .map(ledger => [normalizeName(ledger.name), ledger])).values());
-    if (candidateMasters.length) setLedgerMasters(effectiveLedgerMasters);
+    if (candidateMasters.length) setLedgerMasters(current => Array.from(new Map(
+      [...candidateMasters, ...current].map(ledger => [normalizeName(ledger.name), ledger])
+    ).values()));
     // Only the API's exact-account resolution may automatically select a ledger.
     // In particular, never retain a ledger from the preceding statement.
     const statementAccountNumber = normalizeBankAccountNumber(payload.account.accountNumber);

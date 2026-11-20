@@ -578,17 +578,18 @@ export class LocalAgentRuntime {
   }
 
   async refreshLocalMasterCatalogue(scope = {}, { moduleName = "bank", signal, progress = async () => {} } = {}) {
-    if (!this.activeIdentity || !(await this.moduleEnabled(moduleName))) return null;
-    if (scope.companyGuid && String(scope.companyGuid) !== String(this.activeIdentity.companyGuid)) {
+    const identity = this.activeIdentity;
+    if (!identity || !(await this.moduleEnabled(moduleName))) return null;
+    if (scope.companyGuid && String(scope.companyGuid) !== String(identity.companyGuid)) {
       throw Object.assign(new Error("Tally changed company before the local catalogue could be validated."), { code: "COMPANY_CHANGED" });
     }
-    if (scope.companyName && String(scope.companyName).trim().toLowerCase() !== String(this.activeIdentity.companyName).trim().toLowerCase()) {
+    if (scope.companyName && String(scope.companyName).trim().toLowerCase() !== String(identity.companyName).trim().toLowerCase()) {
       throw Object.assign(new Error("The requested company is not active in Tally."), { code: "COMPANY_CHANGED" });
     }
-    if (normalizeFinancialYear(scope.financialYear) !== normalizeFinancialYear(this.activeIdentity.financialYear)) {
+    if (normalizeFinancialYear(scope.financialYear) !== normalizeFinancialYear(identity.financialYear)) {
       throw Object.assign(new Error("The requested financial year is not active in the Local Agent."), { code: "FINANCIAL_YEAR_CHANGED" });
     }
-    const key = datasetKey(this.activeIdentity);
+    const key = datasetKey(identity);
     const currentDataset = await this.storage.call("getDataset", { datasetKey: key });
     if (!currentDataset || currentDataset.status !== "ready" || currentDataset.quarantined_at) return null;
     const requested = new Set(scope.requestedTypes || ["ledger", "group"]);
@@ -596,7 +597,7 @@ export class LocalAgentRuntime {
       requested.has(type) || (type === "ledger" && (requested.has("gst_ledger") || requested.has("tax_ledger")))
     );
     await progress("Checking Tally for master changes…");
-    const dataset = await this.syncDataset(this.activeIdentity, {
+    const dataset = await this.syncDataset(identity, {
       masterTypes,
       cursorNamespace: moduleName === "purchase" ? "purchase" : "",
       fieldProfile: moduleName === "purchase" ? "purchase" : "full",
@@ -605,9 +606,12 @@ export class LocalAgentRuntime {
         ? `Checking ${String(update.entityType || "master").replace(/_/g, " ")} changes in Tally…`
         : "Validating the local Tally catalogue…"),
     });
-    this.ledgerLookupCache.delete(datasetKey(this.activeIdentity));
+    if (!this.activeIdentity || datasetKey(this.activeIdentity) !== key || this.activeIdentity.sessionGeneration !== identity.sessionGeneration) {
+      throw Object.assign(new Error("The active Tally connection changed during catalogue preparation. Refresh the catalogue."), { code: "COMPANY_CHANGED" });
+    }
+    this.ledgerLookupCache.delete(key);
     if (Number(dataset?.cacheHealth?.processed || 0) > 0) {
-      void this.ensureVectorIndex(this.activeIdentity, async () => {}, { force: true })
+      void this.ensureVectorIndex(identity, async () => {}, { force: true })
         .catch((error) => this.onLog?.("warn", `Local ledger index: ${error.message}`));
     }
     const catalogue = await this.localMasterCatalogue(scope, { moduleName });
@@ -774,11 +778,16 @@ export class LocalAgentRuntime {
       this.ledgerLookupCache.set(key, lookup);
     }
     const limit=Math.max(1,Math.min(20,Math.trunc(Number(topK)||8)));
+    const indexedNames = rows.map(ledger => ({ ledger, name: ledgerLookupKey(ledger.name) }))
+      .filter(({ name }) => name.length >= 5 && name.includes(" "));
     const prepared = queries.slice(0, 256).map((query, index) => {
+      const narration = ` ${ledgerLookupKey(query.name)} `;
+      const exact = indexedNames.filter(({ name }) => narration.includes(` ${name} `))
+        .map(({ ledger }) => ({ ledger, score: 1, source: "exact_narration" }));
       const shortlist = vectorOnly ? [] : shortlistLedgers(query, lookup, savedMappings);
       return {
         id: String(query.id || query.name || index),
-        query,
+        query, exact,
         deterministic: vectorOnly ? [] : deterministicLedgerCandidates(query, shortlist, savedMappings).slice(0, limit),
       };
     });
@@ -800,7 +809,7 @@ export class LocalAgentRuntime {
         return ledger ? [{ ledger, score: Number(hit.score || 0), source: "openrouter_vector" }] : [];
       });
       const seen = new Set();
-      const suggestions = (vectorOnly ? vector : [...item.deterministic.filter((entry) => entry.score >= 0.94), ...vector, ...item.deterministic])
+      const suggestions = [...item.exact, ...(vectorOnly ? vector : [...item.deterministic.filter((entry) => entry.score >= 0.94), ...vector, ...item.deterministic])]
         .filter((entry) => {
           const id = String(entry.ledger?.guid || entry.ledger?.masterId || entry.ledger?.name || "");
           if (!id || seen.has(id)) return false;
@@ -812,18 +821,19 @@ export class LocalAgentRuntime {
         suggestions,
         deterministic: item.deterministic.slice(0, 5),
         vectorEnabled: true,
-        searchMode: vectorOnly ? 'vector_only' : 'hybrid',
+        searchMode: vectorOnly && !item.exact.length ? 'vector_only' : 'hybrid',
         embeddingModel: LOCAL_LEDGER_VECTOR_MODEL,
       }];
     }));
   }
 
   async localMasterCatalogue(scope = {}, { moduleName = "bank" } = {}) {
-    if (!this.activeIdentity || !(await this.moduleEnabled(moduleName))) return null;
-    if (scope.companyGuid && String(scope.companyGuid) !== String(this.activeIdentity.companyGuid)) return null;
-    if (scope.companyName && String(scope.companyName).trim().toLowerCase() !== String(this.activeIdentity.companyName).trim().toLowerCase()) return null;
-    if (normalizeFinancialYear(scope.financialYear) !== normalizeFinancialYear(this.activeIdentity.financialYear)) return null;
-    const key = datasetKey(this.activeIdentity);
+    const identity = this.activeIdentity;
+    if (!identity || !(await this.moduleEnabled(moduleName))) return null;
+    if (scope.companyGuid && String(scope.companyGuid) !== String(identity.companyGuid)) return null;
+    if (scope.companyName && String(scope.companyName).trim().toLowerCase() !== String(identity.companyName).trim().toLowerCase()) return null;
+    if (normalizeFinancialYear(scope.financialYear) !== normalizeFinancialYear(identity.financialYear)) return null;
+    const key = datasetKey(identity);
     const dataset = await this.storage.call("getDataset", { datasetKey: key });
     if (!dataset || dataset.status !== "ready" || dataset.quarantined_at) return null;
     const requested = new Set(scope.requestedTypes || ["ledger", "group"]);
@@ -833,25 +843,28 @@ export class LocalAgentRuntime {
       requested.has("stock_item") ? this.storage.call("listMasters", { datasetKey: key, masterType: "stock_item" }) : [],
       requested.has("unit") ? this.storage.call("listMasters", { datasetKey: key, masterType: "unit" }) : [],
     ]);
+    if (!this.activeIdentity || datasetKey(this.activeIdentity) !== key || this.activeIdentity.sessionGeneration !== identity.sessionGeneration) {
+      throw Object.assign(new Error("The active Tally connection changed during catalogue preparation. Refresh the catalogue."), { code: "COMPANY_CHANGED" });
+    }
     if (requested.has("ledger") && !ledgers.length) return null;
     const totals = { ledger: ledgers.length, group: groups.length, stock_item: stockItems.length, unit: units.length, godown: 0 };
     const validatedAt = dataset.cacheHealth?.validatedAt || dataset.last_sync_at;
     const dataUpdatedAt = dataset.cacheHealth?.dataUpdatedAt || dataset.last_sync_at;
     const completeTypes = ["ledger", "group", "stock_item", "unit"].filter((type) => requested.has(type));
     const catalogueDigest = createHash("sha256").update(JSON.stringify({
-      companyGuid: this.activeIdentity.companyGuid,
-      financialYear: normalizeFinancialYear(this.activeIdentity.financialYear),
+      companyGuid: identity.companyGuid,
+      financialYear: normalizeFinancialYear(identity.financialYear),
       requestedTypes: [...requested].sort(),
       cursors: dataset.cursors || {},
       totals,
     })).digest("hex");
     return {
       source: "live_tally",
-      companyName: this.activeIdentity.companyName,
-      financialYear: this.activeIdentity.financialYear,
+      companyName: identity.companyName,
+      financialYear: identity.financialYear,
       fetchedAt: dataUpdatedAt,
       validatedAt,
-      companyProfile: this.activeCompanyProfile || { name: this.activeIdentity.companyName, guid: this.activeIdentity.companyGuid },
+      companyProfile: this.activeCompanyProfile || { name: identity.companyName, guid: identity.companyGuid },
       requestedMasterTypes: [...requested],
       masters: { ledgers, groups, stockItems, units, godowns: [] },
       ledgers, groups, stockItems, units,
@@ -861,8 +874,8 @@ export class LocalAgentRuntime {
         mode: "incremental_alter_id",
         validatedAt,
         dataUpdatedAt,
-        companyGuid: this.activeIdentity.companyGuid,
-        financialYear: this.activeIdentity.financialYear,
+        companyGuid: identity.companyGuid,
+        financialYear: identity.financialYear,
         cursors: dataset.cursors || {},
         completeTypes,
         catalogueDigest,

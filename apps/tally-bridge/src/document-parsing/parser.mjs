@@ -41,13 +41,15 @@ async function loadBankStatementModules() {
     load("bank-statement-running-balance.mjs"),
     load("bank-statement-resilience.mjs"),
     load("bank-statement-pdf-columns.mjs"),
-  ]).then(([deterministic, account, amounts, runningBalance, resilience, pdfColumns]) => ({
+    load("bank-statement-layout.mjs"),
+  ]).then(([deterministic, account, amounts, runningBalance, resilience, pdfColumns, layout]) => ({
     deterministic,
     account,
     amounts,
     runningBalance,
     resilience,
     pdfColumns,
+    layout,
   }));
   return bankStatementModulesPromise;
 }
@@ -193,69 +195,183 @@ function transactionsFromPhysicalRows(rows) {
   }));
 }
 
+// The words on each page with their positions, as pdf.js reports them.
+async function readPdfPages(bytes, maxPages = 300) {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const pdf = await pdfjs.getDocument({ data: new Uint8Array(bytes), useSystemFonts: true, verbosity: 0 }).promise;
+  try {
+    if (pdf.numPages > maxPages) throw new Error("PDF page limit exceeded");
+    const pages = [];
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const text = await page.getTextContent();
+      pages.push({ pageNumber, width: page.view[2] - page.view[0], items: text.items });
+      page.cleanup();
+    }
+    return pages;
+  } finally {
+    await pdf.destroy();
+  }
+}
+
+function transactionsFromLayoutRows(rows) {
+  return rows.map((row, sourceIndex) => ({
+    row_index: sourceIndex + 1,
+    transaction_date: row.transactionDate,
+    value_date: row.valueDate || row.transactionDate,
+    description: row.narration,
+    reference_number: row.reference || null,
+    debit_amount: row.debitAmount,
+    credit_amount: row.creditAmount,
+    balance_amount: row.balanceAmount,
+    transaction_type: "unknown",
+    category: row.creditAmount > 0 ? "receipt" : "payment",
+    counterparty_name: null,
+    suggested_ledger_name: null,
+    suggestion_confidence: null,
+    suggestion_reason: null,
+    confirmed_ledger_name: null,
+    additional_charges: [],
+    confidence: row.issues?.length ? 0.6 : 0.95,
+    raw_payload: {
+      rowNumber: sourceIndex + 1,
+      source: "page_layout",
+      ...(row.derivedBalance ? { derivedBalance: true } : {}),
+      ...(row.issues?.length ? { amountValidationIssue: row.issues.join(",") } : {}),
+      row: { sourcePage: row.page },
+      extractionProvenance: { startPage: row.page, endPage: row.page, sourceIndex, method: "page_layout" },
+    },
+  }));
+}
+
+// verified (every balance step checked) beats unavailable beats failed; then
+// fewer breaks, then more rows.
+function candidateRank(candidate) {
+  const status = candidate.balanceValidation.status;
+  return [status === "verified" ? 2 : status === "unavailable" ? 1 : 0,
+    -candidate.balanceValidation.breaks.length, candidate.transactions.length];
+}
+
+function betterCandidate(left, right) {
+  const a = candidateRank(left);
+  const b = candidateRank(right);
+  for (let index = 0; index < a.length; index += 1) if (a[index] !== b[index]) return a[index] > b[index] ? left : right;
+  return left;
+}
+
 export async function processBankStatementMarkdownLocal(markdown, { pageCount = 1, pdfBytes = null } = {}) {
-  const { deterministic, account, amounts, runningBalance, resilience, pdfColumns } =
+  const { deterministic, account, amounts, runningBalance, resilience, pdfColumns, layout } =
     await loadBankStatementModules();
+  const candidates = [];
+  const attempts = {};
+
+  // 1. The Markdown tables AnyDoc produced.
   let normalized = deterministic.deterministicTransactionsFromAnydoc(markdown);
-  let pipeline = "deterministic_anydoc";
-  let physical = null;
-  if (!normalized?.transactions?.length && pdfBytes) {
-    physical = await pdfColumns.readBankStatementPhysicalColumns(pdfBytes);
-    if (physical.detected && physical.rows.length) {
-      normalized = {
-        headers: [`physical:${physical.layout}`],
-        transactions: transactionsFromPhysicalRows(physical.rows),
-      };
-      pipeline = "physical_pdf_columns";
+  const source = amounts.extractBankStatementMarkdownAmounts(markdown);
+  if (normalized?.transactions?.length) {
+    // AnyDoc can preserve all cells while shifting an empty debit/credit cell
+    // in the normalized table. Reapply the amounts read from the original
+    // Markdown columns before judging running-balance continuity.
+    normalized = amounts.reconcileBankStatementMarkdownAmounts({ ...normalized, openingBalance: source.openingBalance }, markdown);
+    candidates.push({
+      pipeline: "deterministic_anydoc",
+      headers: normalized.headers,
+      transactions: resilience.addBankStatementPageProvenance(normalized.transactions, {
+        startPage: 1, endPage: Math.max(1, Number(pageCount) || 1), method: "deterministic_anydoc",
+      }),
+      openingBalance: source.openingBalance,
+      markdownAmounts: normalized.markdownAmountDiagnostics ?? null,
+    });
+  } else attempts.deterministic_anydoc = "no transaction table";
+
+  // 2. The page itself: every word where the bank printed it. Rows that AnyDoc
+  // turned into prose, totals lines and wrapped amounts are read correctly here.
+  let pageLayout = null;
+  // pdf.js loads from the agent's own modules; the copied worker files cannot import it.
+  let pages = null;
+  if (pdfBytes) {
+    try {
+      pages = await readPdfPages(pdfBytes);
+    } catch (error) {
+      attempts.pdf_text = error instanceof Error ? error.message : String(error);
     }
   }
-  if (!normalized?.transactions?.length) {
+  if (pages) {
+    try {
+      pageLayout = layout.extractBankStatementLayout(pages);
+      if (pageLayout.detected && pageLayout.rows.length) {
+        candidates.push({
+          pipeline: "page_layout",
+          headers: pageLayout.columns.map((column) => column.label),
+          transactions: transactionsFromLayoutRows(pageLayout.rows),
+          openingBalance: pageLayout.openingBalance,
+        });
+      } else attempts.page_layout = pageLayout.issues?.join(",") || "no rows";
+    } catch (error) {
+      attempts.page_layout = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  // 3. The original fixed PNB/Central Bank column readers.
+  if (!candidates.length && pages) {
+    try {
+      const physical = pdfColumns.extractBankStatementPhysicalColumns(pages);
+      if (physical.detected && physical.rows.length) {
+        candidates.push({ pipeline: "physical_pdf_columns", physicalLayout: physical.layout, headers: [`physical:${physical.layout}`],
+          transactions: transactionsFromPhysicalRows(physical.rows), openingBalance: source.openingBalance });
+      }
+    } catch (error) {
+      attempts.physical_pdf_columns = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  if (!candidates.length) {
     const error = new Error("The bank-statement tables could not be normalized deterministically.");
     error.code = "deterministic_extraction_unavailable";
     throw error;
   }
-  const source = amounts.extractBankStatementMarkdownAmounts(markdown);
-  // AnyDoc can preserve all cells while shifting an empty debit/credit cell in
-  // the normalized table. Reapply the amounts read from the original Markdown
-  // columns before judging running-balance continuity. This is the same
-  // authoritative reconciliation used by the main bank-statement pipeline.
-  if (pipeline === "deterministic_anydoc") {
-    normalized = amounts.reconcileBankStatementMarkdownAmounts(
-      { ...normalized, openingBalance: source.openingBalance },
-      markdown
-    );
+  for (const candidate of candidates) {
+    candidate.balanceValidation = runningBalance.validateRunningBalanceContinuity(candidate.transactions, candidate.openingBalance);
   }
-  const accountFromMarkdown = account.extractAccountFromBankStatementMarkdown(markdown);
-  const balanceValidation = runningBalance.validateRunningBalanceContinuity(
-    normalized.transactions,
-    source.openingBalance
-  );
+  // Prefer the page reading when it proves more of the statement; keep the
+  // Markdown reading when both are equally proven.
+  const chosen = candidates.reduce((best, candidate) => betterCandidate(best, candidate));
+
+  // Account and period: what the page labels say first, Markdown second.
+  const fromLayout = pageLayout?.detected ? pageLayout.account : {};
+  const fromMarkdown = account.extractAccountFromBankStatementMarkdown(markdown);
+  const saneHolder = (value) => (String(value || "").length <= 80 ? value : "");
+  const statementAccount = account.mergeBankStatementAccount(fromLayout, { ...fromMarkdown, accountHolderName: saneHolder(fromMarkdown.accountHolderName) });
+  const dates = chosen.transactions.map((transaction) => transaction.transaction_date).filter(Boolean).sort();
+
   // A balance mismatch is a review condition, not a parser crash. The backend
   // repeats this validation and safely marks the import as requiring manual
   // review, so no inconsistent statement can be posted automatically.
   return {
     parsed: {
-      account: account.mergeBankStatementAccount({}, accountFromMarkdown),
-      statementPeriodStart: null,
-      statementPeriodEnd: null,
-      openingBalance: source.openingBalance,
-      transactions: pipeline === "physical_pdf_columns"
-        ? normalized.transactions
-        : resilience.addBankStatementPageProvenance(normalized.transactions, {
-            startPage: 1,
-            endPage: Math.max(1, Number(pageCount) || 1),
-            method: "deterministic_anydoc",
-          }),
+      account: statementAccount,
+      statementPeriodStart: pageLayout?.statementPeriodStart || dates[0] || null,
+      statementPeriodEnd: pageLayout?.statementPeriodEnd || dates.at(-1) || null,
+      openingBalance: chosen.openingBalance ?? null,
+      closingBalance: pageLayout?.closingBalance ?? null,
+      transactions: chosen.transactions,
       pageResults: [],
     },
     diagnostics: {
-      pipeline,
-      physicalLayout: physical?.layout ?? null,
-      rowCount: normalized.transactions.length,
-      headers: normalized.headers,
+      pipeline: chosen.pipeline,
+      physicalLayout: chosen.physicalLayout ?? null,
+      rowCount: chosen.transactions.length,
+      headers: chosen.headers,
       normalized: true,
-      markdownAmounts: normalized.markdownAmountDiagnostics ?? null,
-      balanceValidation,
+      markdownAmounts: chosen.markdownAmounts ?? null,
+      balanceValidation: chosen.balanceValidation,
+      duplicateRowsRemoved: chosen.pipeline === "page_layout" ? pageLayout.duplicatesRemoved : 0,
+      derivedBalances: chosen.pipeline === "page_layout" ? pageLayout.derivedBalances : false,
+      candidates: candidates.map((candidate) => ({
+        pipeline: candidate.pipeline, rows: candidate.transactions.length, balance: candidate.balanceValidation.status,
+        breaks: candidate.balanceValidation.breaks.length,
+      })),
+      attempts,
       used: true,
     },
   };

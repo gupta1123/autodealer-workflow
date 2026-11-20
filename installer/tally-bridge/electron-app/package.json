@@ -1,7 +1,7 @@
 {
   "name": "kalika-local-agent",
   "productName": "Kalika Local Agent",
-  "version": "1.2.39",
+  "version": "1.2.43",
   "description": "Secure local workflow agent connecting Kalika to Tally Prime.",
   "author": "Kalika",
   "private": true,
@@ -17,6 +17,7 @@
     "@zvec/zvec": "0.7.1",
     "better-sqlite3-multiple-ciphers": "12.11.1",
     "electron-updater": "6.8.9",
+    "pdfjs-dist": "4.10.38",
     "ws": "8.21.1"
   },
   "optionalDependencies": {
@@ -66,7 +67,8 @@
           "bank-statement-markdown-amounts.mjs",
           "bank-statement-running-balance.mjs",
           "bank-statement-resilience.mjs",
-          "bank-statement-pdf-columns.mjs"
+          "bank-statement-pdf-columns.mjs",
+          "bank-statement-layout.mjs"
         ]
       }
     ],

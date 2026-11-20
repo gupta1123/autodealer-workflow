@@ -302,3 +302,25 @@ test("statement reconciliation reads bank allocations from the primary export", 
   assert.equal(outcome.result.queryDiagnostics.detailedVoucherCount, 0);
   assert.equal(outcome.result.queryDiagnostics.primaryIncludesBankReferences, true);
 });
+
+test("bulk duplicate lookup covers every day and retries a slow window without skipping vouchers", async () => {
+  const days = [];
+  let firstAttempt = true;
+  const transactions = Array.from({ length: 10 }, (_, i) => ({
+    ...MANUAL_BANK_TRANSACTION, referenceNumber: `UTR-12345${i}`, transactionId: String(i)
+  }));
+  await reconcileBankTransactionsInTally({}, {
+    bankLedgerName: "ICICI Current Account", includeBalanceProof: false, transactions,
+  }, { exportCollection: async (_url, options) => {
+    if (options.collectionName === "Kalika Bank Reference Identity") {
+      assert.equal(options.formulae, undefined);
+      if (firstAttempt) { firstAttempt = false; throw new Error("Read timed out after 20 seconds."); }
+      for (let day = Date.parse(options.dateFrom); day <= Date.parse(options.dateTo); day += 86400000) days.push(day);
+    }
+    return "<ENVELOPE><COLLECTION></COLLECTION></ENVELOPE>";
+  } });
+  assert.equal(days[0], Date.parse("2026-04-01"));
+  assert.equal(days.at(-1), Date.parse("2027-03-31"));
+  assert.equal(days.length, 365);
+  assert.equal(new Set(days).size, 365);
+});

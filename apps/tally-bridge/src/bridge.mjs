@@ -4560,15 +4560,14 @@ async function fetchBankReconciliationVouchers(
     const amountFormula = Array.from(new Set(crossDateTransactions.map((row) => Number(row.amount))))
       .map((amount) => `($Amount = ${amount} OR $Amount = ${-amount})`)
       .join(" OR ");
-    const crossDateXml = await exportCollection(tallyUrl, {
+    const crossDateOptions = {
       collectionName: "Kalika Bank Reference Identity",
       tallyType: "Vouchers : Ledger",
       childOf: tallyFormulaString(bankLedgerName),
       fetchFields:
         "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.*",
       companyName,
-      dateFrom: financialYear.dateFrom,
-      dateTo: financialYear.dateTo,
+
       formulae: [
         { name: entryFilterName, formula: `($$IsEqual:$LedgerName:${tallyFormulaString(bankLedgerName)}) AND (${amountFormula})` },
         { name: filterName, formula: `$$FilterCount:AllLedgerEntries:${entryFilterName} > 0` },
@@ -4576,14 +4575,42 @@ async function fetchBankReconciliationVouchers(
       filterNames: [filterName],
       timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
       maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
-    });
-    checkReadBudget(cashDiscountReadContext.getStore());
-    if (!isCompleteVoucherEnvelope(crossDateXml)) {
-      throw new Error("Tally did not return a complete financial-year duplicate lookup.");
+    };
+    const dayMs = 86_400_000;
+    const iso = time => new Date(time).toISOString().slice(0, 10);
+    // Large OR expressions inside Tally's per-voucher FilterCount can stall
+    // even for one bank. Read smaller date windows and match amounts locally.
+    const bulk = crossDateTransactions.length > 8;
+    if (bulk) {
+      delete crossDateOptions.formulae;
+      delete crossDateOptions.filterNames;
     }
-    crossDateVouchers = parseVoucherCollection(crossDateXml).filter(
-      (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
-    );
+    async function readWindow(first, last) {
+      checkReadBudget(cashDiscountReadContext.getStore());
+      let xml;
+      try {
+        xml = await exportCollection(tallyUrl, { ...crossDateOptions, dateFrom: iso(first), dateTo: iso(last) });
+      } catch (error) {
+        if (first >= last || !/timed out after \d+ seconds/i.test(String(error?.message))) throw error;
+        const middle = first + Math.floor((last - first) / dayMs / 2) * dayMs;
+        await readWindow(first, middle);
+        await readWindow(middle + dayMs, last);
+        return;
+      }
+      if (!isCompleteVoucherEnvelope(xml)) throw new Error("Tally did not return a complete financial-year duplicate lookup.");
+      for (const voucher of parseVoucherCollection(xml)) {
+        if (!/^yes$/i.test(String(voucher.isCancelled || ""))) crossDateVouchers.push(voucher);
+      }
+    }
+    const years = new Set(crossDateTransactions.map(row => financialYearBounds(row.voucherDate).dateFrom));
+    for (const start of years) {
+      const last = Date.parse(financialYearBounds(start).dateTo);
+      for (let first = Date.parse(start); first <= last;) {
+        const end = bulk ? Math.min(first + 30 * dayMs, last) : last;
+        await readWindow(first, end);
+        first = end + dayMs;
+      }
+    }
     crossDateExportMs = Date.now() - crossDateStartedAt;
   }
   const voucherByIdentity = new Map();
