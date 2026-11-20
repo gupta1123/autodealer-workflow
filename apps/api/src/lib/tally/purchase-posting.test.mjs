@@ -539,6 +539,27 @@ test("live Tally metadata discovers non-client-specific purchase, GST, and withh
   assert.equal(result.blockers.length, 0);
 });
 
+test("invoice 184 uses the saved GST TDS switch below threshold and sends both deductions to Tally", () => {
+  const doc = invoiceDocument({ totalAmount: "241924.00", taxAmount: "36903.60", tdsAmount: "",
+    lines: [{ description: "MS Scrap", hsnSac: "72044900", quantity: "5695", unit: "KG",
+      rate: "36", taxableAmount: "205020.00", taxAmount: "36903.60" }] });
+  Object.assign(doc.extracted_fields, { invoiceNumber: "184", totalTaxableAmount: "205020", roundOffAmount: "0.40" });
+  delete doc.extracted_fields.cgstTdsAmount;
+  delete doc.extracted_fields.sgstTdsAmount;
+  assert.equal(prepare(doc).review.applyGstTds, false);
+  const savedReview = { applyGstTds: true, applyTds194q: true, tds194qRounding: "nearest_rupee" };
+  const on = prepare(doc, { savedReview });
+  assert.equal(on.calculation.tds194qAmount, "205.00");
+  assert.equal(on.calculation.totalWithholdingAmount, "4305.40");
+  assert.equal(on.calculation.calculatedPayable, "237618.00");
+  for (const [kind, amount] of [["cgst_tds", "2050.20"], ["sgst_tds", "2050.20"]]) {
+    assert.ok(on.tallyPayload.withholdings.some(entry => entry.kind === kind && entry.amount === amount));
+  }
+  assert.equal(on.blockers.length, 0);
+  assert.equal(on.calculation.totalDifference, "0.00");
+  assert.equal(prepare(doc, { savedReview: { ...savedReview, applyGstTds: false } }).calculation.totalWithholdingAmount, "205.00");
+});
+
 test("qualifying Maharashtra MS Scrap automatically deducts 1% CGST and 1% SGST without invoice-printed TDS", () => {
   const document = invoiceDocument({
     totalAmount: "354000.00",

@@ -2224,9 +2224,6 @@ export function TallyPurchasePostingPanel({
     if (review.invoiceDate && review.invoiceDate < "2024-10-10") {
       return `The automatic scrap GST TDS applies only to invoices dated on or after 10 Oct 2024. This invoice is dated ${tallyDate(review.invoiceDate)}, and it does not print a GST TDS amount.`;
     }
-    if (scrapBasis <= 250000) {
-      return "The scrap value on this invoice is ₹2.5 lakh or less, so the automatic scrap GST TDS does not apply, and the invoice does not print a GST TDS amount.";
-    }
     if (calculation.taxMode === "unknown") {
       return "The supplier or buyer GSTIN is missing or invalid, so the tax type cannot be worked out.";
     }
@@ -2843,6 +2840,7 @@ export function TallyPurchasePostingPanel({
                     ? "GST TDS (IGST)"
                     : "GST TDS"}
               </label> : null}
+              {gstTdsOnWithoutAmount && !saving && <span className="text-xs font-medium text-amber-800">GST TDS enabled · ₹0 deducted</span>}
               <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
                 <button
                   aria-checked={review.tcsReceivable}

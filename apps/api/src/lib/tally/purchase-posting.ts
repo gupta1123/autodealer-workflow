@@ -1814,14 +1814,19 @@ function calculate(
       ? calculateLineTaxable(line)
       : null
   ));
-  const scrapGstTdsEligible =
+  const canCalculateScrapGstTds =
     isValidIsoDate(review.invoiceDate) &&
     review.invoiceDate >= SCRAP_GST_TDS_EFFECTIVE_DATE &&
     validGstin(review.supplierGstin) &&
     validGstin(buyerGstin || review.buyerGstin) &&
-    taxMode !== "unknown" &&
-    scrapGstTdsBasis > GST_TDS_CONTRACT_THRESHOLD_PAISE;
-  const automaticScrapGstTds = accountingSettings.gstTdsEnabled && review.applyGstTds && scrapGstTdsEligible;
+    taxMode !== "unknown" && scrapGstTdsBasis > 0;
+  const scrapGstTdsEligible = canCalculateScrapGstTds && scrapGstTdsBasis > GST_TDS_CONTRACT_THRESHOLD_PAISE;
+  const printedGstTds = [source.invoiceCgstTdsAmount, source.invoiceSgstTdsAmount, source.invoiceIgstTdsAmount]
+    .some(amount => (moneyPaise(amount) ?? 0) > 0);
+  // The threshold controls the default. Selecting GST TDS also authorizes a
+  // calculated deduction when this smaller invoice has no printed withholding.
+  const automaticScrapGstTds = accountingSettings.gstTdsEnabled && review.applyGstTds &&
+    canCalculateScrapGstTds && (scrapGstTdsEligible || !printedGstTds);
   const confirmedDeduction = (enabled: boolean, value: string) => {
     const amount = moneyPaise(value);
     return enabled && amount !== null ? Math.abs(amount) : 0;
@@ -2407,7 +2412,7 @@ export function preparePurchasePosting(params: {
     hasPostEffectiveScrap &&
     validGstin(review.supplierGstin) &&
     validGstin(params.companyGstin || review.buyerGstin) &&
-    !calculation.scrapGstTdsEligible
+    !calculation.scrapGstTdsEligible && !review.applyGstTds
   ) {
     warnings.push(issue(
       "SCRAP_GST_TDS_CONTRACT_THRESHOLD_REVIEW",
