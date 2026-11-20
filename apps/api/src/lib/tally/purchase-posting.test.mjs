@@ -184,6 +184,15 @@ function freightInvoiceDocument() {
   return document;
 }
 
+test("two identical printed lines reach the purchase voucher as two items", () => {
+  const document = invoiceDocument();
+  const half = { ...document.extracted_fields.__lineItems[0], quantity: "0.5", taxableAmount: "500", taxAmount: "90" };
+  document.extracted_fields.__lineItems = [half, { ...half }];
+  const result = prepare(document);
+  assert.equal(result.review.lines.length, 2);
+  assert.equal(result.tallyPayload.items.length, 2);
+});
+
 test("Perfect Steel 122 reconciles percentage GST rates through review and Tally payload", () => {
   const document = freightInvoiceDocument();
   for (const savedReview of [null, { gstRate: "18 %", freightGstRate: "18%", transportTdsRate: "1%" }]) {

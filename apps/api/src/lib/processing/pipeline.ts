@@ -22,6 +22,7 @@ import {
   enrichDocumentsWithPacketGstTaxContext,
   isCommercialDocType,
   normalizeExtractedCommercialLineItems,
+  mergeRowsAcrossCopies,
   sanitizeLineItems,
 } from "@/lib/line-items";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
@@ -1796,24 +1797,39 @@ function mergeInvoiceLineItem(primary: CommercialLineItem, fallback: CommercialL
   return next;
 }
 
+// The numbers of a line (quantity and amount, plus rate when both copies show one).
+// Two copies of the same invoice can word an item differently ("MS Scrap" vs
+// "M.S. Scrap & Sponge Iron") but they print the same numbers.
+function buildInvoiceLineNumbersKey(item: CommercialLineItem) {
+  const quantity = parseLooseNumber(typeof item.quantity === "string" || typeof item.quantity === "number" ? item.quantity : undefined);
+  const amount = parseLooseNumber(
+    typeof (item.taxableAmount ?? item.lineTotal) === "string" || typeof (item.taxableAmount ?? item.lineTotal) === "number"
+      ? (item.taxableAmount ?? item.lineTotal) as string | number
+      : undefined
+  );
+  if (quantity === null || amount === null || quantity <= 0 || amount <= 0) return null;
+  const rate = parseLooseNumber(typeof item.rate === "string" || typeof item.rate === "number" ? item.rate : undefined);
+  return { quantity, amount, rate };
+}
+
+function haveSameInvoiceLineNumbers(left: CommercialLineItem, right: CommercialLineItem) {
+  const a = buildInvoiceLineNumbersKey(left);
+  const b = buildInvoiceLineNumbersKey(right);
+  if (!a || !b) return false;
+  if (!numbersClose(a.quantity, b.quantity, Math.max(0.001, a.quantity * 0.0005))) return false;
+  if (!numbersClose(a.amount, b.amount, Math.max(1, a.amount * 0.002))) return false;
+  if (a.rate !== null && b.rate !== null && !numbersClose(a.rate, b.rate, Math.max(0.01, a.rate * 0.002))) return false;
+  return true;
+}
+
 function mergeInvoiceCopyLineItems(primary: CommercialLineItem[] | undefined, fallback: CommercialLineItem[] | undefined) {
-  const result: CommercialLineItem[] = [];
-  const indexBySignature = new Map<string, number>();
-
-  for (const item of sanitizeLineItems([...(primary ?? []), ...(fallback ?? [])])) {
-    const signature = buildInvoiceLineCopySignature(item);
-    const existingIndex = signature ? indexBySignature.get(signature) : undefined;
-
-    if (existingIndex !== undefined) {
-      result[existingIndex] = mergeInvoiceLineItem(result[existingIndex], item);
-      continue;
-    }
-
-    const nextIndex = result.push(item) - 1;
-    if (signature) indexBySignature.set(signature, nextIndex);
-  }
-
-  return result;
+  return mergeRowsAcrossCopies(sanitizeLineItems(primary ?? []), sanitizeLineItems(fallback ?? []), [
+    (left, right) => {
+      const signature = buildInvoiceLineCopySignature(left);
+      return Boolean(signature && signature === buildInvoiceLineCopySignature(right));
+    },
+    haveSameInvoiceLineNumbers,
+  ], mergeInvoiceLineItem);
 }
 
 function getInvoiceDocCompletenessScore(doc: CaseDoc) {

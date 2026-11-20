@@ -61,3 +61,21 @@ test("two different rows on one page are both kept", () => {
   });
   assert.equal(lines.length, 2);
 });
+
+test("a missing row on the original is preserved across multiple invoice copies", () => {
+  const lines = normalizeExtractedCommercialLineItems({
+    docType: "Tax Invoice",
+    lineItems: [line(1), line(2), line(2), line(3), line(3)],
+    visibleTextPages: ["ORIGINAL", "DUPLICATE", "TRIPLICATE"].map(invoicePage),
+  });
+  assert.equal(lines.length, 2);
+});
+
+test("identical rows without evidence of a copy remain separate", () => {
+  const lines = normalizeExtractedCommercialLineItems({
+    docType: "Tax Invoice",
+    lineItems: [1, 1, 2].map(page => ({ ...line(page), lineNumber: "1" })),
+    visibleTextPages: ["Invoice part one", "Invoice continued"],
+  });
+  assert.equal(lines.length, 3);
+});

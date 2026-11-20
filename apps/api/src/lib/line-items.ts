@@ -84,7 +84,6 @@ const DUPLICATE_COPY_WITHOUT_HSN_SIGNATURE_KEYS = DUPLICATE_COPY_LINE_ITEM_SIGNA
 const TAX_RATE_KEYS: TaxRateKey[] = ["cgstRate", "sgstRate", "igstRate", "taxRate"];
 const DUPLICATE_COPY_PAGE_SIMILARITY_THRESHOLD = 0.88;
 const DUPLICATE_COPY_MIN_COMMON_TOKENS = 35;
-const INVOICE_COPY_DOC_TYPES = new Set<string>(["Invoice", "Tax Invoice"]);
 const INVOICE_DOC_TYPES = new Set<string>(["Invoice", "Tax Invoice"]);
 const HOME_GST_STATE_CODE = "27";
 const DEFAULT_GST_RATE = 18;
@@ -481,8 +480,8 @@ function tokenSetSimilarity(left: Set<string>, right: Set<string>) {
   };
 }
 
-function findDuplicateCopyPageNumbers(visibleTextPages: string[]) {
-  const duplicates = new Set<number>();
+function findInvoiceCopyPages(visibleTextPages: string[]) {
+  const duplicates = new Map<number, number>();
   const pageTokens = visibleTextPages.map(normalizeDuplicateCopyPageTokens);
 
   for (let index = 0; index < pageTokens.length; index += 1) {
@@ -498,7 +497,7 @@ function findDuplicateCopyPageNumbers(visibleTextPages: string[]) {
         similarity.common >= DUPLICATE_COPY_MIN_COMMON_TOKENS &&
         similarity.score >= DUPLICATE_COPY_PAGE_SIMILARITY_THRESHOLD
       ) {
-        duplicates.add(index + 1);
+        duplicates.set(index + 1, duplicates.get(previousIndex + 1) ?? previousIndex + 1);
         break;
       }
     }
@@ -523,76 +522,74 @@ function mergeLineItems(primary: CommercialLineItem, fallback: CommercialLineIte
   return next;
 }
 
-function dedupeDuplicateCopyLineItems(
-  lineItems: CommercialLineItem[],
-  duplicatePageNumbers: Set<number>
+// Reserve exact matches first. A row may be used once per copy, and any
+// surplus occurrences in either copy remain separate invoice lines.
+export function mergeRowsAcrossCopies(
+  primary: CommercialLineItem[],
+  copy: CommercialLineItem[],
+  matches: Array<(left: CommercialLineItem, right: CommercialLineItem) => boolean>,
+  merge: (left: CommercialLineItem, right: CommercialLineItem) => CommercialLineItem
 ) {
-  if (lineItems.length < 2) return lineItems;
+  const result = [...primary];
+  const usedPrimary = new Set<number>();
+  const pairedCopy = new Set<number>();
+  for (const matchesRow of matches) {
+    copy.forEach((item, index) => {
+      if (pairedCopy.has(index)) return;
+      const twin = primary.findIndex((row, i) => !usedPrimary.has(i) && matchesRow(row, item));
+      if (twin < 0) return;
+      result[twin] = merge(primary[twin], item);
+      usedPrimary.add(twin);
+      pairedCopy.add(index);
+    });
+  }
+  return result.concat(copy.filter((_, i) => !pairedCopy.has(i)));
+}
 
+function mergeInvoicePageCopies(items: CommercialLineItem[], textPages: string[]) {
+  const copies = findInvoiceCopyPages(textPages);
+  if (!copies.size) return items;
+
+  const byPage = new Map<number, CommercialLineItem[]>();
+  for (const item of items) {
+    const page = item.sourcePage ?? 0;
+    const rows = byPage.get(page) ?? [];
+    rows.push(item);
+    byPage.set(page, rows);
+  }
+  const sameSignature = (keys: TextLineItemKey[]) => (a: CommercialLineItem, b: CommercialLineItem) => {
+    const signature = buildLineItemSignature(a, keys);
+    return Boolean(signature && signature === buildLineItemSignature(b, keys));
+  };
+  const withoutHsn = sameSignature(DUPLICATE_COPY_WITHOUT_HSN_SIGNATURE_KEYS);
+  for (const [page, original] of copies) {
+    const rows = byPage.get(page);
+    if (!rows) continue;
+    byPage.set(original, mergeRowsAcrossCopies(byPage.get(original) ?? [], rows, [
+      sameSignature(LINE_ITEM_SIGNATURE_KEYS),
+      sameSignature(LOOSE_LINE_ITEM_SIGNATURE_KEYS),
+      sameSignature(DUPLICATE_COPY_LINE_ITEM_SIGNATURE_KEYS),
+      (a, b) => (!hasLineItemTextValue(a.hsnSac) || !hasLineItemTextValue(b.hsnSac)) && withoutHsn(a, b),
+    ], mergeLineItems));
+    byPage.delete(page);
+  }
+  return Array.from(byPage.values()).flat();
+}
+
+function dedupeNonInvoiceLineItems(items: CommercialLineItem[]) {
   const result: CommercialLineItem[] = [];
-  const strictIndexBySignature = new Map<string, number>();
-  const looseIndexBySignature = new Map<string, number>();
-  const duplicateCopyIndexBySignature = new Map<string, number>();
-  const duplicateCopyWithoutHsnIndexBySignature = new Map<string, number>();
-
-  for (const item of lineItems) {
-    const strictSignature = buildLineItemSignature(item);
-    const looseSignature = buildLineItemSignature(item, LOOSE_LINE_ITEM_SIGNATURE_KEYS);
-    const duplicateCopySignature = buildLineItemSignature(item, DUPLICATE_COPY_LINE_ITEM_SIGNATURE_KEYS);
-    const duplicateCopyWithoutHsnSignature = buildLineItemSignature(
-      item,
-      DUPLICATE_COPY_WITHOUT_HSN_SIGNATURE_KEYS
-    );
-    const sourcePage = item.sourcePage;
-    const isFromDuplicateCopy = Boolean(sourcePage && duplicatePageNumbers.has(sourcePage));
-    const withoutHsnMatchIndex = duplicateCopyWithoutHsnSignature
-      ? duplicateCopyWithoutHsnIndexBySignature.get(duplicateCopyWithoutHsnSignature)
-      : undefined;
-    const duplicateCopyMatchIndex = duplicateCopySignature
-      ? duplicateCopyIndexBySignature.get(duplicateCopySignature) ??
-        (withoutHsnMatchIndex !== undefined &&
-        (!hasLineItemTextValue(item.hsnSac) || !hasLineItemTextValue(result[withoutHsnMatchIndex].hsnSac))
-          ? withoutHsnMatchIndex
-          : undefined)
-      : undefined;
-    const looseMatchIndex = looseSignature ? looseIndexBySignature.get(looseSignature) : undefined;
-    const strictMatchIndex = strictSignature ? strictIndexBySignature.get(strictSignature) : undefined;
-    const strictMatch = strictMatchIndex === undefined ? undefined : result[strictMatchIndex];
-    const canUseStrictMatch = Boolean(
-      strictMatch &&
-        (hasLineItemTextValue(item.lineNumber) ||
-          (sourcePage && strictMatch.sourcePage && sourcePage !== strictMatch.sourcePage))
-    );
-    const duplicateMatchIndex =
-      isFromDuplicateCopy && duplicateCopyMatchIndex !== undefined
-        ? duplicateCopyMatchIndex
-        : isFromDuplicateCopy && looseMatchIndex !== undefined
-          ? looseMatchIndex
-        : canUseStrictMatch
-          ? strictMatchIndex
-          : undefined;
-
-    if (duplicateMatchIndex !== undefined) {
-      result[duplicateMatchIndex] = mergeLineItems(result[duplicateMatchIndex], item);
-      continue;
-    }
-
-    const nextIndex = result.push(item) - 1;
-    if (strictSignature) strictIndexBySignature.set(strictSignature, nextIndex);
-    if (looseSignature && !looseIndexBySignature.has(looseSignature)) {
-      looseIndexBySignature.set(looseSignature, nextIndex);
-    }
-    if (duplicateCopySignature && !duplicateCopyIndexBySignature.has(duplicateCopySignature)) {
-      duplicateCopyIndexBySignature.set(duplicateCopySignature, nextIndex);
-    }
-    if (
-      duplicateCopyWithoutHsnSignature &&
-      !duplicateCopyWithoutHsnIndexBySignature.has(duplicateCopyWithoutHsnSignature)
-    ) {
-      duplicateCopyWithoutHsnIndexBySignature.set(duplicateCopyWithoutHsnSignature, nextIndex);
+  const bySignature = new Map<string, number>();
+  for (const item of items) {
+    const signature = buildLineItemSignature(item);
+    const index = signature ? bySignature.get(signature) : undefined;
+    if (index !== undefined && (hasLineItemTextValue(item.lineNumber) ||
+        (item.sourcePage && result[index].sourcePage && item.sourcePage !== result[index].sourcePage))) {
+      result[index] = mergeLineItems(result[index], item);
+    } else {
+      if (signature) bySignature.set(signature, result.length);
+      result.push(item);
     }
   }
-
   return result;
 }
 
@@ -1533,10 +1530,9 @@ export function normalizeExtractedCommercialLineItems(params: {
   }
 
   const visibleTextPages = params.visibleTextPages ?? [];
-  const duplicatePageNumbers = INVOICE_COPY_DOC_TYPES.has(params.docType)
-    ? findDuplicateCopyPageNumbers(visibleTextPages)
-    : new Set<number>();
-  const deduped = dedupeDuplicateCopyLineItems(params.lineItems, duplicatePageNumbers);
+  const deduped = INVOICE_DOC_TYPES.has(params.docType)
+    ? mergeInvoicePageCopies(params.lineItems, visibleTextPages)
+    : dedupeNonInvoiceLineItems(params.lineItems);
   const visibleText = visibleTextPages.join("\n");
   const withInvoiceAmounts = INVOICE_DOC_TYPES.has(params.docType)
     ? reconcileInvoiceChargeResiduals(
