@@ -77,6 +77,7 @@ function summarize(job: ProcessingJobRow, queuePosition: number | null) {
     status: mapped.status,
     progress: mapped.progress,
     stage: mapped.stage,
+    nextRunAt: mapped.nextRunAt,
     etaSeconds: mapped.etaSeconds,
     queuePosition: mapped.queuePosition,
     detail: mapped.progressDetail,

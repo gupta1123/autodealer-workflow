@@ -128,6 +128,14 @@ export function LocalAgentPanel({ connectionId, companyName, tallyLive = true }:
           </Button>
         ) : null}
       </div>
+      {canManage && <details className="mt-3 text-xs text-[#6f6255]">
+        <summary className="cursor-pointer font-semibold">Connector diagnostics</summary>
+        <p className="mt-2">Version {payload.agent.version} / {agentOnline ? "Online" : "Offline"}</p>
+        <p>Installation {payload.connection?.installationId || "Unknown"}</p>
+        <p>Company {company?.companyName || "Unknown"} / FY {company?.financialYear || "Unknown"}</p>
+        <p>Last heartbeat {agentLastSeen ? new Date(agentLastSeen).toLocaleString() : "Unavailable"}</p>
+        <p>Last data sync {dataset?.last_synced_at ? new Date(dataset.last_synced_at).toLocaleString() : "Unavailable"}</p>
+      </details>}
       {activeJob && percent !== null ? (
         <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-[#f1ebe2]"><div className="h-full rounded-full bg-sky-600 transition-all" style={{ width: `${percent}%` }} /></div>
       ) : null}

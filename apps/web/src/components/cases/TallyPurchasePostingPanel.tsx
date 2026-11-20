@@ -804,6 +804,20 @@ export function TallyPurchasePostingPanel({
   const liveMasterOptionsRef = useRef<TallyPostingResponse["masterOptions"] | null>(null);
   // The review on screen right now. A save that finishes after newer edits
   // must not replace them; a failed automatic save waits for the next edit.
+  const [catalogueAttempt, setCatalogueAttempt] = useState(0);
+  const [readTimes, setReadTimes] = useState<Record<string, number>>({});
+  const editedFields = useRef(new Set<string>());
+  function applyPreparedReview(incoming: TallyPostingReview | null) {
+    setReview(current => {
+      if (!incoming || !current || incoming.selectedInvoiceDocumentId !== current.selectedInvoiceDocumentId) return incoming;
+      const fields = Object.fromEntries(Object.entries(current).filter(([key]) => editedFields.current.has(key)));
+      return { ...incoming, ...fields, lines: incoming.lines.map(line => {
+        const previous = current.lines.find(row => row.lineId === line.lineId);
+        if (!previous) return line;
+        return { ...line, ...Object.fromEntries(Object.entries(previous).filter(([key]) => editedFields.current.has(line.lineId + "." + key))) };
+      }) };
+    });
+  }
   const currentReviewRef = useRef<TallyPostingReview | null>(null);
   const autoSaveFailedReviewRef = useRef<TallyPostingReview | null>(null);
   const invoiceSelectionRevisionRef = useRef(0);
@@ -830,7 +844,7 @@ export function TallyPurchasePostingPanel({
       setPayload(hydrated);
       setSelectedConnectionId(hydrated.selectedConnectionId ?? connectionId ?? "");
       setSelectedCompanyName(hydrated.selectedCompanyName ?? companyName ?? "");
-      if (replaceReview || (!dirty && !review)) setReview(hydrated.review);
+      if (replaceReview || (!dirty && !review)) applyPreparedReview(hydrated.review);
       // A failed posting loaded from storage is history, not a failure of the
       // current page operation. Keep it in the footer/status area; only a new
       // live request or posting transition should raise the prominent banner.
@@ -844,11 +858,9 @@ export function TallyPurchasePostingPanel({
     }
   }, [caseId, dirty, review, withLiveMasterOptions]);
 
-  // Page-open catalogue load is cache-first. The connector returns its local
-  // incrementally synced catalogue immediately; explicit Refresh remains the
-  // place for an authoritative Tally read. Avoid starting a second full read
-  // on mount: it made the dropdowns disappear and doubled the failure surface
-  // when a live channel reconnected during the request.
+  useEffect(() => { editedFields.current.clear(); setReadTimes({}); }, [caseId]);
+
+  // Show cached mappings first, then validate changes with the connector.
   useEffect(() => {
     if(approval.required&&approval.loading)return;
     if (automaticLiveRefreshRef.current === caseId) return;
@@ -856,6 +868,14 @@ export function TallyPurchasePostingPanel({
     setLiveMastersReady(false);
     let cancelled = false;
     let loadCompleted = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const retry = () => {
+      if (catalogueAttempt >= 3 || cancelled) return;
+      retryTimer = setTimeout(() => {
+        automaticLiveRefreshRef.current = null;
+        setCatalogueAttempt(attempt => attempt + 1);
+      }, 5000 * (catalogueAttempt + 1));
+    };
     const controller=new AbortController();
     const selectionRevision = invoiceSelectionRevisionRef.current;
     void (async () => {
@@ -871,7 +891,7 @@ export function TallyPurchasePostingPanel({
         !connection?.bridgeConnected ||
         !connection.tallyReachable ||
         !connection.companyLoaded
-      ) return;
+      ) { retry(); return; }
       const cataloguePayload = {
         moduleName: "purchase",
         persist: false,
@@ -887,6 +907,7 @@ export function TallyPurchasePostingPanel({
         const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, next.review);
         liveMasterResultRef.current = liveCatalogue.compactResult;
         liveMasterOptionsRef.current = liveCatalogue.masterOptions;
+        const matchStarted = performance.now();
         const prepared = await prepareTallyPurchasePostingFromLive(
           caseId,
           connectionId,
@@ -894,9 +915,10 @@ export function TallyPurchasePostingPanel({
           liveCatalogue.compactResult
         );
         if (cancelled || invoiceSelectionRevisionRef.current !== selectionRevision) return false;
+        setReadTimes(times => ({ ...times, "Prepare and match": performance.now() - matchStarted }));
         const hydrated = withLiveMasterOptions(prepared);
         setPayload(hydrated);
-        setReview(hydrated.review);
+        applyPreparedReview(hydrated.review);
         setSupplierLedgerMatch(hydrated.supplierLedgerMatch ?? null);
         setLineMasterMatches(hydrated.lineMasterMatches ?? []);
         setSupplierLedgerMatchError(null);
@@ -931,13 +953,9 @@ export function TallyPurchasePostingPanel({
           if (!hydrated.review) {
             throw new Error("The cached Tally catalogue did not return a purchase review.");
           }
-          const cachedReview = {
-            ...hydrated.review,
-            supplierLedgerName:
-              next.review?.supplierLedgerName ?? hydrated.review.supplierLedgerName,
-          };
-          setPayload({ ...hydrated, review: cachedReview, liveMatchingComplete: false });
-          setReview(cachedReview);
+          setPayload(hydrated);
+          applyPreparedReview(hydrated.review);
+          setSupplierLedgerMatch(hydrated.supplierLedgerMatch ?? null);
           setLineMasterMatches(hydrated.lineMasterMatches ?? []);
         } catch {
           // An unusable cached preview must never prevent the authoritative
@@ -954,6 +972,7 @@ export function TallyPurchasePostingPanel({
       try {
         setRefreshingMasters(true);
         setNotice("Loading saved Tally catalogue…");
+        const started = performance.now();
         const cachedMasters = await runCashDiscountLiveRequest({
           connectionId,
           companyName,
@@ -963,6 +982,7 @@ export function TallyPurchasePostingPanel({
           onProgress: (message) => { if (!cancelled) setNotice(message); },
         });
         if (cancelled) return;
+        setReadTimes({ "Connector catalogue": performance.now() - started });
         setError(null);
         if (!servedFromCache(cachedMasters)) {
           // No local catalogue: the connector already did a full live read.
@@ -972,15 +992,22 @@ export function TallyPurchasePostingPanel({
         try {
           await applyCachedOptions(cachedMasters);
         } catch {
-          setError("The saved Tally catalogue could not be opened. Refresh it from Tally.");
-          setNotice(null);
-          return;
+          // Continue with the authoritative catalogue if the preview is unusable.
         }
         if (cancelled) return;
-        setNotice(null);
+        setNotice("Validating the saved catalogue with Tally...");
+        const validationStarted = performance.now();
+        const fresh = await runCashDiscountLiveRequest({
+          connectionId, companyName, operation: "ledger_masters",
+          payload: { ...cataloguePayload, requireFresh: true }, signal: controller.signal,
+        });
+        if (cancelled) return;
+        setReadTimes(times => ({ ...times, "Catalogue validation": performance.now() - validationStarted }));
+        await applyCatalogue(fresh, "Latest live Tally data loaded.");
       } catch (refreshError) {
         if (cancelled) return;
         if (!cancelled) {
+          retry();
           setError(refreshError instanceof Error ? refreshError.message : "Saved Tally catalogue is unavailable.");
           setNotice(null);
         }
@@ -990,6 +1017,7 @@ export function TallyPurchasePostingPanel({
     })().finally(() => { loadCompleted = true; });
     return () => {
       cancelled = true;
+      clearTimeout(retryTimer);
       controller.abort();
       // Only interrupted initial loads need a replacement run. Once loaded,
       // approval rechecks after saving or focus must keep the catalogue and
@@ -998,7 +1026,7 @@ export function TallyPurchasePostingPanel({
         automaticLiveRefreshRef.current = null;
       }
     };
-  }, [caseId,approval.enabled,approval.required,approval.loading]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [caseId,approval.enabled,approval.required,approval.loading,catalogueAttempt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!liveMastersReady || !selectedConnectionId || !selectedCompanyName || !review?.supplierName) {
@@ -1084,7 +1112,16 @@ export function TallyPurchasePostingPanel({
             pollAttempt += 1;
             if (!terminal) continue;
             if (!cancelled) {
+              if (runStartedAt !== null) setReadTimes(times => ({ ...times, "Posting command": Date.now() - runStartedAt! }));
               if (terminal.status !== "succeeded") {
+                // Fetch the persisted write outcome before enabling another post.
+                // A failed readback can follow a successful voucher creation.
+                const saved = await load(true, connectionId, false, payload?.selectedCompanyName);
+                if (cancelled) return;
+                if (!saved || saved.posting?.status === "verification_required" || saved.posting?.status === "created") {
+                  setNotice(null);
+                  return;
+                }
                 const failureMessage = purchasePostingFailureMessage(terminal.error, terminal.result);
                 // Keep the already-loaded live master catalogue and validated
                 // selections. A plain posting reload has no live catalogue and
@@ -1330,7 +1367,7 @@ export function TallyPurchasePostingPanel({
       .then((match) => {
         setSupplierLedgerMatch(match);
         if (match.matchType === "direct_match" && match.ledgerName) {
-          setReview((current) => current ? { ...current, supplierLedgerName: match.ledgerName ?? "" } : current);
+          setReview((current) => current && !editedFields.current.has("supplierLedgerName") && !current.supplierLedgerName && current.supplierName.trim() === supplierName && current.supplierGstin.trim() === supplierGstin ? { ...current, supplierLedgerName: match.ledgerName ?? "" } : current);
           setDirty(true);
         }
       })
@@ -1589,6 +1626,7 @@ export function TallyPurchasePostingPanel({
   }
 
   function updateReview<K extends keyof TallyPostingReview>(key: K, value: TallyPostingReview[K]) {
+    editedFields.current.add(key);
     setReview((current) => current ? { ...current, [key]: value } : current);
     if (key === "supplierName" || key === "supplierGstin") {
       setSupplierLedgerMatch(null);
@@ -1638,6 +1676,7 @@ export function TallyPurchasePostingPanel({
     key: "applyTds194q" | "applyTransportTds" | "applyGstTds" | "tcsReceivable"
   ) {
     if (!review || locked || saving) return;
+    editedFields.current.add(key);
     const nextReview = { ...review, [key]: !review[key] };
     setReview(nextReview);
     setDirty(true);
@@ -1646,6 +1685,7 @@ export function TallyPurchasePostingPanel({
   }
 
   function updateLine(index: number, key: keyof TallyPostingReview["lines"][number], value: string) {
+    if (review?.lines[index]) editedFields.current.add(review.lines[index].lineId + "." + key);
     setReview((current) => {
       if (!current) return current;
       return {
@@ -1662,6 +1702,7 @@ export function TallyPurchasePostingPanel({
   // A godown picked on one line also fills every line that has none: Tally
   // rejects the whole voucher when any item line lacks a godown.
   function updateGodown(index: number, value: string) {
+    review?.lines.forEach((line, i) => { if (i === index || (value && !line.godownName)) editedFields.current.add(line.lineId + ".godownName"); });
     setReview((current) => {
       if (!current) return current;
       return {
@@ -1888,7 +1929,7 @@ export function TallyPurchasePostingPanel({
       );
       const hydrated = withLiveMasterOptions(prepared);
       setPayload(hydrated);
-      if (!dirty) setReview(hydrated.review);
+      applyPreparedReview(hydrated.review);
       setSupplierLedgerMatch(hydrated.supplierLedgerMatch ?? null);
       setLineMasterMatches(hydrated.lineMasterMatches ?? []);
       setLiveMastersReady(true);
@@ -2289,6 +2330,14 @@ export function TallyPurchasePostingPanel({
 
   return (
     <div className="tally-purchase-workflow mx-auto max-w-6xl space-y-3 p-3 pb-32 sm:p-4 sm:pb-32" id="tally-header">
+      <details className="rounded-xl border bg-white p-3 text-xs">
+        <summary className="cursor-pointer font-semibold">Diagnose this invoice</summary>
+        <p className="mt-2">{selectedCompanyName} / {payload.connection?.machineName || "Connector"} / Catalogue validated {formatDateTime(payload.connection?.masterValidatedAt ?? null)}</p>
+        <p>{refreshingMasters ? "Checking Tally catalogue..." : liveMastersReady ? "Catalogue loaded" : "Waiting for connector data"}</p>
+        <p>Supplier: {review.supplierLedgerName || "Awaiting selection"} / {editedFields.current.has("supplierLedgerName") ? "Edited in this session" : supplierLedgerMatch?.reason || "No matching decision recorded"}</p>
+        {review.lines.map(line => <p key={line.lineId}>{line.description} / {line.stockItemName || "Stock item unresolved"} / {line.purchaseLedgerName || "Purchase ledger unresolved"}</p>)}
+        {Object.entries(readTimes).map(([phase, ms]) => <p key={phase}>{phase}: {(ms / 1000).toFixed(1)} s</p>)}
+      </details>
       {payload.eligibility.invoiceCandidates.length > 1 ? (
         <section className="rounded-xl border border-slate-200 bg-white p-3">
           <div className="mb-2 text-xs font-semibold text-slate-900">Invoice selected for this Purchase voucher</div>
@@ -2336,7 +2385,7 @@ export function TallyPurchasePostingPanel({
           <div className="flex items-start gap-2">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
             <div className="min-w-0 flex-1">
-              <strong className="block text-sm">Voucher created; verification needs attention</strong>
+              <strong className="block text-sm">{payload.posting.tallyMasterId ? "Voucher created. Tally master ID " + payload.posting.tallyMasterId : "Voucher status requires verification"}</strong>
               <span className="mt-0.5 block text-xs leading-5 text-amber-800">
                 {payload.posting.lastError || "Refresh after checking the voucher in Tally. Kalika will not create a duplicate voucher."}
               </span>

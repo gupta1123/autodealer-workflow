@@ -19,10 +19,16 @@ export function describeAnalysisStep(params: {
   status?: string | null;
   stage: string | null;
   detail: AnalysisProgressDetail | null | undefined;
+  nextRunAt?: string | null;
   queuePosition?: number | null;
 }) {
   const { status, stage, detail, queuePosition } = params;
-  if (isAnalysisPaused({ status, stage })) return "Paused for now. Will continue automatically.";
+  if (isAnalysisPaused({ status, stage })) {
+    const retry = Date.parse(params.nextRunAt ?? "");
+    return retry > Date.now()
+      ? `Paused. Next retry at ${new Date(retry).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+      : "Paused. Waiting for automatic retry.";
+  }
   if (status === "queued") {
     return queuePosition && queuePosition > 1
       ? `Waiting for a free slot (${queuePosition - 1} ahead)`

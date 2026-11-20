@@ -24,16 +24,16 @@ async function run({workflow=null,prepare=true,loading=false,error=null,enabled=
  const next={selectedConnectionId:'kalika-connector',selectedCompanyName:'Kalika Steel',connection:{bridgeConnected:true,tallyReachable:true,companyLoaded:true},review:{supplierName:'Supplier',supplierLedgerName:''}};
  const noop=()=>{};
  const context={exports:{},caseId:'new-case',approval:{enabled,required,loading,error,workflow,snapshot},canAccess,
-  automaticLiveRefreshRef:{current:null},liveMasterResultRef:{current:null},liveMasterOptionsRef:{current:null},
+  automaticLiveRefreshRef:{current:null},liveMasterResultRef:{current:null},liveMasterOptionsRef:{current:null},fullLiveMasterResultRef:{current:null},setReadTimes:noop,applyPreparedReview:noop,
   load:async()=>{calls.push('load-review');return next;},
-  runCashDiscountLiveRequest:async request=>{calls.push(request.operation);return {validation:{mode:'incremental_alter_id'}};},
+  runCashDiscountLiveRequest:async request=>{calls.push(request.payload.requireFresh ? "validate" : request.operation);return {validation:{mode:'incremental_alter_id'}};},
   prepareLiveTallyCatalogue:()=>({compactResult:{},masterOptions:{ledgers:[{name:'Supplier ledger'}]}}),
   prepareTallyPurchasePostingFromLive:async()=>{calls.push('prepare-catalogue');return next;},
   withLiveMasterOptions:value=>value,
   setLiveMastersReady:noop,setPayload:noop,setReview:noop,setSupplierLedgerMatch:noop,setLineMasterMatches:noop,
   setSupplierLedgerMatchError:noop,setLineMasterMatchError:noop,setNotice:noop,setRefreshingMasters:noop,setError:noop,
  };
- vm.runInNewContext(code,{...context,AbortController});const cleanup=context.exports.run();
+ vm.runInNewContext(code,{...context,AbortController,performance,clearTimeout,setTimeout,invoiceSelectionRevisionRef:{current:0},catalogueAttempt:3});const cleanup=context.exports.run();
  for(let i=0;i<4;i++)await new Promise(resolve=>setImmediate(resolve));
  if(approvalRefresh){
   cleanup?.();context.approval.loading=true;context.exports.run();
@@ -44,7 +44,7 @@ async function run({workflow=null,prepare=true,loading=false,error=null,enabled=
 }
 
 test('a new case without an approval record loads ledgers and prepares the saved catalogue',async()=>{
- assert.deepEqual(await run(),['load-review','ledger_masters','prepare-catalogue']);
+ assert.deepEqual(await run(),['load-review','ledger_masters','prepare-catalogue','validate','prepare-catalogue']);
 });
 test('an existing draft and the legacy workflow still load ledgers',async()=>{
  for(const options of [{workflow:{state:'draft'}},{enabled:false}])assert((await run(options)).includes('ledger_masters'));
@@ -79,7 +79,7 @@ test('read-only access and failed approval checks do not start catalogue prepara
 });
 
 test('approval rechecks after Save or autosave do not reload the review or Tally catalogue',async()=>{
- assert.deepEqual(await run({approvalRefresh:true}),['load-review','ledger_masters','prepare-catalogue']);
+ assert.deepEqual(await run({approvalRefresh:true}),['load-review','ledger_masters','prepare-catalogue','validate','prepare-catalogue']);
 });
 
 test('an interrupted initial load releases its guard so a replacement can finish',async()=>{
@@ -89,7 +89,7 @@ test('an interrupted initial load releases its guard so a replacement can finish
  const context={exports:{},caseId:'new-case',approval:{enabled:true,required:true,loading:false,error:null,workflow:null,snapshot},canAccess,
   automaticLiveRefreshRef:{current:null},setLiveMastersReady:()=>{},load:async()=>{calls.push('load-review');return deferred;},
  };
- vm.runInNewContext(code,{...context,AbortController});
+ vm.runInNewContext(code,{...context,AbortController,performance,clearTimeout,setTimeout,invoiceSelectionRevisionRef:{current:0},catalogueAttempt:3});
  const cleanup=context.exports.run();assert.equal(context.automaticLiveRefreshRef.current,'new-case');
  cleanup();assert.equal(context.automaticLiveRefreshRef.current,null);
  context.exports.run();assert.deepEqual(calls,['load-review','load-review']);

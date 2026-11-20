@@ -115,6 +115,7 @@ export type AnalysisProgressDetail = {
 };
 
 export type CaseAnalysisProgress = {
+  nextRunAt?: string | null;
   status: string;
   progress: number;
   stage: string | null;

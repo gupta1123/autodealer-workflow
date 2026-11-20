@@ -602,7 +602,7 @@ export function CasesPage() {
                               className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium shadow-[0_1px_2px_rgba(0,0,0,0.02)] ${pill.className}`}
                             >
                               <span className={`h-1.5 w-1.5 rounded-full ${pill.dotColor}`} />
-                              {pill.label}
+                              {isAnalysisPaused(progressByCase[item.id]) ? "Paused" : pill.label}
                             </span>
                             {(item.status === "processing" || item.status === "queued") && (() => {
                               const live = progressByCase[item.id];
@@ -613,6 +613,7 @@ export function CasesPage() {
                                 stage: live.stage,
                                 detail: live.detail,
                                 queuePosition: live.queuePosition,
+                                nextRunAt: live.nextRunAt,
                               });
                               return (
                                 <div className="mt-1.5 w-44" title={stepLabel}>
