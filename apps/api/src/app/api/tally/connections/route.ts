@@ -269,8 +269,9 @@ async function POSTHandler(request: Request) {
     const teamContext=process.env.TEAM_ACCESS_ENFORCEMENT==='true'?await requireAccessContext(request):null;
     const controlToken = createBridgeToken();
     const supabase = createSupabaseAdminClient();
+    const newPc = body.newPc === true;
     const reuseConnectionId =
-      typeof body.reuseConnectionId === "string" && body.reuseConnectionId.trim()
+      !newPc && typeof body.reuseConnectionId === "string" && body.reuseConnectionId.trim()
         ? body.reuseConnectionId.trim()
         : null;
 
@@ -282,7 +283,7 @@ async function POSTHandler(request: Request) {
     let resumeId = reuseConnectionId
       ? await latestConnectionForSamePc(supabase, user.id, scopeFilter, reuseConnectionId)
       : null;
-    if (!reuseConnectionId) {
+    if (!newPc && !reuseConnectionId) {
       const { data: live, error: liveError } = await supabase
         .from("tally_connections")
         .select("id")

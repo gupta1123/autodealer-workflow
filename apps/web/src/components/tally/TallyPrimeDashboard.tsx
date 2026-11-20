@@ -339,6 +339,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     tone: "success" | "error";
     text: string;
   } | null>(null);
+  const [pairNewPc, setPairNewPc] = useState(false);
   const statusRefreshInFlight = useRef(false);
   const companyRequestConnection = useRef('');
 
@@ -523,7 +524,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
     }
   }, []);
 
-  async function connectConnector() {
+  async function connectConnector(newPc = false) {
     if (!canManage) return;
     try {
       setCreating(true);
@@ -553,8 +554,9 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
           displayName:
             setupMode === "same_machine" ? "Tally Prime" : "Tally Prime LAN",
           tallyUrl,
+          newPc,
           reuseConnectionId:
-            selectedConnection && !connectorActive ? selectedConnection.id : null,
+            !newPc && selectedConnection && !connectorActive ? selectedConnection.id : null,
         }),
       });
       if (!response.ok) {
@@ -578,6 +580,8 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         ...current.filter((connection) => connection.id !== payload.connection?.id),
       ]);
       setSelectedId(payload.connection.id);
+      setCompanies([]);
+      setPairNewPc(false);
       companyRequestConnection.current = payload.connection.id;
       window.localStorage.setItem(EXPLICIT_CONNECTION_STORAGE_KEY, payload.connection.id);
       window.localStorage.setItem(
@@ -882,7 +886,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
             {companyLoaded ? `Connected to ${selectedConnection?.lastCompanyName || "Tally Prime"}` : waitingForTally ? "Waiting for Tally to respond" : "Bring Tally Prime online"}
           </h2>
           <p className="mt-2 max-w-md text-xs font-semibold leading-5 text-[#6f6255]">
-            {companyLoaded ? "Your connector, Tally Prime, and company are ready for Kalika workflows." : waitingForTally ? "Tally has not answered recently. It may be busy or closed. This updates by itself once Tally responds." : "Connect this workstation to sync companies, masters, and accounting entries."}
+            {companyLoaded ? `Tally Prime is connected on ${pcName}.` : waitingForTally ? "Tally has not answered recently. It may be busy or closed. This updates by itself once Tally responds." : "Connect this workstation to sync companies, masters, and accounting entries."}
           </p>
         </div>
       </section>
@@ -899,7 +903,15 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         </div>
       ) : null}
 
-      {canManage && !connectorActive ? (
+      {canManage && selectedConnection && !pairNewPc && (
+        <Button className="mb-4 w-fit" variant="outline" disabled={creating} onClick={() => {
+          setSetupMode("same_machine");
+          setTallyUrlInput(DEFAULT_TALLY_URL);
+          setPairNewPc(true);
+        }}>Pair a new PC</Button>
+      )}
+
+      {canManage && (!connectorActive || pairNewPc) ? (
         <section className="mb-5 rounded-2xl border border-[#e5ddd0] bg-white p-6 shadow-[0_2px_8px_rgba(0,0,0,0.02)] transition-shadow duration-300 hover:shadow-[0_6px_18px_rgba(64,51,35,0.05)]">
           <div className="mb-4">
             <div className="text-xs font-medium text-[#8a7f72]">
@@ -975,6 +987,10 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
               </div>
             </div>
           ) : null}
+          {pairNewPc && <div className="mt-4 flex gap-2">
+            <Button disabled={creating} onClick={() => void connectConnector(true)}>Pair this computer</Button>
+            <Button disabled={creating} variant="outline" onClick={() => setPairNewPc(false)}>Cancel</Button>
+          </div>}
         </section>
       ) : null}
 

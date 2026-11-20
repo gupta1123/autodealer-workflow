@@ -65,6 +65,11 @@ test('connection managers retain management, while company mapping needs all-com
  assert.match(fixture({manager:true,empty:true}),/Connect Tally Prime<\/button>/);
 });
 
+test('a scoped manager can pair a new PC while a shared connector is online',()=>{
+ assert.match(fixture({manager:true}),/Pair a new PC/);
+ assert.doesNotMatch(fixture({manager:false}),/Pair a new PC/);
+});
+
 test('an old Tally check is not shown as a live company or as a failed check',()=>{
  const html=fixture({staleCheck:true});
  assert.match(html,/Waiting for Tally to respond/);
