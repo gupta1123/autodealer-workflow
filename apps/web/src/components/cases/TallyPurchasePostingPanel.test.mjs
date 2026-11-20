@@ -8,9 +8,10 @@ import {canAccess} from '../../../../../packages/shared/src/lib/access.ts';
 // Exercise the real catalogue-loading effect, including its asynchronous calls.
 const source=await readFile(new URL('./TallyPurchasePostingPanel.tsx',import.meta.url),'utf8');
 const ast=ts.createSourceFile('panel.tsx',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
-let effect;
+let effect, suggestionEffect;
 const expressions={};
 function visit(node){
+ if(ts.isCallExpression(node)&&node.expression.getText(ast)==='useEffect'&&node.arguments[0]?.getText(ast).includes('operation: "ledger_suggestions"'))suggestionEffect=node.arguments[0].getText(ast);
  if(ts.isCallExpression(node)&&node.expression.getText(ast)==='useEffect'&&node.arguments[0]?.getText(ast).includes('automaticLiveRefreshRef.current === caseId'))effect=node.arguments[0].getText(ast);
  if(ts.isVariableDeclaration(node)&&['locked','canApprove'].includes(node.name.getText(ast)))expressions[node.name.getText(ast)]=node.initializer.getText(ast);
  ts.forEachChild(node,visit);
@@ -18,10 +19,26 @@ function visit(node){
 visit(ast);assert(effect,'Catalogue effect must exist.');
 const code=ts.transpileModule(`exports.run = ${effect}`,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS}}).outputText;
 
-async function run({workflow=null,prepare=true,loading=false,error=null,enabled=true,required=enabled,approvalRefresh=false}={}){
+test('supplier suggestions wait for validation and only run for an unresolved supplier', () => {
+ const script = ts.transpileModule(`exports.run = ${suggestionEffect}`, {compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+ const base = {liveMastersReady:true, refreshingMasters:false, payload:{liveMatchingComplete:true,
+   connection:{masterSnapshotFresh:true,masterSnapshotComplete:true}}, selectedConnectionId:'pc', selectedCompanyName:'company',
+   review:{supplierName:'Supplier'}, supplierLedgerMatch:null};
+ for(const [overrides,expected] of [[{refreshingMasters:true},0],[{review:{supplierName:'Supplier',supplierLedgerName:'Selected'}},0],
+   [{supplierLedgerMatch:{matchType:'direct_match'}},0],[{payload:{liveMatchingComplete:false}},0],[{},1]]) {
+   let calls=0;
+   const context={...base,...overrides,exports:{},AbortController,runCashDiscountLiveRequest:()=>{calls++;return Promise.resolve({});}};
+   vm.runInNewContext(script,context);
+   const cleanup=context.exports.run();
+   assert.equal(calls,expected);
+   cleanup?.();
+ }
+});
+
+async function run({workflow=null,prepare=true,loading=false,error=null,enabled=true,required=enabled,fresh=false,complete=true,approvalRefresh=false}={}){
  const calls=[];
  const snapshot={member:{status:'active',must_change_password:false,modules:['purchases']},role:{archived:false,permissions:prepare?['purchases.view','purchases.prepare']:['purchases.view']}};
- const next={selectedConnectionId:'kalika-connector',selectedCompanyName:'Kalika Steel',connection:{bridgeConnected:true,tallyReachable:true,companyLoaded:true},review:{supplierName:'Supplier',supplierLedgerName:''}};
+ const next={selectedConnectionId:'kalika-connector',selectedCompanyName:'Kalika Steel',connection:{masterSnapshotFresh:fresh,masterSnapshotComplete:complete,bridgeConnected:true,tallyReachable:true,companyLoaded:true},review:{supplierName:'Supplier',supplierLedgerName:''}};
  const noop=()=>{};
  const context={exports:{},caseId:'new-case',approval:{enabled,required,loading,error,workflow,snapshot},canAccess,
   automaticLiveRefreshRef:{current:null},liveMasterResultRef:{current:null},liveMasterOptionsRef:{current:null},fullLiveMasterResultRef:{current:null},setReadTimes:noop,applyPreparedReview:noop,
@@ -45,6 +62,10 @@ async function run({workflow=null,prepare=true,loading=false,error=null,enabled=
 
 test('a new case without an approval record loads ledgers and prepares the saved catalogue',async()=>{
  assert.deepEqual(await run(),['load-review','ledger_masters','prepare-catalogue','validate','prepare-catalogue']);
+});
+test('a complete fresh review skips the second connector and preparation round trip',async()=>{
+ assert.deepEqual(await run({fresh:true}),['load-review','ledger_masters','prepare-catalogue']);
+ assert((await run({fresh:true,complete:false})).includes('validate'));
 });
 test('an existing draft and the legacy workflow still load ledgers',async()=>{
  for(const options of [{workflow:{state:'draft'}},{enabled:false}])assert((await run(options)).includes('ledger_masters'));

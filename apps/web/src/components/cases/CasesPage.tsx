@@ -55,6 +55,13 @@ function getCaseListCacheKey(query: string, approval: string, reconciliation: st
   return `active:${query.trim().toLowerCase()}:approval:${approval}:reconciliation:${reconciliation}:page:${page}:limit:${pageSize}`;
 }
 
+function localDayBoundary(day: string, nextDay = false) {
+  if (!day) return undefined;
+  const date = new Date(day + "T00:00:00");
+  if (nextDay) date.setDate(date.getDate() + 1);
+  return date.toISOString();
+}
+
 function formatRelativeDate(value: string) {
   const date = new Date(value);
   const now = new Date();
@@ -220,6 +227,9 @@ export function CasesPage() {
   const [showFilters, setShowFilters] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [posting, setPosting] = useState("all");
   const [selectedApproval, setSelectedApproval] = useState("all");
   const [selectedReconciliation, setSelectedReconciliation] = useState("all");
 
@@ -239,9 +249,10 @@ export function CasesPage() {
   const [pendingCase, setPendingCase] = useState<SavedCaseRecord | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
 
+  const hasFilters = Boolean(searchQuery || dateFrom || dateTo || posting !== "all" || selectedApproval !== "all" || selectedReconciliation !== "all");
   const cacheKey = useMemo(
-    () => `${cacheEpoch}:${listRevision}:${snapshot?.member.user_id||'legacy'}:${snapshot?.organizationId||''}:${snapshot?.revision||0}:`+getCaseListCacheKey(debouncedSearchQuery, selectedApproval, selectedReconciliation, currentPage, pageSize),
-    [currentPage, debouncedSearchQuery, selectedApproval, selectedReconciliation, pageSize,cacheEpoch,listRevision,snapshot?.member.user_id,snapshot?.organizationId,snapshot?.revision]
+    () => `${cacheEpoch}:${listRevision}:${snapshot?.member.user_id||'legacy'}:${snapshot?.organizationId||''}:${snapshot?.revision||0}:`+getCaseListCacheKey(debouncedSearchQuery, selectedApproval, selectedReconciliation, currentPage, pageSize) + JSON.stringify([dateFrom, dateTo, posting]),
+    [dateFrom, dateTo, posting, currentPage, debouncedSearchQuery, selectedApproval, selectedReconciliation, pageSize,cacheEpoch,listRevision,snapshot?.member.user_id,snapshot?.organizationId,snapshot?.revision]
   );
 
   // Size the page from the window height so laptops and large monitors both
@@ -315,6 +326,9 @@ export function CasesPage() {
       limit: pageSize,
       page: currentPage,
       query: debouncedSearchQuery,
+      createdFrom: localDayBoundary(dateFrom),
+      createdBefore: localDayBoundary(dateTo, true),
+      posting,
       approvalFilter: selectedApproval as "all" | "approved" | "pending" | "rejected",
       reconciliationFilter: selectedReconciliation as "all" | "clean" | "issues",
       signal: controller.signal,
@@ -479,6 +493,25 @@ export function CasesPage() {
                   options={RECONCILIATION_OPTIONS}
                   placeholder="All Reconciliation"
                 />
+                <label className="flex h-9 items-center justify-between gap-2 rounded-lg border px-3 text-xs">
+                  Created from
+                  <input type="date" value={dateFrom} max={dateTo || undefined} onChange={event => { setDateFrom(event.target.value); setCurrentPage(1); }} />
+                </label>
+                <label className="flex h-9 items-center justify-between gap-2 rounded-lg border px-3 text-xs">
+                  Created through
+                  <input type="date" value={dateTo} min={dateFrom || undefined} onChange={event => { setDateTo(event.target.value); setCurrentPage(1); }} />
+                </label>
+                <SelectDropdown value={posting} onChange={value => { setPosting(value); setCurrentPage(1); }}
+                  options={[
+                    { value: "all", label: "All Tally posting states" },
+                    { value: "posted", label: "Posted to Tally" }, { value: "unposted", label: "Not posted" },
+                    { value: "waiting", label: "In line for Tally" }, { value: "posting", label: "Posting" },
+                    { value: "verification", label: "Check in Tally" }, { value: "failed", label: "Posting failed" },
+                  ]} />
+                {hasFilters && <button type="button" className="justify-self-start text-xs underline" onClick={() => {
+                  setDateFrom(""); setDateTo(""); setPosting("all"); setSelectedApproval("all");
+                  setSelectedReconciliation("all"); setSearchQuery(""); setDebouncedSearchQuery(""); setCurrentPage(1);
+                }}>Clear filters</button>}
               </div>
             )}
           </PageHeader>
@@ -509,14 +542,14 @@ export function CasesPage() {
             {status === "ready" && cases.length === 0 && (
               <div className="flex min-h-[300px] flex-col items-center justify-center py-12 text-center">
                 <p className="text-sm font-semibold text-[#111827]">
-                  {debouncedSearchQuery ? "No matching cases found" : "No cases yet"}
+                  {hasFilters ? "No matching cases found" : "No cases yet"}
                 </p>
                 <p className="mt-1 text-xs text-[#8a7f72]">
-                  {debouncedSearchQuery
+                  {hasFilters
                     ? "Try adjusting your search query or filters."
                     : "Add your first case to see it in the list."}
                 </p>
-                {!debouncedSearchQuery && (
+                {!hasFilters && (
                   <Link
                     href="/workspace"
                     className="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-[#2b1a10] px-3.5 py-1.5 text-xs font-medium text-white shadow-sm hover:bg-[#3b271a]"

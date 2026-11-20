@@ -999,7 +999,29 @@ function mapCaseRow(
   };
 }
 
+const postingGroups: Record<string, string[]> = {
+  posted: ["created"], waiting: ["approved", "queued"], posting: ["creating", "sending"],
+  verification: ["verification_required"], failed: ["failed"],
+};
+
+type DirectoryFilters = { start: string | null; end: string | null; posting: string };
+
+function caseListQuery(supabase: ReturnType<typeof createSupabaseAdminClient>, columns: string, count: boolean, filters: DirectoryFilters) {
+  // An empty filtered embed selects cases without transferring any posting data.
+  const select = filters.posting === "all" ? columns : columns + ",matched_posting:purchase_invoice_tally_postings()";
+  let query = supabase.from("packet_cases").select(select, count ? { count: "exact" } : undefined);
+  if (filters.start) query = query.gte("created_at", filters.start);
+  if (filters.end) query = query.lt("created_at", filters.end);
+  if (filters.posting !== "all") {
+    const unposted = filters.posting === "unposted";
+    query = query.in("matched_posting.status", unposted ? Object.values(postingGroups).flat() : postingGroups[filters.posting]);
+    query = unposted ? query.is("matched_posting", null) : query.not("matched_posting", "is", null);
+  }
+  return query;
+}
+
 async function fetchLegacyCaseListRows(params: {
+  filters: DirectoryFilters;
   supabase: ReturnType<typeof createSupabaseAdminClient>;
   userId: string;
   scope: CaseListScope;
@@ -1013,9 +1035,7 @@ async function fetchLegacyCaseListRows(params: {
   const searchTokens = params.searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
 
   for (let offset = 0; ; offset += pageSize) {
-    let query = params.supabase
-      .from("packet_cases")
-      .select(LIST_COLUMNS_WITHOUT_RECYCLE_BIN)
+    let query = caseListQuery(params.supabase, LIST_COLUMNS_WITHOUT_RECYCLE_BIN, false, params.filters)
       .eq("owner_user_id", params.userId);
 
     if (params.statusValues) {
@@ -1125,6 +1145,16 @@ async function GETHandler(request: Request) {
     const statusFilter = readCaseStatusFilter(url.searchParams.get("status"));
     const approvalFilter = readCaseApprovalFilter(url.searchParams.get("approval"));
     const reconciliationFilter = readCaseReconciliationFilter(url.searchParams.get("reconciliation"));
+    const filters = {
+      start: url.searchParams.get("createdFrom"), end: url.searchParams.get("createdBefore"),
+      posting: url.searchParams.get("posting") ?? "all",
+    };
+    if ([filters.start, filters.end].some(value => value !== null &&
+        (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) || !Number.isFinite(Date.parse(value)))) ||
+        (filters.start && filters.end && filters.start >= filters.end) ||
+        !(filters.posting === "all" || filters.posting === "unposted" || Object.hasOwn(postingGroups, filters.posting))) {
+      return jsonWithCors(request, { error: "Invalid date range or Tally posting filter." }, { status: 400 });
+    }
     const sortMode = readCaseSortMode(url.searchParams.get("sort"));
     // Recycle bin only: cases deleted 23+ days ago, i.e. within a week of the 30-day purge.
     const expiringSoon = scope === "deleted" && url.searchParams.get("expiring") === "1";
@@ -1151,9 +1181,7 @@ async function GETHandler(request: Request) {
 
     try {
       const queryStartedAt = nowMs();
-      let query = supabase
-        .from("packet_cases")
-        .select(LIST_COLUMNS, usePageNumbers ? { count: "exact" } : undefined)
+      let query = caseListQuery(supabase, LIST_COLUMNS, usePageNumbers, filters)
         .or(accessPredicate);
 
       if (scope === "deleted") {
@@ -1207,9 +1235,7 @@ async function GETHandler(request: Request) {
         queryMode = "database-pagination-search-fallback";
         const queryStartedAt = nowMs();
         const searchPattern = `%${escapePostgrestOrValue(escapeIlikePattern(searchQuery))}%`;
-        let fallbackSearchQuery = supabase
-          .from("packet_cases")
-          .select(LIST_COLUMNS, usePageNumbers ? { count: "exact" } : undefined)
+        let fallbackSearchQuery = caseListQuery(supabase, LIST_COLUMNS, usePageNumbers, filters)
           .or(accessPredicate);
 
         if (scope === "deleted") {
@@ -1281,6 +1307,7 @@ async function GETHandler(request: Request) {
         const queryStartedAt = nowMs();
         if(process.env.TEAM_ACCESS_ENFORCEMENT==='true')throw new AccessError('Scoped listing requires the reviewed database migration.',503);
         const legacyRows = await fetchLegacyCaseListRows({
+          filters,
           supabase,
           userId: user.id,
           scope,

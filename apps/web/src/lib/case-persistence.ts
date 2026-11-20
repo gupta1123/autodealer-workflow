@@ -185,6 +185,9 @@ export type CaseDecision = "accepted" | "rejected";
 export type MismatchDecision = "accepted" | "rejected";
 
 export type FetchCasesOptions = {
+  createdFrom?: string;
+  createdBefore?: string;
+  posting?: string;
   scope: CaseListScope;
   limit?: number;
   cursor?: string | null;
@@ -645,6 +648,7 @@ export async function fetchCasePage({
   cursor,
   page,
   query: searchQuery,
+  createdFrom, createdBefore, posting,
   sortMode,
   statusFilter,
   approvalFilter,
@@ -655,6 +659,9 @@ export async function fetchCasePage({
   const query = new URLSearchParams();
   query.set("limit", String(limit));
   query.set("scope", scope);
+  if (createdFrom) query.set("createdFrom", createdFrom);
+  if (createdBefore) query.set("createdBefore", createdBefore);
+  if (posting && posting !== "all") query.set("posting", posting);
   if (cursor) {
     query.set("cursor", cursor);
   } else if (page && page > 0) {

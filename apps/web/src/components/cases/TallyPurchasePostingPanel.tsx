@@ -789,13 +789,11 @@ export function TallyPurchasePostingPanel({
   const [editingGstRate, setEditingGstRate] = useState(false);
   const [supplierLedgerMatch, setSupplierLedgerMatch] = useState<SupplierLedgerMatch | null>(null);
   const [matchingSupplierLedger, setMatchingSupplierLedger] = useState(false);
-  const [matchingIndexedSupplierLedger, setMatchingIndexedSupplierLedger] = useState(false);
   const [supplierLedgerMatchError, setSupplierLedgerMatchError] = useState<string | null>(null);
   const [lineMasterMatches, setLineMasterMatches] = useState<PurchaseLineMasterSuggestion[]>([]);
   const [matchingLineMasters, setMatchingLineMasters] = useState(false);
   const [lineMasterMatchError, setLineMasterMatchError] = useState<string | null>(null);
   const automaticSupplierMatchKeyRef = useRef("");
-  const localSupplierSuggestionKeyRef = useRef("");
   const automaticLineMasterMatchKeyRef = useRef("");
   const lastPostingStatusRef = useRef<string | null>(null);
   const automaticLiveRefreshRef = useRef<string | null>(null);
@@ -941,6 +939,7 @@ export function TallyPurchasePostingPanel({
           // Resolve fixed/deterministic masters from SQL immediately. Supplier
           // selection stays independent and is populated only by its dedicated
           // exact/GSTIN/vector path. Live validation still runs before approval.
+          const matchStarted = performance.now();
           const prepared = await prepareTallyPurchasePostingFromLive(
             caseId,
             connectionId,
@@ -953,10 +952,15 @@ export function TallyPurchasePostingPanel({
           if (!hydrated.review) {
             throw new Error("The cached Tally catalogue did not return a purchase review.");
           }
+          setReadTimes(times => ({ ...times, "Prepare and match": performance.now() - matchStarted }));
           setPayload(hydrated);
           applyPreparedReview(hydrated.review);
           setSupplierLedgerMatch(hydrated.supplierLedgerMatch ?? null);
           setLineMasterMatches(hydrated.lineMasterMatches ?? []);
+          return hydrated.connection?.masterSnapshotFresh === true &&
+            hydrated.connection.masterSnapshotComplete === true &&
+            hydrated.selectedConnectionId === connectionId &&
+            hydrated.selectedCompanyName === companyName;
         } catch {
           // An unusable cached preview must never prevent the authoritative
           // incremental Tally validation that follows.
@@ -990,7 +994,10 @@ export function TallyPurchasePostingPanel({
           return;
         }
         try {
-          await applyCachedOptions(cachedMasters);
+          if (await applyCachedOptions(cachedMasters)) {
+            setNotice(null);
+            return;
+          }
         } catch {
           // Continue with the authoritative catalogue if the preview is unusable.
         }
@@ -1006,7 +1013,11 @@ export function TallyPurchasePostingPanel({
         await applyCatalogue(fresh, "Latest live Tally data loaded.");
       } catch (refreshError) {
         if (cancelled) return;
-        if (!cancelled) {
+        if (catalogueAttempt < 3 && refreshError instanceof Error &&
+            refreshError.message === "The live Tally master read is incomplete or stale.") {
+          setNotice("Rechecking Tally catalogue...");
+          retry();
+        } else {
           retry();
           setError(refreshError instanceof Error ? refreshError.message : "Saved Tally catalogue is unavailable.");
           setNotice(null);
@@ -1029,21 +1040,20 @@ export function TallyPurchasePostingPanel({
   }, [caseId,approval.enabled,approval.required,approval.loading,catalogueAttempt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (!liveMastersReady || !selectedConnectionId || !selectedCompanyName || !review?.supplierName) {
-      setMatchingIndexedSupplierLedger(false);
-      return;
-    }
-    const key = JSON.stringify([selectedConnectionId, selectedCompanyName, review.supplierName, review.supplierGstin]);
-    if (localSupplierSuggestionKeyRef.current === key) return;
-    localSupplierSuggestionKeyRef.current = key;
+    // Suggestions are optional. Give catalogue validation and exact matching the connector first.
+    if (!liveMastersReady || refreshingMasters || !payload?.liveMatchingComplete ||
+        !payload.connection?.masterSnapshotFresh || !payload.connection.masterSnapshotComplete ||
+        !selectedConnectionId || !selectedCompanyName || !review?.supplierName ||
+        review.supplierLedgerName?.trim() || supplierLedgerMatch?.matchType === "direct_match") return;
     let cancelled = false;
-    setMatchingIndexedSupplierLedger(true);
+    const controller = new AbortController();
     void runCashDiscountLiveRequest<{
       matches?: Record<string, { suggestions?: Array<{ ledger?: { name?: string } }> }>;
     }>({
       connectionId: selectedConnectionId,
       companyName: selectedCompanyName,
       operation: "ledger_suggestions",
+      signal: controller.signal,
       payload: {
         moduleName: "purchase",
         id: "supplier",
@@ -1066,11 +1076,12 @@ export function TallyPurchasePostingPanel({
           reason: current?.reason || "Closest ledger names from the encrypted Local Agent index.",
         };
       });
-    }).catch(() => {}).finally(() => {
-      if (!cancelled) setMatchingIndexedSupplierLedger(false);
-    });
-    return () => { cancelled = true; };
-  }, [liveMastersReady, review?.supplierGstin, review?.supplierName, selectedCompanyName, selectedConnectionId]);
+    }).catch(() => {});
+    return () => { cancelled = true; controller.abort(); };
+  }, [caseId, liveMastersReady, refreshingMasters, payload?.liveMatchingComplete,
+    payload?.connection?.masterSnapshotFresh, payload?.connection?.masterSnapshotComplete,
+    review?.supplierLedgerName, review?.supplierGstin, review?.supplierName,
+    supplierLedgerMatch?.matchType === "direct_match", selectedCompanyName, selectedConnectionId]);
 
   useEffect(() => {
     const postingStatus = payload?.posting?.status;
@@ -1533,9 +1544,8 @@ export function TallyPurchasePostingPanel({
     },
     [ledgerOptions]
   );
-  const supplierLedgerLoading = matchingSupplierLedger || matchingIndexedSupplierLedger;
   const masterValidationPending =
-    !liveMastersReady || refreshingMasters || supplierLedgerLoading || matchingLineMasters;
+    !liveMastersReady || refreshingMasters || matchingSupplierLedger || matchingLineMasters;
   const correctionBlockers = useMemo(
     () => masterValidationPending || ["created", "verification_required"].includes(payload?.posting?.status ?? "")
       ? []
@@ -2448,7 +2458,7 @@ export function TallyPurchasePostingPanel({
             <MasterCombobox
               {...masterContext}
               compact
-              disabled={locked || !liveMastersReady || supplierLedgerLoading}
+              disabled={locked || !liveMastersReady || matchingSupplierLedger}
               emptyMessage="No ledger matched this search in the selected Tally company."
               id="field-supplier-ledger"
               issues={scopeIssues("invoice", ["SUPPLIER_LEDGER_REQUIRED", "SUPPLIER_LEDGER_GSTIN_MISMATCH"])}
@@ -2459,7 +2469,7 @@ export function TallyPurchasePostingPanel({
                 ...(supplierLedgerMatch?.ledgerName ? [supplierLedgerMatch.ledgerName] : []),
                 ...(supplierLedgerMatch?.candidateLedgerNames ?? []),
               ]}
-              syncing={!liveMastersReady || supplierLedgerLoading}
+              syncing={!liveMastersReady || matchingSupplierLedger}
               value={review.supplierLedgerName}
             />
             {(() => {
