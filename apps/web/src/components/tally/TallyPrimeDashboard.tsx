@@ -341,6 +341,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
   } | null>(null);
   const [pairNewPc, setPairNewPc] = useState(false);
   const statusRefreshInFlight = useRef(false);
+  const pendingPairing = useRef<{ id: string; expiresAt: number } | null>(null);
   const companyRequestConnection = useRef('');
 
   const selectedConnection =
@@ -477,6 +478,10 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         },
       );
       if (response.status === 404) {
+        // Scoped status becomes visible after the first heartbeat links the company.
+        const pending = pendingPairing.current;
+        if (pending?.id === connectionId && Date.now() < pending.expiresAt) return;
+        if (pending?.id === connectionId) pendingPairing.current = null;
         setConnections((current) =>
           current.filter((connection) => connection.id !== connectionId),
         );
@@ -515,6 +520,18 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
             : connection,
         ),
       );
+      if (pendingPairing.current?.id === connectionId && payload.connection.bridgeConnected &&
+          companyRequestConnection.current === connectionId) {
+        const companiesResponse = await apiFetch(`/api/tally/companies?connectionId=${encodeURIComponent(connectionId)}`, { cache: "no-store" });
+        if (companiesResponse.ok && companyRequestConnection.current === connectionId) {
+          const companiesPayload = await companiesResponse.json() as CompaniesResponse;
+          if (companyRequestConnection.current === connectionId) {
+            setCompanies(companiesPayload.companies ?? []);
+            pendingPairing.current = null;
+            window.dispatchEvent(new Event("kalika:tally-status-invalidated"));
+          }
+        }
+      }
     } catch (error) {
       // A single failed background poll is retried on the next tick; don't
       // leave a sticky error banner for a transient network blip.
@@ -574,6 +591,7 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         );
       }
 
+      pendingPairing.current = { id: payload.connection.id, expiresAt: Date.parse(payload.connection.pairingCodeExpiresAt ?? "") };
       // Reconnect may resume the same connection; replace it rather than list it twice.
       setConnections((current) => [
         payload.connection as TallyConnection,
