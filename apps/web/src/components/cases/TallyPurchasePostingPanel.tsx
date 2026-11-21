@@ -117,8 +117,25 @@ function tallyQuantity(value: string | number | null | undefined) {
   if (!Number.isFinite(parsed)) return String(value ?? "0.000");
   return new Intl.NumberFormat("en-IN", {
     minimumFractionDigits: 3,
-    maximumFractionDigits: 3,
+    maximumFractionDigits: 9,
   }).format(parsed);
+}
+
+function tonnesPerUnit(value: string) {
+  const unit = value.trim().toLowerCase().replace(/[.\s]/g, "");
+  if (/^(g|gms?|grams?|grms?)$/.test(unit)) return 0.000001;
+  if (/^(kgs?|kilos?|kilograms?)$/.test(unit)) return 0.001;
+  if (/^(qtls?|quintals?)$/.test(unit)) return 0.1;
+  if (/^(mts?|(?:metric)?ton(?:ne)?s?)$/.test(unit)) return 1;
+  return null;
+}
+
+function purchasePreviewWeight(line: { quantity: string; unit: string; rate: string }) {
+  const scale = tonnesPerUnit(line.unit);
+  const quantity = Number(line.quantity.replace(/,/g, ""));
+  const rate = Number(line.rate.replace(/,/g, ""));
+  if (!scale || !line.quantity.trim() || !line.rate.trim() || !Number.isFinite(quantity) || !Number.isFinite(rate)) return line;
+  return { quantity: quantity * scale, rate: rate / scale, unit: "MT" };
 }
 
 function tallyDate(value: string | null | undefined) {
@@ -2248,11 +2265,12 @@ export function TallyPurchasePostingPanel({
   const purchaseReference = review.invoiceNumber
     ? `${review.invoiceNumber} / ${tallyDate(review.invoiceDate)}`
     : "Invoice number / date missing";
-  const previewTotalQuantity = review.lines.reduce(
+  const previewMeasures = review.lines.map(purchasePreviewWeight);
+  const previewTotalQuantity = previewMeasures.reduce(
     (total, line) => total + (Number.isFinite(Number(line.quantity)) ? Number(line.quantity) : 0),
     0
   );
-  const previewUnits = Array.from(new Set(review.lines.map((line) => line.unit).filter(Boolean)));
+  const previewUnits = Array.from(new Set(previewMeasures.map((line) => line.unit)));
   const previewQuantityLabel = previewUnits.length === 1
     ? `${tallyQuantity(previewTotalQuantity)} ${previewUnits[0]}`
     : `${review.lines.length} item${review.lines.length === 1 ? "" : "s"}`;
@@ -3242,13 +3260,15 @@ export function TallyPurchasePostingPanel({
                 </div>
                 <div className="min-h-[255px] py-1">
                   {review.lines.map((line) => {
+                    const measure = purchasePreviewWeight(line);
                     // The saved Tally payload carries the stock item's own unit; show it when
                     // the invoice unit is converted (25,320 KG -> 25.32 MTS).
                     const tallyItems = Array.isArray(payload.tallyPayload?.items)
                       ? (payload.tallyPayload.items as Array<Record<string, unknown>>)
                       : [];
                     const tallyItem = tallyItems.find((item) => item.lineId === line.lineId);
-                    const convertedUnit = tallyItem && typeof tallyItem.unit === "string" && tallyItem.unit !== line.unit
+                    const convertedUnit = tallyItem && typeof tallyItem.unit === "string" && tallyItem.unit !== measure.unit &&
+                      !(measure.unit === "MT" && tonnesPerUnit(tallyItem.unit) === 1)
                       ? `Posts to Tally as ${tallyQuantity(String(tallyItem.quantity ?? ""))} ${tallyItem.unit} @ ${tallyAmount(String(tallyItem.rate ?? ""))}`
                       : null;
                     return (
@@ -3258,9 +3278,9 @@ export function TallyPurchasePostingPanel({
                         <div className="text-[9px] text-[#657186]">{line.description || `HSN ${line.hsn || "missing"}`}</div>
                         {convertedUnit ? <div className="text-[9px] font-semibold text-[#173b70]">{convertedUnit}</div> : null}
                       </div>
-                      <strong className="text-right tabular-nums">{tallyQuantity(line.quantity)}</strong>
-                      <strong className="text-right tabular-nums">{tallyAmount(line.rate)}</strong>
-                      <span className="text-center">{line.unit || "—"}</span>
+                      <strong className="text-right tabular-nums">{tallyQuantity(measure.quantity)}</strong>
+                      <strong className="text-right tabular-nums">{tallyAmount(measure.rate)}</strong>
+                      <span className="text-center">{measure.unit || "—"}</span>
                       <strong className="text-right tabular-nums">{tallyAmount(line.taxableAmount)}</strong>
                     </div>
                     );
