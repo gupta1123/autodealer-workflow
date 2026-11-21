@@ -52,3 +52,25 @@ test('posting status renders duplicate evidence before the bill workflow and dis
   assert.match(html({ verificationStatus: 'ambiguous' }), /Review before posting/);
   assert.match(html({ verificationStatus: 'unchecked' }), /Unchecked/);
 });
+
+test('live Tally subgroup ledgers qualify for bills by their root group and bank direction', () => {
+  const names = ['normalizeName', 'normalizeLiveLedgerMasters', 'masterParentDescendsFromGroupMap',
+    'findLedgerByNormalizedName', 'getSelectedLedger', 'parseNumber', 'isSuspenseLedgerName', 'getPartyBillMatchContext'];
+  const code = names.map(name => ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name.text === name).getText(ast)).join('\n');
+  const api = vm.runInNewContext(ts.transpileModule(code, {compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText +
+    '\n({normalizeLiveLedgerMasters,getPartyBillMatchContext})', {ledgerMasterIndexCache:new WeakMap()});
+  const groups = [{name:'Unknown',parent:'Sundry Debtors'}, {name:'SCRAP',parent:'Transport'}, {name:'Transport',parent:'Sundry Creditors'}];
+  const ledgers = api.normalizeLiveLedgerMasters([{name:'Kadam Traders',parent:'Unknown'},
+    {name:'M P Karnataka Transport',parent:'SCRAP'}, {name:'Loan',parent:'Bank OD Account'},
+    {name:'Disabled',parent:'Unknown',billWiseEnabled:false}], groups);
+  const check = (ledger, payment=false) => api.getPartyBillMatchContext({
+    selectedLedgerName:ledger,creditAmount:payment?0:100,debitAmount:payment?100:0, description:'NEFT'
+  }, ledgers);
+  assert.equal(check('Kadam Traders').eligible,true);
+  assert.equal(check('M P Karnataka Transport', true).eligible,true);
+  assert.equal(check('Kadam Traders',true).eligible,false);
+  assert.equal(check('Disabled').eligible,false);
+  assert.equal(check('Loan',true).eligible,false);
+  assert.equal(check('Suspense').eligible,false);
+  assert.match(source,/const masters = normalizeLiveLedgerMasters\(\s*payload\.ledgers/);
+});

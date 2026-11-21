@@ -2458,17 +2458,7 @@ function getBillAllocationSubtext(
   ledgerMasters: TallyMaster[] = []
 ) {
   if (!draft) {
-    if (
-      transaction &&
-      isIncomingReceiptRow(transaction) &&
-      transaction.selectedLedgerName.trim() &&
-      !isBillMatchEligibleTransaction(transaction, ledgerMasters)
-    ) {
-      return isSuspenseLedgerName(transaction.selectedLedgerName)
-        ? "Will post to Suspense · Bill matching not applicable"
-        : "Bill matching not applicable";
-    }
-    return "";
+    return transaction ? getPartyBillMatchContext(transaction, ledgerMasters).reason : "";
   }
   if (draft.status === "ready_to_post") {
     const billLines = draft.allocations.filter((line) => line.referenceType === "Agst Ref");
@@ -4294,7 +4284,10 @@ export function BankStatementsPage() {
       payload: { persist: false, ...(exactScope ? { bankDocumentIdentity: exactScope.identity } : {}) },
     });
     if (exactScope) assertLocalBankContextIdentity(exactScope.identity, payload.bankDocumentIdentity);
-    const masters = payload.ledgers ?? payload.masters?.ledgers ?? [];
+    const masters = normalizeLiveLedgerMasters(
+      payload.ledgers ?? payload.masters?.ledgers ?? [],
+      payload.groups ?? payload.masters?.groups ?? []
+    );
     if (loadSeq === ledgerLoadSeqRef.current) {
       completeLedgerScope.current = JSON.stringify([connectionId, selectedCompanyId]);
       setLedgerMasters(masters);
@@ -5147,7 +5140,7 @@ export function BankStatementsPage() {
     ledgerMastersForReview = ledgerMasters
   ) {
     const candidateMasters = connectorCandidateMasters(payload.transactions);
-    const effectiveLedgerMasters = Array.from(new Map([...ledgerMastersForReview, ...candidateMasters]
+    const effectiveLedgerMasters = Array.from(new Map([...candidateMasters, ...ledgerMastersForReview]
       .map(ledger => [normalizeName(ledger.name), ledger])).values());
     if (candidateMasters.length) setLedgerMasters(current => Array.from(new Map(
       [...candidateMasters, ...current].map(ledger => [normalizeName(ledger.name), ledger])
@@ -5944,6 +5937,7 @@ export function BankStatementsPage() {
       const ledgerResult = rawByLedger[ledgerName] && typeof rawByLedger[ledgerName] === "object"
         ? rawByLedger[ledgerName] as Record<string, unknown>
         : null;
+      if (!Array.isArray(ledgerResult?.openBills) || !Array.isArray(ledgerResult?.existingAdvances)) continue;
       billDataByLedger.set(ledgerName, {
         openBills: ledgerResult && Array.isArray(ledgerResult.openBills)
           ? ledgerResult.openBills as OpenBillReference[]
@@ -5954,7 +5948,7 @@ export function BankStatementsPage() {
       });
     }
 
-    if (Object.keys(rawByLedger).length === 0) {
+    if (requestedLedgerNames.length === 1 && Object.keys(rawByLedger).length === 0 && Array.isArray(result.openBills) && Array.isArray(result.existingAdvances)) {
       const legacyLedgerName =
         typeof result.ledgerName === "string" && requestedLedgerNames.includes(result.ledgerName)
           ? result.ledgerName
@@ -6219,9 +6213,13 @@ export function BankStatementsPage() {
     try {
       setMatchingBills(true);
       setBanner({ tone: "info", text: "Checking the full statement against live Tally vouchers..." });
+      const scopedMasters = completeLedgerScope.current === JSON.stringify([connection.id, selectedCompanyId]) && ledgerMasters.length
+        ? ledgerMasters : null;
       const { drafts: presenceDrafts, balanceProof, sequence } = await verifyBankStatementPresence(connection, validTransactions);
-      const receiptTransactionsToMatch = pendingBillEligibleTransactions.filter(
-        (transaction) => presenceDrafts[transaction.id]?.status === "missing"
+      const checkMasters = scopedMasters ?? await loadLedgerMasters(connection.id);
+      if (sequence !== bankCheckSequence.current) return;
+      const receiptTransactionsToMatch = validTransactions.filter(transaction =>
+        presenceDrafts[transaction.id]?.status === "missing" && isBillMatchEligibleTransaction(transaction, checkMasters)
       );
       const nextDrafts: Record<string, BillAllocationDraft> = {};
       if (receiptTransactionsToMatch.length > 0) {
@@ -6235,26 +6233,6 @@ export function BankStatementsPage() {
         if (sequence !== bankCheckSequence.current) return;
 
         for (const transaction of receiptTransactionsToMatch) {
-          if (!isBillMatchEligibleTransaction(transaction, ledgerMasters)) {
-            const context = getPartyBillMatchContext(transaction, ledgerMasters);
-            nextDrafts[transaction.id] = {
-              status: "not_applicable",
-              caseType: "not_applicable",
-              caseLabel: "Not Applicable",
-              reason: context.reason || "This row is not eligible for bill matching.",
-              receiptAmount: context.amount,
-              totalAllocatedAmount: 0,
-              newAdvanceAmount: 0,
-              unallocatedAmount: 0,
-              allocations: [],
-              candidateBills: [],
-              existingAdvances: [],
-              requiresUserReview: false,
-              isEligibleForPosting: true,
-            };
-            continue;
-          }
-
           const data = billDataByLedger.get(transaction.selectedLedgerName);
           if (!data) {
             nextDrafts[transaction.id] = {
@@ -6262,10 +6240,10 @@ export function BankStatementsPage() {
               caseType: "cannot_match_yet",
               caseLabel: "Cannot Match Yet",
               reason: "Could not fetch open bills for the selected party ledger.",
-              receiptAmount: getPartyBillMatchContext(transaction, ledgerMasters).amount,
+              receiptAmount: getPartyBillMatchContext(transaction, checkMasters).amount,
               totalAllocatedAmount: 0,
               newAdvanceAmount: 0,
-              unallocatedAmount: getPartyBillMatchContext(transaction, ledgerMasters).amount,
+              unallocatedAmount: getPartyBillMatchContext(transaction, checkMasters).amount,
               allocations: [],
               candidateBills: [],
               existingAdvances: [],
@@ -6297,7 +6275,7 @@ export function BankStatementsPage() {
       ).length;
       const outgoingBillReviews = validTransactions.filter((transaction) => {
         if (!isOutgoingPaymentRow(transaction) || presenceDrafts[transaction.id]?.status !== "missing") return false;
-        if (!isBillMatchEligibleTransaction(transaction, ledgerMasters)) return false;
+        if (!isBillMatchEligibleTransaction(transaction, checkMasters)) return false;
         const draft = nextDrafts[transaction.id];
         return !draft || draft.requiresUserReview || !draft.isEligibleForPosting;
       }).length;
