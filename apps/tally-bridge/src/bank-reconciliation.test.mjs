@@ -208,7 +208,7 @@ test("the primary export finds manual vouchers even when Tally would exclude a R
     assert.equal(outcome.result.transactions[0].verificationStatus, "found");
     assert.equal(outcome.result.transactions[0].voucherId, "101");
     assert.equal(calls[0].formulae, undefined);
-    assert.equal(calls.length, referenceNumber.startsWith("NEFT-ICICI-") ? 1 : 2);
+    assert.equal(calls.length, referenceNumber.startsWith("NEFT-ICICI-") ? 1 : 13);
   }
 });
 
@@ -252,7 +252,7 @@ test("statement reconciliation reads manual entries and a bounded amount-filtere
     }
   );
 
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 13);
   assert.match(calls[0].fetchFields, /AllLedgerEntries\.BankAllocations\.\*/);
   assert.equal(calls[0].tallyType, "Vouchers : Ledger");
   assert.equal(calls[0].childOf, '"ICICI Current Account"');
@@ -260,7 +260,8 @@ test("statement reconciliation reads manual entries and a bounded amount-filtere
   assert.equal(calls[0].dateTo, "2026-08-01");
   assert.equal(calls[0].formulae, undefined);
   assert.equal(calls[1].dateFrom, "2026-04-01");
-  assert.equal(calls[1].dateTo, "2027-03-31");
+  assert.equal(calls[1].dateTo, "2026-05-01");
+  assert.equal(calls.at(-1).dateTo, "2027-03-31");
   assert.equal(calls[1].formulae.length, 2);
   assert.match(calls[1].formulae[0].formula, /\$Amount = 1250/);
   assert.ok(calls[1].formulae.every(({ formula }) => !formula.includes("$Reference")));
@@ -296,7 +297,7 @@ test("statement reconciliation reads bank allocations from the primary export", 
     }
   );
 
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 13);
   assert.match(calls[0].fetchFields, /AllLedgerEntries\.BankAllocations\.\*/);
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
   assert.equal(outcome.result.queryDiagnostics.detailedVoucherCount, 0);
@@ -323,4 +324,132 @@ test("bulk duplicate lookup covers every day and retries a slow window without s
   assert.equal(days.at(-1), Date.parse("2027-03-31"));
   assert.equal(days.length, 365);
   assert.equal(new Set(days).size, 365);
+});
+
+import http from "node:http";
+import { createBankWindowCache } from "./bridge.mjs";
+
+const envelope = vouchers => "<ENVELOPE><HEADER><STATUS>1</STATUS></HEADER><COLLECTION>" + vouchers.join("") + "</COLLECTION></ENVELOPE>";
+const manualRow = (date, id) => ({ ...MANUAL_BANK_TRANSACTION, transactionId: id, voucherDate: date,
+  referenceNumber: "", bankReferenceNumber: "" });
+const voucherXml = (id, date) => `<VOUCHER><MASTERID>${id}</MASTERID><DATE>${date}</DATE><ALLLEDGERENTRIES.LIST><LEDGERNAME>ICICI Current Account</LEDGERNAME><AMOUNT>-1250</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST></VOUCHER>`;
+
+test("oversized single day fetches identities, splits detail batches, and refuses an incomplete batch", async () => {
+  for (const omitDetail of [false, true]) {
+    const seen = [];
+    const load = reconcileBankTransactionsInTally({}, { bankLedgerName: "ICICI Current Account", includeBalanceProof: false,
+      transactions: [manualRow("2026-08-01", "a")] }, { exportCollection: async (_url, options) => {
+      if (options.fetchFields === "MasterID") return envelope([1,2,3].map(id => `<VOUCHER><MASTERID>${id}</MASTERID></VOUCHER>`));
+      const filter = options.formulae?.at(-1)?.formula;
+      if (!filter || filter.includes(" OR ")) throw new Error("Tally response exceeded the safe Cash Discount size limit.");
+      const id = Number(filter.match(/= (\d+)/)[1]);
+      seen.push(id);
+      return envelope(omitDetail && id === 2 ? [] : [voucherXml(id, "20260801")]);
+    } });
+    if (omitDetail) await assert.rejects(load, /details changed or were incomplete/);
+    else { const outcome = await load; assert.equal(outcome.result.transactions[0].scannedCount, 3); assert.deepEqual(seen,[1,2,3]); }
+  }
+});
+
+test("real XML reader caps an oversized response; incomplete work resumes and Alter IDs invalidate edited and deleted evidence", async t => {
+  let revision = 100, voucherDay = "20260801", interrupt = true, simulateOversize = true;
+  let reads = 0, counterReads = 0;
+  const server = http.createServer(async (req,res) => {
+    let xml = ""; for await (const chunk of req) xml += chunk;
+    if (xml.includes("Kalika Bank Change Counters")) {
+      counterReads++;
+      return res.end(envelope([`<COMPANY NAME="Demo"><GUID>company-guid</GUID><ALTVCHID>${revision}</ALTVCHID><ALTMSTID>10</ALTMSTID></COMPANY>`]));
+    }
+    reads++;
+    const from = xml.match(/<SVFROMDATE[^>]*>(\d+)/)[1], to = xml.match(/<SVTODATE[^>]*>(\d+)/)[1];
+    if (simulateOversize && from < to) {
+      res.setHeader("content-length", 8 * 1024 * 1024 + 1);
+      res.writeHead(200); res.flushHeaders(); res.write("<ENVELOPE>"); return;
+    }
+    if (interrupt && from === "20260802") return res.end("<ENVELOPE><LINEERROR>fixture interruption</LINEERROR></ENVELOPE>");
+    return res.end(envelope(voucherDay && voucherDay >= from && voucherDay <= to ? [voucherXml(11,voucherDay)] : []));
+  });
+  await new Promise(resolve => server.listen(0,"127.0.0.1",resolve));
+  t.after(() => {server.closeAllConnections();server.close();});
+  const saved = new Map();
+  const config = {tallyUrl:`http://127.0.0.1:${server.address().port}`,__agentRuntime:{
+    activeIdentity:{installationId:"VJ",organizationId:"org",companyName:"Demo",companyGuid:"company-guid",financialYear:"2026-27"},
+    storage:{call:async(method,args) => {
+      if(method==="getWorkflowSnapshot") return saved.get(args.snapshotKey);
+      assert.equal(method,"putWorkflowSnapshot");saved.set(args.snapshotKey,{payload:args.payload});
+    }}}};
+  async function run(label) {
+    reads=0;counterReads=0;
+    const started=performance.now();
+    const result=await reconcileBankTransactionsInTally(config,{companyName:"Demo", bankLedgerName:"ICICI Current Account",
+      includeBalanceProof:false,transactions:[manualRow("2026-08-01","a"),manualRow("2026-08-02","b")]},
+      {allowPartial:true,bankCache:createBankWindowCache(config,"Demo")});
+    t.diagnostic(`${label}: ${(performance.now()-started).toFixed(1)}ms; ${reads} voucher requests, ${counterReads} revision checks`);
+    return result.result.transactions.map(row=>row.verificationStatus);
+  }
+  interrupt=false;
+  await run("cold"); assert.equal(reads,3);
+  saved.clear(); interrupt=true;
+  const partial=await run("interrupted"); assert.equal(partial[1],"unchecked"); assert.equal(reads,3);
+  interrupt=false;
+  const complete=await run("resume"); assert.equal(complete[1],"missing");assert.equal(reads,1);
+  assert.deepEqual(await run("warm"),complete);assert.equal(reads,0);
+  revision++;voucherDay="20260802";simulateOversize=false;
+  const edited=await run("edit");assert.equal(edited[0],"missing");assert.notEqual(edited[1],"missing");assert.equal(reads,1);
+  revision++;voucherDay=null;
+  assert.deepEqual(await run("deletion"),["missing","missing"]);assert.equal(reads,1);
+  revision=100;
+  assert.deepEqual(await run("restored counter"),["missing","missing"]);assert.equal(reads,1);
+});
+
+test("wider lookup failure leaves only rows needing that evidence unchecked", async () => {
+  const payload = {bankLedgerName:"ICICI Current Account",includeBalanceProof:false,transactions:[
+    manualRow("2026-08-01","manual"),
+    {...manualRow("2026-08-01","wire"),referenceNumber:"UTR-123456",bankReferenceNumber:"UTR-123456"},
+  ]};
+  const exportCollection = async (_url, options) => {
+    if (options.collectionName === "Kalika Bank Reference Identity") throw new Error("fetch failed");
+    return envelope([]);
+  };
+  const checked = await reconcileBankTransactionsInTally({},payload,{allowPartial:true,exportCollection});
+  assert.deepEqual(checked.result.transactions.map(r=>r.verificationStatus),["missing","unchecked"]);
+  assert.match(checked.result.transactions[1].reason,/Tally unreachable/);
+  await assert.rejects(reconcileBankTransactionsInTally({},payload,{exportCollection}),/Tally unreachable/);
+});
+
+test("live-year lookup finds the same transfer recorded months before the statement", async () => {
+  const result = await reconcileBankTransactionsInTally({}, {
+    bankLedgerName: "ICICI Current Account", includeBalanceProof: false,
+    transactions: [{...manualRow("2026-12-02", "wire"), bankReferenceNumber:"UTR-123456", referenceNumber:"UTR-123456"}],
+  }, {exportCollection: async (_url, options) => {
+    const date = "2026-05-03";
+    if (options.dateFrom > date || options.dateTo < date) return envelope([]);
+    return envelope([voucherXml(99,"20260503").replace("<DATE>", "<REFERENCE>UTR-123456</REFERENCE><DATE>")]);
+  }});
+  assert.equal(result.result.transactions[0].verificationStatus, "found");
+  assert.equal(result.result.transactions[0].voucherId, "99");
+});
+
+test("a changed watermark before completion invalidates the whole run", async () => {
+  const promise = reconcileBankTransactionsInTally({}, {
+    bankLedgerName:"ICICI Current Account",includeBalanceProof:false,transactions:[manualRow("2026-08-01","wire")],
+  }, {allowPartial:true,exportCollection:async()=>envelope([]),bankCache:{
+    begin:async()=>({current:"100/10"}),get:async()=>null,put:async()=>{},
+    verify:async()=>{ throw new Error("Tally changed during the voucher check"); },
+  }});
+  await assert.rejects(promise, /Tally changed/);
+});
+
+test("Tally company statistics do not become voucher IDs during dense-day recovery", async () => {
+  const wrap = contents => '<ENVELOPE><DESC><CMPINFO><VOUCHER>1398</VOUCHER></CMPINFO></DESC><BODY><DATA><COLLECTION>' + contents + '</COLLECTION></DATA></BODY></ENVELOPE>';
+  const result = await reconcileBankTransactionsInTally({}, {
+    bankLedgerName: "ICICI Current Account", includeBalanceProof: false,
+    transactions: [manualRow("2026-10-21", "wire")],
+  }, { exportCollection: async (_url, options) => {
+    if (options.fetchFields === "MasterID") return wrap("<VOUCHER><MASTERID> 123</MASTERID></VOUCHER>");
+    if (!options.filterNames) throw new Error("Tally response exceeded the safe size limit.");
+    return wrap(voucherXml(123, "20261021"));
+  } });
+  assert.equal(result.result.transactions[0].scannedCount, 1);
+  assert.equal(result.result.queryDiagnostics.detailBatchCount, 1);
 });

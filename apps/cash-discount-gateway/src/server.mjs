@@ -689,6 +689,22 @@ export function startCashDiscountGateway(options = {}) {
         if (item?.browser === socket && ["ledger_masters", "scan", "followups_scan", "verify_bank_transaction", "fetch_customer_open_bills"].includes(item.operation)) failPending(item.requestId, new Error("Scan cancelled."));
       } else if (["operation_result", "result"].includes(message.type) && meta.role === "connector") {
         await handleConnectorResult(socket, message, meta);
+      } else if (["bank_read_diagnostic", "bank_match_preview"].includes(message.type) && meta.role === "connector") {
+        const item = pending.get(String(message.requestId || ""));
+        if (!item || item.connector !== socket || item.connectionId !== meta.connectionId || item.operation !== "verify_bank_transaction") return;
+        if (message.type === "bank_read_diagnostic") {
+          const detail = String(message.detail || "");
+          if (/^Kalika Bank (Statement Reconciliation|Reference Identity) \| \d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2} \| (size limit|timeout|Tally unreachable|read failed) \| \d+ms \| retries \d+$/.test(detail)) {
+            trace(item.requestId, detail);
+            send(item.browser, { type: "progress", requestId: item.requestId, message: detail });
+          }
+        } else if (Array.isArray(message.ids)) {
+          if (item.authority) await authorizeLiveOperation({accessToken:item.accessToken,organizationId:item.organizationId,connectionId:item.connectionId,ownerUserId:item.ownerUserId},item.authorizationMessage,item.authority);
+          if (pending.get(item.requestId) !== item) return;
+          const allowedIds = new Set((item.payload?.transactions || []).map(row => row.transactionId));
+          const ids = message.ids.filter(id => typeof id === "string" && allowedIds.has(id));
+          if (ids.length) send(item.browser, {type:"preview",requestId:item.requestId,data:{ids}});
+        }
       } else if (message.type === "progress" && meta.role === "connector") {
         const item = pending.get(String(message.requestId ?? ""));
         if (item?.connector === socket) send(item.browser, item.authority

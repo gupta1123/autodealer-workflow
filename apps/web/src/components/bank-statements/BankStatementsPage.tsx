@@ -2300,6 +2300,8 @@ function outgoingVerificationFromCommand(command?: TallyCommand | null): Outgoin
     };
   }
 
+  if (verificationStatus !== "missing") return { status: "failed", label: "Unchecked", reason: reason || "Voucher verification is incomplete." };
+
   return {
     status: "missing",
     label: "Missing in Tally",
@@ -3240,6 +3242,7 @@ export function BankStatementsPage() {
   const [postingExcludedIds, setPostingExcludedIds] = useState<Set<string>>(() => new Set());
   const sending = sendingMode !== null;
   const [matchingBills, setMatchingBills] = useState(false);
+  const bankCheckSequence = useRef(0);
   const [tallyCheckAttempted, setTallyCheckAttempted] = useState(false);
   const [statementDirectionsSwapped, setStatementDirectionsSwapped] = useState(false);
   const [syncingMasters, setSyncingMasters] = useState(false);
@@ -4374,11 +4377,7 @@ export function BankStatementsPage() {
     setPostUploadSyncError(null);
     setTallyPostingStatus(null);
     setStatementDoneSummary(null);
-    setBillAllocationsByTransactionId({});
-    setOutgoingVerificationsByTransactionId({});
-    setTallyPresenceByTransactionId({});
-    setTallyBalanceProof(null);
-    setTallyCheckAttempted(false);
+    clearTallyCheckResults();
     setStatementDirectionsSwapped(false);
     setBillAllocationReviewTransactionId(null);
     setOutgoingReviewTransactionId(null);
@@ -5034,6 +5033,7 @@ export function BankStatementsPage() {
   // Tally check results belong to one bank ledger. After the ledger or account
   // changes they must be discarded, so posting requires a fresh check.
   function clearTallyCheckResults() {
+    bankCheckSequence.current++;
     setBillAllocationsByTransactionId({});
     setOutgoingVerificationsByTransactionId({});
     setTallyPresenceByTransactionId({});
@@ -5170,11 +5170,7 @@ export function BankStatementsPage() {
     setReviewPage(1);
     setEditingLedgerIds(new Set());
     setTallyPostingStatus(null);
-    setBillAllocationsByTransactionId({});
-    setOutgoingVerificationsByTransactionId({});
-    setTallyPresenceByTransactionId({});
-    setTallyBalanceProof(null);
-    setTallyCheckAttempted(false);
+    clearTallyCheckResults();
     setStatementDirectionsSwapped(false);
     setReviewFiltersOpen(false);
     setReviewSearch("");
@@ -5997,6 +5993,11 @@ export function BankStatementsPage() {
           .filter(Boolean)
       )
     );
+    const sequence = ++bankCheckSequence.current;
+    const waiting = Object.fromEntries(rows.map(row => [row.id, {
+      status: "failed" as const, label: "Unchecked", reason: "Waiting for complete voucher evidence.",
+    }]));
+    setTallyPresenceByTransactionId(waiting);
     const result = await runCashDiscountLiveRequest<{
       transactions?: Array<Record<string, unknown>>;
       balanceProof?: Record<string, unknown>;
@@ -6004,6 +6005,13 @@ export function BankStatementsPage() {
       connectionId: connection.id,
       companyName: selectedCompanyName || connection.lastCompanyName || "",
       operation: "verify_bank_transaction",
+      onPreview: data => {
+        if (sequence !== bankCheckSequence.current || !data || typeof data !== "object" || !("ids" in data) || !Array.isArray(data.ids)) return;
+        const updates = Object.fromEntries(data.ids.filter(id => typeof id === "string" && Object.hasOwn(waiting, id)).map(id => [id, {
+          status: "failed" as const, label: "Match located", reason: "A candidate voucher was found. Final duplicate verification is pending.",
+        }]));
+        setTallyPresenceByTransactionId(current => ({ ...current, ...updates }));
+      },
       onProgress: (text) => setBanner({ tone: "info", text }),
       payload: {
         companyName: selectedCompanyName || connection.lastCompanyName,
@@ -6034,6 +6042,7 @@ export function BankStatementsPage() {
           }),
       },
     });
+    if (sequence !== bankCheckSequence.current) throw new Error("Statement selection changed. Run a new check.");
     const resultRows = Array.isArray(result.transactions) ? result.transactions : [];
     const drafts = Object.fromEntries(resultRows.flatMap((value) => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return [];
@@ -6050,7 +6059,7 @@ export function BankStatementsPage() {
     const balanceProof = result.balanceProof && typeof result.balanceProof === "object" && !Array.isArray(result.balanceProof)
       ? result.balanceProof as TallyBalanceProof
       : null;
-    setTallyPresenceByTransactionId(drafts);
+    setTallyPresenceByTransactionId({ ...waiting, ...drafts });
     setOutgoingVerificationsByTransactionId(Object.fromEntries(
       rows.filter(isOutgoingPaymentRow).flatMap((transaction) => {
         const draft = drafts[transaction.id];
@@ -6058,7 +6067,7 @@ export function BankStatementsPage() {
       })
     ));
     setTallyBalanceProof(balanceProof);
-    return { drafts, balanceProof };
+    return { drafts, balanceProof, sequence };
   }
 
   async function verifyOutgoingPayments(connection: TallyConnection, rows: ReviewTransaction[]) {
@@ -6184,7 +6193,7 @@ export function BankStatementsPage() {
     try {
       setMatchingBills(true);
       setBanner({ tone: "info", text: "Checking the full statement against live Tally vouchers..." });
-      const { drafts: presenceDrafts, balanceProof } = await verifyBankStatementPresence(connection, validTransactions);
+      const { drafts: presenceDrafts, balanceProof, sequence } = await verifyBankStatementPresence(connection, validTransactions);
       const receiptTransactionsToMatch = pendingBillEligibleTransactions.filter(
         (transaction) => presenceDrafts[transaction.id]?.status === "missing"
       );
@@ -6197,6 +6206,7 @@ export function BankStatementsPage() {
           .sort()
           .at(-1);
         const billDataByLedger = await fetchOpenBillsForLedgers(connection, ledgers, asOfDate);
+        if (sequence !== bankCheckSequence.current) return;
 
         for (const transaction of receiptTransactionsToMatch) {
           if (!isBillMatchEligibleTransaction(transaction, ledgerMasters)) {
@@ -6273,7 +6283,7 @@ export function BankStatementsPage() {
         uncheckedRows > 0;
       setBanner({
         tone: hasRowReviewIssues ? "info" : "success",
-        text: `Statement checked. ${missingReceiptRows > 0
+        text: `${uncheckedRows ? `${uncheckedRows} row(s) unchecked. Retry Check Tally Matches to finish.` : "Statement checked."} ${missingReceiptRows > 0
           ? `${missingReceiptRows} receipt${missingReceiptRows === 1 ? " is" : "s are"} ready to post.`
           : "No new receipts to post."} ${readyOutgoingRows > 0
             ? `${readyOutgoingRows} outgoing payment${readyOutgoingRows === 1 ? " is" : "s are"} ready to post.`

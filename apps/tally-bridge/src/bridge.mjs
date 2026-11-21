@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { datasetKey as bankDatasetKey } from "./agent/identity.mjs";
 
 import fs from "node:fs";
 import { validatePurchaseDocumentFolder, testPurchaseDocumentFolder, withFolderTimeout } from './purchase-document-folder.mjs';
@@ -3471,15 +3472,15 @@ async function exportTallyCollection(tallyUrl, options) {
     tallyUrl,
     buildCollectionExportXml(options),
     options.collectionName,
-    options.timeoutMs
+    options.timeoutMs, options.maxResponseBytes
   );
 }
 
-async function exportTallyXml(tallyUrl, xml, label = "Tally export", timeoutMs = TALLY_EXPORT_TIMEOUT_MS) {
+async function exportTallyXml(tallyUrl, xml, label = "Tally export", timeoutMs = TALLY_EXPORT_TIMEOUT_MS, maxResponseBytes) {
   const readContext = cashDiscountReadContext.getStore();
   if (readContext?.schedule && !readContext.inTallyLane) {
     return readContext.schedule(() => cashDiscountReadContext.run({ ...readContext, inTallyLane: true },
-      () => exportTallyXml(tallyUrl, xml, label, timeoutMs)),
+      () => exportTallyXml(tallyUrl, xml, label, timeoutMs, maxResponseBytes)),
       { signal: readContext.signal, deadlineAt: readContext.deadlineAt, priority: 50, interactive: true });
   }
   const benchmarkStartedAt = performance.now();
@@ -3504,7 +3505,7 @@ async function exportTallyXml(tallyUrl, xml, label = "Tally export", timeoutMs =
       signal: readContext?.signal ? AbortSignal.any([controller.signal, readContext.signal]) : controller.signal,
     });
 
-    const text = readContext ? await readBoundedXml(response) : await response.text();
+    const text = readContext || maxResponseBytes ? await readBoundedXml(response, maxResponseBytes) : await response.text();
     benchmarkResponseBytes = Buffer.byteLength(text);
     if (readContext && (!/<ENVELOPE[\s>]/i.test(text) || !/<\/ENVELOPE>\s*$/i.test(text))) {
       throw new Error(`Tally returned incomplete XML for ${label}.`);
@@ -4509,6 +4510,53 @@ function serializeStrictVoucherMatch(candidate) {
   };
 }
 
+// Persist only complete windows under an observed company revision. A new
+// generation invalidates edits, deletions and observed counter rollbacks.
+export function createBankWindowCache(config, companyName) {
+  const runtime = config.__agentRuntime;
+  const identity = runtime?.activeIdentity;
+  const dataset = identity && bankDatasetKey(identity);
+  if (!dataset || !isSameTallyText(identity.companyName, companyName)) return null;
+  const scope = { datasetKey: dataset, workflow: "bank_voucher_windows_v1" };
+  const get = async snapshotKey => (await runtime.storage.call("getWorkflowSnapshot", { ...scope, snapshotKey }))?.payload;
+  const put = (snapshotKey, payload) => runtime.storage.call("putWorkflowSnapshot", { ...scope, snapshotKey, payload });
+  async function revision() {
+    if (!runtime.activeIdentity || bankDatasetKey(runtime.activeIdentity) !== dataset) throw new Error("Tally company changed. Select the company and retry.");
+    const xml = await exportTallyCollection(normalizeTallyUrl(config.tallyUrl), {
+      collectionName: "Kalika Bank Change Counters", companyName, tallyType: "Company",
+      fetchFields: "Name,GUID,AltVchID,AltMstID", timeoutMs: 10000, maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
+    });
+    const company = extractBlocks(xml, "COMPANY").find(block =>
+      isSameTallyText(getTagText(block, "GUID"), identity.companyGuid) &&
+      isSameTallyText(getTagText(block, "NAME") || getAttribute(block, "NAME"), companyName));
+    if (!company) throw new Error("Could not verify the active Tally company for bank matching.");
+    const counters = ["ALTVCHID", "ALTMSTID"].map(tag => getTagText(company, tag));
+    return counters.every(value => /^\d+$/.test(value || "")) ? counters.join("/") : null;
+  }
+  return {
+    async begin() {
+      const current = await revision();
+      const previous = await get("revision");
+      if (!current) { await put("revision", {}); return null; }
+      if (previous?.current === current) return previous;
+      const stamp = { current, generation: randomUUID() };
+      await put("revision", stamp);
+      return stamp;
+    },
+    async verify(stamp) {
+      if (await revision() !== stamp.current) {
+        await put("revision", {});
+        throw new Error("Tally changed during the voucher check. Retry to verify the updated vouchers.");
+      }
+    },
+    async get(key, stamp) {
+      const saved = await get(key);
+      return saved?.generation === stamp.generation ? saved : null;
+    },
+    put: (key, stamp, value) => put(key, { ...value, generation: stamp.generation }),
+  };
+}
+
 async function fetchBankReconciliationVouchers(
   tallyUrl,
   { companyName, dateFrom, dateTo, bankLedgerName, transactions },
@@ -4527,92 +4575,147 @@ async function fetchBankReconciliationVouchers(
   // request for the same vouchers.
   // Always read the statement period, including manually entered vouchers
   // without a Reference. An identity-filtered export cannot prove absence.
-  const leanXml = await exportCollection(tallyUrl, {
-        collectionName: "Kalika Bank Statement Reconciliation",
-        tallyType: "Vouchers : Ledger",
-        childOf: tallyFormulaString(bankLedgerName),
-        fetchFields:
-          "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.*",
-        companyName,
-        dateFrom,
-        dateTo,
-        timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
-        maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
-      });
-  const leanCompletedAt = Date.now();
-  checkReadBudget(cashDiscountReadContext.getStore());
-  if (!/<\/ENVELOPE\s*>/i.test(leanXml) ||
-      !/<(?:COLLECTION|VOUCHER)(?:\s|\/?>)/i.test(leanXml)) {
-    throw new Error("Tally did not return a complete bank voucher collection. Duplicate checking could not be completed.");
+  const fields = "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.*";
+  const base = { tallyType: "Vouchers : Ledger", childOf: tallyFormulaString(bankLedgerName),
+    companyName, fetchFields: fields, timeoutMs: BANK_MATCH_READ_TIMEOUT_MS, maxResponseBytes: BANK_MATCH_MAX_XML_BYTES };
+  const sameDateVouchers = [];
+  const crossDateVouchers = [];
+  const metrics = { requests: 0, retries: 0, cacheHits: 0, detailBatches: 0 };
+  const dayMs = 86_400_000;
+  const iso = time => new Date(time).toISOString().slice(0, 10);
+  const cache = dependencies.bankCache;
+  const stamp = cache ? await cache.begin() : null;
+  const retryable = error => /size limit|safe response size|timed out after/i.test(error?.message || "");
+  let diagnostic;
+  const primaryWindows = [];
+  async function read(options) {
+    checkReadBudget(cashDiscountReadContext.getStore());
+    metrics.requests++;
+    const xml = await exportCollection(tallyUrl, options);
+    checkReadBudget(cashDiscountReadContext.getStore());
+    if (!isCompleteVoucherEnvelope(xml) || /<LINEERROR\b/i.test(xml)) throw new Error("Incomplete Tally voucher collection.");
+    // Tally also emits a numeric HEADER/DESC/CMPINFO/VOUCHER statistic.
+    // Only the records in the collection belong to the ledger export.
+    const collections = extractBlocks(xml, "COLLECTION");
+    if (/<COLLECTION(?:\s|>)/i.test(xml) && !collections.length) throw new Error("Incomplete Tally collection.");
+    const records = collections.length ? collections.join("") : xml.replace(/<CMPINFO\b[^>]*>[\s\S]*?<\/CMPINFO>/gi, "");
+    const rows = parseVoucherCollection(records);
+    if (rows.length !== (records.match(/<VOUCHER(?:\s|>)/gi) || []).length) throw new Error("Incomplete voucher data in Tally response.");
+    return rows.map(({ masterId, voucherNumber, date, effectiveDate, voucherType, reference, narration,
+      partyLedgerName, ledgerNames, ledgerEntries, bankReferences, isCancelled }) => ({
+      masterId, voucherNumber, date, effectiveDate, voucherType, reference, narration,
+      partyLedgerName, ledgerNames, ledgerEntries, bankReferences, isCancelled,
+    }));
   }
-  const sameDateVouchers = parseVoucherCollection(leanXml).filter(
-    (voucher) => !/^yes$/i.test(String(voucher.isCancelled || ""))
-  );
-  let crossDateVouchers = [];
-  let crossDateExportMs = 0;
-  const financialYear = financialYearBounds(dateFrom);
-  if (crossDateTransactions.length > 0 && financialYear) {
-    const crossDateStartedAt = Date.now();
-    const filterName = "KalikaBankReferenceIdentity";
-    // Filter by bank entry amount, not Reference. The UTR can be in bank
-    // allocations or narration, and is compared exactly after export.
-    const entryFilterName = "KalikaBankIdentityAmount";
-    const amountFormula = Array.from(new Set(crossDateTransactions.map((row) => Number(row.amount))))
-      .map((amount) => `($Amount = ${amount} OR $Amount = ${-amount})`)
-      .join(" OR ");
-    const crossDateOptions = {
-      collectionName: "Kalika Bank Reference Identity",
-      tallyType: "Vouchers : Ledger",
-      childOf: tallyFormulaString(bankLedgerName),
-      fetchFields:
-        "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.*",
-      companyName,
-
-      formulae: [
-        { name: entryFilterName, formula: `($$IsEqual:$LedgerName:${tallyFormulaString(bankLedgerName)}) AND (${amountFormula})` },
-        { name: filterName, formula: `$$FilterCount:AllLedgerEntries:${entryFilterName} > 0` },
-      ],
-      filterNames: [filterName],
-      timeoutMs: BANK_MATCH_READ_TIMEOUT_MS,
-      maxResponseBytes: BANK_MATCH_MAX_XML_BYTES,
-    };
-    const dayMs = 86_400_000;
-    const iso = time => new Date(time).toISOString().slice(0, 10);
-    // Large OR expressions inside Tally's per-voucher FilterCount can stall
-    // even for one bank. Read smaller date windows and match amounts locally.
-    const bulk = crossDateTransactions.length > 8;
-    if (bulk) {
-      delete crossDateOptions.formulae;
-      delete crossDateOptions.filterNames;
-    }
-    async function readWindow(first, last) {
-      checkReadBudget(cashDiscountReadContext.getStore());
-      let xml;
+  async function readDay(options) {
+    const identities = await read({ ...options, fetchFields: "MasterID" });
+    const ids = identities.map(v => String(v.masterId || ""));
+    if (!ids.every(isNumericMasterId) || new Set(ids).size !== ids.length) throw new Error("Incomplete Tally voucher identities.");
+    async function details(batch) {
+      metrics.detailBatches++;
+      let rows;
       try {
-        xml = await exportCollection(tallyUrl, { ...crossDateOptions, dateFrom: iso(first), dateTo: iso(last) });
+        rows = await read({ ...options, formulae: [...(options.formulae || []), {
+          name: "KalikaIds", formula: batch.map(id => `$MasterID = ${id}`).join(" OR ")
+        }], filterNames: [...(options.filterNames || []), "KalikaIds"] });
       } catch (error) {
-        if (first >= last || !/timed out after \d+ seconds/i.test(String(error?.message))) throw error;
-        const middle = first + Math.floor((last - first) / dayMs / 2) * dayMs;
-        await readWindow(first, middle);
-        await readWindow(middle + dayMs, last);
-        return;
+        if (!retryable(error) || batch.length < 2) throw error;
+        metrics.retries++;
+        const mid = Math.ceil(batch.length / 2);
+        return [...await details(batch.slice(0, mid)), ...await details(batch.slice(mid))];
       }
-      if (!isCompleteVoucherEnvelope(xml)) throw new Error("Tally did not return a complete financial-year duplicate lookup.");
-      for (const voucher of parseVoucherCollection(xml)) {
-        if (!/^yes$/i.test(String(voucher.isCancelled || ""))) crossDateVouchers.push(voucher);
-      }
+      const received = new Set(rows.map(row => String(row.masterId)));
+      if (rows.length !== batch.length || !batch.every(id => received.has(id))) throw new Error("Voucher details changed or were incomplete. Retry the check.");
+      return rows;
     }
-    const years = new Set(crossDateTransactions.map(row => financialYearBounds(row.voucherDate).dateFrom));
-    for (const start of years) {
-      const last = Date.parse(financialYearBounds(start).dateTo);
-      for (let first = Date.parse(start); first <= last;) {
-        const end = bulk ? Math.min(first + 30 * dayMs, last) : last;
-        await readWindow(first, end);
-        first = end + dayMs;
-      }
-    }
-    crossDateExportMs = Date.now() - crossDateStartedAt;
+    const rows = [];
+    for (let i = 0; i < ids.length; i += 32) rows.push(...await details(ids.slice(i, i + 32)));
+    return rows;
   }
+  async function range(options, first, last, consume) {
+    checkReadBudget(cashDiscountReadContext.getStore());
+    const from = iso(first), to = iso(last);
+    const key = createHash("sha256").update(JSON.stringify([bankLedgerName, from, to, options.formulae || []])).digest("hex");
+    const cached = stamp && await cache.get(key, stamp);
+    if (cached?.rows) { metrics.cacheHits++; consume(cached.rows, from, to); return; }
+    const scoped = { ...options, dateFrom: from, dateTo: to };
+    async function split() {
+      const mid = first + Math.floor((last - first) / dayMs / 2) * dayMs;
+      await range(options, first, mid, consume);
+      await range(options, mid + dayMs, last, consume);
+    }
+    if (cached?.split && first < last) return split();
+    let rows;
+    try {
+      rows = await read(scoped);
+    } catch (error) {
+      checkReadBudget(cashDiscountReadContext.getStore());
+      const cause = retryable(error) ? (/size/i.test(error.message) ? "size limit" : "timeout") :
+        /fetch failed|ECONNREFUSED|unreachable/i.test(error.message) ? "Tally unreachable" : "read failed";
+      diagnostic = `${options.collectionName} | ${from}..${to} | ${cause} | ${Date.now()-startedAt}ms | retries ${metrics.retries}`;
+      dependencies.onBankDiagnostic?.(diagnostic);
+      if (!retryable(error)) throw new Error(`${diagnostic}. ${error.message}`, { cause: error });
+      metrics.retries++;
+      if (first < last) {
+        if (stamp) await cache.put(key, stamp, { split: true });
+        return split();
+      }
+      try { rows = await readDay(scoped); }
+      catch (detailError) {
+        const cause = /size/i.test(detailError.message) ? "size limit" : /timed out/i.test(detailError.message) ? "timeout" :
+          /fetch failed|ECONNREFUSED/i.test(detailError.message) ? "Tally unreachable" : "read failed";
+        diagnostic = `${options.collectionName} | ${from}..${to} | ${cause} | ${Date.now()-startedAt}ms | retries ${metrics.retries}`;
+        dependencies.onBankDiagnostic?.(diagnostic);
+        throw new Error(`${diagnostic}. Day detail read failed: ${detailError.message}`, { cause: detailError });
+      }
+    }
+    rows = rows.filter(v => !/^yes$/i.test(String(v.isCancelled || "")));
+    if (stamp) await cache.put(key, stamp, { rows });
+    consume(rows, from, to);
+  }
+  async function scan(options, from, to, consume) {
+    const start = Date.parse(from), end = Date.parse(to);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || iso(start) !== from || iso(end) !== to) {
+      throw new Error("Invalid bank voucher date range.");
+    }
+    for (let first = start; first <= end; first += 31 * dayMs)
+      await range(options, first, Math.min(first + 30 * dayMs, end), consume);
+  }
+  const primary = { ...base, collectionName: "Kalika Bank Statement Reconciliation" };
+  const completeYears = [];
+  let primaryComplete = false;
+  let leanCompletedAt = startedAt;
+  let incomplete = "";
+  try {
+    await scan(primary, dateFrom, dateTo, (rows, from, to) => {
+      primaryWindows.push([from, to]);
+      for (const row of rows) sameDateVouchers.push(row);
+      dependencies.onBankWindow?.(rows);
+    });
+    primaryComplete = true;
+    leanCompletedAt = Date.now();
+    const years = new Set(crossDateTransactions.map(row => financialYearBounds(row.voucherDate).dateFrom));
+    const wider = { ...base, collectionName: "Kalika Bank Reference Identity" };
+    if (crossDateTransactions.length && crossDateTransactions.length <= 8) {
+      const amounts = [...new Set(crossDateTransactions.map(row => Number(row.amount)))];
+      wider.formulae = [
+        { name: "KalikaBankIdentityAmount", formula: `($$IsEqual:$LedgerName:${base.childOf}) AND (${amounts.map(a => `($Amount = ${a} OR $Amount = ${-a})`).join(" OR ")})` },
+        { name: "KalikaBankReferenceIdentity", formula: "$$FilterCount:AllLedgerEntries:KalikaBankIdentityAmount > 0" }
+      ];
+      wider.filterNames = ["KalikaBankReferenceIdentity"];
+    }
+    for (const start of years) {
+      await scan(wider, start, financialYearBounds(start).dateTo, rows => {
+        for (const row of rows) crossDateVouchers.push(row);
+      });
+      completeYears.push(start);
+    }
+  } catch (error) {
+    if (!dependencies.allowPartial || cashDiscountReadContext.getStore()?.signal?.aborted) throw error;
+    incomplete = error.message;
+  }
+  if (stamp) await cache.verify(stamp);
+  const crossDateExportMs = Date.now() - leanCompletedAt;
   const voucherByIdentity = new Map();
   for (const voucher of [...sameDateVouchers, ...crossDateVouchers]) {
     const key = [
@@ -4628,13 +4731,14 @@ async function fetchBankReconciliationVouchers(
   return {
     vouchers,
     diagnostics: {
+      incomplete, primaryComplete, primaryWindows, completeYears, ...metrics,
       leanExportMs: leanCompletedAt - startedAt,
       referenceExportMs: 0,
       crossDateExportMs,
       totalMs: Date.now() - startedAt,
       scannedVoucherCount: vouchers.length,
       detailedVoucherCount: 0,
-      detailBatchCount: 0,
+      detailBatchCount: metrics.detailBatches,
       primaryIncludesBankReferences: true,
       queryMode: crossDateTransactions.length > 0
         ? "bank_ledger_plus_financial_year_amount"
@@ -4683,7 +4787,13 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
       matchBasis,
     } = strictResult;
     const duplicateInTally = matchBasis === "reference" && candidates.length > 1;
-    const verificationStatus = bankCandidateVerificationStatus(strictResult);
+    const ref = bankTransactionReferences(transaction).bankReference;
+    const requiresWiderLookup = isStrongBankReference(ref) && !/^\d+$/.test(normalizeExactReference(ref));
+    const dayChecked = queryDiagnostics?.primaryComplete || queryDiagnostics?.primaryWindows?.some(
+      ([from, to]) => from <= transaction.voucherDate && transaction.voucherDate <= to);
+    const unchecked = queryDiagnostics?.incomplete && (!dayChecked || (!queryDiagnostics.primaryComplete && !candidates.length) ||
+      (requiresWiderLookup && !queryDiagnostics.completeYears.includes(financialYearBounds(transaction.voucherDate).dateFrom)));
+    const verificationStatus = unchecked ? "unchecked" : bankCandidateVerificationStatus(strictResult);
     if (verificationStatus === "found") {
       const indexesToReserve = duplicateInTally ? candidates.map((candidate) => candidate.index) : [candidates[0].index];
       indexesToReserve.forEach((index) => reservedVoucherIndexes.add(index));
@@ -4703,7 +4813,7 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
       voucherDate: selectedCandidate
         ? normalizeDateForCompare(selectedCandidate.voucher.effectiveDate || selectedCandidate.voucher.date)
         : null,
-      reason: verificationStatus === "found" ? "Already entered in Tally."
+      reason: unchecked ? `${candidates.length ? "Possible voucher located. " : ""}${queryDiagnostics.incomplete}` : verificationStatus === "found" ? "Already entered in Tally."
         : verificationStatus === "ambiguous" ? "Possible existing entry — please review."
           : "No matching entry found in Tally.",
       matches: candidates.slice(0, 5).map(serializeStrictVoucherMatch),
@@ -4718,7 +4828,7 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
     (entry) => normalizeLooseName(entry.ledgerName) === normalizeLooseName(bankLedgerName)
   ));
   const tallyMovement = periodBankEntries.reduce((sum, entry) => sum - Number(entry.amount || 0), 0);
-  const includeBalanceProof = commandPayload.includeBalanceProof !== false;
+  const includeBalanceProof = commandPayload.includeBalanceProof !== false && queryDiagnostics?.primaryComplete !== false;
   let tallyClosingBalance = null;
   let balanceError = includeBalanceProof ? null : "Balance proof skipped for posting duplicate preflight.";
   if (includeBalanceProof) {
@@ -8463,7 +8573,25 @@ export function startCashDiscountLiveChannel(config, executeExclusive, options =
           };
         }
         if (operation === "verify_bank_transaction") {
-          const outcome = await cashDiscountReadContext.run({ signal: controller.signal, deadlineAt, benchmark, schedule: executeExclusive, onProgress: (text) => send({ type: "progress", requestId, message: text }) }, () => reconcileBankTransactionsInTally(config, message.payload || {}));
+          const payload = { ...message.payload, tallyUrl: config.tallyUrl, companyName: message.payload?.companyName || message.companyName };
+          if (!isSameTallyText(message.companyName, payload.companyName)) throw new Error("Bank matching company does not match the connector request.");
+          const reported = new Set();
+          const outcome = await cashDiscountReadContext.run({ signal: controller.signal, deadlineAt, benchmark, schedule: executeExclusive },
+            () => reconcileBankTransactionsInTally(config, payload, {
+              allowPartial: true,
+              bankCache: createBankWindowCache(config, message.companyName),
+              onBankDiagnostic: detail => send({ type: "bank_read_diagnostic", requestId, detail }),
+              onBankWindow: vouchers => {
+                const byDate = indexBankVouchersByDate(vouchers);
+                const ids = [];
+                for (const row of payload.transactions || []) {
+                  if (reported.has(row.transactionId)) continue;
+                  const matches = strictBankTransactionCandidates(vouchers, row, payload.bankLedgerName, new Set(), byDate);
+                  if (matches.candidates.length) { reported.add(row.transactionId); ids.push(row.transactionId); }
+                }
+                if (ids.length) send({ type: "bank_match_preview", requestId, ids });
+              },
+            }));
           return outcome.result || outcome;
         }
         if (operation === "fetch_customer_open_bills") {

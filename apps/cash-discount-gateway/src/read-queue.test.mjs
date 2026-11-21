@@ -84,3 +84,19 @@ test('bank verification waits for a master read, while another connector remains
   h.complete('bank');assert.equal((await result).success,true);
   otherConnector.send(JSON.stringify({type:'operation_result',requestId:'independent',success:true,data:{}}));
 });
+
+test('bank preview only forwards requested row IDs and bounded read diagnostics', async t => {
+  const h = await setup(t);
+  const requestId = 'bank-window';
+  const forwarded = next(h.connector, m => m.type === 'operation' && m.requestId === requestId);
+  h.request(requestId, 'verify_bank_transaction', {transactions: [{transactionId: 'own-row'}]});
+  await forwarded;
+  const preview = next(h.browser, m => m.type === 'preview' && m.requestId === requestId);
+  h.connector.send(JSON.stringify({type:'bank_match_preview',requestId,ids:['own-row','unknown-row']}));
+  assert.deepEqual((await preview).data.ids,['own-row']);
+  const progress = next(h.browser, m => m.type === 'progress' && m.requestId === requestId);
+  const detail = 'Kalika Bank Statement Reconciliation | 2026-08-01..2026-08-31 | size limit | 118ms | retries 0';
+  h.connector.send(JSON.stringify({type:'bank_read_diagnostic',requestId,detail}));
+  assert.equal((await progress).message, detail);
+  h.complete(requestId);
+});
