@@ -253,7 +253,7 @@ test("statement reconciliation reads manual entries and a bounded amount-filtere
   );
 
   assert.equal(calls.length, 13);
-  assert.match(calls[0].fetchFields, /AllLedgerEntries\.BankAllocations\.\*/);
+  assert.match(calls[0].fetchFields, /AllLedgerEntries\.BankAllocations\.InstrumentNumber/);
   assert.equal(calls[0].tallyType, "Vouchers : Ledger");
   assert.equal(calls[0].childOf, '"ICICI Current Account"');
   assert.equal(calls[0].dateFrom, "2026-08-01");
@@ -298,7 +298,7 @@ test("statement reconciliation reads bank allocations from the primary export", 
   );
 
   assert.equal(calls.length, 13);
-  assert.match(calls[0].fetchFields, /AllLedgerEntries\.BankAllocations\.\*/);
+  assert.match(calls[0].fetchFields, /AllLedgerEntries\.BankAllocations\.InstrumentNumber/);
   assert.equal(outcome.result.transactions[0].verificationStatus, "found");
   assert.equal(outcome.result.queryDiagnostics.detailedVoucherCount, 0);
   assert.equal(outcome.result.queryDiagnostics.primaryIncludesBankReferences, true);
@@ -314,7 +314,9 @@ test("bulk duplicate lookup covers every day and retries a slow window without s
     bankLedgerName: "ICICI Current Account", includeBalanceProof: false, transactions,
   }, { exportCollection: async (_url, options) => {
     if (options.collectionName === "Kalika Bank Reference Identity") {
-      assert.equal(options.formulae, undefined);
+      assert.match(options.formulae[0].formula, /\$Amount = 1250/);
+      const span = (Date.parse(options.dateTo) - Date.parse(options.dateFrom)) / 86400000 + 1;
+      assert.ok(span <= (firstAttempt ? 7 : 4), "later windows retain the smaller successful size");
       if (firstAttempt) { firstAttempt = false; throw new Error("Read timed out after 20 seconds."); }
       for (let day = Date.parse(options.dateFrom); day <= Date.parse(options.dateTo); day += 86400000) days.push(day);
     }

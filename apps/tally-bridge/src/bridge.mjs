@@ -4604,7 +4604,7 @@ async function fetchBankReconciliationVouchers(
   // request for the same vouchers.
   // Always read the statement period, including manually entered vouchers
   // without a Reference. An identity-filtered export cannot prove absence.
-  const fields = "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.*";
+  const fields = "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName,AllLedgerEntries.BankAllocations.Name";
   const base = { tallyType: "Vouchers : Ledger", childOf: tallyFormulaString(bankLedgerName),
     companyName, fetchFields: fields, timeoutMs: BANK_MATCH_READ_TIMEOUT_MS, maxResponseBytes: BANK_MATCH_MAX_XML_BYTES };
   const sameDateVouchers = [];
@@ -4661,7 +4661,7 @@ async function fetchBankReconciliationVouchers(
     for (let i = 0; i < ids.length; i += 32) rows.push(...await details(ids.slice(i, i + 32)));
     return rows;
   }
-  async function range(options, first, last, consume) {
+  async function range(options, first, last, consume, onSplit) {
     checkReadBudget(cashDiscountReadContext.getStore());
     const from = iso(first), to = iso(last);
     const key = createHash("sha256").update(JSON.stringify([bankLedgerName, from, to, options.formulae || []])).digest("hex");
@@ -4670,8 +4670,9 @@ async function fetchBankReconciliationVouchers(
     const scoped = { ...options, dateFrom: from, dateTo: to };
     async function split() {
       const mid = first + Math.floor((last - first) / dayMs / 2) * dayMs;
-      await range(options, first, mid, consume);
-      await range(options, mid + dayMs, last, consume);
+      onSplit((mid - first) / dayMs + 1);
+      await range(options, first, mid, consume, onSplit);
+      await range(options, mid + dayMs, last, consume, onSplit);
     }
     if (cached?.split && first < last) return split();
     let rows;
@@ -4702,13 +4703,16 @@ async function fetchBankReconciliationVouchers(
     if (stamp) await cache.put(key, stamp, { rows });
     consume(rows, from, to);
   }
-  async function scan(options, from, to, consume) {
+  async function scan(options, from, to, consume, windowDays = 31) {
     const start = Date.parse(from), end = Date.parse(to);
     if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || iso(start) !== from || iso(end) !== to) {
       throw new Error("Invalid bank voucher date range.");
     }
-    for (let first = start; first <= end; first += 31 * dayMs)
-      await range(options, first, Math.min(first + 30 * dayMs, end), consume);
+    for (let first = start; first <= end;) {
+      const last = Math.min(first + (windowDays - 1) * dayMs, end);
+      await range(options, first, last, consume, days => { windowDays = Math.min(windowDays, days); });
+      first = last + dayMs;
+    }
   }
   const primary = { ...base, collectionName: "Kalika Bank Statement Reconciliation" };
   const completeYears = [];
@@ -4725,10 +4729,20 @@ async function fetchBankReconciliationVouchers(
     leanCompletedAt = Date.now();
     const years = new Set(crossDateTransactions.map(row => financialYearBounds(row.voucherDate).dateFrom));
     const wider = { ...base, collectionName: "Kalika Bank Reference Identity" };
-    if (crossDateTransactions.length && crossDateTransactions.length <= 8) {
-      const amounts = [...new Set(crossDateTransactions.map(row => Number(row.amount)))];
+    const amounts = [...new Set(crossDateTransactions.map(row => Number(row.amount)))];
+    if (amounts.length && amounts.every(Number.isFinite)) {
+      // Bound the formula size on long statements. Ranges may return extra
+      // candidates. The strict matcher still checks each exact bank entry.
+      amounts.sort((a, b) => a - b);
+      const batchSize = Math.ceil(amounts.length / 64);
+      const clauses = [];
+      for (let i = 0; i < amounts.length; i += batchSize) {
+        const low = amounts[i], high = amounts[Math.min(i + batchSize, amounts.length) - 1];
+        clauses.push(low === high ? `($Amount = ${low} OR $Amount = ${-low})` :
+          `(($Amount >= ${low} AND $Amount <= ${high}) OR ($Amount >= ${-high} AND $Amount <= ${-low}))`);
+      }
       wider.formulae = [
-        { name: "KalikaBankIdentityAmount", formula: `($$IsEqual:$LedgerName:${base.childOf}) AND (${amounts.map(a => `($Amount = ${a} OR $Amount = ${-a})`).join(" OR ")})` },
+        { name: "KalikaBankIdentityAmount", formula: `($$IsEqual:$LedgerName:${base.childOf}) AND (${clauses.join(" OR ")})` },
         { name: "KalikaBankReferenceIdentity", formula: "$$FilterCount:AllLedgerEntries:KalikaBankIdentityAmount > 0" }
       ];
       wider.filterNames = ["KalikaBankReferenceIdentity"];
@@ -4736,7 +4750,7 @@ async function fetchBankReconciliationVouchers(
     for (const start of years) {
       await scan(wider, start, financialYearBounds(start).dateTo, rows => {
         for (const row of rows) crossDateVouchers.push(row);
-      });
+      }, crossDateTransactions.length > 8 ? 7 : 31);
       completeYears.push(start);
     }
   } catch (error) {
