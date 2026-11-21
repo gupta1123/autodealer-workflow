@@ -3893,14 +3893,10 @@ export function BankStatementsPage() {
   const firstSelectedBlockingBillAllocationTransaction = selectedBlockingBillAllocationTransactions[0] ?? null;
   const billAllocationReviewIsNextAction =
     tallyCheckAttempted &&
-    uncheckedTallyPresenceCount === 0 &&
-    ambiguousTallyPresenceCount === 0 &&
     selectedBlockingBillAllocationCount > 0;
   const postTallyButtonLabel = sendingMode
     ? "Sending..."
-    : ambiguousTallyPresenceCount > 0
-      ? `Review ${ambiguousTallyPresenceCount} Ambiguous`
-      : selectedBlockingBillAllocationCount > 0
+    : selectedBlockingBillAllocationCount > 0
         ? `Review ${selectedBlockingBillAllocationCount} Bill Match${selectedBlockingBillAllocationCount === 1 ? "" : "es"}`
         : tallyPostingScope === "receipts"
           ? `Post ${newReceiptCount} Receipt${newReceiptCount === 1 ? "" : "s"}`
@@ -6383,14 +6379,6 @@ export function BankStatementsPage() {
     ).length;
     if (selectedMissingLedgerCount > 0) {
       showToast("error", "Select a ledger for every row before sending to Tally.");
-      return;
-    }
-    if (!skipBillMatching && uncheckedTallyPresenceCount > 0) {
-      showToast("error", "Check the full statement against Tally before sending anything.");
-      return;
-    }
-    if (ambiguousTallyPresenceCount > 0) {
-      showToast("error", "Review ambiguous Tally matches before sending anything.");
       return;
     }
     if (transactionsNeedingTallyWork.length === 0) {
@@ -9303,7 +9291,6 @@ export function BankStatementsPage() {
                               preview.extractionDiagnostics?.coverageComplete === false ||
                               selectedPostingTransactions.length === 0 ||
                               selectedPostingMissingLedgerCount > 0 ||
-                              ambiguousTallyPresenceCount > 0 ||
                               (!bankLedgerVerified && !bankLedgerManuallyConfirmed)
                             }
                             type="button"

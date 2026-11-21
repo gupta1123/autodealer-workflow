@@ -74,3 +74,32 @@ test('live Tally subgroup ledgers qualify for bills by their root group and bank
   assert.equal(check('Suspense').eligible,false);
   assert.match(source,/const masters = normalizeLiveLedgerMasters\(\s*payload\.ledgers/);
 });
+
+test('receipt-only posting admits the checked missing receipt despite other ambiguous and unchecked rows', () => {
+  const vars = new Map();
+  let postButton;
+  function visit(node) {
+    if (ts.isVariableDeclaration(node) && node.initializer) vars.set(node.name.getText(ast), node.initializer);
+    if (ts.isJsxOpeningElement(node) && node.tagName.getText(ast) === 'Button' &&
+        node.getText(ast).includes('setPendingDirectPostMode(mode)')) postButton = node;
+    ts.forEachChild(node, visit);
+  }
+  visit(ast);
+  const ids = ['receipt', 'unticked', 'payment', 'possible', 'unchecked', 'already'];
+  const context = { validTransactions: ids.map(id => ({id})), postingExcludedIds: new Set(['unticked']),
+    tallyPresenceByTransactionId: Object.fromEntries(ids.map((id,i)=>[id,{status:['missing','missing','missing','ambiguous','failed','found'][i]}])),
+    tallyCheckAttempted:true, tallyPostingScope:'receipts', useMemo: fn=>fn(),
+    isIncomingReceiptRow: row=>row.id!=='payment', isOutgoingPaymentRow: row=>row.id==='payment',
+    sending:false, matchingBills:false, tallyPostingInProgress:false, preview:{}, selectedPostingMissingLedgerCount:0,
+    ambiguousTallyPresenceCount:1, uncheckedTallyPresenceCount:1, bankLedgerVerified:true, bankLedgerManuallyConfirmed:false };
+  for (const name of ['postableTransactions','transactionsNeedingTallyWork','receiptTransactionsNeedingPost','outgoingTransactionsNeedingPost','selectedPostingTransactions']) {
+    context[name] = vm.runInNewContext(vars.get(name).getText(ast), context);
+  }
+  assert.deepEqual(Array.from(context.selectedPostingTransactions, row=>row.id), ['receipt']);
+  const disabled = postButton.attributes.properties.find(attr=>attr.name?.getText(ast)==='disabled').initializer.expression.getText(ast);
+  assert.equal(vm.runInNewContext(disabled, context),false);
+  assert.equal(vm.runInNewContext(disabled, {...context,bankLedgerVerified:false}),true);
+  const send = source.slice(source.indexOf('async function sendToTally('),source.indexOf('const confirmResponse',source.indexOf('async function sendToTally(')));
+  assert.doesNotMatch(send,/ambiguousTallyPresenceCount|uncheckedTallyPresenceCount/);
+  assert.match(send,/candidateTallyWorkTransactions\.filter\([\s\S]*?isReadyForTallyPosting/);
+});
