@@ -455,3 +455,45 @@ test("Tally company statistics do not become voucher IDs during dense-day recove
   assert.equal(result.result.transactions[0].scannedCount, 1);
   assert.equal(result.result.queryDiagnostics.detailBatchCount, 1);
 });
+
+test("bank narration rules distinguish confirmed, possible and unrelated vouchers", async () => {
+  const row = { narration: "NEFT: CUSTOMER A: ICICI" };
+  const voucher = { ...bankVoucher(), narration: "NEFT Customer A ICICI" };
+  const check = (rows, overrides = {}) => checkManualBankVouchers(rows, { ...row, ...overrides });
+  assert.equal((await check([voucher])).matchBasis, "date_bank_amount_direction_narration");
+  assert.equal((await check([voucher])).verificationStatus, "found");
+  const other = { ...bankVoucher({ party: "Other Party" }), narration: voucher.narration };
+  assert.equal((await check([other])).verificationStatus, "ambiguous");
+  assert.equal((await check([other])).matchBasis, "narration_party_differs");
+  assert.equal((await check([voucher, voucher])).verificationStatus, "ambiguous");
+  for (const overrides of [{ amount: 1200 }, { expectedDirection: "outgoing" }, { narration: "NEFT" }]) {
+    assert.equal((await check([other], overrides)).verificationStatus, "missing");
+  }
+  const conflicting = { ...voucher, reference: "UTIBN26300012345", bankReferences: ["UTIBN26300012345"] };
+  assert.equal((await check([conflicting], { referenceNumber: "UTIBN26300099999" })).verificationStatus, "missing");
+});
+
+test("a one-day statement reads nearby narration candidates and returns bill details only for a confirmed voucher", async () => {
+  const transaction = { ...MANUAL_BANK_TRANSACTION, narration: "NEFT CUSTOMER A ICICI" };
+  const check = async (voucherDate, allocationXml = "") => {
+    const compactDate = voucherDate.replaceAll("-", "");
+    const outcome = await reconcileBankTransactionsInTally({}, {
+      bankLedgerName: "ICICI Current Account", transactions: [transaction], includeBalanceProof: false,
+    }, { exportCollection: async (_url, query) => {
+      assert.match(query.fetchFields, /BillAllocations.Amount/);
+      const xml = voucherDate >= query.dateFrom && voucherDate <= query.dateTo
+        ? `<VOUCHER><MASTERID>7</MASTERID><DATE>${compactDate}</DATE><NARRATION>NEFT CUSTOMER A ICICI</NARRATION><PARTYLEDGERNAME>Customer A</PARTYLEDGERNAME><ALLLEDGERENTRIES.LIST><LEDGERNAME>ICICI Current Account</LEDGERNAME><AMOUNT>-1250</AMOUNT><ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE></ALLLEDGERENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>Customer A</LEDGERNAME><AMOUNT>1250</AMOUNT>${allocationXml}</ALLLEDGERENTRIES.LIST></VOUCHER>` : "";
+      return `<ENVELOPE><COLLECTION>${xml}</COLLECTION></ENVELOPE>`;
+    } });
+    return outcome.result.transactions[0];
+  };
+  const nearby = await check("2026-07-12");
+  assert.equal(nearby.verificationStatus, "ambiguous");
+  assert.equal(nearby.matchBasis, "narration_nearby_date");
+  assert.equal(nearby.billAllocations, undefined);
+  assert.equal((await check("2026-08-22")).verificationStatus, "missing");
+  assert.deepEqual((await check("2026-08-01")).billAllocations, []);
+  const billed = await check("2026-08-01", "<BILLALLOCATIONS.LIST><NAME>INV-44</NAME><BILLTYPE>Agst Ref</BILLTYPE><AMOUNT>1250</AMOUNT></BILLALLOCATIONS.LIST>");
+  assert.equal(billed.billAllocations[0].referenceName, "INV-44");
+  assert.equal(billed.billAllocations[0].amount, 1250);
+});

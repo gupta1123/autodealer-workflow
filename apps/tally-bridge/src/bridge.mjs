@@ -3905,7 +3905,8 @@ function toVoucher(block) {
           .find(Boolean) || null,
     }); })
     .filter((entry) => entry.stockItemName);
-  const billAllocations = extractBlocks(block, "BILLALLOCATIONS.LIST")
+  const billAllocationBlocks = extractBlocks(block, "BILLALLOCATIONS.LIST");
+  const billAllocations = billAllocationBlocks
     .map((allocation) => ({
       referenceName: getTagText(allocation, "NAME"),
       billType: getTagText(allocation, "BILLTYPE") || getTagText(allocation, "TYPEOFREF"),
@@ -3935,6 +3936,7 @@ function toVoucher(block) {
       })),
     })),
     billAllocations,
+    billAllocationsComplete: billAllocations.length === billAllocationBlocks.length,
     inventoryEntries,
     masterId: getTagText(block, "MASTERID"),
     alterId: getTagText(block, "ALTERID"),
@@ -4446,7 +4448,40 @@ function isCompleteVoucherEnvelope(xml) {
   return /<\/ENVELOPE\s*>/i.test(xml) && /<(?:COLLECTION|VOUCHER)(?:\s|\/?>)/i.test(xml);
 }
 
-function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes, byDate = null) {
+const DEFAULT_DUPLICATE_RULES = Object.freeze({ nearbyDays: 20, narrationMinLength: 12, narrationRule: true });
+
+function resolveDuplicateRules(raw) {
+  const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const whole = (value, min, max, fallback) => {
+    const number = Number(value);
+    return Number.isInteger(number) && number >= min && number <= max ? number : fallback;
+  };
+  return {
+    nearbyDays: whole(source.nearbyDays, 0, 60, DEFAULT_DUPLICATE_RULES.nearbyDays),
+    narrationMinLength: whole(source.narrationMinLength, 8, 40, DEFAULT_DUPLICATE_RULES.narrationMinLength),
+    narrationRule: source.narrationRule === false ? false : true,
+  };
+}
+
+function compactNarration(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function narrationsIdentifySameEntry(rowNarration, voucherNarration, minLength = DEFAULT_DUPLICATE_RULES.narrationMinLength) {
+  const row = compactNarration(rowNarration);
+  const voucher = compactNarration(voucherNarration);
+  if (row.length < minLength || voucher.length < minLength) return false;
+  return row === voucher || voucher.includes(row) || row.includes(voucher);
+}
+
+function daysBetween(left, right) {
+  const a = Date.parse(`${left}T00:00:00Z`);
+  const b = Date.parse(`${right}T00:00:00Z`);
+  return Number.isFinite(a) && Number.isFinite(b) ? Math.abs(Math.round((a - b) / 86_400_000)) : Infinity;
+}
+
+function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, reservedVoucherIndexes, byDate = null, duplicateRules = DEFAULT_DUPLICATE_RULES) {
+  const rules = resolveDuplicateRules(duplicateRules);
   const { bankReference, trackingReference } = bankTransactionReferences(transaction);
   const counterpartyLedgerName = String(transaction.counterpartyLedgerName || "").trim();
   const baseCandidates = baseBankTransactionCandidates(
@@ -4500,7 +4535,21 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
       ? compatible.filter(({ voucher, index }) => !reservedVoucherIndexes.has(index) &&
           voucherHasLedger(voucher, counterpartyLedgerName))
       : [];
-    if (partyMatches.length > 0) {
+    const rowNarration = transaction.narration || transaction.description;
+    const narrationAll = baseCandidates.filter(({ voucher, index }) =>
+      !reservedVoucherIndexes.has(index) &&
+      !voucherHasConflictingBankReference(voucher, bankReference) &&
+      rules.narrationRule && narrationsIdentifySameEntry(rowNarration, voucher.narration, rules.narrationMinLength));
+    // The party must also agree (or be unknown): the same text under a different customer is not
+    // a confirmed duplicate, it is something to review.
+    const compatibleKeys = new Set(compatible.map(({ index }) => index));
+    const narrationMatches = narrationAll.filter(({ index }) => compatibleKeys.has(index));
+    if (narrationMatches.length > 0) {
+      // Same day, bank ledger, amount, direction, text and party: the same entry.
+      candidates = narrationMatches;
+      matchBasis = "date_bank_amount_direction_narration";
+      identityInsufficient = false;
+    } else if (partyMatches.length > 0) {
       candidates = partyMatches;
       matchBasis = "date_bank_amount_direction_party";
       identityInsufficient = candidates.some(({ voucher }) =>
@@ -4509,6 +4558,31 @@ function strictBankTransactionCandidates(vouchers, transaction, bankLedgerName, 
       candidates = compatible;
       identityInsufficient = compatible.length > 0;
       matchBasis = compatible.length > 0 ? "possible_manual_entry" : null;
+    }
+    if (candidates.length === 0 && narrationAll.length > 0) {
+      candidates = narrationAll;
+      identityInsufficient = true;
+      matchBasis = "narration_party_differs";
+    }
+    if (candidates.length === 0 && rules.narrationRule && rules.nearbyDays > 0) {
+      // Same text, bank ledger, amount and direction a few days off: probably entered on another
+      // date. Never auto-skip it, but flag it for review instead of posting a second copy.
+      const rowDate = normalizeDateForCompare(transaction.voucherDate);
+      const nearby = vouchers.flatMap((voucher, index) => {
+        if (reservedVoucherIndexes.has(index)) return [];
+        const date = normalizeDateForCompare(voucher.effectiveDate || voucher.date);
+        const gap = daysBetween(date, rowDate);
+        if (!date || gap === 0 || gap > rules.nearbyDays) return [];
+        if (!narrationsIdentifySameEntry(transaction.narration || transaction.description, voucher.narration, rules.narrationMinLength)) return [];
+        if (voucherHasConflictingBankReference(voucher, bankReference)) return [];
+        const bankEntry = getBankLedgerEntry(voucher, bankLedgerName, Number(transaction.amount || 0), transaction.expectedDirection);
+        return bankEntry ? [{ voucher, index, bankEntry }] : [];
+      });
+      if (nearby.length > 0) {
+        candidates = nearby;
+        identityInsufficient = true;
+        matchBasis = "narration_nearby_date";
+      }
     }
   }
 
@@ -4604,7 +4678,7 @@ async function fetchBankReconciliationVouchers(
   // request for the same vouchers.
   // Always read the statement period, including manually entered vouchers
   // without a Reference. An identity-filtered export cannot prove absence.
-  const fields = "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName,AllLedgerEntries.BankAllocations.Name";
+  const fields = "Date,EffectiveDate,VoucherTypeName,VoucherNumber,Reference,Narration,PartyLedgerName,MasterID,IsCancelled,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive,AllLedgerEntries.BankAllocations.InstrumentNumber,AllLedgerEntries.BankAllocations.TransactionName,AllLedgerEntries.BankAllocations.Name,AllLedgerEntries.BillAllocations.Name,AllLedgerEntries.BillAllocations.BillType,AllLedgerEntries.BillAllocations.Amount";
   const base = { tallyType: "Vouchers : Ledger", childOf: tallyFormulaString(bankLedgerName),
     companyName, fetchFields: fields, timeoutMs: BANK_MATCH_READ_TIMEOUT_MS, maxResponseBytes: BANK_MATCH_MAX_XML_BYTES };
   const sameDateVouchers = [];
@@ -4636,9 +4710,10 @@ async function fetchBankReconciliationVouchers(
     const rows = parseVoucherCollection(records);
     if (rows.length !== (records.match(/<VOUCHER(?:\s|>)/gi) || []).length) throw new Error("Incomplete voucher data in Tally response.");
     return rows.map(({ masterId, voucherNumber, date, effectiveDate, voucherType, reference, narration,
-      partyLedgerName, ledgerNames, ledgerEntries, bankReferences, isCancelled }) => ({
+      partyLedgerName, ledgerNames, ledgerEntries, bankReferences, billAllocations, billAllocationsComplete, isCancelled }) => ({
       masterId, voucherNumber, date, effectiveDate, voucherType, reference, narration,
       partyLedgerName, ledgerNames, ledgerEntries, bankReferences, isCancelled,
+      billAllocations: billAllocationsComplete ? billAllocations : undefined,
     }));
   }
   async function readDay(options) {
@@ -4669,7 +4744,7 @@ async function fetchBankReconciliationVouchers(
   async function range(options, first, last, consume, onSplit) {
     checkReadBudget(cashDiscountReadContext.getStore());
     const from = iso(first), to = iso(last);
-    const key = createHash("sha256").update(JSON.stringify([bankLedgerName, from, to, options.formulae || []])).digest("hex");
+    const key = createHash("sha256").update(JSON.stringify([fields, bankLedgerName, from, to, options.formulae || []])).digest("hex");
     const cached = stamp && await cache.get(key, stamp);
     if (cached?.rows) { metrics.cacheHits++; consume(cached.rows, from, to); return; }
     const scoped = { ...options, dateFrom: from, dateTo: to };
@@ -4725,11 +4800,29 @@ async function fetchBankReconciliationVouchers(
   let leanCompletedAt = startedAt;
   let incomplete = "";
   try {
-    await scan(primary, dateFrom, dateTo, (rows, from, to) => {
+    const collectPrimary = (rows, from, to) => {
       primaryWindows.push([from, to]);
       for (const row of rows) sameDateVouchers.push(row);
       dependencies.onBankWindow?.(rows);
-    });
+    };
+    await scan(primary, dateFrom, dateTo, collectPrimary);
+    const statementDays = indexBankVouchersByDate(sameDateVouchers);
+    const narrationDates = (transactions || [])
+      .filter(row => compactNarration(row.narration || row.description).length >= DEFAULT_DUPLICATE_RULES.narrationMinLength)
+      .filter(row => {
+        const day = statementDays.get(normalizeDateForCompare(row.voucherDate)) || [];
+        // An exact reference or compatible same-day candidate always takes precedence over a nearby narration.
+        const match = strictBankTransactionCandidates(day.map(entry => entry.voucher), row, bankLedgerName, new Set());
+        return !match.candidates.length || match.matchBasis === "narration_party_differs";
+      })
+      .map(row => normalizeDateForCompare(row.voucherDate)).filter(Boolean).sort();
+    if (narrationDates.length) {
+      const margin = DEFAULT_DUPLICATE_RULES.nearbyDays * dayMs;
+      const first = Date.parse(narrationDates[0]) - margin;
+      const last = Date.parse(narrationDates.at(-1)) + margin;
+      if (first < Date.parse(dateFrom)) await scan(primary, iso(first), iso(Date.parse(dateFrom) - dayMs), collectPrimary);
+      if (last > Date.parse(dateTo)) await scan(primary, iso(Date.parse(dateTo) + dayMs), iso(last), collectPrimary);
+    }
     primaryComplete = true;
     leanCompletedAt = Date.now();
     const years = new Set(crossDateTransactions.map(row => financialYearBounds(row.voucherDate).dateFrom));
@@ -4853,6 +4946,7 @@ async function reconcileBankTransactionsInTally(config, commandPayload = {}, dep
       matchCount: candidates.length,
       duplicateInTally,
       duplicateVoucherCount: duplicateInTally ? candidates.length : 0,
+      billAllocations: selectedCandidate?.voucher.billAllocations,
       baseCandidateCount,
       matchBasis,
       scannedCount: vouchers.length,
@@ -5038,6 +5132,7 @@ export async function verifyBankTransactionInTally(config, commandPayload = {}, 
       matchBasis: strictResult.matchBasis,
       duplicateInTally,
       duplicateVoucherCount: duplicateInTally ? strictMatches.length : 0,
+      billAllocations: selectedVoucher?.billAllocations,
       voucherId: selectedVoucher?.masterId || selectedVoucher?.voucherNumber || null,
       voucherNumber: selectedVoucher?.voucherNumber || null,
       voucherType: selectedVoucher?.voucherType || null,

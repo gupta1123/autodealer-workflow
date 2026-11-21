@@ -20,3 +20,35 @@ test('matching failure displays unavailable and requires a manual decision',()=>
  const confirmed=row(recommendation,'Balaji Traders');assert.equal(confirmed.requiresUserConfirmation,false);assert.equal(exports.label(confirmed),'Ledger matched');
  const genuine=row({...recommendation,status:'completed'});assert.equal(exports.label(genuine),'In Suspense');assert.equal(genuine.requiresUserConfirmation,false);
 });
+
+test('posting status renders duplicate evidence before the bill workflow and distinguishes verified allocations', async () => {
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  const React = await import('react');
+  let cell;
+  function visit(node) {
+    if (ts.isJsxElement(node) && node.openingElement.getText(ast).includes('className="posting-status-cell')) cell = node;
+    ts.forEachChild(node, visit);
+  }
+  visit(ast);
+  assert.ok(cell);
+  const helpers = ['formatVerifiedBillAllocations', 'outgoingVerificationFromCommand'].map(name =>
+    ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name.text === name).getText(ast)
+  ).join('\n');
+  const context = { React, formatCurrencyAmount: String };
+  const render = vm.runInNewContext(ts.transpileModule(helpers + `
+    (result, posted = false) => {
+      const tallyPresence = outgoingVerificationFromCommand({ status: "succeeded", result });
+      const transaction = { id: "row" };
+      const postedReviewIds = new Set(posted ? ["row"] : []);
+      return (${cell.getText(ast)});
+    }`, { compilerOptions: { target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.React } }).outputText, context);
+  const html = (row, posted) => renderToStaticMarkup(render(row, posted));
+  const found = { verificationStatus: 'found', voucherNumber: '27' };
+  assert.match(html(found), /Already entered in Tally/);
+  assert.doesNotMatch(html(found), /On Account/);
+  assert.match(html({ ...found, billAllocations: [] }, true), /Posted successfully.*On Account/s);
+  assert.match(html({ ...found, billAllocations: [{ referenceName: 'INV-9', amount: 150 }, { billType: 'Advance', referenceName: 'ADV-1', amount: 50 }] }), /INV-9.*150.*Advance.*50/);
+  assert.match(html({ verificationStatus: 'ambiguous', matches: [{ voucherNumber: '55' }] }), /Possible duplicate.*Voucher 55/s);
+  assert.match(html({ verificationStatus: 'ambiguous' }), /Review before posting/);
+  assert.match(html({ verificationStatus: 'unchecked' }), /Unchecked/);
+});

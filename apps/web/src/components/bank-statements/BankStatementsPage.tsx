@@ -489,6 +489,7 @@ type TallyPostingStatus = {
   voucherTotal: number;
   voucherWaiting: number;
   voucherCompleted: number;
+  createdTransactionIds: string[];
   voucherFailed: number;
   paymentCheckTotal: number;
   paymentCheckWaiting: number;
@@ -607,6 +608,7 @@ type OutgoingVerificationDraft = {
   duplicateInTally?: boolean;
   duplicateVoucherCount?: number;
   scannedCount?: number | null;
+  billAllocationSummary?: string;
   matches?: OutgoingMatchCandidate[];
 };
 
@@ -2215,6 +2217,18 @@ function getOutgoingVerificationSubtext(draft?: OutgoingVerificationDraft | null
   return draft.reason || "Could not check";
 }
 
+function formatVerifiedBillAllocations(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined;
+  if (!value.length) return "On Account · no bill allocated";
+  const labels: string[] = [];
+  for (const line of value) {
+    if (!line || typeof line.referenceName !== "string" || typeof line.amount !== "number") return undefined;
+    const name = line.billType === "Advance" ? "Advance" : line.referenceName;
+    labels.push(`${name} · ${formatCurrencyAmount(line.amount)}`);
+  }
+  return labels.join(" + ");
+}
+
 function outgoingVerificationFromCommand(command?: TallyCommand | null): OutgoingVerificationDraft {
   if (!command) {
     return {
@@ -2276,6 +2290,7 @@ function outgoingVerificationFromCommand(command?: TallyCommand | null): Outgoin
     return {
       status: "found",
       label: "Found in Tally",
+      billAllocationSummary: formatVerifiedBillAllocations(result.billAllocations),
       reason: reason || "Existing outgoing entry was found in Tally.",
       voucherNumber,
       voucherDate,
@@ -2728,6 +2743,7 @@ function buildTallyPostingStatus(
   let voucherTotal = 0;
   let voucherWaiting = 0;
   let voucherCompleted = 0;
+  const createdTransactionIds: string[] = [];
   let voucherFailed = 0;
   let paymentCheckTotal = 0;
   let paymentCheckWaiting = 0;
@@ -2747,7 +2763,13 @@ function buildTallyPostingStatus(
 
     if (status === "succeeded") {
       completed += 1;
-      if (isVoucherCommand) voucherCompleted += 1;
+      if (isVoucherCommand) {
+        voucherCompleted += 1;
+        const result = command?.result;
+        if (Number(result?.created) > 0 && !result?.alreadyInTally && typeof result?.transactionId === "string") {
+          createdTransactionIds.push(result.transactionId);
+        }
+      }
       if (isPaymentCheckCommand) paymentCheckCompleted += 1;
     } else if (status === "failed") {
       failed += 1;
@@ -2784,6 +2806,7 @@ function buildTallyPostingStatus(
     voucherTotal,
     voucherWaiting,
     voucherCompleted,
+    createdTransactionIds,
     voucherFailed,
     paymentCheckTotal,
     paymentCheckWaiting,
@@ -3267,6 +3290,7 @@ export function BankStatementsPage() {
   const [reviewDateTo, setReviewDateTo] = useState("");
   const [rowsPerPage, setRowsPerPage] = useState(50);
   const [reviewPage, setReviewPage] = useState(1);
+  const [postedReviewIds, setPostedReviewIds] = useState<Set<string>>(() => new Set());
   const [billAllocationsByTransactionId, setBillAllocationsByTransactionId] = useState<Record<string, BillAllocationDraft>>({});
   const [outgoingVerificationsByTransactionId, setOutgoingVerificationsByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
   const [tallyPresenceByTransactionId, setTallyPresenceByTransactionId] = useState<Record<string, OutgoingVerificationDraft>>({});
@@ -4749,6 +4773,7 @@ export function BankStatementsPage() {
     setBillAllocationsByTransactionId({});
     setOutgoingVerificationsByTransactionId({});
     setTallyPresenceByTransactionId({});
+    setPostedReviewIds(new Set());
     setTallyBalanceProof(null);
     setStatementDoneSummary(null);
     setTallyPostingStatus(null);
@@ -5037,6 +5062,7 @@ export function BankStatementsPage() {
     setBillAllocationsByTransactionId({});
     setOutgoingVerificationsByTransactionId({});
     setTallyPresenceByTransactionId({});
+    setPostedReviewIds(new Set());
     setTallyBalanceProof(null);
     setTallyCheckAttempted(false);
   }
@@ -6615,6 +6641,12 @@ export function BankStatementsPage() {
             if (!finalStatus?.finished || finalStatus.failed > 0 || finalStatus.canceled > 0 || !commandConnection) return;
             setBanner({ tone: "info", text: "Tally actions completed. Verifying the statement against live Tally..." });
             const { drafts, balanceProof } = await verifyBankStatementPresence(commandConnection, validTransactions);
+            const createdIds = new Set(finalStatus.createdTransactionIds);
+            const verifiedReviewIds = queueRows.flatMap(row => {
+              const review = reviewedTransactionsByKey.get(transactionQueueKey(row));
+              return createdIds.has(row.id) && review && drafts[review.id]?.status === "found" ? [review.id] : [];
+            });
+            setPostedReviewIds(current => new Set([...current, ...verifiedReviewIds]));
             const selectedIds = new Set(selectedTallyWorkTransactions.map((transaction) => transaction.id));
             const remainingPostedRows = validTransactions.filter(
               (transaction) => selectedIds.has(transaction.id) && drafts[transaction.id]?.status !== "found"
@@ -8281,7 +8313,8 @@ export function BankStatementsPage() {
                                         ? "border-amber-250 bg-amber-50 text-amber-800"
                                         : "border-emerald-250 bg-emerald-50 text-emerald-800"
                                     }`}>
-                                      {tallyPresence.duplicateInTally ? "Already posted - duplicates" : "Already in Tally"}
+                                      {tallyPresence.duplicateInTally ? "Multiple entries in Tally"
+                                        : postedReviewIds.has(transaction.id) ? "Posted successfully" : "Already entered in Tally"}
                                     </span>
                                     <span className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500" title={tallyPresence.reason}>
                                       {tallyPresence.duplicateInTally
@@ -8289,6 +8322,21 @@ export function BankStatementsPage() {
                                         : tallyPresence.voucherNumber
                                           ? `Voucher ${tallyPresence.voucherNumber}`
                                           : "Unique live match"}
+                                    </span>
+                                    {tallyPresence.billAllocationSummary && (
+                                      <span className="text-[9px] font-semibold text-slate-700">{tallyPresence.billAllocationSummary}</span>
+                                    )}
+                                  </button>
+                                ) : tallyPresence?.status === "failed" || tallyPresence?.status === "cannot_check_yet" ? (
+                                  <span title={tallyPresence.reason} className="text-xs font-semibold text-amber-800">
+                                    {tallyPresence.label} · {tallyPresence.reason}
+                                  </span>
+                                ) : tallyPresence?.status === "ambiguous" ? (
+                                  <button type="button" className="flex w-full flex-col items-start gap-1 rounded-lg border border-transparent px-1.5 py-0 text-left transition hover:border-amber-200 hover:bg-amber-50 focus-visible:ring-2 focus-visible:ring-amber-300" title="Compare with the possible Tally voucher"
+                                    onClick={() => { setOutgoingReviewTransactionId(transaction.id); }}>
+                                    <span className="inline-flex min-h-5 max-w-full self-start items-center rounded-full border border-amber-250 bg-amber-50 px-2 py-0.5 text-[8px] font-bold uppercase leading-none tracking-wide text-amber-800">Possible duplicate</span>
+                                    <span className="block w-full whitespace-normal break-words text-[9px] font-semibold leading-[13px] text-slate-500">
+                                      {tallyPresence.matches?.[0]?.voucherNumber ? `Voucher ${tallyPresence.matches[0].voucherNumber}` : "Review before posting"}
                                     </span>
                                   </button>
                                 ) : outgoingPayment && !outgoingNeedsBillAllocation ? (
