@@ -116,6 +116,18 @@ export function calculatePurchaseVoucher(input: PurchaseCalculationInput) {
     addBucket(bucketMap, "igst", freightRate, freight, freightTax);
   }
 
+  // Some suppliers print each half of split GST to the nearest rupee.
+  // Use that convention only when it reproduces both printed totals exactly.
+  const printedTax = purchaseMoneyPaise(input.invoiceGstAmount);
+  const splitBuckets = Array.from(bucketMap.values());
+  if (input.taxMode === "cgst_sgst" && splitBuckets.length === 2 && splitBuckets[0].rate === splitBuckets[1].rate && splitBuckets[0].kind !== splitBuckets[1].kind && printedTax !== null && printedTax > 0 &&
+      splitBuckets.reduce((sum, bucket) => sum + Math.round(bucket.amount / 100) * 100, 0) === printedTax &&
+      basic + freight + printedTax === purchaseMoneyPaise(input.invoiceTotal) &&
+      !(purchaseMoneyPaise(input.sourceRoundOffAmount) || purchaseMoneyPaise(input.tcsAmount) ||
+        purchaseMoneyPaise(input.invoiceWithholdingAmount))) {
+    for (const bucket of splitBuckets) bucket.amount = Math.round(bucket.amount / 100) * 100;
+  }
+
   const buckets: PurchaseTaxBucket[] = Array.from(bucketMap.values()).map((bucket) => ({
     kind: bucket.kind,
     rate: purchaseFormatPaise(bucket.rate).replace(/\.00$/, ""),

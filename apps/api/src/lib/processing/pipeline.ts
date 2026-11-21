@@ -3677,7 +3677,8 @@ function enrichDocumentTaxRateFields(doc: CaseDoc) {
 
   if (taxMode !== "unknown") {
     const resolvedTotalRate =
-      normalizeKnownGstRate(amountDerivedRate) ??
+      // Positive printed tax cannot establish a zero percent rate.
+      (amountDerivedRate && normalizeKnownGstRate(amountDerivedRate) === 0 ? null : normalizeKnownGstRate(amountDerivedRate)) ??
       normalizeKnownGstRate(parseTaxRateField(fields.taxRate)) ??
       normalizeKnownGstRate(getDominantLineItemTaxRateForMode(doc.lineItems, taxMode)) ??
       normalizeKnownGstRate(selectDominantTaxRate(lineRates)) ??
@@ -3792,13 +3793,20 @@ function fillPurchaseOrderLineItemTaxRates(lineItems: CommercialLineItem[], taxR
 
 function correctLineItemAmounts(
   lineItems: CommercialLineItem[] | undefined,
-  fields: Partial<Record<FieldKey, string>>
+  fields: Partial<Record<FieldKey, string>>,
+  markdown: string
 ) {
   if (!lineItems?.length) return lineItems;
 
   let changed = false;
   const documentTaxAmount = parseLooseNumber(fields.taxAmount);
   const documentTotalAmount = parseLooseNumber(fields.totalAmount);
+  const subtotal = parseLooseNumber(fields.subtotal);
+  const printedAmounts = lineItems.map(item => parseLooseNumber(item.taxableAmount));
+  const printedSubtotalAgrees = subtotal !== null && printedAmounts.every(amount => amount !== null) &&
+    Math.abs(printedAmounts.reduce<number>((sum, amount) => sum + (amount ?? 0), 0) - subtotal) <= 0.01 &&
+    documentTotalAmount !== null && documentTaxAmount !== null &&
+    Math.abs(subtotal + documentTaxAmount - documentTotalAmount) <= 0.01;
   const corrected = lineItems.map((item) => {
     const quantity = parseLooseNumber(item.quantity);
     const rate = parseLooseNumber(item.rate ?? item.netRate);
@@ -3808,6 +3816,17 @@ function correctLineItemAmounts(
     const next = { ...item };
     const lineTotal = parseLooseNumber(item.lineTotal);
     const taxableAmount = parseLooseNumber(item.taxableAmount);
+
+    const evidence = lineItems.length === 1 ? markdown : item.rawText || "";
+    const perTonne = /(?:\bp\s*\/\s*|\bper\s+|\/\s*)(?:m\.?t\.?|t|tonnes?|tons?)\b/i.test(evidence);
+    if (/^(?:kg|kgs|kilograms?)\.?$/i.test((item.unit || "").trim()) && perTonne &&
+        taxableAmount !== null && taxableAmount > 0 && Math.abs(expected / 1000 - taxableAmount) <= 0.01 &&
+        (!item.netRate || parseLooseNumber(item.netRate) === rate)) {
+      const perKg = String(Number((rate / 1000).toFixed(8)));
+      changed = true;
+      return { ...item, rate: perKg, ...(item.netRate ? { netRate: perKg } : {}) };
+    }
+    if (printedSubtotalAgrees) return item;
 
     if (lineTotal !== null && isClearMagnitudeError(lineTotal, expected)) {
       next.lineTotal = formatNumberForField(expected);
@@ -3881,7 +3900,7 @@ function correctCommercialTotals(doc: CaseDoc) {
   doc = correctInvoiceTotalMisreadAsTaxableValue(doc);
   if (!COMMERCIAL_TOTAL_DOC_TYPES.has(doc.type) || !doc.lineItems?.length) return doc;
 
-  let lineItems = correctLineItemAmounts(doc.lineItems, doc.fields) ?? doc.lineItems;
+  let lineItems = correctLineItemAmounts(doc.lineItems, doc.fields, doc.md ?? "") ?? doc.lineItems;
   const lineSum = lineItems
     ?.map((item) => parseLooseNumber(item.taxableAmount ?? item.lineTotal))
     .filter((value): value is number => value !== null && value >= 0)

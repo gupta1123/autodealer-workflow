@@ -209,3 +209,13 @@ test("a printed transport TDS amount is used as printed", () => {
   assert.equal(result.transportTdsAmount, "367.00");
   assert.equal(result.transportTdsDifference, "-0.92");
 });
+
+test("Bharat Steel rounded split tax reconciles both printed totals", () => {
+  const invoice = input({ taxMode: "cgst_sgst", invoiceGstAmount: "191840", invoiceTotal: "1257620",
+    lines: [{lineId: "scrap", taxableAmount: "1065780", taxRate: "18"}] });
+  const actual = calculator.calculatePurchaseVoucher(invoice);
+  assert.equal(actual.cgstAmount, "95920.00");
+  assert.equal(actual.sgstAmount, "95920.00");
+  assert.equal(actual.totalDifference, "0.00");
+  assert.equal(calculator.calculatePurchaseVoucher({...invoice, invoiceTotal: "1257620.40"}).cgstAmount, "95920.20");
+});
