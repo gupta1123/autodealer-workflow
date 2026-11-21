@@ -1,4 +1,4 @@
-const DEFAULT_LATEST_AGENT_VERSION = "1.2.47";
+const DEFAULT_LATEST_AGENT_VERSION = "1.2.48";
 const DEFAULT_MINIMUM_AGENT_VERSION = "1.0.0";
 const DEFAULT_RELEASE_REPOSITORY = "https://github.com/gupta1123/autodealer-workflow";
 
