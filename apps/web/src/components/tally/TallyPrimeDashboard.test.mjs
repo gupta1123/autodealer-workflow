@@ -20,6 +20,7 @@ function fixture({module='bank',manager=false,allCompanies=false,connected=true,
  const container=({children})=>React.createElement('div',null,children);
  const button=({children,...props})=>React.createElement('button',props,children);
  const imports={
+  './ConnectorSupport':{ConnectorSupport:()=>React.createElement('p',null,'Remote support')},
   react:{useState:initial=>{
    const index=stateIndex++;
    return [index===1?(empty?[]:[connection]):index===4?false:initial,()=>{}];

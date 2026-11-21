@@ -1,4 +1,5 @@
 import {canAccess} from '@autodealer/shared/lib/access';
+import {requireResourceAccess} from './resources';
 import {AccessError,requireAccessContext} from './server';
 import {createSupabaseAdminClient} from '@/lib/supabase/admin';
 import {LIVE_OPERATION_PERMISSIONS} from './live-policy';
@@ -54,6 +55,11 @@ export async function authorizeLiveConnection(request:Request,body:Record<string
   if(!operation)return {ownerUserId:connection.owner_user_id,initiatingUserId:access.member.user_id,organizationId:access.organizationId,datasets:eligible};
   if(body.installationId&&body.installationId!==connection.installation_id)throw new AccessError('The connector installation changed.',409);
   if(body.sessionGeneration!==undefined&&body.sessionGeneration!==connection.session_generation)throw new AccessError('The pairing session changed.',409);
+  if(operation==='connector_update'||operation==='connector_diagnostics'){
+    await requireResourceAccess(request,'connection',connection.id,'connections.manage');
+    return {ownerUserId:connection.owner_user_id,initiatingUserId:access.member.user_id,organizationId:access.organizationId,
+      installationId:connection.installation_id,sessionGeneration:connection.session_generation};
+  }
   if(operation==='company_check'&&!body.companyName)return {ownerUserId:connection.owner_user_id,initiatingUserId:access.member.user_id,
     organizationId:access.organizationId,installationId:connection.installation_id,sessionGeneration:connection.session_generation,datasets:eligible};
   // A name may select a previously verified mapping, but never supplies its

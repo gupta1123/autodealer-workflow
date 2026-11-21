@@ -39,6 +39,8 @@ const activeDebitNotes = new Set();
 // explained from the server log alone: when the browser's request arrived,
 // each step, and every message sent back (type and size).
 const requestTimeline = new Map();
+const supportOperations = new Set(["connector_update", "connector_diagnostics"]);
+
 function trace(requestId, step) {
   if (!requestId) return;
   const startedAt = requestTimeline.get(requestId) ?? Date.now();
@@ -156,7 +158,7 @@ function startPending({ requestId, browser, connector, connectionId, ownerUserId
     operation,
     proposal,
     payload,
-    phase: operation === 'test_purchase_document_folder' ? operation : operation === "company_check"
+    phase: supportOperations.has(operation) || operation === 'test_purchase_document_folder' ? operation : operation === "company_check"
     ? "company_check"
     : operation === "bank_ledgers" || operation === "ledger_masters" || operation === "ledger_suggestions" || operation === "verify_bank_transaction" || operation === "fetch_customer_open_bills"
       ? operation
@@ -329,7 +331,7 @@ async function handleBrowserRequest(socket, message, meta) {
     handleCollectionsRequest(socket, message, meta, requestId, operation);
     return;
   }
-  if (!['test_purchase_document_folder', 'company_check', 'bank_ledgers', 'ledger_masters', 'ledger_suggestions', 'verify_bank_transaction', 'fetch_customer_open_bills', 'scan', 'followups_scan', 'create_debit_note'].includes(operation)) {
+  if (!supportOperations.has(operation) && !['test_purchase_document_folder', 'company_check', 'bank_ledgers', 'ledger_masters', 'ledger_suggestions', 'verify_bank_transaction', 'fetch_customer_open_bills', 'scan', 'followups_scan', 'create_debit_note'].includes(operation)) {
     send(socket, { type: "result", requestId, success: false, error: "Unsupported Cash Discount operation." });
     return;
   }
@@ -355,6 +357,10 @@ async function handleBrowserRequest(socket, message, meta) {
     return;
   }
 
+  if (supportOperations.has(operation) && (!authority || !versionAtLeast(connectorMeta.bridgeVersion, [1, 2, 47]))) {
+    send(socket, { type: "result", requestId, success: false, error: "Remote support requires a managed connection and connector 1.2.47 or newer." });
+    return;
+  }
   const proposal = message.proposal && typeof message.proposal === "object" ? message.proposal : null;
   if (["scan", "followups_scan", "create_debit_note"].includes(operation)) {
     const version = /^(\d+)\.(\d+)\.(\d+)$/.exec(connectorMeta.bridgeVersion);
@@ -420,12 +426,16 @@ async function handleBrowserRequest(socket, message, meta) {
     item.contextMs = Date.now() - contextStartedAt;
     if (!pending.has(requestId)) return;
   }
+  if (supportOperations.has(operation) && connectors.get(meta.connectionId) !== connector) {
+    failPending(requestId, new Error("The selected PC reconnected. Run the action again."));
+    return;
+  }
   trace(requestId, "sent to the connector");
   send(connector, {
     type: "operation",
     requestId,
     deadlineAt: Date.now() + (operation === "verify_bank_transaction" ? 180_000 : 90_000),
-      operation: operation === "test_purchase_document_folder" ? operation : operation === "company_check"
+      operation: supportOperations.has(operation) || operation === "test_purchase_document_folder" ? operation : operation === "company_check"
         ? "company_check"
         : operation === "bank_ledgers"
           ? "bank_ledgers"
@@ -499,7 +509,7 @@ async function handleConnectorResult(socket, message, meta) {
     return;
   }
 
-  if (["test_purchase_document_folder", "bank_ledgers", "ledger_masters", "ledger_suggestions", "verify_bank_transaction", "fetch_customer_open_bills", "collections"].includes(item.phase)) {
+  if (supportOperations.has(item.phase) || ["test_purchase_document_folder", "bank_ledgers", "ledger_masters", "ledger_suggestions", "verify_bank_transaction", "fetch_customer_open_bills", "collections"].includes(item.phase)) {
     clearPending(requestId);
     send(item.browser, { type: "result", requestId, success: true, data: message.data });
     return;

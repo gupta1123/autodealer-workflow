@@ -264,6 +264,16 @@ function configureUpdateFeed() {
 const UPDATE_CHECK_DELAY_MS = 2 * 60_000;
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60_000;
 
+let remoteUpdateRunner = null;
+
+async function requestPublishedUpdate() {
+  remoteUpdateRunner = runner;
+  const status = await checkForUpdatesNow();
+  if (status.state === "ready" && remoteUpdateRunner === runner) installDownloadedUpdateWhenSafe();
+  if (["current", "failed", "unavailable"].includes(status.state)) remoteUpdateRunner = null;
+  return { version: app.getVersion(), state: updateState.state, message: updateState.message };
+}
+
 async function checkForUpdatesNow() {
   // Never restart a check while a download is in flight or an update is
   // already waiting to be installed.
@@ -284,6 +294,7 @@ async function checkForUpdatesNow() {
 // Turns updater failures into a short message for the user; the technical
 // detail goes to the error log as a single line.
 function reportUpdateError(error) {
+  remoteUpdateRunner = null;
   const detail = String(error instanceof Error ? error.message : error || "");
   appendLog(errPath, `Updater: ${detail.split("\n")[0].slice(0, 300)}`);
   const version = app.getVersion();
@@ -317,7 +328,14 @@ async function createTray() {
 }
 
 function installDownloadedUpdateWhenSafe() {
+  if (remoteUpdateRunner && (remoteUpdateRunner !== runner || runner?.stopped)) {
+    remoteUpdateRunner = null;
+    if (updateInstallTimer) clearInterval(updateInstallTimer);
+    updateInstallTimer = null;
+    return { installing: false, waiting: false };
+  }
   if (!runner?.busy) {
+    remoteUpdateRunner = null;
     if (updateInstallTimer) clearInterval(updateInstallTimer);
     updateInstallTimer = null;
     sendUpdateStatus({ state: "installing", percent: 100, message: "Installing the update. Kalika Local Agent will reopen automatically…" });
@@ -325,7 +343,14 @@ function installDownloadedUpdateWhenSafe() {
     // Windows must release the running executable before NSIS can replace it.
     // Use a silent install and force the updated app to relaunch so this feels
     // like one continuous in-app update rather than a second installer flow.
-    setTimeout(() => autoUpdater.quitAndInstall(true, true), 350);
+    setTimeout(() => {
+      if (runner?.busy) {
+        safeQuitApproved = false;
+        installDownloadedUpdateWhenSafe();
+        return;
+      }
+      autoUpdater.quitAndInstall(true, true);
+    }, 350);
     return { installing: true };
   }
   sendUpdateStatus({ state: "waiting", message: "Waiting for the active Tally operation to finish safely." });
@@ -409,6 +434,7 @@ async function startRunner() {
 
   runner = createBridgeRunner({
     safeStorage,
+    requestPublishedUpdate,
     renderTallyPrintToPdf,
     onProgress(progress) {
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("agent:progress", progress);
@@ -909,6 +935,7 @@ function startApplication() {
           appendLog(errPath, `Updater marker: ${error instanceof Error ? error.message : error}`);
         }
         sendUpdateStatus({ state: "ready", availableVersion: info.version, percent: 100, message: `Version ${info.version} is ready to install.` });
+        if (remoteUpdateRunner) installDownloadedUpdateWhenSafe();
       });
       autoUpdater.on("error", (error) => reportUpdateError(error));
       // Check shortly after launch and then periodically. Downloads start

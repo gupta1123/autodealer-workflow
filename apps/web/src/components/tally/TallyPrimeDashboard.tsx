@@ -19,6 +19,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { ConnectorSupport } from "./ConnectorSupport";
 import { LocalAgentPanel } from "@/components/tally/LocalAgentPanel";
 import { TallyCompanyLinkingPanel } from "@/components/tally/TallyCompanyLinkingPanel";
 import { CaseConfirmDialog } from "@/components/cases/CaseConfirmDialog";
@@ -921,6 +922,9 @@ export function TallyPrimeDashboard({ initialView = "home" }: TallyPrimeDashboar
         </div>
       ) : null}
 
+      {canManage && selectedConnection?.bridgeConnected && <ConnectorSupport key={selectedConnection.id}
+        connectionId={selectedConnection.id} company={selectedConnection.lastCompanyName || ""}
+        version={selectedConnection.bridgeVersion || ""} canReplay={!enforcementRequired || canAccess(snapshot, 'bank.prepare')} />}
       {canManage && selectedConnection && !pairNewPc && (
         <Button className="mb-4 w-fit" variant="outline" disabled={creating} onClick={() => {
           setSetupMode("same_machine");

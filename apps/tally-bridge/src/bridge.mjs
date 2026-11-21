@@ -4609,7 +4609,7 @@ async function fetchBankReconciliationVouchers(
     companyName, fetchFields: fields, timeoutMs: BANK_MATCH_READ_TIMEOUT_MS, maxResponseBytes: BANK_MATCH_MAX_XML_BYTES };
   const sameDateVouchers = [];
   const crossDateVouchers = [];
-  const metrics = { requests: 0, retries: 0, cacheHits: 0, detailBatches: 0 };
+  const metrics = { requests: 0, retries: 0, oversizedResponses: 0, cacheHits: 0, detailBatches: 0 };
   const dayMs = 86_400_000;
   const iso = time => new Date(time).toISOString().slice(0, 10);
   const cache = dependencies.bankCache;
@@ -4620,7 +4620,12 @@ async function fetchBankReconciliationVouchers(
   async function read(options) {
     checkReadBudget(cashDiscountReadContext.getStore());
     metrics.requests++;
-    const xml = await exportCollection(tallyUrl, options);
+    let xml;
+    try { xml = await exportCollection(tallyUrl, options); }
+    catch (error) {
+      if (/size limit|safe response size/i.test(error.message)) metrics.oversizedResponses++;
+      throw error;
+    }
     checkReadBudget(cashDiscountReadContext.getStore());
     if (!isCompleteVoucherEnvelope(xml) || /<LINEERROR\b/i.test(xml)) throw new Error("Incomplete Tally voucher collection.");
     // Tally also emits a numeric HEADER/DESC/CMPINFO/VOUCHER statistic.
@@ -8370,6 +8375,7 @@ export function startCashDiscountLiveChannel(config, executeExclusive, options =
   const pendingPurchaseReads = new Map();
   let readInFlight = false;
   let readRecoveryUntil = 0;
+  let lastLiveFailure = null;
 
   const log = (level, message) => emitLog(options, level, message);
   const send = (payload) => {
@@ -8460,6 +8466,19 @@ export function startCashDiscountLiveChannel(config, executeExclusive, options =
       const runOperation = isRead || operation === 'test_purchase_document_folder' ? (task) => task() : executeExclusive;
       const data = await runOperation(async () => {
         markConnectorBenchmarkStage(benchmark, "queueWaitMs", performance.now() - startedAt);
+        if (operation === "connector_update" || operation === "connector_diagnostics") {
+          const authority = message.agentIdentity;
+          if (!authority?.installationId || authority.installationId !== (config.installationId || config.bridgeMachineId) ||
+              authority.sessionGeneration !== config.sessionGeneration) throw new Error("Connector pairing changed.");
+          if (operation === "connector_update") {
+            if (!options.requestPublishedUpdate) throw new Error("Run the installed Windows connector to update this PC.");
+            return options.requestPublishedUpdate();
+          }
+          const start = performance.now();
+          const status = await testTally(config.tallyUrl);
+          return { version: BRIDGE_VERSION, reachable: status.tallyReachable, company: status.companyName || null,
+            responseMs: Math.round(performance.now() - start), error: status.error || null, lastLiveFailure };
+        }
         if (operation === 'test_purchase_document_folder') {
           return testPurchaseDocumentFolder(message.payload?.folderPath);
         }
@@ -8618,6 +8637,11 @@ export function startCashDiscountLiveChannel(config, executeExclusive, options =
         if (operation === "verify_bank_transaction") {
           const payload = { ...message.payload, tallyUrl: config.tallyUrl, companyName: message.payload?.companyName || message.companyName };
           if (!isSameTallyText(message.companyName, payload.companyName)) throw new Error("Bank matching company does not match the connector request.");
+          if (message.payload?.supportReplay) {
+            const identity = config.__agentRuntime?.activeIdentity;
+            if (!identity || identity.companyGuid !== message.agentIdentity?.companyGuid ||
+                !isSameTallyText(identity.companyName, message.companyName)) throw new Error("Select the active statement company on this PC.");
+          }
           const reported = new Set();
           const outcome = await cashDiscountReadContext.run({ signal: controller.signal, deadlineAt, benchmark, schedule: executeExclusive },
             () => reconcileBankTransactionsInTally(config, payload, {
@@ -8830,6 +8854,8 @@ export function startCashDiscountLiveChannel(config, executeExclusive, options =
         : data;
       sendOperationResult({ type: "operation_result", success: true, companyName: message.companyName, data: responseData });
     } catch (error) {
+      if (operation !== "connector_diagnostics") lastLiveFailure = { operation, at: new Date().toISOString(),
+        error: String(error?.message || "Request failed").slice(0, 240) };
       if (!benchmarkFinished) {
         if (isRead && shouldPauseAfterReadFailure(controller.signal)) readRecoveryUntil = Date.now() + 30_000;
         if (isRead) log(shouldPauseAfterReadFailure(controller.signal) ? "warn" : "info",
@@ -8942,12 +8968,14 @@ export function startCashDiscountLiveChannel(config, executeExclusive, options =
     }
   }, keepaliveMs);
   keepaliveTimer.unref?.();
-  return () => {
+  const stopChannel = () => {
     stopped = true;
     if (reconnectTimer) clearTimeout(reconnectTimer);
     clearInterval(keepaliveTimer);
     socket?.close();
   };
+  stopChannel.hasActiveReads = () => activeReads.size > 0;
+  return stopChannel;
 }
 
 async function fetchCommandRealtimeConfig(config) {
@@ -9324,7 +9352,7 @@ function createBridgeRunner(options = {}) {
       return stopped;
     },
     get busy() {
-      return scheduler.busy;
+      return scheduler.busy || Boolean(stopCashDiscountLiveChannel?.hasActiveReads?.());
     },
     async start() {
       await agentRuntime.start();

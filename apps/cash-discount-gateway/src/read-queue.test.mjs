@@ -16,12 +16,12 @@ function next(socket, predicate) {
   });
 }
 
-async function setup(t) {
+async function setup(t, managed = false) {
   const server = createServer(async (req, res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString() || '{}');
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({authenticated:true, ownerUserId:'owner', connectionId:body.connectionId}));
+    res.end(JSON.stringify({authenticated:true, ownerUserId:'owner', connectionId:body.connectionId, ...(managed ? {teamAccess:true,installationId:body.connectionId,sessionGeneration:1} : {})}));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -35,7 +35,7 @@ async function setup(t) {
     const socket = new WebSocket(base.replace('http', 'ws')+'/live');
     await new Promise((resolve,reject) => { socket.once('open',resolve);socket.once('error',reject); });
     const authenticated = next(socket, message => message.type === 'authenticated');
-    socket.send(JSON.stringify({type:'authenticate',role,connectionId,token:role+'-token',bridgeVersion:'1.2.36'}));
+    socket.send(JSON.stringify({type:'authenticate',role,connectionId,token:role+'-token',bridgeVersion:managed?'1.2.47':'1.2.36'}));
     await authenticated;
     return socket;
   }
@@ -99,4 +99,28 @@ test('bank preview only forwards requested row IDs and bounded read diagnostics'
   h.connector.send(JSON.stringify({type:'bank_read_diagnostic',requestId,detail}));
   assert.equal((await progress).message, detail);
   h.complete(requestId);
+});
+
+test('remote support targets only the selected paired installation and returns its result', async t => {
+  const h = await setup(t,true);
+  const other = await h.open('connector','other-pc');
+  other.on('message',raw=>assert.notEqual(JSON.parse(raw).type,'operation'));
+  for (const operation of ['connector_update','connector_diagnostics']) {
+    const forwarded = next(h.connector,m=>m.type==='operation' && m.requestId===operation);
+    h.request(operation,operation);
+    const job = await forwarded;
+    assert.equal(job.operation,operation);
+    assert.equal(job.agentIdentity.installationId,'connection');
+    const result = next(h.browser,m=>m.type==='result' && m.requestId===operation);
+    h.complete(operation);
+    assert.equal((await result).success,true);
+  }
+});
+
+test('legacy sessions cannot send remote maintenance requests', async t => {
+  const h = await setup(t);
+  const result = next(h.browser,m=>m.type==='result' && m.requestId==='update');
+  h.request('update','connector_update');
+  assert.equal((await result).success,false);
+  assert.equal(h.operations.length,0);
 });

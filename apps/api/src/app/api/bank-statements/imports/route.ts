@@ -86,8 +86,12 @@ function getEffectiveImportStatus(row: Record<string, unknown>) {
 }
 
 function serializeImport(row: Record<string, unknown>) {
+  const context = readRecord(readRecord(row.processing_meta).selectedContext);
   return {
     id: String(row.id),
+    connectionId: context.connectionId ?? null,
+    companyName: context.companyName ?? null,
+    financialYear: context.financialYear ?? null,
     bankAccountId: row.bank_account_id ? String(row.bank_account_id) : null,
     originalFileName: String(row.original_file_name ?? ""),
     status: getEffectiveImportStatus(row),
@@ -149,11 +153,13 @@ async function GETHandler(request: Request) {
 
     const accessPredicate=await listAccessPredicate(request,user.id,"bank.view");
     const supabase = createSupabaseAdminClient();
-    const { data, error } = await supabase
+    let query = supabase
       .from("bank_statement_imports")
       .select("*")
-      .or(accessPredicate)
-      .order("created_at", { ascending: false })
+      .or(accessPredicate);
+    const pc = new URL(request.url).searchParams.get('connectionId');
+    if (pc) query = query.eq('processing_meta->selectedContext->>connectionId', pc);
+    const { data, error } = await query.order("created_at", { ascending: false })
       .limit(20);
 
     if (error) throw error;
