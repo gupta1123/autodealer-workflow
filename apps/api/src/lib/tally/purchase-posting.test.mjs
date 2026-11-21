@@ -39,10 +39,11 @@ async function loadPurchasePostingModule() {
       'from "@autodealer/shared/lib/purchase-voucher"',
       `from "${sharedCalculatorUrl}"`
     );
-  return import(dataUrl(transpile(postingSource)));
+  return { ...await import(dataUrl(transpile(postingSource))), ...await import(lineItemsUrl) };
 }
 
 const {
+  normalizeExtractedCommercialLineItems,
   compactPurchasePostingReview,
   preparePurchasePosting,
   getCanonicalInvoiceDocuments,
@@ -145,7 +146,7 @@ function invoiceDocument({
 
 function prepare(document, options = {}) {
   const base = preparePurchasePosting({
-    documents: [document],
+    documents: [document, ...(options.supportingDocuments ?? [])],
     masters: options.masters ?? completeMasters,
     mappings: options.mappings ?? [],
     savedReview: Object.prototype.hasOwnProperty.call(options, "savedReview")
@@ -339,17 +340,48 @@ test("printed G02 godown is matched from live Tally and reaches the voucher payl
   assert.equal(result.blockers.some((blocker) => blocker.code === "GODOWN_REQUIRED"), false);
 });
 
-test("printed G02 godown auto-selects when the live godown catalogue is temporarily empty", () => {
-  const document = invoiceDocument();
-  document.extracted_fields.termsAndConditions =
-    "PAYMENT TERMS: 30 days; STORAGE / DELIVERY LOCATION: Main Location; COMMERCIAL CLASSIFICATION: Local purchase";
+test("an unverified packet godown never reaches the selection or voucher", () => {
+  const doc = invoiceDocument();
+  doc.extracted_fields.godownName = "BAJAJ NAGAR";
+  for (const masters of [completeMasters, [...completeMasters, master("godown", "Factory")]]) {
+    const result = prepare(doc, { masters, savedReview: { lines: [{lineId: "invoice-1:1", godownName: "BAJAJ NAGAR"}] } });
+    assert.equal(result.source.godownName, "BAJAJ NAGAR");
+    assert.equal(result.review.lines[0].godownName, "");
+    assert.equal(result.tallyPayload.items[0].godownName, "");
+    assert.ok(result.blockers.some(issue => issue.code === "GODOWN_REQUIRED"));
+  }
+  delete doc.extracted_fields.godownName;
+  doc.markdown = "Delivery destination: BAJAJ NAGAR";
+  assert.equal(prepare(doc).source.godownName, "");
+});
 
-  const result = prepare(document);
+test("PSP/26-27/5731 reconstructed rows produce one voucher item even from a previously saved extraction", () => {
+  const goods = {lineNumber: "1", description: "Scrap", hsnSac: "72044900", quantity: "15.330", unit: "MT", rate: "40000", taxableAmount: "613200", sourcePage: 1};
+  const footer = {description: "Sub-Total", quantity: "15.330", unit: "MT", taxableAmount: "613200"};
+  const doc = invoiceDocument({lines: [goods, {...goods}, footer]});
+  Object.assign(doc.extracted_fields, {invoiceNumber: "PSP/26-27/5731", totalTaxableAmount: "613200"});
+  const stored = doc.extracted_fields.__lineItems;
+  const normalized = normalizeExtractedCommercialLineItems({
+    docType: doc.document_type, lineItems: stored, documentFields: doc.extracted_fields,
+  });
+  assert.equal(normalized.length, 1);
+  for (const rows of [stored, normalized]) {
+    doc.extracted_fields.__lineItems = rows;
+    const result = prepare(doc);
+    assert.equal(result.review.lines.length, 1);
+    assert.equal(result.tallyPayload.items.length, 1);
+    const [item] = result.tallyPayload.items;
+    assert.deepEqual([Number(item.quantity), Number(item.rate), Number(item.taxableAmount)], [15.33, 40000, 613200]);
+  }
+});
 
-  assert.equal(result.source.godownName, "Main Location");
-  assert.equal(result.review.lines[0].godownName, "Main Location");
-  assert.equal(result.tallyPayload.items[0].godownName, "Main Location");
-  assert.equal(result.blockers.some((blocker) => blocker.code === "GODOWN_REQUIRED"), false);
+test("an exact company stock description wins over a generic scrap default", () => {
+  const doc = invoiceDocument();
+  doc.extracted_fields.__lineItems[0].description = "Rejected Pipe & Open Pipe";
+  const name = "Rejected Pipe & Open Pipe";
+  const result = prepare(doc, {masters: [...completeMasters, master("stock_item", name, {hsn_code: "72044900", unit_name: "MT"})]});
+  assert.equal(result.review.lines[0].stockItemName, name);
+  assert.equal(result.tallyPayload.items[0].stockItemName, name);
 });
 
 test("reviewer can disable all applicable GST TDS deductions for a voucher", () => {
@@ -937,6 +969,7 @@ test("mother bills are identified and the one invoice billed to the active compa
     buyerName: "Configured Buyer",
     buyerGstin: maharashtraBuyerGstin,
   };
+  mother.extracted_fields.godownName = "BAJAJ NAGAR";
   const candidates = getPurchaseInvoiceCandidates([mother, downstream], maharashtraBuyerGstin);
   assert.equal(candidates.find((candidate) => candidate.documentId === "mother").role, "mother_bill");
   assert.equal(candidates.find((candidate) => candidate.documentId === "downstream").recommended, true);
@@ -961,6 +994,7 @@ test("mother bills are identified and the one invoice billed to the active compa
   });
   assert.equal(result.canonicalInvoiceCount, 2);
   assert.equal(result.source.documentId, "downstream");
+  assert.equal(result.source.godownName, "");
   assert.equal(result.review.selectedInvoiceDocumentId, "downstream");
   assert.ok(!result.blockers.some((blocker) => blocker.code === "MULTIPLE_INVOICES"));
 });
@@ -1553,9 +1587,14 @@ test("the case's e-way bill page is read for the voucher and only sent when vali
   });
 
   const result = run({ sourceReferenceApproved: true });
+  const bill = result.review.ewayBill;
   assert.deepEqual(
-    { ...result.review.ewayBill, fromAddress: undefined },
-    { record: true, number: "262264097358", date: "2026-08-12", fromAddress: undefined, fromPlace: "NAGPUR", fromPincode: "440016",
+    bill,
+    { record: true, fromName: invoice.extracted_fields.vendorName, fromGstin: supplierGstin, fromRegisteredState: "Maharashtra",
+      toName: invoice.extracted_fields.buyerName, toGstin: maharashtraBuyerGstin, toRegisteredState: "Maharashtra",
+      transporterId: "", transportDocumentDate: "", subType: "", transporterName: "", transportDocumentNumber: "",
+      toAddress: eway.extracted_fields.shipTo, number: "262264097358", date: "2026-08-12",
+      fromAddress: eway.extracted_fields.dispatchFrom, fromPlace: "NAGPUR", fromPincode: "440016",
       fromState: "Maharashtra", toPlace: "JALNA", toPincode: "431203", toState: "Maharashtra", transportMode: "1 - Road",
       vehicleNumber: "MH21X7266", distanceKm: "437" }
   );
@@ -1563,7 +1602,7 @@ test("the case's e-way bill page is read for the voucher and only sent when vali
 
   const invalid = run({ sourceReferenceApproved: true, ewayBill: { number: "12345" } });
   assert.equal(invalid.tallyPayload.ewayBill, undefined);
-  assert.ok(invalid.warnings.some((warning) => warning.code === "EWAY_BILL_NUMBER_INVALID"));
+  assert.ok(invalid.blockers.some((issue) => issue.code === "EWAY_BILL_NUMBER_INVALID"));
 
   const off = run({ sourceReferenceApproved: true, ewayBill: { record: false } });
   assert.equal(off.tallyPayload.ewayBill, undefined);
@@ -1782,4 +1821,58 @@ test("a converted quantity that exceeds the Tally unit's decimals is stopped", (
   const precision = result.blockers.find((row) => row.code === "LINE_PRECISION_UNSUPPORTED");
   assert.ok(precision);
   assert.match(precision.message, /25\.3205 MTS/);
+});
+
+test("two unnumbered identical rows require correction when only one fits the printed subtotal", () => {
+  const doc = invoiceDocument();
+  const row = doc.extracted_fields.__lineItems[0];
+  doc.extracted_fields.__lineItems = [row, {...row}];
+  assert.ok(prepare(doc).blockers.some(issue => issue.code === "POSSIBLE_DUPLICATE_LINE"));
+  doc.extracted_fields.totalTaxableAmount = "2000";
+  const result = prepare(doc);
+  assert.equal(result.review.lines.length, 2);
+  assert.ok(!result.blockers.some(issue => issue.code === "POSSIBLE_DUPLICATE_LINE"));
+});
+
+test("PSP/26-27/5874 invoice alone keeps the reference through review, confirmation and connector XML", async () => {
+  const { buildPurchaseVoucherXml } = await import("../../../../tally-bridge/src/bridge.mjs");
+  const invoice = invoiceDocument();
+  Object.assign(invoice.extracted_fields, {invoiceNumber: "PSP/26-27/5874", documentDate: "20-Nov-26", eWayBillNumber: "272333189336", vehicleNumber: "MH21X3629"});
+  invoice.markdown = "## Visible Text\nE-Way : 272333189336\nACK Date : 20-Nov-26\nName & Address of Consignee (Shipped to)\nKalika Steel Alloys Pvt Ltd\nPhase1, Additional MIDC, JALNA\nJALNA\nMaharashtra, Code : 27\nMode of transport BY ROAD";
+  const pending = prepare(invoice);
+  assert.equal(pending.review.ewayBill.number, "272333189336");
+  assert.equal(pending.review.ewayBill.date, "");
+  assert.equal(pending.review.ewayBill.toPlace, "JALNA");
+  assert.equal(pending.review.ewayBill.transportMode, "1 - Road");
+  assert.ok(pending.blockers.some(issue => issue.code === "EWAY_BILL_DATE_INVALID"));
+  assert.equal(pending.tallyPayload.ewayBill, undefined);
+  const confirmed = prepare(invoice, {savedReview: {ewayBill: {date: "2026-11-19"}}});
+  const xml = buildPurchaseVoucherXml(confirmed.tallyPayload, "Test Company");
+  assert.match(xml, /<BILLNUMBER>272333189336<.BILLNUMBER>/);
+  assert.match(xml, /<BILLDATE>20261119<.BILLDATE>/);
+  assert.match(xml, /<CONSIGNEEPLACE>JALNA<.CONSIGNEEPLACE>/);
+  assert.match(xml, /<VEHICLENUMBER>MH21X3629<.VEHICLENUMBER>/);
+  assert.doesNotMatch(xml, /<SUBTYPE>|<DISTANCE>/);
+  const off = prepare(invoice, {savedReview: {ewayBill: {record: false}}});
+  assert.equal(off.tallyPayload.ewayBill, undefined);
+  assert.ok(!off.blockers.some(issue => issue.code.startsWith("EWAY_BILL_")));
+});
+
+test("only a linked bill and matching receipt can contribute transport details", () => {
+  const invoice = invoiceDocument();
+  Object.assign(invoice.extracted_fields, {eWayBillNumber: "262331678776", vehicleNumber: "MH46F6195"});
+  invoice.markdown = "E-way bill date: 18-Nov-26";
+  const unrelated = {id:"other",document_type:"E-Way Bill",extracted_fields:{referenceInvoiceNumber:"UPSTREAM",documentDate:"11/11/26",eWayBillNumber:"123456789012"}};
+  const lr = {id:"lr",document_type:"Lorry Receipt",extracted_fields:{vehicleNumber:"MH18BG6195",transporterName:"Highway Roadlines",lorryReceiptNumber:"01833"}};
+  const run = () => prepare(invoice, {supportingDocuments:[unrelated,lr]});
+  const conflict = run();
+  assert.equal(conflict.review.ewayBill.transporterName, "");
+  assert.equal(conflict.review.ewayBill.date, "2026-11-18");
+  assert.equal(conflict.review.ewayBill.number, "262331678776");
+  assert.ok(conflict.warnings.some(w => w.code === "EWAY_RECEIPT_VEHICLE_CONFLICT"));
+  lr.extracted_fields.vehicleNumber = "MH46F6195";
+  const match = run().tallyPayload.ewayBill;
+  assert.equal(match.transporterName, "Highway Roadlines");
+  assert.equal(match.transportDocumentNumber, "01833");
+  assert.equal(match.transportMode, "1 - Road");
 });

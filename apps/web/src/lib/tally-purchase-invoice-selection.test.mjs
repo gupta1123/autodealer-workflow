@@ -51,3 +51,14 @@ test('choosing an invoice rebuilds stock and supplier candidates omitted before 
   assert.equal(selected.compactResult.masters.stockItems[0].name,'M S Scrap & Sponge Iron');
   assert(selected.compactResult.masters.ledgers.some(row=>row.name==='Aglow Impex Inc'));
 });
+
+test('a pipe invoice retains its configured scrap candidate despite the twelve-item ranking limit',async()=>{
+  const api=await client(()=>{throw Error('Unexpected network call');});
+  const stockItems=Array.from({length:20},(_,i)=>({name:`Rejected Pipe grade ${i}`,unitName:'MT'}));
+  const target='M S Scrap & Sponge Iron';
+  stockItems.push({name:target,unitName:'MTS'});
+  const invoice={description:'Rejected Pipe & Open Pipe',hsn:'72044900',unit:'MT',stockItemName:''};
+  const data={source:'live_tally',masters:{stockItems}};
+  const {compactResult}=api.prepareLiveTallyCatalogue(data,{lines:[invoice]},[{stockItemName:target}]);
+  assert(compactResult.masters.stockItems.some(row=>row.name===target));
+});

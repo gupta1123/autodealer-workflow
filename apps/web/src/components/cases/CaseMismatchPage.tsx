@@ -1347,6 +1347,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                           >
                             <input
                               aria-label={`Allow ${item.label} and continue`}
+                              disabled={item.code.startsWith("EWAY_BILL_")}
                               checked={allowedTallyBlockerKeys.has(item.overrideKey)}
                               className="mt-0.5 h-3.5 w-3.5 shrink-0 rounded border-rose-300 accent-rose-700"
                               onChange={() => toggleTallyBlockerOverride(item.overrideKey)}
@@ -1362,7 +1363,7 @@ export function CaseMismatchPage({ caseId }: { caseId: string }) {
                                 <span className="min-w-0">
                                   <strong className="block text-[11px] font-semibold leading-4 text-rose-800">{item.label}</strong>
                                   <span className="mt-0.5 block text-[10px] leading-4 text-[#8f5a58]">
-                                    {allowedTallyBlockerKeys.has(item.overrideKey) ? "Allowed for this posting" : "Check to allow anyway"}
+                                    {item.code.startsWith("EWAY_BILL_") ? "Review e-way bill details" : allowedTallyBlockerKeys.has(item.overrideKey) ? "Allowed for this posting" : "Check to allow anyway"}
                                   </span>
                                 </span>
                               </span>

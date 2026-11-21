@@ -1282,6 +1282,14 @@ test("purchase vouchers record the supplier e-way bill as reference, like the cl
   assert.match(xml, /<CONSIGNEEADDRESS>C-7 &amp; 8, Addl\. M\.I\.D\.C\. Area, Jalna<\/CONSIGNEEADDRESS>/);
   assert.match(xml, /<CONSIGNORPLACE>NAGPUR<\/CONSIGNORPLACE><CONSIGNORPINCODE>440016<\/CONSIGNORPINCODE><CONSIGNEEPLACE>JALNA<\/CONSIGNEEPLACE>/);
   assert.match(xml, /<TRANSPORTDETAILS\.LIST><TRANSPORTMODE>1 - Road<\/TRANSPORTMODE><VEHICLENUMBER>MH21X7266<\/VEHICLENUMBER><DISTANCE> 437<\/DISTANCE><\/TRANSPORTDETAILS\.LIST>/);
+  const expected = {...payload.ewayBill, transporterName: "A & B", transportDocumentNumber: "01833"};
+  const reviewed = buildPurchaseVoucherXml({...payload, ewayBill: {...expected, toAddress: "Dock B", toPlace: "Factory", toPincode: ""}}, payload.companyName);
+  assert.match(reviewed, /<CONSIGNEEADDRESS>Dock B<.CONSIGNEEADDRESS>/);
+  assert.doesNotMatch(reviewed, /<CONSIGNEEPINCODE>/);
+  assert.match(reviewed, /<TRANSPORTERNAME>A &amp; B<.TRANSPORTERNAME>/);
+  const verify = voucher => purchaseVoucherReadbackComparison(voucher, {...payload, ewayBill: expected}).filter(message => message.includes("e-way bill"));
+  assert.deepEqual(verify({}), ["Supplier e-way bill number was not returned by Tally."]);
+  assert.deepEqual(verify({ewayBills: [{number: expected.number, date: "20260812", transport: [expected]}]}), []);
   // No e-way bill, or an invalid number: the voucher is exactly as before.
   assert.doesNotMatch(buildPurchaseVoucherXml({ ...payload, ewayBill: undefined }, payload.companyName), /EWAYBILL/);
   assert.doesNotMatch(buildPurchaseVoucherXml({ ...payload, ewayBill: { ...payload.ewayBill, number: "12345" } }, payload.companyName), /EWAYBILL/);

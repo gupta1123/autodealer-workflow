@@ -1,4 +1,4 @@
-import { readStoredLineItems } from "@/lib/line-items";
+import { invoiceArtefactIndices, readStoredLineItems } from "@/lib/line-items";
 import { extractInvoiceCommercialFieldsFromText } from "@/lib/invoice-commercial-fields";
 import type {
   PurchaseAccountingSettings,
@@ -8,6 +8,7 @@ import type {
 import type { CommercialLineItem } from "@/types/pipeline";
 import {
   calculatePurchaseVoucher,
+  GST_STATE_NAMES,
   purchaseRateBasisPoints,
   PURCHASE_CALCULATION_VERSION,
 } from "@autodealer/shared/lib/purchase-voucher";
@@ -140,8 +141,18 @@ export type PurchaseEwayBill = {
   fromPlace: string;
   fromPincode: string;
   fromState: string;
-  // Fallbacks from the e-way bill's Ship To; the connector prefers the
-  // company's own address and PIN from Tally.
+  fromName?: string;
+  fromGstin?: string;
+  fromRegisteredState?: string;
+  toName?: string;
+  toGstin?: string;
+  toRegisteredState?: string;
+  transporterId?: string;
+  transportDocumentDate?: string;
+  subType?: string;
+  toAddress?: string;
+  transporterName?: string;
+  transportDocumentNumber?: string;
   toPlace: string;
   toPincode: string;
   toState: string;
@@ -919,9 +930,12 @@ function packetInventoryText(
     ? ["godownName", "godown", "warehouseName", "warehouse", "storageLocation"]
     : ["batchName", "batchNumber", "batchNo", "lotNumber"];
   const label = kind === "godown"
-    ? "(?:godown|warehouse|storage(?:\\s*\\/\\s*delivery)?\\s+location|delivery\\s+destination)"
+    ? "(?:godown|warehouse|storage(?:\\s*\\/\\s*delivery)?\\s+location)"
     : "(?:batch(?:\\s+(?:name|number|no\\.?))?|lot(?:\\s+(?:number|no\\.?))?)";
+  const identity = invoiceIdentity(invoice);
+  const multipleInvoices = documents.some(doc => /invoice/i.test(doc.document_type) && invoiceIdentity(doc) !== identity);
   const candidates = documents.flatMap((document) => {
+    if (multipleInvoices && invoiceIdentity(document) !== identity) return [];
     const fields = fieldsOf(document);
     for (const fieldName of fieldNames) {
       const value = usableValue(fields[fieldName]);
@@ -1033,8 +1047,10 @@ function buildSource(
     item,
     line: sourceLine(lineSource.id, item, index),
   }));
-  const freightRows = itemRows.filter(({ item, line }) => isFreightChargeRow(item, line));
-  const lines = itemRows.filter((row) => !freightRows.includes(row)).map(({ line }) => line);
+  const artefacts = invoiceArtefactIndices(itemRows.map(row => row.item), fields.totalTaxableAmount || fields.subtotal);
+  const goodsAndCharges = itemRows.filter((_, index) => !artefacts.has(index));
+  const freightRows = goodsAndCharges.filter(({ item, line }) => isFreightChargeRow(item, line));
+  const lines = goodsAndCharges.filter((row) => !freightRows.includes(row)).map(({ line }) => line);
   const freightFromRows = sum(freightRows.map(({ line }) => moneyPaise(line.taxableAmount)));
   const printedFreight = text(fields.freightAmount) || commercialFields.freightAmount;
   return {
@@ -1085,7 +1101,7 @@ function buildSource(
     invoiceRoundOffAmount: invoiceRoundOffAmount(fields, commercialFields, lines),
     godownName: packetInventoryText(document, documents, "godown"),
     batchName: packetInventoryText(document, documents, "batch"),
-    ewayBill: packetEwayBill(fields, documents),
+    ewayBill: packetEwayBill(document, documents),
     lines,
   };
 }
@@ -1116,42 +1132,85 @@ function splitEwayAddress(address: string) {
 
 function emptyEwayBill(): PurchaseEwayBill {
   return { record: false, number: "", date: "", fromAddress: "", fromPlace: "", fromPincode: "", fromState: "",
-    toPlace: "", toPincode: "", toState: "", transportMode: "1 - Road", vehicleNumber: "", distanceKm: "" };
+    toPlace: "", toPincode: "", toState: "", transportMode: "", vehicleNumber: "", distanceKm: "" };
 }
 
-// The supplier's e-way bill page for this invoice: its number, date, dispatch
-// place and transport details, recorded on the purchase voucher as reference.
-function packetEwayBill(invoiceFields: Record<string, unknown>, documents: PurchasePostingDocumentInput[]): PurchaseEwayBill | null {
-  const invoiceNumber = normalizeKey(invoiceFields.invoiceNumber || invoiceFields.referenceInvoiceNumber);
-  const candidates = documents.filter((document) => /e-?way\s*bill/i.test(document.document_type));
-  const document = candidates.find((candidate) =>
-    invoiceNumber && normalizeKey(fieldsOf(candidate).referenceInvoiceNumber) === invoiceNumber
-  ) ?? (candidates.length === 1 ? candidates[0] : null);
-  if (!document) return null;
-  const fields = fieldsOf(document);
-  const pageText = text(document.markdown);
-  const number = text(fields.eWayBillNumber || fields.ewayBillNumber).replace(/\D/g, "") ||
-    (pageText.match(/e-?way\s*bill\s*no\.?\s*:?\s*([\d ]{12,16})/i)?.[1] ?? "").replace(/\D/g, "");
+function printedEwayNumber(doc: PurchasePostingDocumentInput) {
+  const fields = fieldsOf(doc);
+  const printed = text(doc.markdown).match(/\be[- ]?way(?:\s+bill)?\s*(?:no\.?|number)?[ *:.-]*(\d{4}[ ]?\d{4}[ ]?\d{4})(?!\d)/i)?.[1];
+  const numbers = [fields.eWayBillNumber, fields.ewayBillNumber, printed].map(value => text(value).replace(/\s/g, ""));
+  return numbers.find(value => /^\d{12}$/.test(value)) || numbers.find(Boolean) || "";
+}
+
+function packetEwayBill(invoice: PurchasePostingDocumentInput, documents: PurchasePostingDocumentInput[]): PurchaseEwayBill | null {
+  const inv = fieldsOf(invoice);
+  const ref = normalizeKey(inv.invoiceNumber || inv.referenceInvoiceNumber);
+  const invNumber = printedEwayNumber(invoice);
+  const candidates = documents.filter(doc => /e[- ]?way\s*bill/i.test(doc.document_type));
+  const matches = candidates.filter(doc => {
+    const other = fieldsOf(doc);
+    const reference = normalizeKey(other.referenceInvoiceNumber);
+    const number = printedEwayNumber(doc);
+    if (reference && reference !== ref) return false;
+    if (other.supplierGstin && inv.supplierGstin && normalizeGstin(other.supplierGstin) !== normalizeGstin(inv.supplierGstin)) return false;
+    if (other.buyerGstin && inv.buyerGstin && normalizeGstin(other.buyerGstin) !== normalizeGstin(inv.buyerGstin)) return false;
+    return Boolean((ref && reference === ref) || (invNumber && number === invNumber));
+  });
+  const bill = matches.find(doc => invNumber && printedEwayNumber(doc) === invNumber) ?? (matches.length === 1 ? matches[0] : undefined);
+  const fields = bill ? fieldsOf(bill) : {};
+  const number = (bill && printedEwayNumber(bill)) || invNumber;
   if (!number) return null;
-  const from = splitEwayAddress(text(fields.dispatchFrom));
-  const to = splitEwayAddress(text(fields.shipTo));
-  const distance = pageText.match(/approx\.?\s*distance\s*:?\s*(\d{1,4})\s*km/i)?.[1] ?? "";
-  const mode = pageText.match(/\bmode\s*:?\s*(road|rail|air|ship)\b/i)?.[1]?.toLowerCase() ?? "road";
-  const modeCode = { road: "1 - Road", rail: "2 - Rail", air: "3 - Air", ship: "4 - Ship" }[mode] ?? "1 - Road";
+  const invoiceText = String(invoice.markdown ?? "").split("## Visible Text").pop() ?? "";
+  const pageText = bill ? text(bill.markdown) : "";
+  const vehicle = text(fields.vehicleNumber || inv.vehicleNumber).replace(/[^a-z0-9]/gi, "").toUpperCase();
+  const sameVehicleOnOtherInvoice = documents.some(doc =>
+    /invoice/i.test(doc.document_type) && invoiceIdentity(doc) !== invoiceIdentity(invoice) &&
+    normalizeKey(fieldsOf(doc).vehicleNumber) === normalizeKey(vehicle));
+  const receipts = documents.filter(doc => {
+    if (!/lorry receipt/i.test(doc.document_type) || !vehicle) return false;
+    const receipt = fieldsOf(doc);
+    return normalizeKey(receipt.vehicleNumber) === normalizeKey(vehicle) &&
+      (receipt.referenceInvoiceNumber ? normalizeKey(receipt.referenceInvoiceNumber) === ref : !sameVehicleOnOtherInvoice);
+  });
+  const receipt = receipts.length === 1 ? fieldsOf(receipts[0]) : {};
+  const fromAddress = text(fields.dispatchFrom || inv.dispatchFrom);
+  // Read only the labelled shipping block. OCR can interleave the invoice
+  // columns, so discard blocks containing invoice or payment table headers.
+  const shipBlock = invoiceText.match(/(?:consignee\s*\(ship to\)|name & address of consignee\s*\(shipped to\))[^\S\n]*\n([^\n]+)\n([\s\S]{4,240}?)(?=\n(?:GSTIN|State Name|Maharashtra, Code|Buyer\s*\(|Place of Supply))/i);
+  const printedAddress = shipBlock && !/invoice no|dispatch doc|delivery note|order no|dated|payment|GSTIN/i.test(shipBlock[1] + shipBlock[2]) ? shipBlock[2].trim() : "";
+  const rawTo = String(fields.shipTo || inv.shipTo || printedAddress);
+  const toAddress = text(rawTo);
+  const from = splitEwayAddress(fromAddress);
+  const to = splitEwayAddress(rawTo.replace(/\n+/g, ", "));
+  const dateLabel = /\b(?:e[- ]?way\s*bill|ewb)\s*(?:generation\s*)?date\b[ *:.\t-]*(\d{1,4}[-/. ](?:[a-z]{3,9}|\d{1,2})[-/. ,]+\d{2,4})/i;
+  const dates = [fields.eWayBillDate, fields.documentDate];
+  if (!invNumber || number === invNumber) dates.push(inv.eWayBillDate, inv.ewayBillDate, invoiceText.match(dateLabel)?.[1]);
+  const date = dates.map(parseDate).find(isValidIsoDate) ?? "";
+  const modePattern = /\b(?:mode(?: of transport)?\s*[:\s]+|by\s+)(road|rail|air|ship)\b/i;
+  const mode = text(fields.transportMode || pageText.match(modePattern)?.[1] || inv.transportMode || invoiceText.match(modePattern)?.[1] || (receipts.length === 1 ? "road" : "")).toLowerCase();
+  const modes: Record<string,string> = { road: "1 - Road", rail: "2 - Rail", air: "3 - Air", ship: "4 - Ship" };
+  const fromGstin = normalizeGstin(fields.supplierGstin || inv.supplierGstin);
+  const printedConsigneeGstin = printedAddress && shipBlock && invoiceText
+    .slice((shipBlock.index ?? 0) + shipBlock[0].length)
+    .match(/^\s*GSTIN(?:\/UIN)?\s*:\s*(\d{2}[A-Z0-9]{13})\b/i)?.[1];
+  const toGstin = normalizeGstin(fields.buyerGstin || inv.shipToGstin || printedConsigneeGstin || inv.buyerGstin);
+  const receiptDate = parseDate(fields.transportDocumentDate || inv.transportDocumentDate || receipt.documentDate);
+  const invoiceDate = parseDate(inv.documentDate || inv.invoiceDate);
   return {
-    record: true,
-    number,
-    date: parseDate(text(fields.documentDate).split(/\s+/)[0]) || "",
-    fromAddress: text(fields.dispatchFrom),
-    fromPlace: from.place,
-    fromPincode: from.pincode,
-    fromState: from.state || stateInText(text(fields.dispatchFrom)),
-    toPlace: to.place,
-    toPincode: to.pincode,
-    toState: to.state || stateInText(text(fields.shipTo)),
-    transportMode: modeCode,
-    vehicleNumber: text(fields.vehicleNumber).replace(/\s+/g, "").toUpperCase(),
-    distanceKm: distance,
+    record: true, number, date, fromAddress, toAddress,
+    fromName: text(fields.vendorName || inv.vendorName), fromGstin,
+    fromRegisteredState: GST_STATE_NAMES[fromGstin.slice(0, 2)] || "",
+    toName: text(fields.buyerName || inv.shipToName || (printedAddress && shipBlock?.[1]) || inv.buyerName),
+    toGstin, toRegisteredState: GST_STATE_NAMES[toGstin.slice(0, 2)] || "",
+    subType: text(fields.subType || pageText.match(/\btype\s*:\s*(?:inward|outward)\s*-\s*(supply)\b/i)?.[1]),
+    transporterId: text(fields.transporterId || inv.transporterId || receipt.transporterId),
+    transportDocumentDate: isValidIsoDate(receiptDate) && (!isValidIsoDate(invoiceDate) || receiptDate >= invoiceDate) ? receiptDate : "",
+    fromPlace: from.place, fromPincode: from.pincode, fromState: from.state,
+    toPlace: to.place, toPincode: to.pincode, toState: to.state,
+    transportMode: modes[mode] ?? "", vehicleNumber: vehicle,
+    distanceKm: pageText.match(/approx\.?\s*distance\s*:?\s*(\d{1,4})\s*km/i)?.[1] ?? "",
+    transporterName: text(fields.transporterName || inv.transporterName || receipt.transporterName),
+    transportDocumentNumber: text(fields.transportDocumentNumber || inv.lorryReceiptNumber || receipt.lorryReceiptNumber),
   };
 }
 
@@ -1427,6 +1486,7 @@ function buildDefaultReview(
     const stockItem =
       exactMasterName(masters, prior?.stockItemName || "", ["stock_item"]) ||
       mappedItemHsnName(masters, mappings, prior?.hsn || line.hsn) ||
+      exactMasterName(masters, line.description, ["stock_item"]) ||
       exactMasterName(masters, material.suggestedStockItem, ["stock_item"]) ||
       (() => {
         const hsn = normalizeHsn(prior?.hsn || line.hsn);
@@ -1461,7 +1521,6 @@ function buildDefaultReview(
       godownName:
         exactMasterName(masters, prior?.godownName || "", ["godown"]) ||
         exactMasterName(masters, source.godownName, ["godown"]) ||
-        source.godownName ||
         mappedName(masters, mappings, "godown", "purchase", ["godown"]),
       batchName: prior?.batchName ?? source.batchName,
     };
@@ -2043,6 +2102,19 @@ export function preparePurchasePosting(params: {
   );
   review.selectedInvoiceDocumentId = invoice.id;
   warnings.push(...packetConsistencyWarnings(review, params.documents));
+  if (review.ewayBill?.record) {
+    const invoiceBillNumber = printedEwayNumber(invoice);
+    if (invoiceBillNumber && source.ewayBill?.number && invoiceBillNumber !== source.ewayBill.number) {
+      warnings.push({ ...issue("EWAY_NUMBER_CONFLICT", "Confirm e-way bill number",
+        `The invoice shows ${invoiceBillNumber}; the linked e-way bill shows ${source.ewayBill.number}. Confirm the reference before posting.`, "invoice"), requiresAcknowledgement: true });
+    }
+    const receipts = params.documents.filter(doc => /lorry receipt/i.test(doc.document_type));
+    if (receipts.length && review.ewayBill.vehicleNumber && receipts.every(doc => fieldsOf(doc).vehicleNumber &&
+      normalizeKey(fieldsOf(doc).vehicleNumber) !== normalizeKey(review.ewayBill?.vehicleNumber))) {
+      warnings.push({ ...issue("EWAY_RECEIPT_VEHICLE_CONFLICT", "Check the lorry receipt",
+        "The receipt vehicle differs from the e-way bill vehicle. Confirm the transport details.", "invoice"), requiresAcknowledgement: true });
+    }
+  }
   if (selectedCandidate.role === "mother_bill") {
     warnings.push(issue(
       "MOTHER_BILL_SELECTED",
@@ -2158,21 +2230,43 @@ export function preparePurchasePosting(params: {
       "invoice"
     ));
   }
-  // E-way bill details are reference data: problems only warn and the voucher
-  // is posted without them rather than blocked.
+  // Recording is optional, but an elected reference must reach the voucher.
   if (review.ewayBill?.record) {
     if (!/^\d{12}$/.test(review.ewayBill.number)) {
-      warnings.push(issue("EWAY_BILL_NUMBER_INVALID", "E-way bill number not recorded", "An e-way bill number has 12 digits. It will not be recorded in Tally until corrected.", "invoice"));
+      blockers.push(issue("EWAY_BILL_NUMBER_INVALID", "E-way bill number not recorded", "Confirm the 12-digit e-way bill number or turn off Record in Tally.", "invoice"));
     }
     if (!isValidIsoDate(review.ewayBill.date)) {
-      warnings.push(issue("EWAY_BILL_DATE_INVALID", "E-way bill date missing", "Enter the e-way bill date to record it in Tally.", "invoice"));
+      blockers.push(issue("EWAY_BILL_DATE_INVALID", "E-way bill date missing", "Enter the e-way bill date to record it in Tally.", "invoice"));
+    }
+    if (review.ewayBill.transportDocumentDate && !isValidIsoDate(review.ewayBill.transportDocumentDate)) {
+      blockers.push(issue("EWAY_BILL_TRANSPORT_DATE_INVALID", "Transport document date is invalid",
+        "Correct or clear the transport document date.", "invoice"));
     }
     if (review.ewayBill.distanceKm && !/^\d{1,4}$/.test(review.ewayBill.distanceKm)) {
-      warnings.push(issue("EWAY_BILL_DISTANCE_INVALID", "E-way bill distance is not a number", "Enter the distance in whole kilometres.", "invoice"));
+      blockers.push(issue("EWAY_BILL_DISTANCE_INVALID", "E-way bill distance is not a number", "Enter the distance in whole kilometres.", "invoice"));
     }
   }
   if (review.lines.length === 0) {
     blockers.push(issue("LINE_ITEMS_REQUIRED", "Invoice items required", "No invoice items were found. Add the item details before approval.", "invoice"));
+  }
+
+  const printedTaxable = moneyPaise(source.invoiceTaxableAmount);
+  const itemsTaxable = sum(review.lines.map(line => moneyPaise(line.taxableAmount)));
+  const excess = printedTaxable === null ? 0 : itemsTaxable - printedTaxable;
+  if (printedTaxable !== null && printedTaxable > 0 && excess > 0) {
+    const seen = new Set<string>();
+    for (const line of review.lines) {
+      if (moneyPaise(line.taxableAmount) !== excess) continue;
+      const key = JSON.stringify([normalizeKey(line.description), normalizeHsn(line.hsn),
+        quantityMillis(line.quantity), normalizeUnit(line.unit), moneyPaise(line.rate)]);
+      if (seen.has(key)) {
+        blockers.push(issue("POSSIBLE_DUPLICATE_LINE", "Verify repeated invoice rows",
+          "Two matching item rows exceed the printed taxable subtotal by exactly one row. Check the original invoice and correct the extraction before posting.",
+          "line", line.lineId));
+        break;
+      }
+      seen.add(key);
+    }
   }
 
   for (const line of review.lines) {
@@ -2323,7 +2417,6 @@ export function preparePurchasePosting(params: {
     );
     if (
       line.godownName &&
-      liveGodowns.length > 0 &&
       !selectedMaster(params.masters, line.godownName, ["godown"])
     ) {
       blockers.push(issue(
@@ -2334,13 +2427,9 @@ export function preparePurchasePosting(params: {
         line.lineId
       ));
     } else if (source.godownName && !line.godownName) {
-      blockers.push(issue(
-        "GODOWN_REQUIRED",
-        "Godown missing",
-        `Select the live Tally godown matching ${source.godownName}.`,
-        "line",
-        line.lineId
-      ));
+      blockers.push(issue("GODOWN_REQUIRED", "Confirm storage location",
+        `The packet lists ${source.godownName}. Choose the corresponding godown from the active company.`,
+        "line", line.lineId));
     } else if (!line.godownName && liveGodowns.length > 1) {
       // With more than one godown Tally rejects the whole voucher ("Godown
       // name in Item Allocations is missing/invalid"); catch it here instead.
@@ -2635,7 +2724,7 @@ export function preparePurchasePosting(params: {
     // Reference only: the connector records these with e-way bill
     // applicability left at No, as the client books purchases.
     ...(review.ewayBill?.record && /^\d{12}$/.test(review.ewayBill.number) && isValidIsoDate(review.ewayBill.date)
-      ? { ewayBill: { ...review.ewayBill, vehicleNumber: review.ewayBill.vehicleNumber || review.vehicleNumber } }
+      ? { ewayBill: { ...review.ewayBill, vehicleNumber: review.ewayBill.vehicleNumber } }
       : {}),
     taxMode: calculation.taxMode,
     items: review.lines.map((line) => {

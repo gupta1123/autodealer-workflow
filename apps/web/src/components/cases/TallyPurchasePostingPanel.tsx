@@ -18,7 +18,7 @@ import {
 
 import { Badge } from "@/components/ui/badge";
 import {canAccess} from '@autodealer/shared/lib/access';
-import { calculatePurchaseVoucher } from "@autodealer/shared/lib/purchase-voucher";
+import { calculatePurchaseVoucher, GST_STATE_NAMES } from "@autodealer/shared/lib/purchase-voucher";
 import {PurchaseApprovalControls,usePurchaseApproval} from '@/components/access/PurchaseApprovalControls';
 import { Button } from "@/components/ui/button";
 import {
@@ -155,22 +155,8 @@ function moneyOrMissing(value: string | null | undefined) {
 }
 
 function stateLabel(code: string | null | undefined) {
-  const states: Record<string, string> = {
-    "01": "Jammu and Kashmir", "02": "Himachal Pradesh", "03": "Punjab",
-    "04": "Chandigarh", "05": "Uttarakhand", "06": "Haryana", "07": "Delhi",
-    "08": "Rajasthan", "09": "Uttar Pradesh", "10": "Bihar", "11": "Sikkim",
-    "12": "Arunachal Pradesh", "13": "Nagaland", "14": "Manipur", "15": "Mizoram",
-    "16": "Tripura", "17": "Meghalaya", "18": "Assam", "19": "West Bengal",
-    "20": "Jharkhand", "21": "Odisha", "22": "Chhattisgarh", "23": "Madhya Pradesh",
-    "24": "Gujarat", "25": "Daman and Diu",
-    "26": "Dadra and Nagar Haveli and Daman and Diu", "27": "Maharashtra",
-    "28": "Andhra Pradesh (old)", "29": "Karnataka", "30": "Goa",
-    "31": "Lakshadweep", "32": "Kerala", "33": "Tamil Nadu", "34": "Puducherry",
-    "35": "Andaman and Nicobar Islands", "36": "Telangana", "37": "Andhra Pradesh",
-    "38": "Ladakh", "97": "Other territory", "99": "Centre jurisdiction",
-  };
   if (!code) return "Not known";
-  return states[code] ? `${states[code]} (${code})` : `State code ${code}`;
+  return GST_STATE_NAMES[code] ? `${GST_STATE_NAMES[code]} (${code})` : `State code ${code}`;
 }
 
 function numericDifference(
@@ -756,12 +742,14 @@ export type TallyPurchaseValidationState = {
 export function TallyPurchasePostingPanel({
   caseId,
   onApprovePacket,
+  quickView = false,
   onHeaderStateChange,
   onRefreshReady,
   onValidationStateChange,
   allowedBlockerKeys = [],
 }: {
   caseId: string;
+  quickView?: boolean;
   onApprovePacket?: () => Promise<void>;
   onHeaderStateChange?: (state: TallyPurchaseHeaderState) => void;
   onRefreshReady?: (refresh: () => Promise<void>) => void;
@@ -770,6 +758,7 @@ export function TallyPurchasePostingPanel({
 }) {
   const [payload, setPayload] = useState<TallyPostingResponse | null>(null);
   const approval = usePurchaseApproval(caseId);
+  const [showDetails, setShowDetails] = useState(false);
   const [review, setReview] = useState<TallyPostingReview | null>(null);
   const [selectedConnectionId, setSelectedConnectionId] = useState("");
   const [selectedCompanyName, setSelectedCompanyName] = useState("");
@@ -902,7 +891,7 @@ export function TallyPurchasePostingPanel({
       const companyName = next.selectedCompanyName;
       const applyCatalogue = async (liveMasters: unknown, noticeText: string) => {
         fullLiveMasterResultRef.current = liveMasters;
-        const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, next.review);
+        const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, next.review, next.source?.lines);
         liveMasterResultRef.current = liveCatalogue.compactResult;
         liveMasterOptionsRef.current = liveCatalogue.masterOptions;
         const matchStarted = performance.now();
@@ -930,7 +919,7 @@ export function TallyPurchasePostingPanel({
       // responsible for approval freshness and final validation.
       const applyCachedOptions = async (liveMasters: unknown) => {
         fullLiveMasterResultRef.current = liveMasters;
-        const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, next.review);
+        const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, next.review, next.source?.lines);
         liveMasterResultRef.current = liveCatalogue.compactResult;
         liveMasterOptionsRef.current = liveCatalogue.masterOptions;
         setPayload((current) => current ? { ...current, masterOptions: liveCatalogue.masterOptions } : current);
@@ -1287,35 +1276,7 @@ export function TallyPurchasePostingPanel({
     () => payload?.masterOptions.stockItems ?? [],
     [payload?.masterOptions.stockItems]
   );
-  const godownOptions = useMemo(() => {
-    const liveOptions = payload?.masterOptions.godowns ?? [];
-    const inferredNames = Array.from(new Set(
-      [payload?.source?.godownName, ...(payload?.source?.lines ?? []).map((line) => line.godownName)]
-        .map((name) => name?.trim())
-        .filter((name): name is string => Boolean(name))
-    ));
-    const existing = new Set(liveOptions.map((option) => option.name.trim().toLowerCase()));
-    const inferredOptions: TallyMasterOption[] = inferredNames
-      .filter((name) => !existing.has(name.toLowerCase()))
-      .map((name) => ({
-        id: `packet-godown:${name}`,
-        type: "godown",
-        key: name.toLowerCase(),
-        name,
-        parent: null,
-        gstin: null,
-        hsnCode: null,
-        unitName: null,
-        taxRate: null,
-        groupPath: "From purchase packet",
-        taxType: null,
-        gstDutyHead: null,
-        closingBalance: null,
-        closingBalanceType: null,
-        decimalPlaces: null,
-      }));
-    return [...liveOptions, ...inferredOptions];
-  }, [payload?.masterOptions.godowns, payload?.source?.godownName, payload?.source?.lines]);
+  const godownOptions = payload?.masterOptions.godowns ?? [];
   const supplierLedgerOptions = useMemo(() => {
     const preferredNames = new Set(
       (supplierLedgerMatch?.candidateLedgerNames ?? []).map((name) => name.trim().toLowerCase())
@@ -1570,7 +1531,7 @@ export function TallyPurchasePostingPanel({
   );
   const remainingCorrectionBlockers = useMemo(
     () => correctionBlockers.filter((item) =>
-      !allowedBlockerKeys.includes(`${item.code}:${item.lineId ?? item.scope}`)
+      item.code.startsWith("EWAY_BILL_") || !allowedBlockerKeys.includes(`${item.code}:${item.lineId ?? item.scope}`)
     ),
     [allowedBlockerKeys, correctionBlockers]
   );
@@ -1754,7 +1715,7 @@ export function TallyPurchasePostingPanel({
       // Rebuild it for the chosen invoice from the catalogue already on this
       // PC; no second Tally read or connector update is needed.
       if (hydrated.review && fullLiveMasterResultRef.current) {
-        const catalogue = prepareLiveTallyCatalogue(fullLiveMasterResultRef.current, hydrated.review);
+        const catalogue = prepareLiveTallyCatalogue(fullLiveMasterResultRef.current, hydrated.review, hydrated.source?.lines);
         liveMasterResultRef.current = catalogue.compactResult;
         liveMasterOptionsRef.current = catalogue.masterOptions;
         const matched = await prepareTallyPurchasePostingFromLive(
@@ -1927,7 +1888,7 @@ export function TallyPurchasePostingPanel({
         },
         onProgress: (message) => setNotice(message),
       });
-      const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, review);
+      const liveCatalogue = prepareLiveTallyCatalogue(liveMasters, review, payload?.source?.lines);
       fullLiveMasterResultRef.current = liveMasters;
       liveMasterResultRef.current = liveCatalogue.compactResult;
       liveMasterOptionsRef.current = liveCatalogue.masterOptions;
@@ -2027,7 +1988,7 @@ export function TallyPurchasePostingPanel({
   );
   const allBlockersAllowed = Boolean(
     payload?.blockers.length && payload.blockers.every((blocker) =>
-      allowedBlockerKeys.includes(`${blocker.code}:${blocker.lineId ?? blocker.scope}`)
+      !blocker.code.startsWith("EWAY_BILL_") && allowedBlockerKeys.includes(`${blocker.code}:${blocker.lineId ?? blocker.scope}`)
     )
   );
   const effectivelyReadyForApproval = Boolean(payload?.readyForApproval || allBlockersAllowed);
@@ -2335,16 +2296,78 @@ export function TallyPurchasePostingPanel({
     credit?: boolean;
   }>;
 
+  const deductionSwitches = (
+    <>
+      {deductionSettings.purchaseGoodsTdsEnabled ? <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
+        <button
+          aria-checked={review.applyTds194q}
+          className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.applyTds194q ? "bg-emerald-700" : "bg-slate-300"}`}
+          disabled={locked || saving}
+          onClick={() => void handleAdjustmentToggle("applyTds194q")}
+          role="switch"
+          type="button"
+        >
+          <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.applyTds194q ? "left-[18px]" : "left-0.5"}`} />
+        </button>
+        194Q TDS
+      </label> : null}
+      {deductionSettings.transporterTdsEnabled ? <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
+        <button
+          aria-checked={review.applyTransportTds}
+          className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.applyTransportTds ? "bg-emerald-700" : "bg-slate-300"}`}
+          disabled={locked || saving}
+          onClick={() => void handleAdjustmentToggle("applyTransportTds")}
+          role="switch"
+          type="button"
+        >
+          <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.applyTransportTds ? "left-[18px]" : "left-0.5"}`} />
+        </button>
+        Transport TDS
+      </label> : null}
+      {deductionSettings.gstTdsEnabled ? <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
+        <button
+          aria-checked={review.applyGstTds}
+          className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.applyGstTds ? "bg-emerald-700" : "bg-slate-300"}`}
+          disabled={locked || saving}
+          onClick={() => void handleAdjustmentToggle("applyGstTds")}
+          role="switch"
+          type="button"
+        >
+          <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.applyGstTds ? "left-[18px]" : "left-0.5"}`} />
+        </button>
+        {calculation?.taxMode === "cgst_sgst"
+          ? "GST TDS (CGST + SGST)"
+          : calculation?.taxMode === "igst"
+            ? "GST TDS (IGST)"
+            : "GST TDS"}
+      </label> : null}
+      {gstTdsOnWithoutAmount && !saving && <span className="text-xs font-medium text-amber-800">GST TDS enabled · ₹0 deducted</span>}
+      <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
+        <button
+          aria-checked={review.tcsReceivable}
+          className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.tcsReceivable ? "bg-emerald-700" : "bg-slate-300"}`}
+          disabled={locked || saving}
+          onClick={() => void handleAdjustmentToggle("tcsReceivable")}
+          role="switch"
+          type="button"
+        >
+          <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.tcsReceivable ? "left-[18px]" : "left-0.5"}`} />
+        </button>
+        TCS Receivable
+      </label>
+    </>
+  );
+
   return (
     <div className="tally-purchase-workflow mx-auto max-w-6xl space-y-3 p-3 pb-32 sm:p-4 sm:pb-32" id="tally-header">
-      <details className="rounded-xl border bg-white p-3 text-xs">
+      {(!quickView || showDetails) && <details className="rounded-xl border bg-white p-3 text-xs">
         <summary className="cursor-pointer font-semibold">Diagnose this invoice</summary>
         <p className="mt-2">{selectedCompanyName} / {payload.connection?.machineName || "Connector"} / Catalogue validated {formatDateTime(payload.connection?.masterValidatedAt ?? null)}</p>
         <p>{refreshingMasters ? "Checking Tally catalogue..." : liveMastersReady ? "Catalogue loaded" : "Waiting for connector data"}</p>
         <p>Supplier: {review.supplierLedgerName || "Awaiting selection"} / {editedFields.current.has("supplierLedgerName") ? "Edited in this session" : supplierLedgerMatch?.reason || "No matching decision recorded"}</p>
         {review.lines.map(line => <p key={line.lineId}>{line.description} / {line.stockItemName || "Stock item unresolved"} / {line.purchaseLedgerName || "Purchase ledger unresolved"}</p>)}
         {Object.entries(readTimes).map(([phase, ms]) => <p key={phase}>{phase}: {(ms / 1000).toFixed(1)} s</p>)}
-      </details>
+      </details>}
       {payload.eligibility.invoiceCandidates.length > 1 ? (
         <section className="rounded-xl border border-slate-200 bg-white p-3">
           <div className="mb-2 text-xs font-semibold text-slate-900">Invoice selected for this Purchase voucher</div>
@@ -2405,6 +2428,10 @@ export function TallyPurchasePostingPanel({
         </section>
       ) : null}
 
+      {quickView && <Button size="sm" variant="outline" aria-expanded={showDetails} onClick={() => setShowDetails(value => !value)}>
+        {showDetails ? "Hide voucher details" : remainingCorrectionBlockers.length ? "Review required corrections" : "Review voucher details"}
+      </Button>}
+      {(!quickView || showDetails) && <>
       <section className="scroll-mt-24 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" id="tally-invoice">
         <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2.5 sm:px-5">
           <h3 className="text-sm font-semibold text-slate-950">Source invoice</h3>
@@ -2526,7 +2553,7 @@ export function TallyPurchasePostingPanel({
                 <div className="text-[8px] font-semibold uppercase tracking-[0.12em] text-slate-400">E-way bill</div>
                 <label
                   className="flex items-center gap-1.5 text-[10px] font-medium text-slate-600"
-                  title={"Recorded as reference; Tally's e-way bill applicability stays No. To is your company address from Tally."}
+                  title="Record the supplier's existing e-way bill on the purchase voucher."
                 >
                   <input
                     checked={review.ewayBill.record}
@@ -2560,6 +2587,22 @@ export function TallyPurchasePostingPanel({
                   {([
                     ["number", "E-way bill number", "text"],
                     ["date", "E-way bill date", "date"],
+                    ["fromName", "Consignor name", "text"],
+                    ["fromGstin", "Consignor GSTIN", "text"],
+                    ["fromRegisteredState", "Consignor registered state", "text"],
+                    ["toName", "Consignee name", "text"],
+                    ["toGstin", "Consignee GSTIN", "text"],
+                    ["toRegisteredState", "Consignee registered state", "text"],
+                    ["subType", "Sub type", "text"],
+                    ["transporterId", "Transporter ID", "text"],
+                    ["transportDocumentDate", "Transport document date", "date"],
+                    ["fromAddress", "Dispatch address", "text"],
+                    ["toAddress", "Ship-to address", "text"],
+                    ["toPlace", "To place", "text"],
+                    ["toPincode", "To PIN", "text"],
+                    ["toState", "To state", "text"],
+                    ["transporterName", "Transporter", "text"],
+                    ["transportDocumentNumber", "Transport document number", "text"],
                     ["fromPlace", "From place", "text"],
                     ["fromPincode", "From PIN", "text"],
                     ["fromState", "From state", "text"],
@@ -2574,7 +2617,7 @@ export function TallyPurchasePostingPanel({
                       label={label}
                       onChange={(value) => updateReview("ewayBill", { ...review.ewayBill!, [key]: value })}
                       type={type}
-                      value={review.ewayBill![key]}
+                      value={review.ewayBill![key] ?? ""}
                     />
                   ))}
                 </div>
@@ -2717,7 +2760,7 @@ export function TallyPurchasePostingPanel({
                     onChange={(value) => updateGodown(index, value)}
                     options={godownOptions}
                     placeholder="No godown allocation"
-                    sourceHint={sourceLine?.godownName}
+                    sourceHint={payload?.source?.godownName}
                     suggestedNames={sourceLine?.godownName ? [sourceLine.godownName] : []}
                     value={line.godownName}
                   />
@@ -2797,63 +2840,7 @@ export function TallyPurchasePostingPanel({
 
           <div className="border-b border-slate-100">
             <div className="flex flex-wrap items-center gap-x-5 gap-y-2 py-2.5">
-              {deductionSettings.purchaseGoodsTdsEnabled ? <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
-                <button
-                  aria-checked={review.applyTds194q}
-                  className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.applyTds194q ? "bg-emerald-700" : "bg-slate-300"}`}
-                  disabled={locked || saving}
-                  onClick={() => void handleAdjustmentToggle("applyTds194q")}
-                  role="switch"
-                  type="button"
-                >
-                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.applyTds194q ? "left-[18px]" : "left-0.5"}`} />
-                </button>
-                194Q TDS
-              </label> : null}
-              {deductionSettings.transporterTdsEnabled ? <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
-                <button
-                  aria-checked={review.applyTransportTds}
-                  className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.applyTransportTds ? "bg-emerald-700" : "bg-slate-300"}`}
-                  disabled={locked || saving}
-                  onClick={() => void handleAdjustmentToggle("applyTransportTds")}
-                  role="switch"
-                  type="button"
-                >
-                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.applyTransportTds ? "left-[18px]" : "left-0.5"}`} />
-                </button>
-                Transport TDS
-              </label> : null}
-              {deductionSettings.gstTdsEnabled ? <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
-                <button
-                  aria-checked={review.applyGstTds}
-                  className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.applyGstTds ? "bg-emerald-700" : "bg-slate-300"}`}
-                  disabled={locked || saving}
-                  onClick={() => void handleAdjustmentToggle("applyGstTds")}
-                  role="switch"
-                  type="button"
-                >
-                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.applyGstTds ? "left-[18px]" : "left-0.5"}`} />
-                </button>
-                {calculation?.taxMode === "cgst_sgst"
-                  ? "GST TDS (CGST + SGST)"
-                  : calculation?.taxMode === "igst"
-                    ? "GST TDS (IGST)"
-                    : "GST TDS"}
-              </label> : null}
-              {gstTdsOnWithoutAmount && !saving && <span className="text-xs font-medium text-amber-800">GST TDS enabled · ₹0 deducted</span>}
-              <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-800">
-                <button
-                  aria-checked={review.tcsReceivable}
-                  className={`relative h-5 w-9 shrink-0 rounded-full transition ${review.tcsReceivable ? "bg-emerald-700" : "bg-slate-300"}`}
-                  disabled={locked || saving}
-                  onClick={() => void handleAdjustmentToggle("tcsReceivable")}
-                  role="switch"
-                  type="button"
-                >
-                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${review.tcsReceivable ? "left-[18px]" : "left-0.5"}`} />
-                </button>
-                TCS Receivable
-              </label>
+              {deductionSwitches}
               {purchaseGoodsTdsActive ? (
                 <details className="group basis-full border-t border-slate-100 pt-2">
                   <summary className="cursor-pointer list-none text-[10px] font-semibold text-slate-500 hover:text-slate-800">
@@ -3150,6 +3137,24 @@ export function TallyPurchasePostingPanel({
         </div>
       </section>
 
+      </>}
+      {quickView && !showDetails && review.ewayBill?.record && (
+        <div className="flex flex-wrap items-end gap-4 rounded-xl border bg-white px-4 py-3">
+          <div className="flex-1 text-sm">
+            E-way bill <strong>{review.ewayBill.number}</strong>
+            <p className="text-xs text-slate-600">{[review.ewayBill.transportMode, review.ewayBill.vehicleNumber,
+              review.ewayBill.transporterName, review.ewayBill.transportDocumentNumber && `LR ${review.ewayBill.transportDocumentNumber}`,
+              review.ewayBill.toAddress && `Ship to ${review.ewayBill.toAddress}`].filter(Boolean).join(" / ")}</p>
+          </div>
+          <Field compact type="date" label="E-way bill generation date" disabled={locked}
+            value={review.ewayBill.date} onChange={date => updateReview("ewayBill", { ...review.ewayBill!, date })} />
+        </div>
+      )}
+      {quickView && !showDetails && (
+        <div role="group" aria-label="Voucher tax adjustments" className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-xl border border-slate-200 bg-white px-4 py-3">
+          {deductionSwitches}
+        </div>
+      )}
       <section className="scroll-mt-24 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm" id="tally-preview">
         <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-2.5 sm:px-5">
           <h3 className="text-sm font-semibold text-slate-950">Confirm Purchase voucher</h3>
@@ -3278,8 +3283,10 @@ export function TallyPurchasePostingPanel({
 
               <div className="border-t border-[#9da5b2] pt-3">
                 <div className="grid grid-cols-[210px_1fr] gap-y-2">
-                  <span>Provide GST/e-Way Bill details</span>
-                  <strong>: &nbsp; No</strong>
+                  <span>Supplier e-way bill</span>
+                  <strong>{review.ewayBill?.record
+                    ? `${review.ewayBill.number} / ${review.ewayBill.date ? formatShortDate(review.ewayBill.date) : "Generation date required"}`
+                    : "Not recorded"}</strong>
                   <span>Narration</span>
                   <strong className="whitespace-pre-wrap">: &nbsp; {review.narration || "No narration"}</strong>
                 </div>
@@ -3346,7 +3353,7 @@ export function TallyPurchasePostingPanel({
         </div>
       ) : null}
 
-      <div className="fixed bottom-0 right-0 z-30 border-t border-slate-200 bg-white/95 px-4 py-2.5 shadow-[0_-8px_24px_rgba(15,23,42,0.08)] backdrop-blur lg:left-[340px]">
+      <div className={`${quickView ? "sticky bottom-0" : "fixed bottom-0 right-0 lg:left-[340px]"} z-30 border-t border-slate-200 bg-white/95 px-4 py-2.5 shadow-[0_-8px_24px_rgba(15,23,42,0.08)] backdrop-blur`}>
         <div className="mx-auto flex max-w-6xl flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
             <Database className="h-4 w-4" />
@@ -3416,7 +3423,7 @@ export function TallyPurchasePostingPanel({
                     ? "Checking Tally data"
                     : staleMastersBlocking
                       ? "Refresh Tally data first"
-                      : approval.required ? "Post approved purchase" : "Approve and send"}
+                      : approval.required ? "Post approved purchase" : quickView ? "Post to Tally" : "Approve and send"}
                 </Button>
               )}
             </div>
