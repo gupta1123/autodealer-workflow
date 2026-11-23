@@ -1,4 +1,4 @@
-import { invoiceArtefactIndices, readStoredLineItems } from "@/lib/line-items";
+import { recoverPrintedTonneLine, invoiceArtefactIndices, readStoredLineItems } from "@/lib/line-items";
 import { extractInvoiceCommercialFieldsFromText } from "@/lib/invoice-commercial-fields";
 import type {
   PurchaseAccountingSettings,
@@ -162,6 +162,7 @@ export type PurchaseEwayBill = {
 };
 
 type PurchasePostingSourceLine = PurchasePostingReviewLine & {
+  printedTonneRateConfirmed?: boolean;
   material: "ms_scrap" | "sponge_iron" | "unknown";
   materialLabel: string;
   invoiceCgstAmount: string;
@@ -1043,15 +1044,25 @@ function buildSource(
   // Freight printed as an invoice row ("Transportation Charges") is booked on
   // the freight ledger, never as a stock line. Keeping it in both places
   // counted it twice and inflated GST, 194Q and the total.
-  const itemRows = readStoredLineItems(lineSource.extracted_fields).map((item, index) => ({
+  const stored = readStoredLineItems(lineSource.extracted_fields);
+  const recovered = lineSource.id === document.id ? recoverPrintedTonneLine(stored, fields, document.markdown ?? "") : null;
+  const itemRows = (recovered ? [recovered] : stored).map((item, index) => ({
     item,
-    line: sourceLine(lineSource.id, item, index),
+    line: { ...sourceLine(lineSource.id, item, index), ...(recovered ? { printedTonneRateConfirmed: true } : {}) },
   }));
   const artefacts = invoiceArtefactIndices(itemRows.map(row => row.item), fields.totalTaxableAmount || fields.subtotal);
   const goodsAndCharges = itemRows.filter((_, index) => !artefacts.has(index));
   const freightRows = goodsAndCharges.filter(({ item, line }) => isFreightChargeRow(item, line));
   const lines = goodsAndCharges.filter((row) => !freightRows.includes(row)).map(({ line }) => line);
   const freightFromRows = sum(freightRows.map(({ line }) => moneyPaise(line.taxableAmount)));
+  const printedTax = moneyPaise(fields.taxAmount);
+  const printedRoundOff = moneyPaise(fields.roundOffAmount);
+  const splitTaxes = lines.map(line => [moneyPaise(line.invoiceCgstAmount), moneyPaise(line.invoiceSgstAmount)]);
+  const itemTax = sum(splitTaxes.flat());
+  const basic = sum(lines.map(line => moneyPaise(line.taxableAmount)));
+  const taxIncludesRoundOff = printedTax !== null && printedRoundOff && Math.abs(printedRoundOff) <= 100 &&
+    splitTaxes.length && splitTaxes.every(pair => pair.every(value => value !== null && value > 0)) &&
+    itemTax + printedRoundOff === printedTax && basic + printedTax === moneyPaise(fields.totalAmount);
   const printedFreight = text(fields.freightAmount) || commercialFields.freightAmount;
   return {
     documentId: document.id,
@@ -1070,9 +1081,9 @@ function buildSource(
     buyerName: text(fields.buyerName),
     buyerGstin: normalizeGstin(fields.buyerGstin),
     vehicleNumber: packetVehicleNumber(document, documents),
-    invoiceTaxableAmount: text(fields.totalTaxableAmount || fields.subtotal),
-    invoiceTaxRate: text(fields.taxRate),
-    invoiceTaxAmount: text(fields.taxAmount) || commercialFields.taxAmount,
+    invoiceTaxableAmount: text(recovered?.taxableAmount || fields.totalTaxableAmount || fields.subtotal),
+    invoiceTaxRate: text(recovered?.taxRate || fields.taxRate),
+    invoiceTaxAmount: taxIncludesRoundOff ? formatPaise(itemTax) : text(fields.taxAmount) || commercialFields.taxAmount,
     invoiceTotal: text(fields.totalAmount),
     invoiceTdsAmount: text(fields.tdsAmount) || commercialFields.tdsAmount,
     invoiceTdsRate: text(fields.tdsRate) || commercialFields.tdsRate,
@@ -2334,7 +2345,11 @@ export function preparePurchasePosting(params: {
         ));
         continue;
       }
-      if (Math.abs(calculatedTaxable - taxable) > TOTAL_TOLERANCE_PAISE) {
+      const printedLine = source.lines.find(candidate => candidate.lineId === line.lineId && candidate.printedTonneRateConfirmed);
+      const matchesPrintedRounding = printedLine && quantityMillis(printedLine.quantity) === quantity &&
+        printedLine.unit === line.unit && printedLine.rate === line.rate && moneyPaise(printedLine.taxableAmount) === taxable &&
+        Math.abs(calculatedTaxable - taxable) <= 50;
+      if (!matchesPrintedRounding && Math.abs(calculatedTaxable - taxable) > TOTAL_TOLERANCE_PAISE) {
         blockers.push(issue(
           "LINE_TAXABLE_MISMATCH",
           "Line taxable amount does not reconcile",

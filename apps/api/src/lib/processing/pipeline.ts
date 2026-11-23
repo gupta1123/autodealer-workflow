@@ -22,6 +22,7 @@ import {
   enrichDocumentsWithPacketGstTaxContext,
   isCommercialDocType,
   normalizeExtractedCommercialLineItems,
+  recoverPrintedTonneLine,
   mergeRowsAcrossCopies,
   sanitizeLineItems,
 } from "@/lib/line-items";
@@ -3900,7 +3901,14 @@ function correctCommercialTotals(doc: CaseDoc) {
   doc = correctInvoiceTotalMisreadAsTaxableValue(doc);
   if (!COMMERCIAL_TOTAL_DOC_TYPES.has(doc.type) || !doc.lineItems?.length) return doc;
 
-  let lineItems = correctLineItemAmounts(doc.lineItems, doc.fields, doc.md ?? "") ?? doc.lineItems;
+  const originalItems = doc.lineItems;
+  const recovered = doc.type === "Tax Invoice" ? recoverPrintedTonneLine(originalItems, doc.fields, doc.md ?? "") : null;
+  if (recovered) {
+    doc = { ...doc, fields: { ...doc.fields, subtotal: recovered.taxableAmount,
+      ...(doc.fields.totalTaxableAmount ? { totalTaxableAmount: recovered.taxableAmount } : {}) } };
+  }
+  const sourceItems = recovered ? [recovered] : originalItems;
+  let lineItems = correctLineItemAmounts(sourceItems, doc.fields, doc.md ?? "") ?? sourceItems;
   const lineSum = lineItems
     ?.map((item) => parseLooseNumber(item.taxableAmount ?? item.lineTotal))
     .filter((value): value is number => value !== null && value >= 0)

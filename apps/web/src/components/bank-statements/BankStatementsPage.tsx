@@ -34,7 +34,7 @@ import {useAccess} from '@/components/access/AccessProvider';
 import { localPdfMetadata, sendPdfToLocalAgent, sendLedgerContextToLocalAgent, cancelLocalDocument, assertLocalBankContextIdentity } from "@/lib/local-bank-document";
 import { createBankPreviewCompletion } from '@/lib/bank-preview-completion';
 import { watchBankJob } from '@/lib/cash-discount-live';
-import { allocateReceiptByFifo, applyFifoAllocationsToBills } from "@/lib/bank-statement-bill-allocation";
+import { isTdsBill, allocateReceiptByFifo, applyFifoAllocationsToBills } from "@/lib/bank-statement-bill-allocation";
 import { buildBankBookCsv } from "@/lib/bank-book-csv";
 import { isPreviewExtractionIncomplete } from "@/lib/bank-statement-extraction-state";
 import { isReadyForTallyPosting } from "@/lib/bank-statement-posting-readiness";
@@ -557,6 +557,7 @@ type BillAllocationLine = {
 };
 
 type BillAllocationDraft = {
+  excludedTdsCount?: number;
   status:
     | "not_applicable"
     | "cannot_match_yet"
@@ -2614,9 +2615,10 @@ function buildManualAllocationDraft(
 
 function allocateBillsForTransaction(
   transaction: ReviewTransaction,
-  openBills: OpenBillReference[],
+  returnedBills: OpenBillReference[],
   existingAdvances: ExistingAdvanceReference[]
 ): BillAllocationDraft {
+  const openBills = returnedBills.filter(bill => !isTdsBill(bill));
   const receiptAmount = Math.max(parseNumber(transaction.creditAmount) ?? 0, parseNumber(transaction.debitAmount) ?? 0);
   const allocationSubject = isOutgoingPaymentRow(transaction) ? "payment" : "receipt";
   if (receiptAmount <= 0) {
@@ -2630,6 +2632,7 @@ function allocateBillsForTransaction(
       newAdvanceAmount: 0,
       unallocatedAmount: 0,
       allocations: [],
+      excludedTdsCount: returnedBills.length - openBills.length,
       candidateBills: openBills,
       existingAdvances,
       requiresUserReview: false,
@@ -2651,6 +2654,7 @@ function allocateBillsForTransaction(
       newAdvanceAmount: 0,
       unallocatedAmount: receiptAmount,
       allocations: [],
+      excludedTdsCount: returnedBills.length - openBills.length,
       candidateBills,
       existingAdvances,
       requiresUserReview: true,
@@ -2688,7 +2692,8 @@ function allocateBillsForTransaction(
     newAdvanceAmount: automaticAllocation.newAdvanceAmount,
     unallocatedAmount: automaticAllocation.unallocatedAmount,
     allocations,
-    candidateBills: openBills.length > 0 ? automaticAllocation.orderedBills : candidateBills,
+    excludedTdsCount: returnedBills.length - openBills.length,
+      candidateBills: openBills.length > 0 ? automaticAllocation.orderedBills : candidateBills,
     existingAdvances,
     requiresUserReview: !isBalanced,
     isEligibleForPosting: isBalanced,
@@ -3215,6 +3220,63 @@ function formatFileSize(size: number | null | undefined) {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+type LedgerBills = { openBills: OpenBillReference[]; existingAdvances: ExistingAdvanceReference[] };
+
+function CloseMatchPanel({ transaction, names, load, choose, search, close }: {
+  transaction: ReviewTransaction; names: string[];
+  load: () => Promise<Map<string, LedgerBills>>;
+  choose: (name: string, bills: LedgerBills) => void;
+  search: () => void; close: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [index, setIndex] = useState(0);
+  const [attempt, setAttempt] = useState(0);
+  const [result, setResult] = useState<Map<string, LedgerBills> | null>(null);
+  const loadRef = useRef(load);
+  loadRef.current = load;
+  useEffect(() => {
+    const element = dialog.current;
+    element?.showModal();
+    return () => element?.close();
+  }, []);
+  useEffect(() => {
+    let active = true;
+    const timer = window.setTimeout(() => {
+      loadRef.current().then(data => { if (active) setResult(data); },
+        () => { if (active) setResult(new Map()); });
+    }, 0);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [attempt]);
+  const name = names[index];
+  const data = result?.get(name);
+  const amount = parseNumber(transaction.creditAmount) ?? 0;
+  const exact = (bill: OpenBillReference) => Math.round(bill.pendingAmount * 100) === Math.round(amount * 100);
+  const eligible = sortOpenBills((data?.openBills ?? []).filter(bill => !isTdsBill(bill)))
+    .sort((a, b) => Number(exact(b)) - Number(exact(a)));
+  const excluded = (data?.openBills.length ?? 0) - eligible.length;
+  return <dialog ref={dialog} aria-label="Compare close ledger matches" onCancel={close}
+    className="fixed inset-y-0 left-auto right-0 m-0 h-dvh max-h-none w-full max-w-md bg-white p-0 shadow-xl backdrop:bg-black/30">
+    <div className="flex h-full flex-col gap-4 p-5">
+      <header className="flex items-center justify-between"><strong>Close matches</strong><Button onClick={close}>Close</Button></header>
+      <div><strong>{formatCurrencyAmount(amount)}</strong> &middot; {formatShortDate(transaction.transactionDate)}<p>{transaction.description}</p></div>
+      <div className="border-t pt-4"><small>Ledger {index + 1} of {names.length}</small><h2 className="text-lg font-bold">{name}</h2></div>
+      <section className="flex-1 overflow-auto" aria-live="polite"><h3 className="mb-2 font-semibold">Open bills</h3>
+        {!result ? <p>Checking open bills...</p> : !data ? <p>Could not load bills. <Button onClick={() => { setResult(null); setAttempt(a => a + 1); }}>Retry</Button></p> :
+        <>{eligible.length === 0 && <p>No eligible open bills.</p>}{eligible.map((bill, i) =>
+          <div key={bill.referenceName + i} className="flex justify-between border-b py-2"><div>{bill.referenceName}
+          <small className="block">{bill.invoiceDate && formatShortDate(bill.invoiceDate)}</small></div>
+          <div className="text-right">{formatCurrencyAmount(bill.pendingAmount)}{exact(bill) && <small className="block text-emerald-700">Exact amount</small>}</div></div>)}
+          {excluded > 0 && <small>{excluded} TDS {excluded === 1 ? "entry" : "entries"} excluded</small>}</>}
+      </section>
+      <footer><div className="flex justify-between gap-2">
+        <Button disabled={index === 0} onClick={() => setIndex(i => i - 1)}>Previous</Button>
+        <Button disabled={index + 1 === names.length} onClick={() => setIndex(i => i + 1)}>Next</Button>
+        <Button disabled={!data} onClick={() => data && choose(name, data)}>Use this ledger</Button>
+      </div><button type="button" className="mt-3 text-sm underline" onClick={search}>Search all ledgers</button></footer>
+    </div>
+  </dialog>;
+}
+
 export function BankStatementsPage() {
   const {enforcementRequired:accessEnforced}=useAccess();
   const router = useRouter();
@@ -3246,6 +3308,7 @@ export function BankStatementsPage() {
   const [ledgerMasters, setLedgerMasters] = useState<TallyMaster[]>([]);
   const localLedgerSuggestionKeyRef = useRef("");
   const [transactions, setTransactions] = useState<ReviewTransaction[]>([]);
+  const [comparison, setComparison] = useState<{ id: string; scope: string; names: string[] } | null>(null);
   const [editingLedgerIds, setEditingLedgerIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [sendingMode, setSendingMode] = useState<TallySendMode | null>(null);
@@ -3962,6 +4025,7 @@ export function BankStatementsPage() {
     }
 
     function handleReviewShortcut(event: KeyboardEvent) {
+      if (document.querySelector('dialog[aria-label="Compare close ledger matches"][open]')) return;
       if (!preview) {
         if (event.key === "Escape" && shortcutsOpen) {
           event.preventDefault();
@@ -4063,7 +4127,8 @@ export function BankStatementsPage() {
       const activeReviewTransactionId = activeReviewTransactionIdRef.current;
       if ((event.key === "Enter" || event.key === "F2") && activeReviewTransactionId && !statementReviewLocked) {
         event.preventDefault();
-        setEditingLedgerIds(new Set([activeReviewTransactionId]));
+        const row = filteredTransactions.find(transaction => transaction.id === activeReviewTransactionId);
+        if (row) openLedgerEditor(row);
       }
     }
 
@@ -4718,6 +4783,19 @@ export function BankStatementsPage() {
     });
     return () => { cancelled = true; };
   }, [ledgerMasters.length, selectedCompany, tallyConnectionId, transactions]);
+
+  const comparisonScope = JSON.stringify([commandConnection?.id, selectedCompanyId, selectedCompanyName, bankLedgerName]);
+  useEffect(() => { setComparison(null); }, [comparisonScope]);
+  const comparing = comparison?.scope === comparisonScope && !statementReviewLocked
+    ? validTransactions.find(row => row.id === comparison.id) : undefined;
+
+  function openLedgerEditor(transaction: ReviewTransaction) {
+    const names = Array.from(new Set(transaction.candidateLedgerNames.map(name =>
+      findLedgerByNormalizedName(ledgerMasters, name)?.name ?? name.trim()).filter(Boolean)));
+    if (getReviewStatus(transaction) === "needs_review" && !isOutgoingPaymentRow(transaction) && names.length) {
+      setComparison({ id: transaction.id, scope: comparisonScope, names });
+    } else setEditingLedgerIds(new Set([transaction.id]));
+  }
 
   function updateLedgerSelection(id: string, selection: LedgerSelection) {
     setTransactions((current) =>
@@ -5933,6 +6011,7 @@ export function BankStatementsPage() {
       const ledgerResult = rawByLedger[ledgerName] && typeof rawByLedger[ledgerName] === "object"
         ? rawByLedger[ledgerName] as Record<string, unknown>
         : null;
+      if (ledgerResult?.complete === false || ledgerResult?.error) continue;
       if (!Array.isArray(ledgerResult?.openBills) || !Array.isArray(ledgerResult?.existingAdvances)) continue;
       billDataByLedger.set(ledgerName, {
         openBills: ledgerResult && Array.isArray(ledgerResult.openBills)
@@ -5944,7 +6023,7 @@ export function BankStatementsPage() {
       });
     }
 
-    if (requestedLedgerNames.length === 1 && Object.keys(rawByLedger).length === 0 && Array.isArray(result.openBills) && Array.isArray(result.existingAdvances)) {
+    if (requestedLedgerNames.length === 1 && (!result.ledgerName || result.ledgerName === requestedLedgerNames[0]) && Object.keys(rawByLedger).length === 0 && result.complete !== false && !result.error && Array.isArray(result.openBills) && Array.isArray(result.existingAdvances)) {
       const legacyLedgerName =
         typeof result.ledgerName === "string" && requestedLedgerNames.includes(result.ledgerName)
           ? result.ledgerName
@@ -8221,13 +8300,13 @@ export function BankStatementsPage() {
                                 data-ledger-editor-toggle
                                 onClick={() => {
                                   if (showLedgerSelect || statementReviewLocked) return;
-                                  setEditingLedgerIds(new Set([transaction.id]));
+                                  openLedgerEditor(transaction);
                                 }}
                                 onKeyDown={(event) => {
                                   if (showLedgerSelect || statementReviewLocked) return;
                                   if (event.key === "Enter" || event.key === " ") {
                                     event.preventDefault();
-                                    setEditingLedgerIds(new Set([transaction.id]));
+                                    openLedgerEditor(transaction);
                                   }
                                 }}
                                 role={!showLedgerSelect && !statementReviewLocked ? "button" : undefined}
@@ -8364,14 +8443,10 @@ export function BankStatementsPage() {
                                       ? "bg-[#2d2d2d] text-white hover:bg-[#1a1a1a]"
                                       : "border border-[#e5ddd0] bg-white text-[#5a5046] hover:bg-[#faf8f4] hover:text-[#1a1a1a]"
                                   }`}
-                                  onClick={() =>
-                                    setEditingLedgerIds((current) => {
-                                      const next = new Set(current);
-                                       if (next.has(transaction.id)) next.delete(transaction.id);
-                                       else return new Set([transaction.id]);
-                                       return next;
-                                    })
-                                  }
+                                  onClick={() => {
+                                    if (isEditingLedger) setEditingLedgerIds(new Set());
+                                    else openLedgerEditor(transaction);
+                                  }}
                                   disabled={statementReviewLocked}
                                   title={isEditingLedger ? "Close ledger selection" : "Change ledger"}
                                   type="button"
@@ -8437,6 +8512,25 @@ export function BankStatementsPage() {
                 </div>
               </div>
 
+              {comparison && comparing && <CloseMatchPanel key={comparison.scope + comparison.id} transaction={comparing} names={comparison.names}
+                load={async () => {
+                  if (!commandConnection) throw Error("Select a Tally connection.");
+                  return fetchOpenBillsForLedgers(commandConnection, comparison.names, comparing.transactionDate);
+                }}
+                close={() => setComparison(null)}
+                search={() => { setComparison(null); setEditingLedgerIds(new Set([comparing.id])); }}
+                choose={(name, data) => {
+                  const master = findLedgerByNormalizedName(ledgerMasters, name);
+                  const selected = { ...comparing, selectedLedgerName: name, ledgerGroup: master?.parent || "",
+                    ledgerAction: "use_existing_ledger" as const, requiresUserConfirmation: false };
+                  updateLedgerSelection(selected.id, { name, action: selected.ledgerAction, ledgerGroup: selected.ledgerGroup });
+                  setComparison(null);
+                  if (isBillMatchEligibleTransaction(selected, ledgerMasters)) {
+                    const draft = allocateBillsForTransaction(selected, data.openBills, data.existingAdvances);
+                    setBillAllocationsByTransactionId(current => ({ ...current, [selected.id]: draft }));
+                    setBillAllocationReviewTransactionId(selected.id);
+                  }
+                }} />}
               {billAllocationReviewTransaction ? (
                 <div className="fixed inset-0 z-50 flex justify-end bg-black/20">
                   <button
@@ -8480,8 +8574,13 @@ export function BankStatementsPage() {
                       </div>
                       <div className="bg-white px-4 py-2.5">
                         <h2 className="text-[15px] font-extrabold leading-5 text-[#171717]">
-                          {getTransactionPartyTitle(billAllocationReviewTransaction)}
+                          {billAllocationReviewTransaction.selectedLedgerName.trim() || "No ledger selected"}
                         </h2>
+                        {billAllocationReviewTransaction.description.trim() && (
+                          <p className="mt-1 break-words text-xs text-slate-600">
+                            <span className="font-semibold">Narration</span>{" "}{billAllocationReviewTransaction.description}
+                          </p>
+                        )}
                         <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[9px] font-bold leading-4 text-[#61788a]">
                           <span>
                             {formatShortDate(billAllocationReviewTransaction.transactionDate)}
@@ -8661,6 +8760,7 @@ export function BankStatementsPage() {
                             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#e8e1d7] pb-2">
                               <div>
                               <h3 className="text-xs font-extrabold text-[#1a1a1a]">Open bills</h3>
+                              {Boolean(billAllocationReviewDraft.excludedTdsCount) && <small>{billAllocationReviewDraft.excludedTdsCount} TDS excluded</small>}
                               </div>
                               <div className="flex flex-wrap gap-1 rounded-lg bg-[#f3efe9] p-1">
                               <Button

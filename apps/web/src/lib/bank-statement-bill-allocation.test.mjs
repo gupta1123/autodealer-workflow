@@ -74,3 +74,12 @@ test("uses due date before invoice date and leaves undated bills last", () => {
   assert.deepEqual(result.allocations.map((allocation) => allocation.referenceName), ["EARLIER-DUE", "LATER-INVOICE"]);
   assert.deepEqual(result.allocations.map((allocation) => allocation.allocatedAmount), [40_000, 20_000]);
 });
+
+test("exact TDS names and numbers stay outside preferred and FIFO allocation", () => {
+  const bills = [{referenceName: " tDs ", pendingAmount: 100}, {referenceName: "A", voucherNumber: "TDS", pendingAmount: 100},
+    {referenceName: "INV-TDS-184", pendingAmount: 60}];
+  const result = allocateReceiptByFifo(100, bills, "ADV", " tDs ");
+  assert.deepEqual(result.orderedBills, [bills[2]]);
+  assert.deepEqual(result.allocations.map(a => [a.referenceName, a.allocatedAmount]), [["INV-TDS-184",60], ["ADV",40]]);
+  assert.equal(allocateReceiptByFifo(20, bills.slice(0,2), "ADV").newAdvanceAmount, 20);
+});

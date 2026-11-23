@@ -7,7 +7,7 @@ const source = readFileSync(new URL("./line-items.ts", import.meta.url), "utf8")
 const js = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { normalizeExtractedCommercialLineItems } = await import(
+const { normalizeExtractedCommercialLineItems, invoiceArtefactIndices } = await import(
   `data:text/javascript;base64,${Buffer.from(js).toString("base64")}`
 );
 
@@ -89,4 +89,16 @@ test("PSP scrap subtotal and repeated serial are removed only when printed amoun
   assert.equal(normalize([goods, {...goods}], "1226400").length, 2);
   assert.deepEqual(normalize([goods, {...goods}, footer], "1226400").map(row => row.description), ["Scrap", "Scrap"]);
   assert.equal(normalize([goods, {...goods}], "").length, 2);
+});
+
+test("a tax-footer copy needs both matching source identity and a reconciling printed subtotal", () => {
+  const goods = { sourcePage: 1, lineNumber: "1", description: "HRPO SCRAP", hsnSac: "72042190",
+    quantity: "9625", unit: "KG", rate: "22", taxableAmount: "211750", cgstAmount: "19057.5" };
+  const copy = { ...goods, taxableAmount: "19057.5", rawText: "OUTPUT CGST @ 9% 19,057.50" };
+  assert.deepEqual([...invoiceArtefactIndices([goods, copy], "211750")], [1]);
+  assert.deepEqual([...invoiceArtefactIndices([copy, goods], "211750")], [0]);
+  assert.deepEqual([...invoiceArtefactIndices([goods, copy], "230807.5")], []);
+  assert.deepEqual([...invoiceArtefactIndices([goods, {...copy, sourcePage: 2}], "211750")], []);
+  assert.deepEqual([...invoiceArtefactIndices([goods, {...goods, lineNumber: "2"}], "423500")], []);
+  assert.deepEqual([...invoiceArtefactIndices([goods, {...goods}], "423500")], []);
 });

@@ -103,3 +103,27 @@ test('receipt-only posting admits the checked missing receipt despite other ambi
   assert.doesNotMatch(send,/ambiguousTallyPresenceCount|uncheckedTallyPresenceCount/);
   assert.match(send,/candidateTallyWorkTransactions\.filter\([\s\S]*?isReadyForTallyPosting/);
 });
+test('allocation header shows the selected ledger and keeps bank narration separate', async () => {
+  const React = await import('react');
+  const { renderToStaticMarkup } = await import('react-dom/server');
+  let header;
+  function visit(node) {
+    if (ts.isJsxElement(node) && node.openingElement.tagName.getText(ast) === 'h2' &&
+        node.getText(ast).includes('billAllocationReviewTransaction')) header = node.parent;
+    ts.forEachChild(node, visit);
+  }
+  visit(ast);
+  const code = ts.transpileModule('const view = (' + header.getText(ast) + '); view;', {
+    compilerOptions: { jsx: ts.JsxEmit.React, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  function render(selectedLedgerName, description) {
+    return renderToStaticMarkup(vm.runInNewContext(code, { React,
+      billAllocationReviewTransaction: {selectedLedgerName, description, counterpartyName:'Bank alias'},
+      formatShortDate:()=>'', formatCurrencyAmount:()=>'', parseNumber:()=>0, getTransactionReference:()=>'' }));
+  }
+  const html = render('A B Enterprises', 'NEFT 123 BANK ALIAS');
+  assert.match(html, /<h2[^>]*>A B Enterprises<\/h2>/);
+  assert.match(html, /Narration<\/span> NEFT 123 BANK ALIAS/);
+  assert.doesNotMatch(render('A B Enterprises',' '), /Narration/);
+  assert.match(render(' ', 'NEFT 123'), /<h2[^>]*>No ledger selected<\/h2>/);
+});

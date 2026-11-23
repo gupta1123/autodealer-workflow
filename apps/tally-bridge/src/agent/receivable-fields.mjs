@@ -425,12 +425,16 @@ export function openBillsByLedgerFromFields(ledgerNames, bills, vouchers) {
 }
 
 // buildOpenBillAmountIndex on fields: open bills by amount in paise.
+export function isBankTdsBill(bill) {
+  return [bill.referenceName, bill.voucherNumber].some(value => String(value ?? "").trim().toUpperCase() === "TDS");
+}
+
 export function openBillAmountIndexFromFields(bills) {
   const byPaise = new Map();
   for (const bill of bills) {
     const ledgerName = bill.ledger;
     const open = ledgerName ? openBillFromFields(bill, ledgerName) : null;
-    if (!open || open.kind !== "bill") continue;
+    if (!open || open.kind !== "bill" || isBankTdsBill(open)) continue;
     const closing = bill.closing ?? bill.pending ?? bill.amount;
     if (!closing) continue;
     const paise = Math.round(open.pendingAmount * 100);

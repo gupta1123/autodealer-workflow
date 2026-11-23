@@ -18,6 +18,10 @@ export type FifoBillAllocation = {
   statusAfterAllocation?: string | null;
 };
 
+export function isTdsBill(bill: FifoOpenBill) {
+  return [bill.referenceName, bill.voucherNumber].some(value => value?.trim().toUpperCase() === "TDS");
+}
+
 function billOrderDate(bill: FifoOpenBill) {
   return bill.dueDate || bill.invoiceDate || "9999-12-31";
 }
@@ -29,7 +33,7 @@ export function allocateReceiptByFifo(
   preferredReferenceName?: string | null
 ) {
   const preferredReference = preferredReferenceName?.trim().toLocaleLowerCase() || "";
-  const orderedBills = [...openBills].sort((left, right) => {
+  const orderedBills = openBills.filter(bill => !isTdsBill(bill)).sort((left, right) => {
     const leftPreferred = preferredReference && left.referenceName.trim().toLocaleLowerCase() === preferredReference;
     const rightPreferred = preferredReference && right.referenceName.trim().toLocaleLowerCase() === preferredReference;
     if (leftPreferred !== rightPreferred) return leftPreferred ? -1 : 1;

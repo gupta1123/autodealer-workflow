@@ -1515,6 +1515,34 @@ function extractLabelledTaxRate(line: string, label: "cgst" | "sgst" | "igst") {
   return line.match(new RegExp(`\\b${label}\\s*rate\\b[^\\d%]{0,20}(\\d{1,2}(?:\\.\\d+)?)\\s*%?`, "i"))?.[1];
 }
 
+// A handwritten invoice can price kilograms per tonne and truncate the basic
+// amount to whole rupees. Require the printed subtotal, taxes and grand total
+// to agree before repairing either a fresh or a previously stored extraction.
+export function recoverPrintedTonneLine(items: CommercialLineItem[], fields: Record<string, unknown>, markdown: string) {
+  if (items.length !== 1) return null;
+  const item = items[0];
+  const rate = parseLineItemNumber(item.rate);
+  const quantity = parseLineItemNumber(item.quantity);
+  if (!rate || !quantity || !/^kgs?$/i.test(item.unit ?? "") ||
+      (item.netRate && parseLineItemNumber(item.netRate) !== rate)) return null;
+  const visible = markdown.split("## Visible Text").pop() ?? "";
+  const quotedRate = visible.match(/^\s*([\d,.]+)\s*(?:\/-)?\s*P\s*\/\s*T\s*$/im);
+  const basic = parseLineItemNumber(visible.match(/^\s*TOTAL\s+([\d,.]+)/im)?.[1]);
+  const cgst = visible.match(/^\s*CGST\s*@\s*([\d.]+)\s*%\s*([\d,.]+)/im);
+  const sgst = visible.match(/^\s*SGST\s*@\s*([\d.]+)\s*%\s*([\d,.]+)/im);
+  const tonneRate = parseLineItemNumber(quotedRate?.[1]);
+  if (!tonneRate || (rate !== tonneRate && rate !== tonneRate / 1000) || !basic || !cgst || !sgst ||
+      Math.abs(quantity * tonneRate / 1000 - basic) > 0.5) return null;
+  const tax = parseLineItemNumber(cgst[2]);
+  if (!tax || cgst[1] !== sgst[1] || parseLineItemNumber(sgst[2]) !== tax ||
+      Math.abs(basic * Number(cgst[1]) / 100 - tax) > 0.5 ||
+      basic + 2 * tax !== parseLineItemNumber(fields.totalAmount) ||
+      2 * tax !== parseLineItemNumber(fields.taxAmount)) return null;
+  return { ...item, rate: String(tonneRate / 1000), ...(item.netRate ? {netRate: String(tonneRate / 1000)} : {}),
+    taxableAmount: String(basic), lineTotal: String(basic), taxRate: String(Number(cgst[1]) * 2),
+    cgstRate: cgst[1], sgstRate: sgst[1], cgstAmount: String(tax), sgstAmount: String(tax), taxAmount: String(2 * tax) };
+}
+
 // Remove an extraction artefact only when the remaining rows independently
 // reconcile to the printed taxable subtotal. Keep the original indices so
 // previously saved reviews still refer to the same goods.
@@ -1537,11 +1565,40 @@ export function invoiceArtefactIndices(rows: CommercialLineItem[], printedSubtot
     if (amount === null) return new Set<number>();
     const paise = Math.round(amount * 100);
     goodsPaise += paise;
+    // An unnumbered extraction and a numbered table transcription can
+    // describe the same row on invoice copies. Keep the numbered source.
+    if (!row.lineNumber && row.itemCode && row.hsnSac && row.sourcePage && rows.some(peer =>
+      peer.lineNumber && peer.rawText && peer.sourcePage && peer.sourcePage !== row.sourcePage &&
+      peer.hsnSac === row.hsnSac && peer.unit === row.unit && peer.description &&
+      row.itemCode === `${peer.description} (${peer.hsnSac})` && peer.rawText.includes(row.itemCode ?? "") &&
+      getLineCommercialAmount(peer) === amount && parseLineItemNumber(row.quantity) !== null &&
+      parseLineItemNumber(peer.quantity) === parseLineItemNumber(row.quantity) &&
+      parseLineItemNumber(row.rate) !== null && parseLineItemNumber(peer.rate) === parseLineItemNumber(row.rate)
+    )) {
+      duplicates.add(index);
+      duplicatePaise += paise;
+    }
     if (!row.lineNumber || !row.description || !row.quantity || !(row.netRate || row.rate)) continue;
     const signature = JSON.stringify([row.sourcePage, ...TEXT_LINE_ITEM_KEYS
       .filter(key => key !== "rawText")
       .map(key => normalizeSignatureValue(key, row[key]))]);
-    if (numberedRows.has(signature)) {
+    // A raw table read can attach the tax footer to the same numbered item
+    // and use the CGST/SGST amount as its taxable value. Require a peer
+    // whose quantity and rate account for its printed goods amount.
+    const isTaxFooterCopy = row.sourcePage && row.hsnSac && row.unit &&
+      /\b(?:CGST|SGST|IGST)\b/i.test(row.rawText ?? "") &&
+      [row.cgstAmount, row.sgstAmount, row.igstAmount].some(tax => parseLineItemNumber(tax) === amount) &&
+      rows.some(peer => {
+        if (peer === row || peer.sourcePage !== row.sourcePage || peer.lineNumber !== row.lineNumber ||
+            peer.description !== row.description || peer.hsnSac !== row.hsnSac || peer.unit !== row.unit ||
+            peer.quantity !== row.quantity || (peer.netRate || peer.rate) !== (row.netRate || row.rate)) return false;
+        const goods = getLineCommercialAmount(peer);
+        const quantity = parseLineItemNumber(peer.quantity);
+        const rate = parseLineItemNumber(peer.netRate || peer.rate);
+        return goods !== null && quantity !== null && rate !== null && goods > amount &&
+          Math.round(goods * 100) === Math.round(quantity * rate * 100);
+      });
+    if (numberedRows.has(signature) || isTaxFooterCopy) {
       duplicates.add(index);
       duplicatePaise += paise;
     }

@@ -873,6 +873,7 @@ async function POSTHandler(request: Request) {
         });
         if (billPolicyError) return skipTransaction(transaction, billPolicyError);
         if (
+          billAllocations.some(row => /^agst ref$/i.test(row.referenceType) && row.referenceName.trim().toUpperCase() === "TDS") ||
           (counterpartyIsPartyLedger && billAllocations.length > 0 && Math.abs(billAllocationTotal(billAllocations) - amount) >= 0.005) ||
           (!counterpartyIsPartyLedger && billAllocations.length > 0)
         ) {

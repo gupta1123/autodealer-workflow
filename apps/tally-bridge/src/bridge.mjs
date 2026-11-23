@@ -17,7 +17,7 @@ import { cashDiscountReadContext, checkReadBudget, readBoundedXml, createTallySc
   CASH_DISCOUNT_RESULT_BYTES, cancelCashDiscountRead, shouldPauseAfterReadFailure } from "./cash-discount-runtime.mjs";
 import { createLocalAgentRuntime } from "./agent/runtime.mjs";
 import { RECEIVABLE_RECONCILIATION_VERSION } from "./agent/receivables.mjs";
-import { billFields, voucherFields, openBillAmountIndexFromFields, openBillFromFields, openBillsByLedgerFromFields } from "./agent/receivable-fields.mjs";
+import { isBankTdsBill, billFields, voucherFields, openBillAmountIndexFromFields, openBillFromFields, openBillsByLedgerFromFields } from "./agent/receivable-fields.mjs";
 import { buildLiveCashDiscountDashboard } from "./collections-analysis/cash-discount-live-dashboard.mjs";
 import { collectionPaymentRequirement } from "./collections-analysis/payment-terms.mjs";
 import { businessDateText } from "./collections-analysis/business-date.mjs";
@@ -3139,7 +3139,7 @@ async function validateBankVoucherBillAllocationsLive(config, payloads, companyN
       throw new Error(`Open bills for '${ledgerName}' could not be verified immediately before posting.`);
     }
     const billByReference = new Map(
-      bucket.openBills.map((bill) => [normalizeExactReference(bill.referenceName || bill.voucherNumber), bill])
+      bucket.openBills.filter(bill => !isBankTdsBill(bill)).map((bill) => [normalizeExactReference(bill.referenceName || bill.voucherNumber), bill])
     );
     for (const allocation of payload.billAllocations) {
       if (!/^agst\s+ref$/i.test(String(allocation?.referenceType || "").trim())) continue;
@@ -3571,7 +3571,7 @@ export function buildOpenBillAmountIndex(billXml) {
   for (const block of extractBlocks(billXml, "BILL")) {
     const ledgerName = billLedgerName(block);
     const bill = ledgerName ? toOpenBill(block, ledgerName) : null;
-    if (!bill || bill.kind !== "bill") continue;
+    if (!bill || bill.kind !== "bill" || isBankTdsBill(bill)) continue;
     const closing = parseTallyAmount(getTagText(block, "CLOSINGBALANCE")) ??
       parseTallyAmount(getTagText(block, "PENDINGAMOUNT")) ?? parseTallyAmount(getTagText(block, "AMOUNT"));
     if (!closing) continue;

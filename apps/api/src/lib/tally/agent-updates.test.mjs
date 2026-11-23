@@ -17,5 +17,5 @@ test("Local Agent update metadata compares semantic versions and builds a direct
   const info = exports.localAgentUpdateInfo("1.0.0");
   assert.equal(info.updateAvailable, true);
   assert.equal(info.updateRequired, false);
-  assert.match(info.downloadUrl, /releases\/download\/v1\.2\.48\/KalikaLocalAgent-1\.2\.48-x64\.exe$/);
+  assert.match(info.downloadUrl, /releases\/download\/v1\.2\.49\/KalikaLocalAgent-1\.2\.49-x64\.exe$/);
 });

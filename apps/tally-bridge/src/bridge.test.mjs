@@ -67,6 +67,7 @@ test("shared-folder purchase PDFs are named <Supplier> <Invoice No>.pdf and fill
 test("bank lines match parties by an open bill of the same amount and direction", () => {
   const bill = (ledger, name, closing) => `<BILL NAME="${name}"><LEDGERNAME>${ledger}</LEDGERNAME><BILLDATE>20260502</BILLDATE><OPENINGBALANCE>${closing}</OPENINGBALANCE><CLOSINGBALANCE>${closing}</CLOSINGBALANCE></BILL>`;
   const index = buildOpenBillAmountIndex([
+    bill("TDS only", " tDs ", "-1231200.00"),
     bill("Apex Rebar Projects", "INV/1", "-1231200.00"),   // receivable
     bill("Balaji Rebar Projects", "INV/2", "-50000.50"),   // receivable
     bill("Surya Steel Trading Co", "SSTC/9", "484206.40"), // payable
