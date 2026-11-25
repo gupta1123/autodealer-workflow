@@ -3,6 +3,7 @@ import test from "node:test";
 import { createServer } from "node:http";
 
 import {
+  downloadTrustedDocument,
   buildCollectionExportXml,
   collectCashDiscountCustomerEvidence,
   buildBankVoucherBatchXml,
@@ -1394,4 +1395,29 @@ test("purchase godowns come from the last list while Tally is busy or the read f
   assert.deepEqual(afterFailure, live);
   const noneYet = await purchaseGodownsForCatalogue({ companyName: "Kalika Godown Other", fetchLive: async () => { throw new Error("timed out"); }, now });
   assert.deepEqual(noneYet, [], "an optional list never fails the screen");
+});
+
+test("purchase PDF downloads accept 50 MiB and reject larger declared or streamed files", async () => {
+  const limit = 50 * 1024 * 1024;
+  const chunk = Buffer.alloc(1024 * 1024);
+  const server = createServer((request, response) => {
+    if (request.url === "/declared-over") {
+      response.writeHead(200, { "Content-Length": limit + 1 });
+      response.end();
+      return;
+    }
+    if (request.url === "/at-limit") response.setHeader("Content-Length", limit);
+    for (let i = 0; i < 50; i++) response.write(chunk);
+    response.end(request.url === "/streamed-over" ? "x" : undefined);
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const url = "http://127.0.0.1:" + server.address().port;
+    assert.equal((await downloadTrustedDocument(url + "/at-limit")).length, limit);
+    for (const route of ["/declared-over", "/streamed-over"]) {
+      await assert.rejects(downloadTrustedDocument(url + route), /50 MiB connector limit/);
+    }
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
 });

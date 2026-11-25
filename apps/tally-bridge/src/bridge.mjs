@@ -71,7 +71,7 @@ const INSTALLATION_ID_PATH = path.join(CONFIG_DIR, "installation-id");
 const LEGACY_CONFIG_PATH = path.join(LEGACY_CONFIG_DIR, "config.json");
 const LEGACY_INSTALLATION_ID_PATH = path.join(LEGACY_CONFIG_DIR, "installation-id");
 const MAX_NATIVE_DEBIT_NOTE_PDF_BYTES = 5 * 1024 * 1024;
-const MAX_PURCHASE_SOURCE_PDF_BYTES = 25 * 1024 * 1024;
+const MAX_PURCHASE_SOURCE_PDF_BYTES = 50 * 1024 * 1024;
 const PURCHASE_DOCUMENT_UDFS = {
   path: { name: "KalikaSourceDocumentPath", index: 30001 },
   name: { name: "KalikaSourceDocumentName", index: 30002 },
@@ -7300,7 +7300,7 @@ function safeDocumentPathSegment(value, fallback) {
   return sanitized || fallback;
 }
 
-function downloadTrustedDocument(url, { timeoutMs = 60_000, redirectCount = 0 } = {}) {
+export function downloadTrustedDocument(url, { timeoutMs = 60_000, redirectCount = 0 } = {}) {
   return new Promise((resolve, reject) => {
     let parsedUrl;
     try {
@@ -7338,7 +7338,7 @@ function downloadTrustedDocument(url, { timeoutMs = 60_000, redirectCount = 0 } 
       const declaredLength = Number(response.headers["content-length"] || 0);
       if (declaredLength > MAX_PURCHASE_SOURCE_PDF_BYTES) {
         response.destroy();
-        reject(new Error("The source invoice PDF is larger than the 25 MB connector limit."));
+        reject(new Error("The source invoice PDF is larger than the 50 MiB connector limit."));
         return;
       }
 
@@ -7347,7 +7347,7 @@ function downloadTrustedDocument(url, { timeoutMs = 60_000, redirectCount = 0 } 
       response.on("data", (chunk) => {
         receivedBytes += chunk.length;
         if (receivedBytes > MAX_PURCHASE_SOURCE_PDF_BYTES) {
-          response.destroy(new Error("The source invoice PDF is larger than the 25 MB connector limit."));
+          response.destroy(new Error("The source invoice PDF is larger than the 50 MiB connector limit."));
           return;
         }
         chunks.push(chunk);
@@ -7385,7 +7385,7 @@ async function saveToSharedPurchaseFolder(payload, folder, downloadUrl, document
   if (!/^https?:\/\//i.test(downloadUrl)) throw new Error("Purchase source document does not have a valid download URL.");
   const bytes = await downloadTrustedDocument(downloadUrl);
   if (bytes.length === 0 || bytes.length > MAX_PURCHASE_SOURCE_PDF_BYTES) {
-    throw new Error("The source invoice PDF is empty or larger than the 25 MB connector limit.");
+    throw new Error("The source invoice PDF is empty or larger than the 50 MiB connector limit.");
   }
   if (bytes.subarray(0, 5).toString("ascii") !== "%PDF-") throw new Error("The downloaded source invoice is not a valid PDF.");
   const sha256 = createHash("sha256").update(bytes).digest("hex").toUpperCase();
@@ -7469,7 +7469,7 @@ async function materializePurchaseSourceDocument(payload) {
 
   const bytes = await downloadTrustedDocument(downloadUrl);
   if (bytes.length === 0 || bytes.length > MAX_PURCHASE_SOURCE_PDF_BYTES) {
-    throw new Error("The source invoice PDF is empty or larger than the 25 MB connector limit.");
+    throw new Error("The source invoice PDF is empty or larger than the 50 MiB connector limit.");
   }
   if (bytes.subarray(0, 5).toString("ascii") !== "%PDF-") {
     throw new Error("The downloaded source invoice is not a valid PDF.");
