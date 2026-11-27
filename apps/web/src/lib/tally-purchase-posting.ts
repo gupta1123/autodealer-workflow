@@ -103,6 +103,7 @@ export type TallyPostingReview = {
 };
 
 export type TallyPostingResponse = {
+  supportsLedgerEdits?: boolean;
   liveMatchingComplete?: boolean;
   supplierLedgerMatch?: SupplierLedgerMatch;
   lineMasterMatches?: PurchaseLineMasterSuggestion[];
@@ -797,17 +798,44 @@ export async function fetchTallyPurchasePosting(
   return readResponse(response, "Failed to load Tally posting review.");
 }
 
+// A sparse edit is safe only when all other values belong to the saved revision.
+export function ledgerChanges(base: TallyPostingReview, next: TallyPostingReview) {
+  const fields: Record<string, string> = {};
+  const lines: Array<{ lineId: string; purchaseLedgerName: string }> = [];
+  if (base.lines.length !== next.lines.length) return null;
+  for (const key of Object.keys(next) as Array<keyof TallyPostingReview>) {
+    if (key === "lines" || base[key] === next[key]) continue;
+    const value = next[key];
+    if (key.endsWith("LedgerName") && typeof value === "string") fields[key] = value;
+    else if (JSON.stringify(base[key]) !== JSON.stringify(value)) return null;
+  }
+  for (const [index, line] of next.lines.entries()) {
+    const previous = base.lines[index];
+    if (previous === line) continue;
+    for (const key of Object.keys(line) as Array<keyof typeof line>) {
+      if (line[key] === previous[key]) continue;
+      if (key !== "purchaseLedgerName") return null;
+      lines.push({ lineId: line.lineId, purchaseLedgerName: line.purchaseLedgerName });
+    }
+  }
+  if (!Object.keys(fields).length && !lines.length) return null;
+  return { ...fields, ...(lines.length ? { lines } : {}) };
+}
+
 export async function saveTallyPurchasePosting(
   caseId: string,
   review: TallyPostingReview,
   connectionId: string,
   companyName: string,
-  liveMasters?: unknown
+  liveMasters?: unknown,
+  expectedRevision?: number,
+  base?: TallyPostingReview | null
 ) {
+  const delta = base && ledgerChanges(base, review);
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ review, connectionId, companyName, liveMasters, compactResponse: true }),
+    body: JSON.stringify({ review: delta || review, ledgerEdit: Boolean(delta), expectedRevision, connectionId, companyName, liveMasters, compactResponse: true }),
   });
   return readResponse(response, "Failed to save Tally posting review.");
 }
@@ -841,7 +869,8 @@ export async function approveAndQueueTallyPurchasePosting(
   connectionId?: string | null,
   companyName?: string | null,
   liveMasters?: unknown,
-  workflowRevision?: number
+  workflowRevision?: number,
+  expectedRevision?: number
 ) {
   const response = await apiFetch(`/api/cases/${caseId}/tally-posting`, {
     method: "POST",
@@ -849,6 +878,7 @@ export async function approveAndQueueTallyPurchasePosting(
     body: JSON.stringify({
       action: "approve_and_queue",
       workflowRevision,
+      expectedRevision,
       acknowledgedWarningCodes,
       allowedBlockerKeys,
       connectionId,

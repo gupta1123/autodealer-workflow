@@ -4,7 +4,7 @@ import {CASE_LIST_COLUMNS,CASE_LIST_META_KEYS,restoreCaseListMetadata,makeCaseCu
 const row={id:'12345678-1234-1234-1234-123456789abc',created_at:'2026-09-04T12:00:00Z',deleted_at:'2026-09-05T12:00:00Z',display_name:'A, ("B")'};
 test('directory projection excludes full processing metadata and preserves presentation inputs',()=>{
   assert.ok(!CASE_LIST_COLUMNS.split(',').includes('processing_meta'));
-  const meta={caseCategory:'Goods',packetCategory:'Other',documentTypes:['invoice'],termsComplianceMismatchMode:'old',termsComplianceChecklist:[{status:'unknown',severity:'high'}],recycleBin:{deletedAt:row.deleted_at}};
+  const meta={caseCategory:'Goods',packetCategory:'Other',documentTypes:['invoice'],termsComplianceMismatchMode:'old',termsComplianceChecklist:[{status:'unknown',severity:'high'}],recycleBin:{deletedAt:row.deleted_at},uploadBatch:{id:row.id,position:2,total:3}};
   const projected={...row,...Object.fromEntries(CASE_LIST_META_KEYS.map(k=>[`list_${k}`,meta[k]]))};
   assert.deepEqual(restoreCaseListMetadata(projected).processing_meta,meta);
   assert.deepEqual(restoreCaseListMetadata({...row,processing_meta:meta}).processing_meta,meta);

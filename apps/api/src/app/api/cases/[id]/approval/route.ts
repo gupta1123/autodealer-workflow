@@ -32,7 +32,7 @@ export async function POST(request: Request, ctx: { params: Promise<{ id: string
     if (access.purchaseApprovalRequired === false) throw new AccessError('Separate purchase approval is disabled for this organization.', 409);
     // Preparation is read from saved business records. Never approve a client-supplied digest.
     const [docs, posting] = await Promise.all([
-      db.from('packet_documents').select('id,document_type,extracted_fields').eq('case_id', id),
+      db.from('packet_documents').select('id,document_type,extracted_fields,markdown').eq('case_id', id),
       db.from('purchase_invoice_tally_postings').select('review_patch,connection_id,status').eq('case_id', id).maybeSingle(),
     ]);
     if (docs.error || posting.error) throw new AccessError('Could not read the current purchase revision.', 503);

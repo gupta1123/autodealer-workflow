@@ -8,12 +8,13 @@ import {canAccess} from '../../../../../packages/shared/src/lib/access.ts';
 // Exercise the real catalogue-loading effect, including its asynchronous calls.
 const source=await readFile(new URL('./TallyPurchasePostingPanel.tsx',import.meta.url),'utf8');
 const ast=ts.createSourceFile('panel.tsx',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);
-let effect, suggestionEffect;
+let effect, suggestionEffect, persistReview;
 const expressions={};
 function visit(node){
+ if(ts.isFunctionDeclaration(node) && node.name?.text === "persistReview") persistReview = node.getText(ast);
  if(ts.isCallExpression(node)&&node.expression.getText(ast)==='useEffect'&&node.arguments[0]?.getText(ast).includes('operation: "ledger_suggestions"'))suggestionEffect=node.arguments[0].getText(ast);
  if(ts.isCallExpression(node)&&node.expression.getText(ast)==='useEffect'&&node.arguments[0]?.getText(ast).includes('automaticLiveRefreshRef.current === caseId'))effect=node.arguments[0].getText(ast);
- if(ts.isVariableDeclaration(node)&&['locked','canApprove'].includes(node.name.getText(ast)))expressions[node.name.getText(ast)]=node.initializer.getText(ast);
+ if(ts.isVariableDeclaration(node)&&['locked','canApprove','canOpenConfirmation'].includes(node.name.getText(ast)))expressions[node.name.getText(ast)]=node.initializer.getText(ast);
  ts.forEachChild(node,visit);
 }
 visit(ast);assert(effect,'Catalogue effect must exist.');
@@ -115,4 +116,37 @@ test('an interrupted initial load releases its guard so a replacement can finish
  cleanup();assert.equal(context.automaticLiveRefreshRef.current,null);
  context.exports.run();assert.deepEqual(calls,['load-review','load-review']);
  release(null);for(let i=0;i<4;i++)await new Promise(resolve=>setImmediate(resolve));
+});
+
+test('a pending save keeps later picks on screen and permits preview without final approval', async () => {
+  let complete;
+  const first = {supplierLedgerName: 'A'}, latest = {supplierLedgerName: 'B'};
+  const saved = {review:first, posting:{caseId:'case',revision:1,connectionId:'pc',companyName:'company'}};
+  const noop = () => {};
+  const ctx = {
+    exports:{}, caseId:'case', selectedConnectionId:'pc', selectedCompanyName:'company', locked:false,
+    saveInFlight:{current:false}, discreteEdit:{current:true}, savedReviewRef:{current:null},
+    currentReviewRef:{current:first}, autoSaveFailedReviewRef:{current:null},
+    setSaving:noop, setError:noop, setSelectedConnectionId:noop, setSelectedCompanyName:noop,
+    setConnectionDirty:noop, setDirty:noop, setNotice:noop, setPayload:noop,
+    setReview:() => assert.fail('Stale save replaced the newer selection'),
+    withSelectedLiveMasters:noop, withLiveMasterOptions:x=>x, liveMasterResultRef:{}, liveMasterOptionsRef:{},
+    payload:saved, connectionDirty:false, approval:{required:false,enabled:false},
+    saveTallyPurchasePosting:()=>new Promise(resolve=>{complete=resolve;}),
+    hasUnsavedChanges:true, canSave:true, postingLocked:false, effectivelyReadyForApproval:true,
+    tallyReviewRefreshing:false, connectionReadable:true, selectedMatchesActive:true,
+  };
+  vm.runInNewContext(ts.transpileModule(persistReview+';exports.save=persistReview', {
+    compilerOptions:{target:ts.ScriptTarget.ES2022},
+  }).outputText,ctx);
+  const pending = ctx.exports.save(first);
+  ctx.currentReviewRef.current = latest;
+  await ctx.exports.save(latest);
+  ctx.canApprove=vm.runInNewContext(expressions.canApprove,ctx);
+  assert.equal(ctx.canApprove,false);
+  assert.equal(vm.runInNewContext(expressions.canOpenConfirmation,ctx),true);
+  complete(saved);
+  await pending;
+  assert.equal(ctx.saveInFlight.current,false);
+  assert.equal(ctx.currentReviewRef.current,latest);
 });

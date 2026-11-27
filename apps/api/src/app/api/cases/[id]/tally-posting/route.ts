@@ -23,6 +23,7 @@ import {
   compactPurchasePostingReview,
   dedupeLedgerMasters,
   getCanonicalInvoiceDocuments,
+  getPurchaseInvoiceCandidates, selectPurchaseInvoice,
   normalizePurchasePostingDate,
   normalizePurchaseDuplicatePart,
   preparePurchasePosting,
@@ -223,6 +224,17 @@ function getSourceFile(
   return files.length === 1 ? files[0] : null;
 }
 
+function sourceReference(caseId: string, sourceFile: { id: string } | null) {
+  const webBase = String(
+    process.env.WEB_BASE_URL ||
+    process.env.NEXT_PUBLIC_WEB_BASE_URL ||
+    "http://localhost:3000"
+  ).replace(/\/$/, "");
+  return sourceFile
+    ? `${webBase}/cases/${caseId}?sourceFileId=${encodeURIComponent(sourceFile.id)}`
+    : null;
+}
+
 function duplicateKey(companyName: string, supplierGstin: string, invoiceNumber: string) {
   const raw = [companyName, supplierGstin, invoiceNumber]
     .map(normalizePurchaseDuplicatePart)
@@ -309,6 +321,7 @@ function asSavedReview(value: unknown): Partial<PurchasePostingReview> | null {
       "unit",
       "rate",
       "taxableAmount",
+      "taxRate",
       "stockItemName",
       "purchaseLedgerName",
       "godownName",
@@ -808,14 +821,7 @@ async function loadContext(
     files,
     asSavedReview(posting?.review_patch)?.selectedInvoiceDocumentId
   );
-  const webBase = String(
-    process.env.WEB_BASE_URL ||
-    process.env.NEXT_PUBLIC_WEB_BASE_URL ||
-    "http://localhost:3000"
-  ).replace(/\/$/, "");
-  const sourceDocumentReference = sourceFile
-    ? `${webBase}/cases/${caseId}?sourceFileId=${encodeURIComponent(sourceFile.id)}`
-    : null;
+  const sourceDocumentReference = sourceReference(caseId, sourceFile);
 
   return {
     supabase,
@@ -862,6 +868,14 @@ async function hasDuplicateClaim(params: {
   return (data ?? []).length > 0;
 }
 
+function selectedDocument(context: LoadedContext, review?: Partial<PurchasePostingReview> | null) {
+  const invoices = getCanonicalInvoiceDocuments(context.documents);
+  const gstin = context.liveCompanyProfile?.gstin ?? "";
+  const candidates = getPurchaseInvoiceCandidates(invoices, gstin);
+  const { selectedCandidate } = selectPurchaseInvoice(invoices, candidates, gstin, review?.selectedInvoiceDocumentId);
+  return invoices.find(doc => doc.id === selectedCandidate?.documentId);
+}
+
 function prepareLoadedContext(
   context: LoadedContext,
   savedReview: Partial<PurchasePostingReview> | null | undefined,
@@ -871,19 +885,9 @@ function prepareLoadedContext(
   const activeCompanyName = context.connectionStatus?.lastCompanyName ?? "";
   const companyGstin = context.liveCompanyProfile?.gstin ?? "";
   const masterSnapshotComplete = hasCompleteMasterSnapshot(context);
-  const selectedSourceFile = getSourceFile(
-    context.documents,
-    context.files,
-    savedReview?.selectedInvoiceDocumentId
-  );
-  const webBase = String(
-    process.env.WEB_BASE_URL ||
-    process.env.NEXT_PUBLIC_WEB_BASE_URL ||
-    "http://localhost:3000"
-  ).replace(/\/$/, "");
-  const selectedSourceReference = selectedSourceFile
-    ? `${webBase}/cases/${context.caseRow.id}?sourceFileId=${encodeURIComponent(selectedSourceFile.id)}`
-    : null;
+  const selected = selectedDocument(context, savedReview);
+  const selectedSourceFile = selected ? getSourceFile(context.documents, context.files, selected.id) : null;
+  const selectedSourceReference = sourceReference(context.caseRow.id, selectedSourceFile);
   return preparePurchasePosting({
     documents: context.documents,
     masters: context.masters,
@@ -918,10 +922,7 @@ async function prepareContext(
   options: { checkDuplicate?: boolean } = {}
 ) {
   const companyGstin = context.liveCompanyProfile?.gstin ?? "";
-  const canonicalInvoices = getCanonicalInvoiceDocuments(context.documents);
-  const source = canonicalInvoices.find((candidate) =>
-    savedReview?.selectedInvoiceDocumentId === candidate.id
-  ) ?? canonicalInvoices[0];
+  const source = selectedDocument(context, savedReview);
   const sourceFields = source?.extracted_fields && typeof source.extracted_fields === "object"
     ? source.extracted_fields as Record<string, unknown>
     : {};
@@ -955,6 +956,7 @@ function responseBody(
   // A verified voucher is an immutable accounting result. Normal GETs do not
   // include the ephemeral live-master catalogue, so revalidating the frozen
   // selections would incorrectly report every selected master as missing.
+  const previewFile = prepared.source ? getSourceFile(context.documents, context.files, prepared.source.documentId) : null;
   const postingVerified = context.posting?.status === "created";
   const blockers = postingVerified ? [] : prepared.blockers;
   const warnings = postingVerified ? [] : prepared.warnings;
@@ -1015,8 +1017,8 @@ function responseBody(
       companyGstin: context.liveCompanyProfile?.gstin ?? null,
       companyStateCode: context.liveCompanyProfile?.stateCode ?? null,
     } : null,
-    sourceFileId: context.sourceFileId,
-    sourceDocumentReference: context.sourceDocumentReference,
+    sourceFileId: previewFile?.id ?? null,
+    sourceDocumentReference: sourceReference(context.caseRow.id, previewFile),
     accountingSettings: context.purchaseAccountingSettings,
     source: prepared.source,
     review: prepared.review,
@@ -1137,15 +1139,54 @@ async function PATCHHandler(request: Request, contextParam: { params: Promise<{ 
     if (!context.connection) {
       return jsonWithCors(request, { error: "Select the exact Tally company before saving this review." }, { status: 409 });
     }
+    if (body.expectedRevision !== undefined && body.expectedRevision !== (context.posting?.revision ?? 0)) {
+      return jsonWithCors(request, { error: "The saved voucher changed. Reopen it before editing." }, { status: 409 });
+    }
+    const ledgerEdit = body.ledgerEdit === true;
+    let reviewToPrepare = requestedReview;
+    if (ledgerEdit) {
+      if (!context.posting || body.expectedRevision !== context.posting.revision ||
+          requestedConnectionId !== context.posting.connection_id || requestedCompanyName !== context.selectedCompanyName ||
+          (context.posting.review_patch.postingCompanyId ?? null) !== context.postingCompanyId) {
+        return jsonWithCors(request, { error: "Reopen the voucher in the selected company." }, { status: 409 });
+      }
+      if (Object.keys(requestedReview).some(key => key !== "lines" && !key.endsWith("LedgerName")) ||
+          requestedReview.lines?.some(line => Object.keys(line).some(key => key !== "lineId" && key !== "purchaseLedgerName"))) {
+        return jsonWithCors(request, { error: "Invalid ledger edit." }, { status: 400 });
+      }
+      const saved = asSavedReview(context.posting.review_patch) ?? {};
+      const lines = new Map(saved.lines?.map(line => [line.lineId, line]));
+      for (const line of requestedReview.lines ?? []) {
+        lines.set(line.lineId, { ...lines.get(line.lineId), ...line });
+      }
+      reviewToPrepare = { ...saved, ...requestedReview, lines: Array.from(lines.values()) };
+    }
     const [defaultsResult, preliminaryResult] = await Promise.all([
-      prepareContext(context, user.id, undefined, { checkDuplicate: false }),
-      prepareContext(context, user.id, requestedReview),
+      ledgerEdit ? null : prepareContext(context, user.id, undefined, { checkDuplicate: false }),
+      prepareContext(context, user.id, reviewToPrepare),
     ]);
-    const mappingProposals = purchaseMappingProposals(
-      context,
-      requestedReview,
-      preliminaryResult.prepared
-    );
+    const validated = preliminaryResult.prepared.review;
+    if (ledgerEdit && (!validated || Object.entries(requestedReview).some(([key, value]) =>
+      key !== "lines" && validated[key as keyof PurchasePostingReview] !== value
+    ) || requestedReview.lines?.some(line => !validated?.lines.some(current =>
+      current.lineId === line.lineId && current.purchaseLedgerName === line.purchaseLedgerName
+    )))) {
+      return jsonWithCors(request, { error: "The selected ledger or invoice line is unavailable. Refresh the voucher." }, { status: 409 });
+    }
+    const mappingReview = ledgerEdit && validated ? {
+      ...requestedReview, supplierGstin: validated.supplierGstin, supplierName: validated.supplierName,
+      gstRate: validated.gstRate, tcsReceivable: validated.tcsReceivable,
+      lines: requestedReview.lines?.map(line => {
+        const source = validated.lines.find(current => current.lineId === line.lineId)!;
+        return { ...line, hsn: source.hsn, description: source.description };
+      }),
+    } : requestedReview;
+    const mappingProposals = purchaseMappingProposals(context, mappingReview, preliminaryResult.prepared)
+      .filter(proposal => !context.mappings.some(existing =>
+        existing.status === "active" && existing.mapping_type === proposal.mapping_type &&
+        existing.source_key === proposal.source_key && existing.target_master_key === proposal.target_master_key &&
+        existing.target_master_name === proposal.target_master_name
+      ));
     const proposalKeys = new Set(
       mappingProposals.map((mapping) => `${mapping.mapping_type}:${normalizeCompanyName(mapping.source_key)}`)
     );
@@ -1158,10 +1199,9 @@ async function PATCHHandler(request: Request, contextParam: { params: Promise<{ 
         ),
       ],
     };
-    const defaults = defaultsResult.prepared;
     const duplicate = preliminaryResult.duplicate;
     const prepared = mappingProposals.length > 0
-      ? prepareLoadedContext(effectiveContext, requestedReview, preliminaryResult.duplicateExists)
+      ? prepareLoadedContext(effectiveContext, reviewToPrepare, preliminaryResult.duplicateExists)
       : preliminaryResult.prepared;
     if (!prepared.source || !prepared.review) {
       return jsonWithCors(request, responseBody(context, prepared, {
@@ -1182,7 +1222,7 @@ async function PATCHHandler(request: Request, contextParam: { params: Promise<{ 
       duplicate_key: duplicate,
       idempotency_key: null,
       review_patch: {
-        ...compactPurchasePostingReview(defaults.review, prepared.review),
+        ...(ledgerEdit ? reviewToPrepare : compactPurchasePostingReview(defaultsResult?.prepared.review ?? null, prepared.review)),
         ...(context.postingCompanyId ? { postingCompanyId: context.postingCompanyId } : {}),
       },
       approved_payload_hash: null,
@@ -1196,14 +1236,19 @@ async function PATCHHandler(request: Request, contextParam: { params: Promise<{ 
           .from("purchase_invoice_tally_postings")
           .update(row)
           .eq("id", context.posting.id)
+          .eq("revision", context.posting.revision)
+          .eq("status", context.posting.status)
           .eq("owner_user_id", user.id)
           .select("*")
-          .single()
+          .maybeSingle()
       : await context.supabase
           .from("purchase_invoice_tally_postings")
           .insert(row)
           .select("*")
           .single();
+    if (result.error?.code === "23505" || (!result.error && !result.data)) {
+      return jsonWithCors(request, { error: "Another save changed this voucher. Reopen it before editing." }, { status: 409 });
+    }
     if (result.error) throw result.error;
     if (mappingProposals.length > 0) {
       const { error: mappingError } = await context.supabase
@@ -1227,22 +1272,20 @@ async function PATCHHandler(request: Request, contextParam: { params: Promise<{ 
       if (mappingError) throw mappingError;
     }
     const posting = result.data as PostingRow;
-    const refreshed = await loadContext(request,
-      id,
-      user.id,
-      posting.connection_id,
-      context.selectedCompanyName,
-      body.liveMasters
-    );
-    const refreshedPrepared = prepareLoadedContext(
-      refreshed,
-      asSavedReview(posting.review_patch),
-      preliminaryResult.duplicateExists
-    );
+    const saved = asSavedReview(posting.review_patch);
+    const selectedFile = getSourceFile(context.documents, context.files, saved?.selectedInvoiceDocumentId);
+    const refreshed = {
+      ...effectiveContext,
+      posting,
+      sourceFileId: selectedFile?.id ?? null,
+      sourceDocumentReference: sourceReference(id, selectedFile),
+    };
+    const refreshedPrepared = ledgerEdit ? prepared : prepareLoadedContext(refreshed, saved, preliminaryResult.duplicateExists);
     return jsonWithCors(request, {
       ...responseBody(refreshed, refreshedPrepared, {
         includeMasterOptions: body.compactResponse !== true,
       }),
+      supportsLedgerEdits: true,
       liveMatchingComplete: Boolean(body.liveMasters),
     });
   } catch (error) {
@@ -1490,6 +1533,9 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
     if (!context.posting) {
       return jsonWithCors(request, { error: "Save the Tally review before approving it." }, { status: 409 });
     }
+    if (body.expectedRevision !== undefined && body.expectedRevision !== context.posting.revision) {
+      return jsonWithCors(request, { error: "The reviewed voucher changed. Reopen it before approving." }, { status: 409 });
+    }
     if (["queued", "creating", "created"].includes(context.posting.status)) {
       const { prepared } = await prepareContext(context, user.id, asSavedReview(context.posting.review_patch));
       return jsonWithCors(request, responseBody(context, prepared, {
@@ -1519,7 +1565,7 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
       `${blocker.code}:${blocker.lineId ?? blocker.scope}`;
     // The reviewer must complete the reference or explicitly turn off recording.
     for (const blocker of prepared.blockers) {
-      if (blocker.code.startsWith("EWAY_BILL_")) allowedBlockerKeys.delete(blockerKey(blocker));
+      if (blocker.code.startsWith("EWAY_BILL_") || blocker.code === "POSSIBLE_DUPLICATE_LINE") allowedBlockerKeys.delete(blockerKey(blocker));
     }
     const allowedBlockers = prepared.blockers.filter((blocker) => allowedBlockerKeys.has(blockerKey(blocker)));
     const unallowedBlockers = prepared.blockers.filter((blocker) => !allowedBlockerKeys.has(blockerKey(blocker)));
@@ -1562,9 +1608,7 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
 
     const now = new Date().toISOString();
     const idem = idempotencyKey(id, context.posting.revision, duplicate);
-    const sourceFile = context.sourceFileId
-      ? context.files.find((file) => file.id === context.sourceFileId) ?? null
-      : null;
+    const sourceFile = getSourceFile(context.documents, context.files, prepared.source.documentId);
     let sourceDocument: {
       id: string;
       name: string;
@@ -1660,7 +1704,7 @@ async function POSTHandler(request: Request, contextParam: { params: Promise<{ i
       ? await context.supabase.rpc('access_enqueue_purchase', {
           p_actor: user.id, p_org: team.access.organizationId, p_case: id,
           p_workflow_revision: body.workflowRevision ?? 0, p_source_revision: team.scope.source_revision,
-          p_financial_digest: purchaseFinancialDigest(context.documents.map(({id,document_type,extracted_fields}) => ({id,document_type,extracted_fields})), context.posting.review_patch, { companyId: team.scope.company_id, connectionId: context.connection.id }),
+          p_financial_digest: purchaseFinancialDigest(context.documents.map(({id,document_type,extracted_fields,markdown}) => ({id,document_type,extracted_fields,markdown})), context.posting.review_patch, { companyId: team.scope.company_id, connectionId: context.connection.id }),
           p_args: queueArgs,
         })
       : await context.supabase.rpc('queue_purchase_invoice_tally_posting', queueArgs);

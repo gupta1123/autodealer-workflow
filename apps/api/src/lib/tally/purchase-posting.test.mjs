@@ -1836,3 +1836,45 @@ test("only a linked bill and matching receipt can contribute transport details",
   assert.equal(match.transportDocumentNumber, "01833");
   assert.equal(match.transportMode, "1 - Road");
 });
+
+test("Bramha 399 copy fields resolve to one posted line, and genuine continuation quantities survive", () => {
+  const rawText = "1 M.S.Scrap TURNING 72044900 8.245 M.Ton 35,300.00 M.Ton 2,91,048.50";
+  const goods = { lineNumber:"1", itemCode:"TURNING", description:"M.S.Scrap", hsnSac:"72044900",
+    quantity:"8.245", unit:"MT", rate:"35300", taxableAmount:"291048.50", rawText, sourcePage:1 };
+  const copy = {...goods, sourcePage:2, description:"M.S.Scrap TURNING", netRate:"35300", itemCode:"Total 8.245 M.Ton 3,43,437.00"};
+  const document = invoiceDocument({lines:[goods,copy], totalAmount:"343437",taxAmount:"52388.74",tdsAmount:""});
+  const body = "Tax invoice BE/2026-27/399 date 26-Nov-2026 supplier Bramha Enterprises buyer Kalika Steel Alloys address place of supply Maharashtra ship to factory registered office additional industrial area state code twenty seven goods dispatched by road against purchase order " + rawText;
+  document.markdown = "### Page 1\nORIGINAL FOR RECIPIENT\n"+body+"\n### Page 2\nDUPLICATE FOR TRANSPORTER\n"+body;
+  document.extracted_fields.totalTaxableAmount = "291048.50";
+  document.extracted_fields.roundOffAmount = "-0.24";
+  document.extracted_fields.cgstTdsAmount = "";
+  document.extracted_fields.sgstTdsAmount = "";
+  const result = prepare(document);
+  assert.equal(result.source.lines.length,1);
+  assert.equal(result.tallyPayload.items.length,1);
+  assert.equal(Number(result.calculation.basicAmount),291048.5);
+  assert.equal(Number(result.calculation.totalDifference),0);
+  document.extracted_fields.totalTaxableAmount = "582097";
+  assert.equal(prepare(document).tallyPayload.items.length,2);
+  document.extracted_fields.totalTaxableAmount = "291048.50";
+  document.markdown = "### Page 1\nFirst page\n### Page 2\nContinuation";
+  const ambiguous = prepare(document);
+  assert(ambiguous.blockers.some(b=>b.code==="POSSIBLE_DUPLICATE_LINE" && b.message.includes("page 2")));
+});
+
+test("upstream-only packets cannot post and two downstream invoices require selection", () => {
+  const mother = invoiceDocument({id:"mother",buyerGstin:"27CCCCC0000C1Z5"});
+  mother.extracted_fields.shipToGstin = maharashtraBuyerGstin;
+  const only = prepare(mother,{companyGstin:maharashtraBuyerGstin});
+  assert.equal(only.tallyPayload,null);
+  assert(only.blockers.some(b=>b.message.includes("missing")));
+  const a = invoiceDocument({id:"a"}), b = invoiceDocument({id:"b"});
+  a.extracted_fields.invoiceNumber="PART-A";
+  b.extracted_fields.invoiceNumber="PART-B";
+  mother.extracted_fields.totalTaxableAmount="20000";
+  const options={companyGstin:maharashtraBuyerGstin,supportingDocuments:[a,b]};
+  assert.equal(prepare(mother,options).tallyPayload,null);
+  const chosen=prepare(mother,{...options,savedReview:{selectedInvoiceDocumentId:"b"}});
+  assert.equal(chosen.tallyPayload.supplierInvoiceNumber,"PART-B");
+  assert.equal(Number(chosen.calculation.basicAmount),1000);
+});

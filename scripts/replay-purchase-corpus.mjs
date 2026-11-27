@@ -102,5 +102,16 @@ for (const [number, basic, cgst, total] of [
   assert.ok(!result.blockers.includes("LINE_TAXABLE_MISMATCH"));
   assert.ok(!result.blockers.includes("GST_RATE_REQUIRED"));
 }
+// Both suppliers printed the two 9% components independently rounded to paise.
+for (const [invoice, half, total] of [["1485/2026-27", 87162.08, 1142792], ["1482/2026-27", 99002.48, 1298032]]) {
+  const [id, result] = findInvoice(invoice);
+  assert.deepEqual(result.lines, before[id].lines);
+  assert.equal(Number(result.calculation.cgstAmount), half);
+  assert.equal(Number(result.calculation.sgstAmount), half);
+  assert.equal(Number(result.calculation.calculatedInvoiceTotal), total);
+  assert.equal(Number(result.calculation.gstDifference), 0);
+  assert.equal(Number(result.calculation.totalDifference), 0);
+  expectedChanges.push(id);
+}
 assert.deepEqual(changed.sort(), expectedChanges.sort(), "Inspect unexpected voucher changes");
 console.log({ cases: cases.length, changed: changed.length, otherChanges: 0, flaggedForInspection: issues.length });

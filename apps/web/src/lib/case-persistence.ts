@@ -11,7 +11,10 @@ import {loadProtectedCasePreview} from './protected-preview';
 import type { PacketIntelligence } from "@/lib/packet-intelligence";
 import { getQueuedUploadFiles, serializeQueuedUploadGroups } from "@/lib/upload-groups";
 
+import type { UploadBatchPosition } from "@autodealer/shared/lib/upload-groups";
+
 export type SavedCaseRecord = {
+  uploadBatch?: UploadBatchPosition | null;
   id: string;
   slug: string;
   displayName: string;
@@ -469,6 +472,7 @@ export async function persistProcessedCase(params: {
 }
 
 export async function createDraftCase(params: {
+  batch?: UploadBatchPosition;
   accessCompanyId?: string;
   uploads: QueuedUpload[];
   allowDuplicate?: boolean;
@@ -476,6 +480,7 @@ export async function createDraftCase(params: {
   const formData = new FormData();
   if(params.accessCompanyId) formData.set('accessCompanyId',params.accessCompanyId);
   formData.set("mode", "draft");
+  if (params.batch) formData.set("uploadBatch", JSON.stringify(params.batch));
   if (params.allowDuplicate) {
     formData.set("allowDuplicate", "true");
   }

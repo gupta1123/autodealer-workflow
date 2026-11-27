@@ -102,3 +102,10 @@ test("a tax-footer copy needs both matching source identity and a reconciling pr
   assert.deepEqual([...invoiceArtefactIndices([goods, {...goods, lineNumber: "2"}], "423500")], []);
   assert.deepEqual([...invoiceArtefactIndices([goods, {...goods}], "423500")], []);
 });
+
+test("distinct printed invoice numbers cannot collapse even for nearly identical page text", () => {
+  const lines = normalizeExtractedCommercialLineItems({docType:"Tax Invoice",
+    lineItems:[line(1),line(2)],visibleTextPages:[invoicePage("ORIGINAL"),
+      invoicePage("DUPLICATE").replace("2026-27/422","2026-27/423")]});
+  assert.equal(lines.length,2);
+});

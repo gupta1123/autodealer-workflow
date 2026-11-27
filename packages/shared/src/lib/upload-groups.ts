@@ -2,6 +2,21 @@ import type { QueuedUpload } from "@/types/pipeline";
 
 export const CAMERA_SCAN_SOURCE = "camera_scan" as const;
 
+export type UploadBatchPosition = { id: string; position: number; total: number };
+
+export function readUploadBatch(value: unknown): UploadBatchPosition | null {
+  if (!value || typeof value !== "object") return null;
+  const { id, position, total } = value as Partial<UploadBatchPosition>;
+  if (typeof id !== "string" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id) ||
+      typeof position !== "number" || !Number.isSafeInteger(position) || position < 1 ||
+      typeof total !== "number" || !Number.isSafeInteger(total) || position > total) return null;
+  return { id, position, total };
+}
+
+export function uploadBatchSuffix(batch?: UploadBatchPosition | null, postingStatus?: string) {
+  return batch && postingStatus !== "created" ? ` (#${batch.position}/${batch.total})` : "";
+}
+
 export type UploadGroupMeta = {
   id: string;
   name: string;

@@ -1,5 +1,7 @@
 "use client";
 
+import { uploadBatchSuffix } from "@autodealer/shared/lib/upload-groups";
+
 import Link from "next/link";
 import dynamic from "next/dynamic";
 import { canAccess } from "@autodealer/shared/lib/access";
@@ -159,10 +161,12 @@ function toReadableCaseText(value: string) {
     .replace(/\s+packet$/i, " packet");
 }
 
+function caseName(item: SavedCaseRecord) {
+  return toReadableCaseText(item.receiverName || item.buyerName || item.displayName);
+}
+
 function getCaseTitle(item: SavedCaseRecord) {
-  if (item.receiverName) return toReadableCaseText(item.receiverName);
-  if (item.buyerName) return toReadableCaseText(item.buyerName);
-  return toReadableCaseText(item.displayName);
+  return caseName(item) + uploadBatchSuffix(item.uploadBatch, item.tallyPosting?.status);
 }
 
 const APPROVAL_OPTIONS = [
@@ -682,11 +686,12 @@ export function CasesPage() {
                           <TableCell className="pl-0 pr-3 py-2 font-medium text-[#111827]">
                             <Link
                               href={`/cases/${item.id}`}
-                              className="hover:underline hover:text-[#2b1a10] block max-w-[260px] truncate font-medium text-[13px]"
+                              className="hover:underline hover:text-[#2b1a10] flex max-w-[260px] items-baseline gap-1 font-medium text-[13px]"
                               onFocus={() => router.prefetch(`/cases/${item.id}`)}
                               onMouseEnter={() => router.prefetch(`/cases/${item.id}`)}
                             >
-                              {getCaseTitle(item)}
+                              <span className="truncate">{caseName(item)}</span>
+                              <span className="shrink-0">{uploadBatchSuffix(item.uploadBatch, item.tallyPosting?.status)}</span>
                             </Link>
                           </TableCell>
 

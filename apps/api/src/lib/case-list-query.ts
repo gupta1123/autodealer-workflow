@@ -1,7 +1,7 @@
 // Keep the legacy presentation helpers, but do not fetch unrelated workflow,
 // AI or upload metadata for directory rows.
 const BASE = 'id,slug,display_name,buyer_name,po_number,invoice_number,status,risk_score,upload_count,document_count,mismatch_count,created_at';
-export const CASE_LIST_META_KEYS = ['caseCategory','packetCategory','documentTypes','termsComplianceMismatchMode','termsComplianceChecklist','recycleBin'] as const;
+export const CASE_LIST_META_KEYS = ['caseCategory','packetCategory','documentTypes','termsComplianceMismatchMode','termsComplianceChecklist','recycleBin','uploadBatch'] as const;
 export const CASE_LIST_COLUMNS_LEGACY = `${BASE},${CASE_LIST_META_KEYS.map(key => `list_${key}:processing_meta->${key}`).join(',')}`;
 export const CASE_LIST_COLUMNS = `${CASE_LIST_COLUMNS_LEGACY},deleted_at`;
 export function restoreCaseListMetadata<T extends Record<string, unknown>>(row: T): T & {processing_meta: unknown} {

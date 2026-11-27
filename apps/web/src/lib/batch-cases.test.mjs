@@ -39,3 +39,16 @@ test('a number shared by too many files does not group them', () => {
   const files = uploads(Array.from({ length: 8 }, (_, i) => `Ledger 5500 part ${i}.pdf`));
   assert.equal(planBatchCases(files, { undone: [], moves: {} }).length, 8);
 });
+
+test('batch position survives list reordering and stays visible until Tally confirms creation', async () => {
+  const {readUploadBatch, uploadBatchSuffix} = await import('../../../../packages/shared/src/lib/upload-groups.ts');
+  const id = '250adbd2-1103-4616-ad9a-fc3809fb1234';
+  const entries = [3, 1, 2].map(position => readUploadBatch({id, position, total:3}));
+  assert.deepEqual(entries.map(batch => uploadBatchSuffix(batch)), [' (#3/3)', ' (#1/3)', ' (#2/3)']);
+  for (const status of ['approved','queued','creating','verification_required','failed']) {
+    assert.equal(uploadBatchSuffix(entries[2],status),' (#2/3)');
+  }
+  assert.equal(uploadBatchSuffix(entries[2],'created'),'');
+  assert.equal(uploadBatchSuffix(readUploadBatch(undefined)),'');
+  assert.equal(readUploadBatch({id,position:4,total:3}),null);
+});

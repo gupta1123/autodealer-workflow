@@ -15,6 +15,7 @@ import {
   type DuplicateCaseReference,
 } from "@/lib/case-persistence";
 import { batchStateRank, planBatchCases, type BatchPlanAdjustments, type BatchRowState } from "@/lib/batch-cases";
+import { uploadBatchSuffix, type UploadBatchPosition } from "@autodealer/shared/lib/upload-groups";
 import { getQueuedUploadPageCount } from "@/lib/upload-groups";
 import { PAUSED_STAGE, friendlyProcessingError } from "@autodealer/shared/lib/processing-errors";
 import type { ComparisonOptions, QueuedUpload } from "@/types/pipeline";
@@ -24,6 +25,7 @@ const UPLOAD_CONCURRENCY = 2;
 const POLL_MS = 4000;
 
 type BatchRow = {
+  batch: UploadBatchPosition;
   key: string;
   label: string;
   uploads: QueuedUpload[];
@@ -96,7 +98,7 @@ export function BatchCases({ uploads, onRemoveUpload, onStarted, onReset }: Batc
   const createCase = useCallback(async (row: BatchRow, allowDuplicate = false) => {
     patch(row.key, { state: "uploading", error: null, duplicate: null });
     try {
-      const created = await createDraftCase({ uploads: row.uploads, allowDuplicate });
+      const created = await createDraftCase({ uploads: row.uploads, allowDuplicate, batch: row.batch });
       patch(row.key, { caseId: created.case.id, caseName: created.case.displayName });
       await queueAnalysis(row, created.case.id);
     } catch (error) {
@@ -109,9 +111,11 @@ export function BatchCases({ uploads, onRemoveUpload, onStarted, onReset }: Batc
   const start = async (options: ComparisonOptions) => {
     optionsRef.current = options;
     setOptionsOpen(false);
-    const initial: BatchRow[] = plans.map((plan) => {
+    const batchId = crypto.randomUUID();
+    const initial: BatchRow[] = plans.map((plan, index) => {
       const caseUploads = plan.uploadIds.map((id) => uploadById.get(id)).filter((upload): upload is QueuedUpload => Boolean(upload));
       return {
+        batch: { id: batchId, position: index + 1, total: plans.length },
         key: plan.key,
         label: caseLabel(caseUploads),
         uploads: caseUploads,
@@ -321,13 +325,13 @@ export function BatchCases({ uploads, onRemoveUpload, onStarted, onReset }: Batc
     <div className="w-full space-y-4 text-left">
       <div>
         <div className="text-sm font-semibold text-[#111827]">
-          {ready} of {rows.length} ready to review
+          {rows.filter(row => row.caseId).length} of {rows.length} cases uploaded, {ready} ready to review
           {needsYou ? <span className="text-[#8c1d18]">, {needsYou} need{needsYou === 1 ? "s" : ""} you</span> : null}
         </div>
         <p className="mt-0.5 text-[11px] text-[#8a7f72]">
           {stillUploading
             ? "Keep this page open until every case is uploaded. Analysis then carries on even if you leave."
-            : "Every case is uploaded. Analysis carries on if you leave; the cases are in All Cases."}
+            : "Uploaded cases are in All Cases. Analysis continues if you leave."}
         </p>
         <div className="mt-3 flex flex-wrap gap-1" role="list" aria-label="Cases in this batch">
           {rows.map((row) => (
@@ -363,7 +367,10 @@ export function BatchCases({ uploads, onRemoveUpload, onStarted, onReset }: Batc
                 >
                   <span className={`h-2 w-2 shrink-0 rounded-full ${STATE_STYLE[row.state]}`} />
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-xs font-semibold text-[#111827]">{row.caseName ?? row.label}</div>
+                    <div className="flex items-baseline gap-1 text-xs font-semibold text-[#111827]">
+                      <span className="truncate">{row.caseName ?? row.label}</span>
+                      <span className="shrink-0">{uploadBatchSuffix(row.batch)}</span>
+                    </div>
                     <div className="truncate text-[11px] text-[#8a7f72]">
                       {row.uploads.length} file{row.uploads.length === 1 ? "" : "s"}
                       {row.state === "ready" && row.mismatchCount !== null

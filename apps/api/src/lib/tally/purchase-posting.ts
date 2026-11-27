@@ -518,7 +518,7 @@ function invoiceIdentity(document: PurchasePostingDocumentInput) {
   const supplier = normalizeGstin(fields.supplierGstin) || normalizeKey(fields.vendorName);
   const buyer = normalizeGstin(fields.buyerGstin) || normalizeKey(fields.buyerName);
   return invoiceNumber && (supplier || buyer)
-    ? `${invoiceNumber}:${supplier}:${buyer}`
+    ? `${invoiceNumber}:${supplier}:${buyer}:${parseDate(fields.invoiceDate || fields.documentDate)}:${moneyPaise(fields.totalAmount)}`
     : `document:${document.id}`;
 }
 
@@ -1050,7 +1050,13 @@ function buildSource(
     item,
     line: { ...sourceLine(lineSource.id, item, index), ...(recovered ? { printedTonneRateConfirmed: true } : {}) },
   }));
-  const artefacts = invoiceArtefactIndices(itemRows.map(row => row.item), fields.totalTaxableAmount || fields.subtotal);
+  const pages: string[] = [];
+  for (const section of (lineSource.markdown ?? "").matchAll(/^### Page (\d+)[^\S\n]*\n([\s\S]*?)(?=^### Page \d+|(?![\s\S]))/gm)) {
+    const page = Number(section[1]);
+    if (page >= 1 && page <= 1000) pages[page - 1] = section[2];
+  }
+  const artefacts = invoiceArtefactIndices(itemRows.map(row => row.item), fields.totalTaxableAmount || fields.subtotal,
+    Array.from(pages, page => page ?? ""));
   const goodsAndCharges = itemRows.filter((_, index) => !artefacts.has(index));
   const freightRows = goodsAndCharges.filter(({ item, line }) => isFreightChargeRow(item, line));
   const lines = goodsAndCharges.filter((row) => !freightRows.includes(row)).map(({ line }) => line);
@@ -2019,6 +2025,42 @@ function calculate(
   };
 }
 
+export function selectPurchaseInvoice(canonicalInvoices: PurchasePostingDocumentInput[],
+  invoiceCandidates: PurchaseInvoiceCandidate[], companyGstin?: string | null, requestedDocumentId?: string) {
+  const recommendedCandidates = invoiceCandidates.filter((candidate) => candidate.recommended);
+  const identifiedCompany = normalizeGstin(companyGstin);
+  const missingCompanyInvoice = identifiedCompany && !recommendedCandidates.length &&
+    invoiceCandidates.every(candidate => candidate.buyerGstin && candidate.buyerGstin !== identifiedCompany);
+  const requested = invoiceCandidates.find(candidate => candidate.documentId === requestedDocumentId);
+  // Copies with different buyers, dates or totals survive canonicalisation.
+  // Require a deliberate choice if they purport to be the same supplier invoice.
+  const supplierReferences = new Set<string>();
+  const conflictingCopies = canonicalInvoices.some(doc => {
+    const f = fieldsOf(doc);
+    const number = normalizeKey(f.invoiceNumber || f.referenceInvoiceNumber);
+    const date = parseDate(f.invoiceDate || f.documentDate);
+    const supplier = normalizeGstin(f.supplierGstin) || normalizeKey(f.vendorName);
+    if (!number || !supplier) return false;
+    const year = date ? Number(date.slice(0, 4)) - Number(Number(date.slice(5, 7)) < 4) : "";
+    const key = JSON.stringify([supplier, number, year]);
+    if (supplierReferences.has(key)) return true;
+    supplierReferences.add(key);
+    return false;
+  });
+  let selectedCandidate: PurchaseInvoiceCandidate | null = null;
+  if (!missingCompanyInvoice) {
+    if (requested) {
+      if (!identifiedCompany || !requested.buyerGstin || requested.recommended) selectedCandidate = requested;
+    } else if (!conflictingCopies && recommendedCandidates.length === 1) {
+      selectedCandidate = recommendedCandidates[0];
+    } else if (canonicalInvoices.length === 1) {
+      selectedCandidate = invoiceCandidates[0];
+    }
+  }
+
+  return {selectedCandidate, missingCompanyInvoice, conflictingCopies};
+}
+
 export function preparePurchasePosting(params: {
   documents: PurchasePostingDocumentInput[];
   masters: PurchasePostingMasterInput[];
@@ -2060,19 +2102,14 @@ export function preparePurchasePosting(params: {
   }
 
   const requestedDocumentId = text(params.savedReview?.selectedInvoiceDocumentId);
-  const recommendedCandidates = invoiceCandidates.filter((candidate) => candidate.recommended);
-  const selectedCandidate = invoiceCandidates.find((candidate) =>
-    requestedDocumentId && candidate.documentId === requestedDocumentId
-  ) ?? (recommendedCandidates.length === 1
-    ? recommendedCandidates[0]
-    : canonicalInvoices.length === 1
-      ? invoiceCandidates[0]
-      : null);
-
+  const { selectedCandidate, missingCompanyInvoice, conflictingCopies } =
+    selectPurchaseInvoice(canonicalInvoices, invoiceCandidates, params.companyGstin, requestedDocumentId);
   if (!selectedCandidate) {
     blockers.push(issue(
       "INVOICE_SELECTION_REQUIRED",
       "Choose the invoice billed to your company",
+      missingCompanyInvoice ? "Purchase invoice billed to the active company is missing. Check the bill-to GSTIN or attach the downstream invoice." :
+      conflictingCopies ? "Copies of the same supplier invoice disagree on the buyer, date or total. Check the source pages and select the correct invoice." :
       `This packet contains ${canonicalInvoices.length} distinct commercial invoices. Select the invoice whose buyer is the active Tally company; duplicate copies have already been collapsed.`,
       "case"
     ));
@@ -2109,7 +2146,7 @@ export function preparePurchasePosting(params: {
     params.masters,
     params.mappings ?? [],
     normalizeGstin(params.companyGstin) || source.buyerGstin,
-    params.savedReview
+    requestedDocumentId && requestedDocumentId !== invoice.id ? undefined : params.savedReview
   );
   review.selectedInvoiceDocumentId = invoice.id;
   warnings.push(...packetConsistencyWarnings(review, params.documents));
@@ -2265,18 +2302,23 @@ export function preparePurchasePosting(params: {
   const itemsTaxable = sum(review.lines.map(line => moneyPaise(line.taxableAmount)));
   const excess = printedTaxable === null ? 0 : itemsTaxable - printedTaxable;
   if (printedTaxable !== null && printedTaxable > 0 && excess > 0) {
-    const seen = new Set<string>();
+    const seen = new Map<string, typeof review.lines[number]>();
     for (const line of review.lines) {
       if (moneyPaise(line.taxableAmount) !== excess) continue;
-      const key = JSON.stringify([normalizeKey(line.description), normalizeHsn(line.hsn),
-        quantityMillis(line.quantity), normalizeUnit(line.unit), moneyPaise(line.rate)]);
-      if (seen.has(key)) {
+      const key = JSON.stringify([normalizeHsn(line.hsn), quantityMillis(line.quantity),
+        normalizeUnit(line.unit), moneyPaise(line.rate)]);
+      const previous = seen.get(key);
+      if (previous) {
+        const evidence = [previous, line].map(candidate => {
+          const page = source.lines.find(row => row.lineId === candidate.lineId)?.sourcePage;
+          return candidate.description + (page ? " (page " + page + ")" : "");
+        }).join(" and ");
         blockers.push(issue("POSSIBLE_DUPLICATE_LINE", "Verify repeated invoice rows",
-          "Two matching item rows exceed the printed taxable subtotal by exactly one row. Check the original invoice and correct the extraction before posting.",
+          evidence + " have the same quantity, rate and amount. The excess equals one row. Check the printed invoice and correct the extraction before posting.",
           "line", line.lineId));
         break;
       }
-      seen.add(key);
+      seen.set(key, line);
     }
   }
 

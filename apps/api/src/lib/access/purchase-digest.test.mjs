@@ -13,3 +13,11 @@ test('amounts, ledger choices and routing all invalidate the approved digest',()
  assert.notEqual(baseline,purchaseFinancialDigest(docs,{ledger:'A'},{company:'A',connection:'2'}));
  assert.notEqual(baseline,purchaseFinancialDigest([{...docs[0],extracted_fields:{amount:11}}],{ledger:'A'},{company:'A',connection:'1'}));
 });
+
+test('copy evidence is bound to the approval for a multipage invoice',()=>{
+  const doc={id:'a',document_type:'Tax Invoice',extracted_fields:{subtotal:100}};
+  const old=purchaseFinancialDigest([doc],{},null);
+  const copy={...doc,markdown:'### Page 1\noriginal\n### Page 2\ncopy'};
+  assert.notEqual(purchaseFinancialDigest([copy],{},null),old);
+  assert.notEqual(purchaseFinancialDigest([copy],{},null),purchaseFinancialDigest([{...copy,markdown:copy.markdown+' corrected'}],{},null));
+});

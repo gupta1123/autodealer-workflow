@@ -53,6 +53,7 @@ import {
   TERMS_COMPLIANCE_FIELD,
   TERMS_COMPLIANCE_MISMATCH_MODE,
 } from "@/lib/terms-compliance";
+import { readUploadBatch } from "@autodealer/shared/lib/upload-groups";
 import { readUploadGroupMeta } from "@/lib/upload-groups";
 import type { CaseDoc, FieldKey, Mismatch } from "@/types/pipeline";
 
@@ -984,6 +985,7 @@ function mapCaseRow(
     id: row.id,
     slug: row.slug,
     displayName,
+    uploadBatch: readUploadBatch(toRecord(row.processing_meta).uploadBatch),
     buyerName: receiverName,
     receiverName,
     category,
@@ -1448,6 +1450,16 @@ async function POSTHandler(request: Request) {
     const uploadGroups = parseUploadGroups(formData.get("uploadGroups"));
 
     if (mode === "draft") {
+      const rawBatch = formData.get("uploadBatch");
+      let uploadBatch = null;
+      try {
+        uploadBatch = readUploadBatch(parseOptionalJsonField(rawBatch));
+      } catch {
+        return jsonWithCors(request, { error: "Invalid upload batch position." }, { status: 400 });
+      }
+      if (rawBatch !== null && !uploadBatch) {
+        return jsonWithCors(request, { error: "Invalid upload batch position." }, { status: 400 });
+      }
       if (!preparedFiles.length) {
         return jsonWithCors(request, 
           { error: "Upload at least one file to create a case." },
@@ -1503,6 +1515,7 @@ async function POSTHandler(request: Request) {
         mismatch_count: 0,
         processing_meta: {
           draft: true,
+          ...(uploadBatch ? { uploadBatch } : {}),
           draftCreatedAt: new Date().toISOString(),
           caseCategory: "Draft case",
           packetCategory: "Draft case",

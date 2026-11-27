@@ -16,15 +16,18 @@ export type PurchaseLedgerRole =
 
 type SearchIndex = {
   byName: Map<string, TallyMasterOption>;
-  rows: Array<{ option: TallyMasterOption; searchText: string }>;
+  rows?: Array<{ option: TallyMasterOption; searchText: string }>;
 };
 
 const searchIndexes = new WeakMap<TallyMasterOption[], SearchIndex>();
 
 function optionIdentity(option: TallyMasterOption) {
-  return [option.name, option.parent, option.groupPath, option.taxType, option.gstDutyHead]
-    .filter(Boolean)
-    .join(" ");
+  let text = option.name;
+  if (option.parent) text += " " + option.parent;
+  if (option.groupPath) text += " " + option.groupPath;
+  if (option.taxType) text += " " + option.taxType;
+  if (option.gstDutyHead) text += " " + option.gstDutyHead;
+  return text;
 }
 
 export type PurchaseWithholdingRole = "194q" | "transport" | "cgst_tds" | "sgst_tds" | "igst_tds" | "tcs";
@@ -50,17 +53,17 @@ function normalizeUnitFamily(value: string | null | undefined) {
   return normalized;
 }
 
+const compareMasterNames = new Intl.Collator().compare;
+
 function topScoredOptions(
   scored: Array<{ option: TallyMasterOption; score: number }>,
-  minimumScore = 100,
   limit = 8
 ) {
   const top: Array<{ option: TallyMasterOption; score: number }> = [];
   for (const entry of scored) {
-    if (entry.score < minimumScore) continue;
     const index = top.findIndex((current) =>
       entry.score > current.score ||
-      (entry.score === current.score && entry.option.name.localeCompare(current.option.name) < 0)
+      (entry.score === current.score && compareMasterNames(entry.option.name, current.option.name) < 0)
     );
     if (index < 0) top.push(entry);
     else top.splice(index, 0, entry);
@@ -72,32 +75,15 @@ function topScoredOptions(
 function searchIndex(options: TallyMasterOption[]) {
   const cached = searchIndexes.get(options);
   if (cached) return cached;
-  const rows = options.map((option) => ({
-    option,
-    searchText: [
-      option.name,
-      option.parent,
-      option.groupPath,
-      option.gstin,
-      option.hsnCode,
-      option.unitName,
-      option.taxRate,
-      option.closingBalance,
-      option.closingBalanceType,
-    ]
-      .filter((item) => item !== null && item !== undefined)
-      .join(" ")
-      .toLowerCase(),
-  }));
-  const index = {
-    byName: new Map(options.map((option) => [option.name.trim().toLowerCase(), option])),
-    rows,
+  const index: SearchIndex = {
+    byName: new Map(options.map(option => [option.name.trim().toLowerCase(), option])),
   };
   searchIndexes.set(options, index);
   return index;
 }
 
 export function selectedMasterOption(options: TallyMasterOption[], value: string) {
+  if (!value.trim()) return null;
   return searchIndex(options).byName.get(value.trim().toLowerCase()) ?? null;
 }
 
@@ -120,12 +106,26 @@ export function searchPurchaseMasterOptions(
       }
     }
   }
-  for (const row of index.rows) {
-    if (query && !row.searchText.includes(query)) continue;
-    if (seen.has(row.option.id)) continue;
-    seen.add(row.option.id);
-    result.push(row.option);
-    if (result.length > limit) break;
+  if (query) {
+    index.rows ??= options.map(option => ({
+      option,
+      searchText: [option.name, option.parent, option.groupPath, option.gstin, option.hsnCode,
+        option.unitName, option.taxRate, option.closingBalance, option.closingBalanceType]
+        .filter(value => value != null).join(" ").toLowerCase(),
+    }));
+    for (const row of index.rows) {
+      if (!row.searchText.includes(query) || seen.has(row.option.id)) continue;
+      seen.add(row.option.id);
+      result.push(row.option);
+      if (result.length > limit) break;
+    }
+  } else {
+    for (const option of options) {
+      if (seen.has(option.id)) continue;
+      seen.add(option.id);
+      result.push(option);
+      if (result.length > limit) break;
+    }
   }
   return { visibleOptions: result.slice(0, limit), hasMore: result.length > limit };
 }
@@ -140,7 +140,7 @@ export function rankPurchaseLedgerRole(
   const scored: Array<{ option: TallyMasterOption; score: number }> = [];
   for (const option of options) {
     const identity = optionIdentity(option);
-    let value = aiNames.has(option.name.trim().toLowerCase()) ? 300 : 0;
+    let value = aiNames.size && aiNames.has(option.name.trim().toLowerCase()) ? 300 : 0;
     if (role === "purchase") {
       if (/purchase\s+accounts?/i.test(identity)) value += 120;
       else if (/\bpurchase\b/i.test(identity)) value += 80;
@@ -179,7 +179,7 @@ export function rankPurchaseLedgerRole(
     } else if (role === "round_off" && /round[\s-]*off/i.test(identity)) {
       value += 150;
     }
-    scored.push({ option, score: value });
+    if (value >= 100) scored.push({ option, score: value });
   }
   const suggested = topScoredOptions(scored);
   return { options, suggestedNames: suggested.map((entry) => entry.option.name) };
@@ -191,16 +191,19 @@ export function rankPurchaseStockItems(
   aiCandidates: string[]
 ) {
   const aiNames = new Set(aiCandidates.map((name) => name.trim().toLowerCase()));
+  const unitFamily = normalizeUnitFamily(line.unit);
   const normalizedHsn = line.hsn.replace(/\D/g, "");
   const descriptionTokens = line.description.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token.length > 2);
   const scored: Array<{ option: TallyMasterOption; score: number }> = [];
   for (const option of options) {
-    let score = aiNames.has(option.name.trim().toLowerCase()) ? 300 : 0;
+    let score = aiNames.size && aiNames.has(option.name.trim().toLowerCase()) ? 300 : 0;
     if (normalizedHsn && option.hsnCode?.replace(/\D/g, "") === normalizedHsn) score += 140;
+    // Even every matching word and the unit bonus cannot qualify this item.
+    if (score + descriptionTokens.length * 15 + 20 < 100) continue;
     const identity = optionIdentity(option).toLowerCase();
     for (const token of descriptionTokens) if (identity.includes(token)) score += 15;
-    if (line.unit && option.unitName && normalizeUnitFamily(line.unit) === normalizeUnitFamily(option.unitName)) score += 20;
-    scored.push({ option, score });
+    if (line.unit && option.unitName && unitFamily === normalizeUnitFamily(option.unitName)) score += 20;
+    if (score >= 100) scored.push({ option, score });
   }
   const suggested = topScoredOptions(scored);
   return { options, suggestedNames: suggested.map((entry) => entry.option.name) };

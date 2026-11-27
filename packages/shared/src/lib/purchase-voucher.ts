@@ -128,6 +128,19 @@ export function calculatePurchaseVoucher(input: PurchaseCalculationInput) {
     for (const bucket of splitBuckets) bucket.amount = Math.round(bucket.amount / 100) * 100;
   }
 
+  // A supplier may round each 9% component to paise before adding them.
+  // Accept that one-paisa difference only when both printed totals agree.
+  if (input.taxMode === "cgst_sgst" && splitBuckets.length === 2 && printedTax !== null &&
+      splitBuckets[0].rate === splitBuckets[1].rate && splitBuckets[0].basis === splitBuckets[1].basis &&
+      Math.abs(splitBuckets[0].amount + splitBuckets[1].amount - printedTax) === 1 &&
+      !purchaseMoneyPaise(input.tcsAmount) && !purchaseMoneyPaise(input.invoiceWithholdingAmount)) {
+    const half = Math.round(splitBuckets[0].basis * splitBuckets[0].rate / 10000);
+    if (half * 2 === printedTax && basic + freight + printedTax + (purchaseMoneyPaise(input.sourceRoundOffAmount) ?? 0)
+        === purchaseMoneyPaise(input.invoiceTotal)) {
+      for (const bucket of splitBuckets) bucket.amount = half;
+    }
+  }
+
   const buckets: PurchaseTaxBucket[] = Array.from(bucketMap.values()).map((bucket) => ({
     kind: bucket.kind,
     rate: purchaseFormatPaise(bucket.rate).replace(/\.00$/, ""),

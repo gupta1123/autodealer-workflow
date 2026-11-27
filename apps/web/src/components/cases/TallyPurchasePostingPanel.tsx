@@ -300,6 +300,14 @@ const ISSUE_REVIEW_FIELD: Partial<Record<string, keyof TallyPostingReview>> = {
   TCS_LEDGER_REQUIRED: "tcsLedgerName",
   ROUND_OFF_LEDGER_REQUIRED: "roundOffLedgerName",
 };
+const withholdingIssueRole: Record<string, PurchaseWithholdingRole | undefined> = {
+  TDS_194Q_LEDGER_REQUIRED: "194q",
+  TRANSPORT_TDS_LEDGER_REQUIRED: "transport",
+  CGST_TDS_LEDGER_REQUIRED: "cgst_tds",
+  SGST_TDS_LEDGER_REQUIRED: "sgst_tds",
+  IGST_TDS_LEDGER_REQUIRED: "igst_tds",
+  TCS_LEDGER_REQUIRED: "tcs",
+};
 // Item-line errors and the line values that can resolve them.
 const ISSUE_LINE_FIELDS: Partial<Record<string, Array<keyof TallyPostingLine>>> = {
   STOCK_ITEM_REQUIRED: ["stockItemName"],
@@ -315,19 +323,29 @@ const ISSUE_LINE_FIELDS: Partial<Record<string, Array<keyof TallyPostingLine>>> 
 function issueFieldChanged(
   issue: TallyPostingIssue,
   checked: TallyPostingReview | null,
-  current: TallyPostingReview | null
+  current: TallyPostingReview | null,
+  ledgers: TallyMasterOption[]
 ) {
   if (!checked || !current) return false;
   const field = ISSUE_REVIEW_FIELD[issue.code];
   if (field) {
     const value = current[field];
-    return typeof value === "string" && Boolean(value.trim()) && value !== checked[field];
+    if (typeof value !== "string" || !value.trim() || value === checked[field]) return false;
+    const master = selectedMasterOption(ledgers, value);
+    if (!master) return false;
+    const role = withholdingIssueRole[issue.code];
+    if (role) return isPurchaseWithholdingOption(master, role);
+    if (issue.code === "SUPPLIER_LEDGER_GSTIN_MISMATCH" && master.gstin && current.supplierGstin)
+      return master.gstin.trim().toUpperCase() === current.supplierGstin.trim().toUpperCase();
+    return true;
   }
   const lineFields = ISSUE_LINE_FIELDS[issue.code];
   if (!lineFields || !issue.lineId) return false;
   const before = checked.lines.find((line) => line.lineId === issue.lineId);
   const after = current.lines.find((line) => line.lineId === issue.lineId);
   if (!before || !after) return false;
+  if (issue.code === "PURCHASE_LEDGER_MATCHES_SUPPLIER" &&
+      after.purchaseLedgerName.trim().toLowerCase() === current.supplierLedgerName.trim().toLowerCase()) return false;
   const changed = lineFields.some((key) => after[key] !== before[key]);
   const filled = lineFields.every((key) => String(after[key] ?? "").trim());
   return changed && filled;
@@ -438,6 +456,15 @@ function Field({
   );
 }
 
+function useWithholdingOptions(options: TallyMasterOption[], role: PurchaseWithholdingRole, current?: string) {
+  const eligible = useMemo(() => options.filter(option => isPurchaseWithholdingOption(option, role)), [options, role]);
+  return useMemo(() => {
+    const selected = current ? selectedMasterOption(options, current) : null;
+    if (selected && !isPurchaseWithholdingOption(selected, role)) return [...eligible, selected];
+    return eligible.length ? eligible : options;
+  }, [current, eligible, options, role]);
+}
+
 function MasterCombobox({
   id,
   label,
@@ -481,8 +508,8 @@ function MasterCombobox({
   const [search, setSearch] = useState("");
   const selected = useMemo(() => selectedMasterOption(options, value), [options, value]);
   const visibleState = useMemo(
-    () => searchPurchaseMasterOptions(options, suggestedNames, search),
-    [options, search, suggestedNames]
+    () => open ? searchPurchaseMasterOptions(options, suggestedNames, search) : { visibleOptions: [], hasMore: false },
+    [open, options, search, suggestedNames]
   );
   const visibleOptions = useMemo(() => {
     const current = visibleState.visibleOptions;
@@ -822,6 +849,9 @@ export function TallyPurchasePostingPanel({
       }) };
     });
   }
+  const savedReviewRef = useRef<TallyPostingReview | null>(null);
+  const saveInFlight = useRef(false);
+  const discreteEdit = useRef(false);
   const currentReviewRef = useRef<TallyPostingReview | null>(null);
   const autoSaveFailedReviewRef = useRef<TallyPostingReview | null>(null);
   const invoiceSelectionRevisionRef = useRef(0);
@@ -1495,16 +1525,12 @@ export function TallyPurchasePostingPanel({
   const freightOptions = freightRanked.options;
   // Withholding pickers list only ledgers that the posting check accepts for
   // that deduction (plus the current choice, which may come from a mapping).
-  const withholdingOptions = (options: TallyMasterOption[], role: PurchaseWithholdingRole, current: string | undefined) => {
-    const valid = options.filter((option) => isPurchaseWithholdingOption(option, role) || option.name === current);
-    return valid.length ? valid : options;
-  };
-  const tds194qOptions = withholdingOptions(tds194qRanked.options, "194q", review?.tds194qLedgerName);
-  const transportTdsOptions = withholdingOptions(transportTdsRanked.options, "transport", review?.transportTdsLedgerName);
-  const cgstTdsOptions = withholdingOptions(cgstTdsRanked.options, "cgst_tds", review?.cgstTdsLedgerName);
-  const sgstTdsOptions = withholdingOptions(sgstTdsRanked.options, "sgst_tds", review?.sgstTdsLedgerName);
-  const igstTdsOptions = withholdingOptions(igstTdsRanked.options, "igst_tds", review?.igstTdsLedgerName);
-  const tcsOptions = withholdingOptions(tcsRanked.options, "tcs", review?.tcsLedgerName);
+  const tds194qOptions = useWithholdingOptions(tds194qRanked.options, "194q", review?.tds194qLedgerName);
+  const transportTdsOptions = useWithholdingOptions(transportTdsRanked.options, "transport", review?.transportTdsLedgerName);
+  const cgstTdsOptions = useWithholdingOptions(cgstTdsRanked.options, "cgst_tds", review?.cgstTdsLedgerName);
+  const sgstTdsOptions = useWithholdingOptions(sgstTdsRanked.options, "sgst_tds", review?.sgstTdsLedgerName);
+  const igstTdsOptions = useWithholdingOptions(igstTdsRanked.options, "igst_tds", review?.igstTdsLedgerName);
+  const tcsOptions = useWithholdingOptions(tcsRanked.options, "tcs", review?.tcsLedgerName);
   const roundOffOptions = roundOffRanked.options;
   // Keep expensive 50k-master line rankings across ordinary amount and text
   // edits. Each cache is discarded when its authoritative option array changes.
@@ -1541,14 +1567,14 @@ export function TallyPurchasePostingPanel({
       ) return false;
       // The user already changed the field this error is about; the automatic
       // re-check (under a second later) decides whether it still applies.
-      if (issueFieldChanged(issue, payload?.review ?? null, review)) return false;
+      if (issueFieldChanged(issue, payload?.review ?? null, review, ledgerOptions)) return false;
       return true;
     }),
-    [masterValidationPending, payload?.blockers, payload?.posting?.status, payload?.review, review, roundOffOptions]
+    [masterValidationPending, payload?.blockers, payload?.posting?.status, payload?.review, review, roundOffOptions, ledgerOptions]
   );
   const remainingCorrectionBlockers = useMemo(
     () => correctionBlockers.filter((item) =>
-      item.code.startsWith("EWAY_BILL_") || !allowedBlockerKeys.includes(`${item.code}:${item.lineId ?? item.scope}`)
+      item.code.startsWith("EWAY_BILL_") || item.code === "POSSIBLE_DUPLICATE_LINE" || !allowedBlockerKeys.includes(`${item.code}:${item.lineId ?? item.scope}`)
     ),
     [allowedBlockerKeys, correctionBlockers]
   );
@@ -1614,6 +1640,7 @@ export function TallyPurchasePostingPanel({
   }
 
   function updateReview<K extends keyof TallyPostingReview>(key: K, value: TallyPostingReview[K]) {
+    discreteEdit.current = key.endsWith("LedgerName");
     editedFields.current.add(key);
     setReview((current) => current ? { ...current, [key]: value } : current);
     if (key === "supplierName" || key === "supplierGstin") {
@@ -1626,7 +1653,9 @@ export function TallyPurchasePostingPanel({
   }
 
   async function persistReview(nextReview: TallyPostingReview) {
-    if (!selectedConnectionId || !selectedCompanyName || locked) return;
+    if (!selectedConnectionId || !selectedCompanyName || locked || saveInFlight.current) return;
+    saveInFlight.current = true;
+    discreteEdit.current = false;
     try {
       setSaving(true);
       setError(null);
@@ -1637,9 +1666,14 @@ export function TallyPurchasePostingPanel({
         nextReview,
         selectedConnectionId,
         selectedCompanyName,
-        withSelectedLiveMasters(liveMasterResultRef.current, nextReview, liveMasterOptionsRef.current)
+        withSelectedLiveMasters(liveMasterResultRef.current, nextReview, liveMasterOptionsRef.current),
+        payload?.posting?.revision ?? 0,
+        !connectionDirty && payload?.supportsLedgerEdits && payload.review === savedReviewRef.current &&
+          payload?.posting?.caseId === caseId && payload.posting.connectionId === selectedConnectionId &&
+          payload.posting.companyName === selectedCompanyName ? payload.review : null
       );
       const hydrated = withLiveMasterOptions(next);
+      savedReviewRef.current = hydrated.review;
       setPayload(hydrated);
       setSelectedConnectionId(hydrated.selectedConnectionId ?? selectedConnectionId);
       setSelectedCompanyName(hydrated.selectedCompanyName ?? selectedCompanyName);
@@ -1656,6 +1690,7 @@ export function TallyPurchasePostingPanel({
       autoSaveFailedReviewRef.current = nextReview;
       setError(saveError instanceof Error ? `${saveError.message} Your changes are kept; use Retry.` : "Could not save your changes. Use Retry.");
     } finally {
+      saveInFlight.current = false;
       setSaving(false);
     }
   }
@@ -1673,6 +1708,7 @@ export function TallyPurchasePostingPanel({
   }
 
   function updateLine(index: number, key: keyof TallyPostingReview["lines"][number], value: string) {
+    discreteEdit.current = ["purchaseLedgerName", "stockItemName", "godownName"].includes(key);
     if (review?.lines[index]) editedFields.current.add(review.lines[index].lineId + "." + key);
     setReview((current) => {
       if (!current) return current;
@@ -1834,7 +1870,8 @@ export function TallyPurchasePostingPanel({
         selectedConnectionId,
         selectedCompanyName,
         approvalContext,
-        approval.required ? approval.workflow?.revision : undefined
+        approval.required ? approval.workflow?.revision : undefined,
+        payload?.posting?.revision
       );
       const hydrated = withLiveMasterOptions(next);
       setPayload(hydrated);
@@ -1966,7 +2003,7 @@ export function TallyPurchasePostingPanel({
   useEffect(() => {
     if (!(hasUnsavedChanges || !payload?.posting) || !canSave || saving || !review) return;
     if (autoSaveFailedReviewRef.current === review) return;
-    const timer = window.setTimeout(() => { void persistReview(review); }, 800);
+    const timer = window.setTimeout(() => { void persistReview(review); }, discreteEdit.current ? 0 : 800);
     return () => window.clearTimeout(timer);
     // persistReview reads current state; re-run only when the edit state changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2005,7 +2042,7 @@ export function TallyPurchasePostingPanel({
   );
   const allBlockersAllowed = Boolean(
     payload?.blockers.length && payload.blockers.every((blocker) =>
-      !blocker.code.startsWith("EWAY_BILL_") && allowedBlockerKeys.includes(`${blocker.code}:${blocker.lineId ?? blocker.scope}`)
+      !blocker.code.startsWith("EWAY_BILL_") && blocker.code !== "POSSIBLE_DUPLICATE_LINE" && allowedBlockerKeys.includes(`${blocker.code}:${blocker.lineId ?? blocker.scope}`)
     )
   );
   const effectivelyReadyForApproval = Boolean(payload?.readyForApproval || allBlockersAllowed);
@@ -2019,6 +2056,11 @@ export function TallyPurchasePostingPanel({
     !tallyReviewRefreshing &&
     connectionReadable &&
     selectedMatchesActive
+  );
+  const canOpenConfirmation = canApprove || Boolean(
+    hasUnsavedChanges && canSave && !connectionDirty && !approval.required &&
+    (!approval.enabled || canAccess(approval.snapshot, 'purchases.post')) &&
+    connectionReadable && selectedMatchesActive
   );
   const masterContext = {
     companyName: connection?.companyName ?? selectedCompanyName,
@@ -3429,8 +3471,8 @@ export function TallyPurchasePostingPanel({
                 </Button>
               ) : (
                 <Button
-                  className={canApprove ? "bg-emerald-700 text-white hover:bg-emerald-800" : "bg-slate-200 text-slate-500"}
-                  disabled={!canApprove || queueing}
+                  className={canOpenConfirmation ? "bg-emerald-700 text-white hover:bg-emerald-800" : "bg-slate-200 text-slate-500"}
+                  disabled={!canOpenConfirmation || queueing}
                   onClick={() => setConfirmOpen(true)}
                   title={staleMastersBlocking ? "Refresh Tally data before approving this voucher." : undefined}
                 >
@@ -3499,9 +3541,14 @@ export function TallyPurchasePostingPanel({
               </a>
             </div>
           ) : null}
+          {hasUnsavedChanges || saving ? (
+            <p role="status" className="text-sm">{error || "Saving and checking your latest changes..."}</p>
+          ) : !canApprove ? (
+            <p role="status" className="text-sm">Review the remaining corrections before sending.</p>
+          ) : null}
           <DialogFooter>
             <Button disabled={queueing} onClick={() => setConfirmOpen(false)} variant="outline">Cancel</Button>
-            <Button className="bg-emerald-700 text-white hover:bg-emerald-800" disabled={queueing || tallyReviewRefreshing || staleMastersBlocking || (acknowledgementWarnings.length > 0 && !warningsAcknowledged)} onClick={() => void handleApproveAndQueue()}>
+            <Button className="bg-emerald-700 text-white hover:bg-emerald-800" disabled={!canApprove || saving || queueing || tallyReviewRefreshing || staleMastersBlocking || (acknowledgementWarnings.length > 0 && !warningsAcknowledged)} onClick={() => void handleApproveAndQueue()}>
               {queueing || tallyReviewRefreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
               {tallyReviewRefreshing
                 ? "Checking Tally data"

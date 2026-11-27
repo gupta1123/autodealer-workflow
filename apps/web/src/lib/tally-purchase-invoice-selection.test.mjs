@@ -62,3 +62,28 @@ test('a pipe invoice retains its configured scrap candidate despite the twelve-i
   const {compactResult}=api.prepareLiveTallyCatalogue(data,{lines:[invoice]},[{stockItemName:target}]);
   assert(compactResult.masters.stockItems.some(row=>row.name===target));
 });
+
+test('rapid ledger edits send only fields changed since the acknowledged revision', async () => {
+  const requests = [];
+  const api = await client(async (_, request) => {
+    requests.push(JSON.parse(request.body));
+    return Response.json({});
+  });
+  const base = { supplierLedgerName: 'A', invoiceNumber: '108', lines: [
+    { lineId: 'first', purchaseLedgerName: 'P', quantity: '5' },
+    { lineId: 'second', purchaseLedgerName: 'P', quantity: '7' },
+  ] };
+  const first = { ...base, supplierLedgerName: 'B' };
+  const next = { ...first, lines: [first.lines[0], { ...first.lines[1], purchaseLedgerName: 'Q' }] };
+  await api.saveTallyPurchasePosting('case', first, 'pc', 'company', {}, 7, base);
+  await api.saveTallyPurchasePosting('case', next, 'pc', 'company', {}, 8, first);
+  await api.approveAndQueueTallyPurchasePosting('case', [], [], 'pc', 'company', {}, undefined, 9);
+  assert.deepEqual(requests.map(x => x.expectedRevision), [7, 8, 9]);
+  assert.deepEqual(requests[0].review, { supplierLedgerName: 'B' });
+  assert.deepEqual(requests[1].review, { lines: [{ lineId: 'second', purchaseLedgerName: 'Q' }] });
+  assert.equal(requests[1].ledgerEdit, true);
+  const mixed = { ...next, invoiceNumber: '109' };
+  await api.saveTallyPurchasePosting('case', mixed, 'pc', 'company', {}, 9, next);
+  assert.equal(requests[3].ledgerEdit, false);
+  assert.deepEqual(requests[3].review, mixed);
+});

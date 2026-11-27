@@ -483,12 +483,18 @@ function tokenSetSimilarity(left: Set<string>, right: Set<string>) {
 function findInvoiceCopyPages(visibleTextPages: string[]) {
   const duplicates = new Map<number, number>();
   const pageTokens = visibleTextPages.map(normalizeDuplicateCopyPageTokens);
+  const invoiceNumbers = visibleTextPages.map(page => {
+    const match = page.match(/\binvoice\s+(?:no\.?|number)\s*[:#]?\s*(?:e-way bill no\.?\s+dated\s+)?([a-z0-9][a-z0-9/-]*\d[a-z0-9/-]*|\d+)\b/i);
+    return match?.[1].toUpperCase();
+  });
 
   for (let index = 0; index < pageTokens.length; index += 1) {
     const current = pageTokens[index];
     if (current.size < DUPLICATE_COPY_MIN_COMMON_TOKENS) continue;
 
     for (let previousIndex = 0; previousIndex < index; previousIndex += 1) {
+      if (invoiceNumbers[index] && invoiceNumbers[previousIndex] &&
+          invoiceNumbers[index] !== invoiceNumbers[previousIndex]) continue;
       const previous = pageTokens[previousIndex];
       if (previous.size < DUPLICATE_COPY_MIN_COMMON_TOKENS) continue;
 
@@ -1546,11 +1552,29 @@ export function recoverPrintedTonneLine(items: CommercialLineItem[], fields: Rec
 // Remove an extraction artefact only when the remaining rows independently
 // reconcile to the printed taxable subtotal. Keep the original indices so
 // previously saved reviews still refer to the same goods.
-export function invoiceArtefactIndices(rows: CommercialLineItem[], printedSubtotal: unknown) {
+function samePrintedGoods(a: CommercialLineItem, b: CommercialLineItem) {
+  if (!a.lineNumber || a.lineNumber !== b.lineNumber || !a.hsnSac || a.hsnSac !== b.hsnSac ||
+      !a.unit || a.unit !== b.unit || !a.description || !b.description) return false;
+  for (const [left, right] of [[a.quantity, b.quantity], [a.netRate || a.rate, b.netRate || b.rate],
+    [a.taxableAmount, b.taxableAmount]]) {
+    const value = parseLineItemNumber(left);
+    if (value === null || value <= 0 || value !== parseLineItemNumber(right)) return false;
+  }
+  const words = (value?: string) => (value || "").toLowerCase().match(/[a-z0-9]+/g)?.sort().join(" ");
+  if (words(a.rawText) && words(a.rawText) === words(b.rawText)) return true;
+  return words([a.description, a.itemCode].filter(Boolean).join(" ")) ===
+    words([b.description, b.itemCode].filter(Boolean).join(" "));
+}
+
+export function invoiceArtefactIndices(rows: CommercialLineItem[], printedSubtotal: unknown, pages: string[] = []) {
   const footers = new Set<number>();
   const duplicates = new Set<number>();
   const subtotal = parseLineItemNumber(printedSubtotal);
   if (subtotal === null || subtotal <= 0 || rows.length < 2) return footers;
+  const copyPages = findInvoiceCopyPages(pages);
+  const confirmedCopies = new Set<number>();
+  let copyPaise = 0;
+  const usedOriginals = new Map<number, Set<number>>();
   const numberedRows = new Set<string>();
   let goodsPaise = 0;
   let duplicatePaise = 0;
@@ -1565,6 +1589,21 @@ export function invoiceArtefactIndices(rows: CommercialLineItem[], printedSubtot
     if (amount === null) return new Set<number>();
     const paise = Math.round(amount * 100);
     goodsPaise += paise;
+    const originalPage = copyPages.get(row.sourcePage ?? 0);
+    if (originalPage && row.sourcePage) {
+      const used = usedOriginals.get(row.sourcePage) ?? new Set<number>();
+      const peer = rows.findIndex((other, i) => other.sourcePage === originalPage &&
+        !used.has(i) && samePrintedGoods(other, row));
+      if (peer >= 0) {
+        confirmedCopies.add(index);
+        copyPaise += paise;
+        used.add(peer);
+        usedOriginals.set(row.sourcePage, used);
+        duplicates.add(index);
+        duplicatePaise += paise;
+        continue;
+      }
+    }
     // An unnumbered extraction and a numbered table transcription can
     // describe the same row on invoice copies. Keep the numbered source.
     if (!row.lineNumber && row.itemCode && row.hsnSac && row.sourcePage && rows.some(peer =>
@@ -1606,6 +1645,7 @@ export function invoiceArtefactIndices(rows: CommercialLineItem[], printedSubtot
   }
   const printedPaise = Math.round(subtotal * 100);
   if (goodsPaise === printedPaise) return footers;
+  if (goodsPaise - copyPaise === printedPaise) return new Set([...footers, ...confirmedCopies]);
   if (goodsPaise - duplicatePaise === printedPaise) return new Set([...footers, ...duplicates]);
   return new Set<number>();
 }
@@ -1625,11 +1665,15 @@ export function normalizeExtractedCommercialLineItems(params: {
   }
 
   const visibleTextPages = params.visibleTextPages ?? [];
+  const printed = parseLineItemNumber(params.documentFields?.totalTaxableAmount || params.documentFields?.subtotal);
+  const alreadyBalanced = printed !== null && printed > 0 &&
+    params.lineItems.every(row => getLineCommercialAmount(row) !== null) &&
+    params.lineItems.reduce((sum, row) => sum + Math.round(getLineCommercialAmount(row)! * 100), 0) === Math.round(printed * 100);
   const deduped = INVOICE_DOC_TYPES.has(params.docType)
-    ? mergeInvoicePageCopies(params.lineItems, visibleTextPages)
+    ? (alreadyBalanced ? params.lineItems : mergeInvoicePageCopies(params.lineItems, visibleTextPages))
     : dedupeNonInvoiceLineItems(params.lineItems);
   const artefacts = INVOICE_DOC_TYPES.has(params.docType)
-    ? invoiceArtefactIndices(deduped, params.documentFields?.totalTaxableAmount || params.documentFields?.subtotal)
+    ? invoiceArtefactIndices(deduped, params.documentFields?.totalTaxableAmount || params.documentFields?.subtotal, visibleTextPages)
     : new Set<number>();
   const visibleText = visibleTextPages.join("\n");
   const withInvoiceAmounts = INVOICE_DOC_TYPES.has(params.docType)
